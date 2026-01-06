@@ -20,16 +20,9 @@ namespace llaminar2
         // Q16 Integer Attention Kernel (wired to Q16IntegerAttentionRef)
         // =================================================================
 
-        // Fixed KV cache scale used for Q16_1 quantization throughout the pipeline.
-        // This matches the scale used in KVCacheAppendStage, UnifiedKVCache, and RoPE.
-        // Block scale d = kv_cache_scale / 32767 is what the kernel needs.
-        //
-        // IMPORTANT: For this to work correctly, the RoPE stage MUST use fixed-scale
-        // quantization (not data-adaptive). See PLAN_FIXED_SCALE_ROPE_Q16.md for details.
-        // Currently V uses fixed-scale (from KVCacheAppendStage), but Q and K from RoPE
-        // use data-adaptive scales which causes a mismatch.
-        constexpr float KV_CACHE_SCALE = 8.0f;
-        constexpr float BLOCK_SCALE = KV_CACHE_SCALE / 32767.0f;
+        // NOTE: Head scales are now extracted dynamically from Q16 blocks in compute().
+        // This supports data-adaptive quantization from RoPE, which assigns different
+        // scales to different positions based on the actual value range.
 
         // =================================================================
         // Parameter Validation
@@ -130,29 +123,129 @@ namespace llaminar2
             Q16IntegerAttentionParams ref_params;
 
             // Input tensors (already validated as Q16_1 blocks in FusedAttentionWoStage)
+            // NOTE: These are Q16BlockPtr types, assignment works directly
             ref_params.Q = params.Q;
             ref_params.K = params.K;
             ref_params.V = params.V;
 
-            // Block size: auto-detect based on head_dim
-            // - 64-element blocks for head_dim=64
-            // - 128-element blocks for head_dim=128 (Qwen2, Llama, etc.)
-            ref_params.block_size = optimal_q16_block_size(params.head_dim);
+            // NOTE: block_size is now derived from Q.block_size automatically
+            // (no explicit assignment needed)
 
-            // Head scales: Q16_1 blocks store their scale in the `d` field.
-            // RoPE uses data-adaptive quantization, so each block can have a different scale.
-            // The reference kernel assumes 1 scale per head (head-aligned blocks).
-            // We extract the actual `d` values from the Q and K blocks.
+            // ================================================================
+            // HEAD SCALES: Two modes depending on HybridQ16 K precision fix
+            // ================================================================
+            // Mode 1: Per-position K scales from RoPE (HybridQ16 K precision fix)
+            //   - params.k_head_scales is non-null
+            //   - K scales vary per position due to dynamic-scale RoPE
+            //   - Pass to ref_params.k_position_scales for per-position softmax scaling
             //
-            // NOTE: This is an approximation for K since different positions have different scales.
-            // For true integer attention with fixed scales, the entire pipeline should use
-            // fixed-scale quantization (like V does for KV cache).
-            // Head scales: Use fixed BLOCK_SCALE for all heads.
-            // NOTE: This assumes the RoPE stage uses fixed-scale quantization.
-            // Currently RoPE uses data-adaptive scaling, which causes a mismatch.
-            // See PLAN_FIXED_SCALE_ROPE_Q16.md for the proper fix.
-            std::vector<float> q_scales(params.n_heads, BLOCK_SCALE);
-            std::vector<float> kv_scales(params.n_kv_heads, BLOCK_SCALE);
+            // Mode 2: Uniform K scales from block headers (standard)
+            //   - params.k_head_scales is null
+            //   - Extract scales from Q16 block headers (first position approximation)
+            //   - All positions within a head use the same scale
+
+            const int block_elements = static_cast<int>(params.Q.block_size);
+            const int blocks_per_head = (params.head_dim + block_elements - 1) / block_elements;
+
+            std::vector<float> q_scales(params.n_heads);
+            std::vector<float> kv_scales(params.n_kv_heads);
+
+            // Lambda to extract d from Q16 block at given index
+            auto extract_d = [&params](const Q16BlockPtr &ptr, size_t block_idx) -> float
+            {
+                switch (ptr.block_size)
+                {
+                case Q16BlockSize::BLOCK_64:
+                    return ptr.as_block_64()[block_idx].d;
+                case Q16BlockSize::BLOCK_128:
+                    return ptr.as_block_128()[block_idx].d;
+                case Q16BlockSize::BLOCK_32:
+                    return ptr.as_block_32()[block_idx].d;
+                }
+                return 1.0f; // Fallback
+            };
+
+            // Extract Q head scales from first position of each head (always needed)
+            for (int h = 0; h < params.n_heads; ++h)
+            {
+                // Head h starts at block index: h * seq_len_q * blocks_per_head
+                const size_t head_start_block = static_cast<size_t>(h) * params.seq_len_q * blocks_per_head;
+                q_scales[h] = extract_d(params.Q, head_start_block);
+            }
+
+            // Debug: print Q scales for layer 0
+            if (params.layer_idx == 0)
+            {
+                LOG_DEBUG("Q16FusedAttentionKernel Layer 0: extracted q_scales[0..2]="
+                          << q_scales[0] << ", " << q_scales[1] << ", " << q_scales[2]
+                          << " (expected ~0.00781 = 256/32767 (kv_cache_scale))");
+            }
+
+            const int effective_kv_stride = (params.kv_head_stride > 0) ? params.kv_head_stride : params.kv_len;
+
+            if (params.k_head_scales)
+            {
+                // DISABLED: Per-position K scale code path was reading the WRONG scale value.
+                // K_block.d is the QUANTIZATION scale (~0.008, which is max_abs(K)/32767)
+                // NOT the normalization scale (~0.000244, which is 1/(KV_CACHE_SCALE*16))
+                // This caused alpha to be 32x too large, making softmax almost one-hot.
+                // See Test__OnlineSoftmaxPerPositionKScales.cpp for detailed proof.
+                //
+                // Until a correct per-position scale source is implemented, use uniform scaling.
+                ref_params.read_k_scales_from_blocks = false;
+                ref_params.k_position_scales = nullptr;
+
+                // Still need kv_head_scales for V scale (V doesn't have per-position scales)
+                // Extract from block headers as fallback
+                for (int kv_h = 0; kv_h < params.n_kv_heads; ++kv_h)
+                {
+                    const size_t head_start_block = static_cast<size_t>(kv_h) * effective_kv_stride * blocks_per_head;
+                    kv_scales[kv_h] = extract_d(params.V, head_start_block); // Use V for V scale
+                }
+
+                // Debug: Log K scale range from K cache blocks (first layer only)
+                if (params.layer_idx == 0)
+                {
+                    // Read K scales directly from K cache for logging
+                    float min_k = std::numeric_limits<float>::max();
+                    float max_k = std::numeric_limits<float>::lowest();
+                    int zero_count = 0;
+                    const int total_positions = params.kv_len;
+                    for (int kv_h = 0; kv_h < params.n_kv_heads; ++kv_h)
+                    {
+                        const size_t head_start_block = static_cast<size_t>(kv_h) * effective_kv_stride * blocks_per_head;
+                        for (int pos = 0; pos < total_positions; ++pos)
+                        {
+                            float k_scale = extract_d(params.K, head_start_block + pos * blocks_per_head);
+                            if (k_scale == 0.0f)
+                                zero_count++;
+                            min_k = std::min(min_k, k_scale);
+                            max_k = std::max(max_k, k_scale);
+                        }
+                    }
+                    LOG_DEBUG("Q16FusedAttentionKernel Layer 0: K scales from cache range [" << min_k << " - " << max_k << "]"
+                                                                                             << " zeros=" << zero_count << "/" << (total_positions * params.n_kv_heads)
+                                                                                             << " ratio=" << (min_k > 0 ? max_k / min_k : 0));
+                }
+
+                LOG_DEBUG("Q16FusedAttentionKernel: Per-position K scale path DISABLED (was reading wrong scale)"
+                          << " read_k_scales_from_blocks=false"
+                          << ", kv_len=" << params.kv_len
+                          << ", n_kv_heads=" << params.n_kv_heads << ")");
+            }
+            else
+            {
+                // Mode 2: Standard - extract scales from K block headers
+                for (int kv_h = 0; kv_h < params.n_kv_heads; ++kv_h)
+                {
+                    const size_t head_start_block = static_cast<size_t>(kv_h) * effective_kv_stride * blocks_per_head;
+                    kv_scales[kv_h] = extract_d(params.K, head_start_block);
+                }
+
+                LOG_DEBUG("Q16FusedAttentionKernel: Using uniform K scales from block headers"
+                          << " (kv_scales[0]=" << kv_scales[0] << ")");
+            }
+
             ref_params.q_head_scales = q_scales.data();
             ref_params.kv_head_scales = kv_scales.data();
 
@@ -167,7 +260,7 @@ namespace llaminar2
             const int blocks_per_row = (params.d_model + 31) / 32; // Q16_1Block has 32 elements
             const int total_blocks = params.seq_len_q * blocks_per_row;
             std::vector<Q16_1Block> wo_output_buffer(total_blocks);
-            ref_params.output = wo_output_buffer.data();
+            ref_params.output = (wo_output_buffer.data());
 
             // Residual pointers - these can alias (in-place: residual_in == residual_out)
             ref_params.residual_in = params.residual_in;
@@ -176,6 +269,7 @@ namespace llaminar2
             // Dimensions
             ref_params.seq_len_q = params.seq_len_q;
             ref_params.kv_len = params.kv_len;
+            ref_params.kv_head_stride = params.kv_head_stride; // Pass through for sparse HEAD_MAJOR cache
             ref_params.num_heads = params.n_heads;
             ref_params.num_kv_heads = params.n_kv_heads;
             ref_params.head_dim = params.head_dim;

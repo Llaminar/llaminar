@@ -59,8 +59,8 @@ namespace llaminar2
 
         // Fixed scale for Q16_1 KV cache quantization (FP32 range: ±kv_cache_scale)
         // See RuntimeConfig.h for detailed documentation on scale selection.
-        // Default 8.0f covers typical K/V activation ranges with ~2× headroom.
-        float kv_cache_scale = 8.0f;
+        // Default 64.0f covers Q8_1 activation ranges (max ±35) with ~2× headroom.
+        float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must cover Q projection max (~130 for Qwen2)
     };
 
     /**

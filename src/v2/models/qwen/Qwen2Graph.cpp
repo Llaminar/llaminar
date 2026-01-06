@@ -826,6 +826,17 @@ namespace llaminar2
                 LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx
                                                 << " using " << (inference_mode.isHybridQ16() ? "HybridQ16" : "Hybrid")
                                                 << " RoPE: Q8_1→" << (inference_mode.isHybridQ16() ? "Q16_1" : "FP32") << " output");
+
+                // HybridQ16 K precision fix: K from GEMM is Q16_1 (not Q8_1)
+                // RoPE will use Q16→Q16 dynamic scale path and output per-head scales
+                // Note: buffers.K is already Q16_1 for HybridQ16 (allocated by GraphOrchestrator)
+                if (inference_mode.isHybridQ16() && buffers.K_head_scales)
+                {
+                    rope_params.K_head_scales = buffers.K_head_scales;
+                    rope_params.kv_cache_scale = config_.kv_cache_scale;
+                    LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx
+                                                    << " HybridQ16 K precision fix: K_head_scales buffer provided");
+                }
             }
 
             graph.addNode(prefix + "rope",
@@ -1030,6 +1041,16 @@ namespace llaminar2
                 TensorBase *K_for_fused = buffers.K;
                 TensorBase *V_for_fused = buffers.V;
 
+                // HybridQ16 K precision fix: Use K_rope (post-RoPE Q16_1 with dynamic scale)
+                // instead of K (pre-RoPE Q16_1 from GEMM) for prefill
+                // The K_head_scales were extracted during RoPE and must match the K data
+                if (inference_mode.isHybridQ16() && inference_mode.needsKRope() && buffers.K_rope)
+                {
+                    K_for_fused = buffers.K_rope;
+                    LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx
+                                                    << " FusedAttention using K_rope (post-RoPE Q16_1)");
+                }
+
                 // Check decode mode - need to get K/V from cache
                 if (kv_cache)
                 {
@@ -1083,6 +1104,16 @@ namespace llaminar2
                 {
                     fused_params.fuse_residual_add = true;
                     fused_params.output = buffers.residual; // Output directly to Q16_1 residual
+
+                    // HybridQ16 K precision fix: pass K_head_scales from RoPE to attention kernel
+                    // This enables per-head scale lookup for Q×K^T computation
+                    if (buffers.K_head_scales)
+                    {
+                        fused_params.K_head_scales = buffers.K_head_scales;
+                        LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx
+                                                        << " HybridQ16 K precision fix: K_head_scales passed to attention");
+                    }
+
                     LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " HybridQ16: fused residual add enabled");
                 }
 

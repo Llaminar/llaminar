@@ -151,7 +151,7 @@ namespace llaminar2
 
         /// Fixed scale for Q16 KV cache quantization (FP32 range: ±kv_cache_scale).
         /// Used by KVCacheAppendStage for VNNI-safe quantization.
-        float kv_cache_scale = 8.0f;
+        float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must cover Q projection max (~130 for Qwen2)
 
         // TP-adjusted dimensions
         int local_n_heads = 0;    ///< Heads on this rank

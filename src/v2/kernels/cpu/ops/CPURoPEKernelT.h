@@ -553,6 +553,27 @@ namespace llaminar2
             float kv_cache_scale,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
+
+        // HybridQ16 K precision fix: Q=Q8_1→Q16_1 (fixed), K=Q16_1→Q16_1 (dynamic)
+        // Used when GEMM outputs K as Q16_1 to preserve small values.
+        // Q is processed normally (Q8_1→Q16_1 fixed scale).
+        // K uses dynamic per-head scale output for attention kernel.
+        bool apply_mixed_q8_k16_to_q16(
+            TensorBase *Q_in,     // Q8_1 input
+            TensorBase *K_in,     // Q16_1 input (from GEMM K precision fix!)
+            TensorBase *Q_out,    // Q16_1 output (fixed scale)
+            TensorBase *K_out,    // Q16_1 output (dynamic scale)
+            float *K_head_scales, // Output: per-head K scales [seq_len * n_kv_heads]
+            Q16BlockSize block_size,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta,
+            float kv_cache_scale,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
     };
 
     // =========================================================================

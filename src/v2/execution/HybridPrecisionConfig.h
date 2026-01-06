@@ -36,8 +36,11 @@ namespace llaminar2
         Logits,
         ResidualStream, // Explicit residual stream type (Q16_1 in HybridQ16 mode)
 
-        // QKV path
-        QKV_GEMM_Output, // Output of QKV projection GEMM
+        // QKV path - individual buffers for mixed-precision GEMM output
+        QKV_GEMM_Output, // Output of QKV projection GEMM (legacy - same precision for all)
+        Q_GEMM_Output,   // Q projection output (allows mixed-precision: Q8_1 while K is Q16_1)
+        K_GEMM_Output,   // K projection output (Q16_1 in HybridQ16 for precision)
+        V_GEMM_Output,   // V projection output (Q8_1 typically)
         Q_After_RoPE,    // Q after rotary position embedding
         K_After_RoPE,    // K after rotary position embedding
         KV_Cache,        // KV cache storage
@@ -132,6 +135,12 @@ namespace llaminar2
      * - attn_proj: Q16_1 (2.25 B/elem) vs FP32 (4 B/elem) = 44% savings
      * - ffn_output: Q8_1 (1.125 B/elem) vs FP32 (4 B/elem) = 72% savings
      * - Overall: ~55% memory reduction
+     *
+     * K Precision Fix (Phase 2):
+     * The key insight is that K projection has high dynamic range (max_abs ≈ 130).
+     * Q8_1 step = 130/127 ≈ 1.02, which zeros out values < 0.51.
+     * Q16_1 step = 130/32767 ≈ 0.004, preserving values down to 0.002.
+     * Therefore K GEMM outputs Q16_1 directly, while Q and V remain Q8_1.
      */
     struct HybridQ16PrecisionConfig
     {
@@ -142,8 +151,12 @@ namespace llaminar2
         ActivationPrecision attention_output = ActivationPrecision::Q16_1; ///< Fused kernel outputs Q16_1 directly
         ActivationPrecision ffn_down = ActivationPrecision::Q8_1;          ///< FFN still uses Q8_1 (added to Q16_1 residual)
 
-        // QKV path precision - Q16_1 for fused attention kernel
-        ActivationPrecision qkv_gemm_output = ActivationPrecision::Q8_1; ///< QKV projection output
+        // QKV path precision - mixed precision for K (Q16_1) vs Q/V (Q8_1)
+        // K_GEMM_Output is Q16_1 to preserve small values in high-dynamic-range K projection
+        ActivationPrecision qkv_gemm_output = ActivationPrecision::Q8_1; ///< Legacy: uniform QKV output (deprecated)
+        ActivationPrecision q_gemm_output = ActivationPrecision::Q8_1;   ///< Q projection output
+        ActivationPrecision k_gemm_output = ActivationPrecision::Q16_1;  ///< K projection output (256× better precision!)
+        ActivationPrecision v_gemm_output = ActivationPrecision::Q8_1;   ///< V projection output
         ActivationPrecision q_after_rope = ActivationPrecision::Q16_1;   ///< Q16 kernel expects Q16_1 Q input
         ActivationPrecision k_after_rope = ActivationPrecision::Q16_1;   ///< Q16 kernel expects Q16_1 K input
         ActivationPrecision kv_cache = ActivationPrecision::Q16_1;       ///< Q16_1 KV cache for Q16 attention

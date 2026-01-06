@@ -339,7 +339,7 @@ namespace llaminar2
          * @note Only applies when activation_precision is HybridQ16.
          * @see VNNISafetyConstants.h for VNNI overflow limits
          */
-        float kv_cache_scale = 8.0f;
+        float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must cover Q projection max (~130 for Qwen2)
 
         // ===== Multi-Device Executor Feature Flags (Incremental Rollout) =====
 

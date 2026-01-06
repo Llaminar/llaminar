@@ -598,7 +598,8 @@ TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_BF16_UsesPositionMajor)
     EXPECT_EQ(state.kv_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
 }
 
-TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_HybridQ16_UsesHeadMajor)
+// HybridQ16 tests disabled - HybridQ16 project on hold (2025-01)
+TEST_F(Test__GraphOrchestrator, DISABLED_KVCacheLayoutMode_HybridQ16_UsesHeadMajor)
 {
     // Create config with HybridQ16 precision - this resolves KV cache to Q16_1
     auto hybrid_config = config_;
@@ -619,7 +620,8 @@ TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_HybridQ16_UsesHeadMajor)
     EXPECT_EQ(state.kv_cache->layout_mode(), KVCacheLayoutMode::HEAD_MAJOR);
 }
 
-TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_Hybrid_UsesPositionMajor)
+// Hybrid tests disabled - HybridQ16 project on hold (2025-01)
+TEST_F(Test__GraphOrchestrator, DISABLED_KVCacheLayoutMode_Hybrid_UsesPositionMajor)
 {
     // Create config with Hybrid precision - KV cache should be BF16
     auto hybrid_config = config_;

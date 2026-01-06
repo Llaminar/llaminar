@@ -6,6 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include <vector>
 
 namespace llaminar2
 {
@@ -39,7 +40,11 @@ namespace llaminar2
             int seq_len = 0;             ///< Explicit sequence length (for pre-allocated buffers)
 
             // Fixed-scale quantization for HybridQ16 mode (used when Q_out is Q16_1)
-            float kv_cache_scale = 8.0f; ///< Fixed scale for Q16 output (d = kv_cache_scale / 32767)
+            float kv_cache_scale = 256.0f; ///< Fixed scale for Q16 output (d = kv_cache_scale / 32767)
+
+            // Dynamic-scale K output (for HybridQ16 K precision fix)
+            // When K is Q16_1 from GEMM, RoPE outputs per-head scales for attention
+            float *K_head_scales = nullptr; ///< Output: per-head K scales [seq_len * n_kv_heads]
 
             // Optional MPI context for distributed execution
             const MPIContext *mpi_ctx = nullptr;
@@ -67,6 +72,11 @@ namespace llaminar2
 
     private:
         Params params_;
+
+        // Mutable cache for getDumpInfo() to store transposed Q16 output
+        // HybridQ16 RoPE outputs HEAD_MAJOR layout, but snapshot comparison expects SEQ_MAJOR
+        mutable std::vector<float> q_transposed_cache_;
+        mutable std::vector<float> k_transposed_cache_;
     };
 
 } // namespace llaminar2

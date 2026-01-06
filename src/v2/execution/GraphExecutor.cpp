@@ -517,6 +517,7 @@ namespace llaminar2
         StageDumpContext dump_ctx;
         const bool should_dump = StageDumper::shouldDump(
             node.stage.get(),
+            node.name, // Pass node name for LLAMINAR_STAGE_DUMP_NAMES filtering
             config_.current_layer_idx,
             config_.current_iteration,
             config_.mpi_rank);
@@ -525,6 +526,7 @@ namespace llaminar2
         {
             dump_ctx = StageDumper::beginDump(
                 node.stage.get(),
+                node.name, // Pass node name for directory naming
                 config_.current_layer_idx,
                 config_.current_iteration,
                 config_.mpi_rank);

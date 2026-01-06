@@ -3403,6 +3403,30 @@ namespace llaminar2
         /// Get the block size enum value
         Q16BlockSize q16_block_size() const { return block_size_; }
 
+        /**
+         * @brief Get dtype name including block size suffix for stage dumps
+         *
+         * Returns "Q16_1_32", "Q16_1_64", or "Q16_1_128" depending on block size.
+         * This enables stage dump infrastructure to correctly compute byte sizes
+         * for Q16_1 tensors with variable block sizes.
+         *
+         * @return Static string like "Q16_1_64"
+         */
+        const char *dtype_name_with_block_size() const
+        {
+            switch (block_size_)
+            {
+            case Q16BlockSize::BLOCK_32:
+                return "Q16_1_32";
+            case Q16BlockSize::BLOCK_64:
+                return "Q16_1_64";
+            case Q16BlockSize::BLOCK_128:
+                return "Q16_1_128";
+            default:
+                return "Q16_1_32"; // Fallback
+            }
+        }
+
         // =================================================================
         // Safe Block Accessors (Phase 2 API)
         // Return nullptr if block size doesn't match - use for safe runtime dispatch

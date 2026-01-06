@@ -111,7 +111,7 @@ namespace llaminar2
         /// range [-32767 * kv_cache_scale, +32767 * kv_cache_scale]. The value must
         /// match the expected activation range to avoid clipping. Default 8.0f works
         /// for typical Qwen2 models. See VNNISafetyConstants.h for VNNI overflow limits.
-        float kv_cache_scale = 8.0f;
+        float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must cover Q projection max (~130)
 
         // Execution settings
         int default_device = 0;
@@ -246,6 +246,14 @@ namespace llaminar2
         // === Batched Decode Buffers (for gather from multiple cache slots) ===
         TensorBase *gathered_K = nullptr; ///< [batch_size * max_kv_len, kv_dim]
         TensorBase *gathered_V = nullptr; ///< [batch_size * max_kv_len, kv_dim]
+
+        // === HybridQ16 K Precision Fix: Per-head K scales ===
+        /// Per-head dynamic scales from RoPE Q16→Q16 path
+        /// Shape: [seq_len * n_kv_heads] for prefill, stored in KV cache for decode
+        /// Only used when GEMM outputs K as Q16_1 (K precision fix mode)
+        float *K_head_scales = nullptr;
+        /// Capacity of K_head_scales buffer (in floats)
+        size_t K_head_scales_capacity = 0;
 
         // === OUTPUT Buffers ===
         TensorBase *attn_proj = nullptr;

@@ -1,8 +1,8 @@
 # Q16_1 Integer-Domain Attention Kernel v2
 
-**Status**: In Progress (Phase 9 - Graph Wiring Complete, Numerical Debugging Needed)  
+**Status**: In Progress (Phase 12 - Dynamic-Scale RoPE + VNNI-Safe Normalization)  
 **Created**: 2025-12-30  
-**Updated**: 2025-01-01  
+**Updated**: 2026-01-02  
 **Author**: Llaminar Team  
 **Supersedes**: [PROJECT_Q16_INTEGER_ATTENTION.md](./PROJECT_Q16_INTEGER_ATTENTION.md)
 
@@ -327,6 +327,74 @@
   - [ ] Run on representative prompts (diverse dataset)
   - [ ] Output recommended `kv_cache_scale` values per model family
   - [ ] Profile: Qwen 2.5 (0.5B, 7B), Llama 3 (8B), DeepSeek V3
+- [x] Phase 12: Dynamic-Scale Q16→Q16 RoPE + VNNI-Safe Normalization (CRITICAL)
+  - **Problem**: K projection GEMM outputs Q16_1 with peaks ~130 (spiky activations), but:
+    - VNNI safety requires MAX_SAFE_INT16=16383 for head_dim=128
+    - With kv_cache_scale=64, max representable FP32 is ~32
+    - Fixed-scale quantization clips peaks, causing ~60% cosine similarity loss
+  - **Solution**: Dynamic-scale RoPE + post-RoPE normalization to VNNI-safe range
+  - **Key Constraint**: O(elements) must be INTEGER-ONLY, O(blocks) FP32 is acceptable
+  - [x] **Phase 12.1: Dynamic-Scale Q16→Q16 RoPE Primitives** ✅ (2026-01-02)
+    - [x] `RoPEPrimitives.h`: Add declarations for dynamic-scale functions ✅
+      - [x] `apply_rope_q16_to_q16_head_dynamic_scale_scalar<BlockType>()` ✅
+      - [x] `apply_rope_q16_to_q16_head_dynamic_scale_avx2()` (Q16_1Block only) ✅
+      - [x] `apply_rope_q16_to_q16_head_dynamic_scale_avx512()` (Q16_1Block only) ✅
+      - [x] `apply_rope_q16_to_q16_head_dynamic_scale<BlockType>()` (auto-dispatch) ✅
+      - [x] `apply_rope_q16_to_q16_dynamic_scale<BlockType>()` (batch wrapper) ✅
+      - [x] `apply_rope_q16_to_q16_dynamic_scale_dispatch()` (runtime block dispatch) ✅
+    - [x] `RoPEPrimitives.cpp`: Implement dynamic-scale scalar ✅
+      - [x] Step 1: Find max(|d|) across all input blocks → `d_unified = max_d` ✅
+      - [x] Step 2: Per-block ratio_q16 = round((d_block / d_unified) * 65536) ✅
+      - [x] Step 3: Integer-only rescale + rotate inner loop ✅
+      - [x] Step 4: All output blocks get d = d_unified ✅
+      - [x] Returns d_unified via out parameter for subsequent normalization ✅
+    - [x] `RoPEPrimitives.cpp`: Implement dynamic-scale AVX2 ✅
+      - [x] Same algorithm with SIMD inner loop ✅
+      - [x] Uses _mm256_mullo_epi32 for scale application ✅
+    - [x] `RoPEPrimitives.cpp`: Implement dynamic-scale AVX512 ✅
+      - [x] Same algorithm with wider SIMD ✅
+      - [x] Uses _mm512_mullo_epi32 for scale application ✅
+  - [x] **Phase 12.2: VNNI-Safe Normalization Primitive** ✅ (2026-01-02)
+    - [x] `Q16HeadNormalization.h`: Add `normalize_q16_head_to_vnni_safe<BlockType>()` ✅
+      - [x] Input: Q16 head blocks with d_unified (from RoPE), head_dim ✅
+      - [x] Step 1: Find max(|qs|) across all elements in head ✅
+      - [x] Step 2: If max(|qs|) > VNNI-safe limit, compute scale_ratio ✅
+      - [x] Step 3: Integer rescale: qs_new = (qs * ratio_q16) >> 16 ✅
+      - [x] Step 4: Update d_new = d_unified / scale_ratio ✅
+      - [x] Output: VNNISafeNormResult with norm_factor, new_d, was_rescaled ✅
+      - [x] Returns norm_factor for attention score correction ✅
+    - [x] `Q16HeadNormalization.cpp`: Implement scalar version ✅
+    - [x] `get_vnni_safe_max_qs(head_dim)`: Correct overflow-safe limits ✅
+      - [x] head_dim=64: max_qs=5500 (95% of sqrt(INT32_MAX/64)) ✅
+      - [x] head_dim=128: max_qs=3890 (95% of sqrt(INT32_MAX/128)) ✅
+      - [x] head_dim=192: max_qs=3175 (95% of sqrt(INT32_MAX/192)) ✅
+      - [x] head_dim=256: max_qs=2750 (95% of sqrt(INT32_MAX/256)) ✅
+  - [x] **Phase 12.3: Unit Tests for Dynamic-Scale RoPE** ✅ (2026-01-02)
+    - [x] `Test__Q16_to_Q16_RoPE_DynamicScale.cpp`: 11 tests all passing ✅
+      - [x] `OutputScaleEqualsMaxInputScale`: Verify d_unified = max(d_in) ✅
+      - [x] `MatchesFP32Reference`: Round-trip parity with FP32 RoPE ✅
+      - [x] `PreservesVaryingInputScales`: Realistic magnitude variation preserved ✅
+      - [x] `SpikyInput_Peak130_Preserved`: Cosine=1.0 for peaks ~130 ✅
+      - [x] `DynamicVsFixed_SpikyCosineComparison`: Dynamic=1.0 vs Fixed=0.365 ✅
+      - [x] `SIMDVariantsMatch`: Scalar/AVX2/AVX512 produce identical results ✅
+      - [x] `Block64_Works`, `Block128_Works`: All block types supported ✅
+      - [x] `ZeroInput`, `BatchWrapper_MultiHead`, `SumQsCorrect`: Edge cases ✅
+  - [x] **Phase 12.3b: Unit Tests for VNNI-Safe Normalization** ✅ (2026-01-02)
+    - [x] `Test__Q16_VNNI_Safe_Normalization.cpp`: 18 tests all passing ✅
+      - [x] `VNNISafeMaxQs_HeadDim*`: Verify correct limits for 64/128/192/256 ✅
+      - [x] `FindHeadMaxAbsQs_*`: Helper function tests ✅
+      - [x] `NoRescaleNeeded_AlreadySafe`: Skip rescaling when safe ✅
+      - [x] `RescalesHighValues_HeadDim128`: Rescale when needed ✅
+      - [x] `PreservesRelativeMagnitudes`: Cosine > 0.999 after rescale ✅
+      - [x] `NormFactorCorrect`: norm_factor matches expected ratio ✅
+      - [x] `NoOverflowInVNNI_SimulatedDotProduct`: **GUARANTEED** no INT32 overflow ✅
+      - [x] `AllBlockTypes_Supported`: Q16_1Block, Q16_1Block_64, Q16_1Block_128 ✅
+      - [x] `SpikyKProjection_RealWorld`: Peak=130 preserved, VNNI-safe ✅
+  - [ ] **Phase 12.4: Integration (Future)**
+    - [ ] Wire into `FusedRoPEStage` for K projection output
+    - [ ] Store norm_factor per-head in KV cache metadata
+    - [ ] Apply norm_factor correction to attention scores
+    - [ ] E2E test: verify parity with FP32 attention
 
 ---
 

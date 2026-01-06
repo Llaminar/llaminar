@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -45,6 +46,89 @@ namespace llaminar2
     class FusedAttentionWoKernel;
 
     /**
+     * @brief Compute byte size for a tensor region given dtype and dimensions
+     *
+     * For quantized formats, computes block-aligned storage:
+     * - Q8_0: 34 bytes per 32 elements
+     * - Q8_1: 36 bytes per 32 elements
+     * - Q16_1: 72 bytes per 32 elements
+     * - IQ4_NL: 18 bytes per 32 elements
+     * - FP32: 4 bytes per element
+     * - FP16/BF16: 2 bytes per element
+     *
+     * @param dtype Type string ("FP32", "Q8_1", "Q16_1", etc.)
+     * @param rows Number of rows
+     * @param cols Number of columns
+     * @return Byte size for the specified region
+     */
+    inline size_t computeByteSizeForDtype(const char *dtype, size_t rows, size_t cols)
+    {
+        if (!dtype)
+            return rows * cols * sizeof(float);
+
+        // Handle quantized block formats
+        constexpr size_t BLOCK_SIZE = 32;
+
+        if (std::strcmp(dtype, "Q8_1") == 0)
+        {
+            // Q8_1: 36 bytes per 32-element block
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            return rows * blocks_per_row * sizeof(Q8_1Block);
+        }
+        else if (std::strcmp(dtype, "Q16_1") == 0 || std::strcmp(dtype, "Q16_1_32") == 0)
+        {
+            // Q16_1/Q16_1_32: 72 bytes per 32-element block
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            return rows * blocks_per_row * sizeof(Q16_1Block);
+        }
+        else if (std::strcmp(dtype, "Q16_1_64") == 0)
+        {
+            // Q16_1_64: 136 bytes per 64-element block
+            constexpr size_t BLOCK_SIZE_64 = 64;
+            size_t blocks_per_row = (cols + BLOCK_SIZE_64 - 1) / BLOCK_SIZE_64;
+            return rows * blocks_per_row * sizeof(Q16_1Block_64);
+        }
+        else if (std::strcmp(dtype, "Q16_1_128") == 0)
+        {
+            // Q16_1_128: 264 bytes per 128-element block
+            constexpr size_t BLOCK_SIZE_128 = 128;
+            size_t blocks_per_row = (cols + BLOCK_SIZE_128 - 1) / BLOCK_SIZE_128;
+            return rows * blocks_per_row * sizeof(Q16_1Block_128);
+        }
+        else if (std::strcmp(dtype, "Q8_0") == 0)
+        {
+            // Q8_0: 34 bytes per 32-element block
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            return rows * blocks_per_row * sizeof(Q8_0Block);
+        }
+        else if (std::strcmp(dtype, "IQ4_NL") == 0)
+        {
+            // IQ4_NL: 18 bytes per 32-element block
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            return rows * blocks_per_row * sizeof(IQ4_NLBlock);
+        }
+        else if (std::strcmp(dtype, "FP32") == 0)
+        {
+            return rows * cols * sizeof(float);
+        }
+        else if (std::strcmp(dtype, "FP16") == 0 || std::strcmp(dtype, "BF16") == 0)
+        {
+            return rows * cols * sizeof(uint16_t);
+        }
+        else if (std::strcmp(dtype, "INT8") == 0)
+        {
+            return rows * cols * sizeof(int8_t);
+        }
+        else if (std::strcmp(dtype, "INT32") == 0)
+        {
+            return rows * cols * sizeof(int32_t);
+        }
+
+        // Default to FP32
+        return rows * cols * sizeof(float);
+    }
+
+    /**
      * @brief Detailed dump info for stage debugging
      *
      * Contains all input, output, and parameter buffers needed to fully
@@ -62,6 +146,7 @@ namespace llaminar2
             size_t cols = 0;
             const char *dtype = "FP32";
             size_t element_size = sizeof(float);
+            size_t byte_size = 0; ///< Total byte size for native format (0 = use rows*cols*element_size)
         };
 
         // Output buffers (written during execute)
@@ -73,6 +158,7 @@ namespace llaminar2
             size_t cols = 0;
             const char *dtype = "FP32";
             size_t element_size = sizeof(float);
+            size_t byte_size = 0; ///< Total byte size for native format (0 = use rows*cols*element_size)
         };
 
         // Weight/parameter buffers (read-only during execute)

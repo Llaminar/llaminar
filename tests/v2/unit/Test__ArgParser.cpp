@@ -74,7 +74,6 @@ TEST(Test__ArgRegistry, ValidatesActivationPrecision)
     EXPECT_TRUE(ArgRegistry::validateArg("--activation-precision", "bf16", error));
     EXPECT_TRUE(ArgRegistry::validateArg("--activation-precision", "fp16", error));
     EXPECT_TRUE(ArgRegistry::validateArg("--activation-precision", "q8_1", error));
-    EXPECT_TRUE(ArgRegistry::validateArg("--activation-precision", "hybrid", error));
 
     // Invalid values
     EXPECT_FALSE(ArgRegistry::validateArg("--activation-precision", "INVALID", error));
@@ -202,7 +201,7 @@ TEST(Test__ArgRegistry, AliasValidationWorks)
     std::string error;
 
     // Validation should work via aliases too
-    EXPECT_TRUE(ArgRegistry::validateArg("--act-prec", "hybrid", error));
+    EXPECT_TRUE(ArgRegistry::validateArg("--act-prec", "fp32", error));
     EXPECT_FALSE(ArgRegistry::validateArg("--act-prec", "INVALID", error));
 
     EXPECT_TRUE(ArgRegistry::validateArg("--weight-prec", "native", error));
@@ -213,13 +212,13 @@ TEST(Test__ArgRegistry, AliasValidationWorks)
 // ArgParser Integration Tests - End-to-end parsing and validation
 // ============================================================================
 
-TEST(Test__ArgParser, DefaultActivationPrecisionIsHybrid)
+TEST(Test__ArgParser, DefaultActivationPrecisionIsFP32)
 {
     ArgvHelper args{"llaminar2"};
     auto ctx = ArgParser::parse(args.argc(), args.argv());
 
     EXPECT_TRUE(ctx.error.empty()) << "Parse should succeed with defaults: " << ctx.error;
-    EXPECT_EQ(ctx.activation_precision, "hybrid");
+    EXPECT_EQ(ctx.activation_precision, "fp32");
 }
 
 TEST(Test__ArgParser, DefaultWeightPrecisionIsNative)
@@ -251,7 +250,7 @@ TEST(Test__ArgParser, DefaultStrategyIsAuto)
 
 TEST(Test__ArgParser, AcceptsValidActivationPrecision)
 {
-    for (const char *val : {"fp32", "bf16", "fp16", "q8_1", "hybrid"})
+    for (const char *val : {"fp32", "bf16", "fp16", "q8_1"})
     {
         ArgvHelper args{"llaminar2", "--activation-precision", val};
         auto ctx = ArgParser::parse(args.argc(), args.argv());
@@ -361,7 +360,7 @@ TEST(Test__ArgParser, MultipleValidArguments)
         "-m", "model.gguf",
         "-p", "Hello world",
         "-n", "50",
-        "--activation-precision", "hybrid",
+        "--activation-precision", "fp32",
         "--weight-precision", "native",
         "--device", "cuda:0",
         "--strategy", "all-gpu"};
@@ -371,7 +370,7 @@ TEST(Test__ArgParser, MultipleValidArguments)
     EXPECT_EQ(ctx.model_path, "model.gguf");
     EXPECT_EQ(ctx.prompt, "Hello world");
     EXPECT_EQ(ctx.n_predict, 50);
-    EXPECT_EQ(ctx.activation_precision, "hybrid");
+    EXPECT_EQ(ctx.activation_precision, "fp32");
     EXPECT_EQ(ctx.weight_precision, "native");
     EXPECT_EQ(ctx.device, "cuda:0");
     EXPECT_EQ(ctx.strategy, "all-gpu");

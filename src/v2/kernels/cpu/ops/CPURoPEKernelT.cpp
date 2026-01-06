@@ -864,6 +864,103 @@ namespace llaminar2
         return true;
     }
 
+    // --- Q8_1 apply_mixed_q8_k16_to_q16() (HybridQ16 K precision fix mode) ---
+    // Q input: Q8_1 (from GEMM) → Q16_1 output with FIXED kv_cache_scale
+    // K input: Q16_1 (from GEMM with higher precision) → Q16_1 output with DYNAMIC per-head scale
+    //
+    // This method handles the K precision fix case where GEMM outputs K as Q16_1
+    // (instead of Q8_1) to preserve small values. Q is still processed as Q8_1→Q16_1
+    // with fixed scale, but K uses Q16_1→Q16_1 dynamic scale path.
+    bool CPURoPEKernelT<ActivationPrecision::Q8_1>::apply_mixed_q8_k16_to_q16(
+        TensorBase *Q_in,     // Q8_1 input
+        TensorBase *K_in,     // Q16_1 input (from GEMM K precision fix!)
+        TensorBase *Q_out,    // Q16_1 output (fixed scale)
+        TensorBase *K_out,    // Q16_1 output (dynamic scale)
+        float *K_head_scales, // Output: per-head K scales [seq_len * n_kv_heads]
+        Q16BlockSize block_size,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        float kv_cache_scale,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        (void)mpi_ctx;
+        (void)device_idx;
+
+        // Validate Q inputs (Q8_1 → Q16_1 fixed scale path)
+        if (!Q_in || Q_in->native_type() != TensorType::Q8_1)
+        {
+            LOG_ERROR("CPURoPEKernelT<Q8_1>::apply_mixed_q8_k16_to_q16: Q_in must be Q8_1Tensor");
+            return false;
+        }
+        if (!Q_out || Q_out->native_type() != TensorType::Q16_1)
+        {
+            LOG_ERROR("CPURoPEKernelT<Q8_1>::apply_mixed_q8_k16_to_q16: Q_out must be Q16_1Tensor");
+            return false;
+        }
+
+        // Validate K inputs (Q16_1 → Q16_1 dynamic scale path - K precision fix!)
+        if (!K_in || K_in->native_type() != TensorType::Q16_1)
+        {
+            LOG_ERROR("CPURoPEKernelT<Q8_1>::apply_mixed_q8_k16_to_q16: K_in must be Q16_1Tensor (K precision fix mode)");
+            return false;
+        }
+        if (!K_out || K_out->native_type() != TensorType::Q16_1)
+        {
+            LOG_ERROR("CPURoPEKernelT<Q8_1>::apply_mixed_q8_k16_to_q16: K_out must be Q16_1Tensor");
+            return false;
+        }
+        if (!K_head_scales)
+        {
+            LOG_ERROR("CPURoPEKernelT<Q8_1>::apply_mixed_q8_k16_to_q16: K_head_scales must not be nullptr");
+            return false;
+        }
+
+        auto *q_in_q8 = dynamic_cast<Q8_1Tensor *>(Q_in);
+        auto *q_out_q16 = dynamic_cast<Q16_1Tensor *>(Q_out);
+        auto *k_in_q16 = dynamic_cast<Q16_1Tensor *>(K_in);
+        auto *k_out_q16 = dynamic_cast<Q16_1Tensor *>(K_out);
+
+        // Step 1: Process Q with Q8_1 → Q16_1 fixed scale (same as standard HybridQ16)
+        // K_in=nullptr and K_out=nullptr since we handle K separately
+        primitives::apply_rope_q8_1_to_q16_fixed_scale_dispatch(
+            q_in_q8->typed_data(),
+            nullptr, // K_in - handled separately
+            q_out_q16->mutable_typed_data(),
+            nullptr, // K_out - handled separately
+            block_size,
+            position_ids,
+            seq_len,
+            n_heads,
+            n_kv_heads, // Doesn't matter for K since we pass nullptr
+            head_dim,
+            rope_theta,
+            kv_cache_scale);
+
+        // Step 2: Process K with Q16_1 → Q16_1 dynamic scale (K precision fix path)
+        // This preserves the higher precision from GEMM and outputs per-head scales
+        primitives::apply_rope_q16_to_q16_dynamic_scale_dispatch(
+            k_in_q16->typed_data(),
+            k_out_q16->mutable_typed_data(),
+            block_size,
+            position_ids,
+            seq_len,
+            n_kv_heads,
+            head_dim,
+            rope_theta,
+            K_head_scales); // Per-head scales [seq_len * n_kv_heads]
+
+        LOG_DEBUG("[CPURoPEKernelT<Q8_1>::apply_mixed_q8_k16_to_q16] K precision fix applied: "
+                  << "Q: Q8_1→Q16_1 fixed scale=" << kv_cache_scale
+                  << ", K: Q16_1→Q16_1 dynamic scale (head_scales[0]=" << K_head_scales[0] << ")");
+
+        return true;
+    }
+
     // ============================================================================
     // Q16_1 Specialization Implementation (High-Precision Integer)
     // ============================================================================

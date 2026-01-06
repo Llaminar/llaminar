@@ -472,4 +472,103 @@ namespace llaminar2
             m, k, ctx, device_idx);
     }
 
+    bool FusedGEMM::execute_q8_1_mixed_qkv(
+        const void *input_q8_1,
+        void *output_q, // Q8_1 output
+        void *output_k, // Q16_1 output (high precision!)
+        void *output_v, // Q8_1 output
+        const float *bias_q, const float *bias_k, const float *bias_v,
+        int m, int n_q, int n_kv, int k,
+        int k_block_size,
+        const MPIContext *ctx,
+        int device_idx)
+    {
+        if (gemm_kernels_.size() != 3)
+        {
+            LOG_ERROR("[FusedGEMM::execute_q8_1_mixed_qkv] Called with "
+                      << gemm_kernels_.size() << " kernels, expected 3 for QKV");
+            return false;
+        }
+
+        if (!input_q8_1)
+        {
+            LOG_ERROR("[FusedGEMM::execute_q8_1_mixed_qkv] Input is null");
+            return false;
+        }
+
+        if (!output_q || !output_k || !output_v)
+        {
+            LOG_ERROR("[FusedGEMM::execute_q8_1_mixed_qkv] One or more output buffers is null");
+            return false;
+        }
+
+        // Validate K block size
+        if (k_block_size != 32 && k_block_size != 64 && k_block_size != 128)
+        {
+            LOG_ERROR("[FusedGEMM::execute_q8_1_mixed_qkv] Invalid k_block_size "
+                      << k_block_size << ", must be 32, 64, or 128");
+            return false;
+        }
+
+        // Validate K dimension is divisible by block size
+        if (n_kv % k_block_size != 0)
+        {
+            LOG_ERROR("[FusedGEMM::execute_q8_1_mixed_qkv] n_kv=" << n_kv
+                                                                  << " must be divisible by k_block_size=" << k_block_size);
+            return false;
+        }
+
+        LOG_DEBUG("[FusedGEMM::execute_q8_1_mixed_qkv] Mixed QKV: m=" << m << " n_q=" << n_q
+                                                                      << " n_kv=" << n_kv << " k=" << k << " k_block_size=" << k_block_size);
+
+        // Execute Q projection: Q8_1 → Q8_1
+        bool success_q = gemm_kernels_[0]->multiply_with_precomputed_q8_1_to_q8_1(
+            input_q8_1,
+            output_q,
+            m, n_q, k,
+            bias_q,
+            false, // No accumulation
+            ctx, device_idx);
+
+        if (!success_q)
+        {
+            LOG_ERROR("[FusedGEMM::execute_q8_1_mixed_qkv] Q projection failed");
+            return false;
+        }
+
+        // Execute K projection: Q8_1 → Q16_1 (the key precision fix!)
+        // This uses multiply_with_precomputed_q8_1_to_q16_1 which provides 256× better precision
+        bool success_k = gemm_kernels_[1]->multiply_with_precomputed_q8_1_to_q16_1(
+            input_q8_1,
+            output_k,
+            m, n_kv, k,
+            k_block_size,
+            bias_k,
+            ctx, device_idx);
+
+        if (!success_k)
+        {
+            LOG_ERROR("[FusedGEMM::execute_q8_1_mixed_qkv] K projection failed");
+            return false;
+        }
+
+        // Execute V projection: Q8_1 → Q8_1
+        bool success_v = gemm_kernels_[2]->multiply_with_precomputed_q8_1_to_q8_1(
+            input_q8_1,
+            output_v,
+            m, n_kv, k,
+            bias_v,
+            false, // No accumulation
+            ctx, device_idx);
+
+        if (!success_v)
+        {
+            LOG_ERROR("[FusedGEMM::execute_q8_1_mixed_qkv] V projection failed");
+            return false;
+        }
+
+        LOG_DEBUG("[FusedGEMM::execute_q8_1_mixed_qkv] All projections complete");
+        return true;
+    }
+
 } // namespace llaminar2

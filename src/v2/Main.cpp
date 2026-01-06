@@ -393,14 +393,6 @@ int main(int argc, char *argv[])
     {
         runtime_config.activation_precision = ActivationPrecision::Q8_1;
     }
-    else if (args.activation_precision == "hybrid")
-    {
-        runtime_config.activation_precision = ActivationPrecision::Hybrid;
-    }
-    else if (args.activation_precision == "hybridq16")
-    {
-        runtime_config.activation_precision = ActivationPrecision::HybridQ16;
-    }
     else
     {
         // This branch should never be reached due to ArgParser validation,
@@ -410,7 +402,7 @@ int main(int argc, char *argv[])
             LOG_ERROR("Invalid activation precision mode '" << args.activation_precision
                                                             << "' - this should have been caught by ArgParser");
         }
-        runtime_config.activation_precision = ActivationPrecision::Hybrid; // Use default
+        runtime_config.activation_precision = ActivationPrecision::FP32; // Use default
     }
 
     // Fused attention + Wo kernel
@@ -423,20 +415,11 @@ int main(int argc, char *argv[])
     {
         LOG_INFO("Fused attention+Wo kernel enabled (backend="
                  << fusedAttentionBackendToString(runtime_config.fused_attention_backend) << ")");
-        // Fused attention supports Q8_1, Hybrid, and HybridQ16 modes
-        // Q16_INTEGER backend specifically requires HybridQ16 mode
-        if (runtime_config.activation_precision != ActivationPrecision::Q8_1 &&
-            runtime_config.activation_precision != ActivationPrecision::Hybrid &&
-            runtime_config.activation_precision != ActivationPrecision::HybridQ16)
+        // Fused attention supports Q8_1 mode
+        if (runtime_config.activation_precision != ActivationPrecision::Q8_1)
         {
-            LOG_WARN("Fused attention requires Q8_1, Hybrid, or HybridQ16 activation precision, current: "
+            LOG_WARN("Fused attention requires Q8_1 activation precision, current: "
                      << args.activation_precision << ". Will use unfused path.");
-        }
-        if (runtime_config.fused_attention_backend == FusedAttentionBackend::Q16_INTEGER &&
-            runtime_config.activation_precision != ActivationPrecision::HybridQ16)
-        {
-            LOG_WARN("Q16_INTEGER backend requires HybridQ16 activation precision, current: "
-                     << args.activation_precision << ". May not work correctly.");
         }
     }
 

@@ -28,8 +28,8 @@ namespace llaminar2
             // Precision settings
             {"--activation-precision",
              {"--activation-prec", "--act-prec"},
-             {"fp32", "bf16", "fp16", "q8_1", "hybrid", "hybridq16"},
-             "hybrid",
+             {"fp32", "bf16", "fp16", "q8_1"},
+             "fp32",
              false,
              false},
 

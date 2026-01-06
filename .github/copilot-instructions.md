@@ -301,6 +301,167 @@ mpirun -np 2 valgrind --tool=memcheck --leak-check=full ./build_v2/tests/v2/v2_t
 
 ---
 
+## Stage Dump Framework
+
+### Overview
+
+The Stage Dump framework captures raw input/output tensors from pipeline stages for debugging and replay testing. This is essential for isolating bugs in specific stages without running the full pipeline.
+
+**Key Features**:
+- Dumps inputs, outputs, and weights for any ComputeStage
+- Flexible filtering by stage type, name, layer, iteration, and rank
+- Supports substring matching for stage names
+- Binary format for replay testing + human-readable metadata
+- **Variable Q16_1 block size support**: Correctly handles Q16_1_32, Q16_1_64, Q16_1_128 tensors
+- Zero overhead when disabled
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LLAMINAR_STAGE_DUMP_ENABLED` | Master enable (0/1) | Disabled |
+| `LLAMINAR_STAGE_DUMP_DIR` | Output directory | `/tmp/llaminar_stage_dumps` |
+| `LLAMINAR_STAGE_DUMP_TYPES` | Stage types to dump (e.g., `FUSED_ATTENTION_WO,GEMM`) | `all` |
+| `LLAMINAR_STAGE_DUMP_NAMES` | Stage names to dump (substring match) | `all` |
+| `LLAMINAR_STAGE_DUMP_LAYERS` | Layer indices (e.g., `0,1,2`) | `all` |
+| `LLAMINAR_STAGE_DUMP_ITERATION` | Decode iterations to dump | `all` |
+| `LLAMINAR_STAGE_DUMP_RANK` | MPI rank to dump (-1 for all) | 0 |
+| `LLAMINAR_STAGE_DUMP_MAX` | Max dumps per stage type | 100 |
+| `LLAMINAR_STAGE_DUMP_INPUTS` | Dump input tensors (0/1) | 1 |
+| `LLAMINAR_STAGE_DUMP_OUTPUTS` | Dump output tensors (0/1) | 1 |
+| `LLAMINAR_STAGE_DUMP_WEIGHTS` | Dump weight tensors (0/1) | 1 |
+
+### Substring Matching for Stage Names
+
+The `LLAMINAR_STAGE_DUMP_NAMES` filter uses **substring matching** for flexibility:
+
+```bash
+# Dump all fused attention stages (matches layer0_fused_attn_wo, layer5_fused_attn_wo, etc.)
+LLAMINAR_STAGE_DUMP_NAMES=fused_attn_wo
+
+# Dump all layer 0 stages (matches layer0_attn_norm, layer0_qkv_proj, layer0_fused_attn_wo, etc.)
+LLAMINAR_STAGE_DUMP_NAMES=layer0_
+
+# Dump multiple patterns (attention and FFN norms)
+LLAMINAR_STAGE_DUMP_NAMES=fused_attn_wo,ffn_norm
+```
+
+### Example Usage
+
+```bash
+# Dump fused attention stages for layers 0-2
+LLAMINAR_STAGE_DUMP_ENABLED=1 \
+LLAMINAR_STAGE_DUMP_NAMES=fused_attn_wo \
+LLAMINAR_STAGE_DUMP_LAYERS=0,1,2 \
+./build_v2_integration/tests/v2/v2_integration_hybridq16_vs_fp32_pipeline
+
+# Dump all stages for layer 0 during decode iteration 0
+LLAMINAR_STAGE_DUMP_ENABLED=1 \
+LLAMINAR_STAGE_DUMP_NAMES=layer0_ \
+LLAMINAR_STAGE_DUMP_ITERATION=0 \
+./build_v2_release/llaminar2 -m model.gguf -p "test"
+
+# Dump only attention type stages (by type, not name)
+LLAMINAR_STAGE_DUMP_ENABLED=1 \
+LLAMINAR_STAGE_DUMP_TYPES=FUSED_ATTENTION_WO,ATTENTION \
+./build_v2_release/llaminar2 -m model.gguf -p "test"
+```
+
+### Output Structure
+
+Dumps are written to `LLAMINAR_STAGE_DUMP_DIR` (default: `/tmp/llaminar_stage_dumps/`):
+
+```
+/tmp/llaminar_stage_dumps/
+├── stage_0000_FUSED_ATTENTION_WO_layer0_fused_attn_wo_rank0/
+│   ├── inputs/
+│   │   ├── Q_q16_1_64.bin    # Q tensor in native Q16_1_64 format
+│   │   ├── Q_meta.txt        # Metadata for Q tensor
+│   │   ├── K_q16_1_64.bin    # K tensor in native Q16_1_64 format
+│   │   ├── K_meta.txt        # Metadata for K tensor
+│   │   ├── V_q8_1.bin        # V tensor in native Q8_1 format
+│   │   └── V_meta.txt        # Metadata for V tensor
+│   ├── outputs/
+│   │   ├── context.bin       # FP32 attention output
+│   │   └── context_meta.txt  # Metadata for context tensor
+│   └── weights/              # Stage-specific weight metadata
+│       └── Wo_meta.txt
+├── stage_0001_GEMM_layer0_ffn_down_rank0/
+│   └── ...
+```
+
+**Directory naming convention**: `stage_<counter>_<stage_type>_<stage_name>_rank<N>`
+
+### Metadata File Format
+
+Each tensor dump includes a `<tensor_name>_meta.txt` file with key=value pairs:
+
+```
+name=Q
+rows=126
+cols=64
+dtype=Q16_1_64
+element_count=8064
+byte_size=1904
+# Block format info:
+block_count=126
+blocks_per_row=1
+block_element_size=64
+sample_min=-0.123456
+sample_max=0.789012
+sample_mean=0.001234
+```
+
+**Metadata Fields**:
+| Field | Description |
+|-------|-------------|
+| `name` | Tensor name (e.g., "Q", "K", "V", "context") |
+| `rows` | Number of logical rows |
+| `cols` | Number of logical columns |
+| `dtype` | Data type: `FP32`, `Q8_1`, `Q16_1_32`, `Q16_1_64`, `Q16_1_128`, `IQ4_NL`, etc. |
+| `element_count` | Total logical elements (rows × cols) |
+| `byte_size` | Actual binary file size in bytes |
+| `block_count` | Total quantization blocks (for block formats) |
+| `blocks_per_row` | Blocks per row (for block formats) |
+| `block_element_size` | Elements per block: 32, 64, or 128 |
+| `sample_min/max/mean` | Sample statistics from dequantized data |
+
+**Q16_1 Variable Block Size Support**:
+
+The stage dump framework correctly handles Q16_1 tensors with different block sizes:
+
+| dtype | Block Size | Bytes/Block | Use Case |
+|-------|-----------|-------------|----------|
+| `Q16_1_32` | 32 elements | 72 bytes | Legacy GEMM |
+| `Q16_1_64` | 64 elements | 136 bytes | Attention (head_dim=64, Qwen2.5) |
+| `Q16_1_128` | 128 elements | 264 bytes | Attention (head_dim=128, Llama-3) |
+
+### Replay Testing
+
+Use captured dumps to create isolated replay tests:
+
+```cpp
+#include "utils/TensorDumpLoader.h"
+
+// Load dumped tensor with metadata
+auto [data, meta] = loadTensorDequantizedFP32(
+    "/tmp/llaminar_stage_dumps/stage_0000_FUSED_ATTENTION_WO_layer0_fused_attn_wo_rank0",
+    "Q",       // tensor name
+    "inputs"); // subdir
+
+// Access metadata
+LOG_INFO("Loaded " << meta.dtype << " tensor: " 
+         << meta.rows << "x" << meta.cols 
+         << " (" << meta.byte_size << " bytes)");
+
+// For Q16_1 native blocks:
+auto [blocks, meta] = loadTensorAsQ16_1(dump_dir, "Q", "inputs");
+```
+
+See `tests/v2/integration/replay/Test__HybridQ16AttentionReplay.cpp` for a complete example.
+
+---
+
 ## Snapshot Framework and E2E Testing
 
 ### Overview
@@ -957,7 +1118,13 @@ TEST(Test__MyNewKernel, BasicFunctionality) {
 | `LLAMINAR_FAIL_ON_ZERO` | Fail on zero tensors during validation | Disabled |
 | `LLAMINAR_FAIL_ON_NAN` | Fail on NaN/Inf during validation | Auto-ON in Debug/Integration |
 | `LLAMINAR_DUMP_ON_FAILURE` | Dump stage buffers to disk when verification fails | Enabled |
-| `LLAMINAR_STAGE_DUMP` | Dump per-stage tensor outputs | Disabled |
+| `LLAMINAR_STAGE_DUMP_ENABLED` | Master enable for stage dumping (0/1) | Disabled |
+| `LLAMINAR_STAGE_DUMP_DIR` | Output directory for stage dumps | `/tmp/llaminar_stage_dumps` |
+| `LLAMINAR_STAGE_DUMP_TYPES` | Stage types to dump (e.g., `FUSED_ATTENTION_WO,GEMM`) | `all` |
+| `LLAMINAR_STAGE_DUMP_NAMES` | Stage names to dump (substring match) | `all` |
+| `LLAMINAR_STAGE_DUMP_LAYERS` | Comma-separated layer indices to dump | `all` |
+| `LLAMINAR_STAGE_DUMP_ITERATION` | Decode iterations to dump | `all` |
+| `LLAMINAR_STAGE_DUMP_RANK` | MPI rank to dump (-1 for all) | 0 |
 | `LLAMINAR_DETERMINISTIC` | Force deterministic execution | Disabled |
 | `LLAMINAR_SNAPSHOT_TENSOR_DUMP` | Enable raw tensor dump to disk | Disabled |
 | `LLAMINAR_SNAPSHOT_DUMP_DIR` | Output directory for tensor dumps | `/tmp/llaminar_tensor_dumps` |

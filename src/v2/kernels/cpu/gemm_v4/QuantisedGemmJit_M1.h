@@ -179,14 +179,16 @@ namespace llaminar2
          *
          * Controls how the GEMM result is written to memory. FP32 is the default
          * for compatibility. Q8_1 enables fused requantization for bandwidth savings
-         * in the Q8_1 activation pipeline.
+         * in the Q8_1 activation pipeline. Q16_1 provides 256× more precision than
+         * Q8_1 for high-dynamic-range outputs like K projections.
          */
         enum class GemmOutputFormat : uint8_t
         {
             FP32 = 0, ///< Output as FP32 (default, 4 bytes per value)
             Q8_1 = 1, ///< Output as Q8_1 blocks (fused requantization, ~1.125 bytes per value)
             BF16 = 2, ///< Output as BF16 (future, 2 bytes per value)
-            FP16 = 3  ///< Output as FP16 (future, 2 bytes per value)
+            FP16 = 3, ///< Output as FP16 (future, 2 bytes per value)
+            Q16_1 = 4 ///< Output as Q16_1 blocks (high-precision quantization, ~2.25 bytes per value)
         };
 
         /**
@@ -201,26 +203,32 @@ namespace llaminar2
          *
          * ## Memory Offsets (used in generated assembly)
          *
-         * | Field         | Offset | Size  | Description |
-         * |---------------|--------|-------|-------------|
-         * | A             |   0    | 8     | Pointer to Q8_1 quantized activations |
-         * | B_packed      |   8    | 8     | Pointer to packed INT8 weights |
-         * | comp          |  16    | 8     | Pointer to compensation data (unused in M1) |
-         * | scales        |  24    | 8     | Pointer to weight scales [K/32][N] |
-         * | mins          |  32    | 8     | Pointer to asymmetric mins [N] or nullptr |
-         * | C             |  40    | 8     | Pointer to output matrix (FP32) |
-         * | K_blocks      |  48    | 4     | Number of K blocks (K/32) |
-         * | N             |  52    | 4     | Output dimension N |
-         * | ldc           |  56    | 4     | Leading dimension of C (stride between rows) |
-         * | padding       |  60    | 4     | Alignment padding |
-         * | bias          |  64    | 8     | Pointer to bias vector [N] or nullptr |
-         * | mask          |  72    | 8     | Pointer to attention mask [M×N] or nullptr |
-         * | local_max     |  80    | 8     | Pointer to store softmax local max |
-         * | local_sum     |  88    | 8     | Pointer to store softmax local sum |
-         * | do_softmax    |  96    | 1     | Flag to enable softmax computation |
-         * | A_stride      | 100    | 4     | Stride between A rows (for M>1) |
-         * | gate_input    | 104    | 8     | Pointer to gate tensor for SwiGLU |
-         * | do_swiglu     | 112    | 1     | Flag to enable SwiGLU activation |
+         * | Field           | Offset | Size  | Description |
+         * |-----------------|--------|-------|-------------|
+         * | A               |   0    | 8     | Pointer to Q8_1 quantized activations |
+         * | B_packed        |   8    | 8     | Pointer to packed INT8 weights |
+         * | comp            |  16    | 8     | Pointer to compensation data (unused in M1) |
+         * | scales          |  24    | 8     | Pointer to weight scales [K/32][N] |
+         * | mins            |  32    | 8     | Pointer to asymmetric mins [N] or nullptr |
+         * | C               |  40    | 8     | Pointer to output matrix (FP32) |
+         * | K_blocks        |  48    | 4     | Number of K blocks (K/32) |
+         * | N               |  52    | 4     | Output dimension N |
+         * | ldc             |  56    | 4     | Leading dimension of C (stride between rows) |
+         * | padding         |  60    | 4     | Alignment padding |
+         * | bias            |  64    | 8     | Pointer to bias vector [N] or nullptr |
+         * | mask            |  72    | 8     | Pointer to attention mask [M×N] or nullptr |
+         * | local_max       |  80    | 8     | Pointer to store softmax local max |
+         * | local_sum       |  88    | 8     | Pointer to store softmax local sum |
+         * | do_softmax      |  96    | 1     | Flag to enable softmax computation |
+         * | A_stride        | 100    | 4     | Stride between A rows (for M>1) |
+         * | gate_input      | 104    | 8     | Pointer to gate tensor for SwiGLU |
+         * | do_swiglu       | 112    | 1     | Flag to enable SwiGLU activation |
+         * | output_format   | 113    | 1     | Output format (FP32=0, Q8_1=1, Q16_1=4) |
+         * | C_q8_1          | 120    | 8     | Pointer to Q8_1 output buffer |
+         * | C_q8_1_stride   | 128    | 4     | Stride between Q8_1 output rows (bytes) |
+         * | C_q16_1         | 136    | 8     | Pointer to Q16_1 output buffer |
+         * | C_q16_1_stride  | 144    | 4     | Stride between Q16_1 output rows (bytes) |
+         * | q16_block_size  | 148    | 4     | Q16_1 block size (32, 64, or 128) |
          */
         struct QuantisedGemmParams
         {
@@ -308,6 +316,11 @@ namespace llaminar2
              * When set to Q8_1, the kernel performs fused requantization and writes
              * Q8_1 blocks to C_q8_1 instead of FP32 to C. This eliminates a separate
              * quantization pass for the Q8_1 activation pipeline.
+             *
+             * When set to Q16_1, the kernel outputs Q16_1 blocks for high-precision
+             * quantization (256× more precision than Q8_1). This is critical for
+             * K projections in HybridQ16 mode where high dynamic range would cause
+             * Q8_1 to lose small values.
              */
             GemmOutputFormat output_format = GemmOutputFormat::FP32;
 
@@ -327,6 +340,48 @@ namespace llaminar2
              * Typically: (N / 32) * sizeof(Q8_1Block) = (N / 32) * 36.
              */
             int C_q8_1_stride = 0;
+
+            // ================================================================
+            // Q16_1 Output Parameters (for high-precision quantization)
+            // ================================================================
+
+            /**
+             * @brief Pointer to Q16_1 output buffer [M, N/block_size blocks].
+             *
+             * Used when output_format == Q16_1. Block size is configurable via
+             * q16_block_size (32, 64, or 128 elements). This enables 1-block-per-head
+             * attention computation when block_size matches head_dim.
+             *
+             * Block structure (Q16_1Block_64 example, 136 bytes):
+             *   - float d: FP32 scale factor (4 bytes)
+             *   - int32_t sum_qs: Pre-computed sum of qs values (4 bytes)
+             *   - int16_t qs[64]: 64 quantized INT16 values (128 bytes)
+             */
+            void *C_q16_1 = nullptr;
+
+            /**
+             * @brief Stride between output rows in bytes (for Q16_1 output).
+             *
+             * Specifies the byte offset from one output row to the next in C_q16_1.
+             * Depends on block size:
+             *   - 32-elem blocks: (N / 32) * 72 bytes
+             *   - 64-elem blocks: (N / 64) * 136 bytes
+             *   - 128-elem blocks: (N / 128) * 264 bytes
+             */
+            int C_q16_1_stride = 0;
+
+            /**
+             * @brief Q16_1 block size (elements per block: 32, 64, or 128).
+             *
+             * Should match model head_dim for optimal attention performance:
+             *   - 64: Qwen2.5-0.5B, GPT-2 (1 block per head)
+             *   - 128: Qwen3, Llama-3, Mistral (1 block per head)
+             *   - 32: Legacy, GEMM compatibility
+             *
+             * The JIT kernel writes output as head_dim-sized blocks, enabling
+             * 1-block-per-head integer attention without per-block scale tracking.
+             */
+            int q16_block_size = 64;
         };
 
         /**
@@ -680,14 +735,19 @@ namespace llaminar2
                     // For beta=1 semantics: C = alpha*A*B + beta*C
                     // Load existing C values as initial accumulator values
                     //
-                    // IMPORTANT: When output_format is Q8_1, C pointer is nullptr.
+                    // IMPORTANT: When output_format is Q8_1 or Q16_1, C pointer is nullptr.
                     // In that case, we zero-initialize the accumulators instead.
                     mov(rax, ptr[rsp + 8]); // Reload params (reg_tmp=rax was clobbered)
                     cmp(byte[rax + 113], static_cast<uint8_t>(GemmOutputFormat::Q8_1));
+                    Label zero_accumulators;
+                    je(zero_accumulators, T_NEAR);
+                    cmp(byte[rax + 113], static_cast<uint8_t>(GemmOutputFormat::Q16_1));
                     Label load_c_values;
-                    jne(load_c_values, T_NEAR); // If not Q8_1, load from C
+                    jne(load_c_values, T_NEAR); // If not Q8_1 or Q16_1, load from C
+
+                    L(zero_accumulators);
                     {
-                        // Q8_1 output: Zero-initialize accumulators
+                        // Quantized output: Zero-initialize accumulators
                         vxorps(zmm_c0, zmm_c0, zmm_c0);
                         vxorps(zmm_c1, zmm_c1, zmm_c1);
                         vxorps(zmm_c2, zmm_c2, zmm_c2);
@@ -1282,12 +1342,12 @@ namespace llaminar2
                     L(skip_swiglu);
 
                     // ==================== STORE OUTPUT ====================
-                    // Check output format: FP32 (default) or Q8_1 (fused requantization)
+                    // Check output format: FP32 (default), Q8_1, or Q16_1
                     mov(rax, ptr[rsp + 8]); // Reload params pointer
                     // output_format is at offset 113 (after do_swiglu at 112)
                     cmp(byte[rax + 113], static_cast<uint8_t>(GemmOutputFormat::Q8_1));
-                    Label store_fp32;
-                    jne(store_fp32, T_NEAR); // If not Q8_1, use FP32 store
+                    Label store_fp32, check_q16_1;
+                    jne(check_q16_1, T_NEAR); // If not Q8_1, check Q16_1
                     {
                         // ==================== Q8_1 REQUANTIZATION STORE ====================
                         // Convert 64 FP32 values (zmm_c0..zmm_c3) to 2 Q8_1 blocks
@@ -1428,8 +1488,157 @@ namespace llaminar2
 
                         vmovdqu32(ptr[rdx + 36 + 4], ymm20);
 
-                        jmp("after_store");
+                        jmp("after_store", T_NEAR);
                     }
+
+                    // ==================== Q16_1 OUTPUT CHECK ====================
+                    L(check_q16_1);
+                    mov(rax, ptr[rsp + 8]); // Reload params pointer
+                    cmp(byte[rax + 113], static_cast<uint8_t>(GemmOutputFormat::Q16_1));
+                    jne(store_fp32, T_NEAR); // If not Q16_1, use FP32 store
+                    {
+                        // ==================== Q16_1 REQUANTIZATION STORE ====================
+                        // Convert 64 FP32 values (zmm_c0..zmm_c3) to Q16_1 block(s)
+                        // Q16_1 Block structure:
+                        //   - float d: FP32 scale (4 bytes)
+                        //   - int32_t sum_qs: Sum of quantized values (4 bytes)
+                        //   - int16_t qs[block_size]: Quantized values (2 * block_size bytes)
+                        //
+                        // Block sizes: 32 (72 bytes), 64 (136 bytes), or 128 (264 bytes)
+                        // The kernel always processes 64 columns, so:
+                        //   - block_size=32: Write 2 Q16_1Block (32 values each)
+                        //   - block_size=64: Write 1 Q16_1Block_64 (64 values)
+                        //   - block_size=128: Accumulate first 64 of 128-value block (partial)
+                        //
+                        // For HybridQ16 K projection, block_size=64 (head_dim) is typical.
+
+                        // Load Q16_1 output pointer and block size
+                        // Note: We need to be careful about register usage here
+                        // rdx/edx is used by div, so we save the pointer elsewhere first
+                        mov(r11, ptr[rax + 136]); // C_q16_1 pointer - save in r11
+                        mov(ecx, ptr[rax + 148]); // q16_block_size (offset 148)
+
+                        // Compute output address: C_q16_1 + (loop_N / block_size) * block_bytes
+                        // For block_size=64, block_bytes = 136
+                        // We need to handle different block sizes at runtime
+
+                        // Calculate block byte size based on q16_block_size
+                        // block_bytes = 8 + 2 * block_size (d=4, sum_qs=4, qs[n]*2)
+                        mov(r8d, ecx); // r8 = block_size
+                        shl(r8d, 1);   // r8 = block_size * 2 (bytes for qs)
+                        add(r8d, 8);   // r8 = block_bytes = 8 + 2*block_size
+                        mov(r9d, r8d); // Save block_bytes in r9
+
+                        // Calculate block index = loop_N / block_size
+                        mov(eax, reg_loop_N.cvt32()); // eax = loop_N (32-bit) for division
+                        xor_(edx, edx);               // Clear edx for division (edx:eax / ecx)
+                        div(ecx);                     // eax = loop_N / block_size (quotient)
+                        // Note: eax now contains block_index
+
+                        // Calculate offset = block_index * block_bytes
+                        imul(eax, r9d); // eax = block_index * block_bytes
+                        mov(rdx, r11);  // rdx = C_q16_1 pointer (restored from r11)
+                        add(rdx, rax);  // rdx = output pointer for this block (zero-extend eax to rax)
+
+                        // For block_size=64: Write all 64 values as one Q16_1Block_64
+                        // For block_size=32: Write as two Q16_1Block (handled in multiply method)
+                        // For now, implement block_size=64 path (most common for HybridQ16)
+
+                        // ============ QUANTIZE 64 FP32 VALUES TO Q16_1 ============
+                        // Step 1: Find max absolute value across all 64 floats
+                        vrangeps(zmm16, zmm_c0, zmm_c0, 0x0B); // abs(c0)
+                        vrangeps(zmm17, zmm_c1, zmm_c1, 0x0B); // abs(c1)
+                        vrangeps(zmm18, zmm_c2, zmm_c2, 0x0B); // abs(c2)
+                        vrangeps(zmm19, zmm_c3, zmm_c3, 0x0B); // abs(c3)
+                        vmaxps(zmm16, zmm16, zmm17);
+                        vmaxps(zmm18, zmm18, zmm19);
+                        vmaxps(zmm16, zmm16, zmm18);
+
+                        // Horizontal max reduction to get single max_abs value
+                        vextractf32x8(ymm17, zmm16, 1);
+                        vmaxps(ymm16, ymm16, ymm17);
+                        vextractf32x4(xmm17, ymm16, 1);
+                        vmaxps(xmm16, xmm16, xmm17);
+                        vshufps(xmm17, xmm16, xmm16, 0x4E);
+                        vmaxps(xmm16, xmm16, xmm17);
+                        vshufps(xmm17, xmm16, xmm16, 0xB1);
+                        vmaxps(xmm16, xmm16, xmm17);
+                        // xmm16[0] = max_abs
+
+                        // Copy to low register for VEX operations
+                        vmovaps(xmm4, xmm16); // xmm4 = max_abs
+
+                        // Step 2: Compute scale: d = max_abs / 16383.0 (INT16 range)
+                        // Using 16383 instead of 32767 for headroom
+                        mov(eax, 0x467FFE00); // 16383.0f in IEEE754
+                        vmovd(xmm5, eax);
+                        vdivss(xmm6, xmm4, xmm5); // xmm6 = d = max_abs / 16383
+
+                        // Store scale as FP32 (4 bytes at offset 0)
+                        vmovss(ptr[rdx + 0], xmm6);
+
+                        // Step 3: Compute inverse scale for quantization
+                        vrcpss(xmm8, xmm6, xmm6);  // xmm8 = inv_d ≈ 1/d
+                        vbroadcastss(zmm24, xmm8); // Broadcast to zmm24
+
+                        // Step 4: Quantize: qs[i] = round(val[i] * inv_d)
+                        vmulps(zmm20, zmm_c0, zmm24);
+                        vmulps(zmm21, zmm_c1, zmm24);
+                        vmulps(zmm22, zmm_c2, zmm24);
+                        vmulps(zmm23, zmm_c3, zmm24);
+
+                        // Round to nearest and convert to int32
+                        vcvtps2dq(zmm20, zmm20);
+                        vcvtps2dq(zmm21, zmm21);
+                        vcvtps2dq(zmm22, zmm22);
+                        vcvtps2dq(zmm23, zmm23);
+
+                        // Step 5: Pack int32 to int16 with saturation (vpmovsdw)
+                        // Each zmm has 16 int32 values -> 16 int16 values
+                        vpmovsdw(ymm20, zmm20); // 16 int32 -> 16 int16
+                        vpmovsdw(ymm21, zmm21);
+                        vpmovsdw(ymm22, zmm22);
+                        vpmovsdw(ymm23, zmm23);
+
+                        // Combine into zmm registers for 64 int16 total
+                        vinserti64x4(zmm20, zmm20, ymm21, 1); // zmm20 = 32 int16 (c0+c1)
+                        vinserti64x4(zmm22, zmm22, ymm23, 1); // zmm22 = 32 int16 (c2+c3)
+
+                        // Step 6: Compute sum_qs (sum of all 64 int16 values)
+                        // Sign-extend to int32 and sum
+                        vpmovsxwd(zmm16, ymm20); // First 16 int16 -> 16 int32
+                        vextracti64x4(ymm17, zmm20, 1);
+                        vpmovsxwd(zmm17, ymm17); // Next 16 int16 -> 16 int32
+                        vpaddd(zmm16, zmm16, zmm17);
+
+                        vpmovsxwd(zmm18, ymm22); // First 16 int16 of c2+c3
+                        vextracti64x4(ymm19, zmm22, 1);
+                        vpmovsxwd(zmm19, ymm19); // Next 16 int16
+                        vpaddd(zmm18, zmm18, zmm19);
+
+                        vpaddd(zmm16, zmm16, zmm18); // Sum all 64 values
+
+                        // Horizontal sum for sum_qs
+                        vextracti32x8(ymm17, zmm16, 1);
+                        vpaddd(ymm16, ymm16, ymm17);
+                        vextracti32x4(xmm17, ymm16, 1);
+                        vpaddd(xmm16, xmm16, xmm17);
+                        vpshufd(xmm17, xmm16, 0x4E);
+                        vpaddd(xmm16, xmm16, xmm17);
+                        vpshufd(xmm17, xmm16, 0xB1);
+                        vpaddd(xmm16, xmm16, xmm17);
+                        // xmm16[0] = sum_qs (int32)
+
+                        // Store sum_qs as INT32 (4 bytes at offset 4)
+                        vmovd(ptr[rdx + 4], xmm16);
+
+                        // Step 7: Store quantized int16 values (64 * 2 = 128 bytes at offset 8)
+                        vmovdqu32(ptr[rdx + 8], zmm20);      // 32 int16 values (64 bytes)
+                        vmovdqu32(ptr[rdx + 8 + 64], zmm22); // Next 32 int16 values
+
+                        jmp("after_store", T_NEAR);
+                    }
+
                     L(store_fp32);
                     // ==================== FP32 STORE (default) ====================
                     // Write final C values back to memory as FP32

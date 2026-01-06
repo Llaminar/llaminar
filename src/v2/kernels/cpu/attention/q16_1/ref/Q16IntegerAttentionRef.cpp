@@ -243,9 +243,24 @@ namespace llaminar2::kernels::q16_1
             float qk_scale = params.get_qk_scale(h, kv_h);
             float pv_scale = params.get_pv_scale(kv_h);
 
-            // Initialize online softmax state with adaptive alpha for small qk_scale values
+            // Initialize online softmax state
+            // Choose mode based on whether per-position K scales are available
             microkernels::OnlineSoftmaxState state;
-            state.init(qk_scale, 11, 30); // frac_bits=11, lut_value_bits=30
+            bool use_per_position_k = params.has_per_position_k_scales();
+
+            if (use_per_position_k)
+            {
+                // Option C: Pass per-position K scales to softmax
+                // base_alpha = q_scale / sqrt(head_dim) * log2(e)
+                float q_scale = params.get_q_scale(h);
+                state.init_per_position(q_scale, head_dim, 11, 30); // frac_bits=11, lut_value_bits=30
+                LOG_DEBUG("FlashDecode head " << h << ": using per-position K scales (Option C)");
+            }
+            else
+            {
+                // Standard mode: uniform qk_scale
+                state.init(qk_scale, 11, 30); // frac_bits=11, lut_value_bits=30
+            }
 
             // Zero context
             std::memset(context.data(), 0, head_dim * sizeof(int32_t));
@@ -258,25 +273,66 @@ namespace llaminar2::kernels::q16_1
             {
             case Q16BlockSize::BLOCK_64:
             {
-                auto Q = reinterpret_cast<const Q16_1Block_64 *>(params.Q);
-                auto K = reinterpret_cast<const Q16_1Block_64 *>(params.K);
-                auto V = reinterpret_cast<const Q16_1Block_64 *>(params.V);
+                // Type-safe access via Q16BlockPtr accessors
+                const Q16_1Block_64 *Q_blocks = params.Q.as_block_64();
+                const Q16_1Block_64 *K_blocks = params.K.as_block_64();
+                const Q16_1Block_64 *V_blocks = params.V.as_block_64();
 
-                const Q16_1Block_64 *Q_head = Q + h * blocks_per_row;
-                const Q16_1Block_64 *K_head = K + kv_h * kv_len * blocks_per_row;
-                const Q16_1Block_64 *V_head = V + kv_h * kv_len * blocks_per_row;
+                if (!Q_blocks || !K_blocks || !V_blocks)
+                {
+                    LOG_ERROR("BLOCK_64 specified but Q/K/V pointers are wrong type!");
+                    return false;
+                }
+
+                const Q16_1Block_64 *Q_head = Q_blocks + h * blocks_per_row;
+                const int kv_stride = params.effective_kv_head_stride();
+                const Q16_1Block_64 *K_head = K_blocks + kv_h * kv_stride * blocks_per_row;
+                const Q16_1Block_64 *V_head = V_blocks + kv_h * kv_stride * blocks_per_row;
 
                 // Process in blocks
                 for (int kv_start = 0; kv_start < kv_len; kv_start += KV_BLOCK_SIZE)
                 {
                     int block_size = std::min(KV_BLOCK_SIZE, kv_len - kv_start);
 
-                    microkernels::flash_decode_process_kv_block<Q16_1Block_64>(
-                        Q_head, K_head, V_head,
-                        context.data(), state,
-                        scores_scratch.data(), weights_scratch.data(),
-                        kv_start, block_size,
-                        head_dim, blocks_per_row, qk_scale);
+                    if (use_per_position_k)
+                    {
+                        // Option C: Use per-position K scales
+                        // Extract K scale for each position in this block
+                        std::vector<float> k_scales_block(block_size);
+                        for (int i = 0; i < block_size; ++i)
+                        {
+                            if (params.read_k_scales_from_blocks)
+                            {
+                                // CORRECT: Read K scale directly from K cache block .d field
+                                // This avoids cross-layer contamination since KV cache is per-layer.
+                                // K_head[kv_pos * blocks_per_row] is the first block at that position.
+                                const Q16_1Block_64 *K_at_pos = K_head + (kv_start + i) * blocks_per_row;
+                                k_scales_block[i] = K_at_pos[0].d;
+                            }
+                            else
+                            {
+                                // Legacy: Read from k_position_scales buffer (cross-layer contamination risk)
+                                k_scales_block[i] = params.get_k_scale(kv_start + i, kv_h);
+                            }
+                        }
+
+                        microkernels::flash_decode_process_kv_block_with_k_scales<Q16_1Block_64>(
+                            Q_head, K_head, V_head,
+                            context.data(), state,
+                            scores_scratch.data(), weights_scratch.data(),
+                            kv_start, block_size,
+                            head_dim, blocks_per_row, k_scales_block.data());
+                    }
+                    else
+                    {
+                        // Standard mode: uniform qk_scale
+                        microkernels::flash_decode_process_kv_block<Q16_1Block_64>(
+                            Q_head, K_head, V_head,
+                            context.data(), state,
+                            scores_scratch.data(), weights_scratch.data(),
+                            kv_start, block_size,
+                            head_dim, blocks_per_row, qk_scale);
+                    }
 
                     // Capture raw scores (before softmax) for snapshot
                     // We'll recompute weights at the end using final max
@@ -292,24 +348,63 @@ namespace llaminar2::kernels::q16_1
             }
             case Q16BlockSize::BLOCK_128:
             {
-                auto Q = reinterpret_cast<const Q16_1Block_128 *>(params.Q);
-                auto K = reinterpret_cast<const Q16_1Block_128 *>(params.K);
-                auto V = reinterpret_cast<const Q16_1Block_128 *>(params.V);
+                // Type-safe access via Q16BlockPtr accessors
+                const Q16_1Block_128 *Q_blocks = params.Q.as_block_128();
+                const Q16_1Block_128 *K_blocks = params.K.as_block_128();
+                const Q16_1Block_128 *V_blocks = params.V.as_block_128();
 
-                const Q16_1Block_128 *Q_head = Q + h * blocks_per_row;
-                const Q16_1Block_128 *K_head = K + kv_h * kv_len * blocks_per_row;
-                const Q16_1Block_128 *V_head = V + kv_h * kv_len * blocks_per_row;
+                if (!Q_blocks || !K_blocks || !V_blocks)
+                {
+                    LOG_ERROR("BLOCK_128 specified but Q/K/V pointers are wrong type!");
+                    return false;
+                }
+
+                const Q16_1Block_128 *Q_head = Q_blocks + h * blocks_per_row;
+                const int kv_stride = params.effective_kv_head_stride();
+                const Q16_1Block_128 *K_head = K_blocks + kv_h * kv_stride * blocks_per_row;
+                const Q16_1Block_128 *V_head = V_blocks + kv_h * kv_stride * blocks_per_row;
 
                 for (int kv_start = 0; kv_start < kv_len; kv_start += KV_BLOCK_SIZE)
                 {
                     int block_size = std::min(KV_BLOCK_SIZE, kv_len - kv_start);
 
-                    microkernels::flash_decode_process_kv_block<Q16_1Block_128>(
-                        Q_head, K_head, V_head,
-                        context.data(), state,
-                        scores_scratch.data(), weights_scratch.data(),
-                        kv_start, block_size,
-                        head_dim, blocks_per_row, qk_scale);
+                    if (use_per_position_k)
+                    {
+                        // Option C: Use per-position K scales
+                        // Extract K scale for each position in this block
+                        std::vector<float> k_scales_block(block_size);
+                        for (int i = 0; i < block_size; ++i)
+                        {
+                            if (params.read_k_scales_from_blocks)
+                            {
+                                // CORRECT: Read K scale directly from K cache block .d field
+                                const Q16_1Block_128 *K_at_pos = K_head + (kv_start + i) * blocks_per_row;
+                                k_scales_block[i] = K_at_pos[0].d;
+                            }
+                            else
+                            {
+                                // Legacy: Read from k_position_scales buffer
+                                k_scales_block[i] = params.get_k_scale(kv_start + i, kv_h);
+                            }
+                        }
+
+                        microkernels::flash_decode_process_kv_block_with_k_scales<Q16_1Block_128>(
+                            Q_head, K_head, V_head,
+                            context.data(), state,
+                            scores_scratch.data(), weights_scratch.data(),
+                            kv_start, block_size,
+                            head_dim, blocks_per_row, k_scales_block.data());
+                    }
+                    else
+                    {
+                        // Standard mode: uniform qk_scale
+                        microkernels::flash_decode_process_kv_block<Q16_1Block_128>(
+                            Q_head, K_head, V_head,
+                            context.data(), state,
+                            scores_scratch.data(), weights_scratch.data(),
+                            kv_start, block_size,
+                            head_dim, blocks_per_row, qk_scale);
+                    }
 
                     // Capture raw scores for snapshot
                     if (params.snapshot_weights || params.snapshot_scores)
@@ -487,7 +582,7 @@ namespace llaminar2::kernels::q16_1
                 full_context_int32.data(),
                 avg_pv_scale,
                 params.Wo_packed,
-                params.output,
+                params.output.data, // Get raw void* from Q16BlockMutablePtr
                 d_model,
                 d_model,                    // input_dim = d_model for Qwen2 (n_heads * head_dim)
                 Q16BlockSize::BLOCK_32,     // Force 32-element output for residual compatibility
@@ -503,13 +598,17 @@ namespace llaminar2::kernels::q16_1
 
         if (params.residual_in && params.residual_out && params.output)
         {
-            // The output from Wo projection and residual_in are both Q16_1 format
+            // The output from Wo projection and residual_in are both Q16_1Block format (32-element)
             // Use the SIMD residual add helper
-            const auto *wo_output = reinterpret_cast<const Q16_1Block *>(params.output);
-            const auto *residual_in = reinterpret_cast<const Q16_1Block *>(params.residual_in);
-            auto *residual_out = reinterpret_cast<Q16_1Block *>(params.residual_out);
+            // Note: residual_in and residual_out are already typed as Q16_1Block* in params
+            const auto *wo_output = params.output.as_block_32();
+            if (!wo_output)
+            {
+                LOG_ERROR("Wo output block size mismatch - expected BLOCK_32 for residual add!");
+                return false;
+            }
 
-            simd::q16_1_add_q16_1(wo_output, residual_in, residual_out, d_model);
+            simd::q16_1_add_q16_1(wo_output, params.residual_in, params.residual_out, d_model);
 
             // Snapshot: residual output (if requested)
             if (params.snapshot_residual_out)
@@ -517,11 +616,11 @@ namespace llaminar2::kernels::q16_1
                 const int num_blocks = (d_model + 31) / 32;
                 for (int b = 0; b < num_blocks; ++b)
                 {
-                    float scale = residual_out[b].d;
+                    float scale = params.residual_out[b].d;
                     for (int i = 0; i < 32 && (b * 32 + i) < d_model; ++i)
                     {
                         params.snapshot_residual_out[b * 32 + i] =
-                            residual_out[b].qs[i] * scale;
+                            params.residual_out[b].qs[i] * scale;
                     }
                 }
             }
@@ -601,6 +700,17 @@ namespace llaminar2::kernels::q16_1
             all_scores_raw.resize(seq_len_q * kv_len, MASKED_SCORE);
         }
 
+        // Check if we should use per-position K scales
+        const bool use_per_position_k = params.has_per_position_k_scales();
+        LOG_DEBUG("FA2 Prefill: checking per-position K scales:"
+                  << " k_position_scales=" << (params.k_position_scales ? "non-null" : "null")
+                  << " read_k_scales_from_blocks=" << params.read_k_scales_from_blocks
+                  << " result=" << (use_per_position_k ? "true" : "false"));
+        if (use_per_position_k)
+        {
+            LOG_DEBUG("FA2 Prefill: using per-position K scales");
+        }
+
         // Process each head
         for (int h = 0; h < num_heads; ++h)
         {
@@ -615,9 +725,17 @@ namespace llaminar2::kernels::q16_1
             {
                 int Br = std::min(TILE_BR, seq_len_q - q_tile_start);
 
-                // Initialize batch softmax state for this Q tile with adaptive alpha
+                // Initialize batch softmax state for this Q tile
                 microkernels::OnlineSoftmaxStateBatch state;
-                state.init(Br, qk_scale); // Use overload with alpha for adaptive scaling
+                if (use_per_position_k)
+                {
+                    float q_scale = params.get_q_scale(h);
+                    state.init_per_position(Br, q_scale, head_dim, 11, 30);
+                }
+                else
+                {
+                    state.init(Br, qk_scale); // Use uniform qk_scale
+                }
 
                 // Zero context tile
                 std::memset(context_tile.data(), 0, TILE_BR * head_dim * sizeof(int32_t));
@@ -630,35 +748,90 @@ namespace llaminar2::kernels::q16_1
                 {
                 case Q16BlockSize::BLOCK_64:
                 {
-                    auto Q = reinterpret_cast<const Q16_1Block_64 *>(params.Q);
-                    auto K = reinterpret_cast<const Q16_1Block_64 *>(params.K);
-                    auto V = reinterpret_cast<const Q16_1Block_64 *>(params.V);
+                    // Type-safe access via Q16BlockPtr accessors
+                    const Q16_1Block_64 *Q_blocks = params.Q.as_block_64();
+                    const Q16_1Block_64 *K_blocks = params.K.as_block_64();
+                    const Q16_1Block_64 *V_blocks = params.V.as_block_64();
+
+                    if (!Q_blocks || !K_blocks || !V_blocks)
+                    {
+                        LOG_ERROR("BLOCK_64 specified but Q/K/V pointers are wrong type!");
+                        return false;
+                    }
 
                     // Q pointer for this head and Q tile
-                    const Q16_1Block_64 *Q_tile = Q + h * seq_len_q * blocks_per_row +
+                    const Q16_1Block_64 *Q_tile = Q_blocks + h * seq_len_q * blocks_per_row +
                                                   q_tile_start * blocks_per_row;
 
-                    // K/V pointers for this KV head
-                    const Q16_1Block_64 *K_head = K + kv_h * kv_len * blocks_per_row;
-                    const Q16_1Block_64 *V_head = V + kv_h * kv_len * blocks_per_row;
+                    // K/V pointers for this KV head (use stride for sparse HEAD_MAJOR cache)
+                    const int kv_stride = params.effective_kv_head_stride();
+                    const Q16_1Block_64 *K_head = K_blocks + kv_h * kv_stride * blocks_per_row;
+                    const Q16_1Block_64 *V_head = V_blocks + kv_h * kv_stride * blocks_per_row;
 
                     // Process KV in tiles
                     for (int kv_tile_start = 0; kv_tile_start < kv_len; kv_tile_start += TILE_BC)
                     {
                         int Bc = std::min(TILE_BC, kv_len - kv_tile_start);
 
-                        microkernels::fa2_prefill_process_kv_tile<Q16_1Block_64>(
-                            Q_tile, K_head, V_head,
-                            context_tile.data(), state,
-                            scores_scratch.data(), weights_scratch.data(),
-                            kv_tile_start, Br, Bc,
-                            head_dim, blocks_per_row,
-                            blocks_per_row, // q_stride
-                            blocks_per_row, // k_stride
-                            head_dim,       // context_stride
-                            qk_scale,
-                            true,          // causal
-                            q_tile_start); // q_offset for causal mask
+                        if (use_per_position_k)
+                        {
+                            // Extract K scales for this tile from K block headers
+
+                            // Debug: log first tile K scales
+                            if (h == 0 && q_tile_start == 0 && kv_tile_start == 0)
+                            {
+                                LOG_DEBUG("FA2 Prefill K scale debug (head 0, first tile):");
+                                LOG_DEBUG("  base_alpha=" << state.base_alpha_fp32 << " q_scale=" << params.get_q_scale(h) << " qk_scale=" << qk_scale);
+                            }
+                            std::vector<float> k_scales_tile(Bc);
+                            for (int c = 0; c < Bc; ++c)
+                            {
+                                if (params.read_k_scales_from_blocks)
+                                {
+                                    // CORRECT: Read K scale from K cache block .d field
+                                    const Q16_1Block_64 *K_at_pos = K_head + (kv_tile_start + c) * blocks_per_row;
+                                    k_scales_tile[c] = K_at_pos[0].d;
+                                    if (h == 0 && q_tile_start == 0 && kv_tile_start == 0 && c < 4)
+                                    {
+                                        LOG_DEBUG("  K_scale[" << c << "]=" << k_scales_tile[c] << " alpha[c]=" << (state.base_alpha_fp32 * k_scales_tile[c]));
+                                    }
+                                }
+                                else
+                                {
+                                    // Legacy: Read from k_position_scales buffer
+                                    k_scales_tile[c] = params.get_k_scale(kv_tile_start + c, kv_h);
+                                }
+                            }
+
+                            microkernels::fa2_prefill_process_kv_tile_with_k_scales<Q16_1Block_64>(
+                                Q_tile, K_head, V_head,
+                                context_tile.data(), state,
+                                scores_scratch.data(), weights_scratch.data(),
+                                kv_tile_start, Br, Bc,
+                                head_dim, blocks_per_row,
+                                blocks_per_row, // q_stride
+                                blocks_per_row, // k_stride
+                                head_dim,       // context_stride
+                                state.base_alpha_fp32,
+                                k_scales_tile.data(),
+                                true,          // causal
+                                q_tile_start); // q_offset for causal mask
+                        }
+                        else
+                        {
+                            microkernels::fa2_prefill_process_kv_tile<Q16_1Block_64>(
+                                Q_tile, K_head, V_head,
+                                context_tile.data(), state,
+                                scores_scratch.data(), weights_scratch.data(),
+                                kv_tile_start, Br, Bc,
+                                head_dim, blocks_per_row,
+                                blocks_per_row, // q_stride
+                                blocks_per_row, // k_stride
+                                head_dim,       // context_stride
+                                qk_scale,
+                                true,          // causal
+                                q_tile_start); // q_offset for causal mask
+                        }
 
                         // Capture raw scores (with causal mask applied) for snapshot
                         // Note: microkernel uses r * Bc stride, not r * TILE_BC
@@ -680,27 +853,77 @@ namespace llaminar2::kernels::q16_1
                 }
                 case Q16BlockSize::BLOCK_128:
                 {
-                    auto Q = reinterpret_cast<const Q16_1Block_128 *>(params.Q);
-                    auto K = reinterpret_cast<const Q16_1Block_128 *>(params.K);
-                    auto V = reinterpret_cast<const Q16_1Block_128 *>(params.V);
+                    // Type-safe access via Q16BlockPtr accessors
+                    const Q16_1Block_128 *Q_blocks = params.Q.as_block_128();
+                    const Q16_1Block_128 *K_blocks = params.K.as_block_128();
+                    const Q16_1Block_128 *V_blocks = params.V.as_block_128();
 
-                    const Q16_1Block_128 *Q_tile = Q + h * seq_len_q * blocks_per_row +
+                    if (!Q_blocks || !K_blocks || !V_blocks)
+                    {
+                        LOG_ERROR("BLOCK_128 specified but Q/K/V pointers are wrong type!");
+                        return false;
+                    }
+
+                    const Q16_1Block_128 *Q_tile = Q_blocks + h * seq_len_q * blocks_per_row +
                                                    q_tile_start * blocks_per_row;
-                    const Q16_1Block_128 *K_head = K + kv_h * kv_len * blocks_per_row;
-                    const Q16_1Block_128 *V_head = V + kv_h * kv_len * blocks_per_row;
+                    const int kv_stride = params.effective_kv_head_stride();
+                    const Q16_1Block_128 *K_head = K_blocks + kv_h * kv_stride * blocks_per_row;
+                    const Q16_1Block_128 *V_head = V_blocks + kv_h * kv_stride * blocks_per_row;
 
                     for (int kv_tile_start = 0; kv_tile_start < kv_len; kv_tile_start += TILE_BC)
                     {
                         int Bc = std::min(TILE_BC, kv_len - kv_tile_start);
 
-                        microkernels::fa2_prefill_process_kv_tile<Q16_1Block_128>(
-                            Q_tile, K_head, V_head,
-                            context_tile.data(), state,
-                            scores_scratch.data(), weights_scratch.data(),
-                            kv_tile_start, Br, Bc,
-                            head_dim, blocks_per_row,
-                            blocks_per_row, blocks_per_row, head_dim,
-                            qk_scale, true, q_tile_start);
+                        if (use_per_position_k)
+                        {
+                            // Extract K scales for this tile from K block headers
+
+                            // Debug: log first tile K scales
+                            if (h == 0 && q_tile_start == 0 && kv_tile_start == 0)
+                            {
+                                LOG_DEBUG("FA2 Prefill K scale debug (head 0, first tile):");
+                                LOG_DEBUG("  base_alpha=" << state.base_alpha_fp32 << " q_scale=" << params.get_q_scale(h) << " qk_scale=" << qk_scale);
+                            }
+                            std::vector<float> k_scales_tile(Bc);
+                            for (int c = 0; c < Bc; ++c)
+                            {
+                                if (params.read_k_scales_from_blocks)
+                                {
+                                    const Q16_1Block_128 *K_at_pos = K_head + (kv_tile_start + c) * blocks_per_row;
+                                    k_scales_tile[c] = K_at_pos[0].d;
+                                    if (h == 0 && q_tile_start == 0 && kv_tile_start == 0 && c < 4)
+                                    {
+                                        LOG_DEBUG("  K_scale[" << c << "]=" << k_scales_tile[c] << " alpha[c]=" << (state.base_alpha_fp32 * k_scales_tile[c]));
+                                    }
+                                }
+                                else
+                                {
+                                    k_scales_tile[c] = params.get_k_scale(kv_tile_start + c, kv_h);
+                                }
+                            }
+
+                            microkernels::fa2_prefill_process_kv_tile_with_k_scales<Q16_1Block_128>(
+                                Q_tile, K_head, V_head,
+                                context_tile.data(), state,
+                                scores_scratch.data(), weights_scratch.data(),
+                                kv_tile_start, Br, Bc,
+                                head_dim, blocks_per_row,
+                                blocks_per_row, blocks_per_row, head_dim,
+                                state.base_alpha_fp32,
+                                k_scales_tile.data(),
+                                true, q_tile_start);
+                        }
+                        else
+                        {
+                            microkernels::fa2_prefill_process_kv_tile<Q16_1Block_128>(
+                                Q_tile, K_head, V_head,
+                                context_tile.data(), state,
+                                scores_scratch.data(), weights_scratch.data(),
+                                kv_tile_start, Br, Bc,
+                                head_dim, blocks_per_row,
+                                blocks_per_row, blocks_per_row, head_dim,
+                                qk_scale, true, q_tile_start);
+                        }
 
                         // Capture raw scores for snapshot
                         // Note: microkernel uses r * Bc stride, not r * TILE_BC
@@ -893,7 +1116,7 @@ namespace llaminar2::kernels::q16_1
                 batched_context_int32.data(),
                 context_scales.data(),
                 params.Wo_packed,
-                params.output,
+                params.output.data, // Get raw void* from Q16BlockMutablePtr
                 seq_len_q,
                 d_model,
                 d_model,                 // input_dim
@@ -914,17 +1137,21 @@ namespace llaminar2::kernels::q16_1
             const int d_model = params.d_model;
             const int blocks_per_row_out = (d_model + 31) / 32;
 
-            const auto *wo_output = reinterpret_cast<const Q16_1Block *>(params.output);
-            const auto *residual_in = reinterpret_cast<const Q16_1Block *>(params.residual_in);
-            auto *residual_out = reinterpret_cast<Q16_1Block *>(params.residual_out);
+            // Type-safe access - output uses Q16BlockMutablePtr, residual uses typed Q16_1Block*
+            const Q16_1Block *wo_output = params.output.as_block_32();
+            if (!wo_output)
+            {
+                LOG_ERROR("Prefill: Wo output block size mismatch - expected BLOCK_32 for residual add!");
+                return false;
+            }
 
             // Process each query position
             for (int q = 0; q < seq_len_q; ++q)
             {
                 simd::q16_1_add_q16_1(
                     wo_output + q * blocks_per_row_out,
-                    residual_in + q * blocks_per_row_out,
-                    residual_out + q * blocks_per_row_out,
+                    params.residual_in + q * blocks_per_row_out,
+                    params.residual_out + q * blocks_per_row_out,
                     d_model);
             }
 
@@ -935,7 +1162,7 @@ namespace llaminar2::kernels::q16_1
                 {
                     for (int b = 0; b < blocks_per_row_out; ++b)
                     {
-                        const auto &block = residual_out[q * blocks_per_row_out + b];
+                        const auto &block = params.residual_out[q * blocks_per_row_out + b];
                         float scale = block.d;
                         for (int i = 0; i < 32 && (b * 32 + i) < d_model; ++i)
                         {

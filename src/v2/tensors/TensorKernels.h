@@ -11,6 +11,7 @@
 #pragma once
 
 #include "../utils/MPIContext.h"
+#include "BlockStructures.h"
 #include "KernelSnapshotInfo.h"
 #include <memory>
 #include <vector>
@@ -610,6 +611,50 @@ namespace llaminar2
             (void)k;
             (void)bias;
             (void)accumulate;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
+
+        /**
+         * @brief GEMM with pre-quantized Q8_1 input, outputting to Q16_1 format
+         *
+         * Performs C_q16 = A_q8 @ W, where A is pre-quantized Q8_1 and output is Q16_1.
+         * This provides 256× more precision than Q8_1 output, critical for preserving
+         * dynamic range in K projections for HybridQ16 attention.
+         *
+         * Use case: K projection in HybridQ16 mode where small values would be lost
+         * in Q8_1 output due to high dynamic range (~130 max).
+         *
+         * @param q8_1_activations Pre-quantized Q8_1 activation blocks [m, k/32 blocks]
+         * @param C_q16_1 Output Q16_1 blocks [m, n/block_size blocks] - must be pre-allocated
+         * @param m Number of rows (sequence length)
+         * @param n Output features (columns, must be divisible by block_size)
+         * @param k Input features (rows in weight matrix)
+         * @param q16_block_size Q16_1 block size: 32, 64, or 128 (should match head_dim)
+         * @param bias Optional bias vector [n] to add before requantization (nullptr if none)
+         * @param mpi_ctx MPI context
+         * @param device_idx Device index
+         *
+         * @return true on success
+         */
+        virtual bool multiply_with_precomputed_q8_1_to_q16_1(
+            const void *q8_1_activations,
+            void *C_q16_1,
+            int m, int n, int k,
+            int q16_block_size = 64,
+            const float *bias = nullptr,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            // Default: not supported
+            (void)q8_1_activations;
+            (void)C_q16_1;
+            (void)m;
+            (void)n;
+            (void)k;
+            (void)q16_block_size;
+            (void)bias;
             (void)mpi_ctx;
             (void)device_idx;
             return false;
@@ -1674,16 +1719,16 @@ namespace llaminar2
      * - **Flash Decode** (seq_len_q=1): Single query, full KV, no tiling
      * - **FA2 Prefill** (seq_len_q>1): Batched queries, tiled KV processing
      *
-     * @note Q, K, V, residual types are void* to support both quantized blocks
-     *       and FP32 pointers. The implementing kernel knows the actual types.
+     * @note Q, K, V use Q16BlockPtr for type-safe access to quantized blocks.
+     *       Residual pointers are typed as Q16_1Block* (always 32-element blocks).
      */
     struct FusedAttentionWoParams
     {
-        // ============== Attention tensors (Q16_1, Q8_1, or FP32) ==============
+        // ============== Attention tensors (Q16_1 blocks, type-safe) ==============
 
-        const void *Q = nullptr; ///< Query tensor [seq_len_q × n_heads × head_dim]
-        const void *K = nullptr; ///< Key tensor [kv_len × n_kv_heads × head_dim]
-        const void *V = nullptr; ///< Value tensor [kv_len × n_kv_heads × head_dim]
+        Q16BlockPtr Q; ///< Query tensor [seq_len_q × n_heads × head_dim]
+        Q16BlockPtr K; ///< Key tensor [kv_len × n_kv_heads × head_dim]
+        Q16BlockPtr V; ///< Value tensor [kv_len × n_kv_heads × head_dim]
 
         // ============== Wo projection weights ==============
 
@@ -1702,11 +1747,11 @@ namespace llaminar2
          */
         const float *Wo_fp32 = nullptr;
 
-        // ============== Residual tensors ==============
+        // ============== Residual tensors (32-element Q16_1Block, typed) ==============
 
-        const void *residual_in = nullptr; ///< Input residual [seq_len_q × d_model]
-        void *residual_out = nullptr;      ///< Output residual [seq_len_q × d_model]
-                                           ///< Can be same as residual_in for in-place
+        const Q16_1Block *residual_in = nullptr; ///< Input residual [seq_len_q × d_model]
+        Q16_1Block *residual_out = nullptr;      ///< Output residual [seq_len_q × d_model]
+                                                 ///< Can be same as residual_in for in-place
 
         // ============== Dimensions ==============
 
@@ -1716,6 +1761,17 @@ namespace llaminar2
         int n_kv_heads = 0; ///< Number of KV heads (for GQA/MQA)
         int head_dim = 0;   ///< Dimension per head (typically 64 or 128)
         int d_model = 0;    ///< Model dimension (n_heads * head_dim)
+
+        // ============== KV Cache Layout ==============
+
+        /**
+         * @brief Stride in positions between consecutive KV heads
+         *
+         * For HEAD_MAJOR sparse cache: max_seq_len (sparse allocation)
+         * For dense/transposed data: kv_len (packed)
+         * If 0, defaults to kv_len (dense layout assumption)
+         */
+        int kv_head_stride = 0;
 
         // ============== Attention configuration ==============
 
@@ -1767,6 +1823,32 @@ namespace llaminar2
          */
         float *attention_residual_snapshot = nullptr;
 
+        // ============== HybridQ16 K Precision Fix: Per-head scales ==============
+
+        /**
+         * @brief Per-head dynamic scales for Q vectors (HybridQ16 K precision fix)
+         *
+         * For HybridQ16 mode where Q uses fixed kv_cache_scale, this is nullptr.
+         * For future dynamic-scale Q support, this would be [seq_len_q * n_heads].
+         * Shape: [seq_len_q * n_heads] when non-null
+         */
+        const float *q_head_scales = nullptr;
+
+        /**
+         * @brief Per-head dynamic scales for K vectors (HybridQ16 K precision fix)
+         *
+         * When GEMM outputs K as Q16_1 (instead of Q8_1) and RoPE uses dynamic
+         * per-head scale, these scales must be provided to the attention kernel
+         * for correct Q×K^T computation.
+         *
+         * Shape: [kv_len * n_kv_heads] when non-null
+         * - For prefill: [seq_len * n_kv_heads] with fresh K vectors
+         * - For decode: scales are stored in KV cache alongside K data
+         *
+         * When nullptr, K is assumed to have fixed kv_cache_scale (standard HybridQ16).
+         */
+        const float *k_head_scales = nullptr;
+
         // ============== Optional debug metadata ==============
 
         /**
@@ -1802,6 +1884,30 @@ namespace llaminar2
             if (n_kv_heads == n_heads)
                 return query_head;
             return query_head / (n_heads / n_kv_heads);
+        }
+
+        /**
+         * @brief Get the block size from Q tensor (Q/K/V must use same block size)
+         */
+        Q16BlockSize block_size() const { return Q.block_size; }
+
+        /**
+         * @brief Validate that Q, K, V all have the same block size
+         */
+        bool validate_block_sizes() const
+        {
+            if (Q.empty() || K.empty() || V.empty())
+                return false;
+            return Q.block_size == K.block_size && K.block_size == V.block_size;
+        }
+
+        /**
+         * @brief Get blocks per row for attention computation
+         */
+        int blocks_per_row() const
+        {
+            int bs = static_cast<int>(Q.block_size);
+            return (head_dim + bs - 1) / bs;
         }
     };
 
@@ -2270,6 +2376,76 @@ namespace llaminar2
             (void)head_dim;
             (void)rope_theta;
             (void)kv_cache_scale;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Default: not supported
+        }
+
+        /**
+         * @brief Apply RoPE to Q16_1 input, output Q16_1 with dynamic per-head scale
+         *
+         * This method takes Q16_1 input (with per-block scales from GEMM) and applies
+         * RoPE rotation, outputting Q16_1 with potentially different per-head scales.
+         * This is used for K projections in HybridQ16 mode where GEMM outputs K as Q16_1
+         * to preserve precision (256× finer than Q8_1).
+         *
+         * For Q: K_in is processed in-place (Q8_1→Q16_1 with fixed scale, same as before)
+         * For K: K_in is already Q16_1 from GEMM, apply dynamic-scale RoPE
+         *
+         * Dynamic Scale Algorithm:
+         * 1. Dequantize input Q16_1 to FP32 (per-block scales from GEMM)
+         * 2. Apply RoPE rotation (FP32)
+         * 3. Find max_abs per head (determines output scale)
+         * 4. Requantize to Q16_1 with per-head scale
+         * 5. Store per-head scales in K_head_scales for attention
+         *
+         * @param Q_in Q8_1 Q input tensor [seq_len, n_heads * head_dim]
+         * @param K_in Q16_1 K input tensor [seq_len, n_kv_heads * head_dim] (from GEMM!)
+         * @param Q_out Q16_1 Q output tensor [seq_len, n_heads * head_dim]
+         * @param K_out Q16_1 K output tensor [seq_len, n_kv_heads * head_dim]
+         * @param K_head_scales Output: per-head K scales [seq_len * n_kv_heads]
+         * @param block_size Q16 block size (64 or 128, matching head_dim)
+         * @param position_ids Position indices [seq_len]
+         * @param seq_len Sequence length
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of KV heads
+         * @param head_dim Head dimension
+         * @param rope_theta RoPE frequency base
+         * @param q_kv_cache_scale Fixed scale for Q output (same as V/KV cache)
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index
+         * @return true on success
+         */
+        virtual bool apply_mixed_q8_k16_to_q16(
+            TensorBase *Q_in,     // Q8_1 input for Q
+            TensorBase *K_in,     // Q16_1 input for K (from GEMM!)
+            TensorBase *Q_out,    // Q16_1 output for Q
+            TensorBase *K_out,    // Q16_1 output for K
+            float *K_head_scales, // Output: per-head K scales [seq_len * n_kv_heads]
+            Q16BlockSize block_size,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta,
+            float q_kv_cache_scale, // Fixed scale for Q output
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            (void)Q_in;
+            (void)K_in;
+            (void)Q_out;
+            (void)K_out;
+            (void)K_head_scales;
+            (void)block_size;
+            (void)position_ids;
+            (void)seq_len;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)rope_theta;
+            (void)q_kv_cache_scale;
             (void)mpi_ctx;
             (void)device_idx;
             return false; // Default: not supported

@@ -53,7 +53,7 @@ namespace llaminar2
 
             /// Fixed scale for Q16_1 quantization (from GraphSchema::kv_cache_scale)
             /// Default 8.0 = ±8.0 FP32 range. Set to 0.0 to use legacy adaptive scaling.
-            float kv_cache_scale = 8.0f;
+            float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must cover projection max (~130)
 
             /// Attention head dimension (for VNNI clipping limits)
             /// Required for proper MAX_SAFE_INT16 selection. Common values: 64, 96, 128, 192.

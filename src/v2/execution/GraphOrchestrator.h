@@ -134,6 +134,12 @@ namespace llaminar2
         /// FP32 V dequantized (Hybrid mode only - for KV cache append when V is Q8_1)
         std::shared_ptr<TensorBase> V_dequant;
 
+        // === HybridQ16 K Precision Fix Buffers ===
+        /// Per-head dynamic scales for K vectors from RoPE Q16→Q16 path
+        /// Shape: [batch_size * max_seq_len * n_kv_heads]
+        /// Only used when GEMM outputs K as Q16_1 (K precision fix mode)
+        std::vector<float> K_head_scales;
+
         // === Attention Workspace ===
         std::shared_ptr<TensorBase> workspace_scores;
         std::shared_ptr<TensorBase> workspace_context;

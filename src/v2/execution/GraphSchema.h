@@ -424,7 +424,7 @@ namespace llaminar2
         /// - Models with known activation ranges can use tighter scales for precision
         /// - Use KV activation profiling tool (python/tools/profile_kv_activations.py)
         ///   to determine optimal scales for specific models
-        float kv_cache_scale = 8.0f;
+        float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must handle Q projection max_abs (~130 for Qwen2)
     };
 
     // =========================================================================

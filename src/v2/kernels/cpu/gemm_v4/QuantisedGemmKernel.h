@@ -2195,6 +2195,214 @@ namespace llaminar2
             }
 
             /**
+             * @brief GEMM with pre-quantized Q8_1 input, outputting to Q16_1 format
+             *
+             * Performs high-precision quantized GEMM where output is Q16_1 blocks.
+             * This provides 256× more precision than Q8_1 output, critical for
+             * preserving dynamic range in K projections for HybridQ16 attention.
+             *
+             * Key insight: K projection often has high dynamic range (~130 max).
+             * Q8_1 output loses small values due to coarse quantization step (max/127).
+             * Q16_1 uses max/16383, preserving values 128× smaller.
+             *
+             * @param q8_1_activations Pre-quantized Q8_1 activation blocks from quantize_activations()
+             * @param C_q16_1 Output Q16_1 blocks [m, n/block_size] - must be pre-allocated
+             * @param m Number of rows (sequence length)
+             * @param n Output features (must be divisible by q16_block_size)
+             * @param k Input features
+             * @param q16_block_size Q16_1 block size: 64 for head_dim=64, 128 for head_dim=128
+             * @param bias Optional bias vector [n] to add before requantization
+             * @param mpi_ctx MPI context
+             * @param device_idx Device index
+             *
+             * @return true on success
+             */
+            bool multiply_with_precomputed_q8_1_to_q16_1(
+                const void *q8_1_activations,
+                void *C_q16_1,
+                int m, int n, int k,
+                int q16_block_size = 64,
+                const float *bias = nullptr,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override
+            {
+                (void)device_idx;
+                (void)mpi_ctx;
+
+                if (!q8_1_activations || !C_q16_1)
+                    return false;
+
+                // Validate block size
+                if (q16_block_size != 32 && q16_block_size != 64 && q16_block_size != 128)
+                {
+                    LOG_ERROR("Invalid q16_block_size " << q16_block_size << ", must be 32, 64, or 128");
+                    return false;
+                }
+
+                // Validate n is divisible by block_size
+                if (n % q16_block_size != 0)
+                {
+                    LOG_ERROR("n=" << n << " must be divisible by q16_block_size=" << q16_block_size);
+                    return false;
+                }
+
+                // Get reference to packed weights
+                const auto &pw = packed_weights();
+
+                // Check dimensions
+                if (n != pw.N || k != pw.K)
+                {
+                    LOG_ERROR("Dimension mismatch in multiply_with_precomputed_q8_1_to_q16_1: "
+                              << "expected n=" << pw.N << ", k=" << pw.K
+                              << " got n=" << n << ", k=" << k);
+                    return false;
+                }
+
+                // Get JIT kernels (with Q16_1 output support)
+                static QuantisedGemmJit_M1 jit;
+                static QuantisedGemmJit_M2 jit_m2;
+                auto kernel = jit.get_kernel();
+                auto kernel_m2 = jit_m2.get_kernel();
+
+                int k_blocks = k / 32;
+                int N_padded = ((n + 63) / 64) * 64;
+                const Q8_1Block *all_blocks = static_cast<const Q8_1Block *>(q8_1_activations);
+
+                // Calculate output Q16_1 block parameters
+                // Block sizes: 32 → 72 bytes, 64 → 136 bytes, 128 → 264 bytes
+                const int q16_block_bytes = 8 + 2 * q16_block_size; // d(4) + sum_qs(4) + qs[block_size]*2
+                const int output_blocks_per_row = n / q16_block_size;
+                const size_t output_stride = output_blocks_per_row * q16_block_bytes;
+
+                auto do_gemm_q16_1_work = [&]()
+                {
+                    int num_threads = omp_get_num_threads();
+                    long long l2_size = cpu_l2_cache_size();
+                    if (l2_size == 0)
+                        l2_size = 1024 * 1024;
+
+                    long long l3_size = cpu_l3_cache_size();
+                    if (l3_size == 0)
+                        l3_size = l2_size * num_threads;
+
+                    long long l2_limit = (long long)(l2_size * 0.9);
+                    long long l3_limit_per_thread = (long long)(l3_size * 0.9 / num_threads);
+                    long long block_size_limit = std::min(l2_limit, l3_limit_per_thread);
+                    if (block_size_limit < 65536)
+                        block_size_limit = 65536;
+
+                    int max_n_block = block_size_limit / k;
+                    max_n_block = (max_n_block / 64) * 64;
+                    if (max_n_block < 64)
+                        max_n_block = 64;
+
+                    int target_tasks = num_threads * 4;
+                    int m_tasks = (m + 1) / 2;
+                    if (m_tasks < 1)
+                        m_tasks = 1;
+
+                    int needed_n_tasks = (target_tasks + m_tasks - 1) / m_tasks;
+                    if (needed_n_tasks < 1)
+                        needed_n_tasks = 1;
+
+                    int calc_block = (n + needed_n_tasks - 1) / needed_n_tasks;
+                    calc_block = (calc_block + 63) / 64 * 64;
+                    if (calc_block < 64)
+                        calc_block = 64;
+
+                    int n_task_block;
+                    if (calc_block > max_n_block)
+                    {
+                        int num_splits = (n + max_n_block - 1) / max_n_block;
+                        int even_block = (n + num_splits - 1) / num_splits;
+                        even_block = (even_block + 63) / 64 * 64;
+                        n_task_block = even_block;
+                    }
+                    else
+                    {
+                        n_task_block = calc_block;
+                    }
+
+                    int unroll = debugEnv().gemm.gemm_m_unroll_factor;
+                    if (unroll != 1 && unroll != 2)
+                        unroll = 2;
+
+#pragma omp for collapse(2) schedule(static)
+                    for (int n_task = 0; n_task < n; n_task += n_task_block)
+                    {
+                        for (int i = 0; i < m; i += unroll)
+                        {
+                            int rows_left = m - i;
+                            int rows_to_process = (rows_left >= unroll) ? unroll : rows_left;
+
+                            const Q8_1Block *blocks = all_blocks + i * k_blocks;
+
+                            int n_end = std::min(n, n_task + n_task_block);
+                            for (int n_blk = n_task; n_blk < n_end; n_blk += 64)
+                            {
+                                size_t weights_offset = (size_t)(n_blk / 64) * (k * 64);
+                                const int8_t *b_ptr = pw.packed_data.data() + weights_offset;
+
+                                const int32_t *comp_ptr = pw.compensation.data() + n_blk;
+                                const float *scales_ptr = pw.scales.data() + n_blk;
+                                const float *mins_ptr = pw.mins.data() + n_blk;
+
+                                volatile QuantisedGemmParams params_v;
+                                params_v.A = blocks;
+                                params_v.B_packed = b_ptr;
+                                params_v.comp = comp_ptr;
+                                params_v.scales = scales_ptr;
+                                params_v.mins = pw.has_mins ? mins_ptr : nullptr;
+                                params_v.C = nullptr; // FP32 output not used
+                                params_v.K_blocks = k_blocks;
+                                params_v.N = 64;
+                                params_v.ldc = N_padded;
+                                params_v.bias = bias ? (bias + n_blk) : nullptr;
+                                params_v.mask = nullptr;
+                                params_v.A_stride = k_blocks * sizeof(Q8_1Block);
+                                params_v.local_max = nullptr;
+                                params_v.local_sum = nullptr;
+                                params_v.do_softmax = false;
+                                params_v.gate_input = nullptr;
+                                params_v.do_swiglu = false;
+
+                                // Q16_1 output parameters
+                                params_v.output_format = GemmOutputFormat::Q16_1;
+                                params_v.C_q8_1 = nullptr; // Not used for Q16_1
+                                params_v.C_q8_1_stride = 0;
+
+                                // Calculate Q16_1 output pointer
+                                // Output block index = n_blk / q16_block_size
+                                int block_index = n_blk / q16_block_size;
+                                uint8_t *output_ptr = static_cast<uint8_t *>(C_q16_1) +
+                                                      i * output_stride +
+                                                      block_index * q16_block_bytes;
+
+                                params_v.C_q16_1 = output_ptr;
+                                params_v.C_q16_1_stride = static_cast<int>(output_stride);
+                                params_v.q16_block_size = q16_block_size;
+
+                                // Copy to non-volatile for kernel call
+                                QuantisedGemmParams params;
+                                std::memcpy(&params, const_cast<QuantisedGemmParams *>(&params_v), sizeof(params));
+
+                                asm volatile("" ::: "memory");
+
+                                if (rows_to_process == 2)
+                                    kernel_m2(&params);
+                                else
+                                    kernel(&params);
+                            }
+                        }
+                    }
+                };
+
+                OMP_WORKSHARE_REGION(do_gemm_q16_1_work);
+
+                return true;
+            }
+
+            /**
              * @brief GEMM with FP32 input, outputting to Q8_1 format
              *
              * Quantizes FP32 activations to Q8_1, performs GEMM, then requantizes

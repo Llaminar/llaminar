@@ -7,9 +7,14 @@
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../tensors/FP16Utils.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/cpu/gemm_v4/FusedGEMM.h"
+
+#include <cmath>
+#include <cstring>
+#include <vector>
 
 namespace llaminar2
 {
@@ -53,10 +58,150 @@ namespace llaminar2
             return false;
         }
 
-        // Check if outputs are Q8_1 tensors - if so, use Q8_1 execution path
+        // Check output tensor types for precision detection
         auto *output_q_q8_1 = dynamic_cast<Q8_1Tensor *>(params_.output_q);
         auto *output_k_q8_1 = dynamic_cast<Q8_1Tensor *>(params_.output_k);
+        auto *output_k_q16_1 = dynamic_cast<Q16_1Tensor *>(params_.output_k);
         auto *output_v_q8_1 = dynamic_cast<Q8_1Tensor *>(params_.output_v);
+
+        // Check for mixed-precision QKV: Q=Q8_1, K=Q16_1, V=Q8_1 (HybridQ16 K precision fix)
+        const bool mixed_qkv = (output_q_q8_1 && output_k_q16_1 && output_v_q8_1);
+
+        if (mixed_qkv)
+        {
+            LOG_DEBUG("[FusedQKVGEMMStage] Mixed-precision QKV detected: Q=Q8_1, K=Q16_1, V=Q8_1");
+
+            // Create FusedGEMM kernel
+            FusedGEMM fused_gemm(params_.wq, params_.wk, params_.wv);
+
+            // Determine Q16 block size from K output tensor
+            // LIMITATION: JIT kernel only properly supports block_size=64 or 32.
+            // block_size=128 writes only partial data (64 values) per block.
+            // Force block_size=64 for now until JIT kernel supports 128.
+            int k_block_size = 64;
+
+            LOG_DEBUG("[FusedQKVGEMMStage] K Q16_1 block_size=" << k_block_size);
+
+            // Check if input is Q8_1 - use direct path
+            auto *input_q8_1 = dynamic_cast<const Q8_1Tensor *>(params_.input);
+            if (input_q8_1)
+            {
+                LOG_DEBUG("[FusedQKVGEMMStage] Q8_1 input, using direct Q8_1→mixed path");
+                bool success = fused_gemm.execute_q8_1_mixed_qkv(
+                    input_q8_1->typed_data(),
+                    output_q_q8_1->mutable_typed_data(),
+                    output_k_q16_1->mutable_typed_data(),
+                    output_v_q8_1->mutable_typed_data(),
+                    params_.bias_q, params_.bias_k, params_.bias_v,
+                    params_.m, params_.n_q, params_.n_k,
+                    params_.k,
+                    k_block_size,
+                    nullptr, -1); // ctx, device_idx
+
+                if (!success)
+                {
+                    LOG_ERROR("[FusedQKVGEMMStage] execute_q8_1_mixed_qkv failed");
+                    return false;
+                }
+
+                LOG_DEBUG("[FusedQKVGEMMStage] Mixed-precision QKV path complete (Q8_1 input)");
+                return true;
+            }
+
+            // FP32 input - quantize to Q8_1 first, then use mixed path
+            const float *input_fp32 = params_.input->fp32_data();
+            if (!input_fp32)
+            {
+                LOG_ERROR("[FusedQKVGEMMStage] Mixed-precision QKV requires Q8_1 or FP32 input");
+                return false;
+            }
+
+            LOG_DEBUG("[FusedQKVGEMMStage] FP32 input, quantizing to Q8_1 for mixed path");
+
+            // Allocate temporary Q8_1 buffer for quantized activations
+            // Use the first kernel to get buffer size
+            size_t buffer_size = fused_gemm.num_projections() > 0
+                                     ? static_cast<size_t>(params_.m) * static_cast<size_t>(params_.k) / 32 * sizeof(Q8_1Block)
+                                     : 0;
+
+            if (buffer_size == 0)
+            {
+                LOG_ERROR("[FusedQKVGEMMStage] Failed to compute Q8_1 buffer size");
+                return false;
+            }
+
+            // Allocate aligned buffer for quantized activations
+            std::vector<Q8_1Block> q8_1_buffer(params_.m * params_.k / 32);
+
+            // Quantize FP32 input to Q8_1
+            // Use scalar quantization for simplicity (GEMM kernel will handle the rest)
+            for (int row = 0; row < params_.m; ++row)
+            {
+                const float *row_data = input_fp32 + row * params_.k;
+                Q8_1Block *row_blocks = q8_1_buffer.data() + row * (params_.k / 32);
+
+                for (int block_idx = 0; block_idx < params_.k / 32; ++block_idx)
+                {
+                    const float *block_data = row_data + block_idx * 32;
+                    Q8_1Block &block = row_blocks[block_idx];
+
+                    // Find max absolute value for scaling
+                    float max_abs = 0.0f;
+                    for (int i = 0; i < 32; ++i)
+                    {
+                        float abs_val = std::abs(block_data[i]);
+                        if (abs_val > max_abs)
+                            max_abs = abs_val;
+                    }
+
+                    // Compute scale (FP16) and sum_qs (INT16)
+                    float scale_fp32 = max_abs / 127.0f;
+                    block.d = fp32_to_fp16(scale_fp32); // FP16 scale
+                    int32_t sum = 0;
+
+                    if (max_abs > 0.0f)
+                    {
+                        float inv_scale = 127.0f / max_abs;
+                        for (int i = 0; i < 32; ++i)
+                        {
+                            int8_t q = static_cast<int8_t>(std::round(block_data[i] * inv_scale));
+                            block.qs[i] = q;
+                            sum += static_cast<int32_t>(q);
+                        }
+                    }
+                    else
+                    {
+                        std::memset(block.qs, 0, 32);
+                    }
+
+                    // Clamp sum to INT16 range (should be within [-127*32, 127*32] = [-4064, 4064])
+                    block.sum_qs = static_cast<int16_t>(std::max(-32768, std::min(32767, sum)));
+                }
+            }
+
+            LOG_DEBUG("[FusedQKVGEMMStage] Quantized FP32 to Q8_1: " << params_.m << "x" << params_.k);
+
+            // Now use the Q8_1 mixed path
+            bool success = fused_gemm.execute_q8_1_mixed_qkv(
+                q8_1_buffer.data(),
+                output_q_q8_1->mutable_typed_data(),
+                output_k_q16_1->mutable_typed_data(),
+                output_v_q8_1->mutable_typed_data(),
+                params_.bias_q, params_.bias_k, params_.bias_v,
+                params_.m, params_.n_q, params_.n_k,
+                params_.k,
+                k_block_size,
+                nullptr, -1); // ctx, device_idx
+
+            if (!success)
+            {
+                LOG_ERROR("[FusedQKVGEMMStage] execute_q8_1_mixed_qkv failed (FP32 input)");
+                return false;
+            }
+
+            LOG_DEBUG("[FusedQKVGEMMStage] Mixed-precision QKV path complete (FP32→Q8_1 input)");
+            return true;
+        }
 
         const bool q8_1_output = (output_q_q8_1 && output_k_q8_1 && output_v_q8_1);
 

@@ -1002,3 +1002,216 @@ TEST_F(Test__Q16IntegerAttention, EdgeCase_ManyHeads)
     bool success = q16_integer_attention_decode(params);
     EXPECT_TRUE(success);
 }
+// =============================================================================
+// Per-Position K Scale Tests (Phase 8: Option C - Pass Scale to Softmax)
+// =============================================================================
+
+/**
+ * @test Verify per-position K scales feature (has_per_position_k_scales())
+ *
+ * When k_position_scales is provided, the attention kernel should use
+ * per-position K scales instead of uniform kv_head_scales for Q×K^T scaling.
+ */
+TEST_F(Test__Q16IntegerAttention, PerPositionKScales_FlagCheck)
+{
+    constexpr int HEAD_DIM = 64;
+    constexpr int KV_LEN = 4;
+    constexpr int NUM_HEADS = 2;
+    constexpr int NUM_KV_HEADS = 1;
+
+    auto Q_blocks = createRandomBlocks<Q16_1Block_64>(NUM_HEADS);
+    auto K_blocks = createRandomBlocks<Q16_1Block_64>(KV_LEN * NUM_KV_HEADS);
+    auto V_blocks = createRandomBlocks<Q16_1Block_64>(KV_LEN * NUM_KV_HEADS);
+
+    auto q_scales = createUniformScales(NUM_HEADS, 1.0f / 32767.0f);
+    auto kv_scales = createUniformScales(NUM_KV_HEADS, 1.0f / 32767.0f);
+
+    // Per-position K scales: different scale for each position
+    std::vector<float> k_pos_scales(KV_LEN * NUM_KV_HEADS);
+    for (int pos = 0; pos < KV_LEN; ++pos)
+    {
+        for (int kv_h = 0; kv_h < NUM_KV_HEADS; ++kv_h)
+        {
+            k_pos_scales[pos * NUM_KV_HEADS + kv_h] = 1.0f / (32767.0f * (1.0f + 0.1f * pos));
+        }
+    }
+
+    Q16IntegerAttentionParams params;
+    params.Q = Q_blocks.data();
+    params.K = K_blocks.data();
+    params.V = V_blocks.data();
+    params.q_head_scales = q_scales.data();
+    params.kv_head_scales = kv_scales.data();
+    params.k_position_scales = k_pos_scales.data();
+    params.seq_len_q = 1;
+    params.kv_len = KV_LEN;
+    params.num_heads = NUM_HEADS;
+    params.num_kv_heads = NUM_KV_HEADS;
+    params.head_dim = HEAD_DIM;
+    params.d_model = NUM_HEADS * HEAD_DIM;
+    params.block_size = Q16BlockSize::BLOCK_64;
+
+    // Verify the flag is set
+    EXPECT_TRUE(params.has_per_position_k_scales());
+
+    // Verify get_k_scale returns per-position scales
+    EXPECT_FLOAT_EQ(params.get_k_scale(0, 0), k_pos_scales[0]);
+    EXPECT_FLOAT_EQ(params.get_k_scale(1, 0), k_pos_scales[1]);
+    EXPECT_FLOAT_EQ(params.get_k_scale(3, 0), k_pos_scales[3]);
+
+    // Verify Q scale
+    EXPECT_FLOAT_EQ(params.get_q_scale(0), q_scales[0]);
+    EXPECT_FLOAT_EQ(params.get_q_scale(1), q_scales[1]);
+}
+
+/**
+ * @test Verify per-position K scales produce different results from uniform scales
+ *
+ * Run attention twice: once with uniform kv_head_scales, once with per-position
+ * k_position_scales. The outputs should differ when K scales vary by position.
+ */
+TEST_F(Test__Q16IntegerAttention, PerPositionKScales_OutputDiffers)
+{
+    constexpr int HEAD_DIM = 64;
+    constexpr int KV_LEN = 8;
+    constexpr int NUM_HEADS = 2;
+    constexpr int NUM_KV_HEADS = 1;
+
+    auto Q_blocks = createRandomBlocks<Q16_1Block_64>(NUM_HEADS);
+    auto K_blocks = createRandomBlocks<Q16_1Block_64>(KV_LEN * NUM_KV_HEADS);
+    auto V_blocks = createRandomBlocks<Q16_1Block_64>(KV_LEN * NUM_KV_HEADS);
+
+    auto q_scales = createUniformScales(NUM_HEADS, 1.0f / 32767.0f);
+    auto kv_scales = createUniformScales(NUM_KV_HEADS, 1.0f / 32767.0f);
+
+    // Per-position K scales with varying values
+    std::vector<float> k_pos_scales(KV_LEN * NUM_KV_HEADS);
+    for (int pos = 0; pos < KV_LEN; ++pos)
+    {
+        for (int kv_h = 0; kv_h < NUM_KV_HEADS; ++kv_h)
+        {
+            // Significant variation: scale = 1/32767 * (0.5 + 0.1*pos)
+            k_pos_scales[pos * NUM_KV_HEADS + kv_h] = (0.5f + 0.1f * pos) / 32767.0f;
+        }
+    }
+
+    // Output buffers for both runs
+    std::vector<float> context_uniform(NUM_HEADS * HEAD_DIM);
+    std::vector<float> context_per_pos(NUM_HEADS * HEAD_DIM);
+
+    // Run 1: Uniform K scales (standard)
+    {
+        Q16IntegerAttentionParams params;
+        params.Q = Q_blocks.data();
+        params.K = K_blocks.data();
+        params.V = V_blocks.data();
+        params.q_head_scales = q_scales.data();
+        params.kv_head_scales = kv_scales.data();
+        params.k_position_scales = nullptr; // Standard mode
+        params.seq_len_q = 1;
+        params.kv_len = KV_LEN;
+        params.num_heads = NUM_HEADS;
+        params.num_kv_heads = NUM_KV_HEADS;
+        params.head_dim = HEAD_DIM;
+        params.d_model = NUM_HEADS * HEAD_DIM;
+        params.block_size = Q16BlockSize::BLOCK_64;
+        params.snapshot_context = context_uniform.data();
+
+        bool success = q16_integer_attention_decode(params);
+        ASSERT_TRUE(success);
+    }
+
+    // Run 2: Per-position K scales (Option C)
+    {
+        Q16IntegerAttentionParams params;
+        params.Q = Q_blocks.data();
+        params.K = K_blocks.data();
+        params.V = V_blocks.data();
+        params.q_head_scales = q_scales.data();
+        params.kv_head_scales = kv_scales.data();
+        params.k_position_scales = k_pos_scales.data(); // Per-position mode
+        params.seq_len_q = 1;
+        params.kv_len = KV_LEN;
+        params.num_heads = NUM_HEADS;
+        params.num_kv_heads = NUM_KV_HEADS;
+        params.head_dim = HEAD_DIM;
+        params.d_model = NUM_HEADS * HEAD_DIM;
+        params.block_size = Q16BlockSize::BLOCK_64;
+        params.snapshot_context = context_per_pos.data();
+
+        bool success = q16_integer_attention_decode(params);
+        ASSERT_TRUE(success);
+    }
+
+    // Compare: outputs should differ since K scales are different
+    float max_diff = 0.0f;
+    for (size_t i = 0; i < context_uniform.size(); ++i)
+    {
+        float diff = std::abs(context_uniform[i] - context_per_pos[i]);
+        max_diff = std::max(max_diff, diff);
+    }
+
+    // The difference should be non-trivial (K scales differ significantly)
+    EXPECT_GT(max_diff, 0.0f) << "Per-position K scales should produce different output";
+
+    std::cout << "[PerPositionKScales] Max diff between uniform and per-position: " << max_diff << std::endl;
+}
+
+/**
+ * @test Verify per-position K scales with BLOCK_128
+ */
+TEST_F(Test__Q16IntegerAttention, PerPositionKScales_Block128)
+{
+    constexpr int HEAD_DIM = 128;
+    constexpr int KV_LEN = 4;
+    constexpr int NUM_HEADS = 2;
+    constexpr int NUM_KV_HEADS = 1;
+
+    auto Q_blocks = createRandomBlocks<Q16_1Block_128>(NUM_HEADS);
+    auto K_blocks = createRandomBlocks<Q16_1Block_128>(KV_LEN * NUM_KV_HEADS);
+    auto V_blocks = createRandomBlocks<Q16_1Block_128>(KV_LEN * NUM_KV_HEADS);
+
+    auto q_scales = createUniformScales(NUM_HEADS, 1.0f / 32767.0f);
+    auto kv_scales = createUniformScales(NUM_KV_HEADS, 1.0f / 32767.0f);
+
+    // Per-position K scales
+    std::vector<float> k_pos_scales(KV_LEN * NUM_KV_HEADS);
+    for (int pos = 0; pos < KV_LEN; ++pos)
+    {
+        for (int kv_h = 0; kv_h < NUM_KV_HEADS; ++kv_h)
+        {
+            k_pos_scales[pos * NUM_KV_HEADS + kv_h] = (1.0f + 0.2f * pos) / 32767.0f;
+        }
+    }
+
+    std::vector<float> context(NUM_HEADS * HEAD_DIM);
+
+    Q16IntegerAttentionParams params;
+    params.Q = Q_blocks.data();
+    params.K = K_blocks.data();
+    params.V = V_blocks.data();
+    params.q_head_scales = q_scales.data();
+    params.kv_head_scales = kv_scales.data();
+    params.k_position_scales = k_pos_scales.data();
+    params.seq_len_q = 1;
+    params.kv_len = KV_LEN;
+    params.num_heads = NUM_HEADS;
+    params.num_kv_heads = NUM_KV_HEADS;
+    params.head_dim = HEAD_DIM;
+    params.d_model = NUM_HEADS * HEAD_DIM;
+    params.block_size = Q16BlockSize::BLOCK_128;
+    params.snapshot_context = context.data();
+
+    EXPECT_TRUE(params.has_per_position_k_scales());
+
+    bool success = q16_integer_attention_decode(params);
+    EXPECT_TRUE(success);
+
+    // Verify output is non-zero
+    float sum = 0.0f;
+    for (float c : context)
+    {
+        sum += std::abs(c);
+    }
+    EXPECT_GT(sum, 0.0f) << "Context should be non-zero";
+}

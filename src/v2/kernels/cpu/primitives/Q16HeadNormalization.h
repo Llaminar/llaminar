@@ -151,6 +151,93 @@ namespace llaminar2::primitives
     }
 
     // ========================================================================
+    // VNNI-Safe Normalization for Integer Attention
+    // ========================================================================
+
+    /**
+     * @brief VNNI-safe maximum INT16 values by head dimension
+     *
+     * For Q16×Q16→INT32 dot products, we MUST avoid overflow.
+     * The constraint is: head_dim × max_qs² ≤ INT32_MAX
+     * Therefore: max_qs ≤ sqrt(INT32_MAX / head_dim)
+     *
+     * With INT32_MAX = 2,147,483,647:
+     *   - head_dim=64:  max_qs = floor(sqrt(2147483647/64))  = 5792
+     *   - head_dim=128: max_qs = floor(sqrt(2147483647/128)) = 4096
+     *   - head_dim=192: max_qs = floor(sqrt(2147483647/192)) = 3344
+     *   - head_dim=256: max_qs = floor(sqrt(2147483647/256)) = 2896
+     *
+     * We use 95% of theoretical max for headroom against rounding errors.
+     */
+    constexpr int16_t get_vnni_safe_max_qs(int head_dim)
+    {
+        // max_qs = floor(sqrt(INT32_MAX / head_dim) * 0.95)
+        // Pre-computed for common head dimensions with 5% safety margin:
+        if (head_dim <= 64)
+            return 5500; // 95% of 5792
+        else if (head_dim <= 128)
+            return 3890; // 95% of 4096
+        else if (head_dim <= 192)
+            return 3175; // 95% of 3344
+        else
+            return 2750; // 95% of 2896
+    }
+
+    /**
+     * @brief Result of VNNI-safe normalization
+     */
+    struct VNNISafeNormResult
+    {
+        float norm_factor; ///< Multiply attention scores by this to restore magnitude
+        float new_d;       ///< New unified scale after VNNI-safe normalization
+        int16_t max_qs;    ///< Maximum |qs| value in normalized output
+        bool was_rescaled; ///< True if rescaling was needed
+    };
+
+    /**
+     * @brief Normalize Q16 head blocks to VNNI-safe range
+     *
+     * After dynamic-scale RoPE, K blocks have unified d but may have |qs| > MAX_SAFE.
+     * This function rescales to ensure safe VNNI dot products, returning a correction
+     * factor to apply to attention scores.
+     *
+     * Algorithm:
+     *   1. Find max(|qs|) across all elements in head
+     *   2. If max(|qs|) <= get_vnni_safe_max_qs(head_dim), no rescaling needed
+     *   3. Otherwise: target_max = get_vnni_safe_max_qs(head_dim)
+     *      - scale_ratio = target_max / max(|qs|) (always <= 1.0)
+     *      - qs_new = round(qs * scale_ratio)
+     *      - d_new = d_old / scale_ratio (scale increases to compensate)
+     *   4. Return norm_factor = d_old / d_new = scale_ratio
+     *
+     * @tparam BlockType One of Q16_1Block, Q16_1Block_64, Q16_1Block_128
+     * @param blocks Pointer to array of Q16_1 blocks (modified in-place)
+     * @param num_blocks Number of blocks in the head
+     * @param head_dim Total dimension of the head (for VNNI limit lookup)
+     * @param d_unified The unified scale from dynamic-scale RoPE
+     * @return VNNISafeNormResult with norm_factor and metadata
+     *
+     * @note For attention: score = (Q·K^T) * norm_factor_q * norm_factor_k
+     * @note Typically only K needs this; Q can use simpler normalization
+     */
+    template <typename BlockType>
+    VNNISafeNormResult normalize_q16_head_to_vnni_safe(
+        BlockType *blocks, size_t num_blocks, int head_dim, float d_unified);
+
+    /**
+     * @brief Find maximum |qs| value across all elements in a head
+     *
+     * Helper function for VNNI-safe normalization.
+     *
+     * @tparam BlockType One of Q16_1Block, Q16_1Block_64, Q16_1Block_128
+     * @param blocks Pointer to array of Q16_1 blocks
+     * @param num_blocks Number of blocks in the head
+     * @return Maximum absolute qs value
+     */
+    template <typename BlockType>
+    int16_t find_head_max_abs_qs(const BlockType *blocks, size_t num_blocks);
+
+    // ========================================================================
     // Explicit instantiation declarations for common block types
     // ========================================================================
 
@@ -169,5 +256,17 @@ namespace llaminar2::primitives
     extern template bool needs_normalization<Q16_1Block>(const Q16_1Block *, size_t, float);
     extern template bool needs_normalization<Q16_1Block_64>(const Q16_1Block_64 *, size_t, float);
     extern template bool needs_normalization<Q16_1Block_128>(const Q16_1Block_128 *, size_t, float);
+
+    // VNNI-safe normalization
+    extern template int16_t find_head_max_abs_qs<Q16_1Block>(const Q16_1Block *, size_t);
+    extern template int16_t find_head_max_abs_qs<Q16_1Block_64>(const Q16_1Block_64 *, size_t);
+    extern template int16_t find_head_max_abs_qs<Q16_1Block_128>(const Q16_1Block_128 *, size_t);
+
+    extern template VNNISafeNormResult normalize_q16_head_to_vnni_safe<Q16_1Block>(
+        Q16_1Block *, size_t, int, float);
+    extern template VNNISafeNormResult normalize_q16_head_to_vnni_safe<Q16_1Block_64>(
+        Q16_1Block_64 *, size_t, int, float);
+    extern template VNNISafeNormResult normalize_q16_head_to_vnni_safe<Q16_1Block_128>(
+        Q16_1Block_128 *, size_t, int, float);
 
 } // namespace llaminar2::primitives

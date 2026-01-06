@@ -698,7 +698,7 @@ namespace llaminar2
             params.seq_len = seq_len / batch_size;
             // Phase 5.4: VNNI-safe Q16 KV cache parameters
             params.head_dim = stage.int_params.count("head_dim") ? stage.int_params.at("head_dim") : 128;
-            params.kv_cache_scale = stage.float_params.count("kv_cache_scale") ? stage.float_params.at("kv_cache_scale") : 8.0f;
+            params.kv_cache_scale = stage.float_params.count("kv_cache_scale") ? stage.float_params.at("kv_cache_scale") : 64.0f;
             return ComputeStageFactory::createKVCacheAppend(params);
         }
 

@@ -153,6 +153,11 @@ namespace llaminar2
             // - During decode: params_.K/V point to current token, cache has full context
             TensorBase *k_tensor = params_.K;
             TensorBase *v_tensor = params_.V;
+            LOG_DEBUG("[FusedAttentionWoStage] Q16_INTEGER checking KV cache: kv_cache="
+                      << static_cast<const void *>(params_.kv_cache)
+                      << " layer_idx=" << params_.layer_idx
+                      << " K=" << (params_.K ? params_.K->dtype_name() : "null")
+                      << " V=" << (params_.V ? params_.V->dtype_name() : "null"));
             if (params_.kv_cache && params_.layer_idx >= 0)
             {
                 // Always use cache for Q16_INTEGER - cache has properly typed Q16_1 tensors
@@ -412,14 +417,32 @@ namespace llaminar2
             std::vector<uint8_t> K_transposed_bytes;
             std::vector<uint8_t> V_transposed_bytes;
 
+            // Use TYPE-SAFE Q16BlockPtr wrappers to ensure block type matches
+            Q16BlockPtr K_ptr, V_ptr;
+
             if (kv_is_head_major)
             {
                 // HEAD_MAJOR: use K/V data directly - already in correct layout
-                q16_params.K = k_q16->raw_data();
-                q16_params.V = v_q16->raw_data();
+                // Create type-safe pointers based on actual block size
+                switch (block_size)
+                {
+                case Q16BlockSize::BLOCK_64:
+                    K_ptr = (k_q16->as_block_64());
+                    V_ptr = (v_q16->as_block_64());
+                    break;
+                case Q16BlockSize::BLOCK_128:
+                    K_ptr = (k_q16->as_block_128());
+                    V_ptr = (v_q16->as_block_128());
+                    break;
+                case Q16BlockSize::BLOCK_32:
+                    K_ptr = (k_q16->as_block_32());
+                    V_ptr = (v_q16->as_block_32());
+                    break;
+                }
                 LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx
                                                            << " HEAD_MAJOR KV cache: no transpose needed"
-                                                           << " kv_len=" << effective_kv_len);
+                                                           << " kv_len=" << effective_kv_len
+                                                           << " block_size=" << static_cast<int>(block_size));
             }
             else
             {
@@ -457,11 +480,114 @@ namespace llaminar2
                                                            << " blocks_per_head=" << blocks_per_head
                                                            << " total_blocks=" << total_blocks);
 
-                q16_params.K = K_transposed_bytes.data();
-                q16_params.V = V_transposed_bytes.data();
+                // Create type-safe pointers to transposed data
+                switch (block_size)
+                {
+                case Q16BlockSize::BLOCK_64:
+                    K_ptr = (reinterpret_cast<const Q16_1Block_64 *>(K_transposed_bytes.data()));
+                    V_ptr = (reinterpret_cast<const Q16_1Block_64 *>(V_transposed_bytes.data()));
+                    break;
+                case Q16BlockSize::BLOCK_128:
+                    K_ptr = (reinterpret_cast<const Q16_1Block_128 *>(K_transposed_bytes.data()));
+                    V_ptr = (reinterpret_cast<const Q16_1Block_128 *>(V_transposed_bytes.data()));
+                    break;
+                case Q16BlockSize::BLOCK_32:
+                    K_ptr = (reinterpret_cast<const Q16_1Block *>(K_transposed_bytes.data()));
+                    V_ptr = (reinterpret_cast<const Q16_1Block *>(V_transposed_bytes.data()));
+                    break;
+                }
             }
 
-            q16_params.Q = q_q16->typed_data();
+            // Set type-safe K/V pointers
+            q16_params.K = K_ptr;
+            q16_params.V = V_ptr;
+
+            // ================================================================
+            // Q TRANSPOSE: Pipeline Q is [seq_len, n_heads, head_dim] (position-major)
+            // Q16 kernel expects [n_heads, seq_len, head_dim] (head-major)
+            // Need to transpose Q for prefill mode (seq_len > 1)
+            // ================================================================
+            const Q16BlockSize q_block_size = q_q16->q16_block_size();
+            const size_t q_block_bytes = q16_block_size_bytes(q_block_size);
+            const size_t q_block_elements = q16_block_size_elements(q_block_size);
+            const int q_blocks_per_head = (params_.head_dim + static_cast<int>(q_block_elements) - 1) / static_cast<int>(q_block_elements);
+
+            // Storage for transposed Q (only allocated if needed for prefill)
+            std::vector<uint8_t> Q_transposed_bytes;
+            Q16BlockPtr Q_ptr;
+
+            if (params_.seq_len > 1)
+            {
+                // Prefill mode: need to transpose Q from [seq_len, n_heads, head_dim] to [n_heads, seq_len, head_dim]
+                const int total_q_blocks = params_.seq_len * params_.n_heads * q_blocks_per_head;
+                Q_transposed_bytes.resize(total_q_blocks * q_block_bytes);
+
+                const uint8_t *Q_src = static_cast<const uint8_t *>(q_q16->raw_data());
+
+                // Transpose: position-major [p][h] -> head-major [h][p]
+                for (int h = 0; h < params_.n_heads; ++h)
+                {
+                    for (int p = 0; p < params_.seq_len; ++p)
+                    {
+                        // Source index: position-major [p * n_heads + h]
+                        const size_t src_block_idx = (static_cast<size_t>(p) * params_.n_heads + h) * q_blocks_per_head;
+                        // Dest index: head-major [h * seq_len + p]
+                        const size_t dst_block_idx = (static_cast<size_t>(h) * params_.seq_len + p) * q_blocks_per_head;
+
+                        // Copy all blocks for this head/position
+                        std::memcpy(Q_transposed_bytes.data() + dst_block_idx * q_block_bytes,
+                                    Q_src + src_block_idx * q_block_bytes,
+                                    q_blocks_per_head * q_block_bytes);
+                    }
+                }
+
+                LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx
+                                                           << " Q TRANSPOSE (prefill): seq_len=" << params_.seq_len
+                                                           << " n_heads=" << params_.n_heads
+                                                           << " blocks_per_head=" << q_blocks_per_head
+                                                           << " total_blocks=" << total_q_blocks);
+
+                // Create type-safe pointer to transposed Q data
+                switch (q_block_size)
+                {
+                case Q16BlockSize::BLOCK_64:
+                    Q_ptr = (reinterpret_cast<const Q16_1Block_64 *>(Q_transposed_bytes.data()));
+                    break;
+                case Q16BlockSize::BLOCK_128:
+                    Q_ptr = (reinterpret_cast<const Q16_1Block_128 *>(Q_transposed_bytes.data()));
+                    break;
+                case Q16BlockSize::BLOCK_32:
+                    Q_ptr = (reinterpret_cast<const Q16_1Block *>(Q_transposed_bytes.data()));
+                    break;
+                }
+            }
+            else
+            {
+                // Decode mode (seq_len=1): no transpose needed - Q is just [n_heads, head_dim]
+                // which is equivalent to [n_heads, 1, head_dim]
+                switch (q_block_size)
+                {
+                case Q16BlockSize::BLOCK_64:
+                    Q_ptr = (q_q16->as_block_64());
+                    break;
+                case Q16BlockSize::BLOCK_128:
+                    Q_ptr = (q_q16->as_block_128());
+                    break;
+                case Q16BlockSize::BLOCK_32:
+                    Q_ptr = (q_q16->as_block_32());
+                    break;
+                }
+                LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx
+                                                           << " Q NO TRANSPOSE (decode): seq_len=" << params_.seq_len);
+            }
+
+            // Set Q pointer (transposed for prefill, direct for decode)
+            q16_params.Q = Q_ptr;
+
+            LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx
+                                                       << " Q/K/V block_size=" << static_cast<int>(block_size)
+                                                       << " Q.block_size=" << static_cast<int>(q16_params.Q.block_size)
+                                                       << " head_dim=" << params_.head_dim);
 
             // Wo weights - get VNNI packed weights via KernelFactory
             // Check if Wo implements IINT8Unpackable (quantized formats)
@@ -490,12 +616,14 @@ namespace llaminar2
 
             // Residual fusion: output tensor IS the residual (in-place read-modify-write)
             // Q16_INTEGER always uses fused residual path (validated above)
+            // Residual uses 32-element Q16_1Block for compatibility with GEMM pipeline
             if (auto *out_q16 = dynamic_cast<Q16_1Tensor *>(params_.output))
             {
                 // residual_in = residual_out = output tensor (in-place accumulation)
-                q16_params.residual_in = out_q16->typed_data();
-                q16_params.residual_out = out_q16->mutable_typed_data();
-                LOG_DEBUG("[FusedAttentionWoStage] Q16_INTEGER: Residual fusion enabled (in-place Q16_1)");
+                // Use as_block_32() for typed access to 32-element blocks
+                q16_params.residual_in = out_q16->as_block_32();
+                q16_params.residual_out = out_q16->mutable_as_block_32();
+                LOG_DEBUG("[FusedAttentionWoStage] Q16_INTEGER: Residual fusion enabled (in-place Q16_1Block)");
             }
             else
             {
@@ -511,6 +639,21 @@ namespace llaminar2
             q16_params.n_kv_heads = params_.n_kv_heads;
             q16_params.head_dim = params_.head_dim;
             q16_params.d_model = params_.d_model;
+
+            // KV cache layout: HEAD_MAJOR uses sparse allocation with stride = max_seq_len
+            // Dense/transposed data uses stride = kv_len (packed)
+            if (kv_is_head_major && params_.kv_cache)
+            {
+                q16_params.kv_head_stride = params_.kv_cache->max_seq_len();
+                LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx
+                                                           << " HEAD_MAJOR sparse cache: kv_head_stride="
+                                                           << q16_params.kv_head_stride
+                                                           << " (max_seq_len), kv_len=" << effective_kv_len);
+            }
+            else
+            {
+                q16_params.kv_head_stride = 0; // Use default (kv_len)
+            }
 
             // Debug metadata
             q16_params.layer_idx = params_.layer_idx;
@@ -557,6 +700,28 @@ namespace llaminar2
                           << q16_params.attention_residual_snapshot);
             }
 #endif
+
+            // Wire K_head_scales for HybridQ16 K precision fix
+            // This enables per-head K scale lookup in the attention kernel
+            q16_params.k_head_scales = params_.K_head_scales;
+            if (params_.K_head_scales)
+            {
+                LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx
+                                                           << " K_head_scales provided (K precision fix active)"
+                                                           << " scales[0]=" << params_.K_head_scales[0]);
+                // Debug: print all K scales for first layer
+                if (params_.layer_idx == 0)
+                {
+                    const int n_k_scales = params_.kv_len * params_.n_kv_heads;
+                    std::stringstream ss;
+                    ss << "[FusedAttentionWoStage] Layer 0 ALL K_head_scales (" << n_k_scales << " total): ";
+                    for (int i = 0; i < std::min(n_k_scales, 20); ++i)
+                    {
+                        ss << params_.K_head_scales[i] << " ";
+                    }
+                    LOG_DEBUG(ss.str());
+                }
+            }
 
             success = q16_kernel_->compute(q16_params);
         }
@@ -620,6 +785,51 @@ namespace llaminar2
     StageDumpInfo FusedAttentionWoStage::getDumpInfo() const
     {
         StageDumpInfo info;
+
+        // =====================================================================
+        // INPUT TENSORS - Q, K, V as they arrive at the attention kernel
+        // =====================================================================
+
+        // Q tensor: [seq_len][n_heads * head_dim]
+        if (params_.Q)
+        {
+            const size_t q_rows = static_cast<size_t>(params_.batch_size * params_.seq_len);
+            const size_t q_cols = static_cast<size_t>(params_.n_heads * params_.head_dim);
+            info.addInput("Q", params_.Q, q_rows, q_cols);
+
+            // Log Q tensor stats for debugging
+            LOG_DEBUG("[FusedAttentionWoStage::getDumpInfo] Q tensor: type="
+                      << static_cast<int>(params_.Q->native_type())
+                      << " rows=" << q_rows << " cols=" << q_cols);
+        }
+
+        // K tensor: [kv_len][n_kv_heads * head_dim] - from KV cache
+        if (params_.K)
+        {
+            const size_t k_rows = static_cast<size_t>(params_.batch_size * params_.kv_len);
+            const size_t k_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
+            info.addInput("K", params_.K, k_rows, k_cols);
+
+            LOG_DEBUG("[FusedAttentionWoStage::getDumpInfo] K tensor: type="
+                      << static_cast<int>(params_.K->native_type())
+                      << " rows=" << k_rows << " cols=" << k_cols);
+        }
+
+        // V tensor: [kv_len][n_kv_heads * head_dim] - from KV cache
+        if (params_.V)
+        {
+            const size_t v_rows = static_cast<size_t>(params_.batch_size * params_.kv_len);
+            const size_t v_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
+            info.addInput("V", params_.V, v_rows, v_cols);
+
+            LOG_DEBUG("[FusedAttentionWoStage::getDumpInfo] V tensor: type="
+                      << static_cast<int>(params_.V->native_type())
+                      << " rows=" << v_rows << " cols=" << v_cols);
+        }
+
+        // =====================================================================
+        // OUTPUT TENSORS - Context and attention snapshots
+        // =====================================================================
 
         // Context snapshot: pre-Wo attention output (for debugging/parity testing)
         // This is ATTENTION_CONTEXT in pipeline terminology

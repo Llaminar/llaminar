@@ -942,6 +942,7 @@ namespace llaminar2
      * - LLAMINAR_STAGE_DUMP_ENABLED=1          Master enable for stage dumping
      * - LLAMINAR_STAGE_DUMP_DIR=/path          Output directory (default: /tmp/llaminar_stage_dumps)
      * - LLAMINAR_STAGE_DUMP_TYPES=GEMM,ATTENTION  Stage types to dump (default: all)
+     * - LLAMINAR_STAGE_DUMP_NAMES=layer0_attention  Stage names to dump (default: all)
      * - LLAMINAR_STAGE_DUMP_LAYERS=0,1,5       Layer indices to dump (default: all)
      * - LLAMINAR_STAGE_DUMP_RANK=0             MPI rank to dump (-1=all, default: 0)
      * - LLAMINAR_STAGE_DUMP_MAX=100            Maximum dumps per type (prevent disk explosion)
@@ -973,6 +974,11 @@ namespace llaminar2
      *   LLAMINAR_STAGE_DUMP_LAYERS=0 \
      *   ./run_llaminar.sh -m model.gguf -p "test"
      *
+     *   # Dump attention stage by name for HybridQ16 debugging
+     *   LLAMINAR_STAGE_DUMP_ENABLED=1 \
+     *   LLAMINAR_STAGE_DUMP_NAMES=layer0_attention \
+     *   ./run_llaminar.sh -m model.gguf -p "test"
+     *
      *   # Dump attention stages for first decode iteration only
      *   LLAMINAR_STAGE_DUMP_ENABLED=1 \
      *   LLAMINAR_STAGE_DUMP_TYPES=ATTENTION \
@@ -984,6 +990,7 @@ namespace llaminar2
         bool enabled = false;                               ///< Master enable for stage dumping
         std::string dump_dir = "/tmp/llaminar_stage_dumps"; ///< Output directory
         std::set<std::string> dump_types;                   ///< Stage types to dump (empty=all)
+        std::set<std::string> dump_names;                   ///< Stage names to dump (empty=all)
         std::set<int> dump_layers;                          ///< Layer indices to dump (empty=all)
         std::set<int> dump_iterations;                      ///< Decode iterations to dump (empty=all)
         int dump_rank = 0;                                  ///< MPI rank to dump (-1=all)
@@ -992,6 +999,7 @@ namespace llaminar2
         bool dump_outputs = true;                           ///< Dump output tensors
         bool dump_weights = true;                           ///< Dump weight tensors
         bool dump_all_types = true;                         ///< Whether to dump all stage types
+        bool dump_all_names = true;                         ///< Whether to dump all stage names
         bool dump_all_layers = true;                        ///< Whether to dump all layers
         bool dump_all_iterations = true;                    ///< Whether to dump all iterations
 
@@ -1036,6 +1044,33 @@ namespace llaminar2
                         if (!token.empty())
                         {
                             dump_types.insert(token);
+                        }
+                    }
+                }
+            }
+
+            const char *names_env = std::getenv("LLAMINAR_STAGE_DUMP_NAMES");
+            if (names_env)
+            {
+                std::string names_str(names_env);
+                if (names_str == "all")
+                {
+                    dump_all_names = true;
+                    dump_names.clear();
+                }
+                else
+                {
+                    dump_all_names = false;
+                    dump_names.clear();
+                    std::istringstream iss(names_str);
+                    std::string token;
+                    while (std::getline(iss, token, ','))
+                    {
+                        token.erase(0, token.find_first_not_of(" \t"));
+                        token.erase(token.find_last_not_of(" \t") + 1);
+                        if (!token.empty())
+                        {
+                            dump_names.insert(token);
                         }
                     }
                 }
@@ -1171,21 +1206,58 @@ namespace llaminar2
         }
 
         /**
+         * @brief Check if a specific stage name should be dumped
+         *
+         * Uses **substring matching** for flexibility:
+         * - "fused_attn_wo" matches "layer0_fused_attn_wo", "layer5_fused_attn_wo", etc.
+         * - "layer0" matches all layer0 stages
+         * - Exact match also works: "layer0_fused_attn_wo" matches "layer0_fused_attn_wo"
+         *
+         * @param stage_name Stage node name (e.g., "layer0_attention", "prefill_attention")
+         * @return true if this stage name should be dumped
+         */
+        bool shouldDumpName(const std::string &stage_name) const
+        {
+            if (dump_all_names)
+                return true;
+
+            // Substring matching: any filter string that appears in stage_name matches
+            for (const auto &filter : dump_names)
+            {
+                if (stage_name.find(filter) != std::string::npos)
+                    return true;
+            }
+            return false;
+        }
+
+        /**
          * @brief Full filter: check if a stage execution should be dumped
-         * @param type_name Stage type name
+         * @param type_name Stage type name (e.g., "GEMM", "ATTENTION")
+         * @param stage_name Stage node name (e.g., "layer0_attention")
          * @param layer_idx Layer index (-1 for non-layer stages)
          * @param iteration Decode iteration (-1 for prefill)
          * @param rank MPI rank
          * @return true if this stage execution should be dumped
          */
-        bool shouldDump(const std::string &type_name, int layer_idx, int iteration, int rank) const
+        bool shouldDump(const std::string &type_name, const std::string &stage_name,
+                        int layer_idx, int iteration, int rank) const
         {
             if (!enabled)
                 return false;
             return shouldDumpType(type_name) &&
+                   shouldDumpName(stage_name) &&
                    shouldDumpLayer(layer_idx) &&
                    shouldDumpIteration(iteration) &&
                    shouldDumpRank(rank);
+        }
+
+        /**
+         * @brief Legacy full filter (without stage name)
+         * @deprecated Use the overload with stage_name parameter
+         */
+        bool shouldDump(const std::string &type_name, int layer_idx, int iteration, int rank) const
+        {
+            return shouldDump(type_name, "", layer_idx, iteration, rank);
         }
     };
 
@@ -1276,12 +1348,12 @@ namespace llaminar2
      */
     struct ValidationConfig
     {
-        bool validate_buffers = false;    ///< Enable buffer validation after stage execution
-        bool validate_inputs = false;     ///< Enable input validation BEFORE stage execution (Phase 1)
-        bool fail_on_zero = false;        ///< Fail immediately when all-zero OUTPUT tensor detected (auto-enabled in Debug)
-        bool fail_on_nan = false;         ///< Fail immediately when NaN/Inf detected
-        bool dump_on_failure = true;      ///< Dump all buffers to disk when verification fails
-        int sample_rows = 8;              ///< Number of rows to sample for verification (efficiency)
+        bool validate_buffers = false; ///< Enable buffer validation after stage execution
+        bool validate_inputs = false;  ///< Enable input validation BEFORE stage execution (Phase 1)
+        bool fail_on_zero = false;     ///< Fail immediately when all-zero OUTPUT tensor detected (auto-enabled in Debug)
+        bool fail_on_nan = false;      ///< Fail immediately when NaN/Inf detected
+        bool dump_on_failure = true;   ///< Dump all buffers to disk when verification fails
+        int sample_rows = 8;           ///< Number of rows to sample for verification (efficiency)
 
         ValidationConfig()
         {
@@ -1294,9 +1366,9 @@ namespace llaminar2
             // This is the default for Debug and Integration builds
 #if LLAMINAR_ASSERTIONS_ACTIVE
             validate_buffers = true;
-            validate_inputs = true;  // Enable input validation in debug builds
-            fail_on_nan = true;      // NaN/Inf is always a bug, fail by default
-            fail_on_zero = true;     // All-zero OUTPUTS are almost always bugs
+            validate_inputs = true; // Enable input validation in debug builds
+            fail_on_nan = true;     // NaN/Inf is always a bug, fail by default
+            fail_on_zero = true;    // All-zero OUTPUTS are almost always bugs
 #endif
 
             // Environment variables can override the defaults

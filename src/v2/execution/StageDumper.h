@@ -78,6 +78,7 @@ namespace llaminar2
         int dump_id = -1;            ///< Unique dump ID (-1 = skip)
         std::string dump_dir;        ///< Full path to dump directory
         std::string type_name;       ///< Stage type name
+        std::string stage_name;      ///< Stage node name (e.g., "layer0_attention")
         int layer_idx = -1;          ///< Layer index (-1 if not layer-specific)
         int iteration = -1;          ///< Decode iteration (-1 for prefill)
         int rank = 0;                ///< MPI rank
@@ -111,6 +112,52 @@ namespace llaminar2
         size_t element_count = 0;
         size_t byte_size = 0;
         float sample_min = 0, sample_max = 0, sample_mean = 0;
+
+        // Block info for quantized formats (computed from dtype and dims)
+        size_t block_count = 0;        ///< Total blocks (0 for non-block formats)
+        size_t blocks_per_row = 0;     ///< Blocks per row (0 for non-block formats)
+        size_t block_element_size = 0; ///< Elements per block (e.g., 32)
+
+        /**
+         * @brief Compute block-related metadata from dtype and dimensions
+         * Call this after setting rows, cols, dtype
+         *
+         * Handles variable Q16_1 block sizes:
+         * - Q16_1 / Q16_1_32: 32 elements per block
+         * - Q16_1_64: 64 elements per block
+         * - Q16_1_128: 128 elements per block
+         */
+        void computeBlockInfo()
+        {
+            constexpr size_t BLOCK_SIZE_32 = 32;   // Elements per block (Q8_1, Q8_0, Q16_1_32, IQ4_NL)
+            constexpr size_t BLOCK_SIZE_64 = 64;   // Elements per block (Q16_1_64)
+            constexpr size_t BLOCK_SIZE_128 = 128; // Elements per block (Q16_1_128)
+
+            if (dtype == "Q8_1" || dtype == "Q16_1" || dtype == "Q16_1_32" || dtype == "Q8_0" || dtype == "IQ4_NL")
+            {
+                block_element_size = BLOCK_SIZE_32;
+                blocks_per_row = (cols + BLOCK_SIZE_32 - 1) / BLOCK_SIZE_32;
+                block_count = rows * blocks_per_row;
+            }
+            else if (dtype == "Q16_1_64")
+            {
+                block_element_size = BLOCK_SIZE_64;
+                blocks_per_row = (cols + BLOCK_SIZE_64 - 1) / BLOCK_SIZE_64;
+                block_count = rows * blocks_per_row;
+            }
+            else if (dtype == "Q16_1_128")
+            {
+                block_element_size = BLOCK_SIZE_128;
+                blocks_per_row = (cols + BLOCK_SIZE_128 - 1) / BLOCK_SIZE_128;
+                block_count = rows * blocks_per_row;
+            }
+            else
+            {
+                block_element_size = 0;
+                blocks_per_row = 0;
+                block_count = 0;
+            }
+        }
     };
 
     /**
@@ -120,14 +167,63 @@ namespace llaminar2
     {
     public:
         /**
-         * @brief Check if dumping is enabled for a stage execution
+         * @brief Extract layer index from stage name
+         *
+         * Parses names like "layer0_fused_attn_wo" → 0, "layer23_ffn_norm" → 23
+         * Returns -1 if no layer prefix found.
          */
-        static bool shouldDump(const IComputeStage *stage, int layer_idx, int iteration, int rank)
+        static int extractLayerFromName(const std::string &stage_name)
+        {
+            if (stage_name.length() < 6 || stage_name.substr(0, 5) != "layer")
+                return -1;
+
+            size_t underscore_pos = stage_name.find('_', 5);
+            if (underscore_pos == std::string::npos)
+                return -1;
+
+            try
+            {
+                return std::stoi(stage_name.substr(5, underscore_pos - 5));
+            }
+            catch (...)
+            {
+                return -1;
+            }
+        }
+
+        /**
+         * @brief Check if dumping is enabled for a stage execution (with stage name)
+         * @param stage The compute stage
+         * @param stage_name The node name (e.g., "layer0_attention")
+         * @param layer_idx Layer index (-1 if not layer-specific, will try to extract from stage_name)
+         * @param iteration Decode iteration (-1 for prefill)
+         * @param rank MPI rank
+         * @return true if this stage execution should be dumped
+         */
+        static bool shouldDump(const IComputeStage *stage, const std::string &stage_name,
+                               int layer_idx, int iteration, int rank)
         {
             const auto &cfg = debugEnv().stage_dump;
             if (!cfg.enabled)
                 return false;
-            return cfg.shouldDump(computeStageTypeName(stage->type()), layer_idx, iteration, rank);
+
+            // If layer_idx not provided, try to extract from stage_name
+            int effective_layer = layer_idx;
+            if (effective_layer < 0 && !stage_name.empty())
+            {
+                effective_layer = extractLayerFromName(stage_name);
+            }
+
+            return cfg.shouldDump(computeStageTypeName(stage->type()), stage_name, effective_layer, iteration, rank);
+        }
+
+        /**
+         * @brief Legacy check without stage name
+         * @deprecated Use the overload with stage_name parameter
+         */
+        static bool shouldDump(const IComputeStage *stage, int layer_idx, int iteration, int rank)
+        {
+            return shouldDump(stage, "", layer_idx, iteration, rank);
         }
 
         /**
@@ -137,6 +233,7 @@ namespace llaminar2
          * The returned context should be passed to dumpOutputs() after execution.
          *
          * @param stage The compute stage
+         * @param stage_name The node name (e.g., "layer0_attention")
          * @param layer_idx Layer index (-1 if not layer-specific)
          * @param iteration Decode iteration (-1 for prefill)
          * @param rank MPI rank
@@ -144,12 +241,14 @@ namespace llaminar2
          */
         static StageDumpContext beginDump(
             const IComputeStage *stage,
+            const std::string &stage_name,
             int layer_idx,
             int iteration,
             int rank)
         {
             StageDumpContext ctx;
             ctx.type_name = computeStageTypeName(stage->type());
+            ctx.stage_name = stage_name;
             ctx.layer_idx = layer_idx;
             ctx.iteration = iteration;
             ctx.rank = rank;
@@ -165,8 +264,9 @@ namespace llaminar2
 
             ctx.dump_id = count - 1; // 0-indexed dump ID
 
-            // Create dump directory
-            ctx.dump_dir = createDumpDirectory(cfg.dump_dir, ctx.type_name, ctx.dump_id, layer_idx, iteration, rank);
+            // Create dump directory (include stage_name in directory name)
+            ctx.dump_dir = createDumpDirectory(cfg.dump_dir, ctx.type_name, stage_name,
+                                               ctx.dump_id, layer_idx, iteration, rank);
             if (ctx.dump_dir.empty())
             {
                 ctx.dump_id = -1;
@@ -174,6 +274,19 @@ namespace llaminar2
             }
 
             return ctx;
+        }
+
+        /**
+         * @brief Legacy beginDump without stage name
+         * @deprecated Use the overload with stage_name parameter
+         */
+        static StageDumpContext beginDump(
+            const IComputeStage *stage,
+            int layer_idx,
+            int iteration,
+            int rank)
+        {
+            return beginDump(stage, "", layer_idx, iteration, rank);
         }
 
         /**
@@ -209,6 +322,10 @@ namespace llaminar2
                     meta.rows = input.rows;
                     meta.cols = input.cols;
                     meta.dtype = input.dtype;
+                    meta.computeBlockInfo(); // Compute block metadata for quantized formats
+
+                    // Use explicit byte_size from input (now computed correctly from logical dims)
+                    size_t dump_bytes = input.byte_size;
 
                     if (std::string(input.dtype) == "FP32")
                     {
@@ -216,16 +333,14 @@ namespace llaminar2
                         dumpFP32Buffer(path, static_cast<const float *>(input.data),
                                        input.rows * input.cols, meta);
                     }
-                    else if (std::string(input.dtype) == "Q8_1")
-                    {
-                        path += "_q8_1.bin";
-                        dumpQ8_1Blocks(path, input.data, input.rows * input.cols, meta);
-                    }
                     else
                     {
-                        // Generic binary dump
-                        path += ".bin";
-                        dumpRawBuffer(path, input.data, input.rows * input.cols * input.element_size, meta);
+                        // Dump in native format (Q8_1, Q16_1, etc.)
+                        // Use dtype-specific extension for clarity
+                        std::string dtype_lower = input.dtype;
+                        std::transform(dtype_lower.begin(), dtype_lower.end(), dtype_lower.begin(), ::tolower);
+                        path += "_" + dtype_lower + ".bin";
+                        dumpRawBuffer(path, input.data, dump_bytes, meta);
                     }
 
                     writeTensorMeta(ctx.dump_dir + "/inputs/" + input.name + "_meta.txt", meta);
@@ -314,6 +429,10 @@ namespace llaminar2
                 meta.rows = output.rows;
                 meta.cols = output.cols;
                 meta.dtype = output.dtype;
+                meta.computeBlockInfo(); // Compute block metadata for quantized formats
+
+                // Use explicit byte_size from output (now computed correctly from logical dims)
+                size_t dump_bytes = output.byte_size;
 
                 if (std::string(output.dtype) == "FP32")
                 {
@@ -321,15 +440,13 @@ namespace llaminar2
                     dumpFP32Buffer(path, static_cast<const float *>(output.data),
                                    output.rows * output.cols, meta);
                 }
-                else if (std::string(output.dtype) == "Q8_1")
-                {
-                    path += "_q8_1.bin";
-                    dumpQ8_1Blocks(path, output.data, output.rows * output.cols, meta);
-                }
                 else
                 {
-                    path += ".bin";
-                    dumpRawBuffer(path, output.data, output.rows * output.cols * output.element_size, meta);
+                    // Dump in native format (Q8_1, Q16_1, etc.)
+                    std::string dtype_lower = output.dtype;
+                    std::transform(dtype_lower.begin(), dtype_lower.end(), dtype_lower.begin(), ::tolower);
+                    path += "_" + dtype_lower + ".bin";
+                    dumpRawBuffer(path, output.data, dump_bytes, meta);
                 }
 
                 writeTensorMeta(ctx.dump_dir + "/outputs/" + output.name + "_meta.txt", meta);
@@ -373,11 +490,12 @@ namespace llaminar2
         }
 
         /**
-         * @brief Create dump directory structure
+         * @brief Create dump directory structure (with stage name)
          */
         static std::string createDumpDirectory(
             const std::string &base_dir,
             const std::string &type_name,
+            const std::string &stage_name,
             int dump_id,
             int layer_idx,
             int iteration,
@@ -390,6 +508,10 @@ namespace llaminar2
             std::ostringstream oss;
             oss << base_dir << "/stage_" << std::setfill('0') << std::setw(4) << dump_id
                 << "_" << type_name;
+            if (!stage_name.empty())
+            {
+                oss << "_" << stage_name;
+            }
             if (layer_idx >= 0)
             {
                 oss << "_layer" << layer_idx;
@@ -429,6 +551,10 @@ namespace llaminar2
             fprintf(f, "# Llaminar Stage Dump\n");
             fprintf(f, "dump_id=%d\n", ctx.dump_id);
             fprintf(f, "type=%s\n", ctx.type_name.c_str());
+            if (!ctx.stage_name.empty())
+            {
+                fprintf(f, "name=%s\n", ctx.stage_name.c_str());
+            }
             fprintf(f, "layer_idx=%d\n", ctx.layer_idx);
             fprintf(f, "iteration=%d\n", ctx.iteration);
             fprintf(f, "rank=%d\n", ctx.rank);
@@ -543,6 +669,16 @@ namespace llaminar2
             fprintf(f, "dtype=%s\n", meta.dtype.c_str());
             fprintf(f, "element_count=%zu\n", meta.element_count);
             fprintf(f, "byte_size=%zu\n", meta.byte_size);
+
+            // Add block info for quantized formats
+            if (meta.block_count > 0)
+            {
+                fprintf(f, "# Block format info:\n");
+                fprintf(f, "block_count=%zu\n", meta.block_count);
+                fprintf(f, "blocks_per_row=%zu\n", meta.blocks_per_row);
+                fprintf(f, "block_element_size=%zu\n", meta.block_element_size);
+            }
+
             fprintf(f, "sample_min=%f\n", meta.sample_min);
             fprintf(f, "sample_max=%f\n", meta.sample_max);
             fprintf(f, "sample_mean=%f\n", meta.sample_mean);

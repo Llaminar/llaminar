@@ -68,19 +68,26 @@ namespace llaminar2
                                  (params_.Q->native_type() == TensorType::Q8_1) &&
                                  (params_.Q_out->native_type() == TensorType::FP32);
 
-        // Detect HybridQ16 mode: Q8_1 input with Q16_1 output buffers
+        // Detect HybridQ16 mode: Q8_1 Q input with Q16_1 Q output
         const bool hybrid_q16_mode = (params_.Q_out != nullptr) &&
                                      (params_.Q->native_type() == TensorType::Q8_1) &&
                                      (params_.Q_out->native_type() == TensorType::Q16_1);
+
+        // Detect K precision fix mode: K input is Q16_1 (from GEMM, not Q8_1)
+        // This is the K precision fix for HybridQ16 where GEMM outputs K as Q16_1
+        const bool k_is_q16_1 = (params_.K != nullptr) &&
+                                (params_.K->native_type() == TensorType::Q16_1);
 
         LOG_DEBUG("[RoPEStage] Execute: seq_len=" << seq_len
                                                   << " n_heads=" << params_.n_heads
                                                   << " n_kv_heads=" << params_.n_kv_heads
                                                   << " head_dim=" << params_.head_dim
                                                   << " pos_offset=" << params_.pos_offset
-                                                  << " tensor_type=" << params_.Q->dtype_name()
+                                                  << " Q_type=" << params_.Q->dtype_name()
+                                                  << " K_type=" << (params_.K ? params_.K->dtype_name() : "nullptr")
                                                   << " hybrid_mode=" << (hybrid_mode ? "true" : "false")
-                                                  << " hybrid_q16_mode=" << (hybrid_q16_mode ? "true" : "false"));
+                                                  << " hybrid_q16_mode=" << (hybrid_q16_mode ? "true" : "false")
+                                                  << " k_is_q16_1=" << (k_is_q16_1 ? "true" : "false"));
 
         // Create kernel via KernelFactory with automatic type dispatch
         auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
@@ -119,7 +126,87 @@ namespace llaminar2
                 params_.device_idx);
         }
 
-        // HybridQ16 mode: use apply_q8_1_to_q16_fixed_scale() for Q8_1 → Q16_1 with fixed scale
+        // HybridQ16 mode with K precision fix: Q=Q8_1→Q16_1, K=Q16_1→Q16_1 (dynamic scale)
+        // This is the new path for the K precision fix where GEMM outputs K as Q16_1
+        if (hybrid_q16_mode && k_is_q16_1)
+        {
+            const Q16BlockSize block_size = optimal_q16_block_size(params_.head_dim);
+            LOG_DEBUG("[RoPEStage] Using HybridQ16 K precision fix mode: Q8_1→Q16_1 (fixed), Q16_1→Q16_1 (dynamic)");
+            LOG_DEBUG("[RoPEStage] block_size=" << static_cast<int>(block_size)
+                                                << " kv_cache_scale=" << params_.kv_cache_scale);
+
+            // Debug: Check K_in state from GEMM (TRACE level)
+            auto *k16_in = dynamic_cast<Q16_1Tensor *>(params_.K);
+            if (k16_in)
+            {
+                LOG_TRACE("[RoPEStage] K_in block_size=" << static_cast<int>(k16_in->block_size())
+                                                         << " shape=[" << k16_in->shape()[0] << "," << k16_in->shape()[1] << "]");
+                const float *k_fp32 = k16_in->fp32_data();
+                if (k_fp32)
+                {
+                    float max_val = 0.0f;
+                    int nonzero_count = 0;
+                    for (int i = 0; i < std::min(128, static_cast<int>(k16_in->numel())); ++i)
+                    {
+                        if (k_fp32[i] != 0.0f)
+                            nonzero_count++;
+                        max_val = std::max(max_val, std::fabs(k_fp32[i]));
+                    }
+                    LOG_TRACE("[RoPEStage] K_in[0:128] nonzero=" << nonzero_count
+                                                                 << " max_abs=" << max_val << " fp32[0]=" << k_fp32[0]);
+                }
+                // Debug: Check actual block d values
+                const auto *k_typed = k16_in->typed_data();
+                if (k_typed)
+                {
+                    const int blocks_per_head = params_.head_dim / 64; // Q16_1Block_64
+                    float max_d = 0.0f;
+                    for (int b = 0; b < std::min(blocks_per_head, 4); ++b)
+                    {
+                        max_d = std::max(max_d, std::fabs(k_typed[b].d));
+                    }
+                    LOG_TRACE("[RoPEStage] K_in block d values: d[0]=" << k_typed[0].d
+                                                                       << " d[1]=" << (blocks_per_head > 1 ? k_typed[1].d : 0.0f)
+                                                                       << " max_d=" << max_d);
+                }
+            }
+
+            bool success = kernel->apply_mixed_q8_k16_to_q16(
+                params_.Q,             // Q8_1 Q input
+                params_.K,             // Q16_1 K input (from GEMM!)
+                params_.Q_out,         // Q16_1 Q output
+                params_.K_out,         // Q16_1 K output
+                params_.K_head_scales, // Output: per-head K scales [seq_len * n_kv_heads]
+                block_size,
+                position_ids.data(),
+                seq_len,
+                params_.n_heads,
+                n_kv_heads,
+                params_.head_dim,
+                params_.theta_base,
+                params_.kv_cache_scale, // Fixed scale for Q output
+                params_.mpi_ctx,
+                params_.device_idx);
+
+            if (success)
+            {
+                auto *q16_out = dynamic_cast<Q16_1Tensor *>(params_.Q_out);
+                auto *k16_out = dynamic_cast<Q16_1Tensor *>(params_.K_out);
+                if (q16_out && q16_out->typed_data())
+                {
+                    const auto &blk0 = q16_out->typed_data()[0];
+                    LOG_DEBUG("[RoPEStage] K-fix Q_out[0].d=" << blk0.d << " qs[0]=" << blk0.qs[0]);
+                }
+                if (k16_out && k16_out->typed_data())
+                {
+                    const auto &blk0 = k16_out->typed_data()[0];
+                    LOG_DEBUG("[RoPEStage] K-fix K_out[0].d=" << blk0.d << " qs[0]=" << blk0.qs[0]);
+                }
+            }
+            return success;
+        }
+
+        // HybridQ16 mode (standard): use apply_q8_1_to_q16_fixed_scale() for Q8_1 → Q16_1 with fixed scale
         // This ensures Q and K have the same scale as V (kv_cache_scale / 32767), enabling integer attention
         if (hybrid_q16_mode)
         {
@@ -265,8 +352,40 @@ namespace llaminar2
             const float *q_out_data = getSafeFp32Data(params_.Q_out);
             if (q_out_data)
             {
-                info.addOutput("Q", q_out_data,
-                               seq_len, params_.n_heads * params_.head_dim);
+                // HybridQ16 RoPE outputs Q in head-major layout [n_heads, seq, dim]
+                // for the attention kernel. But snapshots expect seq-major [seq, n_heads * dim]
+                // to match FP32 reference. Convert layout for snapshot comparison.
+                if (hybrid_q16_mode)
+                {
+                    const int d_model = params_.n_heads * params_.head_dim;
+                    // Cache the converted buffer in the stage (lazy allocation)
+                    if (q_transposed_cache_.size() != static_cast<size_t>(seq_len * d_model))
+                    {
+                        q_transposed_cache_.resize(seq_len * d_model);
+                    }
+                    // Convert [n_heads, seq, dim] -> [seq, n_heads * dim]
+                    for (int h = 0; h < params_.n_heads; ++h)
+                    {
+                        for (int s = 0; s < seq_len; ++s)
+                        {
+                            for (int d = 0; d < params_.head_dim; ++d)
+                            {
+                                // Source: head-major [h][s][d]
+                                const int src_idx = h * seq_len * params_.head_dim + s * params_.head_dim + d;
+                                // Dest: seq-major [s][h*dim + d]
+                                const int dst_idx = s * d_model + h * params_.head_dim + d;
+                                q_transposed_cache_[dst_idx] = q_out_data[src_idx];
+                            }
+                        }
+                    }
+                    info.addOutput("Q", q_transposed_cache_.data(),
+                                   seq_len, d_model);
+                }
+                else
+                {
+                    info.addOutput("Q", q_out_data,
+                                   seq_len, params_.n_heads * params_.head_dim);
+                }
             }
         }
         else if (q_input_data)

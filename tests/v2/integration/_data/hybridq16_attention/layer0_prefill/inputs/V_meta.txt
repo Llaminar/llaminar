@@ -1,0 +1,13 @@
+name=V
+rows=9
+cols=128
+dtype=Q8_1
+element_count=0
+byte_size=1296
+# Block format info:
+block_count=36
+blocks_per_row=4
+block_element_size=32
+sample_min=0.000000
+sample_max=0.000000
+sample_mean=0.000000

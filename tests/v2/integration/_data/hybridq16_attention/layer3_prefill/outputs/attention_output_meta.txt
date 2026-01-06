@@ -1,0 +1,9 @@
+name=attention_output
+rows=9
+cols=896
+dtype=FP32
+element_count=8064
+byte_size=32256
+sample_min=-0.556837
+sample_max=0.331730
+sample_mean=0.000697

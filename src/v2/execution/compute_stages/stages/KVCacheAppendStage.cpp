@@ -298,8 +298,10 @@ namespace llaminar2
             else if (k_is_fp32)
             {
                 // K is FP32 - quantize to Q16_1 with fixed scale and VNNI clipping
+                // NOTE: Must use same block_size as KV cache (optimal_q16_block_size(head_dim))
                 k_q16_owned = std::make_unique<Q16_1Tensor>(
-                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim});
+                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim},
+                    optimal_q16_block_size(head_dim));
 
                 const float *k_fp32 = params_.K->fp32_data();
                 if (!k_fp32)
@@ -321,8 +323,10 @@ namespace llaminar2
             else
             {
                 // K is some other format (Q8_1, etc.) - dequant to FP32 first
+                // NOTE: Must use same block_size as KV cache (optimal_q16_block_size(head_dim))
                 k_q16_owned = std::make_unique<Q16_1Tensor>(
-                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim});
+                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim},
+                    optimal_q16_block_size(head_dim));
 
                 const float *k_fp32 = params_.K->fp32_data();
                 if (!k_fp32)
@@ -351,8 +355,10 @@ namespace llaminar2
             if (v_is_fp32)
             {
                 // V is FP32 - quantize to Q16_1 with fixed scale and VNNI clipping
+                // NOTE: Must use same block_size as KV cache (optimal_q16_block_size(head_dim))
                 v_q16_owned = std::make_unique<Q16_1Tensor>(
-                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim});
+                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim},
+                    optimal_q16_block_size(head_dim));
 
                 const float *v_fp32 = params_.V->fp32_data();
                 if (!v_fp32)
@@ -375,8 +381,10 @@ namespace llaminar2
                 // V is Q8_1 - dequant to FP32, then requant to Q16_1 with fixed scale
                 // NOTE: This is different from the old path which did direct int8→int16 scaling!
                 // The old path (×256) was NOT VNNI-safe because it produced values close to ±32767.
+                // NOTE: Must use same block_size as KV cache (optimal_q16_block_size(head_dim))
                 v_q16_owned = std::make_unique<Q16_1Tensor>(
-                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim});
+                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim},
+                    optimal_q16_block_size(head_dim));
 
                 const auto *v_q8 = dynamic_cast<const Q8_1Tensor *>(params_.V);
                 if (!v_q8)
@@ -423,8 +431,10 @@ namespace llaminar2
             else
             {
                 // V is some other format - try to dequant via fp32_data()
+                // NOTE: Must use same block_size as KV cache (optimal_q16_block_size(head_dim))
                 v_q16_owned = std::make_unique<Q16_1Tensor>(
-                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim});
+                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim},
+                    optimal_q16_block_size(head_dim));
 
                 const float *v_fp32 = params_.V->fp32_data();
                 if (!v_fp32)

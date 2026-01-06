@@ -819,20 +819,31 @@ namespace llaminar2
                 device_idx);
         }
 
-        // QKV buffers - use configured activation precision
-        // For Hybrid mode: Q/K are Q8_1 (from QKV GEMM), but we need separate FP32 buffers
-        // for post-RoPE to avoid the dequant→rotate→requant cycle
-        ActivationPrecision qkv_prec = resolveBufferPrecision(
-            act_prec, HybridBufferType::QKV_GEMM_Output, nullptr);
+        // QKV buffers - use per-projection precision for HybridQ16 mode
+        // HybridQ16: K is Q16_1 (256× better precision), Q and V are Q8_1
+        // This fixes the K precision loss where Q8_1 zeros out small values
+        ActivationPrecision q_prec = resolveBufferPrecision(
+            act_prec, HybridBufferType::Q_GEMM_Output, nullptr);
+        ActivationPrecision k_prec = resolveBufferPrecision(
+            act_prec, HybridBufferType::K_GEMM_Output, nullptr);
+        ActivationPrecision v_prec = resolveBufferPrecision(
+            act_prec, HybridBufferType::V_GEMM_Output, nullptr);
+
+        LOG_DEBUG("[GraphOrchestrator] QKV GEMM output precision: Q=" << activationPrecisionToString(q_prec)
+                                                                      << " K=" << activationPrecisionToString(k_prec)
+                                                                      << " V=" << activationPrecisionToString(v_prec));
+
         state_.Q = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
-            qkv_prec, device_idx);
+            q_prec, device_idx);
+        // K buffer: Q16_1 for HybridQ16 mode to preserve small values
+        // Pass head_dim for optimal Q16 block size (1 block per head)
         state_.K = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-            qkv_prec, device_idx);
+            k_prec, head_dim, device_idx);
         state_.V = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-            qkv_prec, device_idx);
+            v_prec, device_idx);
 
         // Hybrid/HybridQ16 mode: Allocate separate FP32 buffers for Q/K after RoPE
         // This eliminates the requantization step in RoPE
@@ -870,6 +881,17 @@ namespace llaminar2
             LOG_INFO("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
                                             << " mode: allocating V_dequant buffer ("
                                             << activationPrecisionToString(kv_cache_prec) << ")");
+
+            // HybridQ16 K precision fix: allocate per-head K scales buffer
+            // This stores dynamic scales from RoPE Q16→Q16 path for attention kernel
+            if (act_prec == ActivationPrecision::HybridQ16)
+            {
+                const size_t k_head_scales_size = static_cast<size_t>(batch_size * max_seq_len * buffer_n_kv_heads);
+                state_.K_head_scales.resize(k_head_scales_size, 1.0f);
+                LOG_INFO("[GraphOrchestrator] HybridQ16 K precision fix: allocating K_head_scales buffer ("
+                         << k_head_scales_size << " floats, "
+                         << k_head_scales_size * sizeof(float) / 1024 << " KB)");
+            }
         }
 
         // Attention output buffer
@@ -1110,6 +1132,13 @@ namespace llaminar2
         model_buffers.layer_buffers.Q_rope = state_.Q_rope.get();
         model_buffers.layer_buffers.K_rope = state_.K_rope.get();
         model_buffers.layer_buffers.V_dequant = state_.V_dequant.get();
+
+        // HybridQ16 K precision fix: per-head K scales from RoPE Q16→Q16
+        if (!state_.K_head_scales.empty())
+        {
+            model_buffers.layer_buffers.K_head_scales = state_.K_head_scales.data();
+            model_buffers.layer_buffers.K_head_scales_capacity = state_.K_head_scales.size();
+        }
 
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
         // Pass context snapshot buffer for attention debugging

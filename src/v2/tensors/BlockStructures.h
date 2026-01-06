@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <type_traits>
 
 namespace llaminar2
 {
@@ -239,6 +240,156 @@ namespace llaminar2
     {
         return static_cast<size_t>(size);
     }
+
+    // ========================================================================
+    // Type-Safe Q16 Block Pointer Wrappers
+    // ========================================================================
+    //
+    // These wrappers eliminate the dangerous `const void*` pattern by storing
+    // both the pointer and its actual block type together. Accessors return
+    // correctly typed pointers or nullptr if the wrong type is requested.
+    //
+    // Usage:
+    //   Q16BlockPtr ptr(tensor->as_block_64());  // Type is remembered
+    //   auto* blocks = ptr.as_block_64();        // Returns typed pointer
+    //   auto* wrong = ptr.as_block_128();        // Returns nullptr (type mismatch)
+    // ========================================================================
+
+    /**
+     * @brief Type-safe wrapper for const Q16_1 block pointers with runtime block size.
+     *
+     * This allows implicit conversion from typed block pointers, automatically
+     * setting the block_size field based on the source type.
+     */
+    struct Q16BlockPtr
+    {
+        const void *data = nullptr;
+        Q16BlockSize block_size = Q16BlockSize::BLOCK_64;
+
+        Q16BlockPtr() = default;
+
+        // Type-safe constructors - block_size is set automatically
+        // NON-EXPLICIT to allow implicit conversion (e.g., params.Q = block_ptr)
+        Q16BlockPtr(const Q16_1Block *p)
+            : data(p), block_size(Q16BlockSize::BLOCK_32)
+        {
+        }
+        Q16BlockPtr(const Q16_1Block_64 *p)
+            : data(p), block_size(Q16BlockSize::BLOCK_64)
+        {
+        }
+        Q16BlockPtr(const Q16_1Block_128 *p)
+            : data(p), block_size(Q16BlockSize::BLOCK_128)
+        {
+        }
+
+        // Generic pointer constructor for tests - defaults to BLOCK_64
+        // This allows assigning arbitrary pointers for null-check validation tests
+        template <typename T,
+                  typename = std::enable_if_t<!std::is_same_v<T, Q16_1Block> &&
+                                              !std::is_same_v<T, Q16_1Block_64> &&
+                                              !std::is_same_v<T, Q16_1Block_128>>>
+        Q16BlockPtr(const T *p)
+            : data(p), block_size(Q16BlockSize::BLOCK_64)
+        {
+        }
+
+        // Type-safe accessors - return nullptr if wrong type requested
+        const Q16_1Block *as_block_32() const
+        {
+            return block_size == Q16BlockSize::BLOCK_32
+                       ? static_cast<const Q16_1Block *>(data)
+                       : nullptr;
+        }
+        const Q16_1Block_64 *as_block_64() const
+        {
+            return block_size == Q16BlockSize::BLOCK_64
+                       ? static_cast<const Q16_1Block_64 *>(data)
+                       : nullptr;
+        }
+        const Q16_1Block_128 *as_block_128() const
+        {
+            return block_size == Q16BlockSize::BLOCK_128
+                       ? static_cast<const Q16_1Block_128 *>(data)
+                       : nullptr;
+        }
+
+        bool empty() const { return data == nullptr; }
+        explicit operator bool() const { return data != nullptr; }
+
+        /// Get block size in elements (32, 64, or 128)
+        int block_elements() const { return static_cast<int>(block_size); }
+    };
+
+    /**
+     * @brief Type-safe wrapper for mutable Q16_1 block pointers with runtime block size.
+     */
+    struct Q16BlockMutablePtr
+    {
+        void *data = nullptr;
+        Q16BlockSize block_size = Q16BlockSize::BLOCK_64;
+
+        Q16BlockMutablePtr() = default;
+
+        // Type-safe constructors - NON-EXPLICIT to allow implicit conversion
+        Q16BlockMutablePtr(Q16_1Block *p)
+            : data(p), block_size(Q16BlockSize::BLOCK_32)
+        {
+        }
+        Q16BlockMutablePtr(Q16_1Block_64 *p)
+            : data(p), block_size(Q16BlockSize::BLOCK_64)
+        {
+        }
+        Q16BlockMutablePtr(Q16_1Block_128 *p)
+            : data(p), block_size(Q16BlockSize::BLOCK_128)
+        {
+        }
+
+        // Mutable accessors
+        Q16_1Block *as_block_32()
+        {
+            return block_size == Q16BlockSize::BLOCK_32
+                       ? static_cast<Q16_1Block *>(data)
+                       : nullptr;
+        }
+        Q16_1Block_64 *as_block_64()
+        {
+            return block_size == Q16BlockSize::BLOCK_64
+                       ? static_cast<Q16_1Block_64 *>(data)
+                       : nullptr;
+        }
+        Q16_1Block_128 *as_block_128()
+        {
+            return block_size == Q16BlockSize::BLOCK_128
+                       ? static_cast<Q16_1Block_128 *>(data)
+                       : nullptr;
+        }
+
+        // Const accessors for reading
+        const Q16_1Block *as_block_32() const
+        {
+            return block_size == Q16BlockSize::BLOCK_32
+                       ? static_cast<const Q16_1Block *>(data)
+                       : nullptr;
+        }
+        const Q16_1Block_64 *as_block_64() const
+        {
+            return block_size == Q16BlockSize::BLOCK_64
+                       ? static_cast<const Q16_1Block_64 *>(data)
+                       : nullptr;
+        }
+        const Q16_1Block_128 *as_block_128() const
+        {
+            return block_size == Q16BlockSize::BLOCK_128
+                       ? static_cast<const Q16_1Block_128 *>(data)
+                       : nullptr;
+        }
+
+        bool empty() const { return data == nullptr; }
+        explicit operator bool() const { return data != nullptr; }
+
+        int block_elements() const { return static_cast<int>(block_size); }
+    };
 
     /** @brief Q4_0 block: 4-bit quantization (32 elements per block, 18 bytes) */
     struct Q4_0Block

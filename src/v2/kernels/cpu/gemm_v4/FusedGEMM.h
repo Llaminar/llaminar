@@ -63,6 +63,22 @@ namespace llaminar2
     };
 
     /**
+     * @brief Single projection descriptor for FusedGEMM with Q16_1 output
+     *
+     * Used when the GEMM result should be fused-requantized to Q16_1 format,
+     * providing 256× better precision than Q8_1. This is critical for K projections
+     * in HybridQ16 mode where high dynamic range would cause Q8_1 to lose small values.
+     */
+    struct GEMMProjectionQ16_1
+    {
+        void *output_q16_1; ///< Output Q16_1 buffer [m, n/block_size] blocks
+        const float *bias;  ///< Optional bias [n] to add before requantization (nullptr if none)
+        int n;              ///< Output dimension (must be divisible by block_size)
+        int q16_block_size; ///< Block size: 32, 64, or 128 (should match head_dim)
+        std::string name;   ///< Name for error messages (optional)
+    };
+
+    /**
      * @brief Generic fused multi-GEMM kernel
      *
      * Wraps N QuantisedGemmKernel instances, quantizes activations once,
@@ -247,6 +263,47 @@ namespace llaminar2
             void *output_q, void *output_k, void *output_v,
             const float *bias_q, const float *bias_k, const float *bias_v,
             int m, int n_q, int n_kv, int k,
+            const MPIContext *ctx = nullptr,
+            int device_idx = -1);
+
+        // =============================================================================
+        // Mixed-Precision QKV Interface (for HybridQ16 K precision fix)
+        // =============================================================================
+
+        /**
+         * @brief Execute mixed-precision QKV GEMM: Q=Q8_1, K=Q16_1, V=Q8_1
+         *
+         * This method addresses the K precision problem in HybridQ16 mode:
+         * - K projection has high dynamic range (max_abs ≈ 130)
+         * - Q8_1 step = 130/127 ≈ 1.02, which zeros out values < 0.51
+         * - Q16_1 step = 130/32767 ≈ 0.004, preserving values down to 0.002
+         *
+         * By outputting K as Q16_1 directly from GEMM, we avoid the Q8_1 bottleneck.
+         *
+         * @param input_q8_1 Input Q8_1 blocks [m, k/32] (from attention norm)
+         * @param output_q [m, ceil(n_q/32)] Q8_1 blocks for Q projection
+         * @param output_k [m, n_kv/block_size] Q16_1 blocks for K projection
+         * @param output_v [m, ceil(n_kv/32)] Q8_1 blocks for V projection
+         * @param bias_q Optional bias [n_q] for Q projection
+         * @param bias_k Optional bias [n_kv] for K projection
+         * @param bias_v Optional bias [n_kv] for V projection
+         * @param m Batch size (sequence length)
+         * @param n_q Q output dimension
+         * @param n_kv K/V output dimension
+         * @param k Input dimension
+         * @param k_block_size Q16_1 block size for K output (64 or 128, matching head_dim)
+         * @param ctx MPI context (optional)
+         * @param device_idx Device index (-1 for CPU)
+         * @return true on success, false on error
+         */
+        bool execute_q8_1_mixed_qkv(
+            const void *input_q8_1,
+            void *output_q, // Q8_1 output
+            void *output_k, // Q16_1 output (high precision!)
+            void *output_v, // Q8_1 output
+            const float *bias_q, const float *bias_k, const float *bias_v,
+            int m, int n_q, int n_kv, int k,
+            int k_block_size = 64, // Q16 block size for K (should match head_dim)
             const MPIContext *ctx = nullptr,
             int device_idx = -1);
 

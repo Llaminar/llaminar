@@ -263,6 +263,18 @@ namespace llaminar2::kernels::q16_1::microkernels
         /// Adaptive alpha configuration (computed once at init)
         AdaptiveAlphaConfig alpha_config;
 
+        // ===== Per-position K scale support (HybridQ16 K precision fix) =====
+
+        /// Base alpha for per-position mode: q_scale / sqrt(head_dim) * log2(e)
+        /// Final alpha = base_alpha_fp32 * k_scale[pos]
+        float base_alpha_fp32 = 0.0f;
+
+        /// Head dimension (needed for per-position scale computation)
+        int head_dim_for_scale = 0;
+
+        /// Flag indicating per-position K scale mode is active
+        bool per_position_k_mode = false;
+
         /// Reset to initial state
         void reset()
         {
@@ -270,21 +282,193 @@ namespace llaminar2::kernels::q16_1::microkernels
             l = 0;
             l_processed = 0.0;
             count = 0;
-            // Note: alpha_config is preserved across reset
+            // Note: alpha_config, base_alpha_fp32, per_position_k_mode preserved across reset
         }
 
-        /// Initialize with alpha for adaptive scaling
+        /// Initialize with alpha for adaptive scaling (uniform K scale mode)
         void init(float alpha, int frac = 11, int lut_bits = 30)
         {
             reset();
             frac_bits = frac;
             lut_value_bits = lut_bits;
             alpha_config = AdaptiveAlphaConfig::compute(alpha);
+            per_position_k_mode = false;
+            base_alpha_fp32 = 0.0f;
+            head_dim_for_scale = 0;
+        }
+
+        /**
+         * @brief Initialize for per-position K scale mode (Option C: Pass Scale to Softmax).
+         *
+         * In this mode, we separate the QK scale into:
+         *   - base_alpha = q_scale / sqrt(head_dim) * log2(e) (computed once)
+         *   - per_position_alpha = base_alpha * k_scale[pos] (per-position)
+         *
+         * The softmax processes integer scores and applies per-position K scale
+         * during the exp2 computation.
+         *
+         * @param q_scale Q head scale factor
+         * @param head_dim Head dimension (for 1/sqrt normalization)
+         * @param frac Fractional bits for exp2 computation
+         * @param lut_bits LUT value precision bits
+         */
+        void init_per_position(float q_scale, int head_dim, int frac = 11, int lut_bits = 30)
+        {
+            reset();
+            frac_bits = frac;
+            lut_value_bits = lut_bits;
+            per_position_k_mode = true;
+            head_dim_for_scale = head_dim;
+
+            // Pre-compute base alpha (without K scale or LOG2E)
+            // LOG2E is applied inside AdaptiveAlphaConfig/exp2_compute_weight
+            // So base_alpha = q_scale / sqrt(head_dim), NOT including LOG2E
+            float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(head_dim));
+            base_alpha_fp32 = q_scale * inv_sqrt_d; // Note: NO LOG2E here!
+
+            // Initialize alpha_config with a representative scale for rescaling
+            // Use q_scale only; actual per-position alpha is computed on-the-fly
+            float representative_alpha = q_scale * inv_sqrt_d;
+            alpha_config = AdaptiveAlphaConfig::compute(representative_alpha);
         }
 
         /// Check if any positions have been processed
         bool empty() const { return count == 0; }
     };
+
+    // ============================================================================
+    // V2: Deferred Normalization Online Softmax State
+    // ============================================================================
+
+    /**
+     * @brief VNNI-safe weight configuration for deferred normalization.
+     *
+     * With 10-bit scaled weights (weight_shift=20), we can safely accumulate
+     * up to 60 positions in INT32 before dumping to INT64.
+     *
+     * Proof:
+     *   max_weight_scaled = 2^30 >> 20 = 1024 (10 bits)
+     *   max_V = 32767 (INT16)
+     *   max_per_product = 1024 × 32767 ≈ 2^25
+     *   max_per_chunk = 60 × 2^25 ≈ 2×10^9 < 2.15×10^9 (INT32_MAX) ✓
+     */
+    struct VNNIChunkConfig
+    {
+        static constexpr int WEIGHT_SHIFT = 20; ///< 30-bit LUT → 10-bit VNNI-safe
+        static constexpr int MAX_WEIGHT = 1023; ///< After shift
+        static constexpr int CHUNK_SIZE = 60;   ///< Positions per INT32 accumulation
+        static constexpr int MAX_V = 32767;     ///< INT16 max
+    };
+
+    /**
+     * @brief Running state for deferred-normalization online softmax (V2).
+     *
+     * KEY DIFFERENCE FROM V1:
+     * =======================
+     * V1 normalized context after EVERY block (O(N × head_dim) FP divisions).
+     * V2 accumulates unnormalized sums in INT64, divides ONCE at finalization.
+     *
+     * INVARIANT:
+     *   context_accum[d] = Σ(w_scaled[k] × V[k][d]) for all k processed
+     *   sum_w_scaled     = Σ(w_scaled[k]) for all k processed
+     *
+     * At finalization: output[d] = context_accum[d] / sum_w_scaled
+     *
+     * This eliminates ~725K FP divisions for a 596-token prefill.
+     */
+    struct OnlineSoftmaxStateV2
+    {
+        // === Max tracking (same as V1) ===
+        int32_t m = std::numeric_limits<int32_t>::min(); ///< Running max score
+
+        // === Weight sums (BOTH tracked for correctness) ===
+        int64_t sum_w_unscaled = 0; ///< Sum before weight_shift (for debugging/verification)
+        int64_t sum_w_scaled = 0;   ///< Sum after weight_shift (for final division)
+
+        // === Position tracking ===
+        int count = 0; ///< Unmasked positions processed
+
+        // === Configuration ===
+        int frac_bits = 11;                               ///< Fractional bits for exp2 computation
+        int lut_value_bits = 30;                          ///< Total bits in LUT output
+        int weight_shift = VNNIChunkConfig::WEIGHT_SHIFT; ///< Shift for VNNI-safe weights
+        int chunk_size = VNNIChunkConfig::CHUNK_SIZE;     ///< P×V accumulation chunk
+
+        // === Alpha configuration ===
+        AdaptiveAlphaConfig alpha_config;
+        float base_alpha_fp32 = 0.0f;     ///< For per-position K scale mode
+        int head_dim_for_scale = 0;       ///< Head dimension for scale computation
+        bool per_position_k_mode = false; ///< Whether using per-position K scales
+
+        // REMOVED: double l_processed (no longer needed!)
+
+        /// Reset to initial state (preserves configuration)
+        void reset()
+        {
+            m = std::numeric_limits<int32_t>::min();
+            sum_w_unscaled = 0;
+            sum_w_scaled = 0;
+            count = 0;
+        }
+
+        /// Initialize with alpha for adaptive scaling (uniform K scale mode)
+        void init(float alpha, int frac = 11, int lut_bits = 30)
+        {
+            reset();
+            frac_bits = frac;
+            lut_value_bits = lut_bits;
+            weight_shift = VNNIChunkConfig::WEIGHT_SHIFT;
+            chunk_size = VNNIChunkConfig::CHUNK_SIZE;
+            alpha_config = AdaptiveAlphaConfig::compute(alpha);
+            per_position_k_mode = false;
+            base_alpha_fp32 = 0.0f;
+            head_dim_for_scale = 0;
+        }
+
+        /// Initialize for per-position K scale mode
+        void init_per_position(float q_scale, int head_dim, int frac = 11, int lut_bits = 30)
+        {
+            reset();
+            frac_bits = frac;
+            lut_value_bits = lut_bits;
+            weight_shift = VNNIChunkConfig::WEIGHT_SHIFT;
+            chunk_size = VNNIChunkConfig::CHUNK_SIZE;
+            per_position_k_mode = true;
+            head_dim_for_scale = head_dim;
+
+            float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(head_dim));
+            base_alpha_fp32 = q_scale * inv_sqrt_d;
+
+            float representative_alpha = q_scale * inv_sqrt_d;
+            alpha_config = AdaptiveAlphaConfig::compute(representative_alpha);
+        }
+
+        /// Check if any positions have been processed
+        bool empty() const { return count == 0; }
+    };
+
+    // ============================================================================
+    // V2: 128-bit Rescale Helper
+    // ============================================================================
+
+    /**
+     * @brief Rescale INT64 value using 128-bit intermediate.
+     *
+     * Computes: (value × scale_num) >> scale_shift
+     *
+     * Uses __int128 to prevent overflow when value is large (e.g., 2^50)
+     * and scale_num is up to 2^30.
+     *
+     * @param value INT64 value to rescale
+     * @param scale_num Rescale numerator (from exp2 LUT)
+     * @param scale_shift Rescale denominator as power of 2
+     * @return Rescaled INT64 value
+     */
+    inline int64_t rescale_int64_v2(__int128 value, int32_t scale_num, int scale_shift)
+    {
+        __int128 product = value * static_cast<__int128>(scale_num);
+        return static_cast<int64_t>(product >> scale_shift);
+    }
 
     // ============================================================================
     // Block-wise Online Softmax Operations
@@ -466,6 +650,100 @@ namespace llaminar2::kernels::q16_1::microkernels
         int blocks_per_row,
         float alpha);
 
+    /**
+     * @brief Process one KV block in FlashDecode with per-position K scales.
+     *
+     * Option C implementation: Pass per-position K scales to softmax.
+     * The dot product remains pure integer, and per-position K scale is applied
+     * during the exp2 computation in softmax.
+     *
+     * @tparam BlockType Q16_1Block_64 or Q16_1Block_128
+     * @param Q Query blocks [blocks_per_row]
+     * @param K Key blocks for this block [block_size, blocks_per_row]
+     * @param V Value blocks for this block [block_size, blocks_per_row]
+     * @param context Running INT32 context [head_dim] (modified in place)
+     * @param state Online softmax state (modified in place, must use init_per_position())
+     * @param scores_scratch INT32 scratch for scores [block_size]
+     * @param weights_scratch INT32 scratch for unnorm weights [block_size]
+     * @param kv_block_start Starting KV position for this block
+     * @param kv_block_size Number of positions in this block
+     * @param head_dim Head dimension
+     * @param blocks_per_row Blocks per head
+     * @param k_scales Per-position K scale factors [kv_block_size] for this block
+     */
+    template <typename BlockType>
+    void flash_decode_process_kv_block_with_k_scales(
+        const BlockType *Q,
+        const BlockType *K,
+        const BlockType *V,
+        int32_t *context,
+        OnlineSoftmaxState &state,
+        int32_t *scores_scratch,
+        int32_t *weights_scratch,
+        int kv_block_start,
+        int kv_block_size,
+        int head_dim,
+        int blocks_per_row,
+        const float *k_scales);
+
+    // ============================================================================
+    // V2: Deferred Normalization Block Processing (PURE INTEGER)
+    // ============================================================================
+
+    /**
+     * @brief Process one KV block in FlashDecode with deferred normalization (V2).
+     *
+     * KEY DIFFERENCE FROM V1:
+     * - context_accum is INT64 (unnormalized accumulator)
+     * - NO division happens in this function
+     * - Uses VNNI-safe chunking (60 positions per INT32 accumulation)
+     *
+     * @tparam BlockType Q16_1Block_64 or Q16_1Block_128
+     * @param Q Query blocks [blocks_per_row]
+     * @param K Key blocks for this block [block_size, blocks_per_row]
+     * @param V Value blocks for this block [block_size, blocks_per_row]
+     * @param context_accum Running INT64 unnormalized context [head_dim] (modified in place)
+     * @param state V2 online softmax state (modified in place)
+     * @param scores_scratch INT32 scratch for scores [block_size]
+     * @param weights_scratch INT32 scratch for unnorm weights [block_size]
+     * @param kv_block_start Starting KV position for this block
+     * @param kv_block_size Number of positions in this block
+     * @param head_dim Head dimension
+     * @param blocks_per_row Blocks per head
+     * @param alpha QK scale factor
+     */
+    template <typename BlockType>
+    void flash_decode_process_kv_block_v2(
+        const BlockType *Q,
+        const BlockType *K,
+        const BlockType *V,
+        int64_t *context_accum,
+        OnlineSoftmaxStateV2 &state,
+        int32_t *scores_scratch,
+        int32_t *weights_scratch,
+        int kv_block_start,
+        int kv_block_size,
+        int head_dim,
+        int blocks_per_row,
+        float alpha);
+
+    /**
+     * @brief Finalize FlashDecode context with single division pass (V2).
+     *
+     * Divides the accumulated unnormalized context by the total weight sum
+     * to produce the final normalized INT32 context.
+     *
+     * @param context_accum Unnormalized INT64 context [head_dim]
+     * @param context_out Output INT32 context [head_dim]
+     * @param state V2 online softmax state (read-only)
+     * @param head_dim Head dimension
+     */
+    void flash_decode_finalize_v2(
+        const int64_t *context_accum,
+        int32_t *context_out,
+        const OnlineSoftmaxStateV2 &state,
+        int head_dim);
+
     // ============================================================================
     // FA2 Prefill: Batch Online Softmax State
     // ============================================================================
@@ -511,7 +789,43 @@ namespace llaminar2::kernels::q16_1::microkernels
             num_rows = br;
             frac_bits = frac;
             lut_value_bits = lut_bits;
+            base_alpha_fp32 = 0.0f; // Not using per-position mode
             alpha_config = AdaptiveAlphaConfig::compute(alpha);
+            for (int r = 0; r < FA2_TILE_BR; ++r)
+            {
+                m[r] = std::numeric_limits<int32_t>::min();
+                l[r] = 0;
+                l_processed[r] = 0.0;
+                count[r] = 0;
+            }
+        }
+
+        /**
+         * @brief Initialize for per-position K scale mode (Option C).
+         *
+         * In this mode, each K position has its own scale factor, so we can't
+         * pre-compute a single alpha. Instead we store base_alpha = q_scale / sqrt(head_dim)
+         * and compute per-position alpha on-the-fly: alpha[k] = base_alpha * k_scale[k]
+         *
+         * @param br Number of query rows in this batch
+         * @param q_scale Q head scale factor
+         * @param head_dim Head dimension (for 1/sqrt normalization)
+         * @param frac Fractional bits for exp2 computation
+         * @param lut_bits LUT value precision bits
+         */
+        void init_per_position(int br, float q_scale, int head_dim, int frac = 11, int lut_bits = 30)
+        {
+            num_rows = br;
+            frac_bits = frac;
+            lut_value_bits = lut_bits;
+
+            // Pre-compute base alpha (without K scale)
+            float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(head_dim));
+            base_alpha_fp32 = q_scale * inv_sqrt_d;
+
+            // Initialize alpha_config with representative scale for rescaling
+            alpha_config = AdaptiveAlphaConfig::compute(base_alpha_fp32);
+
             for (int r = 0; r < FA2_TILE_BR; ++r)
             {
                 m[r] = std::numeric_limits<int32_t>::min();
@@ -529,6 +843,10 @@ namespace llaminar2::kernels::q16_1::microkernels
 
         /// Check if row r has any positions processed
         bool empty(int r) const { return count[r] == 0; }
+
+        /// Base alpha for per-position K scale mode (q_scale / sqrt(head_dim))
+        /// Zero when not in per-position mode
+        float base_alpha_fp32 = 0.0f;
     };
 
     // ============================================================================
@@ -585,6 +903,63 @@ namespace llaminar2::kernels::q16_1::microkernels
         int k_stride,
         int context_stride,
         float alpha,
+        bool causal = false,
+        int q_offset = 0);
+
+    /**
+     * @brief Process one KV tile in FA2 Prefill with per-position K scales.
+     *
+     * Same as fa2_prefill_process_kv_tile but with per-position K scale support.
+     * Each KV position has its own K scale, allowing for dynamic quantization
+     * where different positions may have different scale factors.
+     *
+     * The base_alpha_fp32 is computed as: q_scale / sqrt(head_dim)
+     * For each KV position k, the effective alpha is: base_alpha_fp32 * k_scales[k]
+     *
+     * This is critical for HybridQ16 pipeline where K cache blocks have per-position
+     * scales stored in their .d header field, and using a uniform qk_scale causes
+     * numerical divergence.
+     *
+     * @tparam BlockType Q16_1Block_64 or Q16_1Block_128
+     * @param Q Query tile blocks [Br, blocks_per_row]
+     * @param K Key tile blocks [Bc, blocks_per_row]
+     * @param V Value tile blocks [Bc, blocks_per_row]
+     * @param context Running INT32 context tile [Br, head_dim] (modified)
+     * @param state Batch online softmax state [Br] (modified)
+     * @param scores_scratch INT32 scratch for score tile [Br × Bc]
+     * @param weights_scratch INT32 scratch for unnorm weights [Br × Bc]
+     * @param kv_tile_start Starting KV position for this tile
+     * @param Br Number of query rows in tile (may be < FA2_TILE_BR)
+     * @param Bc Number of KV positions in tile (may be < FA2_TILE_BC)
+     * @param head_dim Head dimension
+     * @param blocks_per_row Blocks per head
+     * @param q_stride Stride between Q rows in blocks
+     * @param k_stride Stride between K rows in blocks (usually blocks_per_row)
+     * @param context_stride Stride between context rows (usually head_dim)
+     * @param base_alpha_fp32 Base alpha = q_scale / sqrt(head_dim) (WITHOUT k_scale)
+     * @param k_scales Per-position K scales [Bc] for this tile (starting at kv_tile_start)
+     * @param causal Whether to apply causal masking
+     * @param q_offset Query position offset (for causal mask calculation)
+     */
+    template <typename BlockType>
+    void fa2_prefill_process_kv_tile_with_k_scales(
+        const BlockType *Q,
+        const BlockType *K,
+        const BlockType *V,
+        int32_t *context,
+        OnlineSoftmaxStateBatch &state,
+        int32_t *scores_scratch,
+        int32_t *weights_scratch,
+        int kv_tile_start,
+        int Br,
+        int Bc,
+        int head_dim,
+        int blocks_per_row,
+        int q_stride,
+        int k_stride,
+        int context_stride,
+        float base_alpha_fp32,
+        const float *k_scales,
         bool causal = false,
         int q_offset = 0);
 

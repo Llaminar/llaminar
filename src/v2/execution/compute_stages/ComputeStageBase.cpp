@@ -455,19 +455,71 @@ namespace llaminar2
 
     StageDumpInfo &StageDumpInfo::addInput(const char *name, const TensorBase *tensor, size_t rows, size_t cols)
     {
-        // Extract FP32 data from tensor for dumping - works for all tensor types
-        const float *data = tensor ? tensor->fp32_data() : nullptr;
+        // Store raw tensor data in native format for accurate replay testing
+        // This preserves quantized blocks (Q8_1, Q16_1, etc.) instead of dequantizing
+        //
+        // CRITICAL: Use the LOGICAL dimensions (rows, cols) to compute byte_size,
+        // NOT tensor->size_bytes() which may reflect a larger pre-allocated buffer
+        // (e.g., KV cache allocated for max_seq_len but only using kv_len positions)
+        const void *data = tensor ? tensor->raw_data() : nullptr;
         const char *dtype = tensor ? tensor->dtype_name() : "FP32";
-        inputs.push_back({name, data, rows, cols, dtype, sizeof(float)});
+
+        LOG_DEBUG("[StageDumpInfo::addInput] name=" << name
+                                                    << " tensor=" << (tensor ? "non-null" : "null")
+                                                    << " native_type=" << (tensor ? static_cast<int>(tensor->native_type()) : -1)
+                                                    << " dtype_name=" << dtype);
+
+        // Special handling for Q16_1: use block-size-aware dtype name
+        // Q16_1Tensor has variable block sizes (32, 64, 128 elements)
+        if (tensor && tensor->native_type() == TensorType::Q16_1)
+        {
+            const auto *q16_tensor = dynamic_cast<const Q16_1Tensor *>(tensor);
+            if (q16_tensor)
+            {
+                dtype = q16_tensor->dtype_name_with_block_size();
+                LOG_DEBUG("[StageDumpInfo::addInput] Q16_1 detected, block-size dtype=" << dtype);
+            }
+            else
+            {
+                LOG_WARN("[StageDumpInfo::addInput] Q16_1 native_type but dynamic_cast failed!");
+            }
+        }
+
+        // Compute byte size from logical dimensions and dtype
+        size_t byte_size = computeByteSizeForDtype(dtype, rows, cols);
+        LOG_DEBUG("[StageDumpInfo::addInput] Final dtype=" << dtype << " byte_size=" << byte_size);
+        size_t element_size = (rows > 0 && cols > 0) ? byte_size / (rows * cols) : sizeof(float);
+
+        inputs.push_back({name, data, rows, cols, dtype, element_size, byte_size});
         return *this;
     }
 
     StageDumpInfo &StageDumpInfo::addOutput(const char *name, const TensorBase *tensor, size_t rows, size_t cols)
     {
-        // Extract FP32 data from tensor for dumping - works for all tensor types
-        const float *data = tensor ? tensor->fp32_data() : nullptr;
+        // Store raw tensor data in native format for accurate replay testing
+        // This preserves quantized blocks (Q8_1, Q16_1, etc.) instead of dequantizing
+        //
+        // CRITICAL: Use the LOGICAL dimensions (rows, cols) to compute byte_size,
+        // NOT tensor->size_bytes() which may reflect a larger pre-allocated buffer
+        const void *data = tensor ? tensor->raw_data() : nullptr;
         const char *dtype = tensor ? tensor->dtype_name() : "FP32";
-        outputs.push_back({name, data, rows, cols, dtype, sizeof(float)});
+
+        // Special handling for Q16_1: use block-size-aware dtype name
+        // Q16_1Tensor has variable block sizes (32, 64, 128 elements)
+        if (tensor && tensor->native_type() == TensorType::Q16_1)
+        {
+            const auto *q16_tensor = dynamic_cast<const Q16_1Tensor *>(tensor);
+            if (q16_tensor)
+            {
+                dtype = q16_tensor->dtype_name_with_block_size();
+            }
+        }
+
+        // Compute byte size from logical dimensions and dtype
+        size_t byte_size = computeByteSizeForDtype(dtype, rows, cols);
+        size_t element_size = (rows > 0 && cols > 0) ? byte_size / (rows * cols) : sizeof(float);
+
+        outputs.push_back({name, data, rows, cols, dtype, element_size, byte_size});
         return *this;
     }
 

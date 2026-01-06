@@ -1,0 +1,10 @@
+batch_size=1
+seq_len=9
+kv_len=9
+n_heads=14
+n_kv_heads=2
+head_dim=64
+d_model=896
+causal=true
+backend=3
+device_idx=0

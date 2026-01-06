@@ -1,8 +1,8 @@
 /**
  * @file Test__HybridQ16Pipeline_vs_FP32_LayerByLayer.cpp
- * @brief E2E Parity: HybridQ16 Pipeline vs FP32 Pipeline (Layer-by-Layer)
+ * @brief Parity: HybridQ16 Pipeline vs FP32 Pipeline (Layer-by-Layer)
  *
- * @category e2e/parity/internal/hybridq16_vs_fp32
+ * @category parity/internal/hybridq16_vs_fp32
  * @tested   HybridQ16 precision inference pipeline (GraphOrchestrator with HybridQ16)
  * @reference FP32 inference pipeline (GraphOrchestrator with FP32)
  * @comparison Hybrid and Q8_1 pipelines (to measure improvement)
@@ -29,7 +29,7 @@
  *   - ATTENTION_CONTEXT comparison is valid and shows actual attention precision
  *
  * REQUIRES: ENABLE_PIPELINE_SNAPSHOTS compile flag
- * Build with: cmake -B build_v2_e2e_release -S src/v2 -DCMAKE_BUILD_TYPE=E2ERelease
+ * Run with: build_v2_integration
  *
  * @author David Sanftenberg
  * @date 2025-12-26
@@ -357,6 +357,110 @@ protected:
 
             double cos_sim = cosine_similarity(ref_data, test_data, ref_size);
             double rel_l2 = relativeL2(ref_data, test_data, ref_size);
+
+            // Debug: print first few values for divergent Q_ROPE snapshots
+            if (key.find("Q_ROPE") != std::string::npos && key.find("layer0") != std::string::npos && cos_sim < 0.95)
+            {
+                LOG_DEBUG("Q_ROPE DEBUG for " << key << " (cos=" << cos_sim << "):");
+                LOG_DEBUG("  FP32 ref first 8: "
+                          << ref_data[0] << ", " << ref_data[1] << ", " << ref_data[2] << ", " << ref_data[3] << ", "
+                          << ref_data[4] << ", " << ref_data[5] << ", " << ref_data[6] << ", " << ref_data[7]);
+                LOG_DEBUG("  HybridQ16 test first 8: "
+                          << test_data[0] << ", " << test_data[1] << ", " << test_data[2] << ", " << test_data[3] << ", "
+                          << test_data[4] << ", " << test_data[5] << ", " << test_data[6] << ", " << test_data[7]);
+
+                // Also print values at position 64 (head 1)
+                if (ref_size >= 128)
+                {
+                    LOG_DEBUG("  FP32 ref head1 first 8: "
+                              << ref_data[64] << ", " << ref_data[65] << ", " << ref_data[66] << ", " << ref_data[67] << ", "
+                              << ref_data[68] << ", " << ref_data[69] << ", " << ref_data[70] << ", " << ref_data[71]);
+                    LOG_DEBUG("  HybridQ16 test head1 first 8: "
+                              << test_data[64] << ", " << test_data[65] << ", " << test_data[66] << ", " << test_data[67] << ", "
+                              << test_data[68] << ", " << test_data[69] << ", " << test_data[70] << ", " << test_data[71]);
+                }
+
+                // Print second position (seq=1, all heads start)
+                LOG_DEBUG("  FP32 ref seq1 first 8 (starting at 896): "
+                          << ref_data[896] << ", " << ref_data[897] << ", " << ref_data[898] << ", " << ref_data[899] << ", "
+                          << ref_data[900] << ", " << ref_data[901] << ", " << ref_data[902] << ", " << ref_data[903]);
+                LOG_DEBUG("  HybridQ16 test seq1 first 8: "
+                          << test_data[896] << ", " << test_data[897] << ", " << test_data[898] << ", " << test_data[899] << ", "
+                          << test_data[900] << ", " << test_data[901] << ", " << test_data[902] << ", " << test_data[903]);
+            }
+
+            // Debug: print values for K_ROPE divergence - K has fewer heads (n_kv_heads=2)
+            // Layout: [seq=9, n_kv_heads=2, head_dim=64] = [9, 128] = 1152 floats
+            if (key.find("K_ROPE") != std::string::npos && key.find("layer0") != std::string::npos && cos_sim < 0.95)
+            {
+                LOG_WARN("K_ROPE DEBUG for " << key << " (cos=" << cos_sim << ", size=" << ref_size << "):");
+                LOG_WARN("  FP32 ref first 8: "
+                         << ref_data[0] << ", " << ref_data[1] << ", " << ref_data[2] << ", " << ref_data[3] << ", "
+                         << ref_data[4] << ", " << ref_data[5] << ", " << ref_data[6] << ", " << ref_data[7]);
+                LOG_WARN("  HybridQ16 test first 8: "
+                         << test_data[0] << ", " << test_data[1] << ", " << test_data[2] << ", " << test_data[3] << ", "
+                         << test_data[4] << ", " << test_data[5] << ", " << test_data[6] << ", " << test_data[7]);
+
+                // Head 1 (elements 64-71 within seq=0)
+                if (ref_size >= 128)
+                {
+                    LOG_WARN("  FP32 ref kv_head1 (64-71): "
+                             << ref_data[64] << ", " << ref_data[65] << ", " << ref_data[66] << ", " << ref_data[67] << ", "
+                             << ref_data[68] << ", " << ref_data[69] << ", " << ref_data[70] << ", " << ref_data[71]);
+                    LOG_WARN("  HybridQ16 kv_head1 (64-71): "
+                             << test_data[64] << ", " << test_data[65] << ", " << test_data[66] << ", " << test_data[67] << ", "
+                             << test_data[68] << ", " << test_data[69] << ", " << test_data[70] << ", " << test_data[71]);
+                }
+
+                // Seq=1, head=0 (elements 128-135)
+                if (ref_size >= 200)
+                {
+                    LOG_WARN("  FP32 ref seq1_head0 (128-135): "
+                             << ref_data[128] << ", " << ref_data[129] << ", " << ref_data[130] << ", " << ref_data[131] << ", "
+                             << ref_data[128 + 4] << ", " << ref_data[128 + 5] << ", " << ref_data[128 + 6] << ", " << ref_data[128 + 7]);
+                    LOG_WARN("  HybridQ16 seq1_head0 (128-135): "
+                             << test_data[128] << ", " << test_data[129] << ", " << test_data[130] << ", " << test_data[131] << ", "
+                             << test_data[128 + 4] << ", " << test_data[128 + 5] << ", " << test_data[128 + 6] << ", " << test_data[128 + 7]);
+                }
+            }
+
+            // Debug: print K_PROJECTION values BEFORE RoPE to see quantization error
+            if (key.find("K_PROJECTION") != std::string::npos && key.find("layer0") != std::string::npos)
+            {
+                LOG_WARN("K_PROJECTION DEBUG for " << key << " (cos=" << cos_sim << ", size=" << ref_size << "):");
+                LOG_WARN("  FP32 ref first 8: "
+                         << ref_data[0] << ", " << ref_data[1] << ", " << ref_data[2] << ", " << ref_data[3] << ", "
+                         << ref_data[4] << ", " << ref_data[5] << ", " << ref_data[6] << ", " << ref_data[7]);
+                LOG_WARN("  HybridQ16 test first 8: "
+                         << test_data[0] << ", " << test_data[1] << ", " << test_data[2] << ", " << test_data[3] << ", "
+                         << test_data[4] << ", " << test_data[5] << ", " << test_data[6] << ", " << test_data[7]);
+
+                // Show RoPE pair elements (4 and 36, since head_dim=64, half_dim=32)
+                LOG_WARN("  RoPE pair (4, 36): FP32 ref=(" << ref_data[4] << ", " << ref_data[36]
+                                                           << ") HybridQ16=(" << test_data[4] << ", " << test_data[36] << ")");
+
+                // Find max abs to understand the quantization scale
+                float max_abs = 0;
+                for (size_t i = 0; i < ref_size; ++i)
+                {
+                    float abs_val = std::abs(ref_data[i]);
+                    if (abs_val > max_abs)
+                        max_abs = abs_val;
+                }
+                LOG_WARN("  FP32 max_abs=" << max_abs << " -> ideal d=" << (max_abs / 127.0f));
+
+                // Count zeros in test data
+                int zero_count = 0;
+                int should_be_nonzero = 0;
+                for (size_t i = 0; i < ref_size && i < 32; ++i)
+                {
+                    if (test_data[i] == 0.0f)
+                        zero_count++;
+                    if (std::abs(ref_data[i]) > 0.01f && test_data[i] == 0.0f)
+                        should_be_nonzero++;
+                }
+                LOG_WARN("  First 32: zeros=" << zero_count << ", should-be-nonzero=" << should_be_nonzero);
+            }
 
             results[key] = {cos_sim, rel_l2};
         }

@@ -80,6 +80,8 @@ namespace llaminar2::kernels::q16_1
     using llaminar2::Q16_1Block;
     using llaminar2::Q16_1Block_128;
     using llaminar2::Q16_1Block_64;
+    using llaminar2::Q16BlockMutablePtr;
+    using llaminar2::Q16BlockPtr;
     using llaminar2::Q16BlockSize;
     using llaminar2::Q16BlockType;
     using llaminar2::Q16BlockType_t;
@@ -114,38 +116,67 @@ namespace llaminar2::kernels::q16_1
      * 1. block_size field for model-aware block selection
      * 2. head_scales arrays for pre-normalized tensors
      * 3. No FP32 intermediate buffers (all computation stays INT16/INT32)
+     * 4. TYPE-SAFE block pointers via Q16BlockPtr (no more const void*)
+     *
+     * NOTE: Q16BlockPtr and Q16BlockMutablePtr are imported from BlockStructures.h
+     *       via 'using' statements above.
      */
     struct Q16IntegerAttentionParams
     {
         // === Input tensors (Q16_1 quantized, pre-normalized) ===
-        const void *Q = nullptr; ///< Query: [seq_len_q, num_heads, head_dim] as Q16_1 blocks
-        const void *K = nullptr; ///< Key: [kv_len, num_kv_heads, head_dim] as Q16_1 blocks
-        const void *V = nullptr; ///< Value: [kv_len, num_kv_heads, head_dim] as Q16_1 blocks
+        // TYPE-SAFE: Uses Q16BlockPtr instead of const void*
+        Q16BlockPtr Q; ///< Query: [seq_len_q, num_heads, head_dim] as Q16_1 blocks
+        Q16BlockPtr K; ///< Key: [kv_len, num_kv_heads, head_dim] as Q16_1 blocks
+        Q16BlockPtr V; ///< Value: [kv_len, num_kv_heads, head_dim] as Q16_1 blocks
 
         // === Per-head scale factors (from normalization) ===
         const float *q_head_scales = nullptr;  ///< [num_heads] scale applied during Q normalization
         const float *kv_head_scales = nullptr; ///< [num_kv_heads] scale applied during K/V normalization
 
+        // === Per-position K scale factors (HybridQ16 K precision fix) ===
+        // When K uses dynamic per-head scale from RoPE (instead of uniform kv_head_scale),
+        // these per-position scales must be provided for correct Q×K^T computation.
+        // Shape: [kv_len * num_kv_heads] (position-major: k_position_scales[pos * num_kv_heads + kv_h])
+        // When nullptr, K scales come from kv_head_scales (uniform per-head).
+        //
+        // NOTE: k_position_scales is DEPRECATED. Use read_k_scales_from_blocks=true instead.
+        // The k_position_scales buffer is shared across layers and gets overwritten.
+        const float *k_position_scales = nullptr;
+
+        // === Read K scales directly from K block headers ===
+        // When true, the attention kernel reads K scales from K cache block .d fields
+        // instead of from k_position_scales buffer. This avoids cross-layer contamination
+        // since KV cache is per-layer.
+        // This is the CORRECT mode for HybridQ16 K precision fix.
+        bool read_k_scales_from_blocks = false;
+
         // === Output projection weights ===
         const QuantisedPackedWeights *Wo_packed = nullptr; ///< Packed Wo weights for VPDPWSSD
 
         // === Output buffer (Wo projection output) ===
-        void *output = nullptr; ///< [seq_len_q, d_model] as Q16_1 blocks (Wo projection output)
+        Q16BlockMutablePtr output; ///< [seq_len_q, d_model] as Q16_1 blocks (Wo projection output)
 
-        // === Residual connection ===
-        const void *residual_in = nullptr; ///< Input residual [seq_len_q, d_model] as Q16_1
-        void *residual_out = nullptr;      ///< Output [seq_len_q, d_model] as Q16_1
+        // === Residual connection (uses 32-element blocks for compatibility) ===
+        const Q16_1Block *residual_in = nullptr; ///< Input residual [seq_len_q, d_model] as Q16_1Block
+        Q16_1Block *residual_out = nullptr;      ///< Output [seq_len_q, d_model] as Q16_1Block
 
         // === Dimensions ===
         int seq_len_q = 0;    ///< Query sequence length (1 for decode, >1 for prefill)
-        int kv_len = 0;       ///< KV cache length
+        int kv_len = 0;       ///< KV cache length (number of valid positions)
         int num_heads = 0;    ///< Number of query/attention heads
         int num_kv_heads = 0; ///< Number of KV heads (for GQA)
         int head_dim = 0;     ///< Dimension per head
         int d_model = 0;      ///< Model dimension (num_heads × head_dim)
 
+        // === KV Cache Layout ===
+        // For HEAD_MAJOR sparse cache: stride between heads = max_seq_len (sparse allocation)
+        // For dense/transposed data: stride between heads = kv_len (packed)
+        // If 0, defaults to kv_len (dense layout assumption)
+        int kv_head_stride = 0; ///< Stride in positions between consecutive KV heads
+
         // === Block configuration ===
-        Q16BlockSize block_size = Q16BlockSize::BLOCK_128; ///< Block size for this model
+        // Can be explicitly set, or will be derived from Q.block_size
+        Q16BlockSize block_size = Q16BlockSize::BLOCK_64;
 
         // === Optional: Snapshot buffers for debugging ===
         float *snapshot_scores = nullptr;       ///< [seq_len_q, num_heads, kv_len] pre-softmax
@@ -156,6 +187,21 @@ namespace llaminar2::kernels::q16_1
         float *snapshot_residual_out = nullptr; ///< [seq_len_q, d_model] after residual add
 
         // === Helper methods ===
+
+        /**
+         * @brief Get effective stride between KV heads (in positions).
+         *
+         * For HEAD_MAJOR sparse cache: returns kv_head_stride (= max_seq_len)
+         * For dense/transposed data: returns kv_len (packed)
+         *
+         * This handles the difference between:
+         * - Sparse cache: head_1 at offset max_seq_len from head_0
+         * - Dense data: head_1 at offset kv_len from head_0
+         */
+        int effective_kv_head_stride() const
+        {
+            return (kv_head_stride > 0) ? kv_head_stride : kv_len;
+        }
 
         /**
          * @brief Get combined QK scale for attention scores.
@@ -170,6 +216,55 @@ namespace llaminar2::kernels::q16_1
             float s_q = q_head_scales ? q_head_scales[q_head] : 1.0f;
             float s_k = kv_head_scales ? kv_head_scales[kv_head] : 1.0f;
             return s_q * s_k / std::sqrt(static_cast<float>(head_dim));
+        }
+
+        /**
+         * @brief Get K scale for specific position and KV head.
+         *
+         * Uses k_position_scales if available (dynamic-scale from RoPE),
+         * otherwise falls back to kv_head_scales (from block header).
+         *
+         * @param kv_pos KV cache position index
+         * @param kv_head KV head index
+         * @return K scale factor for this position/head
+         */
+        float get_k_scale(int kv_pos, int kv_head) const
+        {
+            if (k_position_scales)
+            {
+                return k_position_scales[kv_pos * num_kv_heads + kv_head];
+            }
+            return kv_head_scales ? kv_head_scales[kv_head] : 1.0f;
+        }
+
+        /**
+         * @brief Check if per-position K scales are available.
+         *
+         * When true, attention kernel should use get_k_scale() for each K position
+         * instead of uniform qk_scale.
+         *
+         * This returns true if EITHER:
+         * 1. k_position_scales buffer is provided (legacy, cross-layer contamination risk), OR
+         * 2. read_k_scales_from_blocks is true (correct, reads from K cache blocks)
+         */
+        bool has_per_position_k_scales() const
+        {
+            return k_position_scales != nullptr || read_k_scales_from_blocks;
+        }
+
+        /**
+         * @brief Get Q scale for base alpha computation (Option C: Pass Scale to Softmax).
+         *
+         * When using per-position K scales, we split qk_scale into:
+         *   - base_alpha = q_scale / sqrt(head_dim) * log2(e) (computed once)
+         *   - per_position_alpha = base_alpha * k_scale[pos] (per-position)
+         *
+         * @param q_head Query head index
+         * @return Q scale factor (without K scale or sqrt(head_dim) normalization)
+         */
+        float get_q_scale(int q_head) const
+        {
+            return q_head_scales ? q_head_scales[q_head] : 1.0f;
         }
 
         /**
@@ -200,24 +295,40 @@ namespace llaminar2::kernels::q16_1
             return (num_kv_heads == num_heads) ? q_head : (q_head / (num_heads / num_kv_heads));
         }
 
+        /// Get effective block size - uses member if set non-default, otherwise derives from Q
+        Q16BlockSize effective_block_size() const
+        {
+            // If Q has valid data, use its block_size; otherwise use the member
+            return Q.data ? Q.block_size : block_size;
+        }
+
         int q_blocks_per_row() const
         {
-            return blocks_per_row(head_dim, block_size);
+            return blocks_per_row(head_dim, effective_block_size());
         }
 
         int kv_blocks_per_row() const
         {
-            return blocks_per_row(head_dim, block_size);
+            return blocks_per_row(head_dim, effective_block_size());
         }
 
         int residual_blocks_per_row() const
         {
-            return blocks_per_row(d_model, block_size);
+            // Residual always uses 32-element blocks
+            return blocks_per_row(d_model, Q16BlockSize::BLOCK_32);
         }
 
         bool is_head_aligned() const
         {
             return q16_1::is_head_aligned(head_dim);
+        }
+
+        /// Validate that Q, K, V all have the same block size
+        bool validate_block_sizes() const
+        {
+            if (Q.empty() || K.empty() || V.empty())
+                return false;
+            return Q.block_size == K.block_size && K.block_size == V.block_size;
         }
     };
 

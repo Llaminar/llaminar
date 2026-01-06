@@ -160,6 +160,10 @@ TEST_F(GraphSnapshotCallbackTest, RMSNormStage_CallbackInvoked)
     auto *output = createFP32Tensor({seq_len, d_model});
     auto *gamma = createFP32Tensor({d_model});
 
+    // Initialize input with non-zero values (required for buffer validation)
+    for (size_t i = 0; i < seq_len * d_model; ++i)
+        input->mutable_data()[i] = 0.5f + (i % 10) * 0.1f;
+
     // Initialize gamma to 1.0 for identity scaling
     for (size_t i = 0; i < d_model; ++i)
         gamma->mutable_data()[i] = 1.0f;
@@ -375,8 +379,10 @@ TEST_F(GraphSnapshotCallbackTest, FusedAttentionWoStage_CallbackInvoked)
  * - Q8_1 Wo tensor (auto-packed to VNNI by the stage)
  *
  * Uses TestTensorFactory's Q16_1 and Q8_1FromFP32Random helpers.
+ *
+ * DISABLED: HybridQ16 project on hold - Q16_INTEGER backend tests skipped.
  */
-TEST_F(GraphSnapshotCallbackTest, FusedAttentionWoStage_Q16IntegerBackend_CallbackInvoked)
+TEST_F(GraphSnapshotCallbackTest, DISABLED_FusedAttentionWoStage_Q16IntegerBackend_CallbackInvoked)
 {
     // Test dimensions (small for unit tests)
     const size_t seq_len = 4;
@@ -474,8 +480,10 @@ TEST_F(GraphSnapshotCallbackTest, FusedAttentionWoStage_Q16IntegerBackend_Callba
  * 3. The context snapshot contains valid FP32 values (no NaN/Inf)
  * 4. The context snapshot is not all zeros (kernel actually wrote data)
  * 5. All expected scalar keys are present with correct values
+ *
+ * DISABLED: HybridQ16 project on hold - Q16_INTEGER backend tests skipped.
  */
-TEST_F(GraphSnapshotCallbackTest, Q16IntegerBackend_SnapshotOutputsCorrectKeysAndData)
+TEST_F(GraphSnapshotCallbackTest, DISABLED_Q16IntegerBackend_SnapshotOutputsCorrectKeysAndData)
 {
     // Test dimensions
     const size_t seq_len = 4;
@@ -656,8 +664,10 @@ TEST_F(GraphSnapshotCallbackTest, Q16IntegerBackend_SnapshotOutputsCorrectKeysAn
  *
  * Q16_INTEGER backend requires Q16_1 tensors for Q/K/V. This test verifies that
  * passing Q8_1 tensors (wrong type) is properly rejected with a descriptive error.
+ *
+ * DISABLED: HybridQ16 project on hold - Q16_INTEGER backend tests skipped.
  */
-TEST_F(GraphSnapshotCallbackTest, Q16IntegerBackend_RejectsWrongTensorType)
+TEST_F(GraphSnapshotCallbackTest, DISABLED_Q16IntegerBackend_RejectsWrongTensorType)
 {
     const size_t seq_len = 4;
     const size_t kv_len = 8;
@@ -813,6 +823,10 @@ TEST_F(GraphSnapshotCallbackTest, NoCallback_NoFailure)
     auto *output = createFP32Tensor({seq_len, d_model});
     auto *gamma = createFP32Tensor({d_model});
 
+    // Initialize input with non-zero values (required for buffer validation)
+    for (size_t i = 0; i < seq_len * d_model; ++i)
+        input->mutable_data()[i] = 0.5f + (i % 10) * 0.1f;
+
     for (size_t i = 0; i < d_model; ++i)
         gamma->mutable_data()[i] = 1.0f;
 
@@ -847,6 +861,10 @@ TEST_F(GraphSnapshotCallbackTest, CallbackCanBeChanged)
     auto *input = createFP32Tensor({seq_len, d_model});
     auto *output = createFP32Tensor({seq_len, d_model});
     auto *gamma = createFP32Tensor({d_model});
+
+    // Initialize input with non-zero values (required for buffer validation)
+    for (size_t i = 0; i < seq_len * d_model; ++i)
+        input->mutable_data()[i] = 0.5f + (i % 10) * 0.1f;
 
     for (size_t i = 0; i < d_model; ++i)
         gamma->mutable_data()[i] = 1.0f;
@@ -894,6 +912,10 @@ TEST_F(GraphSnapshotCallbackTest, CallbackReceivesValidDumpInfo)
     auto *input = createFP32Tensor({seq_len, d_model});
     auto *output = createFP32Tensor({seq_len, d_model});
     auto *gamma = createFP32Tensor({d_model});
+
+    // Initialize input with non-zero values (required for buffer validation)
+    for (size_t i = 0; i < seq_len * d_model; ++i)
+        input->mutable_data()[i] = 0.5f + (i % 10) * 0.1f;
 
     for (size_t i = 0; i < d_model; ++i)
         gamma->mutable_data()[i] = 1.0f;

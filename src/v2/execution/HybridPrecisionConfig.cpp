@@ -21,8 +21,13 @@ namespace llaminar2
         case HybridBufferType::Logits:
             return ActivationPrecision::FP32;
 
-        // QKV path
+        // QKV path - legacy uniform output
         case HybridBufferType::QKV_GEMM_Output:
+            return qkv_gemm_output;
+        // Individual Q/K/V GEMM outputs - default to qkv_gemm_output for Hybrid mode
+        case HybridBufferType::Q_GEMM_Output:
+        case HybridBufferType::K_GEMM_Output:
+        case HybridBufferType::V_GEMM_Output:
             return qkv_gemm_output;
         case HybridBufferType::Q_After_RoPE:
             return q_after_rope;
@@ -139,6 +144,12 @@ namespace llaminar2
             return "Logits";
         case HybridBufferType::QKV_GEMM_Output:
             return "QKV_GEMM_Output";
+        case HybridBufferType::Q_GEMM_Output:
+            return "Q_GEMM_Output";
+        case HybridBufferType::K_GEMM_Output:
+            return "K_GEMM_Output";
+        case HybridBufferType::V_GEMM_Output:
+            return "V_GEMM_Output";
         case HybridBufferType::Q_After_RoPE:
             return "Q_After_RoPE";
         case HybridBufferType::K_After_RoPE:
@@ -181,9 +192,16 @@ namespace llaminar2
         case HybridBufferType::Logits:
             return ActivationPrecision::FP32;
 
-        // QKV path (same as Hybrid)
+        // QKV path - mixed precision for HybridQ16
+        // K is Q16_1 to preserve small values, Q and V are Q8_1
         case HybridBufferType::QKV_GEMM_Output:
-            return qkv_gemm_output;
+            return qkv_gemm_output; // Legacy uniform (deprecated)
+        case HybridBufferType::Q_GEMM_Output:
+            return q_gemm_output; // Q8_1
+        case HybridBufferType::K_GEMM_Output:
+            return k_gemm_output; // Q16_1 (256× better precision!)
+        case HybridBufferType::V_GEMM_Output:
+            return v_gemm_output; // Q8_1
         case HybridBufferType::Q_After_RoPE:
             return q_after_rope;
         case HybridBufferType::K_After_RoPE:

@@ -1,0 +1,13 @@
+name=K
+rows=9
+cols=128
+dtype=Q16_1_64
+element_count=0
+byte_size=2448
+# Block format info:
+block_count=18
+blocks_per_row=2
+block_element_size=64
+sample_min=0.000000
+sample_max=0.000000
+sample_mean=0.000000

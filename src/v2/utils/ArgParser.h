@@ -129,7 +129,7 @@ namespace llaminar2
         std::string weight_precision = "native"; // "native", "fp32", "bf16", "fp16", "int8"
 
         // Activation/accumulation precision
-        std::string activation_precision = "hybrid"; // "fp32", "bf16", "fp16", "q8_1", "hybrid"
+        std::string activation_precision = "fp32"; // "fp32", "bf16", "fp16", "q8_1"
 
         // Weight sharding for tensor parallelism
         bool shard_weights = false;           // Explicitly enable weight sharding (legacy)

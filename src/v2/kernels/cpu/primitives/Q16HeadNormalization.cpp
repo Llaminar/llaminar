@@ -219,4 +219,121 @@ namespace llaminar2::primitives
     template float normalize_q16_head<Q16_1Block_128>(Q16_1Block_128 *, size_t);
     template bool needs_normalization<Q16_1Block_128>(const Q16_1Block_128 *, size_t, float);
 
+    // ========================================================================
+    // find_head_max_abs_qs - Find maximum |qs| across all elements in a head
+    // ========================================================================
+
+    template <typename BlockType>
+    int16_t find_head_max_abs_qs(const BlockType *blocks, size_t num_blocks)
+    {
+        if (num_blocks == 0 || blocks == nullptr)
+        {
+            return 0;
+        }
+
+        int16_t max_abs = 0;
+        for (size_t b = 0; b < num_blocks; ++b)
+        {
+            for (size_t i = 0; i < BlockType::BLOCK_SIZE; ++i)
+            {
+                int16_t abs_val = static_cast<int16_t>(std::abs(blocks[b].qs[i]));
+                if (abs_val > max_abs)
+                {
+                    max_abs = abs_val;
+                }
+            }
+        }
+        return max_abs;
+    }
+
+    // ========================================================================
+    // normalize_q16_head_to_vnni_safe - Rescale to VNNI-safe range
+    // ========================================================================
+
+    template <typename BlockType>
+    VNNISafeNormResult normalize_q16_head_to_vnni_safe(
+        BlockType *blocks, size_t num_blocks, int head_dim, float d_unified)
+    {
+        VNNISafeNormResult result;
+        result.norm_factor = 1.0f;
+        result.new_d = d_unified;
+        result.max_qs = 0;
+        result.was_rescaled = false;
+
+        if (num_blocks == 0 || blocks == nullptr || d_unified == 0.0f)
+        {
+            return result;
+        }
+
+        // Find max |qs| across the entire head
+        int16_t max_abs_qs = find_head_max_abs_qs(blocks, num_blocks);
+        result.max_qs = max_abs_qs;
+
+        // Get the VNNI-safe limit for this head dimension
+        int16_t safe_max = get_vnni_safe_max_qs(head_dim);
+
+        // If already safe, no rescaling needed
+        if (max_abs_qs <= safe_max)
+        {
+            // Just ensure all blocks have d = d_unified
+            for (size_t b = 0; b < num_blocks; ++b)
+            {
+                blocks[b].d = d_unified;
+            }
+            return result;
+        }
+
+        // Need to rescale: target_max = safe_max
+        result.was_rescaled = true;
+
+        // scale_ratio = safe_max / max_abs_qs (always < 1.0)
+        // We use Q16 fixed-point for the ratio to maintain integer-only inner loop
+        float scale_ratio = static_cast<float>(safe_max) / static_cast<float>(max_abs_qs);
+        int32_t ratio_q16 = static_cast<int32_t>(std::round(scale_ratio * 65536.0f));
+
+        // Apply rescaling to all blocks
+        for (size_t b = 0; b < num_blocks; ++b)
+        {
+            int32_t new_sum = 0;
+            for (size_t i = 0; i < BlockType::BLOCK_SIZE; ++i)
+            {
+                // Integer-only rescale: qs_new = (qs * ratio_q16) >> 16
+                int32_t scaled = (static_cast<int32_t>(blocks[b].qs[i]) * ratio_q16 + 32768) >> 16;
+
+                // Clamp to safe range (should be guaranteed by construction, but be safe)
+                scaled = std::max(static_cast<int32_t>(-safe_max),
+                                  std::min(scaled, static_cast<int32_t>(safe_max)));
+
+                blocks[b].qs[i] = static_cast<int16_t>(scaled);
+                new_sum += scaled;
+            }
+            blocks[b].sum_qs = new_sum;
+
+            // New scale: d_new = d_old / scale_ratio
+            // (qs values got smaller, so scale must increase to maintain same FP32 values)
+            blocks[b].d = d_unified / scale_ratio;
+        }
+
+        // Return the correction factor
+        result.new_d = d_unified / scale_ratio;
+        result.norm_factor = scale_ratio; // Multiply scores by this to restore magnitude
+
+        return result;
+    }
+
+    // ========================================================================
+    // Explicit template instantiations for VNNI-safe functions
+    // ========================================================================
+
+    template int16_t find_head_max_abs_qs<Q16_1Block>(const Q16_1Block *, size_t);
+    template int16_t find_head_max_abs_qs<Q16_1Block_64>(const Q16_1Block_64 *, size_t);
+    template int16_t find_head_max_abs_qs<Q16_1Block_128>(const Q16_1Block_128 *, size_t);
+
+    template VNNISafeNormResult normalize_q16_head_to_vnni_safe<Q16_1Block>(
+        Q16_1Block *, size_t, int, float);
+    template VNNISafeNormResult normalize_q16_head_to_vnni_safe<Q16_1Block_64>(
+        Q16_1Block_64 *, size_t, int, float);
+    template VNNISafeNormResult normalize_q16_head_to_vnni_safe<Q16_1Block_128>(
+        Q16_1Block_128 *, size_t, int, float);
+
 } // namespace llaminar2::primitives

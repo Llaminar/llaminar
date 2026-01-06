@@ -86,6 +86,11 @@ namespace llaminar2
 
             // Q16_1 residual fusion (HybridQ16 mode)
             bool fuse_residual_add = false;
+
+            // HybridQ16 K precision fix: per-head dynamic K scales from RoPE
+            // Shape: [kv_len * n_kv_heads] when non-null
+            // For prefill: fresh K vectors; for decode: comes from KV cache
+            const float *K_head_scales = nullptr;
         };
 
         explicit FusedAttentionWoStage(Params params);

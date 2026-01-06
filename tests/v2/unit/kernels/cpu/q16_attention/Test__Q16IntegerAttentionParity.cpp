@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "kernels/cpu/attention/q16_1/ref/Q16IntegerAttentionRef.h"
+#include "kernels/cpu/attention/CPUAttentionKernelT.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/Tensors.h"
 
@@ -204,6 +205,7 @@ protected:
         std::vector<BlockType> blocks(total_blocks);
         // Fixed scale formula matching pipeline
         float d = kv_cache_scale / 32767.0f;
+        std::cout << "DEBUG: quantizeToQ16 scale=" << kv_cache_scale << " d=" << d << std::endl;
         float quant_factor = 32767.0f / kv_cache_scale;
 
         for (int r = 0; r < rows; ++r)
@@ -342,11 +344,17 @@ protected:
 // =============================================================================
 // Pipeline Scale Constant (matches kv_cache_scale in real pipeline)
 // =============================================================================
-// kv_cache_scale = 8.0 means the representable range is [-8.0, +8.0]
-// Block scale d = kv_cache_scale / 32767.0f
+// IMPORTANT: This MUST match the real pipeline's kv_cache_scale (GraphSchema.h:427)
+// kv_cache_scale = 256.0 means the representable range is [-256.0, +256.0]
+// Block scale d = kv_cache_scale / 32767.0f ≈ 0.00781
 // Quantization: int16_val = round(fp32_val * 32767.0f / kv_cache_scale)
 // Dequantization: fp32_val = int16_val * d
-constexpr float KV_CACHE_SCALE = 8.0f;
+//
+// HISTORY:
+// - Originally scale=64, but Q projection values reach 130+ causing 42% clipping
+// - Changed to scale=256 to handle Q max_abs ~130 without clipping
+// Using kv_cache_scale=256 ensures VNNI safety (INT16*INT16 dot products)
+constexpr float KV_CACHE_SCALE = 256.0f;
 
 TEST_F(Test__Q16IntegerAttentionParity, Decode_Block64_MHA_Parity)
 {
@@ -363,11 +371,14 @@ TEST_F(Test__Q16IntegerAttentionParity, Decode_Block64_MHA_Parity)
     const int total_kv = KV_LEN * NUM_KV_HEADS * HEAD_DIM;
     const int total_out = SEQ_LEN_Q * NUM_HEADS * HEAD_DIM;
 
-    // Generate random FP32 data in the range [-kv_cache_scale, +kv_cache_scale]
-    // Using stddev=2.0 means most values are in [-6, 6], well within ±8 range
-    auto Q_fp32 = generateNormalData(total_q, 0.0f, 0.5f);
-    auto K_fp32 = generateNormalData(total_kv, 0.0f, 0.5f);
-    auto V_fp32 = generateNormalData(total_kv, 0.0f, 0.5f);
+    // Generate random FP32 data with realistic distributions
+    // Real pipeline activations have:
+    // - Typical values: stddev ~2-5 (mean 0)
+    // - Occasional peaks up to ~130 (but clamped by kv_cache_scale=64)
+    // Using stddev=4.0 gives realistic spread: ~95% of values in [-12, 12]
+    auto Q_fp32 = generateNormalData(total_q, 0.0f, 4.0f);
+    auto K_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+    auto V_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
 
     // Compute FP32 reference
     std::vector<float> ref_output(total_out);
@@ -533,9 +544,9 @@ TEST_F(Test__Q16IntegerAttentionParity, Decode_Block64_GQA_Parity)
     const int total_kv = KV_LEN * NUM_KV_HEADS * HEAD_DIM;
     const int total_out = SEQ_LEN_Q * NUM_HEADS * HEAD_DIM;
 
-    auto Q_fp32 = generateNormalData(total_q, 0.0f, 0.5f);
-    auto K_fp32 = generateNormalData(total_kv, 0.0f, 0.5f);
-    auto V_fp32 = generateNormalData(total_kv, 0.0f, 0.5f);
+    auto Q_fp32 = generateNormalData(total_q, 0.0f, 4.0f);
+    auto K_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+    auto V_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
 
     std::vector<float> ref_output(total_out);
     fp32ReferenceAttention(
@@ -584,6 +595,234 @@ TEST_F(Test__Q16IntegerAttentionParity, Decode_Block64_GQA_Parity)
     EXPECT_LT(max_diff, 1.0f) << "Max difference should be < 1.0";
 }
 
+TEST_F(Test__Q16IntegerAttentionParity, Decode_Block64_GQA_Qwen2_05B_Parity)
+{
+    // Qwen2-0.5B exact configuration: 14 query heads, 2 KV heads (7:1 GQA ratio)
+    // This matches the HybridQ16 pipeline test configuration
+    constexpr int HEAD_DIM = 64;
+    constexpr int KV_LEN = 9; // Same as HybridQ16 test prefill length
+    constexpr int NUM_HEADS = 14;
+    constexpr int NUM_KV_HEADS = 2; // 7:1 GQA ratio
+    constexpr int SEQ_LEN_Q = 9;    // Prefill mode (seq_len == kv_len)
+    constexpr float BLOCK_SCALE = KV_CACHE_SCALE / 32767.0f;
+
+    const int total_q = SEQ_LEN_Q * NUM_HEADS * HEAD_DIM;
+    const int total_kv = KV_LEN * NUM_KV_HEADS * HEAD_DIM;
+    const int total_out = SEQ_LEN_Q * NUM_HEADS * HEAD_DIM;
+
+    auto Q_fp32 = generateNormalData(total_q, 0.0f, 4.0f);
+    auto K_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+    auto V_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+
+    std::vector<float> ref_output(total_out);
+    fp32ReferenceAttention(
+        Q_fp32.data(), K_fp32.data(), V_fp32.data(),
+        ref_output.data(),
+        SEQ_LEN_Q, KV_LEN, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,
+        true // causal for prefill
+    );
+
+    // Transpose K/V to Q16 expected layout [num_kv_heads, kv_len, head_dim]
+    auto K_transposed = transposeKV(K_fp32, KV_LEN, NUM_KV_HEADS, HEAD_DIM);
+    auto V_transposed = transposeKV(V_fp32, KV_LEN, NUM_KV_HEADS, HEAD_DIM);
+
+    auto Q_q16 = quantizeToQ16<Q16_1Block_64>(Q_fp32, SEQ_LEN_Q * NUM_HEADS, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+    auto K_q16 = quantizeToQ16<Q16_1Block_64>(K_transposed, NUM_KV_HEADS * KV_LEN, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+    auto V_q16 = quantizeToQ16<Q16_1Block_64>(V_transposed, NUM_KV_HEADS * KV_LEN, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+
+    std::vector<float> q_scales(SEQ_LEN_Q * NUM_HEADS, BLOCK_SCALE);
+    std::vector<float> kv_scales(NUM_KV_HEADS, BLOCK_SCALE);
+    std::vector<float> q16_context(total_out);
+
+    Q16IntegerAttentionParams params;
+    params.Q = Q_q16.data();
+    params.K = K_q16.data();
+    params.V = V_q16.data();
+    params.q_head_scales = q_scales.data();
+    params.kv_head_scales = kv_scales.data();
+    params.seq_len_q = SEQ_LEN_Q;
+    params.kv_len = KV_LEN;
+    params.num_heads = NUM_HEADS;
+    params.num_kv_heads = NUM_KV_HEADS;
+    params.head_dim = HEAD_DIM;
+    params.d_model = NUM_HEADS * HEAD_DIM;
+    params.block_size = Q16BlockSize::BLOCK_64;
+    // Note: prefill path has hardcoded causal=true
+    params.snapshot_context = q16_context.data();
+
+    // Prefill mode
+    bool success = q16_integer_attention_prefill(params);
+    ASSERT_TRUE(success);
+
+    float cos_sim = cosineSimilarity(ref_output.data(), q16_context.data(), total_out);
+    float max_diff = maxAbsDiff(ref_output.data(), q16_context.data(), total_out);
+    float rmse_val = rmse(ref_output.data(), q16_context.data(), total_out);
+
+    printMetrics("Prefill GQA Qwen2-0.5B (14:2)", cos_sim, max_diff, rmse_val);
+
+    // Print first 8 values per head for debugging
+    std::cout << "  REF head0 first 8: ";
+    for (int i = 0; i < 8; ++i)
+        std::cout << ref_output[i] << " ";
+    std::cout << "\n  Q16 head0 first 8: ";
+    for (int i = 0; i < 8; ++i)
+        std::cout << q16_context[i] << " ";
+    std::cout << "\n";
+
+    // Check per-head cosine similarity to identify problematic heads
+    std::cout << "  Per-head cosine similarity:\n";
+    for (int h = 0; h < NUM_HEADS; ++h)
+    {
+        int kv_h = h / (NUM_HEADS / NUM_KV_HEADS); // GQA mapping
+        int head_offset = h * HEAD_DIM;
+        float head_cos = 0.0f;
+        for (int q = 0; q < SEQ_LEN_Q; ++q)
+        {
+            int q_offset = q * NUM_HEADS * HEAD_DIM + head_offset;
+            float dot = 0, norm_ref = 0, norm_q16 = 0;
+            for (int d = 0; d < HEAD_DIM; ++d)
+            {
+                dot += ref_output[q_offset + d] * q16_context[q_offset + d];
+                norm_ref += ref_output[q_offset + d] * ref_output[q_offset + d];
+                norm_q16 += q16_context[q_offset + d] * q16_context[q_offset + d];
+            }
+            if (norm_ref > 1e-12 && norm_q16 > 1e-12)
+                head_cos += dot / (std::sqrt(norm_ref) * std::sqrt(norm_q16));
+        }
+        head_cos /= SEQ_LEN_Q;
+        std::cout << "    Head " << h << " (kv_h=" << kv_h << "): " << head_cos << "\n";
+    }
+
+    EXPECT_GT(cos_sim, 0.95f) << "Cosine similarity should be > 0.95";
+    EXPECT_LT(max_diff, 1.0f) << "Max difference should be < 1.0";
+}
+
+TEST_F(Test__Q16IntegerAttentionParity, Prefill_Block64_GQA_Qwen2_05B_HeadMajorStride)
+{
+    // Same Qwen2-0.5B config but with HEAD_MAJOR sparse cache layout
+    // This mimics the actual pipeline where kv_head_stride = max_seq_len (4096)
+    constexpr int HEAD_DIM = 64;
+    constexpr int KV_LEN = 9;         // Same as HybridQ16 test
+    constexpr int MAX_SEQ_LEN = 4096; // Sparse cache allocation
+    constexpr int NUM_HEADS = 14;
+    constexpr int NUM_KV_HEADS = 2;
+    constexpr int SEQ_LEN_Q = 9;
+    constexpr float BLOCK_SCALE = KV_CACHE_SCALE / 32767.0f;
+
+    const int total_q = SEQ_LEN_Q * NUM_HEADS * HEAD_DIM;
+    const int total_kv_dense = KV_LEN * NUM_KV_HEADS * HEAD_DIM; // Dense layout for reference
+    const int total_out = SEQ_LEN_Q * NUM_HEADS * HEAD_DIM;
+
+    auto Q_fp32 = generateNormalData(total_q, 0.0f, 4.0f);
+    // For K/V, generate in dense layout first for reference
+    auto K_fp32_dense = generateNormalData(total_kv_dense, 0.0f, 4.0f);
+    auto V_fp32_dense = generateNormalData(total_kv_dense, 0.0f, 4.0f);
+
+    // Compute FP32 reference with dense layout
+    std::vector<float> ref_output(total_out);
+    fp32ReferenceAttention(
+        Q_fp32.data(), K_fp32_dense.data(), V_fp32_dense.data(),
+        ref_output.data(),
+        SEQ_LEN_Q, KV_LEN, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,
+        true // causal for prefill
+    );
+
+    // Transpose K/V to head-major layout [num_kv_heads, kv_len, head_dim]
+    auto K_transposed = transposeKV(K_fp32_dense, KV_LEN, NUM_KV_HEADS, HEAD_DIM);
+    auto V_transposed = transposeKV(V_fp32_dense, KV_LEN, NUM_KV_HEADS, HEAD_DIM);
+
+    // Quantize to Q16_1 for Q (dense layout)
+    auto Q_q16 = quantizeToQ16<Q16_1Block_64>(Q_fp32, SEQ_LEN_Q * NUM_HEADS, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+
+    // For K/V: allocate sparse HEAD_MAJOR layout [num_kv_heads * max_seq_len, head_dim]
+    // Each head's data starts at offset head_idx * MAX_SEQ_LEN
+    const int blocks_per_row = 1; // head_dim=64, block_size=64
+    const int sparse_kv_blocks = NUM_KV_HEADS * MAX_SEQ_LEN * blocks_per_row;
+    std::vector<Q16_1Block_64> K_sparse(sparse_kv_blocks); // Zero-initialized
+    std::vector<Q16_1Block_64> V_sparse(sparse_kv_blocks); // Zero-initialized
+
+    // Quantize dense K/V
+    auto K_q16_dense = quantizeToQ16<Q16_1Block_64>(K_transposed, NUM_KV_HEADS * KV_LEN, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+    auto V_q16_dense = quantizeToQ16<Q16_1Block_64>(V_transposed, NUM_KV_HEADS * KV_LEN, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+
+    // Copy dense data into sparse layout
+    // Dense layout: [h * KV_LEN + pos] -> Sparse layout: [h * MAX_SEQ_LEN + pos]
+    for (int h = 0; h < NUM_KV_HEADS; ++h)
+    {
+        for (int pos = 0; pos < KV_LEN; ++pos)
+        {
+            int dense_idx = h * KV_LEN + pos;
+            int sparse_idx = h * MAX_SEQ_LEN + pos;
+            K_sparse[sparse_idx] = K_q16_dense[dense_idx];
+            V_sparse[sparse_idx] = V_q16_dense[dense_idx];
+        }
+    }
+
+    std::vector<float> q_scales(SEQ_LEN_Q * NUM_HEADS, BLOCK_SCALE);
+    std::vector<float> kv_scales(NUM_KV_HEADS, BLOCK_SCALE);
+    std::vector<float> q16_context(total_out);
+
+    Q16IntegerAttentionParams params;
+    params.Q = Q_q16.data();
+    params.K = K_sparse.data(); // Sparse layout
+    params.V = V_sparse.data(); // Sparse layout
+    params.q_head_scales = q_scales.data();
+    params.kv_head_scales = kv_scales.data();
+    params.seq_len_q = SEQ_LEN_Q;
+    params.kv_len = KV_LEN;
+    params.num_heads = NUM_HEADS;
+    params.num_kv_heads = NUM_KV_HEADS;
+    params.head_dim = HEAD_DIM;
+    params.d_model = NUM_HEADS * HEAD_DIM;
+    params.block_size = Q16BlockSize::BLOCK_64;
+    params.kv_head_stride = MAX_SEQ_LEN; // KEY: Set stride for sparse layout
+    params.snapshot_context = q16_context.data();
+
+    bool success = q16_integer_attention_prefill(params);
+    ASSERT_TRUE(success);
+
+    float cos_sim = cosineSimilarity(ref_output.data(), q16_context.data(), total_out);
+    float max_diff = maxAbsDiff(ref_output.data(), q16_context.data(), total_out);
+    float rmse_val = rmse(ref_output.data(), q16_context.data(), total_out);
+
+    printMetrics("Prefill GQA Qwen2-0.5B HEAD_MAJOR (stride=4096)", cos_sim, max_diff, rmse_val);
+
+    // Print first 8 values for debugging
+    std::cout << "  REF head0 first 8: ";
+    for (int i = 0; i < 8; ++i)
+        std::cout << ref_output[i] << " ";
+    std::cout << "\n  Q16 head0 first 8: ";
+    for (int i = 0; i < 8; ++i)
+        std::cout << q16_context[i] << " ";
+    std::cout << "\n";
+
+    // Per-head analysis
+    std::cout << "  Per-head cosine similarity:\n";
+    for (int h = 0; h < NUM_HEADS; ++h)
+    {
+        int kv_h = h / (NUM_HEADS / NUM_KV_HEADS);
+        float head_cos = 0.0f;
+        for (int q = 0; q < SEQ_LEN_Q; ++q)
+        {
+            int q_offset = q * NUM_HEADS * HEAD_DIM + h * HEAD_DIM;
+            float dot = 0, norm_ref = 0, norm_q16 = 0;
+            for (int d = 0; d < HEAD_DIM; ++d)
+            {
+                dot += ref_output[q_offset + d] * q16_context[q_offset + d];
+                norm_ref += ref_output[q_offset + d] * ref_output[q_offset + d];
+                norm_q16 += q16_context[q_offset + d] * q16_context[q_offset + d];
+            }
+            if (norm_ref > 1e-12 && norm_q16 > 1e-12)
+                head_cos += dot / (std::sqrt(norm_ref) * std::sqrt(norm_q16));
+        }
+        head_cos /= SEQ_LEN_Q;
+        std::cout << "    Head " << h << " (kv_h=" << kv_h << "): " << head_cos << "\n";
+    }
+
+    EXPECT_GT(cos_sim, 0.95f) << "Cosine similarity should be > 0.95";
+    EXPECT_LT(max_diff, 1.0f) << "Max difference should be < 1.0";
+}
+
 TEST_F(Test__Q16IntegerAttentionParity, Decode_Block128_Parity)
 {
     constexpr int HEAD_DIM = 128;
@@ -597,9 +836,9 @@ TEST_F(Test__Q16IntegerAttentionParity, Decode_Block128_Parity)
     const int total_kv = KV_LEN * NUM_KV_HEADS * HEAD_DIM;
     const int total_out = SEQ_LEN_Q * NUM_HEADS * HEAD_DIM;
 
-    auto Q_fp32 = generateNormalData(total_q, 0.0f, 0.5f);
-    auto K_fp32 = generateNormalData(total_kv, 0.0f, 0.5f);
-    auto V_fp32 = generateNormalData(total_kv, 0.0f, 0.5f);
+    auto Q_fp32 = generateNormalData(total_q, 0.0f, 4.0f);
+    auto K_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+    auto V_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
 
     std::vector<float> ref_output(total_out);
     fp32ReferenceAttention(
@@ -664,9 +903,9 @@ TEST_F(Test__Q16IntegerAttentionParity, Prefill_Block64_SmallSequence_Parity)
     const int total_kv = KV_LEN * NUM_KV_HEADS * HEAD_DIM;
     const int total_out = SEQ_LEN_Q * NUM_HEADS * HEAD_DIM;
 
-    auto Q_fp32 = generateNormalData(total_q, 0.0f, 0.5f);
-    auto K_fp32 = generateNormalData(total_kv, 0.0f, 0.5f);
-    auto V_fp32 = generateNormalData(total_kv, 0.0f, 0.5f);
+    auto Q_fp32 = generateNormalData(total_q, 0.0f, 4.0f);
+    auto K_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+    auto V_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
 
     std::vector<float> ref_output(total_out);
     fp32ReferenceAttention(
@@ -728,9 +967,9 @@ TEST_F(Test__Q16IntegerAttentionParity, Prefill_Block64_LargerSequence_Parity)
     const int total_kv = KV_LEN * NUM_KV_HEADS * HEAD_DIM;
     const int total_out = SEQ_LEN_Q * NUM_HEADS * HEAD_DIM;
 
-    auto Q_fp32 = generateNormalData(total_q, 0.0f, 0.5f);
-    auto K_fp32 = generateNormalData(total_kv, 0.0f, 0.5f);
-    auto V_fp32 = generateNormalData(total_kv, 0.0f, 0.5f);
+    auto Q_fp32 = generateNormalData(total_q, 0.0f, 4.0f);
+    auto K_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+    auto V_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
 
     std::vector<float> ref_output(total_out);
     fp32ReferenceAttention(
@@ -794,9 +1033,9 @@ TEST_F(Test__Q16IntegerAttentionParity, SoftmaxWeights_SumToOne)
     const int total_q = SEQ_LEN_Q * NUM_HEADS * HEAD_DIM;
     const int total_kv = KV_LEN * NUM_KV_HEADS * HEAD_DIM;
 
-    auto Q_fp32 = generateNormalData(total_q, 0.0f, 0.5f);
-    auto K_fp32 = generateNormalData(total_kv, 0.0f, 0.5f);
-    auto V_fp32 = generateNormalData(total_kv, 0.0f, 0.5f);
+    auto Q_fp32 = generateNormalData(total_q, 0.0f, 4.0f);
+    auto K_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+    auto V_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
 
     // Transpose K/V to Q16 expected layout
     auto K_transposed = transposeKV(K_fp32, KV_LEN, NUM_KV_HEADS, HEAD_DIM);
@@ -885,9 +1124,9 @@ protected:
         const int total_kv = kv_len * NUM_KV_HEADS * HEAD_DIM;
         const int total_out = SEQ_LEN_Q * NUM_HEADS * HEAD_DIM;
 
-        auto Q_fp32 = generateNormalData(total_q, 0.0f, 0.5f);
-        auto K_fp32 = generateNormalData(total_kv, 0.0f, 0.5f);
-        auto V_fp32 = generateNormalData(total_kv, 0.0f, 0.5f);
+        auto Q_fp32 = generateNormalData(total_q, 0.0f, 4.0f);
+        auto K_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+        auto V_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
 
         std::vector<float> ref_output(total_out);
         fp32ReferenceAttention(
@@ -1017,9 +1256,9 @@ protected:
         const int total_kv = kv_len * NUM_KV_HEADS * HEAD_DIM;
         const int total_out = seq_len * NUM_HEADS * HEAD_DIM;
 
-        auto Q_fp32 = generateNormalData(total_q, 0.0f, 0.5f);
-        auto K_fp32 = generateNormalData(total_kv, 0.0f, 0.5f);
-        auto V_fp32 = generateNormalData(total_kv, 0.0f, 0.5f);
+        auto Q_fp32 = generateNormalData(total_q, 0.0f, 4.0f);
+        auto K_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+        auto V_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
 
         std::vector<float> ref_output(total_out);
         fp32ReferenceAttention(
@@ -1109,4 +1348,985 @@ TEST_F(LongSequencePrefillTest, Prefill_SeqLen_2048)
 TEST_F(LongSequencePrefillTest, Prefill_SeqLen_4096)
 {
     runPrefillTest(4096, "Prefill Seq=4096");
+}
+
+// =============================================================================
+// GQA Tests - Grouped Query Attention (n_heads != n_kv_heads)
+// Tests Qwen2-0.5B configuration: 14 heads, 2 KV heads (7:1 ratio)
+// =============================================================================
+
+/**
+ * @brief Test fixture for GQA (Grouped Query Attention) parity tests.
+ *
+ * These tests verify Q16 attention correctness with n_heads != n_kv_heads,
+ * which is the configuration used by Qwen2-0.5B (14 query heads, 2 KV heads).
+ */
+class GQAAttentionParityTest : public Test__Q16IntegerAttentionParity
+{
+protected:
+    // Qwen2-0.5B GQA configuration
+    static constexpr int NUM_HEADS = 14;
+    static constexpr int NUM_KV_HEADS = 2;
+    static constexpr int HEAD_DIM = 64;
+    static constexpr float KV_CACHE_SCALE = 256.0f; // Must match pipeline (was 8, then 64)
+    static constexpr float BLOCK_SCALE = KV_CACHE_SCALE / 32767.0f;
+
+    /**
+     * @brief Compute FP32 reference using CPUAttentionKernelT<FP32>
+     *
+     * This uses the actual Llaminar FP32 attention kernel as reference,
+     * not a simplified hand-rolled implementation.
+     *
+     * LAYOUT CONVERSION:
+     * - Inline ref & Q16 use Q in [num_heads, seq_len, head_dim] (heads-major)
+     * - CPUAttentionKernelT uses Q in [seq_len, num_heads, head_dim] (seq-major)
+     * - K/V layouts match: [kv_len, num_kv_heads, head_dim]
+     * - Inline ref outputs to [seq_len, num_heads, head_dim]
+     * - CPUAttentionKernelT outputs to [seq_len, num_heads, head_dim]
+     *
+     * So we need to:
+     * 1. Transpose Q from [num_heads, seq_len, head_dim] to [seq_len, num_heads, head_dim]
+     * 2. K/V can be used directly
+     * 3. Output is already in [seq_len, num_heads, head_dim] - no transpose needed
+     */
+    void computeRealFP32Reference(
+        const std::vector<float> &Q_fp32,
+        const std::vector<float> &K_fp32,
+        const std::vector<float> &V_fp32,
+        std::vector<float> &output,
+        int seq_len_q,
+        int kv_len,
+        bool causal)
+    {
+        // Transpose Q from [num_heads, seq_len_q, head_dim] to [seq_len_q, num_heads, head_dim]
+        std::vector<float> Q_transposed(seq_len_q * NUM_HEADS * HEAD_DIM);
+        for (int q = 0; q < seq_len_q; ++q)
+        {
+            for (int h = 0; h < NUM_HEADS; ++h)
+            {
+                for (int d = 0; d < HEAD_DIM; ++d)
+                {
+                    // Source: [h][q][d] = (h * seq_len_q + q) * head_dim + d
+                    // Dest: [q][h][d] = (q * num_heads + h) * head_dim + d
+                    Q_transposed[(q * NUM_HEADS + h) * HEAD_DIM + d] =
+                        Q_fp32[(h * seq_len_q + q) * HEAD_DIM + d];
+                }
+            }
+        }
+
+        // Allocate output
+        output.resize(seq_len_q * NUM_HEADS * HEAD_DIM);
+
+        // Create the real FP32 attention kernel
+        CPUAttentionKernelT<ActivationPrecision::FP32> kernel;
+
+        // Use compute_decode() when seq_len != kv_len (decode case), otherwise compute()
+        bool success;
+        if (seq_len_q != kv_len)
+        {
+            // Decode: seq_len_q=1, kv_len=32 (or whatever)
+            success = kernel.compute_decode(
+                Q_transposed.data(), K_fp32.data(), V_fp32.data(), output.data(),
+                seq_len_q, // seq_len
+                kv_len,    // kv_len
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                causal,
+                -1,      // window_size
+                nullptr, // workspace_scores
+                nullptr, // workspace_buffer
+                nullptr, // workspace_context
+                nullptr, // workspace_mask
+                false,   // use_bf16
+                nullptr, // mpi_ctx
+                -1);     // device_idx
+        }
+        else
+        {
+            // Prefill: seq_len_q == kv_len
+            success = kernel.compute(
+                Q_transposed.data(), K_fp32.data(), V_fp32.data(), output.data(),
+                seq_len_q, // seq_len
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                causal,
+                -1,      // window_size
+                nullptr, // workspace_scores
+                nullptr, // workspace_buffer
+                nullptr, // workspace_context
+                nullptr, // workspace_mask
+                false,   // use_bf16
+                nullptr, // mpi_ctx
+                -1);     // device_idx
+        }
+
+        ASSERT_TRUE(success) << "CPUAttentionKernelT<FP32> compute failed";
+
+        // Output is [seq_len_q, num_heads, head_dim] - matches inline ref output layout
+        // No transpose needed!
+    }
+};
+
+/**
+ * @brief GQA Decode test using inline FP32 reference (7:1 ratio)
+ */
+TEST_F(GQAAttentionParityTest, Decode_GQA_7to1_InlineReference)
+{
+    // Decode: seq_len_q=1, kv_len=32
+    constexpr int SEQ_LEN_Q = 1;
+    constexpr int KV_LEN = 32;
+
+    const int total_q = SEQ_LEN_Q * NUM_HEADS * HEAD_DIM;
+    const int total_kv = KV_LEN * NUM_KV_HEADS * HEAD_DIM;
+    const int total_out = SEQ_LEN_Q * NUM_HEADS * HEAD_DIM;
+
+    // Generate random data in [-kv_cache_scale, +kv_cache_scale]
+    auto Q_fp32 = generateNormalData(total_q, 0.0f, 4.0f);
+    auto K_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+    auto V_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+
+    // FP32 reference (inline implementation)
+    std::vector<float> ref_output(total_out);
+    fp32ReferenceAttention(
+        Q_fp32.data(), K_fp32.data(), V_fp32.data(),
+        ref_output.data(),
+        SEQ_LEN_Q, KV_LEN, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,
+        false // not causal for decode
+    );
+
+    // Transpose K/V to head-major for Q16 kernel
+    std::vector<float> K_transposed = this->transposeKV(K_fp32, KV_LEN, NUM_KV_HEADS, HEAD_DIM);
+    std::vector<float> V_transposed = this->transposeKV(V_fp32, KV_LEN, NUM_KV_HEADS, HEAD_DIM);
+
+    // Quantize to Q16_1
+    auto Q_q16 = quantizeToQ16<Q16_1Block_64>(Q_fp32, NUM_HEADS, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+    auto K_q16 = quantizeToQ16<Q16_1Block_64>(K_transposed, NUM_KV_HEADS * KV_LEN, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+    auto V_q16 = quantizeToQ16<Q16_1Block_64>(V_transposed, NUM_KV_HEADS * KV_LEN, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+
+    std::vector<float> q_scales(NUM_HEADS, BLOCK_SCALE);
+    std::vector<float> kv_scales(NUM_KV_HEADS, BLOCK_SCALE);
+    std::vector<float> q16_context(total_out);
+
+    Q16IntegerAttentionParams params;
+    params.Q = Q_q16.data();
+    params.K = K_q16.data();
+    params.V = V_q16.data();
+    params.q_head_scales = q_scales.data();
+    params.kv_head_scales = kv_scales.data();
+    params.seq_len_q = SEQ_LEN_Q;
+    params.kv_len = KV_LEN;
+    params.num_heads = NUM_HEADS;
+    params.num_kv_heads = NUM_KV_HEADS;
+    params.head_dim = HEAD_DIM;
+    params.d_model = NUM_HEADS * HEAD_DIM;
+    params.block_size = Q16BlockSize::BLOCK_64;
+    params.snapshot_context = q16_context.data();
+
+    bool success = q16_integer_attention_decode(params);
+    ASSERT_TRUE(success) << "GQA Decode failed";
+
+    float cos_sim = cosineSimilarity(ref_output.data(), q16_context.data(), total_out);
+    float max_diff = maxAbsDiff(ref_output.data(), q16_context.data(), total_out);
+    float rmse_val = rmse(ref_output.data(), q16_context.data(), total_out);
+
+    std::cout << "[PARITY] GQA Decode (14:2, inline ref):" << std::endl;
+    std::cout << "  Cosine similarity: " << std::fixed << std::setprecision(6) << cos_sim << std::endl;
+    std::cout << "  Max absolute diff: " << std::scientific << std::setprecision(4) << max_diff << std::endl;
+    std::cout << "  RMSE:             " << rmse_val << std::endl;
+
+    EXPECT_GT(cos_sim, 0.99f) << "GQA decode should have >0.99 cosine similarity with inline ref";
+}
+
+/**
+ * @brief GQA Prefill test using inline FP32 reference (7:1 ratio)
+ */
+TEST_F(GQAAttentionParityTest, Prefill_GQA_7to1_InlineReference)
+{
+    // Prefill: seq_len=9 (Qwen2 prompt), causal
+    constexpr int SEQ_LEN = 9;
+    constexpr int KV_LEN = SEQ_LEN; // Prefill: kv_len == seq_len
+
+    const int total_q = SEQ_LEN * NUM_HEADS * HEAD_DIM;
+    const int total_kv = KV_LEN * NUM_KV_HEADS * HEAD_DIM;
+    const int total_out = SEQ_LEN * NUM_HEADS * HEAD_DIM;
+
+    auto Q_fp32 = generateNormalData(total_q, 0.0f, 4.0f);
+    auto K_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+    auto V_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+
+    // FP32 reference (inline, causal)
+    std::vector<float> ref_output(total_out);
+    fp32ReferenceAttention(
+        Q_fp32.data(), K_fp32.data(), V_fp32.data(),
+        ref_output.data(),
+        SEQ_LEN, KV_LEN, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,
+        true // causal for prefill
+    );
+
+    // Transpose K/V to head-major
+    std::vector<float> K_transposed = this->transposeKV(K_fp32, KV_LEN, NUM_KV_HEADS, HEAD_DIM);
+    std::vector<float> V_transposed = this->transposeKV(V_fp32, KV_LEN, NUM_KV_HEADS, HEAD_DIM);
+
+    // Quantize
+    auto Q_q16 = quantizeToQ16<Q16_1Block_64>(Q_fp32, SEQ_LEN * NUM_HEADS, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+    auto K_q16 = quantizeToQ16<Q16_1Block_64>(K_transposed, NUM_KV_HEADS * KV_LEN, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+    auto V_q16 = quantizeToQ16<Q16_1Block_64>(V_transposed, NUM_KV_HEADS * KV_LEN, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+
+    std::vector<float> q_scales(NUM_HEADS, BLOCK_SCALE);
+    std::vector<float> kv_scales(NUM_KV_HEADS, BLOCK_SCALE);
+    std::vector<float> q16_context(total_out);
+
+    Q16IntegerAttentionParams params;
+    params.Q = Q_q16.data();
+    params.K = K_q16.data();
+    params.V = V_q16.data();
+    params.q_head_scales = q_scales.data();
+    params.kv_head_scales = kv_scales.data();
+    params.seq_len_q = SEQ_LEN;
+    params.kv_len = KV_LEN;
+    params.num_heads = NUM_HEADS;
+    params.num_kv_heads = NUM_KV_HEADS;
+    params.head_dim = HEAD_DIM;
+    params.d_model = NUM_HEADS * HEAD_DIM;
+    params.block_size = Q16BlockSize::BLOCK_64;
+    // Note: prefill handles causal mask internally
+    params.snapshot_context = q16_context.data();
+
+    bool success = q16_integer_attention_prefill(params);
+    ASSERT_TRUE(success) << "GQA Prefill failed";
+
+    float cos_sim = cosineSimilarity(ref_output.data(), q16_context.data(), total_out);
+    float max_diff = maxAbsDiff(ref_output.data(), q16_context.data(), total_out);
+    float rmse_val = rmse(ref_output.data(), q16_context.data(), total_out);
+
+    std::cout << "[PARITY] GQA Prefill (14:2, inline ref, causal):" << std::endl;
+    std::cout << "  Cosine similarity: " << std::fixed << std::setprecision(6) << cos_sim << std::endl;
+    std::cout << "  Max absolute diff: " << std::scientific << std::setprecision(4) << max_diff << std::endl;
+    std::cout << "  RMSE:             " << rmse_val << std::endl;
+
+    // Prefill with GQA has more numerical challenges
+    EXPECT_GT(cos_sim, 0.95f) << "GQA prefill should have >0.95 cosine similarity with inline ref";
+}
+
+/**
+ * @brief GQA Decode test using real CPUAttentionKernelT<FP32> as reference
+ */
+TEST_F(GQAAttentionParityTest, Decode_GQA_7to1_RealFP32Reference)
+{
+    constexpr int SEQ_LEN_Q = 1;
+    constexpr int KV_LEN = 32;
+
+    const int total_q = SEQ_LEN_Q * NUM_HEADS * HEAD_DIM;
+    const int total_kv = KV_LEN * NUM_KV_HEADS * HEAD_DIM;
+    const int total_out = SEQ_LEN_Q * NUM_HEADS * HEAD_DIM;
+
+    // Generate random data
+    auto Q_fp32 = generateNormalData(total_q, 0.0f, 4.0f);
+    auto K_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+    auto V_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+
+    // Real FP32 reference using CPUAttentionKernelT<FP32>
+    std::vector<float> ref_output;
+    computeRealFP32Reference(Q_fp32, K_fp32, V_fp32, ref_output, SEQ_LEN_Q, KV_LEN, false);
+
+    // Transpose K/V to head-major for Q16
+    std::vector<float> K_transposed = this->transposeKV(K_fp32, KV_LEN, NUM_KV_HEADS, HEAD_DIM);
+    std::vector<float> V_transposed = this->transposeKV(V_fp32, KV_LEN, NUM_KV_HEADS, HEAD_DIM);
+
+    // Quantize
+    auto Q_q16 = quantizeToQ16<Q16_1Block_64>(Q_fp32, NUM_HEADS, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+    auto K_q16 = quantizeToQ16<Q16_1Block_64>(K_transposed, NUM_KV_HEADS * KV_LEN, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+    auto V_q16 = quantizeToQ16<Q16_1Block_64>(V_transposed, NUM_KV_HEADS * KV_LEN, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+
+    std::vector<float> q_scales(NUM_HEADS, BLOCK_SCALE);
+    std::vector<float> kv_scales(NUM_KV_HEADS, BLOCK_SCALE);
+    std::vector<float> q16_context(total_out);
+
+    Q16IntegerAttentionParams params;
+    params.Q = Q_q16.data();
+    params.K = K_q16.data();
+    params.V = V_q16.data();
+    params.q_head_scales = q_scales.data();
+    params.kv_head_scales = kv_scales.data();
+    params.seq_len_q = SEQ_LEN_Q;
+    params.kv_len = KV_LEN;
+    params.num_heads = NUM_HEADS;
+    params.num_kv_heads = NUM_KV_HEADS;
+    params.head_dim = HEAD_DIM;
+    params.d_model = NUM_HEADS * HEAD_DIM;
+    params.block_size = Q16BlockSize::BLOCK_64;
+    params.snapshot_context = q16_context.data();
+
+    bool success = q16_integer_attention_decode(params);
+    ASSERT_TRUE(success) << "GQA Decode failed";
+
+    float cos_sim = cosineSimilarity(ref_output.data(), q16_context.data(), total_out);
+    float max_diff = maxAbsDiff(ref_output.data(), q16_context.data(), total_out);
+    float rmse_val = rmse(ref_output.data(), q16_context.data(), total_out);
+
+    std::cout << "[PARITY] GQA Decode (14:2, CPUAttentionKernelT<FP32>):" << std::endl;
+    std::cout << "  Cosine similarity: " << std::fixed << std::setprecision(6) << cos_sim << std::endl;
+    std::cout << "  Max absolute diff: " << std::scientific << std::setprecision(4) << max_diff << std::endl;
+    std::cout << "  RMSE:             " << rmse_val << std::endl;
+
+    EXPECT_GT(cos_sim, 0.99f) << "GQA decode should have >0.99 cosine similarity with real FP32 ref";
+}
+
+/**
+ * @brief GQA Prefill test using real CPUAttentionKernelT<FP32> as reference
+ */
+TEST_F(GQAAttentionParityTest, Prefill_GQA_7to1_RealFP32Reference)
+{
+    constexpr int SEQ_LEN = 9;
+    constexpr int KV_LEN = SEQ_LEN;
+
+    const int total_q = SEQ_LEN * NUM_HEADS * HEAD_DIM;
+    const int total_kv = KV_LEN * NUM_KV_HEADS * HEAD_DIM;
+    const int total_out = SEQ_LEN * NUM_HEADS * HEAD_DIM;
+
+    auto Q_fp32 = generateNormalData(total_q, 0.0f, 4.0f);
+    auto K_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+    auto V_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+
+    // Real FP32 reference using CPUAttentionKernelT<FP32>
+    std::vector<float> ref_output;
+    computeRealFP32Reference(Q_fp32, K_fp32, V_fp32, ref_output, SEQ_LEN, KV_LEN, true);
+
+    // Transpose K/V to head-major
+    std::vector<float> K_transposed = this->transposeKV(K_fp32, KV_LEN, NUM_KV_HEADS, HEAD_DIM);
+    std::vector<float> V_transposed = this->transposeKV(V_fp32, KV_LEN, NUM_KV_HEADS, HEAD_DIM);
+
+    // Quantize
+    auto Q_q16 = quantizeToQ16<Q16_1Block_64>(Q_fp32, SEQ_LEN * NUM_HEADS, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+    auto K_q16 = quantizeToQ16<Q16_1Block_64>(K_transposed, NUM_KV_HEADS * KV_LEN, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+    auto V_q16 = quantizeToQ16<Q16_1Block_64>(V_transposed, NUM_KV_HEADS * KV_LEN, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+
+    std::vector<float> q_scales(NUM_HEADS, BLOCK_SCALE);
+    std::vector<float> kv_scales(NUM_KV_HEADS, BLOCK_SCALE);
+    std::vector<float> q16_context(total_out);
+
+    Q16IntegerAttentionParams params;
+    params.Q = Q_q16.data();
+    params.K = K_q16.data();
+    params.V = V_q16.data();
+    params.q_head_scales = q_scales.data();
+    params.kv_head_scales = kv_scales.data();
+    params.seq_len_q = SEQ_LEN;
+    params.kv_len = KV_LEN;
+    params.num_heads = NUM_HEADS;
+    params.num_kv_heads = NUM_KV_HEADS;
+    params.head_dim = HEAD_DIM;
+    params.d_model = NUM_HEADS * HEAD_DIM;
+    params.block_size = Q16BlockSize::BLOCK_64;
+    // Note: prefill handles causal mask internally
+    params.snapshot_context = q16_context.data();
+
+    bool success = q16_integer_attention_prefill(params);
+    ASSERT_TRUE(success) << "GQA Prefill failed";
+
+    float cos_sim = cosineSimilarity(ref_output.data(), q16_context.data(), total_out);
+    float max_diff = maxAbsDiff(ref_output.data(), q16_context.data(), total_out);
+    float rmse_val = rmse(ref_output.data(), q16_context.data(), total_out);
+
+    std::cout << "[PARITY] GQA Prefill (14:2, CPUAttentionKernelT<FP32>, causal):" << std::endl;
+    std::cout << "  Cosine similarity: " << std::fixed << std::setprecision(6) << cos_sim << std::endl;
+    std::cout << "  Max absolute diff: " << std::scientific << std::setprecision(4) << max_diff << std::endl;
+    std::cout << "  RMSE:             " << rmse_val << std::endl;
+
+    EXPECT_GT(cos_sim, 0.95f) << "GQA prefill should have >0.95 cosine similarity with real FP32 ref";
+}
+
+// =============================================================================
+// Per-Position K Scale Parity Tests (Phase 8 - HybridQ16 K Precision Fix)
+// =============================================================================
+
+/**
+ * @brief Test fixture for per-position K scale parity tests.
+ *
+ * These tests verify that Q16 integer attention with per-position K scales
+ * produces correct results compared to an FP32 reference implementation
+ * that applies the same per-position scaling.
+ */
+class PerPositionKScaleParityTest : public Test__Q16IntegerAttentionParity
+{
+protected:
+    static constexpr int HEAD_DIM = 64;
+    static constexpr int NUM_HEADS = 14;   // Qwen2-0.5B config
+    static constexpr int NUM_KV_HEADS = 2; // GQA 7:1
+
+    /**
+     * @brief Compute FP32 reference attention WITH per-position K scales.
+     */
+    void fp32ReferenceWithPerPositionKScales(
+        const float *Q_fp32, // [num_heads, head_dim] - dequantized values
+        const float *K_fp32, // [num_kv_heads, kv_len, head_dim] - dequantized values
+        const float *V_fp32, // [num_kv_heads, kv_len, head_dim] - dequantized values
+        float *output,       // [num_heads, head_dim]
+        int kv_len,
+        float q_scale,
+        const float *k_position_scales, // [kv_len * num_kv_heads]
+        float v_scale)
+    {
+        const float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
+
+        for (int h = 0; h < NUM_HEADS; ++h)
+        {
+            int kv_h = h / (NUM_HEADS / NUM_KV_HEADS);
+            const float *Q_head = Q_fp32 + h * HEAD_DIM;
+
+            std::vector<float> scores(kv_len);
+            float max_score = -std::numeric_limits<float>::infinity();
+
+            for (int k_pos = 0; k_pos < kv_len; ++k_pos)
+            {
+                const float *K_row = K_fp32 + (kv_h * kv_len + k_pos) * HEAD_DIM;
+                float dot = 0.0f;
+                for (int d = 0; d < HEAD_DIM; ++d)
+                {
+                    dot += Q_head[d] * K_row[d];
+                }
+                scores[k_pos] = dot * inv_sqrt_d;
+                max_score = std::max(max_score, scores[k_pos]);
+            }
+
+            float sum_exp = 0.0f;
+            for (int k_pos = 0; k_pos < kv_len; ++k_pos)
+            {
+                scores[k_pos] = std::exp(scores[k_pos] - max_score);
+                sum_exp += scores[k_pos];
+            }
+            for (int k_pos = 0; k_pos < kv_len; ++k_pos)
+            {
+                scores[k_pos] /= sum_exp;
+            }
+
+            float *out_head = output + h * HEAD_DIM;
+            for (int d = 0; d < HEAD_DIM; ++d)
+            {
+                float val = 0.0f;
+                for (int k_pos = 0; k_pos < kv_len; ++k_pos)
+                {
+                    const float *V_row = V_fp32 + (kv_h * kv_len + k_pos) * HEAD_DIM;
+                    val += scores[k_pos] * V_row[d];
+                }
+                out_head[d] = val;
+            }
+        }
+    }
+
+    /**
+     * @brief Quantize with per-position scales (simulating RoPE output).
+     */
+    template <typename BlockType>
+    std::vector<BlockType> quantizeWithPerPositionScales(
+        const std::vector<float> &fp32_data,
+        int num_kv_heads,
+        int kv_len,
+        int head_dim,
+        const std::vector<float> &position_scales)
+    {
+        constexpr int BLOCK_SIZE = BlockType::BLOCK_SIZE;
+        int blocks_per_row = (head_dim + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        int total_rows = num_kv_heads * kv_len;
+        int total_blocks = total_rows * blocks_per_row;
+
+        int16_t max_safe = get_max_safe_int16(head_dim);
+        std::vector<BlockType> blocks(total_blocks);
+
+        for (int kv_h = 0; kv_h < num_kv_heads; ++kv_h)
+        {
+            for (int k_pos = 0; k_pos < kv_len; ++k_pos)
+            {
+                int row = kv_h * kv_len + k_pos;
+                float scale = position_scales[k_pos * num_kv_heads + kv_h];
+                float quant_factor = 1.0f / scale;
+
+                for (int b = 0; b < blocks_per_row; ++b)
+                {
+                    BlockType &block = blocks[row * blocks_per_row + b];
+                    block.d = scale;
+                    int32_t sum = 0;
+
+                    int start_col = b * BLOCK_SIZE;
+                    for (int i = 0; i < BLOCK_SIZE; ++i)
+                    {
+                        int col = start_col + i;
+                        float val = (col < head_dim) ? fp32_data[row * head_dim + col] : 0.0f;
+                        int32_t q = static_cast<int32_t>(std::round(val * quant_factor));
+                        q = std::clamp(q, static_cast<int32_t>(-max_safe), static_cast<int32_t>(max_safe));
+                        block.qs[i] = static_cast<int16_t>(q);
+                        sum += block.qs[i];
+                    }
+                    block.sum_qs = sum;
+                }
+            }
+        }
+        return blocks;
+    }
+};
+
+/**
+ * @test Per-position K scales with uniform scales (baseline)
+ */
+TEST_F(PerPositionKScaleParityTest, Decode_UniformKScales_MatchesStandard)
+{
+    constexpr int KV_LEN = 9;
+    constexpr float BLOCK_SCALE = KV_CACHE_SCALE / 32767.0f;
+
+    const int total_q = NUM_HEADS * HEAD_DIM;
+    const int total_kv = NUM_KV_HEADS * KV_LEN * HEAD_DIM;
+    const int total_out = NUM_HEADS * HEAD_DIM;
+
+    auto Q_fp32 = generateNormalData(total_q, 0.0f, 4.0f);
+    auto K_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+    auto V_fp32 = generateNormalData(total_kv, 0.0f, 4.0f);
+
+    std::vector<float> k_position_scales(KV_LEN * NUM_KV_HEADS, BLOCK_SCALE);
+
+    auto Q_q16 = quantizeToQ16<Q16_1Block_64>(Q_fp32, NUM_HEADS, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+    auto V_q16 = quantizeToQ16<Q16_1Block_64>(V_fp32, NUM_KV_HEADS * KV_LEN, HEAD_DIM, KV_CACHE_SCALE, HEAD_DIM);
+    auto K_q16 = quantizeWithPerPositionScales<Q16_1Block_64>(K_fp32, NUM_KV_HEADS, KV_LEN, HEAD_DIM, k_position_scales);
+
+    auto Q_dequant = dequantizeFromQ16(Q_q16, NUM_HEADS, HEAD_DIM);
+    auto K_dequant = dequantizeFromQ16(K_q16, NUM_KV_HEADS * KV_LEN, HEAD_DIM);
+    auto V_dequant = dequantizeFromQ16(V_q16, NUM_KV_HEADS * KV_LEN, HEAD_DIM);
+
+    std::vector<float> ref_output(total_out);
+    fp32ReferenceWithPerPositionKScales(
+        Q_dequant.data(), K_dequant.data(), V_dequant.data(),
+        ref_output.data(), KV_LEN,
+        BLOCK_SCALE, k_position_scales.data(), BLOCK_SCALE);
+
+    std::vector<float> q_scales(NUM_HEADS, BLOCK_SCALE);
+    std::vector<float> kv_scales(NUM_KV_HEADS, BLOCK_SCALE);
+    std::vector<float> q16_context(total_out);
+
+    Q16IntegerAttentionParams params;
+    params.Q = Q_q16.data();
+    params.K = K_q16.data();
+    params.V = V_q16.data();
+    params.q_head_scales = q_scales.data();
+    params.kv_head_scales = kv_scales.data();
+    params.k_position_scales = k_position_scales.data();
+    params.seq_len_q = 1;
+    params.kv_len = KV_LEN;
+    params.num_heads = NUM_HEADS;
+    params.num_kv_heads = NUM_KV_HEADS;
+    params.head_dim = HEAD_DIM;
+    params.d_model = NUM_HEADS * HEAD_DIM;
+    params.block_size = Q16BlockSize::BLOCK_64;
+    params.snapshot_context = q16_context.data();
+
+    bool success = q16_integer_attention_decode(params);
+    ASSERT_TRUE(success) << "Decode with uniform per-position K scales failed";
+
+    float cos_sim = cosineSimilarity(ref_output.data(), q16_context.data(), total_out);
+    float max_diff = maxAbsDiff(ref_output.data(), q16_context.data(), total_out);
+    float rmse_val = rmse(ref_output.data(), q16_context.data(), total_out);
+
+    std::cout << "\n[PARITY] Per-Position K Scales (UNIFORM) - Decode:" << std::endl;
+    std::cout << "  Cosine similarity: " << std::fixed << std::setprecision(6) << cos_sim << std::endl;
+    std::cout << "  Max absolute diff: " << std::scientific << std::setprecision(4) << max_diff << std::endl;
+    std::cout << "  RMSE:             " << rmse_val << std::endl;
+
+    EXPECT_GT(cos_sim, 0.99f) << "Uniform per-position K scales should match standard attention";
+}
+
+/**
+ * @test Per-position K scales with varying scales (realistic HybridQ16 scenario)
+ */
+TEST_F(PerPositionKScaleParityTest, Decode_VaryingKScales_MatchesFP32Reference)
+{
+    constexpr int KV_LEN = 9;
+    constexpr float Q_SCALE = 64.0f / 32767.0f;
+
+    const int total_q = NUM_HEADS * HEAD_DIM;
+    const int total_kv = NUM_KV_HEADS * KV_LEN * HEAD_DIM;
+    const int total_out = NUM_HEADS * HEAD_DIM;
+
+    auto Q_fp32 = generateNormalData(total_q, 0.0f, 0.3f);
+    auto K_fp32 = generateNormalData(total_kv, 0.0f, 0.3f);
+    auto V_fp32 = generateNormalData(total_kv, 0.0f, 0.3f);
+
+    // Varying K scales - realistic range (0.001 to 0.004)
+    std::vector<float> k_position_scales(KV_LEN * NUM_KV_HEADS);
+    for (int pos = 0; pos < KV_LEN; ++pos)
+    {
+        for (int kv_h = 0; kv_h < NUM_KV_HEADS; ++kv_h)
+        {
+            float base_scale = Q_SCALE * (0.5f + 0.5f * static_cast<float>(pos) / (KV_LEN - 1));
+            k_position_scales[pos * NUM_KV_HEADS + kv_h] = base_scale;
+        }
+    }
+
+    auto Q_q16 = quantizeToQ16<Q16_1Block_64>(Q_fp32, NUM_HEADS, HEAD_DIM, 64.0f, HEAD_DIM);
+    auto K_q16 = quantizeWithPerPositionScales<Q16_1Block_64>(K_fp32, NUM_KV_HEADS, KV_LEN, HEAD_DIM, k_position_scales);
+    auto V_q16 = quantizeToQ16<Q16_1Block_64>(V_fp32, NUM_KV_HEADS * KV_LEN, HEAD_DIM, 64.0f, HEAD_DIM);
+
+    auto Q_dequant = dequantizeFromQ16(Q_q16, NUM_HEADS, HEAD_DIM);
+    auto K_dequant = dequantizeFromQ16(K_q16, NUM_KV_HEADS * KV_LEN, HEAD_DIM);
+    auto V_dequant = dequantizeFromQ16(V_q16, NUM_KV_HEADS * KV_LEN, HEAD_DIM);
+
+    std::vector<float> ref_output(total_out);
+    fp32ReferenceWithPerPositionKScales(
+        Q_dequant.data(), K_dequant.data(), V_dequant.data(),
+        ref_output.data(), KV_LEN,
+        Q_SCALE, k_position_scales.data(), Q_SCALE);
+
+    std::vector<float> q_scales(NUM_HEADS, Q_SCALE);
+    std::vector<float> kv_scales(NUM_KV_HEADS, Q_SCALE);
+    std::vector<float> q16_context(total_out);
+
+    Q16IntegerAttentionParams params;
+    params.Q = Q_q16.data();
+    params.K = K_q16.data();
+    params.V = V_q16.data();
+    params.q_head_scales = q_scales.data();
+    params.kv_head_scales = kv_scales.data();
+    params.k_position_scales = k_position_scales.data();
+    params.seq_len_q = 1;
+    params.kv_len = KV_LEN;
+    params.num_heads = NUM_HEADS;
+    params.num_kv_heads = NUM_KV_HEADS;
+    params.head_dim = HEAD_DIM;
+    params.d_model = NUM_HEADS * HEAD_DIM;
+    params.block_size = Q16BlockSize::BLOCK_64;
+    params.snapshot_context = q16_context.data();
+
+    bool success = q16_integer_attention_decode(params);
+    ASSERT_TRUE(success) << "Decode with varying per-position K scales failed";
+
+    float cos_sim = cosineSimilarity(ref_output.data(), q16_context.data(), total_out);
+    float max_diff = maxAbsDiff(ref_output.data(), q16_context.data(), total_out);
+    float rmse_val = rmse(ref_output.data(), q16_context.data(), total_out);
+
+    std::cout << "\n[PARITY] Per-Position K Scales (VARYING) - Decode:" << std::endl;
+    std::cout << "  K scale range: " << k_position_scales.front() << " to " << k_position_scales.back() << std::endl;
+    std::cout << "  Cosine similarity: " << std::fixed << std::setprecision(6) << cos_sim << std::endl;
+    std::cout << "  Max absolute diff: " << std::scientific << std::setprecision(4) << max_diff << std::endl;
+    std::cout << "  RMSE:             " << rmse_val << std::endl;
+
+    EXPECT_GT(cos_sim, 0.99f) << "Varying per-position K scales should match FP32 reference";
+}
+
+/**
+ * @test Per-position K scales with realistic pipeline scale variation (540x range)
+ *
+ * This test uses the actual scale range observed in the HybridQ16 pipeline:
+ * - Layer 4 has K scales as low as 2.41e-05
+ * - Layer 0/8 have K scales up to 0.013
+ * - This is a 540× variation, much larger than the 100× test
+ */
+TEST_F(PerPositionKScaleParityTest, Decode_RealisticPipelineScaleRange_MatchesFP32Reference)
+{
+    constexpr int KV_LEN = 9;
+    constexpr float Q_SCALE = 64.0f / 32767.0f; // ~0.00195
+
+    const int total_q = NUM_HEADS * HEAD_DIM;
+    const int total_kv = NUM_KV_HEADS * KV_LEN * HEAD_DIM;
+    const int total_out = NUM_HEADS * HEAD_DIM;
+
+    auto Q_fp32 = generateNormalData(total_q, 0.0f, 0.3f);
+    auto K_fp32 = generateNormalData(total_kv, 0.0f, 0.3f);
+    auto V_fp32 = generateNormalData(total_kv, 0.0f, 0.3f);
+
+    // Realistic K scale variation: 2.4e-05 to 0.013 (540x range)
+    // These are the actual scales observed in the HybridQ16 pipeline
+    std::vector<float> k_position_scales(KV_LEN * NUM_KV_HEADS);
+    // Use scales that mimic the real pipeline's layer-by-layer variation
+    const float real_scales[] = {0.00796, 0.000764, 0.00239, 0.000179, 2.41e-05, 2.47e-05, 0.000417, 3.08e-05, 0.0130};
+    for (int pos = 0; pos < KV_LEN; ++pos)
+    {
+        for (int kv_h = 0; kv_h < NUM_KV_HEADS; ++kv_h)
+        {
+            k_position_scales[pos * NUM_KV_HEADS + kv_h] = real_scales[pos];
+        }
+    }
+
+    auto Q_q16 = quantizeToQ16<Q16_1Block_64>(Q_fp32, NUM_HEADS, HEAD_DIM, 64.0f, HEAD_DIM);
+    auto K_q16 = quantizeWithPerPositionScales<Q16_1Block_64>(K_fp32, NUM_KV_HEADS, KV_LEN, HEAD_DIM, k_position_scales);
+    auto V_q16 = quantizeToQ16<Q16_1Block_64>(V_fp32, NUM_KV_HEADS * KV_LEN, HEAD_DIM, 64.0f, HEAD_DIM);
+
+    auto Q_dequant = dequantizeFromQ16(Q_q16, NUM_HEADS, HEAD_DIM);
+    auto K_dequant = dequantizeFromQ16(K_q16, NUM_KV_HEADS * KV_LEN, HEAD_DIM);
+    auto V_dequant = dequantizeFromQ16(V_q16, NUM_KV_HEADS * KV_LEN, HEAD_DIM);
+
+    std::vector<float> ref_output(total_out);
+    fp32ReferenceWithPerPositionKScales(
+        Q_dequant.data(), K_dequant.data(), V_dequant.data(),
+        ref_output.data(), KV_LEN,
+        Q_SCALE, k_position_scales.data(), Q_SCALE);
+
+    std::vector<float> q_scales(NUM_HEADS, Q_SCALE);
+    std::vector<float> kv_scales(NUM_KV_HEADS, Q_SCALE);
+    std::vector<float> q16_context(total_out);
+
+    Q16IntegerAttentionParams params;
+    params.Q = Q_q16.data();
+    params.K = K_q16.data();
+    params.V = V_q16.data();
+    params.q_head_scales = q_scales.data();
+    params.kv_head_scales = kv_scales.data();
+    params.k_position_scales = k_position_scales.data();
+    params.seq_len_q = 1;
+    params.kv_len = KV_LEN;
+    params.num_heads = NUM_HEADS;
+    params.num_kv_heads = NUM_KV_HEADS;
+    params.head_dim = HEAD_DIM;
+    params.d_model = NUM_HEADS * HEAD_DIM;
+    params.block_size = Q16BlockSize::BLOCK_64;
+    params.snapshot_context = q16_context.data();
+
+    bool success = q16_integer_attention_decode(params);
+    ASSERT_TRUE(success) << "Decode with realistic pipeline K scale variation failed";
+
+    float cos_sim = cosineSimilarity(ref_output.data(), q16_context.data(), total_out);
+    float max_diff = maxAbsDiff(ref_output.data(), q16_context.data(), total_out);
+    float rmse_val = rmse(ref_output.data(), q16_context.data(), total_out);
+
+    std::cout << "\n[PARITY] Per-Position K Scales (REALISTIC PIPELINE 540x) - Decode:" << std::endl;
+    std::cout << "  K scale range: " << *std::min_element(k_position_scales.begin(), k_position_scales.end())
+              << " to " << *std::max_element(k_position_scales.begin(), k_position_scales.end())
+              << " (" << (*std::max_element(k_position_scales.begin(), k_position_scales.end()) / *std::min_element(k_position_scales.begin(), k_position_scales.end())) << "x range)" << std::endl;
+    std::cout << "  Cosine similarity: " << std::fixed << std::setprecision(6) << cos_sim << std::endl;
+    std::cout << "  Max absolute diff: " << std::scientific << std::setprecision(4) << max_diff << std::endl;
+    std::cout << "  RMSE:             " << rmse_val << std::endl;
+
+    EXPECT_GT(cos_sim, 0.95f) << "Realistic pipeline K scale variation should match FP32 reasonably";
+}
+
+/**
+ * @test Per-position K scales with large scale variation (stress test)
+ */
+TEST_F(PerPositionKScaleParityTest, Decode_LargeScaleVariation_MatchesFP32Reference)
+{
+    constexpr int KV_LEN = 9;
+    constexpr float Q_SCALE = 64.0f / 32767.0f;
+
+    const int total_q = NUM_HEADS * HEAD_DIM;
+    const int total_kv = NUM_KV_HEADS * KV_LEN * HEAD_DIM;
+    const int total_out = NUM_HEADS * HEAD_DIM;
+
+    auto Q_fp32 = generateNormalData(total_q, 0.0f, 0.3f);
+    auto K_fp32 = generateNormalData(total_kv, 0.0f, 0.3f);
+    auto V_fp32 = generateNormalData(total_kv, 0.0f, 0.3f);
+
+    // Large K scale variation: 0.0001 to 0.01 (100x range)
+    std::vector<float> k_position_scales(KV_LEN * NUM_KV_HEADS);
+    for (int pos = 0; pos < KV_LEN; ++pos)
+    {
+        for (int kv_h = 0; kv_h < NUM_KV_HEADS; ++kv_h)
+        {
+            float t = static_cast<float>(pos) / (KV_LEN - 1);
+            float scale = 0.0001f * std::pow(100.0f, t);
+            k_position_scales[pos * NUM_KV_HEADS + kv_h] = scale;
+        }
+    }
+
+    auto Q_q16 = quantizeToQ16<Q16_1Block_64>(Q_fp32, NUM_HEADS, HEAD_DIM, 64.0f, HEAD_DIM);
+    auto K_q16 = quantizeWithPerPositionScales<Q16_1Block_64>(K_fp32, NUM_KV_HEADS, KV_LEN, HEAD_DIM, k_position_scales);
+    auto V_q16 = quantizeToQ16<Q16_1Block_64>(V_fp32, NUM_KV_HEADS * KV_LEN, HEAD_DIM, 64.0f, HEAD_DIM);
+
+    auto Q_dequant = dequantizeFromQ16(Q_q16, NUM_HEADS, HEAD_DIM);
+    auto K_dequant = dequantizeFromQ16(K_q16, NUM_KV_HEADS * KV_LEN, HEAD_DIM);
+    auto V_dequant = dequantizeFromQ16(V_q16, NUM_KV_HEADS * KV_LEN, HEAD_DIM);
+
+    std::vector<float> ref_output(total_out);
+    fp32ReferenceWithPerPositionKScales(
+        Q_dequant.data(), K_dequant.data(), V_dequant.data(),
+        ref_output.data(), KV_LEN,
+        Q_SCALE, k_position_scales.data(), Q_SCALE);
+
+    std::vector<float> q_scales(NUM_HEADS, Q_SCALE);
+    std::vector<float> kv_scales(NUM_KV_HEADS, Q_SCALE);
+    std::vector<float> q16_context(total_out);
+
+    Q16IntegerAttentionParams params;
+    params.Q = Q_q16.data();
+    params.K = K_q16.data();
+    params.V = V_q16.data();
+    params.q_head_scales = q_scales.data();
+    params.kv_head_scales = kv_scales.data();
+    params.k_position_scales = k_position_scales.data();
+    params.seq_len_q = 1;
+    params.kv_len = KV_LEN;
+    params.num_heads = NUM_HEADS;
+    params.num_kv_heads = NUM_KV_HEADS;
+    params.head_dim = HEAD_DIM;
+    params.d_model = NUM_HEADS * HEAD_DIM;
+    params.block_size = Q16BlockSize::BLOCK_64;
+    params.snapshot_context = q16_context.data();
+
+    bool success = q16_integer_attention_decode(params);
+    ASSERT_TRUE(success) << "Decode with large K scale variation failed";
+
+    float cos_sim = cosineSimilarity(ref_output.data(), q16_context.data(), total_out);
+    float max_diff = maxAbsDiff(ref_output.data(), q16_context.data(), total_out);
+    float rmse_val = rmse(ref_output.data(), q16_context.data(), total_out);
+
+    std::cout << "\n[PARITY] Per-Position K Scales (LARGE VARIATION 100x) - Decode:" << std::endl;
+    std::cout << "  K scale range: " << k_position_scales.front() << " to " << k_position_scales.back() << std::endl;
+    std::cout << "  Cosine similarity: " << std::fixed << std::setprecision(6) << cos_sim << std::endl;
+    std::cout << "  Max absolute diff: " << std::scientific << std::setprecision(4) << max_diff << std::endl;
+    std::cout << "  RMSE:             " << rmse_val << std::endl;
+
+    EXPECT_GT(cos_sim, 0.95f) << "Large K scale variation should still match FP32 reasonably";
+}
+
+/**
+ * @test Debug test to trace the full computation
+ */
+TEST_F(PerPositionKScaleParityTest, Debug_TraceComputation)
+{
+    constexpr int KV_LEN = 3;
+    constexpr float Q_SCALE = 64.0f / 32767.0f; // ~0.00195
+
+    // Small test case for debugging
+    const int total_q = NUM_HEADS * HEAD_DIM;
+    const int total_kv = NUM_KV_HEADS * KV_LEN * HEAD_DIM;
+    const int total_out = NUM_HEADS * HEAD_DIM;
+
+    // Generate deterministic data
+    std::mt19937 gen(12345);
+    std::normal_distribution<float> dist(0.0f, 0.3f);
+
+    std::vector<float> Q_fp32(total_q);
+    std::vector<float> K_fp32(total_kv);
+    std::vector<float> V_fp32(total_kv);
+
+    for (auto &v : Q_fp32)
+        v = dist(gen);
+    for (auto &v : K_fp32)
+        v = dist(gen);
+    for (auto &v : V_fp32)
+        v = dist(gen);
+
+    // Uniform K scales (should match standard path)
+    std::vector<float> k_position_scales(KV_LEN * NUM_KV_HEADS, Q_SCALE);
+
+    // Quantize
+    auto Q_q16 = quantizeToQ16<Q16_1Block_64>(Q_fp32, NUM_HEADS, HEAD_DIM, 64.0f, HEAD_DIM);
+    auto K_q16 = quantizeWithPerPositionScales<Q16_1Block_64>(K_fp32, NUM_KV_HEADS, KV_LEN, HEAD_DIM, k_position_scales);
+    auto V_q16 = quantizeToQ16<Q16_1Block_64>(V_fp32, NUM_KV_HEADS * KV_LEN, HEAD_DIM, 64.0f, HEAD_DIM);
+
+    // Dequantize for reference
+    auto Q_dequant = dequantizeFromQ16(Q_q16, NUM_HEADS, HEAD_DIM);
+    auto K_dequant = dequantizeFromQ16(K_q16, NUM_KV_HEADS * KV_LEN, HEAD_DIM);
+    auto V_dequant = dequantizeFromQ16(V_q16, NUM_KV_HEADS * KV_LEN, HEAD_DIM);
+
+    // Debug: Print first head's data
+    std::cout << "\n=== DEBUG: Trace Computation ===" << std::endl;
+    std::cout << "Q_SCALE = " << Q_SCALE << std::endl;
+    std::cout << "Q_dequant[0][0:4]: ";
+    for (int i = 0; i < 4; ++i)
+        std::cout << Q_dequant[i] << " ";
+    std::cout << std::endl;
+
+    std::cout << "K_dequant[pos=0][0:4]: ";
+    for (int i = 0; i < 4; ++i)
+        std::cout << K_dequant[i] << " ";
+    std::cout << std::endl;
+
+    // Manual FP32 attention for head 0
+    const float inv_sqrt_d = 1.0f / std::sqrt(64.0f);
+    std::cout << "inv_sqrt_d = " << inv_sqrt_d << std::endl;
+
+    std::vector<float> scores(KV_LEN);
+    for (int k = 0; k < KV_LEN; ++k)
+    {
+        float dot = 0.0f;
+        for (int d = 0; d < HEAD_DIM; ++d)
+        {
+            dot += Q_dequant[d] * K_dequant[k * HEAD_DIM + d];
+        }
+        scores[k] = dot * inv_sqrt_d;
+    }
+    std::cout << "FP32 scores (head 0): ";
+    for (float s : scores)
+        std::cout << s << " ";
+    std::cout << std::endl;
+
+    // Softmax
+    float max_score = *std::max_element(scores.begin(), scores.end());
+    std::vector<float> weights(KV_LEN);
+    float sum_exp = 0.0f;
+    for (int k = 0; k < KV_LEN; ++k)
+    {
+        weights[k] = std::exp(scores[k] - max_score);
+        sum_exp += weights[k];
+    }
+    for (float &w : weights)
+        w /= sum_exp;
+    std::cout << "FP32 weights: ";
+    for (float w : weights)
+        std::cout << w << " ";
+    std::cout << std::endl;
+
+    // FP32 reference output
+    std::vector<float> ref_output(total_out);
+    fp32ReferenceWithPerPositionKScales(
+        Q_dequant.data(), K_dequant.data(), V_dequant.data(),
+        ref_output.data(), KV_LEN,
+        Q_SCALE, k_position_scales.data(), Q_SCALE);
+
+    std::cout << "FP32 ref output[0][0:4]: ";
+    for (int i = 0; i < 4; ++i)
+        std::cout << ref_output[i] << " ";
+    std::cout << std::endl;
+
+    // Q16 integer attention
+    std::vector<float> q_scales(NUM_HEADS, Q_SCALE);
+    std::vector<float> kv_scales(NUM_KV_HEADS, Q_SCALE);
+    std::vector<float> q16_context(total_out);
+
+    Q16IntegerAttentionParams params;
+    params.Q = Q_q16.data();
+    params.K = K_q16.data();
+    params.V = V_q16.data();
+    params.q_head_scales = q_scales.data();
+    params.kv_head_scales = kv_scales.data();
+    params.k_position_scales = k_position_scales.data();
+    params.seq_len_q = 1;
+    params.kv_len = KV_LEN;
+    params.num_heads = NUM_HEADS;
+    params.num_kv_heads = NUM_KV_HEADS;
+    params.head_dim = HEAD_DIM;
+    params.d_model = NUM_HEADS * HEAD_DIM;
+    params.block_size = Q16BlockSize::BLOCK_64;
+    params.snapshot_context = q16_context.data();
+
+    bool success = q16_integer_attention_decode(params);
+    ASSERT_TRUE(success);
+
+    std::cout << "Q16 output[0][0:4]: ";
+    for (int i = 0; i < 4; ++i)
+        std::cout << q16_context[i] << " ";
+    std::cout << std::endl;
+
+    float cos_sim = cosineSimilarity(ref_output.data(), q16_context.data(), total_out);
+    std::cout << "Cosine similarity: " << cos_sim << std::endl;
+
+    // Also run WITHOUT k_position_scales to compare
+    params.k_position_scales = nullptr;
+    std::vector<float> q16_context_standard(total_out);
+    params.snapshot_context = q16_context_standard.data();
+
+    success = q16_integer_attention_decode(params);
+    ASSERT_TRUE(success);
+
+    std::cout << "Q16 standard output[0][0:4]: ";
+    for (int i = 0; i < 4; ++i)
+        std::cout << q16_context_standard[i] << " ";
+    std::cout << std::endl;
+
+    float cos_sim_standard = cosineSimilarity(ref_output.data(), q16_context_standard.data(), total_out);
+    std::cout << "Standard path cosine similarity: " << cos_sim_standard << std::endl;
+
+    // Compare per-position vs standard outputs
+    float cos_sim_paths = cosineSimilarity(q16_context.data(), q16_context_standard.data(), total_out);
+    std::cout << "Per-position vs Standard cosine: " << cos_sim_paths << std::endl;
+
+    EXPECT_GT(cos_sim_standard, 0.99f) << "Standard path should work";
 }

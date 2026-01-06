@@ -966,4 +966,324 @@ namespace llaminar2::primitives
         float rope_theta,
         float kv_cache_scale);
 
+    // ============================================================================
+    // Fixed-Scale Q16_1 → Q16_1 RoPE Primitives (HybridQ16 K Precision Fix)
+    // ============================================================================
+    // These primitives apply RoPE rotation to Q16_1 input and rescale output to
+    // a FIXED kv_cache_scale. Used when K projection outputs Q16_1 directly from
+    // GEMM (bypassing Q8_1 intermediate) to preserve precision for small values.
+    //
+    // Why needed:
+    // - GEMM outputs Q16_1 with dynamic per-block scales (based on output magnitude)
+    // - KV cache requires FIXED scales for efficient integer attention
+    // - This function bridges the gap: applies RoPE and normalizes to kv_cache_scale
+    //
+    // Algorithm:
+    // 1. Dequantize Q16_1 blocks to FP32 using per-block dynamic scales
+    // 2. Apply RoPE rotation in FP32 (x' = x*cos - y*sin, y' = x*sin + y*cos)
+    // 3. Requantize to Q16_1 with FIXED d = kv_cache_scale / 32767
+    //
+    // Note: Unlike Q8_1→Q16 path, input is already Q16_1 with 256× finer precision.
+    // The FP32 intermediate is acceptable here since we're already in high-precision
+    // quantized domain and the rescale operation naturally requires dequantization.
+    // ============================================================================
+
+    /**
+     * @brief Per-head Q16_1→Q16_1 RoPE with FIXED output scale (scalar implementation)
+     *
+     * Scalar fallback implementation. Always available on all platforms.
+     */
+    template <typename BlockType>
+    void apply_rope_q16_to_q16_head_fixed_scale_scalar(
+        const BlockType *q16_in,
+        BlockType *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15,
+        float kv_cache_scale);
+
+#if defined(__AVX2__)
+    /**
+     * @brief Per-head Q16_1→Q16_1 RoPE with FIXED output scale (AVX2 implementation)
+     *
+     * Optimized AVX2 version processing 4 chunks of 8 elements each.
+     * Only available for Q16_1Block (32-element blocks).
+     */
+    void apply_rope_q16_to_q16_head_fixed_scale_avx2(
+        const Q16_1Block *q16_in,
+        Q16_1Block *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15,
+        float kv_cache_scale);
+#endif
+
+#if defined(__AVX512F__)
+    /**
+     * @brief Per-head Q16_1→Q16_1 RoPE with FIXED output scale (AVX512 implementation)
+     *
+     * Optimized AVX512 version processing 2 chunks of 16 elements each.
+     * Only available for Q16_1Block (32-element blocks).
+     */
+    void apply_rope_q16_to_q16_head_fixed_scale_avx512(
+        const Q16_1Block *q16_in,
+        Q16_1Block *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15,
+        float kv_cache_scale);
+#endif
+
+    /**
+     * @brief Per-head Q16_1→Q16_1 RoPE with FIXED output scale (auto-dispatch)
+     *
+     * Takes Q16_1 input (with dynamic per-block scales from GEMM), applies RoPE,
+     * outputs Q16_1 with uniform d = kv_cache_scale / 32767 for integer attention.
+     *
+     * Automatically dispatches to AVX512 > AVX2 > scalar based on platform.
+     *
+     * @tparam BlockType Q16 block type (Q16_1Block, Q16_1Block_64, Q16_1Block_128)
+     * @param q16_in Input Q16 blocks with dynamic scales [head_dim / BLOCK_SIZE]
+     * @param q16_out Output Q16 blocks with fixed scale [head_dim / BLOCK_SIZE]
+     * @param head_dim Head dimension (must be multiple of BLOCK_SIZE)
+     * @param cos_q15 Pre-computed cosine values in Q15 [head_dim/2]
+     * @param sin_q15 Pre-computed sine values in Q15 [head_dim/2]
+     * @param kv_cache_scale Fixed scale for output (e.g., 8.0f)
+     */
+    template <typename BlockType>
+    void apply_rope_q16_to_q16_head_fixed_scale(
+        const BlockType *q16_in,
+        BlockType *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15,
+        float kv_cache_scale);
+
+    /**
+     * @brief Apply fixed-scale RoPE to Q16 K tensor (batch wrapper)
+     *
+     * High-level wrapper for processing K tensor with fixed output scale.
+     * Used in HybridQ16 pipeline where K comes from GEMM as Q16_1.
+     *
+     * LAYOUT NOTE:
+     * - K output is POSITION-MAJOR [seq_len][n_kv_heads][head_dim] for KV cache storage
+     *
+     * @tparam BlockType Q16 block type
+     * @param K_in Q16 K input [seq_len * n_kv_heads * (head_dim/BLOCK_SIZE)]
+     * @param K_out Q16 K output with fixed scale [seq_len * n_kv_heads * (head_dim/BLOCK_SIZE)]
+     * @param position_ids Position indices [seq_len], nullptr = use index
+     * @param seq_len Sequence length
+     * @param n_kv_heads Number of key/value heads
+     * @param head_dim Head dimension
+     * @param rope_theta RoPE base frequency
+     * @param kv_cache_scale Fixed scale for all output blocks
+     */
+    template <typename BlockType>
+    void apply_rope_q16_to_q16_fixed_scale(
+        const BlockType *K_in,
+        BlockType *K_out,
+        const int *position_ids,
+        int seq_len,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        float kv_cache_scale);
+
+    /**
+     * @brief Apply fixed-scale RoPE Q16→Q16 with runtime block size dispatch
+     *
+     * @param block_size Runtime block size selector
+     * @param kv_cache_scale Fixed scale for all output blocks
+     */
+    void apply_rope_q16_to_q16_fixed_scale_dispatch(
+        const void *K_in,
+        void *K_out,
+        Q16BlockSize block_size,
+        const int *position_ids,
+        int seq_len,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        float kv_cache_scale);
+
+    // ============================================================================
+    // Q16→Q16 Dynamic-Scale RoPE (Phase 12)
+    // ============================================================================
+    //
+    // These functions preserve the full dynamic range of spiky K projections by
+    // unifying to the max input scale rather than a fixed scale. The output scale
+    // is returned for subsequent VNNI-safe normalization.
+    //
+    // Key difference from fixed-scale:
+    // - Fixed-scale: All output blocks get d = kv_cache_scale / 32767 (may clip peaks)
+    // - Dynamic-scale: All output blocks get d = max(d_input) (preserves peaks)
+    //
+    // Typical flow:
+    // 1. K proj GEMM → Q16_1 K (dynamic per-block scales, peaks ~130)
+    // 2. Dynamic-scale RoPE → Q16_1 K (unified scale = max_d, peaks preserved)
+    // 3. VNNI-safe normalization → Q16_1 K (VNNI-safe qs, norm_factor returned)
+    // 4. Store K in KV cache with norm_factor metadata
+    // 5. Attention applies norm_factor correction to scores
+    // ============================================================================
+
+    /**
+     * @brief Per-head Q16_1→Q16_1 RoPE with DYNAMIC output scale (scalar implementation)
+     *
+     * Finds the maximum scale across all input blocks within the head, then applies
+     * RoPE with that unified scale as output. This preserves spiky values that would
+     * be clipped by fixed-scale quantization.
+     *
+     * INTEGER-ONLY inner loop: Only O(blocks) FP32 for scale math, O(elements) integer.
+     *
+     * @tparam BlockType Q16 block type (Q16_1Block, Q16_1Block_64, Q16_1Block_128)
+     * @param q16_in Input Q16 blocks with dynamic scales [head_dim / BLOCK_SIZE]
+     * @param q16_out Output Q16 blocks with unified scale [head_dim / BLOCK_SIZE]
+     * @param head_dim Head dimension (must be multiple of BLOCK_SIZE)
+     * @param cos_q15 Pre-computed cosine values in Q15 [head_dim/2]
+     * @param sin_q15 Pre-computed sine values in Q15 [head_dim/2]
+     * @param[out] out_unified_scale Returns the unified output scale (max input d)
+     */
+    template <typename BlockType>
+    void apply_rope_q16_to_q16_head_dynamic_scale_scalar(
+        const BlockType *q16_in,
+        BlockType *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15,
+        float *out_unified_scale);
+
+#if defined(__AVX2__)
+    /**
+     * @brief Per-head Q16→Q16 RoPE with DYNAMIC output scale (AVX2 templated implementation)
+     *
+     * Optimized AVX2 version that works with any Q16 block size (32, 64, 128).
+     * Uses 256-bit vectors to process 8 elements at a time.
+     *
+     * @tparam BlockType Q16 block type (Q16_1Block, Q16_1Block_64, Q16_1Block_128)
+     */
+    template <typename BlockType>
+    void apply_rope_q16_to_q16_head_dynamic_scale_avx2_impl(
+        const BlockType *q16_in,
+        BlockType *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15,
+        float *out_unified_scale);
+
+    /**
+     * @brief Per-head Q16_1→Q16_1 RoPE with DYNAMIC output scale (AVX2 legacy wrapper)
+     *
+     * Legacy wrapper for Q16_1Block (32-element blocks) for API compatibility.
+     */
+    void apply_rope_q16_to_q16_head_dynamic_scale_avx2(
+        const Q16_1Block *q16_in,
+        Q16_1Block *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15,
+        float *out_unified_scale);
+#endif
+
+#if defined(__AVX512F__)
+    /**
+     * @brief Per-head Q16→Q16 RoPE with DYNAMIC output scale (AVX512 templated implementation)
+     *
+     * Optimized AVX512 version that works with any Q16 block size (32, 64, 128).
+     * Uses 512-bit vectors to process 16 elements at a time.
+     *
+     * @tparam BlockType Q16 block type (Q16_1Block, Q16_1Block_64, Q16_1Block_128)
+     */
+    template <typename BlockType>
+    void apply_rope_q16_to_q16_head_dynamic_scale_avx512_impl(
+        const BlockType *q16_in,
+        BlockType *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15,
+        float *out_unified_scale);
+
+    /**
+     * @brief Per-head Q16_1→Q16_1 RoPE with DYNAMIC output scale (AVX512 legacy wrapper)
+     *
+     * Legacy wrapper for Q16_1Block (32-element blocks) for API compatibility.
+     */
+    void apply_rope_q16_to_q16_head_dynamic_scale_avx512(
+        const Q16_1Block *q16_in,
+        Q16_1Block *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15,
+        float *out_unified_scale);
+#endif
+
+    /**
+     * @brief Per-head Q16_1→Q16_1 RoPE with DYNAMIC output scale (auto-dispatch)
+     *
+     * Takes Q16_1 input (with dynamic per-block scales from GEMM), applies RoPE,
+     * outputs Q16_1 with unified d = max(d_input) for full dynamic range preservation.
+     *
+     * Automatically dispatches to AVX512 > AVX2 > scalar based on platform.
+     * All block sizes (32, 64, 128) are now supported with SIMD acceleration.
+     *
+     * @tparam BlockType Q16 block type (Q16_1Block, Q16_1Block_64, Q16_1Block_128)
+     * @param q16_in Input Q16 blocks with dynamic scales [head_dim / BLOCK_SIZE]
+     * @param q16_out Output Q16 blocks with unified scale [head_dim / BLOCK_SIZE]
+     * @param head_dim Head dimension (must be multiple of BLOCK_SIZE)
+     * @param cos_q15 Pre-computed cosine values in Q15 [head_dim/2]
+     * @param sin_q15 Pre-computed sine values in Q15 [head_dim/2]
+     * @param[out] out_unified_scale Returns the unified output scale (max input d)
+     */
+    template <typename BlockType>
+    void apply_rope_q16_to_q16_head_dynamic_scale(
+        const BlockType *q16_in,
+        BlockType *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15,
+        float *out_unified_scale);
+
+    /**
+     * @brief Apply dynamic-scale RoPE to Q16 K tensor (batch wrapper)
+     *
+     * High-level wrapper for processing K tensor with dynamic output scale.
+     * Returns per-head unified scales for subsequent VNNI-safe normalization.
+     *
+     * @tparam BlockType Q16 block type
+     * @param K_in Q16 K input [seq_len * n_kv_heads * (head_dim/BLOCK_SIZE)]
+     * @param K_out Q16 K output with unified scale [seq_len * n_kv_heads * (head_dim/BLOCK_SIZE)]
+     * @param position_ids Position indices [seq_len], nullptr = use index
+     * @param seq_len Sequence length
+     * @param n_kv_heads Number of key/value heads
+     * @param head_dim Head dimension
+     * @param rope_theta RoPE base frequency
+     * @param[out] out_head_scales Per-head unified scales [seq_len * n_kv_heads]
+     */
+    template <typename BlockType>
+    void apply_rope_q16_to_q16_dynamic_scale(
+        const BlockType *K_in,
+        BlockType *K_out,
+        const int *position_ids,
+        int seq_len,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        float *out_head_scales);
+
+    /**
+     * @brief Apply dynamic-scale RoPE Q16→Q16 with runtime block size dispatch
+     *
+     * @param block_size Runtime block size selector
+     * @param[out] out_head_scales Per-head unified scales [seq_len * n_kv_heads]
+     */
+    void apply_rope_q16_to_q16_dynamic_scale_dispatch(
+        const void *K_in,
+        void *K_out,
+        Q16BlockSize block_size,
+        const int *position_ids,
+        int seq_len,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        float *out_head_scales);
+
 } // namespace llaminar2::primitives
