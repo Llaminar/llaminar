@@ -602,6 +602,7 @@ namespace llaminar2
          * @brief Get raw pointer to data buffer (const)
          * @return Void pointer to start of data buffer
          * @note Implements ITensor::raw_data() - delegates to raw_host_data_ptr()
+         * @note Always returns HOST pointer even if tensor is on GPU
          */
         const void *raw_data() const override { return raw_host_data_ptr(); }
 
@@ -609,8 +610,29 @@ namespace llaminar2
          * @brief Get raw mutable pointer to data buffer
          * @return Void pointer to start of data buffer
          * @note Implements ITensor::raw_mutable_data() - delegates to raw_host_data_ptr()
+         * @note Always returns HOST pointer even if tensor is on GPU
          */
         void *raw_mutable_data() override { return raw_host_data_ptr(); }
+
+        /**
+         * @brief Get pointer to data where it currently resides (const)
+         * @return GPU pointer if isOnGPU(), else host pointer
+         * @note Use this when dispatching to kernels that need the "active" pointer
+         */
+        const void *active_data_ptr() const override
+        {
+            return gpu_data_ptr_ ? gpu_data_ptr_ : raw_host_data_ptr();
+        }
+
+        /**
+         * @brief Get mutable pointer to data where it currently resides
+         * @return GPU pointer if isOnGPU(), else host pointer
+         * @note Use this when dispatching to kernels that need the "active" pointer
+         */
+        void *active_mutable_data_ptr() override
+        {
+            return gpu_data_ptr_ ? gpu_data_ptr_ : raw_host_data_ptr();
+        }
 
         // ===== Device Affinity API =====
         //

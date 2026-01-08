@@ -137,10 +137,11 @@ namespace llaminar2::cuda
             if (input->native_type() != TensorType::BF16)
                 return false;
 
+            // Use active_data_ptr() which returns GPU pointer when tensor is on GPU
             return apply_bf16(
-                static_cast<const uint16_t *>(input->raw_data()),
-                static_cast<const uint16_t *>(residual->raw_data()),
-                static_cast<uint16_t *>(output->raw_mutable_data()),
+                static_cast<const uint16_t *>(input->active_data_ptr()),
+                static_cast<const uint16_t *>(residual->active_data_ptr()),
+                static_cast<uint16_t *>(output->active_mutable_data_ptr()),
                 num_elements,
                 mpi_ctx,
                 device_idx);
@@ -206,10 +207,11 @@ namespace llaminar2::cuda
             if (input->native_type() != TensorType::FP16)
                 return false;
 
+            // Use active_data_ptr() which returns GPU pointer when tensor is on GPU
             return apply_fp16(
-                static_cast<const uint16_t *>(input->raw_data()),
-                static_cast<const uint16_t *>(residual->raw_data()),
-                static_cast<uint16_t *>(output->raw_mutable_data()),
+                static_cast<const uint16_t *>(input->active_data_ptr()),
+                static_cast<const uint16_t *>(residual->active_data_ptr()),
+                static_cast<uint16_t *>(output->active_mutable_data_ptr()),
                 num_elements,
                 mpi_ctx,
                 device_idx);

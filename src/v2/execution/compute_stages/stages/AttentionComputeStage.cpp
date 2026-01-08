@@ -175,11 +175,11 @@ namespace llaminar2
 
         if (is_gpu_tensor)
         {
-            // GPU path: use raw pointers via ITensor interface
-            const float *Q_ptr = static_cast<const float *>(params_.Q->raw_data());
-            const float *K_ptr = static_cast<const float *>(params_.K->raw_data());
-            const float *V_ptr = static_cast<const float *>(params_.V->raw_data());
-            float *output_ptr = static_cast<float *>(params_.output->raw_mutable_data());
+            // GPU path: use active_data_ptr() which returns GPU pointer when tensor is on GPU
+            const float *Q_ptr = static_cast<const float *>(params_.Q->active_data_ptr());
+            const float *K_ptr = static_cast<const float *>(params_.K->active_data_ptr());
+            const float *V_ptr = static_cast<const float *>(params_.V->active_data_ptr());
+            float *output_ptr = static_cast<float *>(params_.output->active_mutable_data_ptr());
 
             LOG_DEBUG("[AttentionComputeStage] GPU path: Q=" << (void *)Q_ptr
                                                              << " K=" << (void *)K_ptr

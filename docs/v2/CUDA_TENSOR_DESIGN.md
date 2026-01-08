@@ -1,7 +1,7 @@
 # CUDA Tensor Design Analysis and Fix
 
 **Date**: January 2026  
-**Status**: Analysis Complete - Fix Pending
+**Status**: ✅ Fixed (January 8, 2026)
 
 ## 1. Current Architecture
 
@@ -27,6 +27,7 @@ void* d_ptr = weights->gpu_data_ptr();  // Returns device pointer
 - `gpu_data_ptr()` - Returns device pointer (or nullptr if not on GPU)
 - `isOnGPU()` - Returns `gpu_data_ptr_ != nullptr`
 - `raw_data()` / `raw_mutable_data()` - Returns **host** pointer (always)
+- `active_data_ptr()` / `active_mutable_data_ptr()` - Returns GPU pointer if on GPU, else host pointer ✅ **Added**
 
 #### Pattern B: GPU-Native Tensor (Broken Infrastructure)
 ```cpp
@@ -273,21 +274,38 @@ This preserves backward compatibility while fixing the actual bugs.
 
 ### Priority 1: Fix the Stage Bug
 1. [x] Audit stages using `raw_data()` for GPU tensors  
-2. [ ] Fix `AttentionComputeStage` to use `gpu_data_ptr()` when `is_on_gpu()`
-3. [ ] Fix `CUDAResidualAddKernelT` to use `gpu_data_ptr()`
-4. [ ] Add helper method to CPUTensorBase for cleaner device-aware access
+2. [x] Fix `AttentionComputeStage` to use `active_data_ptr()` when `is_on_gpu()` ✅
+3. [x] Fix `CUDAResidualAddKernelT` to use `active_data_ptr()` ✅
+4. [x] Add helper method `active_data_ptr()` to ITensor and CPUTensorBase ✅
 
 ### Priority 2: Clean Up CUDATensorBase
-1. [ ] Remove invalid `override` markers from `CUDATensorBase`
-2. [ ] Keep `CUDAFp32Tensor` (it works)
-3. [ ] Remove broken `CUDAINT8Tensor`, `CUDAINT32Tensor` type aliases
+1. [x] Remove invalid `override` markers from `CUDATensorBase` → **Deleted entire file**
+2. [x] Remove broken `CUDAINT8Tensor`, `CUDAINT32Tensor` type aliases → **Deleted CUDATypedTensor.h**
 
 ### Priority 3: Testing
 1. [ ] Add integration test for CPU tensor → GPU transfer → kernel execution
 2. [ ] Test with real GPU (run existing V2_Integration_CUDABasicPipeline)
-3. [ ] Document the GPU tensor pattern
+3. [x] Document the GPU tensor pattern (this file)
 
-## 7. Immediate Fix for AttentionComputeStage
+## 7. Fix Implementation (January 8, 2026)
+
+The fix adds `active_data_ptr()` to the ITensor interface with a device-aware override in CPUTensorBase:
+
+```cpp
+// ITensor.h - Default implementation (returns host pointer)
+virtual const void *active_data_ptr() const { return raw_data(); }
+virtual void *active_mutable_data_ptr() { return raw_mutable_data(); }
+
+// CPUTensors.h - Device-aware override
+const void *active_data_ptr() const override {
+    return gpu_data_ptr_ ? gpu_data_ptr_ : raw_host_data_ptr();
+}
+void *active_mutable_data_ptr() override {
+    return gpu_data_ptr_ ? gpu_data_ptr_ : raw_host_data_ptr();
+}
+```
+
+Stages now use `active_data_ptr()` instead of `raw_data()`:
 
 ```cpp
 // BEFORE (BUGGY):
@@ -298,38 +316,38 @@ if (is_gpu_tensor) {
 
 // AFTER (FIXED):
 if (is_gpu_tensor) {
-    // Get device pointers for GPU tensors
-    auto* Q_base = dynamic_cast<CPUTensorBase*>(params_.Q);
-    auto* K_base = dynamic_cast<CPUTensorBase*>(params_.K);
-    auto* V_base = dynamic_cast<CPUTensorBase*>(params_.V);
-    auto* output_base = dynamic_cast<CPUTensorBase*>(params_.output);
-    
-    const float *Q_ptr = static_cast<const float *>(Q_base->gpu_data_ptr());
-    const float *K_ptr = static_cast<const float *>(K_base->gpu_data_ptr());
-    const float *V_ptr = static_cast<const float *>(V_base->gpu_data_ptr());
-    float *output_ptr = static_cast<float *>(output_base->gpu_data_ptr());
+    // active_data_ptr() returns GPU pointer when tensor is on GPU
+    const float *Q_ptr = static_cast<const float *>(params_.Q->active_data_ptr());
+    // Q_ptr is now correctly a DEVICE pointer
 }
 ```
 
 ## 8. Summary
 
-**Root Cause**: Stages incorrectly use `raw_data()` (always returns host) when they should use `gpu_data_ptr()` (returns device pointer when on GPU).
+**Root Cause**: Stages incorrectly used `raw_data()` (always returns host) when they should use the active device pointer.
+
+**Fix**: Added `active_data_ptr()` / `active_mutable_data_ptr()` to ITensor interface:
+- Default implementation returns `raw_data()` (host pointer)
+- CPUTensorBase override returns GPU pointer if `gpu_data_ptr_` is set, else host pointer
+- No breaking changes - existing code using `raw_data()` still works
+- Stages updated to use `active_data_ptr()` for kernel dispatch
 
 **Why It Wasn't Caught**: 
 - CUDA kernels use `gpu_data_ptr()` correctly
-- Stages use `raw_data()` incorrectly  
+- Stages used `raw_data()` incorrectly  
 - If CUDA is unavailable, stages take CPU path (works)
 - If CUDA is available but tensors not on GPU, stages take CPU path (works)
 - Only fails when tensors ARE on GPU → passes host pointer to CUDA kernel → segfault/garbage
 
-**Fix Pattern**:
+**Correct Pattern Going Forward**:
 ```cpp
-void* data_ptr;
-if (tensor->is_on_gpu()) {
-    auto* cpu_tensor = dynamic_cast<CPUTensorBase*>(tensor);
-    data_ptr = cpu_tensor->gpu_data_ptr();
-} else {
-    data_ptr = tensor->raw_mutable_data();  // Host pointer
-}
+// Use active_data_ptr() for kernel dispatch - works for both CPU and GPU
+void* data_ptr = tensor->active_mutable_data_ptr();
+
+// Use raw_data() only when you explicitly need the HOST pointer
+void* host_ptr = tensor->raw_mutable_data();
+
+// Use gpu_data_ptr() only when you explicitly need the GPU pointer
+void* gpu_ptr = dynamic_cast<CPUTensorBase*>(tensor)->gpu_data_ptr();
 ```
 

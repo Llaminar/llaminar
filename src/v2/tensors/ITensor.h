@@ -243,18 +243,42 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Get raw pointer to the data buffer (const)
-         * @return Pointer to start of data buffer, caller must know the actual type
+         * @brief Get raw pointer to HOST data buffer (const)
+         * @return Pointer to start of HOST data buffer, caller must know the actual type
          * @note Use typed_as<T>() for type-safe access when possible
+         * @note Always returns HOST pointer even if tensor is on GPU
+         * @see active_data_ptr() for device-aware pointer access
          */
         virtual const void *raw_data() const = 0;
 
         /**
-         * @brief Get raw mutable pointer to the data buffer
-         * @return Mutable pointer to start of data buffer
+         * @brief Get raw mutable pointer to HOST data buffer
+         * @return Mutable pointer to start of HOST data buffer
          * @note Use typed_as<T>() for type-safe access when possible
+         * @note Always returns HOST pointer even if tensor is on GPU
+         * @see active_mutable_data_ptr() for device-aware pointer access
          */
         virtual void *raw_mutable_data() = 0;
+
+        // =========================================================================
+        // Device-Aware Data Access
+        // =========================================================================
+
+        /**
+         * @brief Get pointer to data where it currently resides (const)
+         * @return GPU pointer if is_on_gpu(), else host pointer from raw_data()
+         * @note Use this when you need the "active" pointer for kernel dispatch
+         * @note Default implementation returns raw_data() - override in GPU-capable tensors
+         */
+        virtual const void *active_data_ptr() const { return raw_data(); }
+
+        /**
+         * @brief Get mutable pointer to data where it currently resides
+         * @return GPU pointer if is_on_gpu(), else host pointer from raw_mutable_data()
+         * @note Use this when you need the "active" pointer for kernel dispatch
+         * @note Default implementation returns raw_mutable_data() - override in GPU-capable tensors
+         */
+        virtual void *active_mutable_data_ptr() { return raw_mutable_data(); }
 
         // =========================================================================
         // Type-Safe Downcasting
