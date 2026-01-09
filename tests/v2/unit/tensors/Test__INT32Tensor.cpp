@@ -267,9 +267,9 @@ TEST_F(Test__INT32Tensor, DeviceAffinity)
 {
     auto tensor = std::make_shared<INT32Tensor>(std::vector<size_t>{10, 10});
 
-    // Default device should be host (CPU = -1)
-    EXPECT_EQ(tensor->home_dm_device_index(), -1);
-    EXPECT_TRUE(tensor->is_on_device(-1));
+    // Default device should be host (CPU)
+    EXPECT_TRUE(tensor->home_device().is_cpu());
+    EXPECT_TRUE(tensor->is_on_device(DeviceId::cpu()));
 }
 
 // ============================================================================

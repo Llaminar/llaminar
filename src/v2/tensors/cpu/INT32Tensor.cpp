@@ -178,15 +178,6 @@ namespace llaminar2
     // DEVICE MANAGEMENT
     // =============================================================================
 
-    bool INT32Tensor::set_device(int device_idx)
-    {
-        if (device_idx == -1)
-        {
-            return true; // CPU always supported
-        }
-        LOG_WARN("[INT32Tensor] Device upload not yet implemented");
-        return false;
-    }
 
     bool INT32Tensor::sync_to_device()
     {

@@ -78,9 +78,9 @@ namespace llaminar2
 
         std::vector<float> host_buffer(numel);
 
-        int device_id = tensor->home_dm_device_index();
+        DeviceId home_device = tensor->home_device();
 
-        if (device_id < 0)
+        if (home_device.is_cpu())
         {
             // CPU tensor - direct memcpy
             std::memcpy(host_buffer.data(), tensor->data(), numel * sizeof(float));
@@ -89,7 +89,8 @@ namespace llaminar2
         else
         {
             // GPU tensor - device-to-host transfer
-            LOG_DEBUG("[MPIStager] toHost: GPU tensor (device " << device_id << "), staging " << numel << " elements");
+            int device_id = home_device.toKernelDeviceIndex();
+            LOG_DEBUG("[MPIStager] toHost: GPU tensor (" << home_device.toString() << "), staging " << numel << " elements");
             synchronizeDevice(device_id);
             deviceToHost(host_buffer.data(), tensor->data(), numel, device_id);
         }
@@ -117,9 +118,9 @@ namespace llaminar2
             throw std::invalid_argument("[MPIStager] toDevice: buffer size mismatch (host=" + std::to_string(host_buffer.size()) + ", tensor=" + std::to_string(numel) + ")");
         }
 
-        int device_id = tensor->home_dm_device_index();
+        DeviceId home_device = tensor->home_device();
 
-        if (device_id < 0)
+        if (home_device.is_cpu())
         {
             // CPU tensor - direct memcpy
             std::memcpy(tensor->mutable_data(), host_buffer.data(), numel * sizeof(float));
@@ -128,7 +129,8 @@ namespace llaminar2
         else
         {
             // GPU tensor - host-to-device transfer
-            LOG_DEBUG("[MPIStager] toDevice: GPU tensor (device " << device_id << "), staging " << numel << " elements");
+            int device_id = home_device.toKernelDeviceIndex();
+            LOG_DEBUG("[MPIStager] toDevice: GPU tensor (" << home_device.toString() << "), staging " << numel << " elements");
             hostToDevice(tensor->mutable_data(), host_buffer.data(), numel, device_id);
             synchronizeDevice(device_id);
         }
@@ -136,9 +138,8 @@ namespace llaminar2
 
     bool MPIStager::requiresStaging(const TensorBase *tensor)
     {
-        // Device index 0 = CPU (no staging needed)
-        // Device index > 0 = GPU (staging required)
-        return tensor && tensor->home_dm_device_index() > 0;
+        // GPU tensors require staging (host<->device transfer) for MPI
+        return tensor && tensor->home_device().is_gpu();
     }
 
     void MPIStager::synchronizeDevice(int device_id)

@@ -2550,6 +2550,18 @@ add_v2_test(V2_Integration_CUDABasicPipeline
     MPI_PROCS 1  # Tests GPU pipeline locally, no MPI needed
 )
 
+# Test: Tensor Host/Device Memory Coherence (comprehensive state machine validation)
+# Tests the two-flag coherence model (host_valid_, device_valid_) with full state
+# transition coverage, edge cases, and efficiency verification.
+# See: docs/v2/TENSOR_MEMORY_COHERENCE_DESIGN.md
+add_executable(v2_integration_tensor_coherence integration/Test__TensorCoherence.cpp)
+target_link_libraries(v2_integration_tensor_coherence llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_TensorCoherence
+    COMMAND $<TARGET_FILE:v2_integration_tensor_coherence>
+    LABELS "V2;Integration;CUDA;TensorTransfer;Coherence;StateMachine;FP32;BF16;FP16;GPUMemory;DeviceManagement"
+    MPI_PROCS 1  # Tests GPU coherence locally, no MPI needed
+)
+
 # Test: CUDA GEMM Parity (FP32 and IQ4_NL: CUDA vs CPU kernel comparison)
 # Tests CUDAFloatingPointGemmKernel and CUDAQuantisedGemmKernel through KernelFactory
 # with cosine similarity metrics against CPU reference kernels
@@ -2581,6 +2593,17 @@ add_v2_test(V2_Integration_CUDAFlashAttentionParity
     COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
     LABELS "V2;Integration;CUDA;Parity;Attention;FlashAttention;FlashDecode;GQA;FP32;CosineSimilarity"
     MPI_PROCS 1  # Tests GPU vs CPU parity locally, no MPI needed
+)
+
+# Performance: CUDA Flash Attention Throughput Benchmarks
+# Tests FA3 pipelined, WMMA, and scalar prefill + decode kernels
+# Measures TFLOPS, GB/s, latency across Qwen model configurations
+add_executable(v2_perf_cuda_flash_attention performance/kernels/cuda/attention/Perf__CUDAFlashAttention.cpp)
+target_link_libraries(v2_perf_cuda_flash_attention llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_CUDAFlashAttention
+    COMMAND $<TARGET_FILE:v2_perf_cuda_flash_attention>
+    LABELS "V2;Performance;CUDA;Attention;FlashAttention;FA3;WMMA;TensorCore;Throughput;Latency"
+    MPI_PROCS 1  # Tests GPU attention locally, no MPI needed
 )
 
 # Test: CUDA Ring Buffer KV Cache Parity
@@ -2791,17 +2814,6 @@ target_link_libraries(v2_test_stage_buffer_requirements llaminar2_core GTest::gt
 add_v2_test(V2_Unit_StageBufferRequirements
     COMMAND $<TARGET_FILE:v2_test_stage_buffer_requirements>
     LABELS "V2;Unit;Execution;ComputeStage;BufferRequirements;BufferRole"
-    MPI_PROCS 1
-)
-
-# Test: TensorValidation (debug-only tensor validation utilities)
-# Tests zero detection, NaN/Inf detection, and validation assertions.
-# Part of Buffer Contract Validation System - Phase 1: Quick Wins
-add_executable(v2_test_tensor_validation unit/Test__TensorValidation.cpp)
-target_link_libraries(v2_test_tensor_validation llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_TensorValidation
-    COMMAND $<TARGET_FILE:v2_test_tensor_validation>
-    LABELS "V2;Unit;TensorOperations;Validation;Debug"
     MPI_PROCS 1
 )
 

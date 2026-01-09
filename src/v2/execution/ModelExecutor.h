@@ -144,7 +144,7 @@ namespace llaminar2
         LayerExecutor layer_executor_;
 
         // Device contexts (created lazily)
-        std::unordered_map<int, std::unique_ptr<IDeviceContext>> device_contexts_;
+        std::unordered_map<DeviceId, std::unique_ptr<IDeviceContext>> device_contexts_;
 
         // Statistics
         ModelExecutorStats stats_;

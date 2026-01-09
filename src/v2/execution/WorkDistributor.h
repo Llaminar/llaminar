@@ -54,7 +54,7 @@ namespace llaminar2
         {
             int world_size = 1;                ///< Total MPI ranks
             int rank = 0;                      ///< This rank's index (0-indexed)
-            std::vector<int> devices;          ///< Device indices for this rank (e.g., {0, 1} for CPU + GPU)
+            std::vector<DeviceId> devices;     ///< Devices for this rank (e.g., {cpu(), cuda(0)})
             std::vector<float> device_weights; ///< Relative compute power per device (default: equal)
         };
 
@@ -283,7 +283,7 @@ namespace llaminar2
 
         int worldSize() const { return config_.world_size; }
         int rank() const { return config_.rank; }
-        const std::vector<int> &devices() const { return config_.devices; }
+        const std::vector<DeviceId> &devices() const { return config_.devices; }
         size_t deviceCount() const { return config_.devices.size(); }
         bool hasMultipleDevices() const { return config_.devices.size() > 1; }
 

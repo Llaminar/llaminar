@@ -5,15 +5,40 @@
  * @date December 2025
  */
 
-#include "../CPUKVCache.h"
+#include "CPUKVCache.h"
 #include "../../utils/Logger.h"
-#include "../SIMDHelpers.h"
+#include "../../tensors/SIMDHelpers.h"
 #include <cstring>
 #include <algorithm>
 #include <omp.h>
 
 namespace llaminar2
 {
+
+    // =========================================================================
+    // Legacy Device Index Conversion Helper
+    // =========================================================================
+
+    namespace
+    {
+        /**
+         * @brief Convert legacy device index to DeviceId
+         *
+         * Legacy convention: 0 = CPU, 1+ = GPU (1=GPU0, 2=GPU1, etc.)
+         * This matches the old DeviceManager indexing.
+         *
+         * TODO: Remove this when CPUKVCache API is updated to take vector<DeviceId>
+         */
+        DeviceId deviceIdFromLegacyIndex(int legacy_idx)
+        {
+            if (legacy_idx <= 0)
+            {
+                return DeviceId::cpu();
+            }
+            // Legacy: GPU indices start at 1, DeviceId::cuda expects 0-based ordinal
+            return DeviceId::cuda(legacy_idx - 1);
+        }
+    } // anonymous namespace
 
     // =========================================================================
     // Helper Specializations: Tensor Allocation
@@ -430,7 +455,7 @@ namespace llaminar2
             layer_devices_.reserve(n_layers_);
             for (int i = 0; i < n_layers_; ++i)
             {
-                layer_devices_.push_back(DeviceId::fromLegacyIndex(attention_devices[i]));
+                layer_devices_.push_back(deviceIdFromLegacyIndex(attention_devices[i]));
             }
         }
         else
@@ -511,7 +536,7 @@ namespace llaminar2
             layer_devices_.reserve(n_layers_);
             for (int i = 0; i < n_layers_; ++i)
             {
-                layer_devices_.push_back(DeviceId::fromLegacyIndex(attention_devices[i]));
+                layer_devices_.push_back(deviceIdFromLegacyIndex(attention_devices[i]));
             }
         }
         else

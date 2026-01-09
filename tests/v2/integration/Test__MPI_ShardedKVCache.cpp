@@ -19,7 +19,7 @@
 #include <iostream>
 
 #include "backends/DeviceId.h"
-#include "tensors/CPUKVCache.h"
+#include "kernels/cpu/CPUKVCache.h"
 #include "tensors/Tensors.h"
 #include "utils/MPIContext.h"
 

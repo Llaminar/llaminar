@@ -18,7 +18,7 @@
 #include <cmath>
 #include <numeric>
 
-#include "v2/tensors/CPUKVCache.h"
+#include "v2/kernels/cpu/CPUKVCache.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/models/qwen/Qwen2Graph.h"
 #include "v2/backends/DeviceId.h"

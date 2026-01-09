@@ -9,8 +9,8 @@
 
 #pragma once
 
-#include "ITensor.h"
-#include "TensorLayout.h"
+#include "../tensors/ITensor.h"
+#include "../tensors/TensorLayout.h"
 #include <vector>
 
 namespace llaminar2

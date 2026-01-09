@@ -167,11 +167,6 @@ namespace llaminar2
 
     IQ3_XXSTensor::~IQ3_XXSTensor() {}
 
-    bool IQ3_XXSTensor::set_device(int device_idx)
-    {
-        device_ = DeviceId::fromLegacyIndex(device_idx);
-        return true;
-    }
 
     const float *IQ3_XXSTensor::data() const
     {

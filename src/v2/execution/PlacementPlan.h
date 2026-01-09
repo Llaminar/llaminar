@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "../backends/DeviceId.h"
 #include <cstddef>
 #include <string>
 #include <unordered_map>
@@ -43,10 +44,39 @@ namespace llaminar2
     };
 
     /**
-     * @brief Convert PlacementDevice to device index
+     * @brief Convert PlacementDevice to DeviceId
+     * @param device PlacementDevice enum
+     * @return DeviceId (CPU or CUDA device)
+     */
+    inline DeviceId toDeviceId(PlacementDevice device)
+    {
+        switch (device)
+        {
+        case PlacementDevice::CPU:
+            return DeviceId::cpu();
+        case PlacementDevice::GPU_0:
+            return DeviceId::cuda(0);
+        case PlacementDevice::GPU_1:
+            return DeviceId::cuda(1);
+        case PlacementDevice::GPU_2:
+            return DeviceId::cuda(2);
+        case PlacementDevice::GPU_3:
+            return DeviceId::cuda(3);
+        case PlacementDevice::GPU_ANY:
+            return DeviceId::cuda(0); // Default to first GPU
+        case PlacementDevice::REPLICATED:
+            return DeviceId::cpu(); // Replicated tensors loaded to CPU by default
+        }
+        return DeviceId::cpu();
+    }
+
+    /**
+     * @brief Convert PlacementDevice to device index (DEPRECATED)
      * @param device PlacementDevice enum
      * @return Device index (0 = CPU, 1+ = GPUs)
+     * @deprecated Use toDeviceId() instead
      */
+    [[deprecated("Use toDeviceId() instead")]]
     inline int toDeviceIndex(PlacementDevice device)
     {
         switch (device)
@@ -84,16 +114,36 @@ namespace llaminar2
         PlacementDevice ffn_device = PlacementDevice::CPU;
         bool split_attention_ffn = false; ///< If true, use separate attention_device/ffn_device
 
-        /// Get device index for attention compute
-        int getAttentionDeviceIdx() const
+        /// Get DeviceId for attention compute
+        DeviceId getAttentionDevice() const
         {
-            return toDeviceIndex(split_attention_ffn ? attention_device : device);
+            return toDeviceId(split_attention_ffn ? attention_device : device);
         }
 
-        /// Get device index for FFN compute
+        /// Get DeviceId for FFN compute
+        DeviceId getFFNDevice() const
+        {
+            return toDeviceId(split_attention_ffn ? ffn_device : device);
+        }
+
+        /// Get device index for attention compute (DEPRECATED)
+        [[deprecated("Use getAttentionDevice() instead")]]
+        int getAttentionDeviceIdx() const
+        {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+            return toDeviceIndex(split_attention_ffn ? attention_device : device);
+#pragma GCC diagnostic pop
+        }
+
+        /// Get device index for FFN compute (DEPRECATED)
+        [[deprecated("Use getFFNDevice() instead")]]
         int getFFNDeviceIdx() const
         {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
             return toDeviceIndex(split_attention_ffn ? ffn_device : device);
+#pragma GCC diagnostic pop
         }
     };
 

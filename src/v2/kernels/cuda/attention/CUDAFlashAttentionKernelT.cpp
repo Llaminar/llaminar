@@ -15,26 +15,29 @@
 // Extern "C" declarations for CUDA kernel wrappers
 extern "C"
 {
-    int cudaFlashAttn_prefill_fp32(
+    // FA3-style pipelined prefill (SM >= 8.0)
+    // Supports head_dim=64 (6 consumer warps) and head_dim=128 (4 consumer warps)
+    int cudaFlashAttn_prefill_fa3(
         const float *Q, const float *K, const float *V, float *O,
         int batch_size, int seq_len, int kv_len,
         int n_heads, int n_kv_heads, int head_dim,
         bool causal, int window_size, int position_offset,
         void *stream);
 
+    // Flash Decoding for single-token decode with split-K parallelism
     int cudaFlashAttn_decode_fp32(
         const float *Q, const float *K_cache, const float *V_cache, float *O,
-        float *O_partial, float *lse_partial,
+        float *O_partial, float *m_partial, float *l_partial,
         int batch_size, int kv_len,
         int n_heads, int n_kv_heads, int head_dim,
         int num_splits,
         void *stream);
 
     int cudaFlashAttn_allocWorkspace(
-        void **partial_output, void **partial_lse,
+        void **partial_output, void **partial_m, void **partial_l,
         int batch_size, int n_heads, int head_dim, int num_splits);
 
-    void cudaFlashAttn_freeWorkspace(void *partial_output, void *partial_lse);
+    void cudaFlashAttn_freeWorkspace(void *partial_output, void *partial_m, void *partial_l);
 
     int cudaFlashAttn_setDevice(int device_idx);
     int cudaFlashAttn_synchronize();
@@ -53,7 +56,7 @@ namespace llaminar2
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::CUDAFlashAttentionKernelT(int device_idx)
             : device_idx_(device_idx), stream_(nullptr),
-              partial_output_buf_(nullptr), partial_lse_buf_(nullptr),
+              partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
               workspace_size_(0), max_splits_(0)
         {
             LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Created for device " << device_idx);
@@ -68,13 +71,15 @@ namespace llaminar2
             CUDAFlashAttentionKernelT &&other) noexcept
             : device_idx_(other.device_idx_), stream_(other.stream_),
               partial_output_buf_(other.partial_output_buf_),
-              partial_lse_buf_(other.partial_lse_buf_),
+              partial_m_buf_(other.partial_m_buf_),
+              partial_l_buf_(other.partial_l_buf_),
               workspace_size_(other.workspace_size_),
               max_splits_(other.max_splits_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
-            other.partial_lse_buf_ = nullptr;
+            other.partial_m_buf_ = nullptr;
+            other.partial_l_buf_ = nullptr;
             other.workspace_size_ = 0;
             other.max_splits_ = 0;
         }
@@ -89,13 +94,15 @@ namespace llaminar2
                 device_idx_ = other.device_idx_;
                 stream_ = other.stream_;
                 partial_output_buf_ = other.partial_output_buf_;
-                partial_lse_buf_ = other.partial_lse_buf_;
+                partial_m_buf_ = other.partial_m_buf_;
+                partial_l_buf_ = other.partial_l_buf_;
                 workspace_size_ = other.workspace_size_;
                 max_splits_ = other.max_splits_;
 
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
-                other.partial_lse_buf_ = nullptr;
+                other.partial_m_buf_ = nullptr;
+                other.partial_l_buf_ = nullptr;
                 other.workspace_size_ = 0;
                 other.max_splits_ = 0;
             }
@@ -115,12 +122,13 @@ namespace llaminar2
             // Allocate for batch_size=1 (resize if needed)
             int batch_size = 1;
             if (cudaFlashAttn_allocWorkspace(
-                    &partial_output_buf_, &partial_lse_buf_,
+                    &partial_output_buf_, &partial_m_buf_, &partial_l_buf_,
                     batch_size, n_heads, head_dim, num_splits) != 0)
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Failed to allocate workspace");
                 partial_output_buf_ = nullptr;
-                partial_lse_buf_ = nullptr;
+                partial_m_buf_ = nullptr;
+                partial_l_buf_ = nullptr;
                 return;
             }
 
@@ -131,11 +139,12 @@ namespace llaminar2
 
         void CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::freeWorkspace()
         {
-            if (partial_output_buf_ || partial_lse_buf_)
+            if (partial_output_buf_ || partial_m_buf_ || partial_l_buf_)
             {
-                cudaFlashAttn_freeWorkspace(partial_output_buf_, partial_lse_buf_);
+                cudaFlashAttn_freeWorkspace(partial_output_buf_, partial_m_buf_, partial_l_buf_);
                 partial_output_buf_ = nullptr;
-                partial_lse_buf_ = nullptr;
+                partial_m_buf_ = nullptr;
+                partial_l_buf_ = nullptr;
                 workspace_size_ = 0;
                 max_splits_ = 0;
             }
@@ -242,18 +251,21 @@ namespace llaminar2
             int result;
 
             // Choose algorithm based on seq_len
-            if (seq_len == 1 && kv_len > 64)
+            if (seq_len == 1)
             {
-                // Flash Decoding for single-token decode with large KV cache
+                // Flash Decoding for single-token decode
+                // Always use this path for seq_len=1, even for short KV
                 int num_splits = DEFAULT_NUM_SPLITS;
-                if (kv_len < 256)
-                    num_splits = 4;
-                if (kv_len < 128)
+                if (kv_len <= 64)
+                    num_splits = 1;  // No splitting for very short KV
+                else if (kv_len < 128)
                     num_splits = 2;
+                else if (kv_len < 256)
+                    num_splits = 4;
 
                 allocateWorkspace(n_heads, head_dim, num_splits);
 
-                if (!partial_output_buf_ || !partial_lse_buf_)
+                if (!partial_output_buf_ || !partial_m_buf_ || !partial_l_buf_)
                 {
                     LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Workspace allocation failed");
                     return false;
@@ -265,18 +277,20 @@ namespace llaminar2
                 result = cudaFlashAttn_decode_fp32(
                     Q, K, V, output,
                     static_cast<float *>(partial_output_buf_),
-                    static_cast<float *>(partial_lse_buf_),
+                    static_cast<float *>(partial_m_buf_),
+                    static_cast<float *>(partial_l_buf_),
                     batch_size, kv_len,
                     n_heads, n_kv_heads, head_dim,
                     num_splits, stream_);
             }
             else
             {
-                // Flash Attention 2 for prefill or short KV
-                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Using Flash Attention 2: "
+                // Flash Attention 3 for prefill or short KV
+                // Uses pipelined cp.async on SM >= 8.0, falls back to WMMA/scalar on older GPUs
+                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Using Flash Attention 3 (pipelined): "
                           << "batch=" << batch_size << " seq_len=" << seq_len << " kv_len=" << kv_len);
 
-                result = cudaFlashAttn_prefill_fp32(
+                result = cudaFlashAttn_prefill_fa3(
                     Q, K, V, output,
                     batch_size, seq_len, kv_len,
                     n_heads, n_kv_heads, head_dim,
@@ -302,7 +316,7 @@ namespace llaminar2
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::CUDAFlashAttentionKernelT(int device_idx)
             : device_idx_(device_idx), stream_(nullptr),
-              partial_output_buf_(nullptr), partial_lse_buf_(nullptr),
+              partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
               workspace_size_(0), max_splits_(0)
         {
             LOG_DEBUG("[CUDAFlashAttentionKernelT<FP16>] Created for device " << device_idx);
@@ -317,13 +331,15 @@ namespace llaminar2
             CUDAFlashAttentionKernelT &&other) noexcept
             : device_idx_(other.device_idx_), stream_(other.stream_),
               partial_output_buf_(other.partial_output_buf_),
-              partial_lse_buf_(other.partial_lse_buf_),
+              partial_m_buf_(other.partial_m_buf_),
+              partial_l_buf_(other.partial_l_buf_),
               workspace_size_(other.workspace_size_),
               max_splits_(other.max_splits_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
-            other.partial_lse_buf_ = nullptr;
+            other.partial_m_buf_ = nullptr;
+            other.partial_l_buf_ = nullptr;
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP16> &
@@ -336,12 +352,14 @@ namespace llaminar2
                 device_idx_ = other.device_idx_;
                 stream_ = other.stream_;
                 partial_output_buf_ = other.partial_output_buf_;
-                partial_lse_buf_ = other.partial_lse_buf_;
+                partial_m_buf_ = other.partial_m_buf_;
+                partial_l_buf_ = other.partial_l_buf_;
                 workspace_size_ = other.workspace_size_;
                 max_splits_ = other.max_splits_;
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
-                other.partial_lse_buf_ = nullptr;
+                other.partial_m_buf_ = nullptr;
+                other.partial_l_buf_ = nullptr;
             }
             return *this;
         }
@@ -357,11 +375,12 @@ namespace llaminar2
 
         void CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::freeWorkspace()
         {
-            if (partial_output_buf_ || partial_lse_buf_)
+            if (partial_output_buf_ || partial_m_buf_ || partial_l_buf_)
             {
-                cudaFlashAttn_freeWorkspace(partial_output_buf_, partial_lse_buf_);
+                cudaFlashAttn_freeWorkspace(partial_output_buf_, partial_m_buf_, partial_l_buf_);
                 partial_output_buf_ = nullptr;
-                partial_lse_buf_ = nullptr;
+                partial_m_buf_ = nullptr;
+                partial_l_buf_ = nullptr;
             }
         }
 
@@ -448,7 +467,7 @@ namespace llaminar2
 
         CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::CUDAFlashAttentionKernelT(int device_idx)
             : device_idx_(device_idx), stream_(nullptr),
-              partial_output_buf_(nullptr), partial_lse_buf_(nullptr),
+              partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
               workspace_size_(0), max_splits_(0)
         {
             LOG_DEBUG("[CUDAFlashAttentionKernelT<BF16>] Created for device " << device_idx);
@@ -463,13 +482,15 @@ namespace llaminar2
             CUDAFlashAttentionKernelT &&other) noexcept
             : device_idx_(other.device_idx_), stream_(other.stream_),
               partial_output_buf_(other.partial_output_buf_),
-              partial_lse_buf_(other.partial_lse_buf_),
+              partial_m_buf_(other.partial_m_buf_),
+              partial_l_buf_(other.partial_l_buf_),
               workspace_size_(other.workspace_size_),
               max_splits_(other.max_splits_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
-            other.partial_lse_buf_ = nullptr;
+            other.partial_m_buf_ = nullptr;
+            other.partial_l_buf_ = nullptr;
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::BF16> &
@@ -482,12 +503,14 @@ namespace llaminar2
                 device_idx_ = other.device_idx_;
                 stream_ = other.stream_;
                 partial_output_buf_ = other.partial_output_buf_;
-                partial_lse_buf_ = other.partial_lse_buf_;
+                partial_m_buf_ = other.partial_m_buf_;
+                partial_l_buf_ = other.partial_l_buf_;
                 workspace_size_ = other.workspace_size_;
                 max_splits_ = other.max_splits_;
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
-                other.partial_lse_buf_ = nullptr;
+                other.partial_m_buf_ = nullptr;
+                other.partial_l_buf_ = nullptr;
             }
             return *this;
         }
@@ -503,11 +526,12 @@ namespace llaminar2
 
         void CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::freeWorkspace()
         {
-            if (partial_output_buf_ || partial_lse_buf_)
+            if (partial_output_buf_ || partial_m_buf_ || partial_l_buf_)
             {
-                cudaFlashAttn_freeWorkspace(partial_output_buf_, partial_lse_buf_);
+                cudaFlashAttn_freeWorkspace(partial_output_buf_, partial_m_buf_, partial_l_buf_);
                 partial_output_buf_ = nullptr;
-                partial_lse_buf_ = nullptr;
+                partial_m_buf_ = nullptr;
+                partial_l_buf_ = nullptr;
             }
         }
 

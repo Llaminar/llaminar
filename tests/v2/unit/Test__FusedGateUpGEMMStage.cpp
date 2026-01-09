@@ -110,7 +110,7 @@ namespace llaminar2
             ASSERT_NE(ctx_, nullptr);
 
             // Create random input activations
-            input_ = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(k_)}, 0);
+            input_ = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(k_)}, DeviceId::cpu());
             fill_random(input_->mutable_data(), m_ * k_, 1.0f, 42);
 
             // Create weight tensors
@@ -118,8 +118,8 @@ namespace llaminar2
             w_up_ = create_mock_weights(n_up_, k_, 200);
 
             // Create output tensors
-            output_gate_ = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(n_gate_)}, 0);
-            output_up_ = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(n_up_)}, 0);
+            output_gate_ = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(n_gate_)}, DeviceId::cpu());
+            output_up_ = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(n_up_)}, DeviceId::cpu());
 
             // Create bias vectors (filled with known values for easy verification)
             bias_gate_.resize(n_gate_);

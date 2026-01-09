@@ -147,12 +147,6 @@ namespace llaminar2
             new_shape, root_data_ptr, root_byte_offset, root_parent));
     }
 
-    bool Q8_0Tensor::set_device(int device_idx)
-    {
-        // TODO: Implement device transfer
-        device_ = DeviceId::fromLegacyIndex(device_idx);
-        return true;
-    }
 
     const float *Q8_0Tensor::data() const
     {

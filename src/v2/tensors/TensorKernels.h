@@ -577,6 +577,93 @@ namespace llaminar2
             return false; // Default: no optimized fusion, uses sequential fallback
         }
 
+        // =====================================================================
+        // Tensor-aware fused projection API (preferred for GPU execution)
+        // =====================================================================
+
+        /**
+         * @brief Descriptor for tensor-aware fused multi-projection GEMM
+         *
+         * Unlike FusedProjectionDesc which uses raw pointers, this uses TensorBase
+         * objects which manage their own device placement. The kernel handles
+         * all device synchronization internally.
+         */
+        struct TensorProjectionDesc
+        {
+            ITensorGemm *kernel;          ///< GEMM kernel for this projection (with packed weights)
+            TensorBase *output;           ///< Output tensor [m, n] - kernel manages device placement
+            int n;                        ///< Output dimension (columns)
+            const TensorBase *bias;       ///< Optional bias tensor [n] (nullptr = no bias)
+            const TensorBase *gate_input; ///< Optional gate tensor for SwiGLU [m, n]
+            bool do_swiglu;               ///< Whether to apply SwiGLU fusion
+            const char *name;             ///< Name for debug logging
+
+            TensorProjectionDesc(ITensorGemm *k, TensorBase *out, int n_dim,
+                                 const TensorBase *b = nullptr, const TensorBase *gate = nullptr,
+                                 bool swiglu = false, const char *nm = nullptr)
+                : kernel(k), output(out), n(n_dim), bias(b), gate_input(gate),
+                  do_swiglu(swiglu), name(nm) {}
+        };
+
+        /**
+         * @brief Tensor-aware fused multi-projection GEMM
+         *
+         * This is the preferred API for GPU execution. Unlike multiply_fused() which
+         * takes raw pointers, this takes ITensor objects which manage their own device
+         * placement. The kernel handles all device synchronization internally.
+         *
+         * **Device Handling**:
+         * - Input tensor: ensureOnDevice() called if needed
+         * - Output tensors: ensureOnDevice() called, mark_device_dirty() after write
+         * - Weight tensors: managed by the kernel (already packed/uploaded)
+         *
+         * **For CPU execution**: Falls back to host pointers transparently
+         * **For GPU execution**: Uses device pointers, no manual sync needed by caller
+         *
+         * @param input Input tensor [m, k] (FP32)
+         * @param projections Vector of tensor projection descriptors
+         * @param m Number of rows (batch_size * seq_len)
+         * @param k Input dimension (must match all kernels' K dimension)
+         * @param mpi_ctx MPI context for distributed execution
+         *
+         * @return true on success, false on error
+         */
+        virtual bool multiply_fused_tensor(
+            const TensorBase *input,
+            const std::vector<TensorProjectionDesc> &projections,
+            int m, int k,
+            const MPIContext *mpi_ctx = nullptr)
+        {
+            // Default implementation: call multiply_tensor() for each projection
+            for (const auto &proj : projections)
+            {
+                if (!proj.kernel || !proj.output)
+                {
+                    return false; // Invalid projection
+                }
+
+                // Use tensor-aware multiply - kernel handles device placement
+                // Note: Must pass transpose_B explicitly before alpha/beta to match signature:
+                //   multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx)
+                bool success = proj.kernel->multiply_tensor(
+                    input, proj.output,
+                    m, proj.n, k,
+                    true, // transpose_B (weights are [K,N] stored as [N,K] transposed)
+                    1.0f, // alpha
+                    0.0f, // beta
+                    mpi_ctx);
+
+                if (!success)
+                {
+                    return false;
+                }
+
+                // Note: bias and SwiGLU fusion not handled in default implementation
+                // Optimized implementations should handle these in fused manner
+            }
+            return true;
+        }
+
         /**
          * @brief GEMM with pre-quantized Q8_1 activations, outputting Q8_1
          *

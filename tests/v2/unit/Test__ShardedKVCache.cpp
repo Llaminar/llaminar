@@ -15,7 +15,7 @@
 #include <gtest/gtest.h>
 
 #include "backends/DeviceId.h"
-#include "tensors/CPUKVCache.h"
+#include "kernels/cpu/CPUKVCache.h"
 #include "utils/MPIContext.h"
 
 namespace llaminar2
@@ -367,6 +367,7 @@ namespace llaminar2
         TEST_F(Test__ShardedKVCache, ShardedCache_PerLayerDevices_Works)
         {
             // Create device list (alternating 0 and 1 for simulation)
+            // Legacy convention: 0 = CPU, 1 = GPU0
             std::vector<int> devices(kNumLayers);
             for (int i = 0; i < kNumLayers; ++i)
             {
@@ -383,9 +384,11 @@ namespace llaminar2
             EXPECT_TRUE(cache->is_sharded());
 
             // Verify per-layer device placement
+            // Legacy 0 = CPU, Legacy 1 = cuda(0)
             for (int layer = 0; layer < kNumLayers; ++layer)
             {
-                EXPECT_EQ(cache->get_layer_device(layer), DeviceId::fromLegacyIndex(layer % 2))
+                DeviceId expected = (layer % 2 == 0) ? DeviceId::cpu() : DeviceId::cuda(0);
+                EXPECT_EQ(cache->get_layer_device(layer), expected)
                     << "Wrong device at layer " << layer;
             }
         }

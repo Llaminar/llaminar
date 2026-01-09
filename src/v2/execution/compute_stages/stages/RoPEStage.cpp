@@ -146,7 +146,7 @@ namespace llaminar2
                 params_.head_dim,
                 params_.theta_base,
                 params_.mpi_ctx,
-                params_.device_id.toLegacyIndex());
+                params_.device_id.toKernelDeviceIndex());
         }
 
         // HybridQ16 mode with K precision fix: Q=Q8_1→Q16_1, K=Q16_1→Q16_1 (dynamic scale)
@@ -209,7 +209,7 @@ namespace llaminar2
                 params_.theta_base,
                 params_.kv_cache_scale, // Fixed scale for Q output
                 params_.mpi_ctx,
-                params_.device_id.toLegacyIndex());
+                params_.device_id.toKernelDeviceIndex());
 
             if (success)
             {
@@ -263,7 +263,7 @@ namespace llaminar2
                 params_.theta_base,
                 params_.kv_cache_scale, // Fixed scale for integer attention
                 params_.mpi_ctx,
-                params_.device_id.toLegacyIndex());
+                params_.device_id.toKernelDeviceIndex());
 
             // Debug: verify RoPE Q16_1 output
             if (success)
@@ -292,7 +292,7 @@ namespace llaminar2
             params_.head_dim,
             params_.theta_base,
             params_.mpi_ctx,
-            params_.device_id.toLegacyIndex());
+            params_.device_id.toKernelDeviceIndex());
     }
 
     size_t RoPEStage::estimatedFlops() const

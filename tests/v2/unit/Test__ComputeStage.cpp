@@ -35,7 +35,7 @@ protected:
     // Helper: Create an FP32Tensor (2D)
     std::unique_ptr<FP32Tensor> makeTensor(size_t rows, size_t cols, const std::vector<float> &data = {})
     {
-        auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{rows, cols}, 0);
+        auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{rows, cols}, DeviceId::cpu());
         if (!data.empty())
         {
             std::copy(data.begin(), data.end(), tensor->mutable_data());
@@ -46,7 +46,7 @@ protected:
     // Helper: Create an FP32Tensor (1D)
     std::unique_ptr<FP32Tensor> makeTensor1D(size_t n, const std::vector<float> &data = {})
     {
-        auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{n}, 0);
+        auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{n}, DeviceId::cpu());
         if (!data.empty())
         {
             std::copy(data.begin(), data.end(), tensor->mutable_data());
@@ -628,7 +628,11 @@ TEST_F(ComputeStageTest, BackendSupport)
 
     EXPECT_TRUE(rms_stage.supportsBackend(ComputeBackendType::CPU));
     EXPECT_TRUE(rms_stage.supportsBackend(ComputeBackendType::CPU));
+#ifdef HAVE_CUDA
+    EXPECT_TRUE(rms_stage.supportsBackend(ComputeBackendType::GPU_CUDA));
+#else
     EXPECT_FALSE(rms_stage.supportsBackend(ComputeBackendType::GPU_CUDA));
+#endif
     EXPECT_FALSE(rms_stage.supportsBackend(ComputeBackendType::GPU_ROCM));
 }
 

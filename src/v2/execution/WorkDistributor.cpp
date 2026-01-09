@@ -31,10 +31,10 @@ namespace llaminar2
             throw std::invalid_argument("WorkDistributor: rank out of range");
         }
 
-        // If no devices specified, assume single CPU device at index 0
+        // If no devices specified, assume single CPU device
         if (config_.devices.empty())
         {
-            config_.devices = {0};
+            config_.devices = {DeviceId::cpu()};
         }
 
         // If weights specified, must match device count
@@ -58,7 +58,7 @@ namespace llaminar2
         : WorkDistributor(Config{
               .world_size = world_size,
               .rank = rank,
-              .devices = device.is_valid() ? std::vector<int>{device.toLegacyIndex()} : std::vector<int>{0},
+              .devices = device.is_valid() ? std::vector<DeviceId>{device} : std::vector<DeviceId>{DeviceId::cpu()},
               .device_weights = {}})
     {
     }
@@ -164,17 +164,17 @@ namespace llaminar2
     WorkDistributor::WorkSlice WorkDistributor::getDeviceSlice(size_t rank_elements, DeviceId device) const
     {
         // Find device position in our list
-        int device_idx = device.toLegacyIndex();
-        auto it = std::find(config_.devices.begin(), config_.devices.end(), device_idx);
+        auto it = std::find(config_.devices.begin(), config_.devices.end(), device);
         if (it == config_.devices.end())
         {
             throw std::invalid_argument("WorkDistributor::getDeviceSlice: device not in devices list");
         }
         size_t device_pos = std::distance(config_.devices.begin(), it);
+        int device_pos_int = static_cast<int>(device_pos);
 
         if (rank_elements == 0)
         {
-            return WorkSlice{0, 0, 0, device_idx};
+            return WorkSlice{0, 0, 0, device_pos_int};
         }
 
         auto weights = getNormalizedWeights();
@@ -206,7 +206,7 @@ namespace llaminar2
             .start = start,
             .end = end,
             .count = end - start,
-            .owner = device_idx};
+            .owner = device_pos_int}; // owner is index into devices vector
     }
 
     std::vector<WorkDistributor::WorkSlice> WorkDistributor::getAllDeviceSlices(size_t rank_elements) const
@@ -216,9 +216,9 @@ namespace llaminar2
 
         if (rank_elements == 0)
         {
-            for (int dev_idx : config_.devices)
+            for (size_t i = 0; i < config_.devices.size(); ++i)
             {
-                slices.push_back(WorkSlice{0, 0, 0, dev_idx});
+                slices.push_back(WorkSlice{0, 0, 0, static_cast<int>(i)});
             }
             return slices;
         }
@@ -243,7 +243,7 @@ namespace llaminar2
                 .start = current_start,
                 .end = current_start + count,
                 .count = count,
-                .owner = config_.devices[i]});
+                .owner = static_cast<int>(i)}); // owner is index into devices vector
             current_start += count;
         }
 
@@ -257,11 +257,11 @@ namespace llaminar2
         {
             if (slice.contains(element_idx))
             {
-                return slice.owner;
+                return slice.owner; // Returns index into devices vector
             }
         }
         // Should not reach here if element_idx < rank_elements
-        return config_.devices.back();
+        return static_cast<int>(config_.devices.size() - 1);
     }
 
     // =============================================================================
@@ -287,7 +287,7 @@ namespace llaminar2
         {
             result.push_back(HierarchicalSlice{
                 .rank = config_.rank,
-                .device = DeviceId::fromLegacyIndex(dev_slice.owner),
+                .device = config_.devices[dev_slice.owner], // owner is index into devices
                 .global_start = rank_slice.start + dev_slice.start,
                 .global_end = rank_slice.start + dev_slice.end,
                 .local_start = dev_slice.start,
@@ -304,7 +304,7 @@ namespace llaminar2
         {
             return HierarchicalSlice{
                 .rank = config_.rank,
-                .device = DeviceId::fromLegacyIndex(config_.devices.empty() ? 0 : config_.devices[0]),
+                .device = config_.devices.empty() ? DeviceId::cpu() : config_.devices[0],
                 .global_start = 0,
                 .global_end = 0,
                 .local_start = 0,
@@ -406,7 +406,7 @@ namespace llaminar2
             {
                 assignments.push_back(ExpertAssignment{
                     .expert_id = expert_idx++,
-                    .device = DeviceId::fromLegacyIndex(config_.devices[d]),
+                    .device = config_.devices[d], // devices is now vector<DeviceId>
                     .rank = config_.rank});
             }
         }

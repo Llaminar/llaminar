@@ -9,7 +9,7 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
-#include "../../../tensors/CPUKVCache.h"
+#include "../../../kernels/cpu/CPUKVCache.h"
 #include <limits>
 
 namespace llaminar2
@@ -196,7 +196,7 @@ namespace llaminar2
             &scores_workspace,
             mask_tensor.get(),
             params_.mpi_ctx.get(),
-            params_.device_id.toLegacyIndex(),
+            params_.device_id.toKernelDeviceIndex(),
             params_.head_start,
             params_.local_n_heads,
             params_.local_n_kv_heads);
@@ -313,7 +313,7 @@ namespace llaminar2
             &scores_workspace,
             &mask_tensor,
             params_.mpi_ctx.get(),
-            params_.device_id.toLegacyIndex());
+            params_.device_id.toKernelDeviceIndex());
 
         if (!success)
         {
@@ -435,7 +435,7 @@ namespace llaminar2
             &scores_workspace,
             mask_tensor.get(),
             params_.mpi_ctx.get(),
-            params_.device_id.toLegacyIndex(),
+            params_.device_id.toKernelDeviceIndex(),
             params_.head_start,
             params_.local_n_heads,
             params_.local_n_kv_heads);

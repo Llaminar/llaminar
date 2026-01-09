@@ -110,7 +110,7 @@ namespace llaminar2
                 params_.m, params_.n_gate, params_.k,
                 false,      // transpose_B
                 1.0f, 0.0f, // alpha, beta
-                params_.mpi_ctx, params_.device_id.toLegacyIndex());
+                params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
 
             if (!gate_ok)
             {
@@ -124,7 +124,7 @@ namespace llaminar2
                 params_.m, params_.n_up, params_.k,
                 false,      // transpose_B
                 1.0f, 0.0f, // alpha, beta
-                params_.mpi_ctx, params_.device_id.toLegacyIndex());
+                params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
 
             if (!up_ok)
             {

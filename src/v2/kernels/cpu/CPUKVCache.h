@@ -22,12 +22,12 @@
 
 #pragma once
 
-#include "Tensors.h"
-#include "TensorFactory.h"
-#include "TensorLayout.h"
-#include "../backends/DeviceId.h"
-#include "../utils/MPIContext.h"
-#include "../execution/RuntimeConfig.h"
+#include "../../tensors/Tensors.h"
+#include "../../tensors/TensorFactory.h"
+#include "../../tensors/TensorLayout.h"
+#include "../../backends/DeviceId.h"
+#include "../../utils/MPIContext.h"
+#include "../../execution/RuntimeConfig.h"
 #include <vector>
 #include <memory>
 

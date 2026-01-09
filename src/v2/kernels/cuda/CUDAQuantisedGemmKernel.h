@@ -216,6 +216,26 @@ namespace llaminar2
                 int device_idx = -1) override;
 
             /**
+             * @brief Fused multi-projection GEMM with automatic host/device transfer
+             *
+             * Handles the host-to-device transfer required for FusedGateUpGEMMStage
+             * and FusedQKVGEMMStage which pass host pointers.
+             *
+             * @param input Host FP32 input [m, k]
+             * @param projections Vector of projections (each with host output pointer)
+             * @param m Number of rows
+             * @param k Input dimension
+             * @param mpi_ctx MPI context (unused for CUDA)
+             * @param device_idx Device index (unused, kernel bound to cuda_device_id_)
+             */
+            bool multiply_fused(
+                const float *input,
+                const std::vector<FusedProjectionDesc> &projections,
+                int m, int k,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override;
+
+            /**
              * @brief Activation-activation GEMM (not supported for quantized kernel)
              *
              * CUDAQuantisedGemmKernel is for weight projections only.
@@ -287,6 +307,15 @@ namespace llaminar2
              */
             bool multiply_fp32_to_fp32(
                 const float *d_A, float *d_C,
+                int m, int n, int k,
+                float alpha, float beta);
+
+            /**
+             * @brief FP32 activations → quantize → INT8 GEMM → FP32 output + bias
+             * @param d_bias Optional bias vector [N], broadcasted across rows
+             */
+            bool multiply_fp32_to_fp32_with_bias(
+                const float *d_A, float *d_C, const float *d_bias,
                 int m, int n, int k,
                 float alpha, float beta);
 

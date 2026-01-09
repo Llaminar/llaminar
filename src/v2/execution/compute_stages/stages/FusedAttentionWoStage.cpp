@@ -9,7 +9,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorVerification.h"
-#include "../../../tensors/CPUKVCache.h"
+#include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h"
@@ -938,7 +938,7 @@ namespace llaminar2
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarBool("causal", params_.causal);
         info.addScalarInt("backend", static_cast<int>(params_.backend));
-        info.addScalarInt("device_id", params_.device_id.toLegacyIndex());
+        info.addScalarInt("device_id", params_.device_id.toKernelDeviceIndex());
 
         return info;
     }

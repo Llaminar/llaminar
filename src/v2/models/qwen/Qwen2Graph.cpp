@@ -698,13 +698,15 @@ namespace llaminar2
                                                      << " sequence_lengths=" << (sequence_lengths ? "valid" : "nullptr")
                                                      << (sequence_lengths ? " size=" + std::to_string(sequence_lengths->size()) : ""));
 
-        // Determine backend type for stage creation
-        auto &dm = DeviceManager::instance();
+        // Determine backend type for stage creation from DeviceId
         ComputeBackendType backend = ComputeBackendType::CPU;
-        int device_idx = device.toLegacyIndex();
-        if (static_cast<size_t>(device_idx) < dm.devices().size())
+        if (device.is_cuda())
         {
-            backend = dm.devices()[device_idx].type;
+            backend = ComputeBackendType::GPU_CUDA;
+        }
+        else if (device.is_rocm())
+        {
+            backend = ComputeBackendType::GPU_ROCM;
         }
 
         // Stage 1: Pre-attention RMSNorm
@@ -722,6 +724,7 @@ namespace llaminar2
             attn_norm_params.gamma = layer.attn_norm;
             attn_norm_params.eps = config_.rms_norm_eps;
             attn_norm_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
+            attn_norm_params.device_id = device;     // Use graph's target device for kernel dispatch
 
             graph.addNode(prefix + "attn_norm",
                           ComputeStageFactory::createRMSNorm(attn_norm_params),
@@ -1311,13 +1314,15 @@ namespace llaminar2
         // Compute total tokens for GEMM m parameter
         int total_tokens = batch_size * seq_len;
 
-        // Determine backend type
-        auto &dm = DeviceManager::instance();
+        // Determine backend type from DeviceId
         ComputeBackendType backend = ComputeBackendType::CPU;
-        int device_idx = device.toLegacyIndex();
-        if (static_cast<size_t>(device_idx) < dm.devices().size())
+        if (device.is_cuda())
         {
-            backend = dm.devices()[device_idx].type;
+            backend = ComputeBackendType::GPU_CUDA;
+        }
+        else if (device.is_rocm())
+        {
+            backend = ComputeBackendType::GPU_ROCM;
         }
 
         // Stage 1: Pre-FFN RMSNorm
@@ -1334,6 +1339,7 @@ namespace llaminar2
             ffn_norm_params.gamma = layer.ffn_norm;
             ffn_norm_params.eps = config_.rms_norm_eps;
             ffn_norm_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
+            ffn_norm_params.device_id = device;     // Use graph's target device for kernel dispatch
 
             graph.addNode(prefix + "ffn_norm",
                           ComputeStageFactory::createRMSNorm(ffn_norm_params),

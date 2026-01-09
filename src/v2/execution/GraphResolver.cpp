@@ -20,7 +20,7 @@
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 #include "../tensors/Tensors.h"
-#include "../tensors/CPUKVCache.h"
+#include "../kernels/cpu/CPUKVCache.h"
 #include <stdexcept>
 #include <algorithm>
 

@@ -31,7 +31,7 @@
 #include "v2/execution/GraphOrchestrator.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/TensorFactory.h"
-#include "v2/tensors/CPUKVCache.h"
+#include "v2/kernels/cpu/CPUKVCache.h"
 #include "v2/tensors/SIMDHelpers.h"
 #include "v2/backends/ComputeBackend.h"
 #include "v2/loaders/ModelLoader.h"

@@ -230,15 +230,15 @@ TEST_F(Test__CPUOnlyStrategy, IsApplicableWhenNoGPU)
     EXPECT_TRUE(strategy.isApplicable(input));
 }
 
-TEST_F(Test__CPUOnlyStrategy, NotApplicableWhenGPUAvailableAndNotForced)
+TEST_F(Test__CPUOnlyStrategy, AlwaysApplicableEvenWithGPU)
 {
     CPUOnlyStrategy strategy;
     auto input = createBasicInput(24, 1);
     input.any_rank_has_gpu = true;
     input.force_cpu_only = false;
 
-    // CPUOnlyStrategy returns false when GPU is available and not forced
-    EXPECT_FALSE(strategy.isApplicable(input));
+    // CPUOnlyStrategy is ALWAYS applicable - user can explicitly choose CPU
+    EXPECT_TRUE(strategy.isApplicable(input));
 }
 
 TEST_F(Test__CPUOnlyStrategy, ComputeReturnsCPUPlan)
@@ -332,7 +332,7 @@ TEST(Test__GPUFirstStrategy, NotApplicableWhenForcedCPU)
     EXPECT_FALSE(strategy.isApplicable(input));
 }
 
-TEST(Test__GPUFirstStrategy, ComputeFallsBackToCPU)
+TEST(Test__GPUFirstStrategy, ComputeThrowsNotImplemented)
 {
     GPUFirstStrategy strategy;
     PlacementInput input;
@@ -342,11 +342,8 @@ TEST(Test__GPUFirstStrategy, ComputeFallsBackToCPU)
     input.node_count = 1;
     input.any_rank_has_gpu = true;
 
-    PlacementPlan plan = strategy.compute(input);
-
-    // For now, GPUFirst falls back to CPU
-    EXPECT_FALSE(plan.usesGPU());
-    EXPECT_NE(plan.strategy_name.find("fallback"), std::string::npos);
+    // GPUFirst strategy is not yet implemented - should throw, not silently fallback
+    EXPECT_THROW(strategy.compute(input), std::runtime_error);
 }
 
 // =============================================================================
@@ -388,11 +385,30 @@ TEST(Test__PlacementStrategyFactory, AutoSelectRespectsUserChoice)
 {
     PlacementInput input;
     input.preferred_strategy = "CPUOnly";
-    input.any_rank_has_gpu = true; // GPU available but user wants CPU
+    input.any_rank_has_gpu = true; // GPU available but user explicitly wants CPU
 
+    // User explicitly chose CPUOnly, so this should work
     auto strategy = PlacementStrategyFactory::autoSelect(input);
     ASSERT_NE(strategy, nullptr);
     EXPECT_EQ(strategy->name(), "CPUOnly");
+}
+
+TEST(Test__PlacementStrategyFactory, AutoSelectThrowsForGPUWithGPUAvailable)
+{
+    PlacementInput input;
+    input.any_rank_has_gpu = true;
+    // No preferred_strategy and no force_cpu_only - would auto-select for GPU
+    // But GPU strategies aren't implemented, so should throw
+
+    EXPECT_THROW(PlacementStrategyFactory::autoSelect(input), std::runtime_error);
+}
+
+TEST(Test__PlacementStrategyFactory, AutoSelectThrowsForInvalidStrategy)
+{
+    PlacementInput input;
+    input.preferred_strategy = "NonexistentStrategy";
+
+    EXPECT_THROW(PlacementStrategyFactory::autoSelect(input), std::runtime_error);
 }
 
 TEST(Test__PlacementStrategyFactory, AutoSelectRespectsForceCPU)

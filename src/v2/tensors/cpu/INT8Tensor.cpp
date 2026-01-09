@@ -125,13 +125,6 @@ namespace llaminar2
         }
     }
 
-    bool INT8Tensor::set_device(int device_idx)
-    {
-        // TODO: Implement device upload for INT8
-        LOG_WARN("[INT8Tensor] Device upload not yet implemented");
-        device_ = DeviceId::fromLegacyIndex(device_idx);
-        return false;
-    }
 
     const float *INT8Tensor::data() const
     {

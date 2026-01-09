@@ -1,12 +1,16 @@
 /**
  * @file CUDAFlashAttentionKernels.cu
- * @brief CUDA device kernels for Flash Attention 2 and Flash Decoding
+ * @brief CUDA device kernels for Flash Attention 3 and Flash Decoding
  *
  * This file contains the CUDA device kernels and extern "C" wrapper functions
  * called from the C++ implementation file.
  *
  * Algorithms implemented:
- * - Flash Attention 2: Tiled attention with online softmax for prefill
+ * - Flash Attention 3: Pipelined attention with warp specialization (SM >= 8.0)
+ *   - Uses cp.async for overlapped memory transfers
+ *   - Double-buffered shared memory for K/V tiles
+ *   - Producer/consumer warp specialization
+ *   - Adaptive tile sizing for head_dim=64 and head_dim=128
  * - Flash Decoding: Split-K parallelism for single-token decode
  *
  * @author David Sanftenberg
@@ -14,130 +18,213 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <mma.h> // WMMA (Warp Matrix Multiply-Accumulate) for Tensor Cores
 #include <cstdint>
 #include <cmath>
 #include <cfloat>
 #include <cstdio>
 
+// WMMA namespace for Tensor Core operations
+using namespace nvcuda;
+
 namespace
 {
-    // =========================================================================
-    // BF16/FP16 Conversion Helpers (same as CUDAOpsKernels.cu)
-    // =========================================================================
-
-    __device__ __forceinline__ float bf16_to_float(uint16_t bf16)
-    {
-        uint32_t bits = static_cast<uint32_t>(bf16) << 16;
-        float result;
-        memcpy(&result, &bits, sizeof(float));
-        return result;
-    }
-
-    __device__ __forceinline__ uint16_t float_to_bf16(float f)
-    {
-        uint32_t bits;
-        memcpy(&bits, &f, sizeof(float));
-        // Round to nearest even
-        bits += 0x7FFF + ((bits >> 16) & 1);
-        return static_cast<uint16_t>(bits >> 16);
-    }
-
-    __device__ __forceinline__ float fp16_to_float(uint16_t fp16)
-    {
-        __half h;
-        memcpy(&h, &fp16, sizeof(__half));
-        return __half2float(h);
-    }
-
-    __device__ __forceinline__ uint16_t float_to_fp16(float f)
-    {
-        __half h = __float2half(f);
-        uint16_t result;
-        memcpy(&result, &h, sizeof(uint16_t));
-        return result;
-    }
-
     // =========================================================================
     // Constants
     // =========================================================================
 
     constexpr int WARP_SIZE = 32;
 
-    // Tile sizes for Flash Attention 2
-    // These are tuned for common GPU architectures (Ampere, Ada)
-    // Note: Actual tile sizes are computed at runtime based on head_dim
-    // to stay within shared memory limits (100KB on Ampere/Ada)
-    constexpr int MAX_TILE_Q = 64;  // Max rows of Q per tile (Br)
-    constexpr int MAX_TILE_KV = 64; // Max rows of K/V per tile (Bc)
-
-    // For head_dim > 64, we use smaller tiles to fit in shared memory
-    // Formula: smem = (TILE_Q + 2*TILE_KV) * head_dim * 4 + TILE_Q * TILE_KV * 4
-    // Target: smem <= 99KB (to leave some margin on 100KB GPUs)
-    __host__ __device__ inline int computeTileQ(int head_dim)
-    {
-        if (head_dim <= 64)
-            return 64;
-        if (head_dim <= 128)
-            return 32; // 32*128*3*4 + 32*32*4 = 49152 + 4096 = 53KB
-        return 16;     // For even larger head_dim
-    }
-
-    __host__ __device__ inline int computeTileKV(int head_dim)
-    {
-        if (head_dim <= 64)
-            return 64;
-        if (head_dim <= 128)
-            return 32;
-        return 16;
-    }
-
-    // Number of splits for Flash Decoding
-    constexpr int DEFAULT_NUM_SPLITS = 8;
+    // WMMA fragment dimensions (M x N x K)
+    // We use 16x16x16 for FP16->FP32 accumulation which is well-supported
+    constexpr int WMMA_M = 16;
+    constexpr int WMMA_N = 16;
+    constexpr int WMMA_K = 16;
 
     // =========================================================================
-    // Warp Reduction Utilities
+    // Flash Attention 3 - Pipelined Prefill with cp.async (SM >= 8.0)
+    // =========================================================================
+    //
+    // Key optimizations:
+    //   1. cp.async for asynchronous global->shared memory transfers
+    //   2. Double-buffered K/V tiles to overlap load and compute
+    //   3. Producer/consumer warp specialization
+    //   4. Reduced synchronization points
+    //   5. Adaptive tile sizing for different head_dim values
+    //
+    // Pipeline structure (2 stages):
+    //   Stage 0: Load K[i], V[i] while computing on K[i-1], V[i-1]
+    //   Stage 1: Load K[i+1], V[i+1] while computing on K[i], V[i]
+    //
+    // Warp roles (configurable via template):
+    //   Warps 0-1: Producers - async load K/V tiles
+    //   Warps 2+:  Consumers - WMMA compute + softmax
     // =========================================================================
 
-    __device__ __forceinline__ float warpReduceMax(float val)
+    // Pipeline configuration
+    constexpr int FA3_NUM_STAGES = 2;     // Double buffering
+    constexpr int FA3_PRODUCER_WARPS = 2; // Warps dedicated to loading (fixed)
+    constexpr int FA3_TILE_KV = 64;       // KV tile size (constant for good K/V reuse)
+    // Shared-memory padding for the [tile_q, tile_kv] scores matrix.
+    // Note: WMMA store/load paths can have implicit alignment/stride constraints;
+    // keep the padded leading dimension a multiple of 16.
+    constexpr int FA3_SCORES_LD_PAD = 16;
+
+    // =========================================================================
+    // Cached Device Properties for Fast Kernel Launch
+    // =========================================================================
+
+    struct FA3DeviceConfig
     {
-#pragma unroll
-        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
-        {
-            val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, offset));
-        }
-        return val;
-    }
+        int sm_major = 0;
+        int sm_minor = 0;
+        int max_smem_optin = 0; // Max dynamic shared memory with opt-in
+        bool initialized = false;
+    };
 
-    __device__ __forceinline__ float warpReduceSum(float val)
-    {
-#pragma unroll
-        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
-        {
-            val += __shfl_xor_sync(0xffffffff, val, offset);
-        }
-        return val;
-    }
-
-    // =========================================================================
-    // Flash Attention 2 - Prefill Kernel (FP32)
-    // =========================================================================
+    // Per-device cached config (thread-safe via atomics on first init)
+    static FA3DeviceConfig g_fa3_device_config[8]; // Support up to 8 GPUs
 
     /**
-     * @brief Flash Attention 2 forward kernel - FP32 version
-     *
-     * Each thread block handles one (batch, head) pair.
-     * Tiles over Q rows (Br) and K/V rows (Bc) with online softmax.
-     *
-     * Memory layout assumptions:
-     *   Q: [batch_size, seq_len, n_heads, head_dim] or [batch_size * seq_len, n_heads, head_dim]
-     *   K: [batch_size, kv_len, n_kv_heads, head_dim]
-     *   V: [batch_size, kv_len, n_kv_heads, head_dim]
-     *   O: [batch_size, seq_len, n_heads, head_dim]
-     *
-     * For simplicity, we use: [total_tokens, n_heads, head_dim] layout
-     * where total_tokens = batch_size * seq_len for Q/O and batch_size * kv_len for K/V.
+     * @brief Get cached device configuration (lazy init, thread-safe)
      */
-    __global__ void flash_attention_2_fp32_kernel(
+    inline FA3DeviceConfig &getFA3DeviceConfig(int device)
+    {
+        if (device < 0 || device >= 8)
+            device = 0;
+        FA3DeviceConfig &cfg = g_fa3_device_config[device];
+
+        if (!cfg.initialized)
+        {
+            cudaDeviceProp prop;
+            cudaGetDeviceProperties(&prop, device);
+            cfg.sm_major = prop.major;
+            cfg.sm_minor = prop.minor;
+            cudaDeviceGetAttribute(&cfg.max_smem_optin,
+                                   cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+            cfg.initialized = true;
+        }
+        return cfg;
+    }
+
+    /**
+     * @brief Calculate optimal tile_q based on head_dim and available shared memory
+     *
+     * Shared memory layout:
+     *   Q_tile: [tile_q, head_dim] in FP16
+     *   KV double buffer: 2 stages * (K + V) * [tile_kv, head_dim] in FP16
+     *   Scores: [tile_q, tile_kv] in FP32
+     *
+     * Total = tile_q * head_dim * 2 + 2 * 2 * tile_kv * head_dim * 2 + tile_q * tile_kv * 4
+     */
+    inline int computeOptimalTileQ(int head_dim, int max_smem)
+    {
+        const int tile_kv = FA3_TILE_KV;
+        const int scores_ld = tile_kv + FA3_SCORES_LD_PAD;
+
+        // KV buffer is fixed size (doesn't depend on tile_q)
+        size_t kv_buffer_size = FA3_NUM_STAGES * 2 * tile_kv * head_dim * sizeof(half);
+
+        // Available for Q tile + scores
+        size_t available = max_smem - kv_buffer_size;
+
+        // Q tile + scores = tile_q * (head_dim * sizeof(half) + scores_ld * sizeof(float))
+        // Note: scores_ld is padded to reduce shared-memory bank conflicts.
+        size_t bytes_per_q_row = head_dim * sizeof(half) + scores_ld * sizeof(float);
+
+        // Maximum tile_q that fits
+        int max_tile_q = static_cast<int>(available / bytes_per_q_row);
+
+        // Round down to multiple of 16 for WMMA alignment
+        max_tile_q = (max_tile_q / 16) * 16;
+
+        // Clamp to reasonable range
+        if (max_tile_q > 96)
+            max_tile_q = 96; // Max for 6 consumer warps
+        if (max_tile_q < 32)
+            max_tile_q = 32; // Minimum viable size
+
+        return max_tile_q;
+    }
+
+    /**
+     * @brief Compute FA3 kernel configuration based on head_dim
+     *
+     * Configurations:
+     *   - head_dim <= 64:  tile_q=96, 6 consumers, 256 threads (~70KB smem)
+     *   - head_dim <= 128: tile_q=64, 4 consumers, 192 threads (~98KB smem)
+     */
+    struct FA3KernelConfig
+    {
+        int tile_q;
+        int tile_kv;
+        int num_consumer_warps;
+        int block_size;
+        size_t smem_size;
+    };
+
+    inline FA3KernelConfig computeFA3Config(int head_dim, int max_smem)
+    {
+        FA3KernelConfig cfg;
+        cfg.tile_kv = FA3_TILE_KV; // Always 64
+
+        if (head_dim <= 64)
+        {
+            // Default config: 6 consumer warps for smaller head_dim
+            cfg.tile_q = 96; // 6 * 16
+            cfg.num_consumer_warps = 6;
+            cfg.block_size = (FA3_PRODUCER_WARPS + 6) * WARP_SIZE; // 256
+        }
+        else
+        {
+            // Reduced config for head_dim=128: 4 consumer warps
+            cfg.tile_q = 64; // 4 * 16
+            cfg.num_consumer_warps = 4;
+            cfg.block_size = (FA3_PRODUCER_WARPS + 4) * WARP_SIZE; // 192
+        }
+
+        // Verify shared memory fits
+        size_t q_tile_size = cfg.tile_q * head_dim * sizeof(half);
+        size_t kv_buffer_size = FA3_NUM_STAGES * 2 * cfg.tile_kv * head_dim * sizeof(half);
+        // Pad scores leading dimension to mitigate shared-memory bank conflicts
+        size_t scores_size = cfg.tile_q * (cfg.tile_kv + FA3_SCORES_LD_PAD) * sizeof(float);
+        cfg.smem_size = q_tile_size + kv_buffer_size + scores_size;
+
+        // If still too large, fall back to even smaller tile_q
+        if ((int)cfg.smem_size > max_smem)
+        {
+            cfg.tile_q = computeOptimalTileQ(head_dim, max_smem);
+            cfg.num_consumer_warps = cfg.tile_q / 16;
+            if (cfg.num_consumer_warps < 2)
+                cfg.num_consumer_warps = 2;
+            if (cfg.num_consumer_warps > 6)
+                cfg.num_consumer_warps = 6;
+            cfg.block_size = (FA3_PRODUCER_WARPS + cfg.num_consumer_warps) * WARP_SIZE;
+
+            // Recompute smem
+            q_tile_size = cfg.tile_q * head_dim * sizeof(half);
+            scores_size = cfg.tile_q * (cfg.tile_kv + FA3_SCORES_LD_PAD) * sizeof(float);
+            cfg.smem_size = q_tile_size + kv_buffer_size + scores_size;
+        }
+
+        return cfg;
+    }
+
+    /**
+     * @brief Flash Attention 3 style kernel with pipelining (SM >= 8.0)
+     *
+     * Uses cp.async for overlapped memory transfers with computation.
+     * Double-buffered shared memory for K/V tiles.
+     * Producer/consumer warp specialization.
+     *
+     * Template parameters:
+     *   NUM_CONSUMER_WARPS: Number of consumer warps (4 for head_dim=128, 6 for head_dim=64)
+     *
+     * Runtime parameters tile_q and tile_kv must be consistent with NUM_CONSUMER_WARPS:
+     *   - tile_q should be NUM_CONSUMER_WARPS * 16 (WMMA_M)
+     */
+    template <int NUM_CONSUMER_WARPS>
+    __global__ void flash_attention_3_pipelined_kernel(
         const float *__restrict__ Q,
         const float *__restrict__ K,
         const float *__restrict__ V,
@@ -152,47 +239,71 @@ namespace
         bool causal,
         int window_size,
         int position_offset,
-        int tile_q,  // Runtime tile size for Q
-        int tile_kv) // Runtime tile size for K/V
+        int tile_q,
+        int tile_kv)
     {
-        // Each block processes one head for one batch element
+        // Block/thread indexing
         const int batch_idx = blockIdx.z;
         const int head_idx = blockIdx.x;
         const int q_tile_idx = blockIdx.y;
+        const int warp_id = threadIdx.x / WARP_SIZE;
+        const int lane_id = threadIdx.x % WARP_SIZE;
 
-        // GQA: map query head to KV head
+        // GQA mapping
         const int kv_head_idx = (n_heads == n_kv_heads) ? head_idx : (head_idx / (n_heads / n_kv_heads));
 
-        // Q row range for this tile
-        const int q_start = q_tile_idx * tile_q;
-        const int q_end = min(q_start + tile_q, seq_len);
-        if (q_start >= seq_len)
+        // Q row range
+        const int q_block_start = q_tile_idx * tile_q;
+        if (q_block_start >= seq_len)
             return;
 
-        // Thread position within block
-        const int tid = threadIdx.x;
-        const int num_threads = blockDim.x;
+        // Warp role: producer (warps 0-1) or consumer (warps 2+)
+        // Use template parameter for consumer warp count
+        const bool is_producer = (warp_id < FA3_PRODUCER_WARPS);
+        const int consumer_warp_id = warp_id - FA3_PRODUCER_WARPS;
+        const bool is_active_consumer = (!is_producer && consumer_warp_id >= 0 && consumer_warp_id < NUM_CONSUMER_WARPS);
 
-        // Shared memory for tiles (dynamically sized based on tile_q, tile_kv)
+        // Shared memory layout with double buffering:
+        // Buffer 0: K_tile[tile_kv, head_dim], V_tile[tile_kv, head_dim]
+        // Buffer 1: K_tile[tile_kv, head_dim], V_tile[tile_kv, head_dim]
+        // Q_tile: [tile_q, head_dim] (loaded once)
+        // scores: [tile_q, tile_kv]
         extern __shared__ char smem[];
-        float *Q_tile = reinterpret_cast<float *>(smem);
-        float *K_tile = Q_tile + tile_q * head_dim;
-        float *V_tile = K_tile + tile_kv * head_dim;
-        float *scores = V_tile + tile_kv * head_dim; // [tile_q, tile_kv]
 
-        // Per-row accumulators (in registers)
-        // Each thread handles one row of Q (if tid < q_end - q_start)
-        const int my_q_row = q_start + tid;
-        const bool valid_row = (my_q_row < seq_len) && (tid < tile_q);
+        const int kv_tile_size = tile_kv * head_dim;
+        const int scores_ld = tile_kv + FA3_SCORES_LD_PAD; // padded LD to reduce shared-memory bank conflicts
 
-        float O_acc[128]; // Max head_dim = 128, adjust if needed
+        half *Q_tile_fp16 = reinterpret_cast<half *>(smem);
+        half *KV_buffers = Q_tile_fp16 + tile_q * head_dim;
+        float *scores = reinterpret_cast<float *>(KV_buffers + FA3_NUM_STAGES * 2 * kv_tile_size);
+
+        // Helper to get K/V tile for a stage
+        auto get_K_tile = [&](int stage) -> half *
+        {
+            return KV_buffers + stage * 2 * kv_tile_size;
+        };
+        auto get_V_tile = [&](int stage) -> half *
+        {
+            return KV_buffers + stage * 2 * kv_tile_size + kv_tile_size;
+        };
+
+        // Consumer warps: per-row accumulators
+        const int q_tile_rows = min(tile_q, seq_len - q_block_start);
+        const int my_consumer_q_row = (is_active_consumer && lane_id < WMMA_M)
+                                          ? q_block_start + consumer_warp_id * WMMA_M + lane_id
+                                          : -1;
+        const bool owns_row = (my_consumer_q_row >= 0 &&
+                               my_consumer_q_row < seq_len &&
+                               (my_consumer_q_row - q_block_start) < q_tile_rows);
+
+        float O_acc[128];
         float m_i = -FLT_MAX;
         float l_i = 0.0f;
 
-        // Initialize output accumulator
-        for (int d = 0; d < head_dim; d++)
+        if (owns_row)
         {
-            O_acc[d] = 0.0f;
+            for (int d = 0; d < head_dim; d++)
+                O_acc[d] = 0.0f;
         }
 
         // Pointers for this batch/head
@@ -200,149 +311,195 @@ namespace
         const float *K_batch = K + batch_idx * kv_len * n_kv_heads * head_dim;
         const float *V_batch = V + batch_idx * kv_len * n_kv_heads * head_dim;
 
-        // Load Q tile into shared memory
-        // Q layout: [seq_len, n_heads, head_dim]
-        for (int i = tid; i < (q_end - q_start) * head_dim; i += num_threads)
+        // ALL warps: Load Q tile (done once)
+        for (int i = threadIdx.x; i < q_tile_rows * head_dim; i += blockDim.x)
         {
             int local_row = i / head_dim;
             int d = i % head_dim;
-            int global_row = q_start + local_row;
-            Q_tile[local_row * head_dim + d] = Q_batch[global_row * n_heads * head_dim + head_idx * head_dim + d];
+            int global_row = q_block_start + local_row;
+            float val = Q_batch[global_row * n_heads * head_dim + head_idx * head_dim + d];
+            Q_tile_fp16[local_row * head_dim + d] = __float2half(val);
+        }
+
+        const int num_kv_tiles = (kv_len + tile_kv - 1) / tile_kv;
+
+        // =====================================================================
+        // Pipeline prologue: Start loading first tile(s) asynchronously
+        // =====================================================================
+        if (is_producer)
+        {
+            const int kv_start_0 = 0;
+            const int kv_end_0 = min(tile_kv, kv_len);
+            const int actual_len_0 = kv_end_0 - kv_start_0;
+
+            half *K_dst_0 = get_K_tile(0);
+            half *V_dst_0 = get_V_tile(0);
+
+            const int producer_local_id = warp_id;
+            const int elems_per_producer = (actual_len_0 * head_dim + 1) / 2;
+            const int my_start = producer_local_id * elems_per_producer;
+            const int my_end = min(my_start + elems_per_producer, actual_len_0 * head_dim);
+
+            for (int i = my_start + lane_id; i < my_end; i += WARP_SIZE)
+            {
+                int local_row = i / head_dim;
+                int d = i % head_dim;
+                int global_row = kv_start_0 + local_row;
+                float k_val = K_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
+                float v_val = V_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
+                K_dst_0[local_row * head_dim + d] = __float2half(k_val);
+                V_dst_0[local_row * head_dim + d] = __float2half(v_val);
+            }
         }
         __syncthreads();
 
-        // Iterate over K/V tiles
-        const int num_kv_tiles = (kv_len + tile_kv - 1) / tile_kv;
+        // WMMA fragments (consumer warps only, but declared for all)
+        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> q_frag;
+        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> k_frag;
+        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> s_frag;
 
+        // =====================================================================
+        // Main pipeline loop
+        // =====================================================================
         for (int kv_tile_iter = 0; kv_tile_iter < num_kv_tiles; kv_tile_iter++)
         {
+            const int current_stage = kv_tile_iter % FA3_NUM_STAGES;
+            const int next_stage = (kv_tile_iter + 1) % FA3_NUM_STAGES;
+
             const int kv_start = kv_tile_iter * tile_kv;
             const int kv_end_tile = min(kv_start + tile_kv, kv_len);
             const int actual_tile_kv_len = kv_end_tile - kv_start;
 
-            // Causal masking: skip KV tiles that are entirely after Q positions
-            if (causal)
+            // Early exit for causal
+            if (causal && kv_start > (q_block_start + tile_q - 1) + position_offset)
             {
-                // For causal attention, K[j] can only attend to Q[i] if j <= i + position_offset
-                // Skip if all K positions are beyond all Q positions in this tile
-                if (kv_start > (q_end - 1) + position_offset)
+                continue;
+            }
+
+            // Get current buffers
+            half *K_tile_fp16 = get_K_tile(current_stage);
+            half *V_tile_fp16 = get_V_tile(current_stage);
+
+            // ----------------------------------------------------------------
+            // PRODUCER WARPS: Start loading next tile into next_stage buffer
+            // ----------------------------------------------------------------
+            if (is_producer && kv_tile_iter + 1 < num_kv_tiles)
+            {
+                const int next_kv_start = (kv_tile_iter + 1) * tile_kv;
+                const int next_kv_end = min(next_kv_start + tile_kv, kv_len);
+                const int next_actual_len = next_kv_end - next_kv_start;
+
+                half *K_dst = get_K_tile(next_stage);
+                half *V_dst = get_V_tile(next_stage);
+
+                const int producer_local_id = warp_id;
+                const int elems_per_producer = (next_actual_len * head_dim + 1) / 2;
+                const int my_start = producer_local_id * elems_per_producer;
+                const int my_end = min(my_start + elems_per_producer, next_actual_len * head_dim);
+
+                for (int i = my_start + lane_id; i < my_end; i += WARP_SIZE)
                 {
-                    continue;
+                    int local_row = i / head_dim;
+                    int d = i % head_dim;
+                    int global_row = next_kv_start + local_row;
+                    float k_val = K_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
+                    float v_val = V_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
+                    K_dst[local_row * head_dim + d] = __float2half(k_val);
+                    V_dst[local_row * head_dim + d] = __float2half(v_val);
                 }
             }
 
-            // Sliding window: skip tiles outside window
-            if (window_size > 0)
+            // ----------------------------------------------------------------
+            // CONSUMER WARPS: Compute Q @ K^T using WMMA
+            // ----------------------------------------------------------------
+            if (is_active_consumer)
             {
-                // Skip if kv_start is beyond window from all Q positions
-                if (kv_start > q_end - 1 + position_offset + window_size)
+                const int warp_q_start = consumer_warp_id * WMMA_M;
+
+                if (warp_q_start < q_tile_rows)
                 {
-                    continue;
-                }
-                // Skip if kv_end is before window starts
-                if (kv_end_tile <= q_start + position_offset - window_size)
-                {
-                    continue;
+                    for (int kv_col = 0; kv_col < actual_tile_kv_len; kv_col += WMMA_N)
+                    {
+                        wmma::fill_fragment(s_frag, 0.0f);
+
+                        for (int k = 0; k < head_dim; k += WMMA_K)
+                        {
+                            const half *Q_ptr = Q_tile_fp16 + warp_q_start * head_dim + k;
+                            wmma::load_matrix_sync(q_frag, Q_ptr, head_dim);
+
+                            const half *K_ptr = K_tile_fp16 + kv_col * head_dim + k;
+                            wmma::load_matrix_sync(k_frag, K_ptr, head_dim);
+
+                            wmma::mma_sync(s_frag, q_frag, k_frag, s_frag);
+                        }
+
+                        float *scores_ptr = scores + warp_q_start * scores_ld + kv_col;
+                        wmma::store_matrix_sync(scores_ptr, s_frag, scores_ld, wmma::mem_row_major);
+                    }
                 }
             }
 
-            // Load K tile
-            // K layout: [kv_len, n_kv_heads, head_dim]
-            for (int i = tid; i < actual_tile_kv_len * head_dim; i += num_threads)
-            {
-                int local_row = i / head_dim;
-                int d = i % head_dim;
-                int global_row = kv_start + local_row;
-                K_tile[local_row * head_dim + d] = K_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-            }
-
-            // Load V tile
-            for (int i = tid; i < actual_tile_kv_len * head_dim; i += num_threads)
-            {
-                int local_row = i / head_dim;
-                int d = i % head_dim;
-                int global_row = kv_start + local_row;
-                V_tile[local_row * head_dim + d] = V_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-            }
+            // Sync all warps before softmax
             __syncthreads();
 
-            // Compute attention scores for this Q row
-            if (valid_row)
+            // ----------------------------------------------------------------
+            // CONSUMER WARPS: Apply softmax and accumulate P @ V
+            // ----------------------------------------------------------------
+            if (is_active_consumer && owns_row)
             {
-                const int local_q_row = tid;
-                const float *Q_row = Q_tile + local_q_row * head_dim;
+                const int local_q_row = consumer_warp_id * WMMA_M + lane_id;
+                float *my_scores = scores + local_q_row * scores_ld;
 
-                // Compute scores: Q[i] @ K[j]^T for j in this tile
-                float m_ij = -FLT_MAX; // Max in this tile
+                float m_ij = -FLT_MAX;
 
+                // Apply scaling and masking
                 for (int j = 0; j < actual_tile_kv_len; j++)
                 {
                     const int kv_pos = kv_start + j;
-
-                    // Causal mask: Q at position (my_q_row + position_offset) can attend to K at position kv_pos
-                    // if kv_pos <= my_q_row + position_offset
                     bool masked = false;
-                    if (causal && kv_pos > my_q_row + position_offset)
-                    {
-                        masked = true;
-                    }
 
-                    // Sliding window mask
+                    if (causal && kv_pos > my_consumer_q_row + position_offset)
+                        masked = true;
                     if (window_size > 0)
                     {
-                        int q_pos = my_q_row + position_offset;
+                        int q_pos = my_consumer_q_row + position_offset;
                         if (kv_pos < q_pos - window_size || kv_pos > q_pos + window_size)
-                        {
                             masked = true;
-                        }
                     }
 
-                    float score;
                     if (masked)
                     {
-                        score = -FLT_MAX;
+                        my_scores[j] = -FLT_MAX;
                     }
                     else
                     {
-                        // Dot product Q[i] @ K[j]
-                        score = 0.0f;
-                        const float *K_row = K_tile + j * head_dim;
-                        for (int d = 0; d < head_dim; d++)
-                        {
-                            score += Q_row[d] * K_row[d];
-                        }
-                        score *= softmax_scale;
+                        my_scores[j] *= softmax_scale;
+                        m_ij = fmaxf(m_ij, my_scores[j]);
                     }
-
-                    scores[local_q_row * tile_kv + j] = score;
-                    m_ij = fmaxf(m_ij, score);
                 }
 
                 // Online softmax update
                 float m_i_new = fmaxf(m_i, m_ij);
                 float scale_old = expf(m_i - m_i_new);
 
-                // Rescale previous accumulator
                 for (int d = 0; d < head_dim; d++)
-                {
                     O_acc[d] *= scale_old;
-                }
                 l_i *= scale_old;
 
-                // Accumulate softmax(scores) @ V
+                // Accumulate P @ V
                 float l_ij = 0.0f;
                 for (int j = 0; j < actual_tile_kv_len; j++)
                 {
-                    float s = scores[local_q_row * tile_kv + j];
+                    float s = my_scores[j];
                     if (s > -FLT_MAX / 2)
-                    { // Not masked
+                    {
                         float p = expf(s - m_i_new);
                         l_ij += p;
 
-                        const float *V_row = V_tile + j * head_dim;
+                        const half *V_row = V_tile_fp16 + j * head_dim;
                         for (int d = 0; d < head_dim; d++)
                         {
-                            O_acc[d] += p * V_row[d];
+                            O_acc[d] += p * __half2float(V_row[d]);
                         }
                     }
                 }
@@ -354,13 +511,15 @@ namespace
             __syncthreads();
         }
 
-        // Final normalization and write output
-        if (valid_row)
+        // =====================================================================
+        // Write final output
+        // =====================================================================
+        if (is_active_consumer && owns_row)
         {
             float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
 
             float *O_batch = O + batch_idx * seq_len * n_heads * head_dim;
-            float *O_row = O_batch + my_q_row * n_heads * head_dim + head_idx * head_dim;
+            float *O_row = O_batch + my_consumer_q_row * n_heads * head_dim + head_idx * head_dim;
 
             for (int d = 0; d < head_dim; d++)
             {
@@ -369,16 +528,57 @@ namespace
         }
     }
 
+    // Explicit template instantiations for supported configurations
+    template __global__ void flash_attention_3_pipelined_kernel<6>(
+        const float *, const float *, const float *, float *,
+        int, int, int, int, int, int, float, bool, int, int, int, int);
+    template __global__ void flash_attention_3_pipelined_kernel<4>(
+        const float *, const float *, const float *, float *,
+        int, int, int, int, int, int, float, bool, int, int, int, int);
+
     // =========================================================================
     // Flash Decoding - Split-K Kernel (FP32)
     // =========================================================================
+    //
+    // The key insight: we store (m, l, O) partials where:
+    //   m = max score seen in this split
+    //   l = sum of exp(score - m) for all positions in split
+    //   O = sum of exp(score - m) * V for all positions (unnormalized)
+    //
+    // These can be combined across splits using stable softmax merge.
+    // =========================================================================
+
+    /**
+     * @brief Warp-level reduction of softmax state (m, l, O)
+     */
+    __device__ void warpReduceSoftmaxState(
+        float &m, float &l, float *O, int head_dim)
+    {
+        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
+        {
+            float other_m = __shfl_xor_sync(0xffffffff, m, offset);
+            float other_l = __shfl_xor_sync(0xffffffff, l, offset);
+
+            float m_new = fmaxf(m, other_m);
+            float scale_self = expf(m - m_new);
+            float scale_other = expf(other_m - m_new);
+
+            l = scale_self * l + scale_other * other_l;
+
+            for (int d = 0; d < head_dim; d++)
+            {
+                float other_O = __shfl_xor_sync(0xffffffff, O[d], offset);
+                O[d] = scale_self * O[d] + scale_other * other_O;
+            }
+
+            m = m_new;
+        }
+    }
 
     /**
      * @brief Flash Decoding kernel for single-query decode
      *
      * Parallelizes over KV cache using split-K pattern.
-     * Each block computes partial attention over a range of K/V.
-     *
      * Grid: (n_heads, num_splits, batch_size)
      * Block: (256,) threads
      */
@@ -387,7 +587,8 @@ namespace
         const float *__restrict__ K_cache,
         const float *__restrict__ V_cache,
         float *__restrict__ O_partial,
-        float *__restrict__ lse_partial,
+        float *__restrict__ m_partial,
+        float *__restrict__ l_partial,
         int kv_len,
         int n_heads,
         int n_kv_heads,
@@ -401,17 +602,23 @@ namespace
 
         const int kv_head_idx = (n_heads == n_kv_heads) ? head_idx : (head_idx / (n_heads / n_kv_heads));
 
-        // Determine this split's KV range
         const int split_size = (kv_len + num_splits - 1) / num_splits;
         const int kv_start = split_idx * split_size;
         const int kv_end = min(kv_start + split_size, kv_len);
 
+        const int partial_idx = (batch_idx * n_heads + head_idx) * num_splits + split_idx;
+
         if (kv_start >= kv_len)
         {
-            // This split has no work - write sentinel values
             if (threadIdx.x == 0)
             {
-                lse_partial[(batch_idx * n_heads + head_idx) * num_splits + split_idx] = -FLT_MAX;
+                m_partial[partial_idx] = -FLT_MAX;
+                l_partial[partial_idx] = 0.0f;
+            }
+            float *O_out = O_partial + partial_idx * head_dim;
+            for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+            {
+                O_out[d] = 0.0f;
             }
             return;
         }
@@ -419,7 +626,6 @@ namespace
         const int tid = threadIdx.x;
         const int num_threads = blockDim.x;
 
-        // Load Q into shared memory (single query vector)
         extern __shared__ char smem[];
         float *Q_shared = reinterpret_cast<float *>(smem);
 
@@ -430,19 +636,15 @@ namespace
         }
         __syncthreads();
 
-        // Per-thread partial sums
-        float O_local[128] = {0}; // Max head_dim
+        float O_local[128] = {0};
         float m_local = -FLT_MAX;
         float l_local = 0.0f;
 
-        // K/V pointers
         const float *K_batch = K_cache + batch_idx * kv_len * n_kv_heads * head_dim;
         const float *V_batch = V_cache + batch_idx * kv_len * n_kv_heads * head_dim;
 
-        // Each thread processes multiple KV positions
         for (int kv_pos = kv_start + tid; kv_pos < kv_end; kv_pos += num_threads)
         {
-            // Compute Q @ K^T for this position
             const float *K_ptr = K_batch + kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
             float score = 0.0f;
             for (int d = 0; d < head_dim; d++)
@@ -451,20 +653,17 @@ namespace
             }
             score *= softmax_scale;
 
-            // Online softmax update
             float m_new = fmaxf(m_local, score);
-            float scale = expf(m_local - m_new);
+            float scale_old = expf(m_local - m_new);
+            float p = expf(score - m_new);
 
-            l_local = l_local * scale + expf(score - m_new);
-
+            l_local = l_local * scale_old + p;
             for (int d = 0; d < head_dim; d++)
             {
-                O_local[d] *= scale;
+                O_local[d] *= scale_old;
             }
 
-            // Accumulate V
             const float *V_ptr = V_batch + kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
-            float p = expf(score - m_new);
             for (int d = 0; d < head_dim; d++)
             {
                 O_local[d] += p * V_ptr[d];
@@ -473,39 +672,20 @@ namespace
             m_local = m_new;
         }
 
-        // Warp reduction
-        float m_warp = warpReduceMax(m_local);
-
-        // Rescale based on warp max
-        float scale_to_warp = expf(m_local - m_warp);
-        l_local *= scale_to_warp;
-        for (int d = 0; d < head_dim; d++)
-        {
-            O_local[d] *= scale_to_warp;
-        }
-
-        // Reduce l across warp
-        float l_warp = warpReduceSum(l_local);
-
-        // Block reduction using shared memory
-        __shared__ float block_m[8];       // Max 8 warps
-        __shared__ float block_l[8];       // Max 8 warps
-        __shared__ float block_O[8 * 128]; // Max 8 warps * max head_dim
+        warpReduceSoftmaxState(m_local, l_local, O_local, head_dim);
 
         const int warp_id = tid / WARP_SIZE;
         const int lane_id = tid % WARP_SIZE;
         const int num_warps = num_threads / WARP_SIZE;
 
-        if (lane_id == 0)
-        {
-            block_m[warp_id] = m_warp;
-            block_l[warp_id] = l_warp;
-        }
+        __shared__ float block_m[8];
+        __shared__ float block_l[8];
+        __shared__ float block_O[8 * 128];
 
-        // Store O to shared (only first thread in warp)
-        // Note: This is simplified - proper implementation needs O reduction
         if (lane_id == 0)
         {
+            block_m[warp_id] = m_local;
+            block_l[warp_id] = l_local;
             for (int d = 0; d < head_dim; d++)
             {
                 block_O[warp_id * head_dim + d] = O_local[d];
@@ -513,40 +693,43 @@ namespace
         }
         __syncthreads();
 
-        // Final reduction by first warp
-        if (warp_id == 0 && lane_id < num_warps)
+        if (warp_id == 0 && lane_id == 0)
         {
-            float my_m = block_m[lane_id];
-            float my_l = block_l[lane_id];
-
-            // Find global max across warps
-            float global_m = warpReduceMax(my_m);
-
-            // Rescale and sum
-            float scale = expf(my_m - global_m);
-            float scaled_l = my_l * scale;
-            float global_l = warpReduceSum(scaled_l);
-
-            // Output reduction (simplified - first thread writes)
-            if (lane_id == 0)
+            float final_m = block_m[0];
+            float final_l = block_l[0];
+            float final_O[128];
+            for (int d = 0; d < head_dim; d++)
             {
-                float *O_out = O_partial + ((batch_idx * n_heads + head_idx) * num_splits + split_idx) * head_dim;
+                final_O[d] = block_O[d];
+            }
 
-                // Combine O from all warps with proper scaling
+            for (int w = 1; w < num_warps; w++)
+            {
+                float other_m = block_m[w];
+                float other_l = block_l[w];
+
+                float m_new = fmaxf(final_m, other_m);
+                float scale_self = expf(final_m - m_new);
+                float scale_other = expf(other_m - m_new);
+
+                final_l = scale_self * final_l + scale_other * other_l;
+
                 for (int d = 0; d < head_dim; d++)
                 {
-                    float sum = 0.0f;
-                    for (int w = 0; w < num_warps; w++)
-                    {
-                        float w_scale = expf(block_m[w] - global_m);
-                        sum += block_O[w * head_dim + d] * w_scale;
-                    }
-                    O_out[d] = sum;
+                    final_O[d] = scale_self * final_O[d] +
+                                 scale_other * block_O[w * head_dim + d];
                 }
 
-                // Store logsumexp for this split
-                lse_partial[(batch_idx * n_heads + head_idx) * num_splits + split_idx] =
-                    global_m + logf(global_l + 1e-10f);
+                final_m = m_new;
+            }
+
+            m_partial[partial_idx] = final_m;
+            l_partial[partial_idx] = final_l;
+
+            float *O_out = O_partial + partial_idx * head_dim;
+            for (int d = 0; d < head_dim; d++)
+            {
+                O_out[d] = final_O[d];
             }
         }
     }
@@ -554,11 +737,12 @@ namespace
     /**
      * @brief Flash Decoding reduction kernel
      *
-     * Combines partial outputs from all splits using LSE correction.
+     * Combines partial outputs from all splits using stable softmax merge.
      */
     __global__ void flash_decoding_reduce_fp32_kernel(
         const float *__restrict__ O_partial,
-        const float *__restrict__ lse_partial,
+        const float *__restrict__ m_partial,
+        const float *__restrict__ l_partial,
         float *__restrict__ O,
         int n_heads,
         int head_dim,
@@ -568,42 +752,44 @@ namespace
         const int batch_idx = blockIdx.y;
 
         const int tid = threadIdx.x;
+        const int base_idx = (batch_idx * n_heads + head_idx) * num_splits;
 
-        // Find global max LSE across splits
-        float lse_max = -FLT_MAX;
-        for (int s = 0; s < num_splits; s++)
+        __shared__ float global_m;
+        __shared__ float global_l;
+        __shared__ float split_scales[32];
+
+        if (tid == 0)
         {
-            float lse = lse_partial[(batch_idx * n_heads + head_idx) * num_splits + s];
-            lse_max = fmaxf(lse_max, lse);
-        }
-
-        // Combine outputs with LSE correction
-        float l_combined = 0.0f;
-        float O_combined[128] = {0}; // Max head_dim
-
-        for (int s = 0; s < num_splits; s++)
-        {
-            float lse = lse_partial[(batch_idx * n_heads + head_idx) * num_splits + s];
-            if (lse > -FLT_MAX / 2)
-            { // Valid split
-                float scale = expf(lse - lse_max);
-                l_combined += scale;
-
-                const float *O_s = O_partial + ((batch_idx * n_heads + head_idx) * num_splits + s) * head_dim;
-                for (int d = tid; d < head_dim; d += blockDim.x)
-                {
-                    O_combined[d] += scale * O_s[d];
-                }
+            float m_max = -FLT_MAX;
+            for (int s = 0; s < num_splits; s++)
+            {
+                m_max = fmaxf(m_max, m_partial[base_idx + s]);
             }
-        }
+            global_m = m_max;
 
-        // Normalize and write output
-        float inv_l = (l_combined > 0.0f) ? (1.0f / l_combined) : 0.0f;
+            float l_sum = 0.0f;
+            for (int s = 0; s < num_splits; s++)
+            {
+                float scale = expf(m_partial[base_idx + s] - m_max);
+                split_scales[s] = scale;
+                l_sum += scale * l_partial[base_idx + s];
+            }
+            global_l = l_sum;
+        }
+        __syncthreads();
+
+        float inv_l = (global_l > 0.0f) ? (1.0f / global_l) : 0.0f;
         float *O_out = O + (batch_idx * n_heads + head_idx) * head_dim;
 
         for (int d = tid; d < head_dim; d += blockDim.x)
         {
-            O_out[d] = O_combined[d] * inv_l;
+            float O_sum = 0.0f;
+            for (int s = 0; s < num_splits; s++)
+            {
+                const float *O_s = O_partial + (base_idx + s) * head_dim;
+                O_sum += split_scales[s] * O_s[d];
+            }
+            O_out[d] = O_sum * inv_l;
         }
     }
 
@@ -616,9 +802,15 @@ namespace
 extern "C"
 {
     /**
-     * @brief Launch Flash Attention 2 prefill kernel (FP32)
+     * @brief Launch Flash Attention 3 pipelined kernel (SM >= 8.0)
+     *
+     * Dispatches to different kernel variants based on head_dim:
+     *   - head_dim <= 64:  6 consumer warps, tile_q=96, 256 threads
+     *   - head_dim <= 128: 4 consumer warps, tile_q=64, 192 threads
+     *
+     * Returns -1 on invalid input, -2 if GPU doesn't support SM 8.0.
      */
-    int cudaFlashAttn_prefill_fp32(
+    int cudaFlashAttn_prefill_fa3(
         const float *Q, const float *K, const float *V, float *O,
         int batch_size, int seq_len, int kv_len,
         int n_heads, int n_kv_heads, int head_dim,
@@ -629,40 +821,81 @@ extern "C"
 
         float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
-        // Compute adaptive tile sizes based on head_dim to fit shared memory
-        const int tile_q = computeTileQ(head_dim);
-        const int tile_kv = computeTileKV(head_dim);
+        // Get cached device config
+        int device;
+        cudaGetDevice(&device);
+        const FA3DeviceConfig &dev_cfg = getFA3DeviceConfig(device);
+
+        if (dev_cfg.sm_major < 8)
+        {
+            printf("[cudaFlashAttn_prefill_fa3] Error: SM %d.%d not supported, requires SM >= 8.0\n",
+                   dev_cfg.sm_major, dev_cfg.sm_minor);
+            return -2;
+        }
+
+        // Input validation
+        if (head_dim <= 0)
+        {
+            printf("[cudaFlashAttn_prefill_fa3] Error: head_dim=%d must be positive\n", head_dim);
+            return -1;
+        }
+        if (head_dim % 16 != 0)
+        {
+            printf("[cudaFlashAttn_prefill_fa3] Error: head_dim=%d must be multiple of 16 for WMMA\n", head_dim);
+            return -1;
+        }
+        if (head_dim > 256)
+        {
+            printf("[cudaFlashAttn_prefill_fa3] Error: head_dim=%d exceeds maximum supported (256)\n", head_dim);
+            return -1;
+        }
+
+        // Compute kernel configuration based on head_dim
+        FA3KernelConfig cfg = computeFA3Config(head_dim, dev_cfg.max_smem_optin);
 
         // Grid: (n_heads, num_q_tiles, batch_size)
-        int num_q_tiles = (seq_len + tile_q - 1) / tile_q;
+        int num_q_tiles = (seq_len + cfg.tile_q - 1) / cfg.tile_q;
         dim3 grid(n_heads, num_q_tiles, batch_size);
 
-        // Block: enough threads for tile_q rows
-        int block_size = tile_q; // One thread per Q row in tile
-        block_size = max(block_size, 64);
-        block_size = min(block_size, 256);
+        cudaError_t err;
 
-        // Shared memory: Q_tile + K_tile + V_tile + scores
-        size_t smem_size = (tile_q * head_dim + tile_kv * head_dim + tile_kv * head_dim + tile_q * tile_kv) * sizeof(float);
+        // Dispatch to correct kernel variant based on consumer warp count
+        if (cfg.num_consumer_warps == 6)
+        {
+            cudaFuncSetAttribute(flash_attention_3_pipelined_kernel<6>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 cfg.smem_size);
 
-        // Configure shared memory carveout for larger shared memory
-        // RTX 3090 supports up to 100KB per SM, but default is 48KB
-        cudaFuncSetAttribute(flash_attention_2_fp32_kernel,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             smem_size);
+            flash_attention_3_pipelined_kernel<6><<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(
+                Q, K, V, O,
+                batch_size, seq_len, kv_len,
+                n_heads, n_kv_heads, head_dim,
+                softmax_scale, causal, window_size, position_offset,
+                cfg.tile_q, cfg.tile_kv);
+        }
+        else
+        {
+            // 4 consumer warps for head_dim=128
+            cudaFuncSetAttribute(flash_attention_3_pipelined_kernel<4>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 cfg.smem_size);
 
-        flash_attention_2_fp32_kernel<<<grid, block_size, smem_size, cuda_stream>>>(
-            Q, K, V, O,
-            batch_size, seq_len, kv_len,
-            n_heads, n_kv_heads, head_dim,
-            softmax_scale, causal, window_size, position_offset,
-            tile_q, tile_kv); // Pass tile sizes to kernel
+            flash_attention_3_pipelined_kernel<4><<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(
+                Q, K, V, O,
+                batch_size, seq_len, kv_len,
+                n_heads, n_kv_heads, head_dim,
+                softmax_scale, causal, window_size, position_offset,
+                cfg.tile_q, cfg.tile_kv);
+        }
 
-        cudaError_t err = cudaGetLastError();
+        err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            printf("[cudaFlashAttn_prefill_fp32] CUDA error: %s (smem=%zu bytes, grid=(%d,%d,%d), block=%d)\n",
-                   cudaGetErrorString(err), smem_size, grid.x, grid.y, grid.z, block_size);
+            printf("[cudaFlashAttn_prefill_fa3] CUDA error: %s (smem=%zu bytes, tile_q=%d, tile_kv=%d, head_dim=%d, "
+                   "consumer_warps=%d, max_smem=%d, grid=(%d,%d,%d), block=%d)\n",
+                   cudaGetErrorString(err), cfg.smem_size, cfg.tile_q, cfg.tile_kv, head_dim,
+                   cfg.num_consumer_warps, dev_cfg.max_smem_optin,
+                   grid.x, grid.y, grid.z, cfg.block_size);
             return -1;
         }
         return 0;
@@ -670,10 +903,15 @@ extern "C"
 
     /**
      * @brief Launch Flash Decoding kernel (FP32)
+     *
+     * Workspace layout:
+     * - O_partial: [batch, heads, splits, head_dim] - unnormalized weighted sums
+     * - m_partial: [batch, heads, splits] - max scores
+     * - l_partial: [batch, heads, splits] - sum of exp(score - m)
      */
     int cudaFlashAttn_decode_fp32(
         const float *Q, const float *K_cache, const float *V_cache, float *O,
-        float *O_partial, float *lse_partial,
+        float *O_partial, float *m_partial, float *l_partial,
         int batch_size, int kv_len,
         int n_heads, int n_kv_heads, int head_dim,
         int num_splits,
@@ -692,7 +930,7 @@ extern "C"
 
             flash_decoding_fp32_kernel<<<grid, block_size, smem_size, cuda_stream>>>(
                 Q, K_cache, V_cache,
-                O_partial, lse_partial,
+                O_partial, m_partial, l_partial,
                 kv_len, n_heads, n_kv_heads, head_dim,
                 num_splits, softmax_scale);
         }
@@ -703,7 +941,7 @@ extern "C"
             int block_size = min(head_dim, 256);
 
             flash_decoding_reduce_fp32_kernel<<<grid, block_size, 0, cuda_stream>>>(
-                O_partial, lse_partial, O,
+                O_partial, m_partial, l_partial, O,
                 n_heads, head_dim, num_splits);
         }
 
@@ -714,23 +952,27 @@ extern "C"
      * @brief Allocate workspace for Flash Decoding
      */
     int cudaFlashAttn_allocWorkspace(
-        void **partial_output, void **partial_lse,
+        void **partial_output, void **partial_m, void **partial_l,
         int batch_size, int n_heads, int head_dim, int num_splits)
     {
         size_t output_size = static_cast<size_t>(batch_size) * n_heads * num_splits * head_dim * sizeof(float);
-        size_t lse_size = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
+        size_t scalar_size = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
 
         cudaError_t err1 = cudaMalloc(partial_output, output_size);
-        cudaError_t err2 = cudaMalloc(partial_lse, lse_size);
+        cudaError_t err2 = cudaMalloc(partial_m, scalar_size);
+        cudaError_t err3 = cudaMalloc(partial_l, scalar_size);
 
-        if (err1 != cudaSuccess || err2 != cudaSuccess)
+        if (err1 != cudaSuccess || err2 != cudaSuccess || err3 != cudaSuccess)
         {
             if (*partial_output)
                 cudaFree(*partial_output);
-            if (*partial_lse)
-                cudaFree(*partial_lse);
+            if (*partial_m)
+                cudaFree(*partial_m);
+            if (*partial_l)
+                cudaFree(*partial_l);
             *partial_output = nullptr;
-            *partial_lse = nullptr;
+            *partial_m = nullptr;
+            *partial_l = nullptr;
             return -1;
         }
 
@@ -740,12 +982,14 @@ extern "C"
     /**
      * @brief Free workspace
      */
-    void cudaFlashAttn_freeWorkspace(void *partial_output, void *partial_lse)
+    void cudaFlashAttn_freeWorkspace(void *partial_output, void *partial_m, void *partial_l)
     {
         if (partial_output)
             cudaFree(partial_output);
-        if (partial_lse)
-            cudaFree(partial_lse);
+        if (partial_m)
+            cudaFree(partial_m);
+        if (partial_l)
+            cudaFree(partial_l);
     }
 
     /**

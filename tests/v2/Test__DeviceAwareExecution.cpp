@@ -56,9 +56,9 @@ TEST(Test__DeviceAwareExecution, DeviceTransferCorrectness_CPU)
             << "Data mismatch at index " << i << " after transfer";
     }
 
-    // Verify device indices
-    EXPECT_EQ(tensor_src->home_dm_device_index(), -1) << "Source tensor should remain on CPU";
-    EXPECT_EQ(tensor_dst->home_dm_device_index(), -1) << "Dest tensor should be on CPU";
+    // Verify device placement
+    EXPECT_TRUE(tensor_src->home_device().is_cpu()) << "Source tensor should remain on CPU";
+    EXPECT_TRUE(tensor_dst->home_device().is_cpu()) << "Dest tensor should be on CPU";
 }
 
 /**
@@ -90,7 +90,7 @@ TEST(Test__DeviceAwareExecution, WeightPlacementMapInterface)
 TEST(Test__DeviceAwareExecution, DeviceIndexTracking)
 {
     auto cpu_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 4}, -1);
-    EXPECT_EQ(cpu_tensor->home_dm_device_index(), -1) << "CPU tensor should have device_idx = -1";
+    EXPECT_TRUE(cpu_tensor->home_device().is_cpu()) << "CPU tensor should be on CPU device";
 
     // Note: set_device() is not fully implemented yet (GPU backends are stubs)
     // This test just documents the interface

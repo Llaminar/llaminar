@@ -11,7 +11,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "tensors/CPUKVCache.h"
+#include "kernels/cpu/CPUKVCache.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 #include "utils/MPIContext.h"
@@ -65,9 +65,9 @@ protected:
     create_kv_tensors(int seq_len, int kv_dim, int seed = 42)
     {
         auto K = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)}, -1);
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)}, DeviceId::cpu());
         auto V = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)}, -1);
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)}, DeviceId::cpu());
 
         // Fill with deterministic random values
         float *k_data = K->mutable_data();

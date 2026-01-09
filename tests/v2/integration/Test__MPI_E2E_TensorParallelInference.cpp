@@ -50,7 +50,7 @@
 #include "utils/Logger.h"
 #include "utils/DebugEnv.h"
 #include "tensors/TensorFactory.h"
-#include "tensors/CPUKVCache.h"
+#include "kernels/cpu/CPUKVCache.h"
 #include "backends/DeviceId.h"
 
 using namespace llaminar2;

@@ -96,6 +96,115 @@ namespace
         return max_err;
     }
 
+    // ============================================================================
+    // CPU Reference for Decode Attention (single query attending to KV cache)
+    // ============================================================================
+
+    /**
+     * @brief CPU reference implementation for decode attention
+     *
+     * Computes attention for a single query token (seq_len=1) attending to
+     * a KV cache of length kv_len. This is the ground truth for Flash Decoding.
+     *
+     * Layout:
+     *   Q: [n_heads, head_dim]
+     *   K: [kv_len, n_kv_heads, head_dim]
+     *   V: [kv_len, n_kv_heads, head_dim]
+     *   O: [n_heads, head_dim]
+     *
+     * @param causal If true, Q at position (kv_len-1+position_offset) attends to K[0..kv_len-1].
+     *               For standard decode, position_offset=0 means Q can see all of KV cache.
+     */
+    void cpuDecodeAttentionReference(
+        const float *Q,       // [n_heads, head_dim]
+        const float *K,       // [kv_len, n_kv_heads, head_dim]
+        const float *V,       // [kv_len, n_kv_heads, head_dim]
+        float *O,             // [n_heads, head_dim]
+        int kv_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        bool causal,
+        int position_offset)  // Q's logical position = kv_len - 1 + position_offset
+    {
+        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        const int gqa_ratio = n_heads / n_kv_heads;
+
+        // For each query head
+        for (int h = 0; h < n_heads; h++)
+        {
+            const int kv_h = h / gqa_ratio; // GQA: which KV head to use
+
+            const float *Q_head = Q + h * head_dim;
+            float *O_head = O + h * head_dim;
+
+            // Q's logical position for causal masking
+            // In decode, Q is the "next" token, so it's at position (kv_len - 1 + position_offset)
+            // If position_offset = 0, Q is at position kv_len-1 and can attend to all KV[0..kv_len-1]
+            const int q_pos = kv_len - 1 + position_offset;
+
+            // Step 1: Compute attention scores and find max for numerical stability
+            std::vector<float> scores(kv_len);
+            float max_score = -std::numeric_limits<float>::infinity();
+
+            for (int kv_pos = 0; kv_pos < kv_len; kv_pos++)
+            {
+                // Causal mask: Q at q_pos can only attend to K at kv_pos if kv_pos <= q_pos
+                bool masked = causal && (kv_pos > q_pos);
+
+                if (masked)
+                {
+                    scores[kv_pos] = -std::numeric_limits<float>::infinity();
+                }
+                else
+                {
+                    const float *K_vec = K + kv_pos * n_kv_heads * head_dim + kv_h * head_dim;
+                    float dot = 0.0f;
+                    for (int d = 0; d < head_dim; d++)
+                    {
+                        dot += Q_head[d] * K_vec[d];
+                    }
+                    scores[kv_pos] = dot * scale;
+                    max_score = std::max(max_score, scores[kv_pos]);
+                }
+            }
+
+            // Step 2: Compute softmax(scores) and weighted sum of V
+            float sum_exp = 0.0f;
+            for (int kv_pos = 0; kv_pos < kv_len; kv_pos++)
+            {
+                if (scores[kv_pos] > -std::numeric_limits<float>::infinity() / 2)
+                {
+                    scores[kv_pos] = std::exp(scores[kv_pos] - max_score);
+                    sum_exp += scores[kv_pos];
+                }
+                else
+                {
+                    scores[kv_pos] = 0.0f;
+                }
+            }
+
+            // Step 3: Compute output = sum(softmax_scores * V)
+            for (int d = 0; d < head_dim; d++)
+            {
+                O_head[d] = 0.0f;
+            }
+
+            for (int kv_pos = 0; kv_pos < kv_len; kv_pos++)
+            {
+                if (scores[kv_pos] > 0.0f)
+                {
+                    float weight = scores[kv_pos] / sum_exp;
+                    const float *V_vec = V + kv_pos * n_kv_heads * head_dim + kv_h * head_dim;
+                    for (int d = 0; d < head_dim; d++)
+                    {
+                        O_head[d] += weight * V_vec[d];
+                    }
+                }
+            }
+        }
+    }
+
 } // namespace
 
 // ============================================================================
@@ -369,22 +478,21 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Large)
 }
 
 // ============================================================================
-// Flash Decoding Parity Tests
+// Flash Decoding Parity Tests (with CPU reference)
 // ============================================================================
 
-TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Short)
+TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Short_Parity)
 {
     SKIP_IF_NO_CUDA();
 
-    // Short KV cache (falls back to Flash Attention 2 path)
-    constexpr int seq_len = 1; // Decode: single token
-    constexpr int kv_len = 32; // Short KV cache
+    // Short KV cache - tests the fallback path (may use prefill kernel)
+    constexpr int kv_len = 32;
     constexpr int n_heads = 14;
-    constexpr int n_kv_heads = 2;
+    constexpr int n_kv_heads = 2; // GQA
     constexpr int head_dim = 64;
-    const size_t q_size = seq_len * n_heads * head_dim;
+    const size_t q_size = n_heads * head_dim;           // [n_heads, head_dim]
     const size_t kv_size = kv_len * n_kv_heads * head_dim;
-    const size_t out_size = seq_len * n_heads * head_dim;
+    const size_t out_size = n_heads * head_dim;
 
     auto Q_data = randomFP32(q_size);
     auto K_data = randomFP32(kv_size);
@@ -392,17 +500,14 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Short)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    // For CPU, we use compute() with seq_len=1
-    // The K/V tensors have kv_len > seq_len to simulate KV cache
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    // CPU reference: decode attention (Q attends to full KV cache)
+    cpuDecodeAttentionReference(
+        Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
+        kv_len, n_heads, n_kv_heads, head_dim,
+        true,  // causal
+        0);    // position_offset = 0 means Q is at position kv_len-1
 
-    // Note: CPU kernel compute() expects K/V to have same seq_len as Q
-    // For decode with KV cache, we need to use a different approach
-    // For now, test with matching lengths
-    auto K_padded = randomFP32(kv_len * n_kv_heads * head_dim);
-    auto V_padded = randomFP32(kv_len * n_kv_heads * head_dim);
-
-    // Use the CUDA decode method directly
+    // CUDA decode
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
 
     float *d_Q, *d_K, *d_V, *d_output;
@@ -418,10 +523,11 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Short)
 
     bool cuda_success = cuda_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
-        seq_len, kv_len, n_heads, n_kv_heads, head_dim,
-        true, // causal
-        0     // position_offset
-    );
+        1,       // seq_len = 1 (single query token)
+        kv_len,
+        n_heads, n_kv_heads, head_dim,
+        true,    // causal
+        0);      // position_offset
     cudaDeviceSynchronize();
 
     ASSERT_TRUE(cuda_success) << "CUDA Flash Decoding failed";
@@ -433,43 +539,46 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Short)
     cudaFree(d_V);
     cudaFree(d_output);
 
-    // For this test, we just check that output is valid (no NaN/Inf) and non-zero
+    // Validate
     ASSERT_FALSE(hasNaNOrInf(cuda_output.data(), out_size)) << "CUDA output contains NaN/Inf";
+    ASSERT_FALSE(hasNaNOrInf(cpu_output.data(), out_size)) << "CPU output contains NaN/Inf";
 
-    // Verify output is not all zeros
-    bool has_nonzero = false;
-    for (size_t i = 0; i < out_size; ++i)
-    {
-        if (std::abs(cuda_output[i]) > 1e-6f)
-        {
-            has_nonzero = true;
-            break;
-        }
-    }
-    EXPECT_TRUE(has_nonzero) << "Output is all zeros";
+    double cosine = cosineSimilarity(cuda_output.data(), cpu_output.data(), out_size);
+    double l2_error = relativeL2Error(cuda_output.data(), cpu_output.data(), out_size);
+    double max_error = maxAbsError(cuda_output.data(), cpu_output.data(), out_size);
 
-    std::cout << "  FlashDecode FP32 Short: output valid, non-zero" << std::endl;
+    printComparisonStats("FlashDecode FP32 Short Parity", cosine, l2_error, max_error, out_size);
+
+    EXPECT_GE(cosine, 0.99) << "Cosine similarity too low - decode kernel may be incorrect";
+    EXPECT_LE(l2_error, 0.05) << "L2 error too high";
 }
 
-TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Long)
+TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Long_Parity)
 {
     SKIP_IF_NO_CUDA();
 
-    // Longer KV cache (uses Flash Decoding split-K)
-    constexpr int seq_len = 1;
-    constexpr int kv_len = 512; // Long KV cache
+    // Longer KV cache - this exercises the split-K Flash Decoding path
+    constexpr int kv_len = 512;
     constexpr int n_heads = 14;
     constexpr int n_kv_heads = 2;
     constexpr int head_dim = 64;
-    const size_t q_size = seq_len * n_heads * head_dim;
+    const size_t q_size = n_heads * head_dim;
     const size_t kv_size = kv_len * n_kv_heads * head_dim;
-    const size_t out_size = seq_len * n_heads * head_dim;
+    const size_t out_size = n_heads * head_dim;
 
     auto Q_data = randomFP32(q_size);
     auto K_data = randomFP32(kv_size);
     auto V_data = randomFP32(kv_size);
+    std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
+    // CPU reference
+    cpuDecodeAttentionReference(
+        Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
+        kv_len, n_heads, n_kv_heads, head_dim,
+        true, 0);
+
+    // CUDA decode
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
 
     float *d_Q, *d_K, *d_V, *d_output;
@@ -485,7 +594,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Long)
 
     bool cuda_success = cuda_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
-        seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+        1, kv_len, n_heads, n_kv_heads, head_dim,
         true, 0);
     cudaDeviceSynchronize();
 
@@ -500,18 +609,275 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Long)
 
     ASSERT_FALSE(hasNaNOrInf(cuda_output.data(), out_size));
 
-    bool has_nonzero = false;
-    for (size_t i = 0; i < out_size; ++i)
-    {
-        if (std::abs(cuda_output[i]) > 1e-6f)
-        {
-            has_nonzero = true;
-            break;
-        }
-    }
-    EXPECT_TRUE(has_nonzero);
+    double cosine = cosineSimilarity(cuda_output.data(), cpu_output.data(), out_size);
+    double l2_error = relativeL2Error(cuda_output.data(), cpu_output.data(), out_size);
+    double max_error = maxAbsError(cuda_output.data(), cpu_output.data(), out_size);
 
-    std::cout << "  FlashDecode FP32 Long: output valid, non-zero" << std::endl;
+    printComparisonStats("FlashDecode FP32 Long Parity (split-K)", cosine, l2_error, max_error, out_size);
+
+    EXPECT_GE(cosine, 0.99) << "Cosine similarity too low - split-K reduction may be incorrect";
+    EXPECT_LE(l2_error, 0.05) << "L2 error too high";
+}
+
+TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_VeryLong_Parity)
+{
+    SKIP_IF_NO_CUDA();
+
+    // Very long KV cache - stress test for split-K with many splits
+    constexpr int kv_len = 2048;
+    constexpr int n_heads = 14;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    const size_t q_size = n_heads * head_dim;
+    const size_t kv_size = kv_len * n_kv_heads * head_dim;
+    const size_t out_size = n_heads * head_dim;
+
+    auto Q_data = randomFP32(q_size);
+    auto K_data = randomFP32(kv_size);
+    auto V_data = randomFP32(kv_size);
+    std::vector<float> cpu_output(out_size, 0.0f);
+    std::vector<float> cuda_output(out_size, 0.0f);
+
+    // CPU reference
+    cpuDecodeAttentionReference(
+        Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
+        kv_len, n_heads, n_kv_heads, head_dim,
+        true, 0);
+
+    // CUDA decode
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+
+    float *d_Q, *d_K, *d_V, *d_output;
+    cudaMalloc(&d_Q, q_size * sizeof(float));
+    cudaMalloc(&d_K, kv_size * sizeof(float));
+    cudaMalloc(&d_V, kv_size * sizeof(float));
+    cudaMalloc(&d_output, out_size * sizeof(float));
+
+    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(d_output, 0, out_size * sizeof(float));
+
+    bool cuda_success = cuda_kernel.compute_decode(
+        d_Q, d_K, d_V, d_output,
+        1, kv_len, n_heads, n_kv_heads, head_dim,
+        true, 0);
+    cudaDeviceSynchronize();
+
+    ASSERT_TRUE(cuda_success);
+
+    cudaMemcpy(cuda_output.data(), d_output, out_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_Q);
+    cudaFree(d_K);
+    cudaFree(d_V);
+    cudaFree(d_output);
+
+    ASSERT_FALSE(hasNaNOrInf(cuda_output.data(), out_size));
+
+    double cosine = cosineSimilarity(cuda_output.data(), cpu_output.data(), out_size);
+    double l2_error = relativeL2Error(cuda_output.data(), cpu_output.data(), out_size);
+    double max_error = maxAbsError(cuda_output.data(), cpu_output.data(), out_size);
+
+    printComparisonStats("FlashDecode FP32 VeryLong Parity (kv=2048)", cosine, l2_error, max_error, out_size);
+
+    EXPECT_GE(cosine, 0.99) << "Cosine similarity too low";
+    EXPECT_LE(l2_error, 0.05) << "L2 error too high";
+}
+
+TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_MHA_Parity)
+{
+    SKIP_IF_NO_CUDA();
+
+    // Multi-head attention (not GQA) - n_heads == n_kv_heads
+    constexpr int kv_len = 256;
+    constexpr int n_heads = 8;
+    constexpr int n_kv_heads = 8; // MHA
+    constexpr int head_dim = 64;
+    const size_t q_size = n_heads * head_dim;
+    const size_t kv_size = kv_len * n_kv_heads * head_dim;
+    const size_t out_size = n_heads * head_dim;
+
+    auto Q_data = randomFP32(q_size);
+    auto K_data = randomFP32(kv_size);
+    auto V_data = randomFP32(kv_size);
+    std::vector<float> cpu_output(out_size, 0.0f);
+    std::vector<float> cuda_output(out_size, 0.0f);
+
+    cpuDecodeAttentionReference(
+        Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
+        kv_len, n_heads, n_kv_heads, head_dim,
+        true, 0);
+
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+
+    float *d_Q, *d_K, *d_V, *d_output;
+    cudaMalloc(&d_Q, q_size * sizeof(float));
+    cudaMalloc(&d_K, kv_size * sizeof(float));
+    cudaMalloc(&d_V, kv_size * sizeof(float));
+    cudaMalloc(&d_output, out_size * sizeof(float));
+
+    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(d_output, 0, out_size * sizeof(float));
+
+    bool cuda_success = cuda_kernel.compute_decode(
+        d_Q, d_K, d_V, d_output,
+        1, kv_len, n_heads, n_kv_heads, head_dim,
+        true, 0);
+    cudaDeviceSynchronize();
+
+    ASSERT_TRUE(cuda_success);
+
+    cudaMemcpy(cuda_output.data(), d_output, out_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_Q);
+    cudaFree(d_K);
+    cudaFree(d_V);
+    cudaFree(d_output);
+
+    ASSERT_FALSE(hasNaNOrInf(cuda_output.data(), out_size));
+
+    double cosine = cosineSimilarity(cuda_output.data(), cpu_output.data(), out_size);
+    double l2_error = relativeL2Error(cuda_output.data(), cpu_output.data(), out_size);
+    double max_error = maxAbsError(cuda_output.data(), cpu_output.data(), out_size);
+
+    printComparisonStats("FlashDecode FP32 MHA Parity", cosine, l2_error, max_error, out_size);
+
+    EXPECT_GE(cosine, 0.99);
+    EXPECT_LE(l2_error, 0.05);
+}
+
+TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_HeadDim128_Parity)
+{
+    SKIP_IF_NO_CUDA();
+
+    // Llama-style head_dim=128
+    constexpr int kv_len = 256;
+    constexpr int n_heads = 8;
+    constexpr int n_kv_heads = 8;
+    constexpr int head_dim = 128;
+    const size_t q_size = n_heads * head_dim;
+    const size_t kv_size = kv_len * n_kv_heads * head_dim;
+    const size_t out_size = n_heads * head_dim;
+
+    auto Q_data = randomFP32(q_size);
+    auto K_data = randomFP32(kv_size);
+    auto V_data = randomFP32(kv_size);
+    std::vector<float> cpu_output(out_size, 0.0f);
+    std::vector<float> cuda_output(out_size, 0.0f);
+
+    cpuDecodeAttentionReference(
+        Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
+        kv_len, n_heads, n_kv_heads, head_dim,
+        true, 0);
+
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+
+    float *d_Q, *d_K, *d_V, *d_output;
+    cudaMalloc(&d_Q, q_size * sizeof(float));
+    cudaMalloc(&d_K, kv_size * sizeof(float));
+    cudaMalloc(&d_V, kv_size * sizeof(float));
+    cudaMalloc(&d_output, out_size * sizeof(float));
+
+    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(d_output, 0, out_size * sizeof(float));
+
+    bool cuda_success = cuda_kernel.compute_decode(
+        d_Q, d_K, d_V, d_output,
+        1, kv_len, n_heads, n_kv_heads, head_dim,
+        true, 0);
+    cudaDeviceSynchronize();
+
+    ASSERT_TRUE(cuda_success);
+
+    cudaMemcpy(cuda_output.data(), d_output, out_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_Q);
+    cudaFree(d_K);
+    cudaFree(d_V);
+    cudaFree(d_output);
+
+    ASSERT_FALSE(hasNaNOrInf(cuda_output.data(), out_size));
+
+    double cosine = cosineSimilarity(cuda_output.data(), cpu_output.data(), out_size);
+    double l2_error = relativeL2Error(cuda_output.data(), cpu_output.data(), out_size);
+    double max_error = maxAbsError(cuda_output.data(), cpu_output.data(), out_size);
+
+    printComparisonStats("FlashDecode FP32 HeadDim128 Parity", cosine, l2_error, max_error, out_size);
+
+    EXPECT_GE(cosine, 0.99);
+    EXPECT_LE(l2_error, 0.05);
+}
+
+TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_NonCausal_Parity)
+{
+    SKIP_IF_NO_CUDA();
+
+    // Non-causal decode (bidirectional attention)
+    constexpr int kv_len = 128;
+    constexpr int n_heads = 8;
+    constexpr int n_kv_heads = 8;
+    constexpr int head_dim = 64;
+    const size_t q_size = n_heads * head_dim;
+    const size_t kv_size = kv_len * n_kv_heads * head_dim;
+    const size_t out_size = n_heads * head_dim;
+
+    auto Q_data = randomFP32(q_size);
+    auto K_data = randomFP32(kv_size);
+    auto V_data = randomFP32(kv_size);
+    std::vector<float> cpu_output(out_size, 0.0f);
+    std::vector<float> cuda_output(out_size, 0.0f);
+
+    cpuDecodeAttentionReference(
+        Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
+        kv_len, n_heads, n_kv_heads, head_dim,
+        false,  // non-causal
+        0);
+
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+
+    float *d_Q, *d_K, *d_V, *d_output;
+    cudaMalloc(&d_Q, q_size * sizeof(float));
+    cudaMalloc(&d_K, kv_size * sizeof(float));
+    cudaMalloc(&d_V, kv_size * sizeof(float));
+    cudaMalloc(&d_output, out_size * sizeof(float));
+
+    cudaMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K, K_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V, V_data.data(), kv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(d_output, 0, out_size * sizeof(float));
+
+    // Note: compute_decode may not support non-causal, but let's test it
+    bool cuda_success = cuda_kernel.compute_decode(
+        d_Q, d_K, d_V, d_output,
+        1, kv_len, n_heads, n_kv_heads, head_dim,
+        false,  // non-causal
+        0);
+    cudaDeviceSynchronize();
+
+    ASSERT_TRUE(cuda_success);
+
+    cudaMemcpy(cuda_output.data(), d_output, out_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_Q);
+    cudaFree(d_K);
+    cudaFree(d_V);
+    cudaFree(d_output);
+
+    ASSERT_FALSE(hasNaNOrInf(cuda_output.data(), out_size));
+
+    double cosine = cosineSimilarity(cuda_output.data(), cpu_output.data(), out_size);
+    double l2_error = relativeL2Error(cuda_output.data(), cpu_output.data(), out_size);
+    double max_error = maxAbsError(cuda_output.data(), cpu_output.data(), out_size);
+
+    printComparisonStats("FlashDecode FP32 NonCausal Parity", cosine, l2_error, max_error, out_size);
+
+    EXPECT_GE(cosine, 0.99);
+    EXPECT_LE(l2_error, 0.05);
 }
 
 // ============================================================================

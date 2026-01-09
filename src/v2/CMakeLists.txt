@@ -207,6 +207,7 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDAResidualAddKernels.cu    # Residual Add kernels (FP32, BF16, FP16)
         kernels/cuda/ops/CUDASwiGLUKernels.cu         # SwiGLU kernels (FP32, BF16, FP16)
         kernels/cuda/ops/CUDARoPEKernels.cu           # RoPE kernels (FP32, BF16, FP16)
+        kernels/cuda/ops/CUDAEmbeddingKernels.cu      # Embedding lookup kernel
         kernels/cuda/attention/CUDAFlashAttentionKernels.cu  # Flash Attention 2 and Flash Decoding kernels
         kernels/cuda/CUDARingKVCache.cu               # Ring buffer KV cache with O(1) eviction
     )
@@ -631,7 +632,8 @@ add_library(llaminar2_core STATIC
     tensors/cpu/IQ3_STensor.cpp
     tensors/cpu/IQ1_STensor.cpp
     tensors/cpu/IQ1_MTensor.cpp
-    tensors/cpu/CPUKVCache.cpp
+    # KV Cache implementation (moved from tensors/cpu/)
+    kernels/cpu/CPUKVCache.cpp
     # Vectorized primitives (ported from V1)
     kernels/cpu/primitives/RoPEPrimitives.cpp
     kernels/cpu/primitives/RMSNormPrimitives.cpp
@@ -770,7 +772,7 @@ if(HAVE_CUDA)
     target_sources(llaminar2_core PRIVATE
         kernels/cuda/CUDAFloatingPointGemmKernel.cpp
         kernels/cuda/CUDAQuantisedGemmKernel.cpp
-        kernels/cuda/ops/CUDAOpsKernels.cpp           # RMSNorm, SwiGLU, RoPE ITensor implementations
+        kernels/cuda/ops/CUDAOpsKernels.cpp           # RMSNorm, SwiGLU, RoPE, Embedding ITensor implementations
         kernels/cuda/attention/CUDAFlashAttentionKernelT.cpp  # Flash Attention ITensor implementation
     )
     
@@ -870,14 +872,6 @@ endif()
 # Main executable
 add_executable(llaminar2 Main.cpp)
 target_link_libraries(llaminar2 llaminar2_core)
-
-# Profiling executable (for ncu profiling data collection)
-if(HAVE_CUDA)
-    add_executable(profile_cuda_config kernels/cuda/ProfileSingleConfig.cu)
-    target_link_libraries(profile_cuda_config cuda_backend CUDA::cudart)
-    target_include_directories(profile_cuda_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    message(STATUS "V2: Added profile_cuda_config executable for profiling data collection")
-endif()
 
 # Enable testing for V2
 enable_testing()

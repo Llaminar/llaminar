@@ -325,11 +325,6 @@ namespace llaminar2
 
     Q2_KTensor::~Q2_KTensor() {}
 
-    bool Q2_KTensor::set_device(int device_idx)
-    {
-        device_ = DeviceId::fromLegacyIndex(device_idx);
-        return true;
-    }
 
     const float *Q2_KTensor::data() const
     {

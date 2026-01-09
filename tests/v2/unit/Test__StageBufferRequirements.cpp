@@ -26,7 +26,7 @@ protected:
     std::unique_ptr<FP32Tensor> createFP32Tensor(size_t rows, size_t cols)
     {
         return std::make_unique<FP32Tensor>(
-            std::vector<size_t>{rows, cols}, -1 // CPU device
+            std::vector<size_t>{rows, cols}, DeviceId::cpu() // CPU device
         );
     }
 
@@ -34,7 +34,7 @@ protected:
     std::unique_ptr<Q8_1Tensor> createQ8_1Tensor(size_t rows, size_t cols)
     {
         return std::make_unique<Q8_1Tensor>(
-            std::vector<size_t>{rows, cols}, -1 // CPU device
+            std::vector<size_t>{rows, cols}, DeviceId::cpu() // CPU device
         );
     }
 

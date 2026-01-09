@@ -14,7 +14,7 @@
 #include "../utils/DebugEnv.h"
 #include "../utils/MPIContext.h"
 #include "../tensors/TensorFactory.h"
-#include "../tensors/CPUKVCache.h"
+#include "../kernels/cpu/CPUKVCache.h"
 #include <chrono>
 
 namespace llaminar2
@@ -129,9 +129,7 @@ namespace llaminar2
 
     IDeviceContext *GraphOrchestrator::getDeviceContext(DeviceId device)
     {
-        // Use legacy index as map key (device_contexts_ uses int keys)
-        int device_key = device.toLegacyIndex();
-        auto it = device_contexts_.find(device_key);
+        auto it = device_contexts_.find(device);
         if (it != device_contexts_.end())
         {
             return it->second.get();
@@ -146,7 +144,7 @@ namespace llaminar2
         }
 
         IDeviceContext *raw_ptr = ctx.get();
-        device_contexts_[device_key] = std::move(ctx);
+        device_contexts_[device] = std::move(ctx);
 
         LOG_DEBUG("[GraphOrchestrator] Created device context for device " << device.to_string());
         return raw_ptr;

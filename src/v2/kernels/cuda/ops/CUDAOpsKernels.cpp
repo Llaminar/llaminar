@@ -13,7 +13,9 @@
 #include "CUDARMSNormKernelT.h"
 #include "CUDASwiGLUKernelT.h"
 #include "CUDARoPEKernelT.h"
+#include "CUDAEmbeddingKernelT.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../backends/DeviceId.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -59,6 +61,15 @@ extern "C"
         uint16_t *Q, uint16_t *K, const int *position_ids,
         int seq_len, int n_heads, int n_kv_heads, int head_dim,
         float rope_theta, int device_idx);
+
+    // Embedding lookup
+    cudaError_t launch_embedding_lookup(
+        const float *embed_data,
+        const int *token_ids,
+        float *output,
+        int num_tokens,
+        int d_model,
+        cudaStream_t stream);
 }
 
 namespace llaminar2
@@ -100,8 +111,51 @@ namespace llaminar2
                 return false;
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            return apply_typed(input->data(), weight->data(), output->mutable_data(),
-                               rows, cols, epsilon, dev);
+
+            // Cast to FP32Tensor for GPU operations
+            auto *input_fp32 = const_cast<FP32Tensor *>(dynamic_cast<const FP32Tensor *>(input));
+            auto *weight_fp32 = const_cast<FP32Tensor *>(dynamic_cast<const FP32Tensor *>(weight));
+            auto *output_fp32 = dynamic_cast<FP32Tensor *>(output);
+
+            if (!input_fp32 || !weight_fp32 || !output_fp32)
+                return false;
+
+            // Construct target device
+            DeviceId target_device(DeviceType::CUDA, dev);
+
+            // Ensure input data is on GPU
+            if (!input_fp32->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDARMSNormKernel] Failed to upload input to GPU\n");
+                return false;
+            }
+
+            // Ensure weight data is on GPU
+            if (!weight_fp32->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDARMSNormKernel] Failed to upload weight to GPU\n");
+                return false;
+            }
+
+            // Ensure output buffer is on GPU
+            if (!output_fp32->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDARMSNormKernel] Failed to ensure output on GPU\n");
+                return false;
+            }
+
+            // Get device pointers
+            const float *d_input = static_cast<const float *>(input_fp32->gpu_data_ptr());
+            const float *d_weight = static_cast<const float *>(weight_fp32->gpu_data_ptr());
+            float *d_output = static_cast<float *>(output_fp32->gpu_data_ptr());
+
+            bool ok = cudaOps_rmsnorm_fp32(d_input, d_weight, d_output, rows, cols, epsilon, dev);
+            if (ok)
+            {
+                cudaDeviceSynchronize();
+                output_fp32->mark_device_dirty();
+            }
+            return ok;
         }
 
         bool CUDARMSNormKernelT<ActivationPrecision::FP32>::apply_typed(
@@ -146,14 +200,46 @@ namespace llaminar2
             if (input->native_type() != TensorType::BF16 || output->native_type() != TensorType::BF16)
                 return false;
 
-            auto *in_bf16 = dynamic_cast<const BF16Tensor *>(input);
+            auto *in_bf16 = const_cast<BF16Tensor *>(dynamic_cast<const BF16Tensor *>(input));
+            auto *weight_fp32 = const_cast<FP32Tensor *>(dynamic_cast<const FP32Tensor *>(weight));
             auto *out_bf16 = dynamic_cast<BF16Tensor *>(output);
             if (!in_bf16 || !out_bf16)
                 return false;
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            return apply_typed(in_bf16->typed_data(), weight->data(), out_bf16->mutable_typed_data(),
-                               rows, cols, epsilon, dev);
+
+            // Construct target device
+            DeviceId target_device(DeviceType::CUDA, dev);
+
+            // Ensure data is on GPU
+            if (!in_bf16->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDARMSNormKernel BF16] Failed to upload input to GPU\n");
+                return false;
+            }
+            if (weight_fp32 && !weight_fp32->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDARMSNormKernel BF16] Failed to upload weight to GPU\n");
+                return false;
+            }
+            if (!out_bf16->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDARMSNormKernel BF16] Failed to ensure output on GPU\n");
+                return false;
+            }
+
+            // Get device pointers
+            const uint16_t *d_input = static_cast<const uint16_t *>(in_bf16->gpu_data_ptr());
+            const float *d_weight = weight_fp32 ? static_cast<const float *>(weight_fp32->gpu_data_ptr()) : weight->data();
+            uint16_t *d_output = static_cast<uint16_t *>(out_bf16->gpu_data_ptr());
+
+            bool ok = cudaOps_rmsnorm_bf16(d_input, d_weight, d_output, rows, cols, epsilon, dev);
+            if (ok)
+            {
+                cudaDeviceSynchronize();
+                out_bf16->mark_device_dirty();
+            }
+            return ok;
         }
 
         bool CUDARMSNormKernelT<ActivationPrecision::BF16>::apply_typed(
@@ -198,14 +284,46 @@ namespace llaminar2
             if (input->native_type() != TensorType::FP16 || output->native_type() != TensorType::FP16)
                 return false;
 
-            auto *in_fp16 = dynamic_cast<const FP16Tensor *>(input);
+            auto *in_fp16 = const_cast<FP16Tensor *>(dynamic_cast<const FP16Tensor *>(input));
+            auto *weight_fp32 = const_cast<FP32Tensor *>(dynamic_cast<const FP32Tensor *>(weight));
             auto *out_fp16 = dynamic_cast<FP16Tensor *>(output);
             if (!in_fp16 || !out_fp16)
                 return false;
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            return apply_typed(in_fp16->typed_data(), weight->data(), out_fp16->mutable_typed_data(),
-                               rows, cols, epsilon, dev);
+
+            // Construct target device
+            DeviceId target_device(DeviceType::CUDA, dev);
+
+            // Ensure data is on GPU
+            if (!in_fp16->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDARMSNormKernel FP16] Failed to upload input to GPU\n");
+                return false;
+            }
+            if (weight_fp32 && !weight_fp32->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDARMSNormKernel FP16] Failed to upload weight to GPU\n");
+                return false;
+            }
+            if (!out_fp16->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDARMSNormKernel FP16] Failed to ensure output on GPU\n");
+                return false;
+            }
+
+            // Get device pointers
+            const uint16_t *d_input = static_cast<const uint16_t *>(in_fp16->gpu_data_ptr());
+            const float *d_weight = weight_fp32 ? static_cast<const float *>(weight_fp32->gpu_data_ptr()) : weight->data();
+            uint16_t *d_output = static_cast<uint16_t *>(out_fp16->gpu_data_ptr());
+
+            bool ok = cudaOps_rmsnorm_fp16(d_input, d_weight, d_output, rows, cols, epsilon, dev);
+            if (ok)
+            {
+                cudaDeviceSynchronize();
+                out_fp16->mark_device_dirty();
+            }
+            return ok;
         }
 
         bool CUDARMSNormKernelT<ActivationPrecision::FP16>::apply_typed(
@@ -251,7 +369,6 @@ namespace llaminar2
         {
             (void)add_residual;
             (void)mpi_ctx;
-            (void)device_idx;
             if (!gate || !up || !output)
                 return false;
             if (gate->native_type() != TensorType::FP32 ||
@@ -259,8 +376,49 @@ namespace llaminar2
                 output->native_type() != TensorType::FP32)
                 return false;
 
+            int dev = (device_idx >= 0) ? device_idx : device_idx_;
+
+            // Cast to FP32Tensor for GPU operations
+            auto *gate_fp32 = const_cast<FP32Tensor *>(dynamic_cast<const FP32Tensor *>(gate));
+            auto *up_fp32 = const_cast<FP32Tensor *>(dynamic_cast<const FP32Tensor *>(up));
+            auto *output_fp32 = dynamic_cast<FP32Tensor *>(output);
+
+            if (!gate_fp32 || !up_fp32 || !output_fp32)
+                return false;
+
+            // Construct target device
+            DeviceId target_device(DeviceType::CUDA, dev);
+
+            // Ensure data is on GPU
+            if (!gate_fp32->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDASwiGLUKernel] Failed to upload gate to GPU\n");
+                return false;
+            }
+            if (!up_fp32->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDASwiGLUKernel] Failed to upload up to GPU\n");
+                return false;
+            }
+            if (!output_fp32->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDASwiGLUKernel] Failed to ensure output on GPU\n");
+                return false;
+            }
+
+            // Get device pointers
+            const float *d_gate = static_cast<const float *>(gate_fp32->gpu_data_ptr());
+            const float *d_up = static_cast<const float *>(up_fp32->gpu_data_ptr());
+            float *d_output = static_cast<float *>(output_fp32->gpu_data_ptr());
+
             int size = rows * cols;
-            return apply_typed(gate->data(), up->data(), output->mutable_data(), size);
+            bool ok = cudaOps_swiglu_fp32(d_gate, d_up, d_output, size, dev);
+            if (ok)
+            {
+                cudaDeviceSynchronize();
+                output_fp32->mark_device_dirty();
+            }
+            return ok;
         }
 
         bool CUDASwiGLUKernelT<ActivationPrecision::FP32>::apply_typed(
@@ -306,7 +464,6 @@ namespace llaminar2
         {
             (void)add_residual;
             (void)mpi_ctx;
-            (void)device_idx;
             if (!gate || !up || !output)
                 return false;
             if (gate->native_type() != TensorType::BF16 ||
@@ -314,15 +471,47 @@ namespace llaminar2
                 output->native_type() != TensorType::BF16)
                 return false;
 
-            auto *gate_bf16 = dynamic_cast<const BF16Tensor *>(gate);
-            auto *up_bf16 = dynamic_cast<const BF16Tensor *>(up);
+            auto *gate_bf16 = const_cast<BF16Tensor *>(dynamic_cast<const BF16Tensor *>(gate));
+            auto *up_bf16 = const_cast<BF16Tensor *>(dynamic_cast<const BF16Tensor *>(up));
             auto *out_bf16 = dynamic_cast<BF16Tensor *>(output);
             if (!gate_bf16 || !up_bf16 || !out_bf16)
                 return false;
 
+            int dev = (device_idx >= 0) ? device_idx : device_idx_;
+
+            // Construct target device
+            DeviceId target_device(DeviceType::CUDA, dev);
+
+            // Ensure data is on GPU
+            if (!gate_bf16->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDASwiGLUKernel BF16] Failed to upload gate to GPU\n");
+                return false;
+            }
+            if (!up_bf16->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDASwiGLUKernel BF16] Failed to upload up to GPU\n");
+                return false;
+            }
+            if (!out_bf16->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDASwiGLUKernel BF16] Failed to ensure output on GPU\n");
+                return false;
+            }
+
+            // Get device pointers
+            const uint16_t *d_gate = static_cast<const uint16_t *>(gate_bf16->gpu_data_ptr());
+            const uint16_t *d_up = static_cast<const uint16_t *>(up_bf16->gpu_data_ptr());
+            uint16_t *d_output = static_cast<uint16_t *>(out_bf16->gpu_data_ptr());
+
             int size = rows * cols;
-            return apply_typed(gate_bf16->typed_data(), up_bf16->typed_data(),
-                               out_bf16->mutable_typed_data(), size);
+            bool ok = cudaOps_swiglu_bf16(d_gate, d_up, d_output, size, dev);
+            if (ok)
+            {
+                cudaDeviceSynchronize();
+                out_bf16->mark_device_dirty();
+            }
+            return ok;
         }
 
         bool CUDASwiGLUKernelT<ActivationPrecision::BF16>::apply_typed(
@@ -368,7 +557,6 @@ namespace llaminar2
         {
             (void)add_residual;
             (void)mpi_ctx;
-            (void)device_idx;
             if (!gate || !up || !output)
                 return false;
             if (gate->native_type() != TensorType::FP16 ||
@@ -376,15 +564,47 @@ namespace llaminar2
                 output->native_type() != TensorType::FP16)
                 return false;
 
-            auto *gate_fp16 = dynamic_cast<const FP16Tensor *>(gate);
-            auto *up_fp16 = dynamic_cast<const FP16Tensor *>(up);
+            auto *gate_fp16 = const_cast<FP16Tensor *>(dynamic_cast<const FP16Tensor *>(gate));
+            auto *up_fp16 = const_cast<FP16Tensor *>(dynamic_cast<const FP16Tensor *>(up));
             auto *out_fp16 = dynamic_cast<FP16Tensor *>(output);
             if (!gate_fp16 || !up_fp16 || !out_fp16)
                 return false;
 
+            int dev = (device_idx >= 0) ? device_idx : device_idx_;
+
+            // Construct target device
+            DeviceId target_device(DeviceType::CUDA, dev);
+
+            // Ensure data is on GPU
+            if (!gate_fp16->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDASwiGLUKernel FP16] Failed to upload gate to GPU\n");
+                return false;
+            }
+            if (!up_fp16->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDASwiGLUKernel FP16] Failed to upload up to GPU\n");
+                return false;
+            }
+            if (!out_fp16->ensureOnDevice(target_device))
+            {
+                fprintf(stderr, "[CUDASwiGLUKernel FP16] Failed to ensure output on GPU\n");
+                return false;
+            }
+
+            // Get device pointers
+            const uint16_t *d_gate = static_cast<const uint16_t *>(gate_fp16->gpu_data_ptr());
+            const uint16_t *d_up = static_cast<const uint16_t *>(up_fp16->gpu_data_ptr());
+            uint16_t *d_output = static_cast<uint16_t *>(out_fp16->gpu_data_ptr());
+
             int size = rows * cols;
-            return apply_typed(gate_fp16->typed_data(), up_fp16->typed_data(),
-                               out_fp16->mutable_typed_data(), size);
+            bool ok = cudaOps_swiglu_fp16(d_gate, d_up, d_output, size, dev);
+            if (ok)
+            {
+                cudaDeviceSynchronize();
+                out_fp16->mark_device_dirty();
+            }
+            return ok;
         }
 
         bool CUDASwiGLUKernelT<ActivationPrecision::FP16>::apply_typed(
@@ -511,4 +731,232 @@ namespace llaminar2
         }
 
     } // namespace cuda
+
+    // =========================================================================
+    // CUDAEmbeddingKernelT Implementation (in llaminar2 namespace, not cuda)
+    // =========================================================================
+
+    bool CUDAEmbeddingKernelT::apply(
+        const float *embed_data,
+        const int *token_ids,
+        int num_tokens,
+        int d_model,
+        float *output,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        (void)mpi_ctx;
+        int dev = (device_idx >= 0) ? device_idx : device_idx_;
+        (void)dev; // Device selection handled by caller setting active device
+
+        cudaError_t err = launch_embedding_lookup(embed_data, token_ids, output,
+                                                  num_tokens, d_model, nullptr);
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "[CUDAEmbeddingKernelT] Kernel launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        cudaDeviceSynchronize();
+        return true;
+    }
+
+    bool CUDAEmbeddingKernelT::apply_bf16(
+        const float *embed_data,
+        const int *token_ids,
+        int num_tokens,
+        int d_model,
+        uint16_t *output,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        (void)embed_data;
+        (void)token_ids;
+        (void)num_tokens;
+        (void)d_model;
+        (void)output;
+        (void)mpi_ctx;
+        (void)device_idx;
+        fprintf(stderr, "[CUDAEmbeddingKernelT] BF16 output not yet implemented\n");
+        return false;
+    }
+
+    bool CUDAEmbeddingKernelT::apply_fp16(
+        const float *embed_data,
+        const int *token_ids,
+        int num_tokens,
+        int d_model,
+        uint16_t *output,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        (void)embed_data;
+        (void)token_ids;
+        (void)num_tokens;
+        (void)d_model;
+        (void)output;
+        (void)mpi_ctx;
+        (void)device_idx;
+        fprintf(stderr, "[CUDAEmbeddingKernelT] FP16 output not yet implemented\n");
+        return false;
+    }
+
+    bool CUDAEmbeddingKernelT::apply_q8_1(
+        const float *embed_data,
+        const int *token_ids,
+        int num_tokens,
+        int d_model,
+        void *output,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        (void)embed_data;
+        (void)token_ids;
+        (void)num_tokens;
+        (void)d_model;
+        (void)output;
+        (void)mpi_ctx;
+        (void)device_idx;
+        fprintf(stderr, "[CUDAEmbeddingKernelT] Q8_1 output not yet implemented\n");
+        return false;
+    }
+
+    bool CUDAEmbeddingKernelT::apply_tensor(
+        const TensorBase *embed_table,
+        const int *token_ids,
+        int num_tokens,
+        int d_model,
+        TensorBase *output,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        // Output must be FP32 (common for all embedding operations)
+        if (output->native_type() != TensorType::FP32)
+        {
+            fprintf(stderr, "[CUDAEmbeddingKernelT] Output must be FP32 tensor\n");
+            return false;
+        }
+
+        auto *output_fp32 = dynamic_cast<FP32Tensor *>(output);
+        if (!output_fp32)
+        {
+            fprintf(stderr, "[CUDAEmbeddingKernelT] Output tensor cast to FP32 failed\n");
+            return false;
+        }
+
+        // Get dequantized FP32 data from any tensor type via data()
+        // This handles Q4_0, Q8_0, FP32, etc. automatically
+        const float *embed_data = embed_table->data();
+        if (!embed_data)
+        {
+            fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to get embedding data\n");
+            return false;
+        }
+
+        // Determine target CUDA device
+        int dev = (device_idx >= 0) ? device_idx : device_idx_;
+        DeviceId target_device = DeviceId::cuda(dev);
+
+        // =====================================================================
+        // Step 1: Allocate and copy token_ids to GPU
+        // =====================================================================
+        int *d_token_ids = nullptr;
+        size_t token_bytes = static_cast<size_t>(num_tokens) * sizeof(int);
+        cudaError_t err = cudaMalloc(&d_token_ids, token_bytes);
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to allocate GPU memory for token_ids: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        err = cudaMemcpy(d_token_ids, token_ids, token_bytes, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to copy token_ids to GPU: %s\n",
+                    cudaGetErrorString(err));
+            cudaFree(d_token_ids);
+            return false;
+        }
+
+        // =====================================================================
+        // Step 2: Ensure output tensor is on GPU
+        // =====================================================================
+        if (!output_fp32->ensureOnDevice(target_device))
+        {
+            fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to ensure output on GPU\n");
+            cudaFree(d_token_ids);
+            return false;
+        }
+        float *d_output = static_cast<float *>(output_fp32->gpu_data_ptr());
+        if (!d_output)
+        {
+            fprintf(stderr, "[CUDAEmbeddingKernelT] Output GPU pointer is null\n");
+            cudaFree(d_token_ids);
+            return false;
+        }
+
+        // =====================================================================
+        // Step 3: Get or upload embedding table to GPU
+        // =====================================================================
+        float *d_embed = nullptr;
+        bool need_free_embed = false;
+
+        // Check if embed_table is FP32 and on GPU
+        auto *embed_fp32 = dynamic_cast<const FP32Tensor *>(embed_table);
+        if (embed_fp32 && embed_fp32->isOnGPU())
+        {
+            // Fast path: FP32 tensor already on GPU
+            d_embed = const_cast<float *>(static_cast<const float *>(embed_fp32->gpu_data_ptr()));
+        }
+        else
+        {
+            // Slow path: Need to copy dequantized embedding data to GPU
+            size_t vocab_size = embed_table->rows();
+            size_t embed_dim = static_cast<size_t>(d_model);
+            size_t embed_bytes = vocab_size * embed_dim * sizeof(float);
+
+            err = cudaMalloc(&d_embed, embed_bytes);
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to allocate GPU memory for embeddings: %s\n",
+                        cudaGetErrorString(err));
+                cudaFree(d_token_ids);
+                return false;
+            }
+
+            err = cudaMemcpy(d_embed, embed_data, embed_bytes, cudaMemcpyHostToDevice);
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to copy embeddings to GPU: %s\n",
+                        cudaGetErrorString(err));
+                cudaFree(d_embed);
+                cudaFree(d_token_ids);
+                return false;
+            }
+            need_free_embed = true;
+        }
+
+        // =====================================================================
+        // Step 4: Execute kernel with all GPU pointers
+        // =====================================================================
+        bool result = apply(d_embed, d_token_ids, num_tokens, d_model, d_output, mpi_ctx, device_idx);
+
+        // Mark output as dirty (GPU has newer data)
+        if (result)
+        {
+            output_fp32->mark_device_dirty();
+        }
+
+        // =====================================================================
+        // Step 5: Cleanup temporary GPU buffers
+        // =====================================================================
+        if (need_free_embed)
+        {
+            cudaFree(d_embed);
+        }
+        cudaFree(d_token_ids);
+
+        return result;
+    }
+
 } // namespace llaminar2

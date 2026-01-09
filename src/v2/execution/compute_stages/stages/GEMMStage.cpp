@@ -399,7 +399,7 @@ namespace llaminar2
         info.addScalar("beta", params_.beta);
         info.addScalarBool("transpose_B", params_.transpose_B);
         info.addScalarBool("do_swiglu", params_.do_swiglu);
-        info.addScalarInt("device_id", params_.device_id.toLegacyIndex());
+        info.addScalarInt("device_id", params_.device_id.toKernelDeviceIndex());
 
         return info;
     }

@@ -104,7 +104,7 @@ protected:
     // Helper to create FP32Tensor from vector (for TensorBase* API)
     std::unique_ptr<FP32Tensor> makeTensor(size_t rows, size_t cols, const std::vector<float> &data = {})
     {
-        auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{rows, cols}, 0);
+        auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{rows, cols});
         if (!data.empty())
         {
             float *dst = tensor->mutable_data();
@@ -119,7 +119,7 @@ protected:
     // Helper for 1D tensor (gamma weights, etc.)
     std::unique_ptr<FP32Tensor> makeTensor1D(size_t n, const std::vector<float> &data = {})
     {
-        auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{1, n}, 0);
+        auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{1, n});
         if (!data.empty())
         {
             float *dst = tensor->mutable_data();
@@ -175,7 +175,7 @@ TEST_F(ComputeStagesTest, GEMMStage_DumpInfo)
     // Create proper tensor for C
     auto C_tensor = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(n)},
-        -1 // device_idx = -1 for CPU
+        DeviceId::cpu() // CPU device
     );
     float *C_data = C_tensor->mutable_data();
     std::fill(C_data, C_data + m * n, 0.0f);
@@ -201,11 +201,10 @@ TEST_F(ComputeStagesTest, GEMMStage_WithFP32Weight)
     const int m = 2, n = 4, k = 8;
 
     // Create weight tensor and fill with identity-ish pattern
-    // Use device_idx -1 for CPU-only (no GPU device enumeration needed)
+    // Use DeviceId::cpu() for CPU-only (no GPU device enumeration needed)
     auto weight = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(k), static_cast<size_t>(n)},
-        -1 // device_idx = -1 for CPU
-    );
+        DeviceId::cpu());
     float *weight_data = weight->mutable_data();
     std::fill(weight_data, weight_data + k * n, 0.0f);
     for (int i = 0; i < std::min(k, n); ++i)
@@ -216,15 +215,13 @@ TEST_F(ComputeStagesTest, GEMMStage_WithFP32Weight)
     // Create activation tensor
     auto A_tensor = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(k)},
-        -1 // device_idx = -1 for CPU
-    );
+        DeviceId::cpu());
     fillPattern(A_tensor->mutable_data(), m * k);
 
     // Create output tensor
     auto C_tensor = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(n)},
-        -1 // device_idx = -1 for CPU
-    );
+        DeviceId::cpu());
     std::fill(C_tensor->mutable_data(), C_tensor->mutable_data() + m * n, 0.0f);
 
     GEMMStage::Params params{

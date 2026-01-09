@@ -55,13 +55,24 @@ namespace llaminar2
         const int seq_len = params_.seq_len > 0 ? params_.seq_len : static_cast<int>(input_base->rows());
         const int hidden_dim = static_cast<int>(input_base->cols());
 
+        // Create kernel via KernelFactory with automatic type dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+
         LOG_DEBUG("[RMSNormStage] Execute: seq_len=" << seq_len
                                                      << " hidden_dim=" << hidden_dim
                                                      << " eps=" << params_.eps
-                                                     << " tensor_type=" << input_base->dtype_name());
+                                                     << " tensor_type=" << input_base->dtype_name()
+                                                     << " device=" << static_cast<int>(dev_type));
 
-        // Create kernel via KernelFactory with automatic type dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+        // DEBUG: Log input for parity debugging
+        const float *in_data = params_.input->fp32_data();
+        if (in_data)
+        {
+            LOG_DEBUG("[RMSNormStage] input[0:8]=" << std::setprecision(6)
+                                                   << in_data[0] << "," << in_data[1] << "," << in_data[2] << "," << in_data[3] << ","
+                                                   << in_data[4] << "," << in_data[5] << "," << in_data[6] << "," << in_data[7]
+                                                   << " device_id=" << params_.device_id.to_string());
+        }
         auto kernel = llaminar::v2::kernels::KernelFactory::createRMSNorm(input_base, dev_type);
         if (!kernel)
         {
@@ -79,7 +90,21 @@ namespace llaminar2
             hidden_dim,
             params_.eps,
             params_.mpi_ctx,
-            params_.device_id.toLegacyIndex());
+            params_.device_id.toKernelDeviceIndex());
+
+        // DEBUG: Log RMSNorm output for parity debugging
+        if (success)
+        {
+            // Get output from host after GPU kernel (if GPU, needs sync)
+            const float *out_data = params_.output->fp32_data();
+            if (out_data)
+            {
+                LOG_DEBUG("[RMSNormStage] output[0:8]=" << std::setprecision(6)
+                                                        << out_data[0] << "," << out_data[1] << "," << out_data[2] << "," << out_data[3] << ","
+                                                        << out_data[4] << "," << out_data[5] << "," << out_data[6] << "," << out_data[7]
+                                                        << " device_id=" << params_.device_id.to_string());
+            }
+        }
 
         // === Stage Tracing (Task 3) ===
         if (success)
@@ -117,8 +142,15 @@ namespace llaminar2
         switch (backend)
         {
         case ComputeBackendType::CPU:
-
             return true;
+#ifdef HAVE_CUDA
+        case ComputeBackendType::GPU_CUDA:
+            return true; // CUDARMSNormKernelT is available via KernelFactory
+#endif
+#ifdef HAVE_ROCM
+        case ComputeBackendType::GPU_ROCM:
+            return false; // ROCm RMSNorm not yet implemented
+#endif
         default:
             return false;
         }

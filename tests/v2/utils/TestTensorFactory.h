@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include "backends/DeviceId.h"
 #include "tensors/Tensors.h"
 #include "kernels/KernelFactory.h"
 #include <memory>
@@ -173,7 +174,7 @@ namespace llaminar2::test
          */
         static std::unique_ptr<Q8_1Tensor> createQ8_1(const std::vector<size_t> &shape)
         {
-            return std::make_unique<Q8_1Tensor>(shape, /*device_idx=*/-1);
+            return std::make_unique<Q8_1Tensor>(shape, DeviceId::cpu());
         }
 
         /**
@@ -229,7 +230,7 @@ namespace llaminar2::test
                 blocks[i].sum_qs = sum_qs; // Q8_1 stores raw integer sum
             }
 
-            return std::make_unique<Q8_1Tensor>(shape, reinterpret_cast<const Q8_1Block *>(raw_data.data()), total_blocks, /*device_idx=*/-1);
+            return std::make_unique<Q8_1Tensor>(shape, reinterpret_cast<const Q8_1Block *>(raw_data.data()), total_blocks, DeviceId::cpu());
         }
 
         // =========================================================================
@@ -1251,7 +1252,7 @@ namespace llaminar2::test
          */
         static std::unique_ptr<Q16_1Tensor> createQ16_1(const std::vector<size_t> &shape)
         {
-            return std::make_unique<Q16_1Tensor>(shape, /*device_idx=*/-1);
+            return std::make_unique<Q16_1Tensor>(shape, DeviceId::cpu());
         }
 
         /**

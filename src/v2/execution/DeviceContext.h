@@ -58,9 +58,18 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Get the logical device index
-         * @return Device index in DeviceManager's device list
+         * @brief Get the type-safe device identifier
+         * @return DeviceId representing this device
          */
+        virtual DeviceId deviceId() const = 0;
+
+        /**
+         * @brief Get the logical device index (DEPRECATED)
+         * @return Device index in DeviceManager's device list
+         * @deprecated Use deviceId().toKernelDeviceIndex() for kernel dispatch
+         *             or deviceId() for type-safe device identification
+         */
+        [[deprecated("Use deviceId() instead")]]
         virtual int deviceIndex() const = 0;
 
         /**
@@ -271,7 +280,8 @@ namespace llaminar2
         ~CPUDeviceContext() override;
 
         // Device info
-        int deviceIndex() const override { return device_.toLegacyIndex(); }
+        DeviceId deviceId() const override { return device_; }
+        int deviceIndex() const override { return device_.toKernelDeviceIndex(); }
         ComputeBackendType backendType() const override { return ComputeBackendType::CPU; }
         DeviceType deviceType() const override { return DeviceType::CPU; }
         bool isGPU() const override { return false; }
@@ -336,7 +346,8 @@ namespace llaminar2
         ~IGPUDeviceContext() override;
 
         // Device info
-        int deviceIndex() const override { return device_.toLegacyIndex(); }
+        DeviceId deviceId() const override { return device_; }
+        int deviceIndex() const override { return device_.toKernelDeviceIndex(); }
         ComputeBackendType backendType() const override { return backend_type_; }
         DeviceType deviceType() const override;
         bool isGPU() const override { return true; }

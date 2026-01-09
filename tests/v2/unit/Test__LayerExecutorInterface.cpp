@@ -209,8 +209,8 @@ TEST_F(LayerExecutorInterfaceTest, Mock_TracksMultiExecuteCalls)
     MockLayerExecutor mock;
 
     ComputeGraph graph;
-    std::unordered_map<int, IDeviceContext *> contexts;
-    contexts[0] = ctx_.get();
+    std::unordered_map<DeviceId, IDeviceContext *> contexts;
+    contexts[DeviceId::cpu()] = ctx_.get();
 
     EXPECT_EQ(mock.multiExecuteCount(), 0);
 
@@ -248,7 +248,7 @@ TEST_F(LayerExecutorInterfaceTest, Mock_Reset)
     mock.execute(graph, ctx_.get());
     mock.execute(graph, ctx_.get());
 
-    std::unordered_map<int, IDeviceContext *> contexts;
+    std::unordered_map<DeviceId, IDeviceContext *> contexts;
     mock.executeMultiDevice(graph, contexts);
 
     EXPECT_EQ(mock.executeCount(), 2);
@@ -427,8 +427,8 @@ TEST_F(LayerExecutorInterfaceTest, MultiDeviceExecute_ThroughInterface)
     stage->setShouldSucceed(true);
     graph.addNode("A", std::move(stage), DeviceId::cpu()); // Device 0
 
-    std::unordered_map<int, IDeviceContext *> contexts;
-    contexts[0] = ctx_.get();
+    std::unordered_map<DeviceId, IDeviceContext *> contexts;
+    contexts[DeviceId::cpu()] = ctx_.get();
 
     // Execute multi-device through interface
     bool result = iface.executeMultiDevice(graph, contexts);
@@ -442,7 +442,7 @@ TEST_F(LayerExecutorInterfaceTest, MockMultiDeviceExecute_ThroughInterface)
     ILayerExecutor &iface = mock;
 
     ComputeGraph graph;
-    std::unordered_map<int, IDeviceContext *> contexts;
+    std::unordered_map<DeviceId, IDeviceContext *> contexts;
 
     bool result = iface.executeMultiDevice(graph, contexts);
 

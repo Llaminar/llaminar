@@ -20,7 +20,7 @@
 #include "models/qwen/Qwen2Schema.h"
 #include "models/qwen/Qwen2Graph.h"
 #include "tensors/Tensors.h"
-#include "tensors/CPUKVCache.h"
+#include "kernels/cpu/CPUKVCache.h"
 #include "kernels/cpu/attention/q16_1/VNNISafetyConstants.h"
 
 namespace llaminar2::test

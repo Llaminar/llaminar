@@ -33,7 +33,7 @@ protected:
     // Helper: Create FP32Tensor with given dimensions
     std::unique_ptr<FP32Tensor> makeTensor(size_t rows, size_t cols)
     {
-        return std::make_unique<FP32Tensor>(std::vector<size_t>{rows, cols}, 0);
+        return std::make_unique<FP32Tensor>(std::vector<size_t>{rows, cols}, DeviceId::cpu());
     }
 
     // Helper: Create FP32Tensor with given dimensions and fill with value
@@ -51,7 +51,7 @@ protected:
     // Helper: Create 1D FP32Tensor
     std::unique_ptr<FP32Tensor> makeTensor1D(size_t n, float fill_value = 1.0f)
     {
-        auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{n}, 0);
+        auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{n}, DeviceId::cpu());
         float *data = tensor->mutable_data();
         for (size_t i = 0; i < n; ++i)
         {
@@ -554,7 +554,7 @@ TEST_F(LayerExecutorTest, ExecuteMultiDeviceEmptyContexts)
 
     graph.addNode("A", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
-    std::unordered_map<int, IDeviceContext *> contexts; // Empty
+    std::unordered_map<DeviceId, IDeviceContext *> contexts; // Empty
     EXPECT_FALSE(executor.executeMultiDevice(graph, contexts));
 }
 
@@ -578,8 +578,8 @@ TEST_F(LayerExecutorTest, ExecuteMultiDeviceSingleContext)
 
     graph.addNode("norm", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
-    std::unordered_map<int, IDeviceContext *> contexts;
-    contexts[0] = ctx_.get();
+    std::unordered_map<DeviceId, IDeviceContext *> contexts;
+    contexts[DeviceId::cpu()] = ctx_.get();
 
     try
     {

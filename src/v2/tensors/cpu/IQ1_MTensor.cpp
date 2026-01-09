@@ -194,11 +194,6 @@ namespace llaminar2
 
     IQ1_MTensor::~IQ1_MTensor() {}
 
-    bool IQ1_MTensor::set_device(int device_idx)
-    {
-        device_ = DeviceId::fromLegacyIndex(device_idx);
-        return true;
-    }
 
     const float *IQ1_MTensor::data() const
     {

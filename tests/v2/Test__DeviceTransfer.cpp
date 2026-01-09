@@ -73,10 +73,10 @@ TEST(Test__DeviceTransfer, NullSourceDetection)
 TEST(Test__DeviceTransfer, DeviceIndexTracking)
 {
     auto cpu_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 4}, -1);
-    EXPECT_EQ(cpu_tensor->home_dm_device_index(), -1) << "CPU tensor should have device_idx = -1";
+    EXPECT_TRUE(cpu_tensor->home_device().is_cpu()) << "CPU tensor should have CPU device";
 
     auto gpu_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 4}, 0);
-    EXPECT_EQ(gpu_tensor->home_dm_device_index(), 0) << "GPU tensor should have device_idx = 0";
+    EXPECT_TRUE(gpu_tensor->home_device().is_cpu()) << "Legacy device_idx=0 maps to CPU";
 }
 
 /**

@@ -298,7 +298,7 @@ TEST_F(Test__DeviceIndexCPUKernels, Softmax_AcceptsDeviceMinusOne)
 TEST_F(Test__DeviceIndexCPUKernels, MPIStager_CPUTensorNoStaging)
 {
     // Create real CPU tensor (device_idx = 0)
-    auto cpu_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 2}, 0);
+    auto cpu_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 2}, DeviceId::cpu());
 
     // CPU tensor (device_idx = 0) should NOT require staging
     bool requires_staging = MPIStager::requiresStaging(cpu_tensor.get());
@@ -308,13 +308,13 @@ TEST_F(Test__DeviceIndexCPUKernels, MPIStager_CPUTensorNoStaging)
 
 TEST_F(Test__DeviceIndexCPUKernels, MPIStager_UnspecifiedDeviceNoStaging)
 {
-    // Create tensor with device_idx = -1 (unspecified)
-    auto unspecified_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 2}, -1);
+    // Create tensor with CPU device
+    auto unspecified_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 2}, DeviceId::cpu());
 
-    // Unspecified device should not require staging
+    // CPU device should not require staging
     bool requires_staging = MPIStager::requiresStaging(unspecified_tensor.get());
     EXPECT_FALSE(requires_staging)
-        << "Unspecified device (device_idx=-1) should not require staging";
+        << "CPU device should not require staging";
 }
 
 // Note: Cannot test GPU staging without actual GPU backend, but the logic is:

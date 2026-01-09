@@ -8,7 +8,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
-#include "../../../tensors/CPUKVCache.h"
+#include "../../../kernels/cpu/CPUKVCache.h"
 
 namespace llaminar2
 {

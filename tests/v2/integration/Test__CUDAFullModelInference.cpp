@@ -45,6 +45,8 @@
 #include <algorithm>
 #include <numeric>
 #include <filesystem>
+#include <set>
+#include <iomanip>
 
 using namespace llaminar2;
 using namespace llaminar2::test::cuda;
@@ -307,7 +309,7 @@ TEST_F(Test__CUDAFullModelInference, CanCreateCPURunner)
 TEST_F(Test__CUDAFullModelInference, CanCreateGPURunner)
 {
     // Test that GPU inference runner can be created
-    auto result = createRunner(DeviceId::fromLegacyIndex(gpu_idx_));
+    auto result = createRunner(gpu_device_);
     ASSERT_NE(result.runner, nullptr) << "Failed to create GPU inference runner";
 }
 
@@ -322,7 +324,7 @@ TEST_F(Test__CUDAFullModelInference, SingleTokenPrediction_MatchesCPU)
 
     // Create runners (each with its own model context that must stay alive)
     auto cpu_result = createRunner(cpu_id);
-    auto gpu_result = createRunner(DeviceId::fromLegacyIndex(gpu_idx_));
+    auto gpu_result = createRunner(gpu_device_);
 
     ASSERT_NE(cpu_result.runner, nullptr) << "Failed to create CPU runner";
     ASSERT_NE(gpu_result.runner, nullptr) << "Failed to create GPU runner";
@@ -411,7 +413,7 @@ TEST_F(Test__CUDAFullModelInference, LongerPrompt_MatchesCPU)
     DeviceId cpu_id = DeviceId::cpu();
 
     auto cpu_result = createRunner(cpu_id);
-    auto gpu_result = createRunner(DeviceId::fromLegacyIndex(gpu_idx_));
+    auto gpu_result = createRunner(gpu_device_);
 
     ASSERT_NE(cpu_result.runner, nullptr);
     ASSERT_NE(gpu_result.runner, nullptr);
@@ -446,7 +448,7 @@ TEST_F(Test__CUDAFullModelInference, MultiTokenGeneration_MatchesCPU)
     DeviceId cpu_id = DeviceId::cpu();
 
     auto cpu_result = createRunner(cpu_id);
-    auto gpu_result = createRunner(DeviceId::fromLegacyIndex(gpu_idx_));
+    auto gpu_result = createRunner(gpu_device_);
 
     ASSERT_NE(cpu_result.runner, nullptr);
     ASSERT_NE(gpu_result.runner, nullptr);
@@ -495,7 +497,7 @@ TEST_F(Test__CUDAFullModelInference, MultiTokenGeneration_MatchesCPU)
 TEST_F(Test__CUDAFullModelInference, GPUMemoryUsage)
 {
     // Test that GPU memory is properly allocated and doesn't leak
-    auto result = createRunner(DeviceId::fromLegacyIndex(gpu_idx_));
+    auto result = createRunner(gpu_device_);
     ASSERT_NE(result.runner, nullptr);
 
     // Get initial memory
@@ -539,7 +541,7 @@ TEST_F(Test__CUDAFullModelInference, SingleTokenPrompt)
     DeviceId cpu_id = DeviceId::cpu();
 
     auto cpu_result = createRunner(cpu_id);
-    auto gpu_result = createRunner(DeviceId::fromLegacyIndex(gpu_idx_));
+    auto gpu_result = createRunner(gpu_device_);
 
     ASSERT_NE(cpu_result.runner, nullptr);
     ASSERT_NE(gpu_result.runner, nullptr);
@@ -555,6 +557,190 @@ TEST_F(Test__CUDAFullModelInference, SingleTokenPrompt)
 
     EXPECT_EQ(cpu_top1.first, gpu_top1.first)
         << "Single token prediction mismatch";
+}
+
+// ============================================================================
+// Diagnostic Test: Stage-by-Stage Comparison
+// ============================================================================
+
+/**
+ * @brief Compute cosine similarity between two float vectors
+ */
+static float cosineSimilarity(const float *a, const float *b, size_t n)
+{
+    double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        dot += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+        norm_a += static_cast<double>(a[i]) * static_cast<double>(a[i]);
+        norm_b += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+    }
+    if (norm_a < 1e-12 || norm_b < 1e-12)
+        return 0.0f;
+    return static_cast<float>(dot / (std::sqrt(norm_a) * std::sqrt(norm_b)));
+}
+
+/**
+ * @brief Compute max absolute error between two float vectors
+ */
+static float maxAbsError(const float *a, const float *b, size_t n)
+{
+    float max_err = 0.0f;
+    for (size_t i = 0; i < n; ++i)
+    {
+        float err = std::abs(a[i] - b[i]);
+        if (err > max_err)
+            max_err = err;
+    }
+    return max_err;
+}
+
+TEST_F(Test__CUDAFullModelInference, DiagnosticStageByStageComparison)
+{
+    // This test captures snapshots at each stage for both CPU and GPU
+    // and compares them to identify where divergence begins
+
+    DeviceId cpu_id = DeviceId::cpu();
+
+    auto cpu_result = createRunner(cpu_id);
+    auto gpu_result = createRunner(gpu_device_);
+
+    ASSERT_NE(cpu_result.runner, nullptr) << "Failed to create CPU runner";
+    ASSERT_NE(gpu_result.runner, nullptr) << "Failed to create GPU runner";
+
+    // Enable snapshot capture on both runners
+    cpu_result.runner->enableSnapshotCapture();
+    gpu_result.runner->enableSnapshotCapture();
+
+    // Tokenize prompt
+    auto tokens = tokenize(cpu_result.model_ctx, TEST_PROMPT_SIMPLE);
+    ASSERT_GT(tokens.size(), 0) << "Tokenization failed";
+
+    LOG_INFO("[Diagnostic] Running forward passes with " << tokens.size() << " tokens");
+
+    // Run CPU forward
+    cpu_result.runner->forward(tokens.data(), static_cast<int>(tokens.size()));
+    auto cpu_keys = cpu_result.runner->getSnapshotKeys();
+
+    // Run GPU forward
+    gpu_result.runner->forward(tokens.data(), static_cast<int>(tokens.size()));
+    auto gpu_keys = gpu_result.runner->getSnapshotKeys();
+
+    LOG_INFO("[Diagnostic] CPU captured " << cpu_keys.size() << " snapshots");
+    LOG_INFO("[Diagnostic] GPU captured " << gpu_keys.size() << " snapshots");
+
+    // Sort keys for consistent ordering
+    std::sort(cpu_keys.begin(), cpu_keys.end());
+    std::sort(gpu_keys.begin(), gpu_keys.end());
+
+    // Print header
+    std::cout << "\n";
+    std::cout << "╔══════════════════════════════════════════════════════════════════════════════════╗\n";
+    std::cout << "║                    STAGE-BY-STAGE CPU vs GPU COMPARISON                          ║\n";
+    std::cout << "╠══════════════════════════════════════════════════════════════════════════════════╣\n";
+    std::cout << "║ Stage Key                           │ Elements  │ Cosine Sim │ Max Abs Err │ OK? ║\n";
+    std::cout << "╠═════════════════════════════════════╪═══════════╪════════════╪═════════════╪═════╣\n";
+
+    // Find common keys and compare
+    std::set<std::string> all_keys(cpu_keys.begin(), cpu_keys.end());
+    all_keys.insert(gpu_keys.begin(), gpu_keys.end());
+
+    int pass_count = 0;
+    int fail_count = 0;
+    std::string first_failure_key;
+    float first_failure_cosine = 1.0f;
+
+    for (const auto &key : all_keys)
+    {
+        // Filter to layer 0 and layer 1 only for brevity (or all if small model)
+        bool is_layer_0_or_1 = (key.find("layer0") != std::string::npos ||
+                                key.find("layer1") != std::string::npos ||
+                                key.find("EMBEDDING") != std::string::npos ||
+                                key.find("FINAL") != std::string::npos ||
+                                key.find("LM_HEAD") != std::string::npos);
+
+        if (!is_layer_0_or_1)
+            continue;
+
+        size_t cpu_size = 0, gpu_size = 0;
+        const float *cpu_data = cpu_result.runner->getSnapshot(key, cpu_size);
+        const float *gpu_data = gpu_result.runner->getSnapshot(key, gpu_size);
+
+        // Format key for display (truncate if too long)
+        std::string display_key = key;
+        if (display_key.length() > 35)
+        {
+            display_key = display_key.substr(0, 32) + "...";
+        }
+
+        if (!cpu_data || !gpu_data)
+        {
+            std::cout << "║ " << std::left << std::setw(35) << display_key
+                      << " │ " << std::setw(9) << (cpu_data ? cpu_size : 0)
+                      << " │ " << std::setw(10) << "MISSING"
+                      << " │ " << std::setw(11) << "-"
+                      << " │ " << std::setw(3) << "❌" << " ║\n";
+            ++fail_count;
+            continue;
+        }
+
+        if (cpu_size != gpu_size)
+        {
+            std::cout << "║ " << std::left << std::setw(35) << display_key
+                      << " │ " << std::setw(9) << std::to_string(cpu_size) + "/" + std::to_string(gpu_size)
+                      << " │ " << std::setw(10) << "SIZE DIFF"
+                      << " │ " << std::setw(11) << "-"
+                      << " │ " << std::setw(3) << "❌" << " ║\n";
+            ++fail_count;
+            continue;
+        }
+
+        float cosine = cosineSimilarity(cpu_data, gpu_data, cpu_size);
+        float max_err = maxAbsError(cpu_data, gpu_data, cpu_size);
+
+        // Consider pass if cosine > 0.999 and max_err < 0.1
+        bool is_pass = (cosine > 0.999f && max_err < 0.1f);
+
+        std::cout << "║ " << std::left << std::setw(35) << display_key
+                  << " │ " << std::right << std::setw(9) << cpu_size
+                  << " │ " << std::fixed << std::setprecision(6) << std::setw(10) << cosine
+                  << " │ " << std::scientific << std::setprecision(3) << std::setw(11) << max_err
+                  << " │ " << std::setw(3) << (is_pass ? "✓" : "❌") << " ║\n";
+
+        if (is_pass)
+        {
+            ++pass_count;
+        }
+        else
+        {
+            ++fail_count;
+            if (first_failure_key.empty())
+            {
+                first_failure_key = key;
+                first_failure_cosine = cosine;
+            }
+        }
+    }
+
+    std::cout << "╠══════════════════════════════════════════════════════════════════════════════════╣\n";
+    std::cout << "║ SUMMARY: " << pass_count << " passed, " << fail_count << " failed";
+    if (!first_failure_key.empty())
+    {
+        std::cout << " (first failure: " << first_failure_key << ")";
+    }
+    std::cout << std::string(std::max(0, 52 - static_cast<int>(first_failure_key.length())), ' ') << "║\n";
+    std::cout << "╚══════════════════════════════════════════════════════════════════════════════════╝\n\n";
+
+    // This test is diagnostic - it reports results but doesn't fail
+    // Uncomment the following to make it fail if divergence detected:
+    // EXPECT_EQ(fail_count, 0) << "Stage divergence detected at: " << first_failure_key;
+
+    // For now, just record what we found
+    if (!first_failure_key.empty())
+    {
+        LOG_WARN("[Diagnostic] First divergence detected at: " << first_failure_key
+                                                               << " (cosine=" << first_failure_cosine << ")");
+    }
 }
 
 // ============================================================================

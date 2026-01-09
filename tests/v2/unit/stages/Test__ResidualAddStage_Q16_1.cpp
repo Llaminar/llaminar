@@ -51,7 +51,7 @@ namespace llaminar2::test
             }
 
             auto tensor = std::make_unique<Q16_1Tensor>(
-                std::vector<size_t>{rows, cols}, block_size, 0);
+                std::vector<size_t>{rows, cols}, block_size, DeviceId::cpu());
             tensor->copyFrom_fp32(fp32_data.data());
             return tensor;
         }
@@ -96,7 +96,7 @@ namespace llaminar2::test
         auto input = createRandomQ16_1(SEQ_LEN, HIDDEN_DIM, Q16BlockSize::BLOCK_32);
         auto residual = createRandomQ16_1(SEQ_LEN, HIDDEN_DIM, Q16BlockSize::BLOCK_32);
         auto output = std::make_unique<Q16_1Tensor>(
-            std::vector<size_t>{SEQ_LEN, HIDDEN_DIM}, Q16BlockSize::BLOCK_32, 0);
+            std::vector<size_t>{SEQ_LEN, HIDDEN_DIM}, Q16BlockSize::BLOCK_32, DeviceId::cpu());
 
         // Compute FP32 reference before operation
         auto ref = computeFP32Reference(input.get(), residual.get());
@@ -119,7 +119,7 @@ namespace llaminar2::test
         auto input = createRandomQ16_1(SEQ_LEN, HIDDEN_DIM, Q16BlockSize::BLOCK_64);
         auto residual = createRandomQ16_1(SEQ_LEN, HIDDEN_DIM, Q16BlockSize::BLOCK_64);
         auto output = std::make_unique<Q16_1Tensor>(
-            std::vector<size_t>{SEQ_LEN, HIDDEN_DIM}, Q16BlockSize::BLOCK_64, 0);
+            std::vector<size_t>{SEQ_LEN, HIDDEN_DIM}, Q16BlockSize::BLOCK_64, DeviceId::cpu());
 
         auto ref = computeFP32Reference(input.get(), residual.get());
 
@@ -141,7 +141,7 @@ namespace llaminar2::test
         auto input = createRandomQ16_1(SEQ_LEN, HIDDEN_DIM, Q16BlockSize::BLOCK_128);
         auto residual = createRandomQ16_1(SEQ_LEN, HIDDEN_DIM, Q16BlockSize::BLOCK_128);
         auto output = std::make_unique<Q16_1Tensor>(
-            std::vector<size_t>{SEQ_LEN, HIDDEN_DIM}, Q16BlockSize::BLOCK_128, 0);
+            std::vector<size_t>{SEQ_LEN, HIDDEN_DIM}, Q16BlockSize::BLOCK_128, DeviceId::cpu());
 
         auto ref = computeFP32Reference(input.get(), residual.get());
 
@@ -167,7 +167,7 @@ namespace llaminar2::test
         auto input = createRandomQ16_1(1, 128, Q16BlockSize::BLOCK_64);
         auto residual = createRandomQ16_1(1, 128, Q16BlockSize::BLOCK_64);
         auto output = std::make_unique<Q16_1Tensor>(
-            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, 0);
+            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, DeviceId::cpu());
 
         ResidualAddStage::Params params;
         params.input = input.get();
@@ -183,7 +183,7 @@ namespace llaminar2::test
         auto input = createRandomQ16_1(1, 128, Q16BlockSize::BLOCK_64);
         auto residual = createRandomQ16_1(1, 128, Q16BlockSize::BLOCK_64);
         auto output = std::make_unique<Q16_1Tensor>(
-            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, 0);
+            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, DeviceId::cpu());
 
         ResidualAddStage::Params params;
         params.input = input.get();
@@ -209,11 +209,11 @@ namespace llaminar2::test
         }
 
         auto input = std::make_unique<Q16_1Tensor>(
-            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, 0);
+            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, DeviceId::cpu());
         auto residual = std::make_unique<Q16_1Tensor>(
-            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, 0);
+            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, DeviceId::cpu());
         auto output = std::make_unique<Q16_1Tensor>(
-            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, 0);
+            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, DeviceId::cpu());
 
         input->copyFrom_fp32(zeros.data());
         residual->copyFrom_fp32(residual_data.data());
@@ -248,11 +248,11 @@ namespace llaminar2::test
         }
 
         auto input = std::make_unique<Q16_1Tensor>(
-            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, 0);
+            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, DeviceId::cpu());
         auto residual = std::make_unique<Q16_1Tensor>(
-            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, 0);
+            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, DeviceId::cpu());
         auto output = std::make_unique<Q16_1Tensor>(
-            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, 0);
+            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, DeviceId::cpu());
 
         input->copyFrom_fp32(input_data.data());
         residual->copyFrom_fp32(zeros.data());
@@ -285,7 +285,7 @@ namespace llaminar2::test
         auto input = createRandomQ16_1(1, 128, Q16BlockSize::BLOCK_64);
         auto residual = createRandomQ16_1(1, 128, Q16BlockSize::BLOCK_128); // Mismatch!
         auto output = std::make_unique<Q16_1Tensor>(
-            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, 0);
+            std::vector<size_t>{1, 128}, Q16BlockSize::BLOCK_64, DeviceId::cpu());
 
         ResidualAddStage::Params params;
         params.input = input.get();

@@ -80,11 +80,6 @@ namespace llaminar2
         // Device cleanup handled elsewhere
     }
 
-    bool Q5_1Tensor::set_device(int device_idx)
-    {
-        device_ = DeviceId::fromLegacyIndex(device_idx);
-        return true;
-    }
 
     const float *Q5_1Tensor::data() const
     {

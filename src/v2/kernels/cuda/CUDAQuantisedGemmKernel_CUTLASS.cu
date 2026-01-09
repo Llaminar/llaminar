@@ -156,7 +156,7 @@ namespace
     }
 
     /**
-     * @brief Apply output scaling: C_fp32 = alpha * C_int32 * scales_A * scales_B + beta * C_existing
+     * @brief Apply output scaling: C_fp32 = alpha * C_int32 * scales_A * scales_B + beta * C_existing + bias
      *
      * Grid: (ceil(N/16), ceil(M/16), 1)
      * Block: (16, 16, 1)
@@ -168,7 +168,8 @@ namespace
         const float *scales_B,  // [N] column scales
         int M, int N,
         float alpha, float beta,
-        const float *C_existing) // For beta != 0
+        const float *C_existing, // For beta != 0
+        const float *bias)       // [N] optional bias, broadcasted across rows
     {
         int col = blockIdx.x * blockDim.x + threadIdx.x;
         int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -183,6 +184,11 @@ namespace
             if (beta != 0.0f && C_existing != nullptr)
             {
                 result += beta * C_existing[idx];
+            }
+
+            if (bias != nullptr)
+            {
+                result += bias[col];
             }
 
             C_fp32[idx] = result;
@@ -293,12 +299,16 @@ extern "C"
 
         CutlassInt8Gemm gemm_op;
 
+        // CUTLASS problem shape: M × N × K
+        // A: [M × K] RowMajor, stride = K
+        // B: [K × N] ColumnMajor, stride = K (leading dimension is number of rows = K)
+        // C: [M × N] RowMajor, stride = N
         typename CutlassInt8Gemm::Arguments args(
             {M, N, K},           // Problem size
-            {d_A_int8, K},       // TensorRef A (RowMajor, leading dim = K)
-            {d_weights_int8, N}, // TensorRef B (ColumnMajor, leading dim = N)
-            {d_C_int32, N},      // TensorRef C (unused, beta=0)
-            {d_C_int32, N},      // TensorRef D (output)
+            {d_A_int8, K},       // TensorRef A (RowMajor, stride = K)
+            {d_weights_int8, K}, // TensorRef B (ColumnMajor, stride = K) [FIXED: was N]
+            {d_C_int32, N},      // TensorRef C (RowMajor, stride = N)
+            {d_C_int32, N},      // TensorRef D (output, RowMajor, stride = N)
             {1, 0}               // alpha=1, beta=0
         );
 
@@ -314,7 +324,7 @@ extern "C"
     }
 
     /**
-     * @brief Apply output scaling
+     * @brief Apply output scaling with optional bias
      */
     bool cudaQuantGemm_applyScaling(
         const int32_t *d_C_int32,
@@ -324,6 +334,7 @@ extern "C"
         int M, int N,
         float alpha, float beta,
         const float *d_C_existing,
+        const float *d_bias,
         int cuda_device_id)
     {
         CUDA_CHECK(cudaSetDevice(cuda_device_id));
@@ -333,7 +344,7 @@ extern "C"
 
         apply_scaling_kernel<<<grid, block>>>(
             d_C_int32, d_C_fp32, d_scales_A, d_scales_B,
-            M, N, alpha, beta, d_C_existing);
+            M, N, alpha, beta, d_C_existing, d_bias);
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
@@ -383,6 +394,55 @@ extern "C"
         {
             cudaFree(d_ptr);
         }
+    }
+
+    /**
+     * @brief Allocate float array on device
+     */
+    bool cudaQuantGemm_allocFloat(float **d_ptr, size_t count, int cuda_device_id)
+    {
+        CUDA_CHECK(cudaSetDevice(cuda_device_id));
+        CUDA_CHECK(cudaMalloc(d_ptr, count * sizeof(float)));
+        return true;
+    }
+
+    /**
+     * @brief Copy floats from host to device
+     */
+    bool cudaQuantGemm_copyHostToDevice(float *d_dst, const float *h_src, size_t count, int cuda_device_id)
+    {
+        CUDA_CHECK(cudaSetDevice(cuda_device_id));
+        CUDA_CHECK(cudaMemcpy(d_dst, h_src, count * sizeof(float), cudaMemcpyHostToDevice));
+        return true;
+    }
+
+    /**
+     * @brief Copy floats from device to host
+     */
+    bool cudaQuantGemm_copyDeviceToHost(float *h_dst, const float *d_src, size_t count, int cuda_device_id)
+    {
+        CUDA_CHECK(cudaSetDevice(cuda_device_id));
+        CUDA_CHECK(cudaMemcpy(h_dst, d_src, count * sizeof(float), cudaMemcpyDeviceToHost));
+        return true;
+    }
+
+    /**
+     * @brief Copy int32 from device to host
+     */
+    bool cudaQuantGemm_copyInt32DeviceToHost(int32_t *h_dst, const int32_t *d_src, size_t count, int cuda_device_id)
+    {
+        CUDA_CHECK(cudaSetDevice(cuda_device_id));
+        CUDA_CHECK(cudaMemcpy(h_dst, d_src, count * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        return true;
+    }
+
+    /**
+     * @brief Set active CUDA device
+     */
+    bool cudaQuantGemm_setDevice(int cuda_device_id)
+    {
+        CUDA_CHECK(cudaSetDevice(cuda_device_id));
+        return true;
     }
 
 } // extern "C"

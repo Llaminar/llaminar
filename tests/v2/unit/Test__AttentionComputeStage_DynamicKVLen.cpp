@@ -15,7 +15,7 @@
 
 #include "execution/compute_stages/ComputeStages.h"
 #include "tensors/Tensors.h"
-#include "tensors/CPUKVCache.h"
+#include "kernels/cpu/CPUKVCache.h"
 #include "backends/DeviceId.h"
 
 namespace llaminar2

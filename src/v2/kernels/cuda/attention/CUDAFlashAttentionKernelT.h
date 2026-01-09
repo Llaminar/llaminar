@@ -196,7 +196,8 @@ namespace llaminar2
 
             // Workspace for Flash Decoding partial outputs
             void *partial_output_buf_ = nullptr;
-            void *partial_lse_buf_ = nullptr;
+            void *partial_m_buf_ = nullptr;
+            void *partial_l_buf_ = nullptr;
             size_t workspace_size_ = 0;
             int max_splits_ = 0;
 
@@ -270,7 +271,8 @@ namespace llaminar2
             int device_idx_;
             void *stream_ = nullptr;
             void *partial_output_buf_ = nullptr;
-            void *partial_lse_buf_ = nullptr;
+            void *partial_m_buf_ = nullptr;
+            void *partial_l_buf_ = nullptr;
             size_t workspace_size_ = 0;
             int max_splits_ = 0;
 
@@ -340,7 +342,8 @@ namespace llaminar2
             int device_idx_;
             void *stream_ = nullptr;
             void *partial_output_buf_ = nullptr;
-            void *partial_lse_buf_ = nullptr;
+            void *partial_m_buf_ = nullptr;
+            void *partial_l_buf_ = nullptr;
             size_t workspace_size_ = 0;
             int max_splits_ = 0;
 
@@ -410,7 +413,8 @@ namespace llaminar2
             int device_idx_;
             void *stream_ = nullptr;
             void *partial_output_buf_ = nullptr;
-            void *partial_lse_buf_ = nullptr;
+            void *partial_m_buf_ = nullptr;
+            void *partial_l_buf_ = nullptr;
             size_t workspace_size_ = 0;
             int max_splits_ = 0;
 

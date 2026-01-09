@@ -182,7 +182,7 @@ TEST_F(Test__MultiGPU_RealModel, Q4_0_AttentionWeight_GPUTransfer)
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device))
         << "Failed to transfer Q4_0 tensor to GPU " << gpu_device.toString();
     EXPECT_TRUE(q4_tensor->isOnGPU());
-    EXPECT_TRUE(q4_tensor->is_on_device(gpu_idx));
+    EXPECT_TRUE(q4_tensor->is_on_device(gpu_device));
 
     // Transfer back to host
     ASSERT_TRUE(q4_tensor->ensureOnHost());
@@ -317,7 +317,7 @@ TEST_F(Test__MultiGPU_RealModel, MultipleWeights_SameGPU)
         ASSERT_TRUE(tensors[i]->ensureOnDevice(gpu_device))
             << "Failed to transfer " << weight_names[i] << " to GPU";
         EXPECT_TRUE(tensors[i]->isOnGPU());
-        EXPECT_TRUE(tensors[i]->is_on_device(gpu_idx));
+        EXPECT_TRUE(tensors[i]->is_on_device(gpu_device));
     }
 
     std::cout << "All " << tensors.size() << " tensors transferred to GPU " << gpu_device.toString() << "\n";
@@ -325,7 +325,7 @@ TEST_F(Test__MultiGPU_RealModel, MultipleWeights_SameGPU)
     // Verify all still accessible (dual residency)
     for (size_t i = 0; i < tensors.size(); ++i)
     {
-        EXPECT_TRUE(tensors[i]->is_on_device(0))
+        EXPECT_TRUE(tensors[i]->is_on_device(DeviceId::cpu()))
             << weight_names[i] << " should still have valid CPU copy";
     }
 
@@ -379,11 +379,11 @@ TEST_F(Test__MultiGPU_RealModel, CrossBackend_CUDAtoROCm)
 
     // Transfer to CUDA
     ASSERT_TRUE(q4_tensor->ensureOnDevice(cuda_device));
-    EXPECT_TRUE(q4_tensor->is_on_device(cuda_idx_));
+    EXPECT_TRUE(q4_tensor->is_on_device(cuda_device));
 
     // Transfer to ROCm (will go via host)
     ASSERT_TRUE(q4_tensor->ensureOnDevice(rocm_device));
-    EXPECT_TRUE(q4_tensor->is_on_device(rocm_idx_));
+    EXPECT_TRUE(q4_tensor->is_on_device(rocm_device));
     // After cross-backend, should no longer be on CUDA
     // (current implementation releases old device when moving to new)
 
@@ -443,7 +443,7 @@ TEST_F(Test__MultiGPU_RealModel, FP32_Embedding_GPUTransfer)
     // Transfer to GPU
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device));
     EXPECT_TRUE(tensor->isOnGPU());
-    EXPECT_TRUE(tensor->is_on_device(gpu_idx));
+    EXPECT_TRUE(tensor->is_on_device(gpu_device));
 
     // Transfer back
     ASSERT_TRUE(tensor->ensureOnHost());

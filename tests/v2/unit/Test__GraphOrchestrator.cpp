@@ -18,7 +18,7 @@
 #include "../../../src/v2/utils/DebugEnv.h"
 #include "../../../src/v2/tensors/Tensors.h"
 #include "../../../src/v2/tensors/TensorFactory.h"
-#include "../../../src/v2/tensors/CPUKVCache.h"
+#include "../../../src/v2/kernels/cpu/CPUKVCache.h"
 #include <memory>
 
 using namespace llaminar2;

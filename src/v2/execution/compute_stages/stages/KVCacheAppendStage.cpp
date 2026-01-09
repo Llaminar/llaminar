@@ -9,7 +9,7 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../../utils/Logger.h"
-#include "../../../tensors/CPUKVCache.h"
+#include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../kernels/cpu/attention/q16_1/VNNISafetyConstants.h"
 

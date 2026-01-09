@@ -24,7 +24,31 @@
 namespace llaminar2
 {
 
-    // ===== Helper functions for multi-GPU device mapping =====
+    // ===== Helper functions for DeviceId-based backend access =====
+
+    /**
+     * @brief Get the appropriate backend for a DeviceId
+     *
+     * Returns the correct backend (CUDA or ROCm) based on the device type.
+     *
+     * @param device DeviceId specifying the target device
+     * @return IBackend* for the device, or nullptr for CPU
+     */
+    static IBackend *getBackendForDevice(DeviceId device)
+    {
+        if (device.is_cpu())
+            return nullptr;
+
+        if (device.is_cuda())
+            return getCUDABackend();
+        else if (device.is_rocm())
+            return getROCmBackend();
+
+        LOG_ERROR("[CPUTensorBase] Unknown device type: " << device.toString());
+        return nullptr;
+    }
+
+    // ===== Legacy helper functions for global device index mapping =====
 
     /**
      * @brief Get the appropriate backend for a global device index
@@ -33,6 +57,7 @@ namespace llaminar2
      * based on the device type from DeviceManager.
      *
      * @param device_idx Global device index (0 = CPU, 1+ = GPUs)
+     * @deprecated Use getBackendForDevice(DeviceId) instead
      * @return IBackend* for the device, or nullptr for CPU/invalid
      */
     static IBackend *getBackendForGlobalDeviceIdx(int device_idx)
@@ -524,6 +549,19 @@ namespace llaminar2
                                  "Override in derived class to support GPU transfer.");
     }
 
+    void CPUTensorBase::invalidateGpuData()
+    {
+        // Mark GPU data as stale - next ensureOnDevice() will re-upload from host
+        // Mark device as invalid (stale) - do NOT free GPU memory
+        // This is called when host data is modified and GPU copy is now stale.
+        // The GPU memory is kept allocated; next ensureOnDevice() will just re-upload.
+        if (gpu_data_ptr_)
+        {
+            device_valid_ = false;
+            LOG_DEBUG("[CPUTensorBase::invalidateGpuData] Device data marked stale (memory retained)");
+        }
+    }
+
     bool CPUTensorBase::ensureOnDevice(DeviceId target_device)
     {
         // Validate target device - must be a GPU
@@ -533,39 +571,37 @@ namespace llaminar2
             return false;
         }
 
-        // Convert DeviceId to legacy DeviceManager index for backend lookup
-        int legacy_idx = target_device.toLegacyIndex();
-
         // Check if already on target device with valid data
-        if (gpu_data_ptr_ && gpu_device_idx_ == legacy_idx && !host_invalid_)
+        if (gpu_data_ptr_ && gpu_device_.has_value() && *gpu_device_ == target_device && device_valid_)
         {
-            // Already on correct device with valid data
+            // Already on correct device with valid GPU data - nothing to do
             return true;
         }
 
-        // Get backend for target device (uses DeviceManager to determine CUDA vs ROCm)
-        IBackend *target_backend = getBackendForGlobalDeviceIdx(legacy_idx);
+        // Get backend for target device directly from DeviceId type
+        IBackend *target_backend = getBackendForDevice(target_device);
         if (!target_backend)
         {
             LOG_ERROR("[CPUTensorBase::ensureOnDevice] No backend available for device " << target_device.toString());
             return false;
         }
 
-        // Get backend-specific device ID (e.g., global idx 2 -> ROCm device 0)
-        int backend_device_id = getBackendSpecificDeviceId(legacy_idx);
+        // Get backend-specific device ordinal (e.g., CUDA:0 -> 0, ROCm:1 -> 1)
+        int backend_device_id = target_device.gpu_ordinal();
 
         // Free existing device memory if on different device
-        if (gpu_data_ptr_ && gpu_device_idx_ != legacy_idx)
+        if (gpu_data_ptr_ && gpu_device_.has_value() && *gpu_device_ != target_device)
         {
-            // Use the OLD device's backend and device ID for freeing
-            IBackend *old_backend = getBackendForGlobalDeviceIdx(gpu_device_idx_);
-            int old_backend_device_id = getBackendSpecificDeviceId(gpu_device_idx_);
+            // Use the OLD device's backend for freeing
+            IBackend *old_backend = getBackendForDevice(*gpu_device_);
+            int old_backend_device_id = gpu_device_->gpu_ordinal();
             if (old_backend)
             {
                 old_backend->free(gpu_data_ptr_, old_backend_device_id);
             }
             gpu_data_ptr_ = nullptr;
-            gpu_device_idx_ = -1;
+            gpu_device_.reset();
+            device_valid_ = false;
         }
 
         // Allocate on target device if needed
@@ -580,56 +616,76 @@ namespace llaminar2
                                                                                 << " (backend device ID: " << backend_device_id << ")");
                 return false;
             }
-            gpu_device_idx_ = legacy_idx; // Store GLOBAL device index
+            gpu_device_ = target_device; // Store the actual DeviceId
+            device_valid_ = false;       // Newly allocated - not yet populated
         }
 
-        // Upload data from host
-        const void *src = raw_host_data_ptr();
-        if (!src)
+        // Upload data from host if device data is stale
+        if (!device_valid_)
         {
-            LOG_ERROR("[CPUTensorBase::ensureOnDevice] Host data pointer is null");
-            target_backend->free(gpu_data_ptr_, backend_device_id);
-            gpu_data_ptr_ = nullptr;
-            gpu_device_idx_ = -1;
-            return false;
+            // Sanity check: host must have valid data if device is stale
+            if (!host_valid_)
+            {
+                LOG_ERROR("[CPUTensorBase::ensureOnDevice] COHERENCE ERROR: Both host and device are invalid!");
+                return false;
+            }
+
+            const void *src = raw_host_data_ptr();
+            if (!src)
+            {
+                LOG_ERROR("[CPUTensorBase::ensureOnDevice] Host data pointer is null");
+                target_backend->free(gpu_data_ptr_, backend_device_id);
+                gpu_data_ptr_ = nullptr;
+                gpu_device_.reset();
+                return false;
+            }
+
+            if (!target_backend->hostToDevice(gpu_data_ptr_, src, bytes, backend_device_id))
+            {
+                LOG_ERROR("[CPUTensorBase::ensureOnDevice] hostToDevice failed");
+                target_backend->free(gpu_data_ptr_, backend_device_id);
+                gpu_data_ptr_ = nullptr;
+                gpu_device_.reset();
+                return false;
+            }
+
+            device_valid_ = true; // Device now has current data
+            // host_valid_ stays true - we uploaded FROM host, so both are now in sync
+
+            LOG_DEBUG("[CPUTensorBase::ensureOnDevice] Uploaded " << bytes
+                                                                  << " bytes to device " << target_device.toString()
+                                                                  << " (backend device ID: " << backend_device_id << ")");
         }
 
-        if (!target_backend->hostToDevice(gpu_data_ptr_, src, bytes, backend_device_id))
-        {
-            LOG_ERROR("[CPUTensorBase::ensureOnDevice] hostToDevice failed");
-            target_backend->free(gpu_data_ptr_, backend_device_id);
-            gpu_data_ptr_ = nullptr;
-            gpu_device_idx_ = -1;
-            return false;
-        }
-
-        host_invalid_ = false; // Host still has valid data (dual residency)
-
-        LOG_DEBUG("[CPUTensorBase::ensureOnDevice] Uploaded " << bytes
-                                                              << " bytes to device " << target_device.toString()
-                                                              << " (backend device ID: " << backend_device_id << ")");
         return true;
     }
 
     bool CPUTensorBase::ensureOnHost()
     {
         // If host is already valid, nothing to do
-        if (!host_invalid_)
+        if (host_valid_)
         {
             return true;
         }
 
-        // If GPU has data, download it
-        if (gpu_data_ptr_ && gpu_device_idx_ >= 0)
+        // Sanity check: device must be valid if host is invalid
+        if (!device_valid_)
         {
-            IBackend *backend = getBackendForGlobalDeviceIdx(gpu_device_idx_);
+            LOG_ERROR("[CPUTensorBase::ensureOnHost] COHERENCE ERROR: Both host and device are invalid!");
+            return false;
+        }
+
+        // If GPU has data, download it
+        if (gpu_data_ptr_ && gpu_device_.has_value())
+        {
+            IBackend *backend = getBackendForDevice(*gpu_device_);
             if (!backend)
             {
-                LOG_ERROR("[CPUTensorBase::ensureOnHost] No backend available for device " << gpu_device_idx_);
+                LOG_ERROR("[CPUTensorBase::ensureOnHost] No backend available for device " << gpu_device_->toString());
                 return false;
             }
 
-            int backend_device_id = getBackendSpecificDeviceId(gpu_device_idx_);
+            int backend_device_id = gpu_device_->gpu_ordinal();
 
             size_t bytes = byte_size();
             void *dst = raw_host_data_ptr();
@@ -645,9 +701,11 @@ namespace llaminar2
                 return false;
             }
 
-            host_invalid_ = false;
+            host_valid_ = true; // Host now has current data
+            // device_valid_ stays true - we downloaded FROM device, so both are now in sync
+
             LOG_DEBUG("[CPUTensorBase::ensureOnHost] Downloaded " << bytes
-                                                                  << " bytes from device " << gpu_device_idx_
+                                                                  << " bytes from device " << gpu_device_->toString()
                                                                   << " (backend device ID: " << backend_device_id << ")");
         }
 
@@ -663,18 +721,19 @@ namespace llaminar2
         }
 
         // Free device memory
-        if (gpu_data_ptr_)
+        if (gpu_data_ptr_ && gpu_device_.has_value())
         {
-            IBackend *backend = getBackendForGlobalDeviceIdx(gpu_device_idx_);
+            IBackend *backend = getBackendForDevice(*gpu_device_);
             if (backend)
             {
-                int backend_device_id = getBackendSpecificDeviceId(gpu_device_idx_);
+                int backend_device_id = gpu_device_->gpu_ordinal();
                 backend->free(gpu_data_ptr_, backend_device_id);
             }
-            gpu_data_ptr_ = nullptr;
             LOG_DEBUG("[CPUTensorBase::releaseDeviceMemory] Released device memory on device "
-                      << gpu_device_idx_);
-            gpu_device_idx_ = -1;
+                      << gpu_device_->toString());
+            gpu_data_ptr_ = nullptr;
+            device_valid_ = false;
+            gpu_device_.reset();
         }
 
         return true;

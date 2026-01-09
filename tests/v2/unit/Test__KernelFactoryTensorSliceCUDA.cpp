@@ -22,6 +22,7 @@
 #include "../../src/v2/tensors/Tensors.h"
 #include "../../src/v2/tensors/TensorSlice.h"
 #include "../../src/v2/backends/ComputeBackend.h"
+#include "../../src/v2/backends/DeviceId.h"
 
 #ifdef HAVE_CUDA
 #include <cuda_runtime.h>
@@ -290,9 +291,18 @@ TEST_F(KernelFactoryTensorSliceCUDATest, CUDADispatchUnwrapsTensorSliceQ4_0)
         GTEST_SKIP() << "No CUDA device available";
     }
 
+    // Find first CUDA device
+    auto cuda_devices = DeviceManager::instance().get_devices_by_type(ComputeBackendType::GPU_CUDA);
+    if (cuda_devices.empty())
+    {
+        GTEST_SKIP() << "No CUDA device in DeviceManager";
+    }
+    DeviceId cuda_device = DeviceId::cuda(DeviceManager::instance().devices()[cuda_devices[0]].device_id);
+
     auto inner = createQ4_0(1024, 896);
-    // Set device to CUDA:0 so KernelFactory uses CUDA dispatch path
-    inner->set_device(1); // Assuming device 1 is CUDA:0 after CPU at index 0
+    // Transfer tensor to CUDA so KernelFactory uses CUDA dispatch path
+    ASSERT_TRUE(inner->ensureOnDevice(cuda_device))
+        << "Failed to transfer tensor to " << cuda_device.toString();
     auto slice = wrapInTensorSlice(std::move(inner), SliceMode::COLUMN_PARALLEL);
     ASSERT_NE(slice, nullptr);
 
@@ -310,8 +320,17 @@ TEST_F(KernelFactoryTensorSliceCUDATest, CUDADispatchUnwrapsTensorSliceQ8_0)
         GTEST_SKIP() << "No CUDA device available";
     }
 
+    // Find first CUDA device
+    auto cuda_devices = DeviceManager::instance().get_devices_by_type(ComputeBackendType::GPU_CUDA);
+    if (cuda_devices.empty())
+    {
+        GTEST_SKIP() << "No CUDA device in DeviceManager";
+    }
+    DeviceId cuda_device = DeviceId::cuda(DeviceManager::instance().devices()[cuda_devices[0]].device_id);
+
     auto inner = createQ8_0(1024, 896);
-    inner->set_device(1); // CUDA:0
+    ASSERT_TRUE(inner->ensureOnDevice(cuda_device))
+        << "Failed to transfer tensor to " << cuda_device.toString();
     auto slice = wrapInTensorSlice(std::move(inner), SliceMode::ROW_PARALLEL);
     ASSERT_NE(slice, nullptr);
 

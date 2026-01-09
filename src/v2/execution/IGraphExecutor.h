@@ -199,12 +199,12 @@ namespace llaminar2
         /**
          * @brief Execute a compute graph with multi-device support
          * @param graph The compute graph to execute
-         * @param contexts Map of device_idx -> DeviceContext
+         * @param contexts Map of DeviceId -> DeviceContext
          * @return true on success
          */
         virtual bool executeMultiDevice(
             ComputeGraph &graph,
-            const std::unordered_map<int, IDeviceContext *> &contexts) = 0;
+            const std::unordered_map<DeviceId, IDeviceContext *> &contexts) = 0;
 
         // =========================================================================
         // Statistics

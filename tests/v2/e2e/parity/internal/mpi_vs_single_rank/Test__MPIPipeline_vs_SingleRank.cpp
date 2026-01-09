@@ -109,8 +109,7 @@ protected:
             config.batch_size = 1;
             config.force_graph = true; // Use Graph path
 
-            auto &dm = DeviceManager::instance();
-            DeviceId cpu_device = DeviceId::fromLegacyIndex(dm.cpuDeviceIndex());
+            DeviceId cpu_device = DeviceId::cpu();
 
             runner_single_ = createInferenceRunner(model_ctx_single_, nullptr, cpu_device, config);
             if (!runner_single_)
@@ -146,8 +145,7 @@ protected:
         config.batch_size = 1;
         config.force_graph = true; // Use Graph path
 
-        auto &dm = DeviceManager::instance();
-        DeviceId cpu_device = DeviceId::fromLegacyIndex(dm.cpuDeviceIndex());
+        DeviceId cpu_device = DeviceId::cpu();
 
         runner_multi_ = createInferenceRunner(model_ctx_multi_, mpi_ctx_, cpu_device, config);
         if (!runner_multi_)
@@ -176,8 +174,7 @@ protected:
         config.batch_size = batch_size;
         config.force_graph = true;
 
-        auto &dm = DeviceManager::instance();
-        DeviceId cpu_device = DeviceId::fromLegacyIndex(dm.cpuDeviceIndex());
+        DeviceId cpu_device = DeviceId::cpu();
 
         return createInferenceRunner(model_ctx, mpi_ctx, cpu_device, config);
     }

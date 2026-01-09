@@ -19,7 +19,6 @@
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/DeviceContext.h"
 #include "tensors/Tensors.h"
-#include "tensors/TensorValidation.h"
 #include "tensors/TensorVerification.h" // For VerificationFailure exception
 #include <cmath>
 
@@ -336,9 +335,7 @@ namespace llaminar2::test
         GraphExecutor executor(config);
         CPUDeviceContext ctx(DeviceId::cpu());
 
-        EXPECT_THROW({
-            executor.execute(graph, &ctx);
-        }, verification::VerificationFailure);
+        EXPECT_THROW({ executor.execute(graph, &ctx); }, verification::VerificationFailure);
     }
 
     TEST_F(GraphExecutorValidationTest, NaNOutput_WarnsButPasses_WhenFailDisabled)
@@ -394,9 +391,7 @@ namespace llaminar2::test
         GraphExecutor executor(config);
         CPUDeviceContext ctx(DeviceId::cpu());
 
-        EXPECT_THROW({
-            executor.execute(graph, &ctx);
-        }, verification::VerificationFailure);
+        EXPECT_THROW({ executor.execute(graph, &ctx); }, verification::VerificationFailure);
     }
 
     TEST_F(GraphExecutorValidationTest, ValidationDisabled_SkipsChecks)

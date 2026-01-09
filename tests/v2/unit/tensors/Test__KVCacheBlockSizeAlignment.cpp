@@ -26,7 +26,7 @@
 
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
-#include "tensors/CPUKVCache.h"
+#include "kernels/cpu/CPUKVCache.h"
 #include "tensors/BlockStructures.h"
 #include "utils/MPIContext.h"
 #include "backends/DeviceId.h"

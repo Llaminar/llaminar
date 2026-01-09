@@ -243,8 +243,7 @@ namespace llaminar2
         TensorType native_type() const override { return inner()->native_type(); }
         const std::vector<size_t> &shape() const override { return inner()->shape(); }
         DeviceId home_device() const override { return inner()->home_device(); }
-        bool set_device(int device_idx) override { return inner()->set_device(device_idx); }
-        bool is_on_device(int device_idx) const override { return inner()->is_on_device(device_idx); }
+        bool is_on_device(DeviceId device) const override { return inner()->is_on_device(device); }
         const float *data() const override { return inner()->data(); }
         float *mutable_data() override { return inner()->mutable_data(); }
         bool copyFrom(const TensorBase *src) override { return inner()->copyFrom(src); }

@@ -103,7 +103,7 @@ namespace llaminar2
 
             // Delegate to kernel's apply_tensor - handles all type dispatch internally
             if (!kernel->apply_tensor(embed_table_base, flat_token_ids.data(), total_positions,
-                                      params_.d_model, output_base, params_.mpi_ctx, params_.device_id.toLegacyIndex()))
+                                      params_.d_model, output_base, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex()))
             {
                 LOG_ERROR("[EmbeddingStage] Kernel apply_tensor failed (batched)");
                 return false;
@@ -128,11 +128,21 @@ namespace llaminar2
         {
             // Single sequence input: delegate directly to kernel
             if (!kernel->apply_tensor(embed_table_base, params_.token_ids, params_.num_tokens,
-                                      params_.d_model, output_base, params_.mpi_ctx, params_.device_id.toLegacyIndex()))
+                                      params_.d_model, output_base, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex()))
             {
                 LOG_ERROR("[EmbeddingStage] Kernel apply_tensor failed");
                 return false;
             }
+        }
+
+        // DEBUG: Log embedding output for parity debugging
+        const float *out_data = params_.output->fp32_data();
+        if (out_data && params_.num_tokens > 0)
+        {
+            LOG_DEBUG("[EmbeddingStage] output[0:8]=" << std::setprecision(6)
+                                                      << out_data[0] << "," << out_data[1] << "," << out_data[2] << "," << out_data[3] << ","
+                                                      << out_data[4] << "," << out_data[5] << "," << out_data[6] << "," << out_data[7]
+                                                      << " device_id=" << params_.device_id.to_string());
         }
 
         return true;
@@ -306,8 +316,23 @@ namespace llaminar2
 
     bool EmbeddingStage::supportsBackend(ComputeBackendType backend) const
     {
-        // Embedding is currently CPU-only (memcpy-based)
-        return backend == ComputeBackendType::CPU;
+        // EmbeddingStage supports GPU backends when CUDA is enabled
+        // KernelFactory::createEmbedding() provides CUDA implementation
+        switch (backend)
+        {
+        case ComputeBackendType::CPU:
+            return true;
+#ifdef HAVE_CUDA
+        case ComputeBackendType::GPU_CUDA:
+            return true; // CUDAEmbeddingKernelT is available via KernelFactory
+#endif
+#ifdef HAVE_ROCM
+        case ComputeBackendType::GPU_ROCM:
+            return false; // ROCm embedding not yet implemented
+#endif
+        default:
+            return false;
+        }
     }
 
     StageDumpInfo EmbeddingStage::getDumpInfo() const
@@ -323,7 +348,7 @@ namespace llaminar2
         info.addScalarInt("num_tokens", params_.num_tokens);
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarInt("vocab_size", params_.vocab_size);
-        info.addScalarInt("device_id", params_.device_id.toLegacyIndex());
+        info.addScalarInt("device_id", params_.device_id.toKernelDeviceIndex());
 
         return info;
     }

@@ -34,7 +34,7 @@
 #include "../../backends/DeviceId.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/TensorFactory.h"
-#include "../../tensors/CPUKVCache.h"
+#include "../../kernels/cpu/CPUKVCache.h"
 #include "../../loaders/ModelContext.h"
 #include "../../utils/MPIContext.h"
 #include "Qwen2Schema.h"

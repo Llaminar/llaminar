@@ -500,6 +500,20 @@ namespace llaminar2
         //
         // CRITICAL: Use the LOGICAL dimensions (rows, cols) to compute byte_size,
         // NOT tensor->size_bytes() which may reflect a larger pre-allocated buffer
+
+        // CRITICAL: Ensure host data is current before reading for verification
+        // GPU execution marks device as authoritative; we must sync back to host
+        // to read correct data for verification/dumping
+        if (tensor)
+        {
+            if (auto *cpu_tensor = dynamic_cast<const CPUTensorBase *>(tensor))
+            {
+                // const_cast is safe here: ensureOnHost() only modifies internal cache state
+                // and downloads GPU data to host - it doesn't change the tensor's logical content
+                const_cast<CPUTensorBase *>(cpu_tensor)->ensureOnHost();
+            }
+        }
+
         const void *data = tensor ? tensor->raw_data() : nullptr;
         const char *dtype = tensor ? tensor->dtype_name() : "FP32";
 

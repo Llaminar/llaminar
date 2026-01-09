@@ -103,7 +103,7 @@ namespace llaminar2::test
         {
             auto tensor = std::make_unique<Q16_1Tensor>(
                 std::vector<size_t>{1, static_cast<size_t>(fp32_data.size())},
-                block_size, 0);
+                block_size, DeviceId::cpu());
             tensor->copyFrom_fp32(fp32_data.data());
             return tensor;
         }

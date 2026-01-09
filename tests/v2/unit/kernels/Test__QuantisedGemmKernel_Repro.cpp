@@ -34,8 +34,7 @@ public:
     }
     TensorType native_type() const override { return TensorType::Q4_1; } // Pretend to be Q4_1
     DeviceId home_device() const override { return DeviceId::cpu(); }
-    bool set_device(int) override { return false; }
-    bool is_on_device(int) const override { return false; }
+    bool is_on_device(DeviceId) const override { return false; }
     const float *data() const override { return nullptr; } // Not needed for this test
     float *mutable_data() override { return nullptr; }
     bool copyFrom(const TensorBase *) override { return false; }

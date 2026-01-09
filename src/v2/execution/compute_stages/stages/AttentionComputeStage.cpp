@@ -7,7 +7,7 @@
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
-#include "../../../tensors/CPUKVCache.h"
+#include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include <limits>
@@ -349,7 +349,7 @@ namespace llaminar2
         info.addScalarInt("head_dim", params_.head_dim);
         info.addScalarBool("causal", params_.causal);
         info.addScalarInt("window_size", params_.window_size);
-        info.addScalarInt("device_id", params_.device_id.toLegacyIndex());
+        info.addScalarInt("device_id", params_.device_id.toKernelDeviceIndex());
 
         // Add attention mode info (as int - PREFILL=0, DECODE=1, BATCHED_DECODE=2, CHUNKED_PREFILL=3)
         AttentionMode mode = params_.auto_detect_mode

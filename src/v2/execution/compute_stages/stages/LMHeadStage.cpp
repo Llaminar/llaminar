@@ -49,6 +49,9 @@ namespace llaminar2
             return false;
         }
 
+        // Debug: show GPU pointers before any fp32_data() call that might trigger sync
+        LOG_DEBUG("[LMHeadStage] hidden_states gpu_data_ptr=" << hidden_states->gpu_data_ptr());
+
         // Debug: dump hidden states input at last position
         {
             const float *hidden = hidden_states->fp32_data();
@@ -102,6 +105,17 @@ namespace llaminar2
             const float *logits_data = logits->fp32_data();
             if (logits_data && params_.seq_len > 0)
             {
+                // Print first row (row 0)
+                LOG_DEBUG("[LMHeadStage] Local logits (row 0, first 8): "
+                          << logits_data[0] << ","
+                          << logits_data[1] << ","
+                          << logits_data[2] << ","
+                          << logits_data[3] << ","
+                          << logits_data[4] << ","
+                          << logits_data[5] << ","
+                          << logits_data[6] << ","
+                          << logits_data[7]);
+
                 // Get last row logits
                 size_t last_row_offset = (params_.seq_len - 1) * params_.vocab_size;
                 LOG_DEBUG("[LMHeadStage] Local logits (last row, first 8): "
@@ -196,7 +210,7 @@ namespace llaminar2
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarInt("vocab_size", params_.vocab_size);
         info.addScalarBool("has_bias", params_.bias != nullptr);
-        info.addScalarInt("device_id", params_.device_id.toLegacyIndex());
+        info.addScalarInt("device_id", params_.device_id.toKernelDeviceIndex());
 
         return info;
     }

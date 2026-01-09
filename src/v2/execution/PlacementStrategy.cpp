@@ -7,6 +7,7 @@
 
 #include "PlacementStrategy.h"
 #include "../utils/Logger.h"
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -17,9 +18,10 @@ namespace llaminar2
 
     bool CPUOnlyStrategy::isApplicable(const PlacementInput &input) const
     {
-        // CPU-only is always applicable (every system has a CPU)
-        // But we prefer other strategies if GPU is available and not forced
-        return input.force_cpu_only || !input.any_rank_has_gpu;
+        // CPU-only is ALWAYS applicable (every system has a CPU)
+        // User can explicitly choose CPU even when GPU is available
+        (void)input; // unused
+        return true;
     }
 
     PlacementPlan CPUOnlyStrategy::compute(const PlacementInput &input) const
@@ -85,44 +87,11 @@ namespace llaminar2
 
     PlacementPlan GPUFirstStrategy::compute(const PlacementInput &input) const
     {
-        // For now, GPUFirstStrategy is a placeholder that falls back to CPU
-        // This will be implemented in Phase G1+
-
-        LOG_WARN("[GPUFirstStrategy] GPU placement not yet implemented, falling back to CPU");
-
-        PlacementPlan plan;
-
-        // Copy input parameters
-        plan.n_layers = input.n_layers;
-        plan.model_memory_bytes = input.estimated_memory_bytes;
-        plan.architecture = input.architecture;
-        plan.world_size = input.world_size;
-        plan.ranks_per_node = input.ranks_per_node;
-        plan.node_count = input.node_count;
-        plan.has_gpu = false; // Not using GPU yet
-        plan.total_gpu_memory = input.total_gpu_memory;
-        plan.strategy_name = name() + " (CPU fallback)";
-
-        // For now, just do CPU placement
-        plan.global.embedding_device = PlacementDevice::CPU;
-        plan.global.lm_head_device = PlacementDevice::CPU;
-        plan.global.final_norm_device = PlacementDevice::CPU;
-        plan.global.shard_embedding = (input.world_size > 1);
-        plan.global.shard_lm_head = (input.world_size > 1);
-
-        plan.layers.resize(input.n_layers);
-        for (int layer = 0; layer < input.n_layers; ++layer)
-        {
-            LayerPlacement &lp = plan.layers[layer];
-            lp.layer_idx = layer;
-            lp.owner_rank = 0;
-            lp.device = PlacementDevice::CPU;
-            lp.attention_device = PlacementDevice::CPU;
-            lp.ffn_device = PlacementDevice::CPU;
-            lp.split_attention_ffn = false;
-        }
-
-        return plan;
+        // NO SILENT FALLBACK: GPU placement must be implemented or fail loudly
+        // GPUFirstStrategy is not yet implemented - throw to make this clear
+        throw std::runtime_error(
+            "[GPUFirstStrategy] GPU placement strategy requested but not yet implemented. "
+            "Use 'CPUOnly' strategy or implement GPU placement in Phase G1+.");
     }
 
     // =========================================================================
@@ -146,18 +115,26 @@ namespace llaminar2
 
     std::unique_ptr<PlacementStrategy> PlacementStrategyFactory::autoSelect(const PlacementInput &input)
     {
-        // Priority 1: User-specified strategy
+        // Priority 1: User-specified strategy - NO SILENT FALLBACK
         if (!input.preferred_strategy.empty())
         {
             auto strategy = create(input.preferred_strategy);
-            if (strategy && strategy->isApplicable(input))
+            if (!strategy)
             {
-                LOG_DEBUG("[PlacementStrategyFactory] Using user-specified strategy: "
-                          << input.preferred_strategy);
-                return strategy;
+                throw std::runtime_error(
+                    "[PlacementStrategyFactory] Unknown strategy: '" + input.preferred_strategy +
+                    "'. Valid strategies: CPUOnly, GPUFirst.");
             }
-            LOG_WARN("[PlacementStrategyFactory] User strategy '" << input.preferred_strategy
-                                                                  << "' not applicable, auto-selecting");
+            if (!strategy->isApplicable(input))
+            {
+                throw std::runtime_error(
+                    "[PlacementStrategyFactory] Strategy '" + input.preferred_strategy +
+                    "' is not applicable for current configuration. "
+                    "Check GPU availability and force_cpu_only flag.");
+            }
+            LOG_DEBUG("[PlacementStrategyFactory] Using user-specified strategy: "
+                      << input.preferred_strategy);
+            return strategy;
         }
 
         // Priority 2: Force flags
@@ -168,13 +145,18 @@ namespace llaminar2
         }
 
         // Priority 3: Auto-select based on device availability
-        // For now, always use CPU-only until GPU support is implemented
-        if (input.any_rank_has_gpu && !input.force_cpu_only)
+        // For GPU, we need GPU strategies to be implemented first
+        if (input.any_rank_has_gpu)
         {
-            LOG_DEBUG("[PlacementStrategyFactory] GPU available but GPU strategies "
-                      "not yet implemented, using CPUOnly");
+            // NO SILENT FALLBACK: If auto-selecting and GPU available, fail loudly
+            // User should either use force_cpu_only or wait for GPU implementation
+            throw std::runtime_error(
+                "[PlacementStrategyFactory] GPU detected but GPU placement strategies not yet implemented. "
+                "Set force_cpu_only=true or use CPUOnly strategy explicitly.");
         }
 
+        // No GPU available, CPU-only is appropriate
+        LOG_DEBUG("[PlacementStrategyFactory] No GPU available, using CPUOnly");
         return std::make_unique<CPUOnlyStrategy>();
     }
 

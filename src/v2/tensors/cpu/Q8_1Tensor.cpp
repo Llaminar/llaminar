@@ -65,9 +65,9 @@ namespace llaminar2
     }
 
     // Construct from Q8_1Block array (for testing and direct block construction)
-    Q8_1Tensor::Q8_1Tensor(const std::vector<size_t> &shape, const Q8_1Block *blocks, size_t num_blocks, int device_idx)
+    Q8_1Tensor::Q8_1Tensor(const std::vector<size_t> &shape, const Q8_1Block *blocks, size_t num_blocks, DeviceId device)
         : shape_(shape), is_view_(false), raw_data_(), raw_data_ptr_(nullptr),
-          view_byte_offset_(0), parent_(nullptr), device_(DeviceId::fromLegacyIndex(device_idx)), device_blocks_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_(device), device_blocks_(nullptr),
           is_mutable_(true), cache_dirty_(false)
     {
         if (shape.empty())
@@ -135,9 +135,9 @@ namespace llaminar2
     // Mutable Q8_1 tensors have mutable Q8_1 BLOCKS, not an FP32 cache.
     // Kernels must write directly to Q8_1 blocks via mutable_q8_1_blocks().
     // Do NOT use mutable_data() - it throws for Q8_1 tensors.
-    Q8_1Tensor::Q8_1Tensor(const std::vector<size_t> &shape, int device_idx)
+    Q8_1Tensor::Q8_1Tensor(const std::vector<size_t> &shape, DeviceId device)
         : shape_(shape), is_view_(false), raw_data_(), raw_data_ptr_(nullptr),
-          view_byte_offset_(0), parent_(nullptr), device_(DeviceId::fromLegacyIndex(device_idx)), device_blocks_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_(device), device_blocks_(nullptr),
           is_mutable_(true), cache_dirty_(false)
     {
         if (shape.empty())
@@ -279,13 +279,6 @@ namespace llaminar2
 
         return std::shared_ptr<Q8_1Tensor>(new Q8_1Tensor(
             new_shape, root_data_ptr, root_byte_offset, root_parent));
-    }
-
-    bool Q8_1Tensor::set_device(int device_idx)
-    {
-        // TODO: Implement device transfer
-        device_ = DeviceId::fromLegacyIndex(device_idx);
-        return true;
     }
 
     const float *Q8_1Tensor::data() const
@@ -1087,7 +1080,7 @@ namespace llaminar2
 
         // Create new Q8_1Tensor with sliced shape
         std::vector<size_t> new_shape = {rows, k_size};
-        auto result = std::make_shared<Q8_1Tensor>(new_shape, device_.toLegacyIndex());
+        auto result = std::make_shared<Q8_1Tensor>(new_shape, device_);
 
         // Get source and destination block pointers
         const uint8_t *src_data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();

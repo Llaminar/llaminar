@@ -228,16 +228,6 @@ namespace llaminar2
 
     // ========== PlacementPlan Integration ==========
 
-    namespace
-    {
-        // Helper to convert PlacementDevice enum to DeviceId
-        DeviceId toDeviceId(PlacementDevice device)
-        {
-            int legacy_idx = toDeviceIndex(device);
-            return DeviceId::fromLegacyIndex(legacy_idx);
-        }
-    } // anonymous namespace
-
     void WeightPlacementMap::applyPlan(const PlacementPlan &plan)
     {
         // Clear existing mappings
@@ -273,8 +263,8 @@ namespace llaminar2
             if (layer.split_attention_ffn)
             {
                 // Separate devices for attention and FFN
-                setAttentionDevice(layer_idx, DeviceId::fromLegacyIndex(layer.getAttentionDeviceIdx()));
-                setFFNDevice(layer_idx, DeviceId::fromLegacyIndex(layer.getFFNDeviceIdx()));
+                setAttentionDevice(layer_idx, layer.getAttentionDevice());
+                setFFNDevice(layer_idx, layer.getFFNDevice());
             }
             else
             {

@@ -179,13 +179,6 @@ namespace llaminar2
 
     // ========== Device Management ==========
 
-    bool IQ4_NLTensor::set_device(int device_idx)
-    {
-        // TODO: Implement device transfer for quantized tensors
-        LOG_DEBUG("[IQ4_NLTensor] set_device not yet implemented");
-        device_ = DeviceId::fromLegacyIndex(device_idx);
-        return true;
-    }
 
     // ========== Data Access ==========
 

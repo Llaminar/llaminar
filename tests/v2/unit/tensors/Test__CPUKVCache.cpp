@@ -8,7 +8,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../../src/v2/tensors/CPUKVCache.h"
+#include "../../../../src/v2/kernels/cpu/CPUKVCache.h"
 #include "../../../../src/v2/tensors/Tensors.h"
 #include "../../../../src/v2/utils/MPIContext.h"
 #include "../../../../src/v2/backends/DeviceId.h"

@@ -279,83 +279,10 @@ namespace llaminar2
             return true;
         }
 
-        // FP32 output path (original implementation)
-        // Extract FP32 data from tensors - works for all tensor types via fp32_data()
-        // NOTE: For GPU execution, we need device pointers
-        const float *input_fp32 = nullptr;
-        float *output_q_fp32 = nullptr;
-        float *output_k_fp32 = nullptr;
-        float *output_v_fp32 = nullptr;
-
-        // Cast to FP32Tensor to access GPU methods
-        auto *input_t = dynamic_cast<FP32Tensor *>(const_cast<ITensor *>(params_.input));
-        auto *output_q_t = dynamic_cast<FP32Tensor *>(params_.output_q);
-        auto *output_k_t = dynamic_cast<FP32Tensor *>(params_.output_k);
-        auto *output_v_t = dynamic_cast<FP32Tensor *>(params_.output_v);
-
-        const bool gpu_execution = params_.device_id.is_gpu();
-
-        if (gpu_execution)
-        {
-            // GPU path: Use device pointers
-            if (!input_t || !output_q_t || !output_k_t || !output_v_t)
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] GPU execution requires FP32Tensor types");
-                return false;
-            }
-
-            // Ensure input is synced to device
-            if (!input_t->ensureOnDevice(params_.device_id))
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] Failed to ensure input on device " << params_.device_id.toString());
-                return false;
-            }
-
-            // Ensure output buffers are allocated on device
-            if (!output_q_t->ensureOnDevice(params_.device_id) ||
-                !output_k_t->ensureOnDevice(params_.device_id) ||
-                !output_v_t->ensureOnDevice(params_.device_id))
-            {
-                LOG_ERROR("[FusedQKVGEMMStage] Failed to ensure outputs on device " << params_.device_id.toString());
-                return false;
-            }
-
-            // Get device pointers
-            input_fp32 = static_cast<const float *>(input_t->gpu_data_ptr());
-            output_q_fp32 = static_cast<float *>(output_q_t->gpu_data_ptr());
-            output_k_fp32 = static_cast<float *>(output_k_t->gpu_data_ptr());
-            output_v_fp32 = static_cast<float *>(output_v_t->gpu_data_ptr());
-
-            LOG_DEBUG("[FusedQKVGEMMStage] GPU execution using device pointers (" << params_.device_id.toString() << ")");
-        }
-        else
-        {
-            // CPU path: Use host pointers
-            input_fp32 = params_.input->fp32_data();
-            output_q_fp32 = params_.output_q->mutable_data();
-            output_k_fp32 = params_.output_k->mutable_data();
-            output_v_fp32 = params_.output_v->mutable_data();
-        }
-
-        if (!input_fp32 || !output_q_fp32 || !output_k_fp32 || !output_v_fp32)
-        {
-            LOG_ERROR("[FusedQKVGEMMStage] Failed to get FP32 data from tensors");
-            return false;
-        }
-
-        // DEBUG: Log input pointer and first values for parity testing
-        LOG_TRACE("[FusedQKVGEMMStage] input_fp32 ptr=" << static_cast<const void *>(input_fp32)
-                                                        << " input[0:4]=" << std::setprecision(10)
-                                                        << input_fp32[0] << "," << input_fp32[1] << ","
-                                                        << input_fp32[2] << "," << input_fp32[3]);
-
-        LOG_DEBUG("[FusedQKVGEMMStage] input_type=" << params_.input->dtype_name()
-                                                    << " output_type=" << params_.output_q->dtype_name());
-
         // Cast weights to TensorBase for KernelFactory
-        auto *wq_base_fp32 = requireTensorBase(params_.wq, "wq");
-        auto *wk_base_fp32 = requireTensorBase(params_.wk, "wk");
-        auto *wv_base_fp32 = requireTensorBase(params_.wv, "wv");
+        auto *wq_base = requireTensorBase(params_.wq, "wq");
+        auto *wk_base = requireTensorBase(params_.wk, "wk");
+        auto *wv_base = requireTensorBase(params_.wv, "wv");
 
         // Get the target device type from device_id
         DeviceType target_dev_type = params_.device_id.is_gpu()
@@ -363,9 +290,9 @@ namespace llaminar2
                                          : DeviceType::CPU;
 
         // Get cached kernels from KernelFactory with device targeting
-        auto *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq_base_fp32, target_dev_type);
-        auto *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk_base_fp32, target_dev_type);
-        auto *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv_base_fp32, target_dev_type);
+        auto *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq_base, target_dev_type);
+        auto *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk_base, target_dev_type);
+        auto *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv_base, target_dev_type);
 
         if (!gemm_q || !gemm_k || !gemm_v)
         {
@@ -373,44 +300,89 @@ namespace llaminar2
             return false;
         }
 
-        // Build projection descriptors using device-agnostic interface
-        // Pass through bias pointers from params_
-        std::vector<ITensorGemm::FusedProjectionDesc> projections = {
-            {gemm_q, output_q_fp32, params_.n_q, params_.bias_q, nullptr, false, "Q"},
-            {gemm_k, output_k_fp32, params_.n_k, params_.bias_k, nullptr, false, "K"},
-            {gemm_v, output_v_fp32, params_.n_v, params_.bias_v, nullptr, false, "V"}};
+        const bool gpu_execution = params_.device_id.is_gpu();
+        bool success = false;
 
-        // Use the interface method - kernel decides if it can do optimized fusion
-        // Note: We use gemm_q's multiply_fused since all kernels should be same type
-        bool success = gemm_q->multiply_fused(
-            input_fp32,
-            projections,
-            params_.m,
-            params_.k);
+        if (gpu_execution)
+        {
+            // GPU path: Use tensor-aware API - kernel handles device placement
+            LOG_DEBUG("[FusedQKVGEMMStage] Using tensor-aware GPU path");
+
+            // Cast ITensor* to TensorBase* for tensor-aware API
+            auto *input_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.input));
+            auto *output_q_base = dynamic_cast<TensorBase *>(params_.output_q);
+            auto *output_k_base = dynamic_cast<TensorBase *>(params_.output_k);
+            auto *output_v_base = dynamic_cast<TensorBase *>(params_.output_v);
+
+            if (!input_base || !output_q_base || !output_k_base || !output_v_base)
+            {
+                LOG_ERROR("[FusedQKVGEMMStage] GPU path requires TensorBase-derived types");
+                return false;
+            }
+
+            // Build tensor projection descriptors
+            std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                {gemm_q, output_q_base, params_.n_q, nullptr, nullptr, false, "Q"},
+                {gemm_k, output_k_base, params_.n_k, nullptr, nullptr, false, "K"},
+                {gemm_v, output_v_base, params_.n_v, nullptr, nullptr, false, "V"}};
+
+            // Use tensor-aware fused API - handles all device sync internally
+            success = gemm_q->multiply_fused_tensor(
+                input_base,
+                projections,
+                params_.m,
+                params_.k);
+
+            if (success)
+            {
+                LOG_DEBUG("[FusedQKVGEMMStage] GPU execution complete");
+            }
+        }
+        else
+        {
+            // CPU path: Use raw pointer API
+            const float *input_fp32 = params_.input->fp32_data();
+            float *output_q_fp32 = params_.output_q->mutable_data();
+            float *output_k_fp32 = params_.output_k->mutable_data();
+            float *output_v_fp32 = params_.output_v->mutable_data();
+
+            if (!input_fp32 || !output_q_fp32 || !output_k_fp32 || !output_v_fp32)
+            {
+                LOG_ERROR("[FusedQKVGEMMStage] Failed to get FP32 data from tensors");
+                return false;
+            }
+
+            LOG_DEBUG("[FusedQKVGEMMStage] input_type=" << params_.input->dtype_name()
+                                                        << " output_type=" << params_.output_q->dtype_name());
+
+            // Build projection descriptors for raw pointer API
+            std::vector<ITensorGemm::FusedProjectionDesc> projections = {
+                {gemm_q, output_q_fp32, params_.n_q, params_.bias_q, nullptr, false, "Q"},
+                {gemm_k, output_k_fp32, params_.n_k, params_.bias_k, nullptr, false, "K"},
+                {gemm_v, output_v_fp32, params_.n_v, params_.bias_v, nullptr, false, "V"}};
+
+            success = gemm_q->multiply_fused(
+                input_fp32,
+                projections,
+                params_.m,
+                params_.k);
+
+            if (success)
+            {
+                // Debug: Log Q output for comparison
+                LOG_TRACE("[FusedQKVGEMMStage] Q output[0:8]=" << std::setprecision(10)
+                                                               << output_q_fp32[0] << "," << output_q_fp32[1] << ","
+                                                               << output_q_fp32[2] << "," << output_q_fp32[3] << ","
+                                                               << output_q_fp32[4] << "," << output_q_fp32[5] << ","
+                                                               << output_q_fp32[6] << "," << output_q_fp32[7]
+                                                               << " n_q=" << params_.n_q);
+            }
+        }
 
         if (!success)
         {
-            LOG_ERROR("[FusedQKVGEMMStage] multiply_fused failed");
+            LOG_ERROR("[FusedQKVGEMMStage] GEMM failed");
             return false;
-        }
-
-        // After GPU execution, mark outputs as device-dirty
-        // This tells the tensor that device has latest data, host is stale
-        if (gpu_execution)
-        {
-            output_q_t->mark_device_dirty();
-            output_k_t->mark_device_dirty();
-            output_v_t->mark_device_dirty();
-            LOG_DEBUG("[FusedQKVGEMMStage] Marked Q/K/V outputs as device-dirty");
-        }
-
-        // Debug: Log Q output for comparison (only for CPU - device memory not accessible)
-        if (!gpu_execution)
-        {
-            LOG_TRACE("[FusedQKVGEMMStage] Q output[0:8]=" << std::setprecision(10)
-                                                           << output_q_fp32[0] << "," << output_q_fp32[1] << "," << output_q_fp32[2] << "," << output_q_fp32[3] << ","
-                                                           << output_q_fp32[4] << "," << output_q_fp32[5] << "," << output_q_fp32[6] << "," << output_q_fp32[7]
-                                                           << " n_q=" << params_.n_q);
         }
 
         LOG_DEBUG("[FusedQKVGEMMStage] Complete");

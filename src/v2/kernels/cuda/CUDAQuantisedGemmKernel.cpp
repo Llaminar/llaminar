@@ -24,6 +24,7 @@
 
 #include "CUDAQuantisedGemmKernel.h"
 #include "backends/ComputeBackend.h" // DeviceManager
+#include "backends/DeviceId.h"       // DeviceId
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.
 #include "tensors/BlockStructures.h" // Q8_1Block
 #include "tensors/KernelSnapshotInfo.h"
@@ -73,7 +74,7 @@ namespace llaminar2
                 int M, int N, int K,
                 int cuda_device_id);
 
-            // Apply output scaling: C_fp32 = C_int32 * scales_A * scales_B
+            // Apply output scaling: C_fp32 = C_int32 * scales_A * scales_B + bias
             bool cudaQuantGemm_applyScaling(
                 const int32_t *d_C_int32, // [M x N]
                 float *d_C_fp32,          // [M x N] output
@@ -82,6 +83,7 @@ namespace llaminar2
                 int M, int N,
                 float alpha, float beta,
                 const float *d_C_existing, // For beta != 0
+                const float *d_bias,       // [N] optional bias
                 int cuda_device_id);
 
             // Quantize FP32 activations to INT8
@@ -94,6 +96,13 @@ namespace llaminar2
 
             // Free device memory
             void cudaQuantGemm_freeDevice(void *d_ptr);
+
+            // Memory management helpers for multiply_fused
+            bool cudaQuantGemm_allocFloat(float **d_ptr, size_t count, int cuda_device_id);
+            bool cudaQuantGemm_copyHostToDevice(float *d_dst, const float *h_src, size_t count, int cuda_device_id);
+            bool cudaQuantGemm_copyDeviceToHost(float *h_dst, const float *d_src, size_t count, int cuda_device_id);
+            bool cudaQuantGemm_copyInt32DeviceToHost(int32_t *h_dst, const int32_t *d_src, size_t count, int cuda_device_id);
+            bool cudaQuantGemm_setDevice(int cuda_device_id);
         }
 
         // =====================================================================
@@ -500,6 +509,30 @@ namespace llaminar2
                 return false;
             }
 
+            // Ensure tensors are on the correct CUDA device
+            DeviceId target_device = DeviceId::cuda(cuda_device_id_);
+
+            // For FP32 tensors, ensure they're on device
+            if (A->native_type() == TensorType::FP32)
+            {
+                auto *fp32_A = dynamic_cast<FP32Tensor *>(const_cast<TensorBase *>(A));
+                if (fp32_A && !fp32_A->ensureOnDevice(target_device))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_tensor] Failed to ensure input A on device");
+                    return false;
+                }
+            }
+
+            if (C->native_type() == TensorType::FP32)
+            {
+                auto *fp32_C = dynamic_cast<FP32Tensor *>(C);
+                if (fp32_C && !fp32_C->ensureOnDevice(target_device))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_tensor] Failed to ensure output C on device");
+                    return false;
+                }
+            }
+
             // Ensure weights are converted
             ensureWeightsConverted();
 
@@ -617,6 +650,132 @@ namespace llaminar2
         }
 
         // =====================================================================
+        // ITensorGemm interface - multiply_fused() for fused projection stages
+        // =====================================================================
+
+        bool CUDAQuantisedGemmKernel::multiply_fused(
+            const float *input,
+            const std::vector<FusedProjectionDesc> &projections,
+            int m, int k,
+            const MPIContext * /*mpi_ctx*/,
+            int /*device_idx*/)
+        {
+            if (!input || projections.empty())
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused] Null input or empty projections");
+                return false;
+            }
+
+            if (m <= 0 || k <= 0)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused] Invalid dimensions: m=" << m << " k=" << k);
+                return false;
+            }
+
+            cudaQuantGemm_setDevice(cuda_device_id_);
+
+            // Step 1: Copy input from host to device
+            const size_t input_count = static_cast<size_t>(m) * k;
+            float *d_input = nullptr;
+            if (!cudaQuantGemm_allocFloat(&d_input, input_count, cuda_device_id_))
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused] Failed to allocate device input");
+                return false;
+            }
+
+            if (!cudaQuantGemm_copyHostToDevice(d_input, input, input_count, cuda_device_id_))
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused] Failed to copy input to device");
+                cudaQuantGemm_freeDevice(d_input);
+                return false;
+            }
+
+            // Step 2: Execute each projection
+            bool all_success = true;
+            for (size_t i = 0; i < projections.size() && all_success; ++i)
+            {
+                const auto &proj = projections[i];
+                if (!proj.kernel || !proj.output)
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused] Projection " << i << " has null kernel or output");
+                    all_success = false;
+                    break;
+                }
+
+                const int n = proj.n;
+                const size_t output_count = static_cast<size_t>(m) * n;
+
+                // Allocate device output
+                float *d_output = nullptr;
+                if (!cudaQuantGemm_allocFloat(&d_output, output_count, cuda_device_id_))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused] Failed to allocate device output for projection " << i);
+                    all_success = false;
+                    break;
+                }
+
+                // Get the CUDA kernel for this projection
+                auto *cuda_kernel = dynamic_cast<CUDAQuantisedGemmKernel *>(proj.kernel);
+                if (!cuda_kernel)
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused] Projection " << i
+                                                                                      << " kernel is not a CUDAQuantisedGemmKernel");
+                    cudaQuantGemm_freeDevice(d_output);
+                    all_success = false;
+                    break;
+                }
+
+                // Upload bias to device if present
+                float *d_bias = nullptr;
+                if (proj.bias)
+                {
+                    if (!cudaQuantGemm_allocFloat(&d_bias, n, cuda_device_id_))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused] Failed to allocate device bias for projection " << i);
+                        cudaQuantGemm_freeDevice(d_output);
+                        all_success = false;
+                        break;
+                    }
+                    if (!cudaQuantGemm_copyHostToDevice(d_bias, proj.bias, n, cuda_device_id_))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused] Failed to copy bias to device for projection " << i);
+                        cudaQuantGemm_freeDevice(d_bias);
+                        cudaQuantGemm_freeDevice(d_output);
+                        all_success = false;
+                        break;
+                    }
+                }
+
+                // Run the GEMM with device pointers (with fused bias)
+                bool success = cuda_kernel->multiply_fp32_to_fp32_with_bias(d_input, d_output, d_bias, m, n, k, 1.0f, 0.0f);
+                if (d_bias)
+                {
+                    cudaQuantGemm_freeDevice(d_bias);
+                }
+                if (!success)
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused] GEMM failed for projection " << i);
+                    cudaQuantGemm_freeDevice(d_output);
+                    all_success = false;
+                    break;
+                }
+
+                // Copy output back to host
+                if (!cudaQuantGemm_copyDeviceToHost(proj.output, d_output, output_count, cuda_device_id_))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused] Failed to copy output from device for projection " << i);
+                    cudaQuantGemm_freeDevice(d_output);
+                    all_success = false;
+                    break;
+                }
+                cudaQuantGemm_freeDevice(d_output);
+            }
+
+            cudaQuantGemm_freeDevice(d_input);
+            return all_success;
+        }
+
+        // =====================================================================
         // Internal dispatch methods
         // =====================================================================
 
@@ -645,6 +804,116 @@ namespace llaminar2
             int m, int n, int k,
             float alpha, float beta)
         {
+            LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] m=" << m << " n=" << n << " k=" << k
+                                                                            << " alpha=" << alpha << " beta=" << beta
+                                                                            << " d_A=" << static_cast<const void *>(d_A)
+                                                                            << " d_C=" << static_cast<void *>(d_C));
+
+            // Ensure weights converted and work buffers allocated
+            ensureWeightsConverted();
+            ensureWorkBuffers(m);
+
+            // Debug: Sample scales_B (weight scales)
+            LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] d_scales_B="
+                      << static_cast<const void *>(impl_->d_scales_B)
+                      << " d_weights_int8=" << static_cast<const void *>(impl_->d_weights_int8));
+            if (impl_->d_scales_B && n > 0)
+            {
+                std::vector<float> h_scales_B(std::min(n, 8));
+                cudaQuantGemm_copyDeviceToHost(h_scales_B.data(), impl_->d_scales_B, h_scales_B.size(), cuda_device_id_);
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] scales_B[0:4]="
+                          << h_scales_B[0] << "," << (h_scales_B.size() > 1 ? h_scales_B[1] : 0.f) << ","
+                          << (h_scales_B.size() > 2 ? h_scales_B[2] : 0.f) << "," << (h_scales_B.size() > 3 ? h_scales_B[3] : 0.f));
+            }
+
+            // Step 1: Quantize activations
+            if (!cudaQuantGemm_quantizeActivations(
+                    d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, cuda_device_id_))
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel] Activation quantization failed");
+                return false;
+            }
+
+            // Debug: dump scales_A (activation row scales)
+            if (impl_->d_scales_A && m > 0)
+            {
+                std::vector<float> h_scales_A(std::min(m, 8));
+                cudaQuantGemm_copyDeviceToHost(h_scales_A.data(), impl_->d_scales_A, h_scales_A.size(), cuda_device_id_);
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] scales_A[0:4]="
+                          << h_scales_A[0] << "," << (h_scales_A.size() > 1 ? h_scales_A[1] : 0.f) << ","
+                          << (h_scales_A.size() > 2 ? h_scales_A[2] : 0.f) << "," << (h_scales_A.size() > 3 ? h_scales_A[3] : 0.f));
+            }
+
+            // Step 2: Execute CUTLASS INT8 GEMM
+            if (!cudaQuantGemm_execute(
+                    impl_->d_A_int8, impl_->d_weights_int8, impl_->d_C_int32,
+                    m, n, k, cuda_device_id_))
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel] CUTLASS GEMM failed");
+                return false;
+            }
+
+            // Debug: dump some int32 outputs
+            if (impl_->d_C_int32 && m > 0 && n > 0)
+            {
+                size_t copy_count = std::min(static_cast<size_t>(m) * static_cast<size_t>(n), static_cast<size_t>(8));
+                std::vector<int32_t> h_C_int32(copy_count);
+                cudaQuantGemm_copyInt32DeviceToHost(h_C_int32.data(), impl_->d_C_int32, h_C_int32.size(), cuda_device_id_);
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] C_int32[0:4]="
+                          << h_C_int32[0] << "," << (h_C_int32.size() > 1 ? h_C_int32[1] : 0) << ","
+                          << (h_C_int32.size() > 2 ? h_C_int32[2] : 0) << "," << (h_C_int32.size() > 3 ? h_C_int32[3] : 0));
+
+                // For LMHead (large n), dump row 1 as well
+                if (m == 2 && n > 1000)
+                {
+                    std::vector<int32_t> h_C_int32_row1(8);
+                    cudaQuantGemm_copyInt32DeviceToHost(h_C_int32_row1.data(), impl_->d_C_int32 + n, 8, cuda_device_id_);
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] C_int32[row1,0:4]="
+                              << h_C_int32_row1[0] << "," << h_C_int32_row1[1] << ","
+                              << h_C_int32_row1[2] << "," << h_C_int32_row1[3]);
+                }
+            }
+
+            // Step 3: Apply scaling and output to FP32 (no bias)
+            const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
+            if (!cudaQuantGemm_applyScaling(
+                    impl_->d_C_int32, d_C, impl_->d_scales_A, impl_->d_scales_B,
+                    m, n, alpha, beta, d_C_existing, nullptr, cuda_device_id_))
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel] Scaling failed");
+                return false;
+            }
+
+            // Debug: dump final FP32 outputs
+            if (d_C && m > 0 && n > 0)
+            {
+                size_t copy_count = std::min(static_cast<size_t>(m) * static_cast<size_t>(n), static_cast<size_t>(8));
+                std::vector<float> h_C_fp32(copy_count);
+                cudaQuantGemm_copyDeviceToHost(h_C_fp32.data(), d_C, h_C_fp32.size(), cuda_device_id_);
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] C_fp32[0:4]="
+                          << h_C_fp32[0] << "," << (h_C_fp32.size() > 1 ? h_C_fp32[1] : 0.f) << ","
+                          << (h_C_fp32.size() > 2 ? h_C_fp32[2] : 0.f) << "," << (h_C_fp32.size() > 3 ? h_C_fp32[3] : 0.f));
+
+                // For LMHead (large n), dump row 1 as well
+                if (m == 2 && n > 1000)
+                {
+                    std::vector<float> h_C_fp32_row1(8);
+                    cudaQuantGemm_copyDeviceToHost(h_C_fp32_row1.data(), d_C + n, 8, cuda_device_id_);
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] C_fp32[row1,0:4]="
+                              << h_C_fp32_row1[0] << "," << h_C_fp32_row1[1] << ","
+                              << h_C_fp32_row1[2] << "," << h_C_fp32_row1[3]);
+                }
+            }
+
+            LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete");
+            return true;
+        }
+
+        bool CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias(
+            const float *d_A, float *d_C, const float *d_bias,
+            int m, int n, int k,
+            float alpha, float beta)
+        {
             // Ensure weights converted and work buffers allocated
             ensureWeightsConverted();
             ensureWorkBuffers(m);
@@ -666,13 +935,13 @@ namespace llaminar2
                 return false;
             }
 
-            // Step 3: Apply scaling and output to FP32
+            // Step 3: Apply scaling, bias, and output to FP32
             const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
             if (!cudaQuantGemm_applyScaling(
                     impl_->d_C_int32, d_C, impl_->d_scales_A, impl_->d_scales_B,
-                    m, n, alpha, beta, d_C_existing, cuda_device_id_))
+                    m, n, alpha, beta, d_C_existing, d_bias, cuda_device_id_))
             {
-                LOG_ERROR("[CUDAQuantisedGemmKernel] Scaling failed");
+                LOG_ERROR("[CUDAQuantisedGemmKernel] Scaling with bias failed");
                 return false;
             }
 

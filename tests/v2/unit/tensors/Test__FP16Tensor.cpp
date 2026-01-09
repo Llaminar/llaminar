@@ -45,7 +45,7 @@ TEST(Test__FP16Tensor, BasicCreation)
     EXPECT_EQ(tensor->shape()[0], 3);
     EXPECT_EQ(tensor->shape()[1], 5);
     EXPECT_EQ(tensor->native_type(), TensorType::FP16);
-    EXPECT_EQ(tensor->home_dm_device_index(), -1); // Default to CPU
+    EXPECT_TRUE(tensor->home_device().is_cpu()); // Default to CPU
     ASSERT_NE(tensor->data(), nullptr);
     EXPECT_FALSE(tensor->is_view());
 }

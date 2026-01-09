@@ -1069,7 +1069,7 @@ namespace llaminar2
         std::vector<LayerGraphCache> layer_graph_cache_;
 
         /// Device context cache (lazy initialization)
-        std::unordered_map<int, std::unique_ptr<IDeviceContext>> device_contexts_;
+        std::unordered_map<DeviceId, std::unique_ptr<IDeviceContext>> device_contexts_;
 
         /// Cache statistics
         mutable CacheStats cache_stats_;

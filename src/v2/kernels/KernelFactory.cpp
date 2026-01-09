@@ -28,6 +28,7 @@
 #include "cuda/ops/CUDARoPEKernelT.h"                 // RoPE FP32/FP16/BF16
 #include "cuda/ops/CUDASwiGLUKernelT.h"               // SwiGLU FP32/FP16/BF16
 #include "cuda/ops/CUDAResidualAddKernelT.h"          // ResidualAdd FP32/FP16/BF16
+#include "cuda/ops/CUDAEmbeddingKernelT.h"            // Embedding FP32
 #include "cuda/attention/CUDAFlashAttentionKernelT.h" // Flash Attention
 #endif
 
@@ -99,7 +100,7 @@ namespace llaminar
 
             namespace
             {
-                // Helper to throw for unsupported GPU backends
+                // Helper to throw for unsupported GPU backends (GEMM kernels)
                 [[noreturn]] void throwUnsupportedBackend(DeviceType dev_type, const char *tensor_type)
                 {
                     LOG_ERROR("[KernelFactory] " << tensor_type << " GEMM not supported on "
@@ -107,6 +108,52 @@ namespace llaminar
                     throw std::runtime_error(std::string(tensor_type) + " GEMM not supported on " +
                                              to_string(dev_type));
                 }
+
+                // Generic helper to throw for unsupported kernel/backend combinations
+                [[noreturn]] void throwUnsupportedKernel(DeviceType dev_type, const char *kernel_type, const char *tensor_type)
+                {
+                    LOG_ERROR("[KernelFactory] " << kernel_type << " for " << tensor_type
+                                                 << " not supported on " << to_string(dev_type)
+                                                 << " - no silent fallback to CPU");
+                    throw std::runtime_error(std::string(kernel_type) + " for " + tensor_type +
+                                             " not supported on " + to_string(dev_type));
+                }
+
+#ifdef HAVE_CUDA
+                /**
+                 * @brief Get CUDA device ID for kernel creation
+                 *
+                 * For weight tensors that are CPU-only (typical for GGUF models), we use
+                 * the first available CUDA device (device 0). For tensors already on GPU,
+                 * we use their actual device.
+                 *
+                 * @param tensor The tensor to check (usually a weight tensor)
+                 * @return CUDA device ID (backend-specific, usually 0)
+                 */
+                int getCUDADeviceIdForKernel(const llaminar2::TensorBase *tensor)
+                {
+                    const auto &dm = llaminar2::DeviceManager::instance();
+                    const auto &devices = dm.devices();
+
+                    // Check if tensor is currently on a CUDA device
+                    auto current_dev = tensor->current_device();
+                    if (current_dev.has_value() && current_dev->is_cuda())
+                    {
+                        return current_dev->cuda_ordinal();
+                    }
+
+                    // Tensor not on CUDA GPU - find the first CUDA device
+                    int cuda_dm_idx = dm.find_device(llaminar2::ComputeBackendType::GPU_CUDA, 0);
+                    if (cuda_dm_idx >= 0 && static_cast<size_t>(cuda_dm_idx) < devices.size())
+                    {
+                        return devices[cuda_dm_idx].device_id;
+                    }
+
+                    // Fallback to device 0 if no CUDA device found via DeviceManager
+                    LOG_WARN("[KernelFactory] No CUDA device found in DeviceManager, using device 0");
+                    return 0;
+                }
+#endif
 
                 // =========================================================================
                 // Adapter: CPURoPEKernelT<FP32> -> ITensorRoPE
@@ -458,7 +505,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ4_NL GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -492,7 +539,7 @@ namespace llaminar
                 {
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return new llaminar2::cuda::CUDAQuantisedGemmKernel(packed, cuda_device_id);
                 }
 #endif
@@ -526,7 +573,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q4_0 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -561,7 +608,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q4_1 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -596,7 +643,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q5_0 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -631,7 +678,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q5_1 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -666,7 +713,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q6_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -701,7 +748,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q8_0 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -736,7 +783,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q8_1 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -771,7 +818,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q2_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -806,7 +853,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q3_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -841,7 +888,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q4_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -876,7 +923,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q5_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -911,7 +958,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q8_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -946,7 +993,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ1_M GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -981,7 +1028,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ1_S GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -1016,7 +1063,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ2_S GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -1051,7 +1098,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ2_XS GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -1086,7 +1133,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ2_XXS GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -1121,7 +1168,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ3_S GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -1156,7 +1203,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ3_XXS GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -1191,7 +1238,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ4_XS GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -1222,7 +1269,7 @@ namespace llaminar
                 {
                     LOG_DEBUG("[KernelFactory] FP32 GEMM: Using CUDAFloatingPointGemmKernel");
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
                         tensor, cuda_device_id, llaminar2::cuda::CUDAFloatingPointGemmKernel::Precision::FP32);
                 }
@@ -1254,7 +1301,7 @@ namespace llaminar
                 {
                     LOG_DEBUG("[KernelFactory] FP16 GEMM: Using CUDAFloatingPointGemmKernel");
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
                         tensor, cuda_device_id, llaminar2::cuda::CUDAFloatingPointGemmKernel::Precision::FP16);
                 }
@@ -1286,7 +1333,7 @@ namespace llaminar
                 {
                     LOG_DEBUG("[KernelFactory] BF16 GEMM: Using CUDAFloatingPointGemmKernel");
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
+                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
                         tensor, cuda_device_id, llaminar2::cuda::CUDAFloatingPointGemmKernel::Precision::BF16);
                 }
@@ -1323,12 +1370,11 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] FP32 RoPE: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    throwUnsupportedKernel(dev_type, "RoPE", "FP32");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    throwUnsupportedKernel(dev_type, "RoPE", "FP32");
                 }
             }
 
@@ -1349,12 +1395,11 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] BF16 RoPE: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    throwUnsupportedKernel(dev_type, "RoPE", "BF16");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    throwUnsupportedKernel(dev_type, "RoPE", "BF16");
                 }
             }
 
@@ -1375,12 +1420,11 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] FP16 RoPE: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    throwUnsupportedKernel(dev_type, "RoPE", "FP16");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    throwUnsupportedKernel(dev_type, "RoPE", "FP16");
                 }
             }
 
@@ -1396,24 +1440,22 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    LOG_DEBUG("[KernelFactory] Q8_1 RoPE: CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+                    throwUnsupportedKernel(dev_type, "RoPE", "Q8_1");
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] Q8_1 RoPE: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+                    throwUnsupportedKernel(dev_type, "RoPE", "Q8_1");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+                    throwUnsupportedKernel(dev_type, "RoPE", "Q8_1");
                 }
             }
 
             // ==========================================================================
             // SwiGLU Kernel Creation - Device-aware dispatch
-            // CPU fallback for GPU requests since GPU SwiGLU kernels not yet implemented
+            // NO CPU FALLBACK: If GPU requested but not implemented, throws
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorSwiGLU> KernelFactory::createSwiGLU(
@@ -1432,12 +1474,11 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] FP32 SwiGLU: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUSwiGLUKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    throwUnsupportedKernel(dev_type, "SwiGLU", "FP32");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUSwiGLUKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    throwUnsupportedKernel(dev_type, "SwiGLU", "FP32");
                 }
             }
 
@@ -1457,12 +1498,11 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] BF16 SwiGLU: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUSwiGLUKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    throwUnsupportedKernel(dev_type, "SwiGLU", "BF16");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUSwiGLUKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    throwUnsupportedKernel(dev_type, "SwiGLU", "BF16");
                 }
             }
 
@@ -1482,12 +1522,11 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] FP16 SwiGLU: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUSwiGLUKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    throwUnsupportedKernel(dev_type, "SwiGLU", "FP16");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUSwiGLUKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    throwUnsupportedKernel(dev_type, "SwiGLU", "FP16");
                 }
             }
 
@@ -1502,18 +1541,16 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    LOG_DEBUG("[KernelFactory] Q8_1 SwiGLU: CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUSwiGLUKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+                    throwUnsupportedKernel(dev_type, "SwiGLU", "Q8_1");
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] Q8_1 SwiGLU: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUSwiGLUKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+                    throwUnsupportedKernel(dev_type, "SwiGLU", "Q8_1");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUSwiGLUKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+                    throwUnsupportedKernel(dev_type, "SwiGLU", "Q8_1");
                 }
             }
 
@@ -1533,18 +1570,16 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    LOG_DEBUG("[KernelFactory] FP32 Softmax: CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    throwUnsupportedKernel(dev_type, "Softmax", "FP32");
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] FP32 Softmax: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    throwUnsupportedKernel(dev_type, "Softmax", "FP32");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    throwUnsupportedKernel(dev_type, "Softmax", "FP32");
                 }
             }
 
@@ -1559,18 +1594,16 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    LOG_DEBUG("[KernelFactory] BF16 Softmax: CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    throwUnsupportedKernel(dev_type, "Softmax", "BF16");
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] BF16 Softmax: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    throwUnsupportedKernel(dev_type, "Softmax", "BF16");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    throwUnsupportedKernel(dev_type, "Softmax", "BF16");
                 }
             }
 
@@ -1585,18 +1618,16 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    LOG_DEBUG("[KernelFactory] FP16 Softmax: CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    throwUnsupportedKernel(dev_type, "Softmax", "FP16");
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] FP16 Softmax: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    throwUnsupportedKernel(dev_type, "Softmax", "FP16");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    throwUnsupportedKernel(dev_type, "Softmax", "FP16");
                 }
             }
 
@@ -1611,18 +1642,16 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    LOG_DEBUG("[KernelFactory] Q8_1 Softmax: CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+                    throwUnsupportedKernel(dev_type, "Softmax", "Q8_1");
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] Q8_1 Softmax: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+                    throwUnsupportedKernel(dev_type, "Softmax", "Q8_1");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+                    throwUnsupportedKernel(dev_type, "Softmax", "Q8_1");
                 }
             }
 
@@ -1646,12 +1675,11 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] FP32 ResidualAdd: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUResidualAddKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    throwUnsupportedKernel(dev_type, "ResidualAdd", "FP32");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUResidualAddKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    throwUnsupportedKernel(dev_type, "ResidualAdd", "FP32");
                 }
             }
 
@@ -1671,12 +1699,11 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] BF16 ResidualAdd: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUResidualAddKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    throwUnsupportedKernel(dev_type, "ResidualAdd", "BF16");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUResidualAddKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    throwUnsupportedKernel(dev_type, "ResidualAdd", "BF16");
                 }
             }
 
@@ -1696,18 +1723,17 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] FP16 ResidualAdd: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUResidualAddKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    throwUnsupportedKernel(dev_type, "ResidualAdd", "FP16");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUResidualAddKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    throwUnsupportedKernel(dev_type, "ResidualAdd", "FP16");
                 }
             }
 
             // ==========================================================================
             // RMSNorm Kernel Creation - Device-aware dispatch
-            // CPU fallback for GPU requests since GPU RMSNorm kernels not yet implemented
+            // NO CPU FALLBACK: If GPU requested but not implemented, throws
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorRMSNorm> KernelFactory::createRMSNorm(
@@ -1726,14 +1752,11 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    // Fall back to CPU kernel until GPU implementation available
-                    LOG_DEBUG("[KernelFactory] FP32 RMSNorm: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    throwUnsupportedKernel(dev_type, "RMSNorm", "FP32");
 #endif
 
                 default:
-                    // Fall back to CPU for unknown backends
-                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    throwUnsupportedKernel(dev_type, "RMSNorm", "FP32");
                 }
             }
 
@@ -1753,12 +1776,11 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] BF16 RMSNorm: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    throwUnsupportedKernel(dev_type, "RMSNorm", "BF16");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    throwUnsupportedKernel(dev_type, "RMSNorm", "BF16");
                 }
             }
 
@@ -1778,12 +1800,11 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] FP16 RMSNorm: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    throwUnsupportedKernel(dev_type, "RMSNorm", "FP16");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    throwUnsupportedKernel(dev_type, "RMSNorm", "FP16");
                 }
             }
 
@@ -1798,18 +1819,16 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    LOG_DEBUG("[KernelFactory] Q8_1 RMSNorm: CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+                    throwUnsupportedKernel(dev_type, "RMSNorm", "Q8_1");
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] Q8_1 RMSNorm: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+                    throwUnsupportedKernel(dev_type, "RMSNorm", "Q8_1");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+                    throwUnsupportedKernel(dev_type, "RMSNorm", "Q8_1");
                 }
             }
 
@@ -1824,18 +1843,16 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    LOG_DEBUG("[KernelFactory] Q16_1 RMSNorm: CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::Q16_1>>();
+                    throwUnsupportedKernel(dev_type, "RMSNorm", "Q16_1");
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] Q16_1 RMSNorm: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::Q16_1>>();
+                    throwUnsupportedKernel(dev_type, "RMSNorm", "Q16_1");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::Q16_1>>();
+                    throwUnsupportedKernel(dev_type, "RMSNorm", "Q16_1");
                 }
             }
 
@@ -2010,7 +2027,7 @@ namespace llaminar
 
             // ==========================================================================
             // Attention Kernel Creation - Device-aware dispatch (typed overloads)
-            // CPU fallback for GPU requests since GPU Attention kernels not yet implemented
+            // NO CPU FALLBACK: If GPU requested but not implemented, throws
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorAttention> KernelFactory::createAttention(
@@ -2029,12 +2046,11 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] FP32 Attention: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    throwUnsupportedKernel(dev_type, "Attention", "FP32");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    throwUnsupportedKernel(dev_type, "Attention", "FP32");
                 }
             }
 
@@ -2054,12 +2070,11 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] BF16 Attention: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    throwUnsupportedKernel(dev_type, "Attention", "BF16");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    throwUnsupportedKernel(dev_type, "Attention", "BF16");
                 }
             }
 
@@ -2079,12 +2094,11 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] FP16 Attention: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    throwUnsupportedKernel(dev_type, "Attention", "FP16");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    throwUnsupportedKernel(dev_type, "Attention", "FP16");
                 }
             }
 
@@ -2099,24 +2113,22 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    LOG_DEBUG("[KernelFactory] Q8_1 Attention: CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+                    throwUnsupportedKernel(dev_type, "Attention", "Q8_1");
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    LOG_DEBUG("[KernelFactory] Q8_1 Attention: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+                    throwUnsupportedKernel(dev_type, "Attention", "Q8_1");
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+                    throwUnsupportedKernel(dev_type, "Attention", "Q8_1");
                 }
             }
 
             // ==========================================================================
             // Embedding Kernel Creation - Device-aware dispatch
-            // Phase 6: Falls back to CPU when GPU embedding not yet implemented
+            // NO CPU FALLBACK: If GPU requested but not implemented, throws
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorEmbedding> KernelFactory::createEmbedding(
@@ -2130,22 +2142,16 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    // Phase 6: GPU embedding not yet implemented, fall back to CPU
-                    LOG_DEBUG("[KernelFactory] FP32 Embedding on CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUEmbeddingKernelT<llaminar2::FP32Tensor>>();
+                    return std::make_unique<llaminar2::CUDAEmbeddingKernelT>();
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    // Phase 6: GPU embedding not yet implemented, fall back to CPU
-                    LOG_DEBUG("[KernelFactory] FP32 Embedding on ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUEmbeddingKernelT<llaminar2::FP32Tensor>>();
+                    throwUnsupportedKernel(dev_type, "Embedding", "FP32");
 #endif
 
                 default:
-                    // Fall back to CPU for unknown device types
-                    LOG_DEBUG("[KernelFactory] FP32 Embedding on device type " << static_cast<int>(dev_type) << " not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUEmbeddingKernelT<llaminar2::FP32Tensor>>();
+                    throwUnsupportedKernel(dev_type, "Embedding", "FP32");
                 }
             }
 
@@ -2160,22 +2166,16 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    // Phase 6: GPU embedding not yet implemented, fall back to CPU
-                    LOG_DEBUG("[KernelFactory] BF16 Embedding on CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUEmbeddingKernelT<llaminar2::BF16Tensor>>();
+                    throwUnsupportedKernel(dev_type, "Embedding", "BF16");
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    // Phase 6: GPU embedding not yet implemented, fall back to CPU
-                    LOG_DEBUG("[KernelFactory] BF16 Embedding on ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUEmbeddingKernelT<llaminar2::BF16Tensor>>();
+                    throwUnsupportedKernel(dev_type, "Embedding", "BF16");
 #endif
 
                 default:
-                    // Fall back to CPU for unknown device types
-                    LOG_DEBUG("[KernelFactory] BF16 Embedding on device type " << static_cast<int>(dev_type) << " not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUEmbeddingKernelT<llaminar2::BF16Tensor>>();
+                    throwUnsupportedKernel(dev_type, "Embedding", "BF16");
                 }
             }
 
@@ -2190,22 +2190,16 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    // Phase 6: GPU embedding not yet implemented, fall back to CPU
-                    LOG_DEBUG("[KernelFactory] FP16 Embedding on CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUEmbeddingKernelT<llaminar2::FP16Tensor>>();
+                    throwUnsupportedKernel(dev_type, "Embedding", "FP16");
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    // Phase 6: GPU embedding not yet implemented, fall back to CPU
-                    LOG_DEBUG("[KernelFactory] FP16 Embedding on ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUEmbeddingKernelT<llaminar2::FP16Tensor>>();
+                    throwUnsupportedKernel(dev_type, "Embedding", "FP16");
 #endif
 
                 default:
-                    // Fall back to CPU for unknown device types
-                    LOG_DEBUG("[KernelFactory] FP16 Embedding on device type " << static_cast<int>(dev_type) << " not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUEmbeddingKernelT<llaminar2::FP16Tensor>>();
+                    throwUnsupportedKernel(dev_type, "Embedding", "FP16");
                 }
             }
 
@@ -2220,22 +2214,16 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    // Phase 6: GPU embedding not yet implemented, fall back to CPU
-                    LOG_DEBUG("[KernelFactory] Q8_1 Embedding on CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUEmbeddingKernelT<llaminar2::Q8_1Tensor>>();
+                    throwUnsupportedKernel(dev_type, "Embedding", "Q8_1");
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    // Phase 6: GPU embedding not yet implemented, fall back to CPU
-                    LOG_DEBUG("[KernelFactory] Q8_1 Embedding on ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUEmbeddingKernelT<llaminar2::Q8_1Tensor>>();
+                    throwUnsupportedKernel(dev_type, "Embedding", "Q8_1");
 #endif
 
                 default:
-                    // Fall back to CPU for unknown device types
-                    LOG_DEBUG("[KernelFactory] Q8_1 Embedding on device type " << static_cast<int>(dev_type) << " not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUEmbeddingKernelT<llaminar2::Q8_1Tensor>>();
+                    throwUnsupportedKernel(dev_type, "Embedding", "Q8_1");
                 }
             }
 
@@ -2421,7 +2409,13 @@ namespace llaminar
                     }
                 }
 
-                auto dev_type = getDeviceType(tensor->current_dm_device_index());
+                // Get device type from tensor's current location
+                auto current_dev = tensor->current_device();
+                DeviceType dev_type = DeviceType::CPU;
+                if (current_dev.has_value() && current_dev->is_gpu())
+                {
+                    dev_type = current_dev->is_cuda() ? DeviceType::CUDA : DeviceType::ROCm;
+                }
 
                 // Handle TensorSlice: delegate to inner tensor's kernel creation
                 // TensorSlice always implements IINT8Unpackable, but the inner tensor may not
@@ -2701,7 +2695,13 @@ namespace llaminar
                     throw std::runtime_error("KernelFactory: tensor must be 2D");
                 }
 
-                auto tensor_dev_type = getDeviceType(tensor->current_dm_device_index());
+                // Get device type from tensor's current location
+                auto current_dev = tensor->current_device();
+                DeviceType tensor_dev_type = DeviceType::CPU;
+                if (current_dev.has_value() && current_dev->is_gpu())
+                {
+                    tensor_dev_type = current_dev->is_cuda() ? DeviceType::CUDA : DeviceType::ROCm;
+                }
                 LOG_DEBUG("[KernelFactory::getOrCreateGemm] Creating kernel with target device "
                           << static_cast<int>(target_device)
                           << " for tensor on device " << static_cast<int>(tensor_dev_type));
@@ -2721,17 +2721,9 @@ namespace llaminar
                     {
                         if (!slice->supports_int8_unpack())
                         {
-                            // Fall back to CPU for non-quantized slices on CUDA
-                            LOG_WARN("[KernelFactory] TensorSlice of non-quantized type not yet supported on CUDA, falling back to CPU");
-                            // Create CPU kernel inline instead of recursive call
-                            auto cpu_kernel = createGemm(dynamic_cast<const llaminar2::FP32Tensor *>(slice->inner()), DeviceType::CPU);
-                            if (cpu_kernel)
-                            {
-                                auto *raw_ptr = cpu_kernel.get();
-                                device_targeted_cache_[key] = std::move(cpu_kernel);
-                                return raw_ptr;
-                            }
-                            return nullptr;
+                            // NO FALLBACK: TensorSlice of non-quantized type not supported on CUDA
+                            throw std::runtime_error(
+                                "TensorSlice of non-quantized type not supported on CUDA - no silent fallback to CPU");
                         }
                     }
 
@@ -2766,28 +2758,29 @@ namespace llaminar
                     }
                     else
                     {
-                        LOG_WARN("[KernelFactory] Tensor type " << static_cast<int>(tensor->native_type())
-                                                                << " not supported on CUDA, falling back to CPU kernel");
-                        // Fall through to cache nullptr and return
+                        // NO FALLBACK: tensor type not supported on CUDA
+                        throw std::runtime_error(
+                            "Tensor type " + std::to_string(static_cast<int>(tensor->native_type())) +
+                            " not supported on CUDA - no silent fallback to CPU");
                     }
                 }
 #endif
 #ifdef HAVE_ROCM
                 else if (target_device == DeviceType::ROCm)
                 {
-                    LOG_WARN("[KernelFactory] ROCm device-targeted kernels not yet implemented");
-                    // Fall through
+                    // NO FALLBACK: ROCm device-targeted kernels not yet implemented
+                    throw std::runtime_error("ROCm device-targeted GEMM kernels not yet implemented - no silent fallback to CPU");
                 }
 #endif
                 else
                 {
-                    LOG_ERROR("[KernelFactory] Unsupported target device type: " << static_cast<int>(target_device));
+                    throw std::runtime_error("Unsupported target device type: " + std::to_string(static_cast<int>(target_device)));
                 }
 
+                // We should always have a kernel if we get here (all error paths throw)
                 if (!kernel)
                 {
-                    LOG_ERROR("[KernelFactory] Failed to create kernel for target device");
-                    return nullptr;
+                    throw std::runtime_error("[KernelFactory] Internal error: Failed to create kernel for target device");
                 }
 
                 // Cache and return
@@ -2840,7 +2833,13 @@ namespace llaminar
                 LOG_DEBUG("[KernelFactory] Sliced GEMM cache MISS: creating kernel for tensor=" << tensor
                                                                                                 << " rows=[" << row_start << "," << row_end << ")");
 
-                auto dev_type = getDeviceType(tensor->current_dm_device_index());
+                // Get device type from tensor's current location
+                auto current_dev = tensor->current_device();
+                DeviceType dev_type = DeviceType::CPU;
+                if (current_dev.has_value() && current_dev->is_gpu())
+                {
+                    dev_type = current_dev->is_cuda() ? DeviceType::CUDA : DeviceType::ROCm;
+                }
 
                 if (dev_type != DeviceType::CPU)
                 {

@@ -44,7 +44,7 @@ protected:
     // Helper: Create FP32Tensor with given dimensions
     std::unique_ptr<FP32Tensor> makeFP32Tensor(size_t rows, size_t cols)
     {
-        return std::make_unique<FP32Tensor>(std::vector<size_t>{rows, cols}, 0);
+        return std::make_unique<FP32Tensor>(std::vector<size_t>{rows, cols}, DeviceId::cpu());
     }
 
     // Helper: Create and fill FP32Tensor with values
@@ -82,7 +82,7 @@ protected:
     // Helper: Create empty Q8_1Tensor (for output buffers)
     std::unique_ptr<Q8_1Tensor> makeQ8_1Tensor(size_t rows, size_t cols)
     {
-        return std::make_unique<Q8_1Tensor>(std::vector<size_t>{rows, cols}, -1);
+        return std::make_unique<Q8_1Tensor>(std::vector<size_t>{rows, cols}, DeviceId::cpu());
     }
 
     // Fill FP32 data with random values in [-1, 1]

@@ -267,11 +267,6 @@ namespace llaminar2
 
     Q4_1Tensor::~Q4_1Tensor() {}
 
-    bool Q4_1Tensor::set_device(int device_idx)
-    {
-        device_ = DeviceId::fromLegacyIndex(device_idx);
-        return true;
-    }
 
     const float *Q4_1Tensor::data() const
     {

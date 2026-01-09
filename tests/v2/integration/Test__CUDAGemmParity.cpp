@@ -27,6 +27,9 @@
 #include "kernels/KernelFactory.h"
 #include "backends/ComputeBackend.h"
 #include "execution/DeviceContext.h"
+#include "loaders/ModelLoader.h"
+#include "tensors/TensorFactory.h"
+#include "utils/MPIContext.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
 #include <cuda_runtime.h> // For cudaMalloc, cudaMemcpy, etc.
@@ -40,6 +43,7 @@
 #include <cmath>
 #include <random>
 #include <numeric>
+#include <filesystem>
 
 using namespace llaminar2;
 using namespace llaminar2::test::cuda;
@@ -561,7 +565,7 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
         ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), M * N)) << "CPU result has NaN/Inf";         \
                                                                                             \
         /* CUDA */                                                                          \
-        ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));                                     \
+        ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));                                  \
         auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(                \
             weights.get(), KernelDeviceType::CUDA);                                         \
         ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel for " #TensorType; \
@@ -724,6 +728,456 @@ DEFINE_QUANTIZED_PARITY_TEST(Q5_1_SmallMatrix, Q5_1Tensor, createQ5_1Random, 32,
 // DEFINE_QUANTIZED_PARITY_TEST(IQ3_S_SmallMatrix, IQ3_STensor, createIQ3_SRandom, 256, 306)
 // DEFINE_QUANTIZED_PARITY_TEST(IQ1_S_SmallMatrix, IQ1_STensor, createIQ1_SRandom, 256, 307)
 // DEFINE_QUANTIZED_PARITY_TEST(IQ1_M_SmallMatrix, IQ1_MTensor, createIQ1_MRandom, 256, 308)
+
+// ============================================================================
+// Real Model Weight Parity Tests
+// ============================================================================
+// These tests load actual Q4_0 weights from a GGUF model file to verify
+// that CUDA GEMM produces correct results with real-world weight distributions.
+// This is critical because synthetic random weights may not expose issues
+// that occur with the specific value patterns in trained models.
+
+namespace
+{
+    constexpr const char *REAL_MODEL_PATH = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
+}
+
+/**
+ * @test Q4_0 parity with real model weights: attn_q.weight (layer 0)
+ *
+ * Tests Q projection weight matrix which is critical for attention.
+ * This is one of the weights that showed massive divergence in full inference
+ * (cosine=0.098 vs expected ~1.0).
+ */
+TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_Layer0)
+{
+    if (!std::filesystem::exists(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
+    }
+
+    // Create MPI context (single rank for this test)
+    auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
+    TensorFactory factory(*mpi_ctx);
+    ModelLoader loader(&factory);
+
+    if (!loader.loadModel(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
+    }
+
+    // Load real Q projection weight
+    auto weights = loader.loadTensor("blk.0.attn_q.weight", DeviceId::cpu());
+    ASSERT_NE(weights, nullptr) << "Failed to load blk.0.attn_q.weight";
+
+    auto *q4_tensor = dynamic_cast<Q4_0Tensor *>(weights.get());
+    ASSERT_NE(q4_tensor, nullptr) << "Expected Q4_0Tensor, got different type";
+
+    // Dimensions: [N, K] where N=896 (output), K=896 (input) for Qwen2.5-0.5B
+    const int M = 4; // Small batch for testing
+    const int N = static_cast<int>(q4_tensor->shape()[0]);
+    const int K = static_cast<int>(q4_tensor->shape()[1]);
+
+    std::cout << "Real model attn_q weight: " << N << "x" << K << " (Q4_0)\n";
+
+    // Create random activations
+    auto A_data = randomFP32(M * K);
+
+    // ===== CPU Reference =====
+    std::vector<float> C_cpu(M * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        q4_tensor, KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr) << "Failed to create CPU kernel";
+    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+
+    // ===== CUDA =====
+    // Upload weights to GPU
+    ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
+    EXPECT_TRUE(q4_tensor->isOnGPU());
+
+    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        q4_tensor, KernelDeviceType::CUDA);
+    ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel";
+
+    float *d_A, *d_C;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
+    ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, M * N * sizeof(float)));
+
+    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
+
+    std::vector<float> C_cuda(M * N);
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // ===== Compare =====
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
+    result.print("Real Model Q4_0 attn_q (layer 0)");
+
+    EXPECT_FALSE(result.has_nan_inf) << "CUDA output contains NaN/Inf";
+    EXPECT_GE(result.cosine_similarity, 0.99)
+        << "Cosine similarity too low: " << result.cosine_similarity;
+
+    cudaFree(d_A);
+    cudaFree(d_C);
+}
+
+/**
+ * @test Q4_0 parity with real model weights: attn_k.weight (layer 0)
+ *
+ * Tests K projection weight matrix. K projection showed even worse divergence
+ * than Q in full inference (cosine=0.031).
+ */
+TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnK_Layer0)
+{
+    if (!std::filesystem::exists(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
+    }
+
+    auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
+    TensorFactory factory(*mpi_ctx);
+    ModelLoader loader(&factory);
+
+    if (!loader.loadModel(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
+    }
+
+    auto weights = loader.loadTensor("blk.0.attn_k.weight", DeviceId::cpu());
+    ASSERT_NE(weights, nullptr) << "Failed to load blk.0.attn_k.weight";
+
+    auto *q4_tensor = dynamic_cast<Q4_0Tensor *>(weights.get());
+    ASSERT_NE(q4_tensor, nullptr) << "Expected Q4_0Tensor";
+
+    const int M = 4;
+    const int N = static_cast<int>(q4_tensor->shape()[0]);
+    const int K = static_cast<int>(q4_tensor->shape()[1]);
+
+    std::cout << "Real model attn_k weight: " << N << "x" << K << " (Q4_0)\n";
+
+    auto A_data = randomFP32(M * K);
+
+    // CPU
+    std::vector<float> C_cpu(M * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        q4_tensor, KernelDeviceType::CPU);
+    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+
+    // CUDA
+    ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
+    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        q4_tensor, KernelDeviceType::CUDA);
+
+    float *d_A, *d_C;
+    cudaMalloc(&d_A, M * K * sizeof(float));
+    cudaMalloc(&d_C, M * N * sizeof(float));
+    cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice);
+
+    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
+
+    std::vector<float> C_cuda(M * N);
+    cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
+    result.print("Real Model Q4_0 attn_k (layer 0)");
+
+    EXPECT_GE(result.cosine_similarity, 0.99);
+    EXPECT_FALSE(result.has_nan_inf);
+
+    cudaFree(d_A);
+    cudaFree(d_C);
+}
+
+/**
+ * @test Q4_0 parity with real model weights: attn_v.weight (layer 0)
+ *
+ * Tests V projection. V showed less divergence (cosine=0.84) but still
+ * significantly off in full inference.
+ */
+TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnV_Layer0)
+{
+    if (!std::filesystem::exists(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
+    }
+
+    auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
+    TensorFactory factory(*mpi_ctx);
+    ModelLoader loader(&factory);
+
+    if (!loader.loadModel(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
+    }
+
+    auto weights = loader.loadTensor("blk.0.attn_v.weight", DeviceId::cpu());
+    ASSERT_NE(weights, nullptr) << "Failed to load blk.0.attn_v.weight";
+
+    auto *q4_tensor = dynamic_cast<Q4_0Tensor *>(weights.get());
+    ASSERT_NE(q4_tensor, nullptr) << "Expected Q4_0Tensor";
+
+    const int M = 4;
+    const int N = static_cast<int>(q4_tensor->shape()[0]);
+    const int K = static_cast<int>(q4_tensor->shape()[1]);
+
+    std::cout << "Real model attn_v weight: " << N << "x" << K << " (Q4_0)\n";
+
+    auto A_data = randomFP32(M * K);
+
+    // CPU
+    std::vector<float> C_cpu(M * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        q4_tensor, KernelDeviceType::CPU);
+    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+
+    // CUDA
+    ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
+    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        q4_tensor, KernelDeviceType::CUDA);
+
+    float *d_A, *d_C;
+    cudaMalloc(&d_A, M * K * sizeof(float));
+    cudaMalloc(&d_C, M * N * sizeof(float));
+    cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice);
+
+    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
+
+    std::vector<float> C_cuda(M * N);
+    cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
+    result.print("Real Model Q4_0 attn_v (layer 0)");
+
+    EXPECT_GE(result.cosine_similarity, 0.99);
+    EXPECT_FALSE(result.has_nan_inf);
+
+    cudaFree(d_A);
+    cudaFree(d_C);
+}
+
+/**
+ * @test Q4_0 parity with real model weights: ffn_gate.weight (layer 0)
+ *
+ * Tests FFN gate weight which is a larger matrix (4864x896 for Qwen2.5-0.5B).
+ */
+TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_FFNGate_Layer0)
+{
+    if (!std::filesystem::exists(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
+    }
+
+    auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
+    TensorFactory factory(*mpi_ctx);
+    ModelLoader loader(&factory);
+
+    if (!loader.loadModel(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
+    }
+
+    auto weights = loader.loadTensor("blk.0.ffn_gate.weight", DeviceId::cpu());
+    ASSERT_NE(weights, nullptr) << "Failed to load blk.0.ffn_gate.weight";
+
+    auto *q4_tensor = dynamic_cast<Q4_0Tensor *>(weights.get());
+    ASSERT_NE(q4_tensor, nullptr) << "Expected Q4_0Tensor";
+
+    const int M = 4;
+    const int N = static_cast<int>(q4_tensor->shape()[0]);
+    const int K = static_cast<int>(q4_tensor->shape()[1]);
+
+    std::cout << "Real model ffn_gate weight: " << N << "x" << K << " (Q4_0)\n";
+
+    auto A_data = randomFP32(M * K);
+
+    // CPU
+    std::vector<float> C_cpu(M * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        q4_tensor, KernelDeviceType::CPU);
+    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+
+    // CUDA
+    ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
+    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        q4_tensor, KernelDeviceType::CUDA);
+
+    float *d_A, *d_C;
+    cudaMalloc(&d_A, M * K * sizeof(float));
+    cudaMalloc(&d_C, M * N * sizeof(float));
+    cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice);
+
+    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
+
+    std::vector<float> C_cuda(M * N);
+    cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.10);
+    result.print("Real Model Q4_0 ffn_gate (layer 0)");
+
+    EXPECT_GE(result.cosine_similarity, 0.99);
+    EXPECT_FALSE(result.has_nan_inf);
+
+    cudaFree(d_A);
+    cudaFree(d_C);
+}
+
+/**
+ * @test Q4_0 parity with real model weights: output/lm_head.weight
+ *
+ * Tests vocabulary projection (LM head) which is the final layer.
+ * Shape: [vocab_size, hidden_dim] = [151936, 896] for Qwen2.5
+ */
+TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_LMHead)
+{
+    if (!std::filesystem::exists(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
+    }
+
+    auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
+    TensorFactory factory(*mpi_ctx);
+    ModelLoader loader(&factory);
+
+    if (!loader.loadModel(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
+    }
+
+    auto weights = loader.loadTensor("output.weight", DeviceId::cpu());
+    ASSERT_NE(weights, nullptr) << "Failed to load output.weight (LM head)";
+
+    auto *q4_tensor = dynamic_cast<Q4_0Tensor *>(weights.get());
+    if (!q4_tensor)
+    {
+        // LM head might be in a different format (e.g., FP32/FP16)
+        std::cout << "LM head is not Q4_0, tensor type: "
+                  << static_cast<int>(weights->native_type()) << "\n";
+        GTEST_SKIP() << "LM head is not Q4_0 format";
+    }
+
+    const int M = 2;                                       // Smaller batch for large vocab
+    const int N = static_cast<int>(q4_tensor->shape()[0]); // vocab_size
+    const int K = static_cast<int>(q4_tensor->shape()[1]); // hidden_dim
+
+    std::cout << "Real model LM head weight: " << N << "x" << K << " (Q4_0)\n";
+
+    auto A_data = randomFP32(M * K);
+
+    // CPU
+    std::vector<float> C_cpu(M * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        q4_tensor, KernelDeviceType::CPU);
+    ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
+
+    // CUDA
+    ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
+    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        q4_tensor, KernelDeviceType::CUDA);
+
+    float *d_A, *d_C;
+    cudaMalloc(&d_A, M * K * sizeof(float));
+    cudaMalloc(&d_C, static_cast<size_t>(M) * N * sizeof(float));
+    cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float), cudaMemcpyHostToDevice);
+
+    ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));
+
+    std::vector<float> C_cuda(static_cast<size_t>(M) * N);
+    cudaMemcpy(C_cuda.data(), d_C, static_cast<size_t>(M) * N * sizeof(float), cudaMemcpyDeviceToHost);
+
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), static_cast<size_t>(M) * N, 0.99, 0.10);
+    result.print("Real Model Q4_0 LM Head");
+
+    EXPECT_GE(result.cosine_similarity, 0.99);
+    EXPECT_FALSE(result.has_nan_inf);
+
+    cudaFree(d_A);
+    cudaFree(d_C);
+}
+
+/**
+ * @test Q4_0 parity with real model weights using TENSOR API
+ *
+ * This test uses the multiply_tensor() API (same as full inference)
+ * instead of the raw multiply() API to see if the issue is in the
+ * tensor-based code path.
+ */
+TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
+{
+    if (!std::filesystem::exists(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
+    }
+
+    auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
+    TensorFactory factory(*mpi_ctx);
+    ModelLoader loader(&factory);
+
+    if (!loader.loadModel(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
+    }
+
+    auto weights = loader.loadTensor("blk.0.attn_q.weight", DeviceId::cpu());
+    ASSERT_NE(weights, nullptr);
+
+    auto *q4_tensor = dynamic_cast<Q4_0Tensor *>(weights.get());
+    ASSERT_NE(q4_tensor, nullptr);
+
+    const int M = 4;
+    const int N = static_cast<int>(q4_tensor->shape()[0]);
+    const int K = static_cast<int>(q4_tensor->shape()[1]);
+
+    std::cout << "Testing multiply_tensor() API with attn_q: " << N << "x" << K << "\n";
+
+    // Create FP32 input and output tensors
+    auto input_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    auto output_cpu = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+    auto output_cuda = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+
+    // Fill input with random data
+    float *input_data = input_tensor->mutable_data();
+    for (int i = 0; i < M * K; ++i)
+    {
+        input_data[i] = dist_(rng_);
+    }
+
+    // ===== CPU: multiply_tensor() =====
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        q4_tensor, KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_TRUE(cpu_kernel->multiply_tensor(
+        input_tensor.get(), output_cpu.get(),
+        M, N, K, true, 1.0f, 0.0f, nullptr, -1));
+
+    // ===== CUDA: multiply_tensor() =====
+    // First ensure weights are on GPU
+    ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
+
+    // Upload input and output to GPU
+    ASSERT_TRUE(input_tensor->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(output_cuda->ensureOnDevice(gpu_device_));
+
+    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        q4_tensor, KernelDeviceType::CUDA);
+    ASSERT_NE(cuda_kernel, nullptr);
+
+    ASSERT_TRUE(cuda_kernel->multiply_tensor(
+        input_tensor.get(), output_cuda.get(),
+        M, N, K, true, 1.0f, 0.0f, nullptr, -1));
+
+    // ===== Compare =====
+    // data() will automatically sync to host if needed
+    const float *cpu_data = output_cpu->data();
+    const float *cuda_data = output_cuda->data();
+
+    auto result = checkParity(cuda_data, cpu_data, M * N, 0.99, 0.10);
+    result.print("Real Model Q4_0 attn_q (multiply_tensor API)");
+
+    EXPECT_GE(result.cosine_similarity, 0.99)
+        << "multiply_tensor() API shows divergence!";
+    EXPECT_FALSE(result.has_nan_inf);
+}
 
 #endif // HAVE_CUDA
 

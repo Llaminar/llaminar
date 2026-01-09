@@ -170,16 +170,6 @@ namespace llaminar2
          */
         virtual DeviceId home_device() const = 0;
 
-        /**
-         * @brief Get the DeviceManager device index where this tensor was created
-         * @return TensorBase::NOT_ON_GPU (-1) for CPU/host, >= 0 for DeviceManager device index
-         * @deprecated Use home_device() instead for type-safe device identification
-         */
-        virtual int home_dm_device_index() const
-        {
-            return home_device().toLegacyIndex();
-        }
-
         // =========================================================================
         // Device Location Convenience Methods
         // =========================================================================

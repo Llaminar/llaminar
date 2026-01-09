@@ -278,7 +278,7 @@ protected:
 TEST_F(Test__MultiGPU_TensorTransfer, FP32_EnsureOnCPU_Fails)
 {
     std::vector<size_t> shape = {8, 16};
-    auto tensor = std::make_unique<FP32Tensor>(shape, -1); // CPU tensor
+    auto tensor = std::make_unique<FP32Tensor>(shape, DeviceId::cpu()); // CPU tensor
 
     // Fill with test data
     float *data = tensor->mutable_data();
@@ -311,7 +311,7 @@ TEST_F(Test__MultiGPU_TensorTransfer, FP32_EnsureOnGPU)
     DeviceId gpu_device = legacyToDeviceId(gpu_idx);
 
     std::vector<size_t> shape = {8, 16};
-    auto tensor = std::make_unique<FP32Tensor>(shape, -1); // Start on CPU
+    auto tensor = std::make_unique<FP32Tensor>(shape, DeviceId::cpu()); // Start on CPU
 
     // Fill with test data
     float *data = tensor->mutable_data();
@@ -324,9 +324,9 @@ TEST_F(Test__MultiGPU_TensorTransfer, FP32_EnsureOnGPU)
     bool success = tensor->ensureOnDevice(gpu_device);
     EXPECT_TRUE(success) << "ensureOnDevice should succeed for GPU " << gpu_device.toString();
     EXPECT_TRUE(tensor->isOnGPU()) << "Tensor should be on GPU after transfer";
-    EXPECT_TRUE(tensor->is_on_device(gpu_idx))
-        << "is_on_device(gpu_idx) should return true after transfer to that GPU";
-    EXPECT_TRUE(tensor->is_on_device(0)) << "Host copy should still be valid (dual residency)";
+    EXPECT_TRUE(tensor->is_on_device(gpu_device))
+        << "is_on_device(gpu_device) should return true after transfer to that GPU";
+    EXPECT_TRUE(tensor->is_on_device(DeviceId::cpu())) << "Host copy should still be valid (dual residency)";
 }
 
 /**
@@ -343,7 +343,7 @@ TEST_F(Test__MultiGPU_TensorTransfer, FP32_RoundTrip)
     DeviceId gpu_device = legacyToDeviceId(gpu_idx);
 
     std::vector<size_t> shape = {32, 64}; // Larger tensor
-    auto tensor = std::make_unique<FP32Tensor>(shape, -1);
+    auto tensor = std::make_unique<FP32Tensor>(shape, DeviceId::cpu());
 
     // Fill with pattern
     float *data = tensor->mutable_data();
@@ -387,7 +387,7 @@ TEST_F(Test__MultiGPU_TensorTransfer, FP32_ReleaseDeviceMemory)
     DeviceId gpu_device = legacyToDeviceId(gpu_idx);
 
     std::vector<size_t> shape = {8, 16};
-    auto tensor = std::make_unique<FP32Tensor>(shape, -1);
+    auto tensor = std::make_unique<FP32Tensor>(shape, DeviceId::cpu());
 
     // Fill with data
     float *data = tensor->mutable_data();
@@ -533,9 +533,9 @@ TEST_F(Test__MultiGPU_Q4_0Transfer, EnsureOnGPU)
     bool success = tensor->ensureOnDevice(gpu_device);
     EXPECT_TRUE(success) << "Q4_0 tensor should transfer to GPU";
     EXPECT_TRUE(tensor->isOnGPU()) << "Tensor should be on GPU after transfer";
-    EXPECT_TRUE(tensor->is_on_device(gpu_idx))
-        << "is_on_device(gpu_idx) should return true after transfer";
-    EXPECT_TRUE(tensor->is_on_device(0)) << "Host copy should still be valid (dual residency)";
+    EXPECT_TRUE(tensor->is_on_device(gpu_device))
+        << "is_on_device(gpu_device) should return true after transfer";
+    EXPECT_TRUE(tensor->is_on_device(DeviceId::cpu())) << "Host copy should still be valid (dual residency)";
 }
 
 // ============================================================================
@@ -576,9 +576,9 @@ TEST_F(Test__MultiGPU_KernelFallback, RMSNorm_CPUFallback)
         GTEST_SKIP() << "No GPU available for testing";
     }
 
-    // Create FP32 tensor
+    // Create FP32 tensor on GPU
     std::vector<size_t> shape = {8, 16};
-    auto tensor = std::make_unique<FP32Tensor>(shape, gpu_idx);
+    auto tensor = std::make_unique<FP32Tensor>(shape, DeviceId::cuda(gpu_idx));
 
     // Request RMSNorm kernel for GPU device
     auto kernel = llaminar::v2::kernels::KernelFactory::createRMSNorm(
@@ -602,9 +602,9 @@ TEST_F(Test__MultiGPU_KernelFallback, SwiGLU_CPUFallback)
         GTEST_SKIP() << "No GPU available for testing";
     }
 
-    // Create FP32 tensor
+    // Create FP32 tensor on GPU
     std::vector<size_t> shape = {8, 16};
-    auto tensor = std::make_unique<FP32Tensor>(shape, gpu_idx);
+    auto tensor = std::make_unique<FP32Tensor>(shape, DeviceId::cuda(gpu_idx));
 
     // Request SwiGLU kernel for GPU device - should get CPU fallback
     auto kernel = llaminar::v2::kernels::KernelFactory::createSwiGLU(
@@ -624,9 +624,9 @@ TEST_F(Test__MultiGPU_KernelFallback, RoPE_CPUFallback)
         GTEST_SKIP() << "No GPU available for testing";
     }
 
-    // Create FP32 tensor
+    // Create FP32 tensor on GPU
     std::vector<size_t> shape = {8, 16};
-    auto tensor = std::make_unique<FP32Tensor>(shape, gpu_idx);
+    auto tensor = std::make_unique<FP32Tensor>(shape, DeviceId::cuda(gpu_idx));
 
     // Request RoPE kernel - should get CPU fallback
     auto kernel = llaminar::v2::kernels::KernelFactory::createRoPE(
@@ -694,7 +694,7 @@ TEST_F(Test__MultiGPU_HeterogeneousBackends, CrossBackendTransfer)
               << ") <-> ROCm (global idx " << rocm_idx_ << ")\n";
 
     std::vector<size_t> shape = {16, 32};
-    auto tensor = std::make_unique<FP32Tensor>(shape, -1);
+    auto tensor = std::make_unique<FP32Tensor>(shape, DeviceId::cpu());
 
     // Fill with pattern
     float *data = tensor->mutable_data();
@@ -707,12 +707,12 @@ TEST_F(Test__MultiGPU_HeterogeneousBackends, CrossBackendTransfer)
     // Transfer to CUDA
     ASSERT_TRUE(tensor->ensureOnDevice(cuda_device_));
     EXPECT_TRUE(tensor->isOnGPU()) << "Should be on CUDA GPU";
-    EXPECT_TRUE(tensor->is_on_device(cuda_idx_)) << "Should report on CUDA device";
+    EXPECT_TRUE(tensor->is_on_device(cuda_device_)) << "Should report on CUDA device";
 
     // Transfer from CUDA to ROCm (will go via host since cross-backend)
     ASSERT_TRUE(tensor->ensureOnDevice(rocm_device_));
     EXPECT_TRUE(tensor->isOnGPU()) << "Should be on ROCm GPU";
-    EXPECT_TRUE(tensor->is_on_device(rocm_idx_)) << "Should report on ROCm device";
+    EXPECT_TRUE(tensor->is_on_device(rocm_device_)) << "Should report on ROCm device";
 
     // Bring back to host and verify
     ASSERT_TRUE(tensor->ensureOnHost());

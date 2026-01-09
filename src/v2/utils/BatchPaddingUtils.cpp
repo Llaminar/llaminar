@@ -44,7 +44,7 @@ namespace llaminar2
         // Create padded token tensor [batch_size, max_length]
         result.tokens = std::make_shared<FP32Tensor>(
             std::vector<size_t>{result.batch_size, result.max_length},
-            -1); // CPU only for now
+            DeviceId::cpu()); // CPU only for now
 
         float *token_data = result.tokens->mutable_data();
 
@@ -88,7 +88,7 @@ namespace llaminar2
         // Create mask tensor [batch_size, max_length]
         auto mask = std::make_shared<FP32Tensor>(
             std::vector<size_t>{batch_size, max_length},
-            -1); // CPU only
+            DeviceId::cpu()); // CPU only
 
         float *mask_data = mask->mutable_data();
 
@@ -182,7 +182,7 @@ namespace llaminar2
                 // Reallocate with boundary padding
                 auto new_tokens = std::make_shared<FP32Tensor>(
                     std::vector<size_t>{batch.batch_size, boundary},
-                    -1);
+                    DeviceId::cpu());
 
                 float *new_data = new_tokens->mutable_data();
                 const float *old_data = batch.tokens->data();

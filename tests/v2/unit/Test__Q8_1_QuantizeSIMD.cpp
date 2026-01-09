@@ -865,7 +865,7 @@ TEST_F(Q8_1_QuantizeSIMD_Test, FP32Tensor_Integration)
     constexpr int K = 64; // cols (2 blocks per row)
 
     // Create FP32 tensor
-    auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{M, K}, -1);
+    auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{M, K}, DeviceId::cpu());
 
     // Fill with random data
     float *data = tensor->mutable_data();
@@ -911,7 +911,7 @@ TEST_F(Q8_1_QuantizeSIMD_Test, LargeMatrixQuantization_StressTest)
     constexpr int QS_TOLERANCE = 1;
     constexpr int SUM_TOLERANCE = 32;
 
-    auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{M, K}, -1);
+    auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{M, K}, DeviceId::cpu());
     float *data = tensor->mutable_data();
     generate_random_fp32(data, M * K, -10.0f, 10.0f);
 

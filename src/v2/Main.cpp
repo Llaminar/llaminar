@@ -85,32 +85,38 @@ void list_devices()
     LOG_DEBUG("\n");
 }
 
-int parse_device(const std::string &device_str, DeviceManager &dm)
+DeviceId parse_device(const std::string &device_str, DeviceManager &dm)
 {
     if (device_str == "auto")
     {
-        return dm.select_device();
+        // DeviceManager returns 1-based indices for GPUs (0 = CPU)
+        int dm_idx = dm.select_device();
+        if (dm_idx == 0)
+        {
+            return DeviceId::cpu();
+        }
+        return DeviceId::cuda(dm_idx - 1);
     }
 
     if (device_str == "cpu")
     {
-        return dm.find_device(ComputeBackendType::CPU, 0);
+        return DeviceId::cpu();
     }
 
     if (device_str.substr(0, 5) == "cuda:")
     {
         int device_id = std::stoi(device_str.substr(5));
-        return dm.find_device(ComputeBackendType::GPU_CUDA, device_id);
+        return DeviceId::cuda(device_id);
     }
 
     if (device_str.substr(0, 5) == "rocm:")
     {
         int device_id = std::stoi(device_str.substr(5));
-        return dm.find_device(ComputeBackendType::GPU_ROCM, device_id);
+        return DeviceId::rocm(device_id);
     }
 
     LOG_ERROR("Error: Unknown device format: " << device_str);
-    return -1;
+    return DeviceId(); // Invalid device
 }
 
 /**
@@ -267,8 +273,8 @@ int main(int argc, char *argv[])
     }
 
     // Parse device
-    int device_idx = parse_device(args.device, dm);
-    if (device_idx < 0)
+    DeviceId device_id = parse_device(args.device, dm);
+    if (!device_id.is_valid())
     {
         MPI_Finalize();
         return 1;
@@ -321,7 +327,7 @@ int main(int argc, char *argv[])
     // Create orchestration config from ArgContext
     OrchestrationConfig orch_config;
     orch_config.strategy = strategy;
-    orch_config.gpu_device_idx = device_idx;
+    orch_config.gpu_device = device_id;
     orch_config.offload_layers = args.offload_layers;
     orch_config.verbose = args.verbose;
     orch_config.device_map = args.device_map;
@@ -331,7 +337,11 @@ int main(int argc, char *argv[])
     orch_config.moe_sparse_experts_cpu = args.moe_sparse_experts_cpu;
     orch_config.multi_gpu = args.multi_gpu;
     orch_config.gpu_split = args.gpu_split;
-    orch_config.gpu_devices = args.gpu_devices;
+    // Convert vector<int> to vector<DeviceId>
+    for (int gpu_idx : args.gpu_devices)
+    {
+        orch_config.gpu_devices.push_back(DeviceId::cuda(gpu_idx));
+    }
 
     // Create device orchestrator
     auto device_mgr_shared = std::shared_ptr<DeviceManager>(&dm, [](DeviceManager *) {});
@@ -562,7 +572,7 @@ int main(int argc, char *argv[])
     runner_config.activation_precision = runtime_config.activation_precision;
     runner_config.fused_attention_backend = runtime_config.fused_attention_backend;
 
-    auto runner = createInferenceRunner(model_ctx, mpi_ctx, DeviceId::fromLegacyIndex(device_idx), runner_config);
+    auto runner = createInferenceRunner(model_ctx, mpi_ctx, device_id, runner_config);
     if (!runner)
     {
         if (mpi_ctx->rank() == 0)

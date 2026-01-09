@@ -74,9 +74,6 @@ namespace llaminar2
          * Returns the appropriate device index for CUDA/ROCm API calls:
          * - CPU: returns -1 (convention for CPU execution)
          * - CUDA/ROCm: returns the 0-based GPU ordinal
-         *
-         * This differs from toLegacyIndex() which uses 1-based GPU indexing
-         * for DeviceManager compatibility.
          */
         int toKernelDeviceIndex() const
         {
@@ -107,43 +104,6 @@ namespace llaminar2
             return type == other.type && ordinal == other.ordinal;
         }
         bool operator!=(const DeviceId &other) const { return !(*this == other); }
-
-        // =========================================================================
-        // Legacy Conversion (for gradual migration - prefer explicit DeviceId)
-        // =========================================================================
-
-        /**
-         * @brief Convert from legacy integer index
-         * @param legacy_idx Legacy index (-1 or 0 = CPU, 1+ = GPU ordinal)
-         * @return DeviceId
-         * @deprecated Use explicit DeviceId::cpu(), DeviceId::cuda(n) instead
-         * @note Historical convention in this codebase:
-         *       - -1 (NOT_ON_GPU): CPU, host-only
-         *       - 0: CPU (DeviceManager device 0)
-         *       - 1+: GPU ordinals (DeviceManager device 1+ maps to GPU 0+)
-         */
-        static DeviceId fromLegacyIndex(int legacy_idx)
-        {
-            if (legacy_idx <= 0)
-                return cpu();
-            // Legacy: device_idx >= 1 means GPU ordinal (device_idx - 1)
-            // Assume CUDA for legacy compatibility
-            return cuda(legacy_idx - 1);
-        }
-
-        /**
-         * @brief Convert to legacy integer index
-         * @return Legacy index (-1=CPU, 1+=GPU device index)
-         * @deprecated Avoid using legacy indices
-         * @note Historical convention: -1=CPU (NOT_ON_GPU), 1=GPU:0, 2=GPU:1, etc.
-         */
-        int toLegacyIndex() const
-        {
-            if (is_cpu())
-                return -1; // NOT_ON_GPU constant
-            // GPU: legacy index = ordinal + 1 (GPU:0=1, GPU:1=2, etc.)
-            return ordinal + 1;
-        }
 
         // =========================================================================
         // String Conversion (for logging)
@@ -178,3 +138,19 @@ namespace llaminar2
     }
 
 } // namespace llaminar2
+
+// Hash specialization for using DeviceId as unordered_map key
+namespace std
+{
+    template <>
+    struct hash<llaminar2::DeviceId>
+    {
+        size_t operator()(const llaminar2::DeviceId &device) const noexcept
+        {
+            // Combine device type and ordinal for hash
+            size_t h1 = std::hash<int>{}(static_cast<int>(device.type));
+            size_t h2 = std::hash<int>{}(device.ordinal);
+            return h1 ^ (h2 << 1);
+        }
+    };
+} // namespace std

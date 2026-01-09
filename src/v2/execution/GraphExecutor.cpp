@@ -7,7 +7,6 @@
 
 #include "GraphExecutor.h"
 #include "StageDumper.h"
-#include "../tensors/TensorValidation.h"
 #include "../tensors/TensorVerification.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
@@ -445,7 +444,7 @@ namespace llaminar2
 
     bool GraphExecutor::executeMultiDevice(
         ComputeGraph &graph,
-        const std::unordered_map<int, IDeviceContext *> &contexts)
+        const std::unordered_map<DeviceId, IDeviceContext *> &contexts)
     {
 
         if (contexts.empty())
@@ -475,7 +474,7 @@ namespace llaminar2
             IDeviceContext *ctx = default_ctx;
             if (node->device.is_gpu())
             {
-                auto it = contexts.find(node->device.toLegacyIndex());
+                auto it = contexts.find(node->device);
                 if (it != contexts.end())
                 {
                     ctx = it->second;

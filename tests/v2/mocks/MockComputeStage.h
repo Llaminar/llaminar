@@ -164,11 +164,18 @@ namespace llaminar2
         class MockDeviceContext : public IDeviceContext
         {
         public:
-            explicit MockDeviceContext(int device_idx = 0,
+            explicit MockDeviceContext(DeviceId device = DeviceId::cpu(),
                                        ComputeBackendType backend = ComputeBackendType::CPU)
-                : device_idx_(device_idx), backend_(backend) {}
+                : device_id_(device), backend_(backend) {}
 
-            int deviceIndex() const override { return device_idx_; }
+            // Legacy constructor for backward compatibility
+            explicit MockDeviceContext(int device_idx,
+                                       ComputeBackendType backend)
+                : device_id_(device_idx == -1 || device_idx == 0 ? DeviceId::cpu() : DeviceId::cuda(device_idx - 1)),
+                  backend_(backend) {}
+
+            DeviceId deviceId() const override { return device_id_; }
+            int deviceIndex() const override { return device_id_.toKernelDeviceIndex(); }
             ComputeBackendType backendType() const override { return backend_; }
             DeviceType deviceType() const override
             {
@@ -193,7 +200,7 @@ namespace llaminar2
                        backend_ == ComputeBackendType::GPU_VULKAN ||
                        backend_ == ComputeBackendType::GPU_METAL;
             }
-            std::string deviceName() const override { return "MockDevice_" + std::to_string(device_idx_); }
+            std::string deviceName() const override { return "MockDevice_" + device_id_.toString(); }
 
             void synchronize() override { sync_count_++; }
             void barrier() override { barrier_count_++; }
@@ -296,7 +303,7 @@ namespace llaminar2
             }
 
         private:
-            int device_idx_;
+            DeviceId device_id_;
             ComputeBackendType backend_;
 
             // Configuration
@@ -452,7 +459,7 @@ namespace llaminar2
 
             bool executeMultiDevice(
                 ComputeGraph &graph,
-                const std::unordered_map<int, IDeviceContext *> &contexts) override
+                const std::unordered_map<DeviceId, IDeviceContext *> &contexts) override
             {
                 multi_execute_count_++;
                 return should_succeed_;

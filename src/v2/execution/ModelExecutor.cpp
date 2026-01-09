@@ -43,8 +43,7 @@ namespace llaminar2
 
     IDeviceContext *ModelExecutor::getDeviceContext(DeviceId device)
     {
-        int key = device.toLegacyIndex();
-        auto it = device_contexts_.find(key);
+        auto it = device_contexts_.find(device);
         if (it != device_contexts_.end())
         {
             return it->second.get();
@@ -59,7 +58,7 @@ namespace llaminar2
         }
 
         IDeviceContext *raw_ptr = ctx.get();
-        device_contexts_[key] = std::move(ctx);
+        device_contexts_[device] = std::move(ctx);
         return raw_ptr;
     }
 

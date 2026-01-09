@@ -68,11 +68,11 @@ namespace llaminar2
 
     // Private view constructor
     FP16Tensor::FP16Tensor(const std::vector<size_t> &shape,
-                           int device_idx,
+                           DeviceId device,
                            AlignedVector<uint16_t> *parent_data,
                            size_t data_offset,
                            std::shared_ptr<FP16Tensor> parent)
-        : shape_(shape), device_(DeviceId::fromLegacyIndex(device_idx)), device_data_(nullptr),
+        : shape_(shape), device_(device), device_data_(nullptr),
           is_view_(true), parent_data_ptr_(parent_data), view_offset_(data_offset),
           parent_(parent)
     {
@@ -86,13 +86,6 @@ namespace llaminar2
     }
 
     // ========== TensorBase Interface ==========
-
-    bool FP16Tensor::set_device(int device_idx)
-    {
-        device_ = DeviceId::fromLegacyIndex(device_idx);
-        // TODO: Upload to device when device support is added
-        return true;
-    }
 
     const float *FP16Tensor::data() const
     {
@@ -450,7 +443,7 @@ namespace llaminar2
         // Create view using private constructor
         auto view_tensor = std::shared_ptr<FP16Tensor>(new FP16Tensor(
             new_shape,
-            device_.toLegacyIndex(),
+            device_,
             root_data,
             root_offset,
             root_parent));

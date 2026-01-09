@@ -599,6 +599,19 @@ namespace llaminar2
         return false;
     }
 
+    std::vector<size_t> DeviceManager::get_devices_by_type(ComputeBackendType type) const
+    {
+        std::vector<size_t> result;
+        for (size_t i = 0; i < devices_.size(); ++i)
+        {
+            if (devices_[i].type == type)
+            {
+                result.push_back(i);
+            }
+        }
+        return result;
+    }
+
     // ============================================================================
     // CPUComputeContext Implementation
     // ============================================================================

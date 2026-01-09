@@ -102,7 +102,7 @@ namespace llaminar2
 
         // Use the mutable activation buffer constructor (no raw_data, allocates internally)
         // This creates a Q8_1Tensor that supports mutable_data() and quantize_from_cache()
-        return std::make_unique<Q8_1Tensor>(shape, device.toLegacyIndex());
+        return std::make_unique<Q8_1Tensor>(shape, device);
     }
 
     std::unique_ptr<Q8_1Tensor> TensorFactory::createQ8_1(const std::vector<size_t> &shape,
@@ -126,7 +126,7 @@ namespace llaminar2
 
         // Use the mutable activation buffer constructor
         // Q16_1Tensor(shape, device) creates an empty tensor for residual accumulation
-        return std::make_unique<Q16_1Tensor>(shape, device.toLegacyIndex());
+        return std::make_unique<Q16_1Tensor>(shape, device);
     }
 
     std::unique_ptr<Q16_1Tensor> TensorFactory::createQ16_1(const std::vector<size_t> &shape,
@@ -139,7 +139,7 @@ namespace llaminar2
         }
 
         // Use the mutable activation buffer constructor with custom block size
-        return std::make_unique<Q16_1Tensor>(shape, block_size, device.toLegacyIndex());
+        return std::make_unique<Q16_1Tensor>(shape, block_size, device);
     }
 
     std::unique_ptr<CPUTensorBase> TensorFactory::createActivation(const std::vector<size_t> &shape,
@@ -168,7 +168,7 @@ namespace llaminar2
             break;
 
         case ActivationPrecision::Q8_1:
-            tensor = createQ8_1(shape);
+            tensor = createQ8_1(shape, device);
             break;
 
         case ActivationPrecision::Q16_1:
@@ -185,15 +185,8 @@ namespace llaminar2
             return createFP32(shape, device);
         }
 
-        // Set device on the created tensor to ensure consistent device tracking
-        // This is critical for pipelines that use placement maps to route tensors
-        // between devices. Without this, Q8_1/BF16/FP16 tensors would have device=-1
-        // even when they should be associated with device 0 (CPU), causing spurious
-        // "device transfer" attempts in prepareActivationForDevice().
-        if (tensor && device.is_valid())
-        {
-            tensor->set_device(device.toLegacyIndex());
-        }
+        // Note: Device is set through constructor for tensor types that support it
+        // (FP32, Q8_1, Q16_1). Other types (BF16, FP16) are CPU-only for now.
 
         return tensor;
     }

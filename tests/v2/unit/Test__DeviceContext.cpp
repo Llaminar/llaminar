@@ -29,7 +29,7 @@ TEST(Test__DeviceContext, CreateCPUContextDirect)
     auto ctx = std::make_unique<CPUDeviceContext>(DeviceId::cpu());
 
     ASSERT_NE(ctx, nullptr);
-    // DeviceId::cpu().toLegacyIndex() returns -1 (NOT_ON_GPU convention)
+    // DeviceId::cpu().toKernelDeviceIndex() returns -1 (CPU convention)
     EXPECT_EQ(ctx->deviceIndex(), -1);
     EXPECT_FALSE(ctx->isGPU());
 }

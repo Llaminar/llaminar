@@ -72,9 +72,9 @@ namespace llaminar2
     struct OrchestrationConfig
     {
         PlacementStrategy strategy = PlacementStrategy::AUTO;
-        int gpu_device_idx = 0;  ///< Which GPU to use (if multiple)
-        int cpu_device_idx = -1; ///< CPU device index (or -1 for auto-detect)
-        int offload_layers = 0;  ///< Number of layers to keep on GPU (LAYER_SPLIT)
+        DeviceId gpu_device = DeviceId::cuda(0); ///< Which GPU to use (if multiple)
+        DeviceId cpu_device = DeviceId::cpu();   ///< CPU device
+        int offload_layers = 0;                  ///< Number of layers to keep on GPU (LAYER_SPLIT)
 
         // Phase 2: Custom device map
         std::string device_map; ///< Custom device map string (e.g., "0-11:gpu:0,12-23:cpu")
@@ -88,9 +88,9 @@ namespace llaminar2
         bool moe_sparse_experts_cpu = true; ///< Put MoE sparse experts on CPU
 
         // Phase 6: Multi-GPU
-        bool multi_gpu = false;         ///< Enable multi-GPU distribution
-        std::string gpu_split = "even"; ///< GPU split strategy: "even", "weighted", or "0.6,0.4"
-        std::vector<int> gpu_devices;   ///< Specific GPU device indices to use (empty = all GPUs)
+        bool multi_gpu = false;            ///< Enable multi-GPU distribution
+        std::string gpu_split = "even";    ///< GPU split strategy: "even", "weighted", or "0.6,0.4"
+        std::vector<DeviceId> gpu_devices; ///< Specific GPU devices to use (empty = all GPUs)
 
         bool verbose = false; ///< Log placement decisions
     };
@@ -231,9 +231,12 @@ namespace llaminar2
         DeviceMapRule parseDeviceMapRule(const std::string &rule_str) const;
 
         /**
-         * @brief Parse device string to device index (Phase 2)
+         * @brief Parse device string to DeviceId
+         * @param device_type Device type string ("cpu", "cuda", "gpu", "rocm")
+         * @param device_id Device ordinal (e.g., 0, 1)
+         * @return DeviceId for the specified device
          */
-        int parseDeviceString(const std::string &device_type, int device_id) const;
+        DeviceId parseDeviceString(const std::string &device_type, int device_id) const;
 
         /**
          * @brief Apply parsed device map rule to placement map (Phase 2)

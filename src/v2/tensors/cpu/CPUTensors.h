@@ -85,8 +85,7 @@
 #pragma once
 
 #include "../ITensor.h"
-#include "../SharedTensorBase.h" // Common base for CPU and CUDA tensors
-#include "../TypedTensorBase.h"  // CRTP base for type-safe typed_data() access
+#include "../TypedTensorBase.h" // CRTP base for type-safe typed_data() access
 #include "../TensorKernels.h"
 #include "../FP16Utils.h"
 #include "../BlockStructures.h" // Must be included BEFORE SIMDHelpers.h
@@ -100,6 +99,7 @@
 #include <cstdint>
 #include <any>
 #include <mutex>
+#include <optional>
 
 namespace llaminar2
 {
@@ -545,7 +545,7 @@ namespace llaminar2
      * This allows concrete tensors to inherit type-safe typed_data() from TypedTensorBase
      * while still getting the full TensorBase infrastructure.
      */
-    class CPUTensorBase : public SharedTensorBase, public std::enable_shared_from_this<CPUTensorBase>
+    class CPUTensorBase : public virtual ITensor, public std::enable_shared_from_this<CPUTensorBase>
     {
     public:
         virtual ~CPUTensorBase(); // Implemented in TensorBase.cpp - clears KernelFactory cache
@@ -566,16 +566,11 @@ namespace llaminar2
         // Separate from cache_ to allow both CPU and CUDA paths to coexist
         mutable std::any cuda_cache_;
 
-        // Shape and type
-        // Note: SharedTensorBase provides shape(), rows(), cols(), numel(), native_type_id(), dtype_name()
-        // Concrete tensor classes override shape() to return their own stored shape
-        // (kept for backward compatibility - each tensor type has its own shape_ member)
-        using SharedTensorBase::shape; // Inherit base implementation, derived classes override
+        // Shape and type - each concrete tensor class has its own shape_ member
+        // and overrides shape() to return it.
         virtual TensorType native_type() const = 0;
 
         // ===== ITensor Interface Implementation =====
-        // Note: native_type_id() and numel() are inherited from SharedTensorBase.
-        // We override native_type_id() to use native_type() from derived classes.
 
         /**
          * @brief Get runtime type ID for this tensor
@@ -612,8 +607,13 @@ namespace llaminar2
          * @return Void pointer to start of data buffer
          * @note Implements ITensor::raw_mutable_data() - delegates to raw_host_data_ptr()
          * @note Always returns HOST pointer even if tensor is on GPU
+         * @note IMPORTANT: Invalidates GPU copy since host will be modified
          */
-        void *raw_mutable_data() override { return raw_host_data_ptr(); }
+        void *raw_mutable_data() override
+        {
+            invalidateGpuData(); // Host is about to be modified, GPU copy is now stale
+            return raw_host_data_ptr();
+        }
 
         /**
          * @brief Get pointer to data where it currently resides (const)
@@ -673,49 +673,43 @@ namespace llaminar2
          * After ensureOnDevice(), this still returns the original value.
          *
          * @return NOT_ON_GPU (-1) for host/CPU, >=0 for DeviceManager device index
-         * @note To check where data currently IS, use current_dm_device_index()
-         * @see current_dm_device_index() for checking current GPU data location
-         * @deprecated Use home_device() instead
+         * @note To check where data currently IS, use current_device()
+         * @see current_device() for checking current GPU data location
          */
-        int home_dm_device_index() const override { return home_device().toLegacyIndex(); }
 
         /**
-         * @brief Get the DeviceManager device index where tensor GPU data currently resides
+         * @brief Get the DeviceId where tensor GPU data currently resides
          *
          * This reflects the CURRENT GPU location of tensor data:
-         * - After ensureOnDevice(gpu_idx): returns gpu_idx
-         * - After ensureOnHost(): returns NOT_ON_GPU
-         * - If never uploaded to GPU: returns NOT_ON_GPU
+         * - After ensureOnDevice(device): returns device
+         * - After ensureOnHost(): returns nullopt
+         * - If never uploaded to GPU: returns nullopt
          *
-         * For dual-residency (data on both CPU and GPU), returns GPU index.
+         * For dual-residency (data on both CPU and GPU), returns GPU device.
          *
-         * @return NOT_ON_GPU (-1) for host/CPU only, >=0 for DeviceManager GPU device index
-         * @note This is non-virtual - uses TensorBase's gpu_device_idx_ tracking
+         * @return std::optional<DeviceId> - nullopt for host/CPU only, DeviceId for GPU
+         * @note This is non-virtual - uses TensorBase's gpu_device_ tracking
          */
-        int current_dm_device_index() const { return gpu_device_idx_; }
-
-        virtual bool set_device(int device_idx) = 0; // Upload to device
+        std::optional<DeviceId> current_device() const { return gpu_device_; }
 
         /**
          * @brief Check if tensor currently has valid data on the specified device
          *
-         * @param device_idx DeviceManager device index to check:
-         *        - device_idx <= 0 (or NOT_ON_GPU): Check if tensor has valid host/CPU data
-         *        - device_idx >= 1: Check if tensor is currently on that specific GPU
+         * @param device DeviceId to check
          * @return true if tensor has valid data on the specified device
          *
          * @note This checks CURRENT location, not creation device.
          *       A tensor can be on multiple devices simultaneously (dual-residency).
          */
-        virtual bool is_on_device(int device_idx) const
+        virtual bool is_on_device(DeviceId device) const
         {
-            if (device_idx <= 0)
+            if (device.is_cpu())
             {
                 // Asking about CPU/host - return true if host data is valid
-                return !host_invalid_;
+                return host_valid_;
             }
-            // Asking about a specific GPU
-            return gpu_device_idx_ == device_idx;
+            // Asking about a specific GPU - must be on that device AND have valid data
+            return gpu_device_.has_value() && *gpu_device_ == device && device_valid_;
         }
 
         // ===== Lazy Transfer API (Phase 1 GPU Device-Aware Slicing) =====
@@ -726,7 +720,7 @@ namespace llaminar2
          * @brief Ensure tensor data is available on target device
          *
          * Performs lazy upload: if data is already on target device, returns immediately.
-         * If data is on host (home_dm_device_index() == NOT_ON_GPU), allocates GPU memory and uploads.
+         * If data is on host, allocates GPU memory and uploads.
          *
          * @param target_device DeviceId for the target GPU device
          * @return true if data is now available on target device, false on error
@@ -737,7 +731,15 @@ namespace llaminar2
          * @note For quantized weight tensors, uploads quantized blocks (not dequantized FP32)
          * @note Implementation in TensorBase.cpp - uses raw_host_data_ptr() and byte_size()
          */
-        bool ensureOnDevice(DeviceId target_device);
+        virtual bool ensureOnDevice(DeviceId target_device);
+
+        /**
+         * @brief Invalidate GPU data, forcing re-upload on next ensureOnDevice() call
+         *
+         * Call this when host data has been modified and GPU copy is now stale.
+         * This frees the GPU memory, so next ensureOnDevice() will reallocate and upload.
+         */
+        virtual void invalidateGpuData();
 
         /**
          * @brief Ensure tensor data is available on host (CPU)
@@ -751,13 +753,14 @@ namespace llaminar2
          * **Memory**: Host buffer is always retained; GPU buffer optionally freed (see releaseDeviceMemory)
          * @note Implementation in TensorBase.cpp - uses raw_host_data_ptr() and byte_size()
          */
-        bool ensureOnHost();
+        virtual bool ensureOnHost();
 
         /**
          * @brief Check if tensor data is currently resident on GPU
          * @return true if GPU buffer is allocated and contains valid data
+         * @note Uses virtual gpu_data_ptr() so derived classes with custom device management work
          */
-        bool isOnGPU() const { return gpu_data_ptr_ != nullptr; }
+        bool isOnGPU() const { return gpu_data_ptr() != nullptr; }
 
         /**
          * @brief Get the raw device (GPU) data pointer
@@ -771,14 +774,28 @@ namespace llaminar2
         /**
          * @brief Mark tensor as modified on device (requires sync to host before host access)
          * @note Call this after GPU kernels write to the tensor via gpu_data_ptr()
+         *
+         * After calling this:
+         *   - device_valid_ = true (device just got written to)
+         *   - host_valid_ = false (host is now stale)
          */
-        virtual void mark_device_dirty() { /* Base class no-op - derived classes override */ }
+        virtual void mark_device_dirty()
+        {
+            device_valid_ = true; // Device just got written to
+            host_valid_ = false;  // Host is now stale
+        }
 
         /**
          * @brief Check if tensor data is currently resident on host (CPU)
-         * @return true if host buffer contains valid data (always true unless in GPU-only mode)
+         * @return true if host buffer contains valid data
          */
-        bool isOnCPU() const { return !host_invalid_; }
+        bool isOnCPU() const { return host_valid_; }
+
+        /**
+         * @brief Check if tensor data is currently valid on GPU
+         * @return true if GPU buffer is allocated AND contains valid data
+         */
+        bool isDeviceValid() const { return device_valid_ && gpu_data_ptr_ != nullptr; }
 
         /**
          * @brief Release GPU memory, keeping only host copy
@@ -1262,12 +1279,23 @@ namespace llaminar2
         void assertValid(const char *) const {}
 #endif
 
-        // ===== Lazy Transfer State (Phase 1 GPU Device-Aware Slicing) =====
-        // Maintained by TensorBase::ensureOnDevice/ensureOnHost implementations.
+        // ===== Host/Device Memory Coherence State =====
+        // Two-flag model for tracking data validity:
+        //   host_valid_   = true:  Host data is current (can be read without sync)
+        //   device_valid_ = true:  Device data is current (can be read without sync)
+        //
+        // Valid state combinations:
+        //   HOST_AUTHORITATIVE:   host_valid_=true,  device_valid_=false
+        //   DEVICE_AUTHORITATIVE: host_valid_=false, device_valid_=true
+        //   SYNCED:               host_valid_=true,  device_valid_=true
+        //   INVALID:              host_valid_=false, device_valid_=false (ERROR STATE)
+        //
+        // See docs/v2/TENSOR_MEMORY_COHERENCE_DESIGN.md for full design.
 
-        void *gpu_data_ptr_ = nullptr;    // GPU buffer pointer (nullptr = not on GPU)
-        bool host_invalid_ = false;       // true if GPU has newer data than host
-        int gpu_device_idx_ = NOT_ON_GPU; // Which GPU device (NOT_ON_GPU = not on GPU)
+        void *gpu_data_ptr_ = nullptr;       // GPU buffer pointer (nullptr = not on GPU)
+        bool host_valid_ = true;             // Host data is current (starts true - data created on host)
+        bool device_valid_ = false;          // Device data is current (starts false - no GPU alloc)
+        std::optional<DeviceId> gpu_device_; // Which GPU device (nullopt = not on GPU)
 
         // ===== Abstract Accessors for Lazy Transfer =====
         // Each tensor type can override these for GPU support.
@@ -1402,12 +1430,6 @@ namespace llaminar2
         /// @param device Device placement (default: CPU)
         explicit FP32Tensor(const std::vector<size_t> &shape, DeviceId device = DeviceId::cpu());
 
-        /// @brief Construct FP32Tensor with legacy device index (deprecated)
-        /// @param shape Tensor dimensions
-        /// @param device_idx Legacy index (-1=CPU, 1+=GPU ordinal)
-        /// @deprecated Use DeviceId constructor instead
-        explicit FP32Tensor(const std::vector<size_t> &shape, int device_idx);
-
         ~FP32Tensor() override;
 
         // ===== TensorBase Interface =====
@@ -1415,7 +1437,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::FP32; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -1428,12 +1449,6 @@ namespace llaminar2
         size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
         const void *raw_data() const final { return CPUTensorBase::raw_data(); }
         void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
-
-        // ===== GPU Data Pointer Override =====
-        // FP32Tensor manages its own device_data_ instead of CPUTensorBase::gpu_data_ptr_
-        void *gpu_data_ptr() override { return device_data_; }
-        const void *gpu_data_ptr() const override { return device_data_; }
-        void mark_device_dirty() override { device_dirty_ = true; }
 
         // ===== Unified FP32 Access (Phase 1 Infrastructure) =====
         float *mutable_fp32_data() override { return mutable_data(); }
@@ -1574,14 +1589,6 @@ namespace llaminar2
         AlignedVector<float> *parent_data_ptr_; // Borrowed data pointer (only used when is_view_)
         size_t view_offset_;                    // Offset into parent data (only used when is_view_)
         std::shared_ptr<FP32Tensor> parent_;    // Keep parent alive (only used when is_view_)
-                                                // Always allocated
-        void *device_data_;                     // Allocated if device_.is_gpu()
-
-        bool host_dirty_;   // Host modified, needs upload
-        bool device_dirty_; // Device modified, needs download
-
-        bool sync_to_device();
-        bool sync_from_device();
     };
 
     // Implementation: FP16Tensor.cpp
@@ -1631,7 +1638,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::FP16; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override; // Dequantizes to cache
         float *mutable_data() override;     // Not supported
@@ -1773,7 +1779,7 @@ namespace llaminar2
     private:
         // Private constructor for creating views
         FP16Tensor(const std::vector<size_t> &shape,
-                   int device_idx,
+                   DeviceId device,
                    AlignedVector<uint16_t> *parent_data,
                    size_t data_offset,
                    std::shared_ptr<FP16Tensor> parent);
@@ -1845,7 +1851,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::BF16; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override; // Dequantizes to cache
         float *mutable_data() override;     // Not supported
@@ -1974,7 +1979,7 @@ namespace llaminar2
     private:
         // Private constructor for creating views
         BF16Tensor(const std::vector<size_t> &shape,
-                   int device_idx,
+                   DeviceId device,
                    AlignedVector<uint16_t> *parent_data,
                    size_t data_offset,
                    std::shared_ptr<BF16Tensor> parent);
@@ -2052,7 +2057,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::INT8; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override; // Dequantizes to cache
         float *mutable_data() override;     // Not supported
@@ -2204,7 +2208,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::INT32; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override; // Dequantizes to cache
         float *mutable_data() override;     // Not supported
@@ -2337,7 +2340,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::IQ4_NL; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override; // Dequantizes to temp buffer
         float *mutable_data() override;     // Not supported for quantized tensors
@@ -2568,7 +2570,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::Q8_0; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -2809,8 +2810,8 @@ namespace llaminar2
         /// @param shape Tensor dimensions [rows, cols]
         /// @param blocks Pointer to Q8_1Block array (copied)
         /// @param num_blocks Number of blocks in the array
-        /// @param device_idx Device index (-1 for CPU)
-        Q8_1Tensor(const std::vector<size_t> &shape, const Q8_1Block *blocks, size_t num_blocks, int device_idx = -1);
+        /// @param device Device placement (default: CPU)
+        Q8_1Tensor(const std::vector<size_t> &shape, const Q8_1Block *blocks, size_t num_blocks, DeviceId device = DeviceId::cpu());
 
         /// Copy constructor (deep copy of all data)
         Q8_1Tensor(const Q8_1Tensor &other);
@@ -2818,8 +2819,8 @@ namespace llaminar2
         /// Construct mutable Q8_1 activation buffer - the primary use case
         /// Use mutable_q8_1_blocks() to write Q8_1 data, NOT mutable_data().
         /// @param shape Tensor dimensions [rows, cols]
-        /// @param device_idx Device index (-1 for CPU)
-        explicit Q8_1Tensor(const std::vector<size_t> &shape, int device_idx = -1);
+        /// @param device Device placement (default: CPU)
+        explicit Q8_1Tensor(const std::vector<size_t> &shape, DeviceId device = DeviceId::cpu());
 
         ~Q8_1Tensor() override;
 
@@ -2828,7 +2829,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::Q8_1; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         /**
          * @brief DEPRECATED: Do not use data() on Q8_1Tensor - throws std::runtime_error
@@ -3283,19 +3283,21 @@ namespace llaminar2
         Q16_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
 
         /// Construct from Q16_1Block array (for testing and direct block construction)
-        Q16_1Tensor(const std::vector<size_t> &shape, const Q16_1Block *blocks, size_t num_blocks, int device_idx = -1);
+        /// @param device Device placement (default: CPU)
+        Q16_1Tensor(const std::vector<size_t> &shape, const Q16_1Block *blocks, size_t num_blocks, DeviceId device = DeviceId::cpu());
 
         /// Copy constructor (deep copy of all data)
         Q16_1Tensor(const Q16_1Tensor &other);
 
         /// Construct mutable Q16_1 activation buffer - the primary use case
-        explicit Q16_1Tensor(const std::vector<size_t> &shape, int device_idx = -1);
+        /// @param device Device placement (default: CPU)
+        explicit Q16_1Tensor(const std::vector<size_t> &shape, DeviceId device = DeviceId::cpu());
 
         /// Construct mutable Q16_1 activation buffer with custom block size
         /// @param shape Tensor shape [rows, cols]
         /// @param block_size Block size for quantization (32, 64, 128, or 192)
-        /// @param device_idx Device index (-1 for CPU)
-        Q16_1Tensor(const std::vector<size_t> &shape, Q16BlockSize block_size, int device_idx = -1);
+        /// @param device Device placement (default: CPU)
+        Q16_1Tensor(const std::vector<size_t> &shape, Q16BlockSize block_size, DeviceId device = DeviceId::cpu());
 
         ~Q16_1Tensor() override;
 
@@ -3304,7 +3306,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::Q16_1; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         const float *fp32_data() const override;
@@ -3740,7 +3741,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::Q4_0; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -3939,7 +3939,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::Q4_1; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -4136,7 +4135,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::Q5_0; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -4324,7 +4322,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::Q5_1; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -4508,7 +4505,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::Q6_K; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -4655,7 +4651,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::Q2_K; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -4810,7 +4805,6 @@ namespace llaminar2
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -4954,7 +4948,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::Q3_K; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -5101,7 +5094,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::Q4_K; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -5252,7 +5244,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::Q8_K; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -5396,7 +5387,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::IQ4_XS; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -5574,7 +5564,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::IQ2_XXS; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -5740,7 +5729,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::IQ2_XS; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -5906,7 +5894,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::IQ3_XXS; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -6076,7 +6063,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::IQ2_S; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -6242,7 +6228,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::IQ3_S; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -6412,7 +6397,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::IQ1_S; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;
@@ -6578,7 +6562,6 @@ namespace llaminar2
         TensorType native_type() const override { return TensorType::IQ1_M; }
 
         DeviceId home_device() const override { return device_; }
-        bool set_device(int device_idx) override;
 
         const float *data() const override;
         float *mutable_data() override;

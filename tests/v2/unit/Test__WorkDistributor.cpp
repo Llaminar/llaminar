@@ -30,8 +30,8 @@ TEST(Test__WorkDistributor, ConfigConstruction)
     WorkDistributor::Config config{
         .world_size = 4,
         .rank = 2,
-        .devices = {0, 1},             // CPU + GPU
-        .device_weights = {0.3f, 0.7f} // 30% CPU, 70% GPU
+        .devices = {DeviceId::cpu(), DeviceId::cuda(0)}, // CPU + GPU
+        .device_weights = {0.3f, 0.7f}                   // 30% CPU, 70% GPU
     };
 
     WorkDistributor dist(config);
@@ -55,7 +55,7 @@ TEST(Test__WorkDistributor, InvalidConfigThrows)
     WorkDistributor::Config bad_config{
         .world_size = 1,
         .rank = 0,
-        .devices = {0, 1},
+        .devices = {DeviceId::cpu(), DeviceId::cuda(0)},
         .device_weights = {1.0f} // Only 1 weight for 2 devices
     };
     EXPECT_THROW({ WorkDistributor dist(bad_config); }, std::invalid_argument);
@@ -64,7 +64,7 @@ TEST(Test__WorkDistributor, InvalidConfigThrows)
     WorkDistributor::Config neg_weight{
         .world_size = 1,
         .rank = 0,
-        .devices = {0},
+        .devices = {DeviceId::cpu()},
         .device_weights = {-1.0f}};
     EXPECT_THROW({ WorkDistributor dist(neg_weight); }, std::invalid_argument);
 }
@@ -178,7 +178,7 @@ TEST(Test__WorkDistributor, SingleDeviceGetsAll)
     EXPECT_EQ(slice.start, 0);
     EXPECT_EQ(slice.end, 500);
     EXPECT_EQ(slice.count, 500);
-    EXPECT_EQ(slice.owner, -1); // Legacy index for CPU is -1
+    EXPECT_EQ(slice.owner, 0); // owner is index into devices vector (0 for single device)
 }
 
 TEST(Test__WorkDistributor, TwoDevicesEqualWeight)
@@ -186,7 +186,7 @@ TEST(Test__WorkDistributor, TwoDevicesEqualWeight)
     WorkDistributor::Config config{
         .world_size = 1,
         .rank = 0,
-        .devices = {0, 1}, // No weights = equal distribution
+        .devices = {DeviceId::cpu(), DeviceId::cuda(0)}, // No weights = equal distribution
         .device_weights = {}};
     WorkDistributor dist(config);
 
@@ -202,7 +202,7 @@ TEST(Test__WorkDistributor, WeightedDeviceDistribution)
     WorkDistributor::Config config{
         .world_size = 1,
         .rank = 0,
-        .devices = {0, 1},
+        .devices = {DeviceId::cpu(), DeviceId::cuda(0)},
         .device_weights = {0.25f, 0.75f} // 25% CPU, 75% GPU
     };
     WorkDistributor dist(config);
@@ -219,7 +219,7 @@ TEST(Test__WorkDistributor, DeviceSlicesContiguous)
     WorkDistributor::Config config{
         .world_size = 1,
         .rank = 0,
-        .devices = {0, 1, 2},
+        .devices = {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::cuda(1)},
         .device_weights = {}};
     WorkDistributor dist(config);
 
@@ -237,7 +237,7 @@ TEST(Test__WorkDistributor, GetDeviceForElement)
     WorkDistributor::Config config{
         .world_size = 1,
         .rank = 0,
-        .devices = {0, 1},
+        .devices = {DeviceId::cpu(), DeviceId::cuda(0)},
         .device_weights = {} // Equal: 50-50
     };
     WorkDistributor dist(config);
@@ -261,7 +261,7 @@ TEST(Test__WorkDistributor, HierarchicalDistribute)
     WorkDistributor::Config config{
         .world_size = 2,
         .rank = 0,
-        .devices = {1, 2}, // Legacy: GPU:0, GPU:1
+        .devices = {DeviceId::cuda(0), DeviceId::cuda(1)}, // Legacy: GPU:0, GPU:1
         .device_weights = {}};
     WorkDistributor dist(config);
 
@@ -290,7 +290,7 @@ TEST(Test__WorkDistributor, PrimaryDeviceSlice)
     WorkDistributor::Config config{
         .world_size = 2,
         .rank = 1, // Second rank
-        .devices = {0, 1},
+        .devices = {DeviceId::cpu(), DeviceId::cuda(0)},
         .device_weights = {}};
     WorkDistributor dist(config);
 
@@ -313,7 +313,7 @@ TEST(Test__WorkDistributor, EstimateMemoryPerDevice)
     WorkDistributor::Config config{
         .world_size = 2,
         .rank = 0,
-        .devices = {0, 1},
+        .devices = {DeviceId::cpu(), DeviceId::cuda(0)},
         .device_weights = {0.25f, 0.75f}};
     WorkDistributor dist(config);
 
@@ -333,7 +333,7 @@ TEST(Test__WorkDistributor, GetElementCountsPerDevice)
     WorkDistributor::Config config{
         .world_size = 1,
         .rank = 0,
-        .devices = {0, 1, 2},
+        .devices = {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::cuda(1)},
         .device_weights = {0.5f, 0.3f, 0.2f}};
     WorkDistributor dist(config);
 

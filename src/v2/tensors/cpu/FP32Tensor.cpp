@@ -69,8 +69,7 @@ namespace llaminar2
     }
 
     FP32Tensor::FP32Tensor(const std::vector<size_t> &shape, DeviceId device)
-        : shape_(shape), device_(device), device_data_(nullptr),
-          host_dirty_(false), device_dirty_(false),
+        : shape_(shape), device_(device),
           is_view_(false), parent_data_ptr_(nullptr), view_offset_(0), parent_(nullptr)
     {
         size_t count = 1;
@@ -80,41 +79,7 @@ namespace llaminar2
         }
         host_data_.resize(count, 0.0f);
 
-        // Phase 6: Allocate GPU memory if device is GPU
-        if (device_.is_gpu())
-        {
-            int device_idx = device_.toLegacyIndex();
-            IBackend *backend = getBackendForDeviceIdx(device_idx);
-            if (backend)
-            {
-                int backend_device_id = getBackendDeviceId(device_idx);
-                size_t bytes = count * sizeof(float);
-                device_data_ = backend->allocate(bytes, backend_device_id);
-                if (device_data_)
-                {
-                    LOG_DEBUG("[FP32Tensor] Allocated " << bytes << " bytes on device " << device_.to_string()
-                                                        << " (backend device " << backend_device_id << ")");
-                    // Initialize device memory from host
-                    backend->hostToDevice(device_data_, host_data_.data(), bytes, backend_device_id);
-                    device_dirty_ = false;
-                    host_dirty_ = false;
-                }
-                else
-                {
-                    LOG_ERROR("[FP32Tensor] GPU allocation failed for " << bytes << " bytes on device " << device_.to_string());
-                }
-            }
-            else
-            {
-                LOG_DEBUG("[FP32Tensor] No backend available for device " << device_.to_string() << ", using CPU fallback");
-            }
-        }
-    }
-
-    FP32Tensor::FP32Tensor(const std::vector<size_t> &shape, int device_idx)
-        : FP32Tensor(shape, DeviceId::fromLegacyIndex(device_idx))
-    {
-        // Legacy constructor - delegates to DeviceId constructor
+        // GPU allocation is handled by CPUTensorBase::ensureOnDevice() when needed
     }
 
     FP32Tensor::FP32Tensor(const std::vector<size_t> &shape,
@@ -122,8 +87,7 @@ namespace llaminar2
                            AlignedVector<float> *parent_data,
                            size_t data_offset,
                            std::shared_ptr<FP32Tensor> parent)
-        : shape_(shape), device_(device), device_data_(nullptr),
-          host_dirty_(false), device_dirty_(false),
+        : shape_(shape), device_(device),
           is_view_(true), parent_data_ptr_(parent_data), view_offset_(data_offset),
           parent_(parent)
     {
@@ -133,101 +97,15 @@ namespace llaminar2
 
     FP32Tensor::~FP32Tensor()
     {
-        // Phase 6: Free device memory using appropriate backend
-        if (device_data_)
-        {
-            int device_idx = device_.toLegacyIndex();
-            IBackend *backend = getBackendForDeviceIdx(device_idx);
-            if (backend)
-            {
-                int backend_device_id = getBackendDeviceId(device_idx);
-                backend->free(device_data_, backend_device_id);
-                LOG_DEBUG("[FP32Tensor] Freed device memory on device " << device_.to_string());
-            }
-            else
-            {
-                LOG_ERROR("[FP32Tensor] Cannot free device data - backend unavailable for device " << device_.to_string());
-            }
-            device_data_ = nullptr;
-        }
-    }
-
-    bool FP32Tensor::set_device(int device_idx)
-    {
-        DeviceId new_device = DeviceId::fromLegacyIndex(device_idx);
-        if (new_device == device_)
-        {
-            return true; // Already on target device
-        }
-
-        // Phase 6: Cross-device transfer
-        size_t bytes = numel() * sizeof(float);
-        int old_device_idx = device_.toLegacyIndex();
-
-        // Step 1: Sync current data to host if on GPU and dirty
-        if (device_data_ && device_dirty_)
-        {
-            IBackend *old_backend = getBackendForDeviceIdx(old_device_idx);
-            if (old_backend)
-            {
-                int old_backend_id = getBackendDeviceId(old_device_idx);
-                old_backend->deviceToHost(host_data_.data(), device_data_, bytes, old_backend_id);
-                device_dirty_ = false;
-            }
-        }
-
-        // Step 2: Free old device memory
-        if (device_data_)
-        {
-            IBackend *old_backend = getBackendForDeviceIdx(old_device_idx);
-            if (old_backend)
-            {
-                int old_backend_id = getBackendDeviceId(old_device_idx);
-                old_backend->free(device_data_, old_backend_id);
-            }
-            device_data_ = nullptr;
-        }
-
-        // Step 3: Update device
-        device_ = new_device;
-
-        // Step 4: Allocate on new device if GPU
-        if (device_.is_gpu())
-        {
-            IBackend *new_backend = getBackendForDeviceIdx(device_idx);
-            if (new_backend)
-            {
-                int new_backend_id = getBackendDeviceId(device_idx);
-                device_data_ = new_backend->allocate(bytes, new_backend_id);
-                if (device_data_)
-                {
-                    // Copy host data to new device
-                    new_backend->hostToDevice(device_data_, host_data_.data(), bytes, new_backend_id);
-                    device_dirty_ = false;
-                    host_dirty_ = false;
-                    LOG_DEBUG("[FP32Tensor] Transferred " << bytes << " bytes to device " << device_.to_string());
-                }
-                else
-                {
-                    LOG_ERROR("[FP32Tensor] set_device: allocation failed on device " << device_.to_string());
-                    return false;
-                }
-            }
-        }
-
-        return true;
+        // Base class CPUTensorBase handles gpu_data_ptr_ cleanup via releaseDeviceMemory
     }
 
     const float *FP32Tensor::data() const
     {
         assertValid("FP32Tensor::data");
 
-        // If on device and device has newer data, sync to host
-        if (device_data_ && device_dirty_)
-        {
-            // Need to cast away const for sync (lazy sync pattern)
-            const_cast<FP32Tensor *>(this)->sync_from_device();
-        }
+        // Use base class to ensure host has current data
+        const_cast<FP32Tensor *>(this)->ensureOnHost();
 
         if (is_view_)
         {
@@ -240,9 +118,12 @@ namespace llaminar2
     {
         assertValid("FP32Tensor::mutable_data");
 
-        // Mark as dirty if on device
-        // TODO: Implement dirty flag when device support is added
-        host_dirty_ = true;
+        // Ensure host has current data before modification
+        ensureOnHost();
+
+        // CRITICAL: Invalidate GPU copy since host will be modified
+        // This forces re-upload on next ensureOnDevice() call
+        invalidateGpuData();
 
         if (is_view_)
         {
@@ -300,75 +181,9 @@ namespace llaminar2
         return llaminar::v2::kernels::KernelFactory::createEmbedding(this, dev_type);
     }
 
-    bool FP32Tensor::sync_to_device()
-    {
-        // No device data to sync to - this is a CPU tensor or device allocation failed
-        if (!device_data_)
-        {
-            return true; // Nothing to sync, not an error
-        }
-
-        // Already synced (device not dirty means host data is fresh on device)
-        if (!host_dirty_)
-        {
-            return true; // Device is already up-to-date
-        }
-
-        // Get backend for the device
-        int device_idx = device_.toLegacyIndex();
-        IBackend *backend = getBackendForDeviceIdx(device_idx);
-        if (!backend)
-        {
-            LOG_ERROR("[FP32Tensor] sync_to_device: No backend for device " << device_.to_string());
-            return false;
-        }
-
-        // Copy host memory to device
-        size_t bytes = host_data_.size() * sizeof(float);
-        int backend_device_id = getBackendDeviceId(device_idx);
-        backend->hostToDevice(device_data_, host_data_.data(), bytes, backend_device_id);
-
-        host_dirty_ = false;
-        LOG_DEBUG("[FP32Tensor] Synced " << bytes << " bytes from host to device " << device_.to_string());
-        return true;
-    }
-
-    bool FP32Tensor::sync_from_device()
-    {
-        // No device data to sync - this is a CPU tensor or device allocation failed
-        if (!device_data_)
-        {
-            return true; // Nothing to sync, not an error
-        }
-
-        // Already synced (host not dirty means device data is fresh in host)
-        if (!device_dirty_)
-        {
-            return true; // Host is already up-to-date
-        }
-
-        // Get backend for the device
-        int device_idx = device_.toLegacyIndex();
-        IBackend *backend = getBackendForDeviceIdx(device_idx);
-        if (!backend)
-        {
-            LOG_ERROR("[FP32Tensor] sync_from_device: No backend for device " << device_.to_string());
-            return false;
-        }
-
-        // Copy device memory to host
-        size_t bytes = host_data_.size() * sizeof(float);
-        int backend_device_id = getBackendDeviceId(device_idx);
-        backend->deviceToHost(host_data_.data(), device_data_, bytes, backend_device_id);
-
-        device_dirty_ = false;
-        LOG_DEBUG("[FP32Tensor] Synced " << bytes << " bytes from device " << device_.to_string() << " to host");
-        return true;
-    }
-
     // =========================================================================
     // Lazy Transfer Accessors (Phase 1 GPU Device-Aware Slicing)
-    // TensorBase uses these to implement ensureOnDevice/ensureOnHost.
+    // CPUTensorBase uses these to implement ensureOnDevice/ensureOnHost.
     // =========================================================================
 
     void *FP32Tensor::raw_host_data_ptr()
@@ -429,24 +244,24 @@ namespace llaminar2
             count *= dim;
         }
 
-        int src_device = src->home_dm_device_index();
-        int dst_device = device_.toLegacyIndex();
+        DeviceId src_device = src->home_device();
+        DeviceId dst_device = device_;
 
         // Determine transfer type
-        bool cpu_to_cpu = (src_device == -1 && dst_device == -1);
-        bool cpu_to_gpu = (src_device == -1 && dst_device >= 0);
-        bool gpu_to_cpu = (src_device >= 0 && dst_device == -1);
-        bool gpu_to_gpu = (src_device >= 0 && dst_device >= 0);
+        bool cpu_to_cpu = (src_device.is_cpu() && dst_device.is_cpu());
+        bool cpu_to_gpu = (src_device.is_cpu() && dst_device.is_gpu());
+        bool gpu_to_cpu = (src_device.is_gpu() && dst_device.is_cpu());
+        bool gpu_to_gpu = (src_device.is_gpu() && dst_device.is_gpu());
 
-        LOG_DEBUG("[FP32Tensor::copyFrom] Transfer: device " << src_device
-                                                             << " → device " << dst_device << " (" << count << " elements)");
+        LOG_DEBUG("[FP32Tensor::copyFrom] Transfer: " << src_device.toString()
+                                                      << " → " << dst_device.toString() << " (" << count << " elements)");
 
         if (cpu_to_cpu)
         {
             // CPU → CPU: Simple memcpy
             const float *src_data = src->data();
             std::memcpy(host_data_.data(), src_data, count * sizeof(float));
-            host_dirty_ = true; // Mark host as authoritative
+            // Host now has latest data; GPU copy (if any) is stale
             return true;
         }
         else if (cpu_to_gpu)
@@ -866,8 +681,7 @@ namespace llaminar2
             col_scales,
             bias);
 
-        host_dirty_ = true;
-        device_dirty_ = false;
+        // Host now has latest data; GPU copy (if any) is stale
         return true;
     }
 
