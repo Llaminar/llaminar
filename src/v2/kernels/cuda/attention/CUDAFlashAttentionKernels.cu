@@ -69,6 +69,7 @@ namespace
     // Note: WMMA store/load paths can have implicit alignment/stride constraints;
     // keep the padded leading dimension a multiple of 16.
     constexpr int FA3_SCORES_LD_PAD = 16;
+    constexpr int FA3_QKV_PAD = 8; // Pad Q/K/V leading dimension by 8 halves (16 bytes)
 
     // =========================================================================
     // Cached Device Properties for Fast Kernel Launch
@@ -121,30 +122,55 @@ namespace
     {
         const int tile_kv = FA3_TILE_KV;
         const int scores_ld = tile_kv + FA3_SCORES_LD_PAD;
+        const int qkv_stride = head_dim + FA3_QKV_PAD;
 
         // KV buffer is fixed size (doesn't depend on tile_q)
-        size_t kv_buffer_size = FA3_NUM_STAGES * 2 * tile_kv * head_dim * sizeof(half);
+        size_t kv_buffer_size = FA3_NUM_STAGES * 2 * tile_kv * qkv_stride * sizeof(half);
 
         // Available for Q tile + scores
+        if (kv_buffer_size >= max_smem)
+            return 32;
         size_t available = max_smem - kv_buffer_size;
 
-        // Q tile + scores = tile_q * (head_dim * sizeof(half) + scores_ld * sizeof(float))
+        // Q tile + scores = tile_q * (qkv_stride * sizeof(half) + scores_ld * sizeof(float))
         // Note: scores_ld is padded to reduce shared-memory bank conflicts.
-        size_t bytes_per_q_row = head_dim * sizeof(half) + scores_ld * sizeof(float);
+        size_t bytes_per_q_row = qkv_stride * sizeof(half) + scores_ld * sizeof(float);
 
-        // Maximum tile_q that fits
-        int max_tile_q = static_cast<int>(available / bytes_per_q_row);
+        // Calculate tile_q candidates
+        auto get_smem_for_q = [&](int q)
+        {
+            return kv_buffer_size + q * bytes_per_q_row;
+        };
 
-        // Round down to multiple of 16 for WMMA alignment
-        max_tile_q = (max_tile_q / 16) * 16;
+        // We want to maximize a score:
+        // Score = OccupancyTier * 1000 + TileQ
+        // where OccupancyTier is 2 (fits 2 blocks) or 1 (fits 1 block)
+        int best_tile_q = 32;
+        int best_score = -1;
 
-        // Clamp to reasonable range
-        if (max_tile_q > 96)
-            max_tile_q = 96; // Max for 6 consumer warps
-        if (max_tile_q < 32)
-            max_tile_q = 32; // Minimum viable size
+        // Iterate standard tile sizes
+        // On RTX 3090, 64 is often the sweet spot for occupancy with padding
+        for (int q : {32, 64, 96, 128})
+        {
+            size_t used = get_smem_for_q(q);
+            if (used > max_smem)
+                continue;
 
-        return max_tile_q;
+            // Occupancy check: assume 2 blocks if usage <= 50% of max
+            // Note: max_smem here is the opt-in limit (e.g. 100KB on Ampere)
+            int occupancy = (used <= max_smem / 2) ? 2 : 1;
+
+            // Score prefers higher occupancy first, then larger tile
+            int score = occupancy * 1000 + q;
+
+            if (score > best_score)
+            {
+                best_score = score;
+                best_tile_q = q;
+            }
+        }
+
+        return best_tile_q;
     }
 
     /**
@@ -184,8 +210,9 @@ namespace
         }
 
         // Verify shared memory fits
-        size_t q_tile_size = cfg.tile_q * head_dim * sizeof(half);
-        size_t kv_buffer_size = FA3_NUM_STAGES * 2 * cfg.tile_kv * head_dim * sizeof(half);
+        int qkv_stride = head_dim + FA3_QKV_PAD;
+        size_t q_tile_size = cfg.tile_q * qkv_stride * sizeof(half);
+        size_t kv_buffer_size = FA3_NUM_STAGES * 2 * cfg.tile_kv * qkv_stride * sizeof(half);
         // Pad scores leading dimension to mitigate shared-memory bank conflicts
         size_t scores_size = cfg.tile_q * (cfg.tile_kv + FA3_SCORES_LD_PAD) * sizeof(float);
         cfg.smem_size = q_tile_size + kv_buffer_size + scores_size;
@@ -270,11 +297,12 @@ namespace
         // scores: [tile_q, tile_kv]
         extern __shared__ char smem[];
 
-        const int kv_tile_size = tile_kv * head_dim;
+        const int smem_stride = head_dim + FA3_QKV_PAD;
+        const int kv_tile_size = tile_kv * smem_stride;
         const int scores_ld = tile_kv + FA3_SCORES_LD_PAD; // padded LD to reduce shared-memory bank conflicts
 
         half *Q_tile_fp16 = reinterpret_cast<half *>(smem);
-        half *KV_buffers = Q_tile_fp16 + tile_q * head_dim;
+        half *KV_buffers = Q_tile_fp16 + tile_q * smem_stride;
         float *scores = reinterpret_cast<float *>(KV_buffers + FA3_NUM_STAGES * 2 * kv_tile_size);
 
         // Helper to get K/V tile for a stage
@@ -318,7 +346,7 @@ namespace
             int d = i % head_dim;
             int global_row = q_block_start + local_row;
             float val = Q_batch[global_row * n_heads * head_dim + head_idx * head_dim + d];
-            Q_tile_fp16[local_row * head_dim + d] = __float2half(val);
+            Q_tile_fp16[local_row * smem_stride + d] = __float2half(val);
         }
 
         const int num_kv_tiles = (kv_len + tile_kv - 1) / tile_kv;
@@ -347,8 +375,8 @@ namespace
                 int global_row = kv_start_0 + local_row;
                 float k_val = K_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
                 float v_val = V_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-                K_dst_0[local_row * head_dim + d] = __float2half(k_val);
-                V_dst_0[local_row * head_dim + d] = __float2half(v_val);
+                K_dst_0[local_row * smem_stride + d] = __float2half(k_val);
+                V_dst_0[local_row * smem_stride + d] = __float2half(v_val);
             }
         }
         __syncthreads();
@@ -404,8 +432,8 @@ namespace
                     int global_row = next_kv_start + local_row;
                     float k_val = K_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
                     float v_val = V_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-                    K_dst[local_row * head_dim + d] = __float2half(k_val);
-                    V_dst[local_row * head_dim + d] = __float2half(v_val);
+                    K_dst[local_row * smem_stride + d] = __float2half(k_val);
+                    V_dst[local_row * smem_stride + d] = __float2half(v_val);
                 }
             }
 
@@ -424,11 +452,11 @@ namespace
 
                         for (int k = 0; k < head_dim; k += WMMA_K)
                         {
-                            const half *Q_ptr = Q_tile_fp16 + warp_q_start * head_dim + k;
-                            wmma::load_matrix_sync(q_frag, Q_ptr, head_dim);
+                            const half *Q_ptr = Q_tile_fp16 + warp_q_start * smem_stride + k;
+                            wmma::load_matrix_sync(q_frag, Q_ptr, smem_stride);
 
-                            const half *K_ptr = K_tile_fp16 + kv_col * head_dim + k;
-                            wmma::load_matrix_sync(k_frag, K_ptr, head_dim);
+                            const half *K_ptr = K_tile_fp16 + kv_col * smem_stride + k;
+                            wmma::load_matrix_sync(k_frag, K_ptr, smem_stride);
 
                             wmma::mma_sync(s_frag, q_frag, k_frag, s_frag);
                         }
@@ -496,7 +524,7 @@ namespace
                         float p = expf(s - m_i_new);
                         l_ij += p;
 
-                        const half *V_row = V_tile_fp16 + j * head_dim;
+                        const half *V_row = V_tile_fp16 + j * smem_stride;
                         for (int d = 0; d < head_dim; d++)
                         {
                             O_acc[d] += p * __half2float(V_row[d]);
