@@ -15,6 +15,7 @@
 #include "../../src/v2/loaders/ModelLoader.h"
 #include "../../src/v2/tensors/TensorFactory.h"
 #include "../../src/v2/utils/MPIContext.h"
+#include "../../src/v2/backends/DeviceId.h"
 #include <cmath>
 #include <numeric>
 
@@ -68,7 +69,7 @@ namespace llaminar2
             const std::string tensor_name = "blk.0.attn_output.weight";
 
             // Load full tensor
-            auto full_tensor = loader_->loadTensor(tensor_name, 0, WeightPrecision::NATIVE);
+            auto full_tensor = loader_->loadTensor(tensor_name, DeviceId::cpu(), WeightPrecision::NATIVE);
             ASSERT_NE(full_tensor, nullptr) << "Failed to load full tensor";
 
             // Load first slice [0, 448)

@@ -23,6 +23,7 @@
 #include "execution/DeviceContext.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
+#include "backends/DeviceId.h"
 #include "../mocks/MockComputeStage.h"
 
 using namespace llaminar2;
@@ -95,7 +96,7 @@ TEST_F(Test__AllGatherStage, FailsWithNullLocalInput)
 {
     // Create test buffers
     TensorFactory factory(*mpi_ctx_);
-    auto full_output = factory.createFP32({4, 2}, 0); // [seq_len, vocab_size]
+    auto full_output = factory.createFP32({4, 2}, DeviceId::cpu()); // [seq_len, vocab_size]
 
     AllGatherStage::Params params;
     params.local_input = nullptr; // NULL
@@ -115,7 +116,7 @@ TEST_F(Test__AllGatherStage, FailsWithNullFullOutput)
 {
     // Create test buffers
     TensorFactory factory(*mpi_ctx_);
-    auto local_input = factory.createFP32({4, 1}, 0); // [seq_len, vocab_local]
+    auto local_input = factory.createFP32({4, 1}, DeviceId::cpu()); // [seq_len, vocab_local]
 
     AllGatherStage::Params params;
     params.local_input = local_input.get();
@@ -135,8 +136,8 @@ TEST_F(Test__AllGatherStage, FailsWithNullMpiComm)
 {
     // Create test buffers
     TensorFactory factory(*mpi_ctx_);
-    auto local_input = factory.createFP32({4, 1}, 0); // [seq_len, vocab_local]
-    auto full_output = factory.createFP32({4, 2}, 0); // [seq_len, vocab_size]
+    auto local_input = factory.createFP32({4, 1}, DeviceId::cpu()); // [seq_len, vocab_local]
+    auto full_output = factory.createFP32({4, 2}, DeviceId::cpu()); // [seq_len, vocab_size]
 
     AllGatherStage::Params params;
     params.local_input = local_input.get();
@@ -156,8 +157,8 @@ TEST_F(Test__AllGatherStage, FailsWithNullMpiContext)
 {
     // Create test buffers
     TensorFactory factory(*mpi_ctx_);
-    auto local_input = factory.createFP32({4, 1}, 0); // [seq_len, vocab_local]
-    auto full_output = factory.createFP32({4, 2}, 0); // [seq_len, vocab_size]
+    auto local_input = factory.createFP32({4, 1}, DeviceId::cpu()); // [seq_len, vocab_local]
+    auto full_output = factory.createFP32({4, 2}, DeviceId::cpu()); // [seq_len, vocab_size]
 
     AllGatherStage::Params params;
     params.local_input = local_input.get();
@@ -177,8 +178,8 @@ TEST_F(Test__AllGatherStage, BufferRequirementsAreCorrect)
 {
     // Create test buffers with known shapes
     TensorFactory factory(*mpi_ctx_);
-    auto local_input = factory.createFP32({4, 128}, 0); // [seq_len, vocab_local]
-    auto full_output = factory.createFP32({4, 256}, 0); // [seq_len, vocab_size]
+    auto local_input = factory.createFP32({4, 128}, DeviceId::cpu()); // [seq_len, vocab_local]
+    auto full_output = factory.createFP32({4, 256}, DeviceId::cpu()); // [seq_len, vocab_size]
 
     AllGatherStage::Params params;
     params.local_input = local_input.get();
@@ -200,8 +201,8 @@ TEST_F(Test__AllGatherStage, FactoryCreatesStage)
 {
     // Create test buffers
     TensorFactory factory(*mpi_ctx_);
-    auto local_input = factory.createFP32({4, 128}, 0); // [seq_len, vocab_local]
-    auto full_output = factory.createFP32({4, 256}, 0); // [seq_len, vocab_size]
+    auto local_input = factory.createFP32({4, 128}, DeviceId::cpu()); // [seq_len, vocab_local]
+    auto full_output = factory.createFP32({4, 256}, DeviceId::cpu()); // [seq_len, vocab_size]
 
     AllGatherStage::Params params;
     params.local_input = local_input.get();

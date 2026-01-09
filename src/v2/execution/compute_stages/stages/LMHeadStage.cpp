@@ -68,8 +68,9 @@ namespace llaminar2
         }
 
         // Get or create GEMM kernel for LM head weight
-        // The kernel handles quantized weights and typed activations
-        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(lm_head_weight);
+        // Use device-targeted kernel creation to ensure GPU kernel when needed
+        auto target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(lm_head_weight, target_dev_type);
         if (!lm_gemm)
         {
             LOG_ERROR("[LMHeadStage] Failed to get/create LM head GEMM kernel");
@@ -88,7 +89,7 @@ namespace llaminar2
             true, // transpose_B (lm_head is [vocab_size, d_model])
             1.0f, 0.0f,
             params_.mpi_ctx,
-            params_.device_idx);
+            params_.device_id.toKernelDeviceIndex());
 
         if (!success)
         {
@@ -195,7 +196,7 @@ namespace llaminar2
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarInt("vocab_size", params_.vocab_size);
         info.addScalarBool("has_bias", params_.bias != nullptr);
-        info.addScalarInt("device_idx", params_.device_idx);
+        info.addScalarInt("device_id", params_.device_id.toLegacyIndex());
 
         return info;
     }

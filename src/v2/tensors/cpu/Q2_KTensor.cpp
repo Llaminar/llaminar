@@ -121,7 +121,7 @@ namespace llaminar2
     std::unique_ptr<ITensorGemm> Q2_KTensor::createGemm()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_);
         return llaminar::v2::kernels::KernelFactory::createGemm(this, dev_type);
     }
 

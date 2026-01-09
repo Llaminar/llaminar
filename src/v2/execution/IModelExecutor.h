@@ -46,6 +46,7 @@
 #include "ILayerExecutor.h"
 #include "compute_stages/ComputeStages.h"
 #include "DeviceContext.h"
+#include "../backends/DeviceId.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -143,7 +144,7 @@ namespace llaminar2
         ICPUKVCache *kv_cache = nullptr; ///< KV cache (nullptr = no caching)
 
         // Device placement
-        int device_idx = -1; ///< Target device (-1 = CPU)
+        DeviceId device = DeviceId::cpu(); ///< Target device
     };
 
     /**
@@ -239,14 +240,14 @@ namespace llaminar2
          * @param input_hidden Hidden states from embedding
          * @param kv_cache KV cache for attention
          * @param position_ids Position IDs for RoPE
-         * @param device_idx Target device
+         * @param device Target device
          * @return Transformer layers compute graph
          */
         virtual ComputeGraph buildTransformerLayersGraph(
             TensorBase *input_hidden,
             ICPUKVCache *kv_cache,
             const int *position_ids,
-            int device_idx) = 0;
+            DeviceId device) = 0;
 
         /**
          * @brief Build compute graph for single transformer layer
@@ -257,7 +258,7 @@ namespace llaminar2
          * @param input_hidden Hidden states input
          * @param kv_cache KV cache
          * @param position_ids Position IDs
-         * @param device_idx Target device
+         * @param device Target device
          * @return Single layer compute graph
          */
         virtual ComputeGraph buildLayerGraph(
@@ -265,7 +266,7 @@ namespace llaminar2
             TensorBase *input_hidden,
             ICPUKVCache *kv_cache,
             const int *position_ids,
-            int device_idx) = 0;
+            DeviceId device) = 0;
 
         /**
          * @brief Build compute graph for LM head
@@ -273,7 +274,7 @@ namespace llaminar2
          * @param hidden_states Final hidden states
          * @param output_logits Output tensor for full logits [seq_len, vocab_size]
          * @param total_tokens Number of tokens (batch_size * seq_len)
-         * @param device_idx Target device
+         * @param device Target device
          * @param logits_local Optional local logits buffer for column-parallel LM head.
          *                     When provided and column-parallel is enabled, LM head
          *                     writes to logits_local then AllGather to output_logits.
@@ -283,7 +284,7 @@ namespace llaminar2
             TensorBase *hidden_states,
             TensorBase *output_logits,
             int total_tokens,
-            int device_idx,
+            DeviceId device,
             TensorBase *logits_local = nullptr) = 0;
 
         // =========================================================================

@@ -90,7 +90,7 @@ TEST_F(Test__ComputeGraphMerge, GetRootNodes_EmptyGraph)
 TEST_F(Test__ComputeGraphMerge, GetRootNodes_SingleNode)
 {
     ComputeGraph graph;
-    graph.addNode("A", createTestStage("A"), 0);
+    graph.addNode("A", createTestStage("A"), DeviceId::cpu());
 
     auto roots = graph.getRootNodes();
     ASSERT_EQ(roots.size(), 1);
@@ -101,9 +101,9 @@ TEST_F(Test__ComputeGraphMerge, GetRootNodes_LinearChain)
 {
     // A -> B -> C
     ComputeGraph graph;
-    graph.addNode("A", createTestStage("A"), 0);
-    graph.addNode("B", createTestStage("B"), 0);
-    graph.addNode("C", createTestStage("C"), 0);
+    graph.addNode("A", createTestStage("A"), DeviceId::cpu());
+    graph.addNode("B", createTestStage("B"), DeviceId::cpu());
+    graph.addNode("C", createTestStage("C"), DeviceId::cpu());
     graph.addDependency("B", "A");
     graph.addDependency("C", "B");
 
@@ -117,9 +117,9 @@ TEST_F(Test__ComputeGraphMerge, GetRootNodes_MultipleRoots)
     // A -> C
     // B -> C
     ComputeGraph graph;
-    graph.addNode("A", createTestStage("A"), 0);
-    graph.addNode("B", createTestStage("B"), 0);
-    graph.addNode("C", createTestStage("C"), 0);
+    graph.addNode("A", createTestStage("A"), DeviceId::cpu());
+    graph.addNode("B", createTestStage("B"), DeviceId::cpu());
+    graph.addNode("C", createTestStage("C"), DeviceId::cpu());
     graph.addDependency("C", "A");
     graph.addDependency("C", "B");
 
@@ -133,9 +133,9 @@ TEST_F(Test__ComputeGraphMerge, GetRootNodes_AllRoots)
 {
     // No dependencies - all nodes are roots
     ComputeGraph graph;
-    graph.addNode("A", createTestStage("A"), 0);
-    graph.addNode("B", createTestStage("B"), 0);
-    graph.addNode("C", createTestStage("C"), 0);
+    graph.addNode("A", createTestStage("A"), DeviceId::cpu());
+    graph.addNode("B", createTestStage("B"), DeviceId::cpu());
+    graph.addNode("C", createTestStage("C"), DeviceId::cpu());
 
     auto roots = graph.getRootNodes();
     ASSERT_EQ(roots.size(), 3);
@@ -152,10 +152,10 @@ TEST_F(Test__ComputeGraphMerge, GetRootNodes_DiamondPattern)
     //    \ /
     //     D
     ComputeGraph graph;
-    graph.addNode("A", createTestStage("A"), 0);
-    graph.addNode("B", createTestStage("B"), 0);
-    graph.addNode("C", createTestStage("C"), 0);
-    graph.addNode("D", createTestStage("D"), 0);
+    graph.addNode("A", createTestStage("A"), DeviceId::cpu());
+    graph.addNode("B", createTestStage("B"), DeviceId::cpu());
+    graph.addNode("C", createTestStage("C"), DeviceId::cpu());
+    graph.addNode("D", createTestStage("D"), DeviceId::cpu());
     graph.addDependency("B", "A");
     graph.addDependency("C", "A");
     graph.addDependency("D", "B");
@@ -180,7 +180,7 @@ TEST_F(Test__ComputeGraphMerge, GetLeafNodes_EmptyGraph)
 TEST_F(Test__ComputeGraphMerge, GetLeafNodes_SingleNode)
 {
     ComputeGraph graph;
-    graph.addNode("A", createTestStage("A"), 0);
+    graph.addNode("A", createTestStage("A"), DeviceId::cpu());
 
     auto leaves = graph.getLeafNodes();
     ASSERT_EQ(leaves.size(), 1);
@@ -191,9 +191,9 @@ TEST_F(Test__ComputeGraphMerge, GetLeafNodes_LinearChain)
 {
     // A -> B -> C
     ComputeGraph graph;
-    graph.addNode("A", createTestStage("A"), 0);
-    graph.addNode("B", createTestStage("B"), 0);
-    graph.addNode("C", createTestStage("C"), 0);
+    graph.addNode("A", createTestStage("A"), DeviceId::cpu());
+    graph.addNode("B", createTestStage("B"), DeviceId::cpu());
+    graph.addNode("C", createTestStage("C"), DeviceId::cpu());
     graph.addDependency("B", "A");
     graph.addDependency("C", "B");
 
@@ -207,9 +207,9 @@ TEST_F(Test__ComputeGraphMerge, GetLeafNodes_MultipleLeaves)
     // A -> B
     // A -> C
     ComputeGraph graph;
-    graph.addNode("A", createTestStage("A"), 0);
-    graph.addNode("B", createTestStage("B"), 0);
-    graph.addNode("C", createTestStage("C"), 0);
+    graph.addNode("A", createTestStage("A"), DeviceId::cpu());
+    graph.addNode("B", createTestStage("B"), DeviceId::cpu());
+    graph.addNode("C", createTestStage("C"), DeviceId::cpu());
     graph.addDependency("B", "A");
     graph.addDependency("C", "A");
 
@@ -223,9 +223,9 @@ TEST_F(Test__ComputeGraphMerge, GetLeafNodes_AllLeaves)
 {
     // No dependencies - all nodes are leaves
     ComputeGraph graph;
-    graph.addNode("A", createTestStage("A"), 0);
-    graph.addNode("B", createTestStage("B"), 0);
-    graph.addNode("C", createTestStage("C"), 0);
+    graph.addNode("A", createTestStage("A"), DeviceId::cpu());
+    graph.addNode("B", createTestStage("B"), DeviceId::cpu());
+    graph.addNode("C", createTestStage("C"), DeviceId::cpu());
 
     auto leaves = graph.getLeafNodes();
     ASSERT_EQ(leaves.size(), 3);
@@ -242,10 +242,10 @@ TEST_F(Test__ComputeGraphMerge, GetLeafNodes_DiamondPattern)
     //    \ /
     //     D
     ComputeGraph graph;
-    graph.addNode("A", createTestStage("A"), 0);
-    graph.addNode("B", createTestStage("B"), 0);
-    graph.addNode("C", createTestStage("C"), 0);
-    graph.addNode("D", createTestStage("D"), 0);
+    graph.addNode("A", createTestStage("A"), DeviceId::cpu());
+    graph.addNode("B", createTestStage("B"), DeviceId::cpu());
+    graph.addNode("C", createTestStage("C"), DeviceId::cpu());
+    graph.addNode("D", createTestStage("D"), DeviceId::cpu());
     graph.addDependency("B", "A");
     graph.addDependency("C", "A");
     graph.addDependency("D", "B");
@@ -263,8 +263,8 @@ TEST_F(Test__ComputeGraphMerge, GetLeafNodes_DiamondPattern)
 TEST_F(Test__ComputeGraphMerge, Merge_EmptyIntoNonEmpty)
 {
     ComputeGraph target;
-    target.addNode("A", createTestStage("A"), 0);
-    target.addNode("B", createTestStage("B"), 0);
+    target.addNode("A", createTestStage("A"), DeviceId::cpu());
+    target.addNode("B", createTestStage("B"), DeviceId::cpu());
     target.addDependency("B", "A");
 
     ComputeGraph source; // Empty
@@ -281,8 +281,8 @@ TEST_F(Test__ComputeGraphMerge, Merge_NonEmptyIntoEmpty)
     ComputeGraph target; // Empty
 
     ComputeGraph source;
-    source.addNode("X", createTestStage("X"), 0);
-    source.addNode("Y", createTestStage("Y"), 0);
+    source.addNode("X", createTestStage("X"), DeviceId::cpu());
+    source.addNode("Y", createTestStage("Y"), DeviceId::cpu());
     source.addDependency("Y", "X");
 
     target.merge(std::move(source));
@@ -299,14 +299,14 @@ TEST_F(Test__ComputeGraphMerge, Merge_TwoGraphsWithoutConnect)
 {
     // Target: A -> B
     ComputeGraph target;
-    target.addNode("A", createTestStage("A"), 0);
-    target.addNode("B", createTestStage("B"), 0);
+    target.addNode("A", createTestStage("A"), DeviceId::cpu());
+    target.addNode("B", createTestStage("B"), DeviceId::cpu());
     target.addDependency("B", "A");
 
     // Source: X -> Y
     ComputeGraph source;
-    source.addNode("X", createTestStage("X"), 0);
-    source.addNode("Y", createTestStage("Y"), 0);
+    source.addNode("X", createTestStage("X"), DeviceId::cpu());
+    source.addNode("Y", createTestStage("Y"), DeviceId::cpu());
     source.addDependency("Y", "X");
 
     target.merge(std::move(source));
@@ -328,14 +328,14 @@ TEST_F(Test__ComputeGraphMerge, Merge_WithConnectFrom)
 {
     // Target: A -> B
     ComputeGraph target;
-    target.addNode("A", createTestStage("A"), 0);
-    target.addNode("B", createTestStage("B"), 0);
+    target.addNode("A", createTestStage("A"), DeviceId::cpu());
+    target.addNode("B", createTestStage("B"), DeviceId::cpu());
     target.addDependency("B", "A");
 
     // Source: X -> Y
     ComputeGraph source;
-    source.addNode("X", createTestStage("X"), 0);
-    source.addNode("Y", createTestStage("Y"), 0);
+    source.addNode("X", createTestStage("X"), DeviceId::cpu());
+    source.addNode("Y", createTestStage("Y"), DeviceId::cpu());
     source.addDependency("Y", "X");
 
     // Connect source to B
@@ -363,10 +363,10 @@ TEST_F(Test__ComputeGraphMerge, Merge_ConnectFromNonExistent)
 {
     // If connect_from doesn't exist, roots should remain unconnected
     ComputeGraph target;
-    target.addNode("A", createTestStage("A"), 0);
+    target.addNode("A", createTestStage("A"), DeviceId::cpu());
 
     ComputeGraph source;
-    source.addNode("X", createTestStage("X"), 0);
+    source.addNode("X", createTestStage("X"), DeviceId::cpu());
 
     // "nonexistent" doesn't exist in target
     target.merge(std::move(source), "nonexistent");
@@ -391,14 +391,14 @@ TEST_F(Test__ComputeGraphMerge, Merge_NodeNameCollision)
 {
     // Target has node "A"
     ComputeGraph target;
-    target.addNode("A", createTestStage("target_A"), 0);
-    target.addNode("B", createTestStage("B"), 0);
+    target.addNode("A", createTestStage("target_A"), DeviceId::cpu());
+    target.addNode("B", createTestStage("B"), DeviceId::cpu());
     target.addDependency("B", "A");
 
     // Source also has node "A" (collision!)
     ComputeGraph source;
-    source.addNode("A", createTestStage("source_A"), 0); // Duplicate name
-    source.addNode("C", createTestStage("C"), 0);
+    source.addNode("A", createTestStage("source_A"), DeviceId::cpu()); // Duplicate name
+    source.addNode("C", createTestStage("C"), DeviceId::cpu());
     source.addDependency("C", "A");
 
     target.merge(std::move(source));
@@ -417,13 +417,13 @@ TEST_F(Test__ComputeGraphMerge, Merge_PreservesInternalDependencies)
 {
     // Target: A
     ComputeGraph target;
-    target.addNode("A", createTestStage("A"), 0);
+    target.addNode("A", createTestStage("A"), DeviceId::cpu());
 
     // Source: X -> Y -> Z (chain)
     ComputeGraph source;
-    source.addNode("X", createTestStage("X"), 0);
-    source.addNode("Y", createTestStage("Y"), 0);
-    source.addNode("Z", createTestStage("Z"), 0);
+    source.addNode("X", createTestStage("X"), DeviceId::cpu());
+    source.addNode("Y", createTestStage("Y"), DeviceId::cpu());
+    source.addNode("Z", createTestStage("Z"), DeviceId::cpu());
     source.addDependency("Y", "X");
     source.addDependency("Z", "Y");
 
@@ -451,15 +451,15 @@ TEST_F(Test__ComputeGraphMerge, Merge_MultipleRootsInSource)
 {
     // Target: A -> B
     ComputeGraph target;
-    target.addNode("A", createTestStage("A"), 0);
-    target.addNode("B", createTestStage("B"), 0);
+    target.addNode("A", createTestStage("A"), DeviceId::cpu());
+    target.addNode("B", createTestStage("B"), DeviceId::cpu());
     target.addDependency("B", "A");
 
     // Source: X and Y are both roots, both connect to Z
     ComputeGraph source;
-    source.addNode("X", createTestStage("X"), 0);
-    source.addNode("Y", createTestStage("Y"), 0);
-    source.addNode("Z", createTestStage("Z"), 0);
+    source.addNode("X", createTestStage("X"), DeviceId::cpu());
+    source.addNode("Y", createTestStage("Y"), DeviceId::cpu());
+    source.addNode("Z", createTestStage("Z"), DeviceId::cpu());
     source.addDependency("Z", "X");
     source.addDependency("Z", "Y");
 
@@ -486,20 +486,20 @@ TEST_F(Test__ComputeGraphMerge, Merge_SequentialMerges)
 {
     // Target: A
     ComputeGraph target;
-    target.addNode("A", createTestStage("A"), 0);
+    target.addNode("A", createTestStage("A"), DeviceId::cpu());
 
     // First merge: B -> C
     ComputeGraph source1;
-    source1.addNode("B", createTestStage("B"), 0);
-    source1.addNode("C", createTestStage("C"), 0);
+    source1.addNode("B", createTestStage("B"), DeviceId::cpu());
+    source1.addNode("C", createTestStage("C"), DeviceId::cpu());
     source1.addDependency("C", "B");
 
     target.merge(std::move(source1), "A");
 
     // Second merge: D -> E
     ComputeGraph source2;
-    source2.addNode("D", createTestStage("D"), 0);
-    source2.addNode("E", createTestStage("E"), 0);
+    source2.addNode("D", createTestStage("D"), DeviceId::cpu());
+    source2.addNode("E", createTestStage("E"), DeviceId::cpu());
     source2.addDependency("E", "D");
 
     target.merge(std::move(source2), "C");
@@ -528,13 +528,13 @@ TEST_F(Test__ComputeGraphMerge, Merge_ChainReturnsThis)
 {
     // Verify merge returns *this for chaining
     ComputeGraph target;
-    target.addNode("A", createTestStage("A"), 0);
+    target.addNode("A", createTestStage("A"), DeviceId::cpu());
 
     ComputeGraph source1;
-    source1.addNode("B", createTestStage("B"), 0);
+    source1.addNode("B", createTestStage("B"), DeviceId::cpu());
 
     ComputeGraph source2;
-    source2.addNode("C", createTestStage("C"), 0);
+    source2.addNode("C", createTestStage("C"), DeviceId::cpu());
 
     // Chain merges
     target.merge(std::move(source1), "A")
@@ -555,14 +555,14 @@ TEST_F(Test__ComputeGraphMerge, Merge_ExecutionOrderCorrect)
     // Verify that merged graphs produce correct execution order
     // Target: A -> B
     ComputeGraph target;
-    target.addNode("A", createTestStage("A"), 0);
-    target.addNode("B", createTestStage("B"), 0);
+    target.addNode("A", createTestStage("A"), DeviceId::cpu());
+    target.addNode("B", createTestStage("B"), DeviceId::cpu());
     target.addDependency("B", "A");
 
     // Source: X -> Y
     ComputeGraph source;
-    source.addNode("X", createTestStage("X"), 0);
-    source.addNode("Y", createTestStage("Y"), 0);
+    source.addNode("X", createTestStage("X"), DeviceId::cpu());
+    source.addNode("Y", createTestStage("Y"), DeviceId::cpu());
     source.addDependency("Y", "X");
 
     // Connect: A -> B -> X -> Y
@@ -594,10 +594,10 @@ TEST_F(Test__ComputeGraphMerge, Merge_ComplexDAGExecutionOrder)
     //     D
 
     ComputeGraph target;
-    target.addNode("A", createTestStage("A"), 0);
-    target.addNode("B", createTestStage("B"), 0);
-    target.addNode("C", createTestStage("C"), 0);
-    target.addNode("D", createTestStage("D"), 0);
+    target.addNode("A", createTestStage("A"), DeviceId::cpu());
+    target.addNode("B", createTestStage("B"), DeviceId::cpu());
+    target.addNode("C", createTestStage("C"), DeviceId::cpu());
+    target.addNode("D", createTestStage("D"), DeviceId::cpu());
     target.addDependency("B", "A");
     target.addDependency("C", "A");
     target.addDependency("D", "B");
@@ -605,8 +605,8 @@ TEST_F(Test__ComputeGraphMerge, Merge_ComplexDAGExecutionOrder)
 
     // Source: E -> F
     ComputeGraph source;
-    source.addNode("E", createTestStage("E"), 0);
-    source.addNode("F", createTestStage("F"), 0);
+    source.addNode("E", createTestStage("E"), DeviceId::cpu());
+    source.addNode("F", createTestStage("F"), DeviceId::cpu());
     source.addDependency("F", "E");
 
     // Connect after D
@@ -647,7 +647,7 @@ TEST_F(Test__ComputeGraphMerge, SimulateLayerGraphMerging)
 
     // Main graph: embedding
     ComputeGraph main_graph;
-    main_graph.addNode("embedding", createTestStage("embedding"), 0);
+    main_graph.addNode("embedding", createTestStage("embedding"), DeviceId::cpu());
 
     std::string prev_node = "embedding";
 
@@ -658,11 +658,11 @@ TEST_F(Test__ComputeGraphMerge, SimulateLayerGraphMerging)
 
         // Build "attention" subgraph
         ComputeGraph attn_graph;
-        attn_graph.addNode(prefix + "attn_norm", createTestStage(prefix + "attn_norm"), 0);
-        attn_graph.addNode(prefix + "qkv_proj", createTestStage(prefix + "qkv_proj"), 0);
-        attn_graph.addNode(prefix + "attention", createTestStage(prefix + "attention"), 0);
-        attn_graph.addNode(prefix + "wo_proj", createTestStage(prefix + "wo_proj"), 0);
-        attn_graph.addNode(prefix + "attn_residual", createTestStage(prefix + "attn_residual"), 0);
+        attn_graph.addNode(prefix + "attn_norm", createTestStage(prefix + "attn_norm"), DeviceId::cpu());
+        attn_graph.addNode(prefix + "qkv_proj", createTestStage(prefix + "qkv_proj"), DeviceId::cpu());
+        attn_graph.addNode(prefix + "attention", createTestStage(prefix + "attention"), DeviceId::cpu());
+        attn_graph.addNode(prefix + "wo_proj", createTestStage(prefix + "wo_proj"), DeviceId::cpu());
+        attn_graph.addNode(prefix + "attn_residual", createTestStage(prefix + "attn_residual"), DeviceId::cpu());
 
         attn_graph.addDependency(prefix + "qkv_proj", prefix + "attn_norm");
         attn_graph.addDependency(prefix + "attention", prefix + "qkv_proj");
@@ -675,11 +675,11 @@ TEST_F(Test__ComputeGraphMerge, SimulateLayerGraphMerging)
 
         // Build "FFN" subgraph
         ComputeGraph ffn_graph;
-        ffn_graph.addNode(prefix + "ffn_norm", createTestStage(prefix + "ffn_norm"), 0);
-        ffn_graph.addNode(prefix + "gate_up", createTestStage(prefix + "gate_up"), 0);
-        ffn_graph.addNode(prefix + "swiglu", createTestStage(prefix + "swiglu"), 0);
-        ffn_graph.addNode(prefix + "down_proj", createTestStage(prefix + "down_proj"), 0);
-        ffn_graph.addNode(prefix + "ffn_residual", createTestStage(prefix + "ffn_residual"), 0);
+        ffn_graph.addNode(prefix + "ffn_norm", createTestStage(prefix + "ffn_norm"), DeviceId::cpu());
+        ffn_graph.addNode(prefix + "gate_up", createTestStage(prefix + "gate_up"), DeviceId::cpu());
+        ffn_graph.addNode(prefix + "swiglu", createTestStage(prefix + "swiglu"), DeviceId::cpu());
+        ffn_graph.addNode(prefix + "down_proj", createTestStage(prefix + "down_proj"), DeviceId::cpu());
+        ffn_graph.addNode(prefix + "ffn_residual", createTestStage(prefix + "ffn_residual"), DeviceId::cpu());
 
         ffn_graph.addDependency(prefix + "gate_up", prefix + "ffn_norm");
         ffn_graph.addDependency(prefix + "swiglu", prefix + "gate_up");
@@ -692,8 +692,8 @@ TEST_F(Test__ComputeGraphMerge, SimulateLayerGraphMerging)
     }
 
     // Add LM head
-    main_graph.addNode("final_norm", createTestStage("final_norm"), 0);
-    main_graph.addNode("lm_head", createTestStage("lm_head"), 0);
+    main_graph.addNode("final_norm", createTestStage("final_norm"), DeviceId::cpu());
+    main_graph.addNode("lm_head", createTestStage("lm_head"), DeviceId::cpu());
     main_graph.addDependency("final_norm", prev_node);
     main_graph.addDependency("lm_head", "final_norm");
 

@@ -138,7 +138,7 @@ protected:
 
         // Get first weight tensor (any quantized tensor works for benchmarking)
         // Layer 0 attention query weight
-        weight_tensor_ = loader_->loadTensor("blk.0.attn_q.weight", 0);
+        weight_tensor_ = loader_->loadTensor("blk.0.attn_q.weight", DeviceId::cpu());
         ASSERT_NE(weight_tensor_, nullptr) << "Failed to load weight tensor";
 
         // Detect quantization format
@@ -235,7 +235,7 @@ protected:
         }
 
         // Try to load the specific weight, fall back to generic if not found
-        auto test_weight = loader_->loadTensor(actual_weight_name, 0);
+        auto test_weight = loader_->loadTensor(actual_weight_name, DeviceId::cpu());
         if (!test_weight)
         {
             std::cerr << "Warning: Could not load " << actual_weight_name

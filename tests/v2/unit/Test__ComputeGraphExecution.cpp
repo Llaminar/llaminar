@@ -20,6 +20,7 @@
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/DeviceContext.h"
 #include "tensors/Tensors.h"
+#include "backends/DeviceId.h"
 #include <algorithm>
 #include <set>
 #include <thread>
@@ -654,13 +655,13 @@ TEST_F(ComputeGraphExecutionTest, GetNode_InvalidName)
 TEST_F(ComputeGraphExecutionTest, Node_DeviceAssignment)
 {
     MockGraphBuilder builder;
-    builder.addNode("cpu_node", ComputeStageType::GEMM, 0);
-    builder.addNode("gpu_node", ComputeStageType::GEMM, 1);
+    builder.addNode("cpu_node", ComputeStageType::GEMM, DeviceId::cpu());
+    builder.addNode("gpu_node", ComputeStageType::GEMM, DeviceId::cuda(0));
 
     auto graph = builder.build();
 
-    EXPECT_EQ(graph.getNode("cpu_node")->device_idx, 0);
-    EXPECT_EQ(graph.getNode("gpu_node")->device_idx, 1);
+    EXPECT_EQ(graph.getNode("cpu_node")->device, DeviceId::cpu());
+    EXPECT_EQ(graph.getNode("gpu_node")->device, DeviceId::cuda(0));
 }
 
 // =============================================================================
@@ -872,10 +873,10 @@ TEST_F(ComputeGraphExecutionTest, RealResidualAddStage_InGraph)
     ComputeGraph graph;
     graph.addNode("residual",
                   ComputeStageFactory::createResidualAdd(params),
-                  0);
+                  DeviceId::cpu());
 
     // Use real CPU context
-    auto real_ctx = std::make_unique<CPUDeviceContext>(0, 4);
+    auto real_ctx = std::make_unique<CPUDeviceContext>(DeviceId::cpu(), 4);
 
     EXPECT_TRUE(executor_->execute(graph, real_ctx.get()));
 

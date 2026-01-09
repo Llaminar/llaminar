@@ -51,6 +51,7 @@
 #include "utils/DebugEnv.h"
 #include "tensors/TensorFactory.h"
 #include "tensors/CPUKVCache.h"
+#include "backends/DeviceId.h"
 
 using namespace llaminar2;
 
@@ -201,7 +202,7 @@ protected:
         config.max_seq_len = max_seq_len;
 
         // InferenceRunner auto-detects TP from mpi_ctx->world_size() > 1
-        int cpu_device = DeviceManager::instance().cpuDeviceIndex();
+        DeviceId cpu_device = DeviceId::cpu();
         return createInferenceRunner(model_ctx_, mpi_ctx_, cpu_device, config);
     }
 

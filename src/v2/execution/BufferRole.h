@@ -17,6 +17,7 @@
 #pragma once
 
 #include "../tensors/TensorLayout.h"
+#include "../backends/DeviceId.h"
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -276,8 +277,8 @@ namespace llaminar2
         /// Memory alignment requirement in bytes
         size_t alignment = 64;
 
-        /// Device index (-1 = CPU, >=0 = GPU)
-        int device_idx = -1;
+        /// Target device
+        DeviceId device = DeviceId::cpu();
 
         // =====================================================================
         // Producer/Consumer Contract Fields (Phase 2: Buffer Validation)
@@ -368,35 +369,35 @@ namespace llaminar2
                                       std::vector<size_t> shape,
                                       BufferTensorType type = BufferTensorType::FP32)
         {
-            return BufferDescriptor{name, BufferRole::INPUT, std::move(shape), type, true, 64, -1};
+            return BufferDescriptor{name, BufferRole::INPUT, std::move(shape), type, true, 64, DeviceId::cpu()};
         }
 
         static BufferDescriptor output(const std::string &name,
                                        std::vector<size_t> shape,
                                        BufferTensorType type = BufferTensorType::FP32)
         {
-            return BufferDescriptor{name, BufferRole::OUTPUT, std::move(shape), type, true, 64, -1};
+            return BufferDescriptor{name, BufferRole::OUTPUT, std::move(shape), type, true, 64, DeviceId::cpu()};
         }
 
         static BufferDescriptor inout(const std::string &name,
                                       std::vector<size_t> shape,
                                       BufferTensorType type = BufferTensorType::FP32)
         {
-            return BufferDescriptor{name, BufferRole::INOUT, std::move(shape), type, true, 64, -1};
+            return BufferDescriptor{name, BufferRole::INOUT, std::move(shape), type, true, 64, DeviceId::cpu()};
         }
 
         static BufferDescriptor scratch(const std::string &name,
                                         std::vector<size_t> shape,
                                         BufferTensorType type = BufferTensorType::FP32)
         {
-            return BufferDescriptor{name, BufferRole::SCRATCH, std::move(shape), type, true, 64, -1};
+            return BufferDescriptor{name, BufferRole::SCRATCH, std::move(shape), type, true, 64, DeviceId::cpu()};
         }
 
         static BufferDescriptor weight(const std::string &name,
                                        std::vector<size_t> shape,
                                        BufferTensorType type = BufferTensorType::FP32)
         {
-            return BufferDescriptor{name, BufferRole::WEIGHT, std::move(shape), type, true, 64, -1};
+            return BufferDescriptor{name, BufferRole::WEIGHT, std::move(shape), type, true, 64, DeviceId::cpu()};
         }
 
         // =====================================================================

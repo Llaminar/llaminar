@@ -25,6 +25,7 @@
 #include "Tensors.h"
 #include "TensorFactory.h"
 #include "TensorLayout.h"
+#include "../backends/DeviceId.h"
 #include "../utils/MPIContext.h"
 #include "../execution/RuntimeConfig.h"
 #include <vector>
@@ -168,7 +169,7 @@ namespace llaminar2
         virtual void evict_oldest_from_sequence(int seq_idx, int tokens_to_evict) = 0;
 
         // Device placement
-        virtual int get_layer_device(int layer) const = 0;
+        virtual DeviceId get_layer_device(int layer) const = 0;
 
         // Eviction tracking
         virtual int get_total_evicted() const = 0;
@@ -275,19 +276,19 @@ namespace llaminar2
          * @param max_seq_len Maximum sequence length (cache capacity per sequence)
          * @param n_kv_heads Number of KV heads (GQA)
          * @param head_dim Dimension per head
-         * @param device_idx Default device for all layers (-1 = CPU)
+         * @param device Default device for all layers (CPU by default)
          * @param layout_mode Memory layout mode (POSITION_MAJOR or HEAD_MAJOR)
          */
         CPUKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
-                       int n_kv_heads, int head_dim, int device_idx = -1,
-                       KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
+                   int n_kv_heads, int head_dim, DeviceId device = DeviceId::cpu(),
+                   KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
         /**
          * @brief Construct unified KV cache with per-layer device placement
          */
         CPUKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
-                       int n_kv_heads, int head_dim, const std::vector<int> &attention_devices,
-                       KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
+                   int n_kv_heads, int head_dim, const std::vector<int> &attention_devices,
+                   KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
         /**
          * @brief Construct unified KV cache with sharded (local) KV heads for tensor parallelism
@@ -303,21 +304,21 @@ namespace llaminar2
          * @param local_n_kv_heads Number of KV heads on this rank (n_kv_heads / world_size)
          * @param kv_head_start Starting KV head index for this rank
          * @param head_dim Dimension per head
-         * @param device_idx Default device for all layers (-1 = CPU)
+         * @param device Default device for all layers (CPU by default)
          * @param layout_mode Memory layout mode (POSITION_MAJOR or HEAD_MAJOR)
          */
         CPUKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
-                       int n_kv_heads, int local_n_kv_heads, int kv_head_start,
-                       int head_dim, int device_idx = -1,
-                       KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
+                   int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+                   int head_dim, DeviceId device = DeviceId::cpu(),
+                   KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
         /**
          * @brief Construct unified KV cache with sharded KV heads and per-layer device placement
          */
         CPUKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
-                       int n_kv_heads, int local_n_kv_heads, int kv_head_start,
-                       int head_dim, const std::vector<int> &attention_devices,
-                       KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
+                   int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+                   int head_dim, const std::vector<int> &attention_devices,
+                   KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
         // ICPUKVCache interface implementation
         ActivationPrecision precision() const override { return Precision; }
@@ -356,7 +357,7 @@ namespace llaminar2
         void evict_oldest(int tokens_to_evict) override;
         void evict_oldest_from_sequence(int seq_idx, int tokens_to_evict) override;
 
-        int get_layer_device(int layer) const override;
+        DeviceId get_layer_device(int layer) const override;
         int get_total_evicted() const override { return total_evicted_; }
         void reset_eviction_counter() override { total_evicted_ = 0; }
 
@@ -426,19 +427,19 @@ namespace llaminar2
         std::vector<std::vector<EntryT>> entries_;
 
         // Device placement per layer
-        std::vector<int> layer_devices_;
+        std::vector<DeviceId> layer_devices_;
 
         // TensorFactory for NUMA-aware allocation
         std::unique_ptr<TensorFactory> tensor_factory_;
 
         // Helpers
-        std::shared_ptr<TensorT> allocate_tensor(size_t rows, size_t cols, int device_idx);
+        std::shared_ptr<TensorT> allocate_tensor(size_t rows, size_t cols, DeviceId device);
         void copy_append_data(TensorT *dst, const TensorT *src, int offset_tokens, int new_tokens);
         void shift_evict_data(TensorT *tensor, int tokens_to_evict, int tokens_to_keep);
         bool append_kv_impl(int layer, int seq_idx, const TensorT *new_k, const TensorT *new_v, int num_tokens);
 
         // Helper to initialize all entries for a layer
-        void initialize_layer(int layer, int device_idx);
+        void initialize_layer(int layer, DeviceId device);
     };
 
     // =========================================================================
@@ -465,7 +466,7 @@ namespace llaminar2
      * @param max_seq_len Maximum sequence length
      * @param n_kv_heads Number of KV heads (GQA)
      * @param head_dim Dimension per head
-     * @param device_idx Device index for all layers (-1 for CPU)
+     * @param device Device identifier for all layers (CPU by default)
      * @param layout_mode Memory layout mode (POSITION_MAJOR or HEAD_MAJOR)
      */
     std::unique_ptr<ICPUKVCache> createCPUKVCache(
@@ -473,7 +474,7 @@ namespace llaminar2
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim,
-        int device_idx = -1,
+        DeviceId device = DeviceId::cpu(),
         KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
     /**
@@ -506,7 +507,7 @@ namespace llaminar2
      * @param local_n_kv_heads Number of KV heads stored on this rank
      * @param kv_head_start Starting KV head index for this rank
      * @param head_dim Dimension per head
-     * @param device_idx Device index for all layers (-1 for CPU)
+     * @param device Device identifier for all layers (CPU by default)
      * @param layout_mode Memory layout mode (POSITION_MAJOR or HEAD_MAJOR)
      */
     std::unique_ptr<ICPUKVCache> createShardedCPUKVCache(
@@ -514,7 +515,7 @@ namespace llaminar2
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
-        int head_dim, int device_idx = -1,
+        int head_dim, DeviceId device = DeviceId::cpu(),
         KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
     /**

@@ -27,6 +27,7 @@
 #include <fstream>
 
 #include "v2/models/qwen/Qwen2Graph.h"
+#include "v2/backends/DeviceId.h"
 #include "v2/execution/GraphOrchestrator.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/TensorFactory.h"
@@ -102,7 +103,7 @@ class Test__LayerExecutor_Q8_1_vs_FP32_Parity : public ::testing::Test
 protected:
     // MPI context (single rank for unit testing)
     std::shared_ptr<MPIContext> mpi_ctx_;
-    int device_idx_ = 0;
+    DeviceId device_ = DeviceId::cpu();
 
     // Model loader and weights
     std::unique_ptr<ModelLoader> loader_;
@@ -141,7 +142,7 @@ protected:
         {
             GTEST_SKIP() << "No compute devices available";
         }
-        device_idx_ = 0;
+        device_ = DeviceId::cpu();
 
         // Create tensor factory
         factory_ = std::make_unique<TensorFactory>(*mpi_ctx_);
@@ -210,7 +211,7 @@ protected:
         config.d_ff = d_ff_;
         config.rms_norm_eps = rms_eps_;
         config.rope_theta = rope_theta_;
-        config.default_device = device_idx_;
+        config.default_device = device_;
         config.activation_precision = precision;
         // NOTE: Decomposed attention is now always used (Phase 7 cleanup)
 
@@ -227,22 +228,22 @@ protected:
         std::string prefix = "blk." + std::to_string(layer_idx) + ".";
 
         // Load attention weights
-        auto wq = loader_->loadTensor(prefix + "attn_q.weight", device_idx_);
-        auto wk = loader_->loadTensor(prefix + "attn_k.weight", device_idx_);
-        auto wv = loader_->loadTensor(prefix + "attn_v.weight", device_idx_);
-        auto wo = loader_->loadTensor(prefix + "attn_output.weight", device_idx_);
-        auto attn_norm = loader_->loadTensor(prefix + "attn_norm.weight", device_idx_);
+        auto wq = loader_->loadTensor(prefix + "attn_q.weight", device_);
+        auto wk = loader_->loadTensor(prefix + "attn_k.weight", device_);
+        auto wv = loader_->loadTensor(prefix + "attn_v.weight", device_);
+        auto wo = loader_->loadTensor(prefix + "attn_output.weight", device_);
+        auto attn_norm = loader_->loadTensor(prefix + "attn_norm.weight", device_);
 
         // Load attention biases (optional - may be nullptr for some models)
-        auto q_bias = loader_->loadTensor(prefix + "attn_q.bias", device_idx_);
-        auto k_bias = loader_->loadTensor(prefix + "attn_k.bias", device_idx_);
-        auto v_bias = loader_->loadTensor(prefix + "attn_v.bias", device_idx_);
+        auto q_bias = loader_->loadTensor(prefix + "attn_q.bias", device_);
+        auto k_bias = loader_->loadTensor(prefix + "attn_k.bias", device_);
+        auto v_bias = loader_->loadTensor(prefix + "attn_v.bias", device_);
 
         // Load FFN weights
-        auto gate_proj = loader_->loadTensor(prefix + "ffn_gate.weight", device_idx_);
-        auto up_proj = loader_->loadTensor(prefix + "ffn_up.weight", device_idx_);
-        auto down_proj = loader_->loadTensor(prefix + "ffn_down.weight", device_idx_);
-        auto ffn_norm = loader_->loadTensor(prefix + "ffn_norm.weight", device_idx_);
+        auto gate_proj = loader_->loadTensor(prefix + "ffn_gate.weight", device_);
+        auto up_proj = loader_->loadTensor(prefix + "ffn_up.weight", device_);
+        auto down_proj = loader_->loadTensor(prefix + "ffn_down.weight", device_);
+        auto ffn_norm = loader_->loadTensor(prefix + "ffn_norm.weight", device_);
 
         // Verify all required weights loaded (biases are optional)
         if (!wq || !wk || !wv || !wo || !attn_norm ||
@@ -325,29 +326,29 @@ protected:
                                             : fp32_owned_buffers_;
 
         // All activation buffers use the requested precision
-        owned.residual = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)}, precision, device_idx_);
-        owned.normalized = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)}, precision, device_idx_);
-        owned.Q = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads_ * head_dim_)}, precision, device_idx_);
-        owned.K = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads_ * head_dim_)}, precision, device_idx_);
-        owned.V = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads_ * head_dim_)}, precision, device_idx_);
-        owned.attn_output = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads_ * head_dim_)}, precision, device_idx_);
+        owned.residual = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)}, precision, device_);
+        owned.normalized = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)}, precision, device_);
+        owned.Q = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads_ * head_dim_)}, precision, device_);
+        owned.K = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads_ * head_dim_)}, precision, device_);
+        owned.V = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads_ * head_dim_)}, precision, device_);
+        owned.attn_output = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads_ * head_dim_)}, precision, device_);
 
         // attn_proj and ffn_output are ALWAYS FP32 - they feed into residual streams
         // This matches GraphOrchestrator::allocateInternalBuffers which creates these as FP32
         // for numerical stability in residual connections
-        owned.attn_proj = factory_->createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)}, device_idx_);
+        owned.attn_proj = factory_->createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)}, device_);
 
-        owned.gate = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_)}, precision, device_idx_);
-        owned.up = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_)}, precision, device_idx_);
+        owned.gate = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_)}, precision, device_);
+        owned.up = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_)}, precision, device_);
 
         // ffn_output is ALWAYS FP32 - feeds into residual stream
-        owned.ffn_output = factory_->createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)}, device_idx_);
+        owned.ffn_output = factory_->createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)}, device_);
 
-        owned.current_hidden = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)}, precision, device_idx_);
+        owned.current_hidden = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)}, precision, device_);
 
         // Workspace buffers (always FP32 - used for attention scores)
-        owned.workspace_scores = factory_->createFP32({static_cast<size_t>(n_heads_ * seq_len), static_cast<size_t>(seq_len)}, device_idx_);
-        owned.workspace_context = factory_->createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(head_dim_)}, device_idx_);
+        owned.workspace_scores = factory_->createFP32({static_cast<size_t>(n_heads_ * seq_len), static_cast<size_t>(seq_len)}, device_);
+        owned.workspace_context = factory_->createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(head_dim_)}, device_);
 
         buffers.residual = owned.residual.get();
         buffers.normalized = owned.normalized.get();
@@ -489,12 +490,12 @@ TEST_F(Test__LayerExecutor_Q8_1_vs_FP32_Parity, FFNParity)
 
     // Execute FFN on FP32
     LOG_INFO("[FFNParity] Running FP32 FFN with real Q8_0 weights...");
-    bool fp32_ok = fp32_executor->executeFFN(weights, fp32_buffers, LAYER_IDX, SEQ_LEN, device_idx_);
+    bool fp32_ok = fp32_executor->executeFFN(weights, fp32_buffers, LAYER_IDX, SEQ_LEN, device_);
     ASSERT_TRUE(fp32_ok) << "FP32 FFN execution failed";
 
     // Execute FFN on Q8_1
     LOG_INFO("[FFNParity] Running Q8_1 FFN with real Q8_0 weights...");
-    bool q8_1_ok = q8_1_executor->executeFFN(weights, q8_1_buffers, LAYER_IDX, SEQ_LEN, device_idx_);
+    bool q8_1_ok = q8_1_executor->executeFFN(weights, q8_1_buffers, LAYER_IDX, SEQ_LEN, device_);
     ASSERT_TRUE(q8_1_ok) << "Q8_1 FFN execution failed";
 
     // Compare results
@@ -529,7 +530,7 @@ TEST_F(Test__LayerExecutor_Q8_1_vs_FP32_Parity, FullLayerParity)
         MAX_SEQ_LEN, // max_seq_len
         n_kv_heads_, // n_kv_heads
         head_dim_,   // head_dim
-        device_idx_  // device_idx
+        device_      // device
     );
 
     auto q8_1_kv_cache = std::make_unique<CPUKVCache<ActivationPrecision::FP32>>(
@@ -539,7 +540,7 @@ TEST_F(Test__LayerExecutor_Q8_1_vs_FP32_Parity, FullLayerParity)
         MAX_SEQ_LEN, // max_seq_len
         n_kv_heads_, // n_kv_heads
         head_dim_,   // head_dim
-        device_idx_  // device_idx
+        device_      // device
     );
 
     // Create FP32 executor and buffers
@@ -566,7 +567,7 @@ TEST_F(Test__LayerExecutor_Q8_1_vs_FP32_Parity, FullLayerParity)
         weights, fp32_buffers,
         LAYER_IDX, SEQ_LEN,
         fp32_kv_cache.get(),
-        position_ids.data(), device_idx_);
+        position_ids.data(), device_);
     ASSERT_TRUE(fp32_ok) << "FP32 layer execution failed";
 
     // Execute full layer on Q8_1
@@ -575,7 +576,7 @@ TEST_F(Test__LayerExecutor_Q8_1_vs_FP32_Parity, FullLayerParity)
         weights, q8_1_buffers,
         LAYER_IDX, SEQ_LEN,
         q8_1_kv_cache.get(),
-        position_ids.data(), device_idx_);
+        position_ids.data(), device_);
     ASSERT_TRUE(q8_1_ok) << "Q8_1 layer execution failed";
 
     // Compare results
@@ -614,10 +615,10 @@ TEST_F(Test__LayerExecutor_Q8_1_vs_FP32_Parity, FFNParity_MultipleSeqLens)
         auto q8_1_buffers = createBuffers(seq_len, ActivationPrecision::Q8_1);
         initInput(q8_1_buffers.current_hidden);
 
-        bool fp32_ok = fp32_executor->executeFFN(weights, fp32_buffers, LAYER_IDX, seq_len, device_idx_);
+        bool fp32_ok = fp32_executor->executeFFN(weights, fp32_buffers, LAYER_IDX, seq_len, device_);
         ASSERT_TRUE(fp32_ok) << "FP32 FFN failed for seq_len=" << seq_len;
 
-        bool q8_1_ok = q8_1_executor->executeFFN(weights, q8_1_buffers, LAYER_IDX, seq_len, device_idx_);
+        bool q8_1_ok = q8_1_executor->executeFFN(weights, q8_1_buffers, LAYER_IDX, seq_len, device_);
         ASSERT_TRUE(q8_1_ok) << "Q8_1 FFN failed for seq_len=" << seq_len;
 
         std::string label = "FFN Output (seq_len=" + std::to_string(seq_len) + ")";

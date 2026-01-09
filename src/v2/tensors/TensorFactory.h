@@ -7,6 +7,7 @@
 #pragma once
 
 #include "Tensors.h"
+#include "../backends/DeviceId.h"
 #include "../utils/MPIContext.h"
 #include "../execution/RuntimeConfig.h"
 #include <memory>
@@ -43,10 +44,10 @@ namespace llaminar2
         /**
          * @brief Create FP32 tensor with NUMA-aware allocation
          * @param shape Tensor dimensions
-         * @param device_idx Optional device index for tracking (-1 = CPU, >=0 = GPU)
+         * @param device Device identifier (default: CPU)
          * @return FP32 tensor allocated on local NUMA node
          */
-        std::unique_ptr<FP32Tensor> createFP32(const std::vector<size_t> &shape, int device_idx = -1);
+        std::unique_ptr<FP32Tensor> createFP32(const std::vector<size_t> &shape, DeviceId device = DeviceId::cpu());
 
         /**
          * @brief Create FP16 tensor with NUMA-aware allocation
@@ -90,10 +91,10 @@ namespace llaminar2
         /**
          * @brief Create Q8_1 tensor with NUMA-aware allocation
          * @param shape Tensor dimensions (logical element count)
-         * @param device_idx Optional device index (-1 = CPU)
+         * @param device Device identifier (default: CPU)
          * @return Q8_1 tensor with properly sized block storage
          */
-        std::unique_ptr<Q8_1Tensor> createQ8_1(const std::vector<size_t> &shape, int device_idx = -1);
+        std::unique_ptr<Q8_1Tensor> createQ8_1(const std::vector<size_t> &shape, DeviceId device = DeviceId::cpu());
 
         /**
          * @brief Create Q8_1 tensor from existing raw data
@@ -111,11 +112,11 @@ namespace llaminar2
          * Ideal for high-precision residual stream storage.
          *
          * @param shape Tensor dimensions (logical element count)
-         * @param device_idx Optional device index (-1 = CPU)
+         * @param device Device identifier (default: CPU)
          * @return Q16_1 tensor with properly sized block storage
          */
         std::unique_ptr<Q16_1Tensor> createQ16_1(const std::vector<size_t> &shape,
-                                                 int device_idx = -1);
+                                                 DeviceId device = DeviceId::cpu());
 
         /**
          * @brief Create Q16_1 tensor with custom block size
@@ -125,12 +126,12 @@ namespace llaminar2
          *
          * @param shape Tensor dimensions (logical element count)
          * @param block_size Block size for quantization (Q16_32, Q16_64, Q16_128, Q16_192)
-         * @param device_idx Optional device index (-1 = CPU)
+         * @param device Device identifier (default: CPU)
          * @return Q16_1 tensor with specified block size
          */
         std::unique_ptr<Q16_1Tensor> createQ16_1(const std::vector<size_t> &shape,
                                                  Q16BlockSize block_size,
-                                                 int device_idx = -1);
+                                                 DeviceId device = DeviceId::cpu());
 
         /**
          * @brief Create activation tensor based on precision setting
@@ -140,12 +141,12 @@ namespace llaminar2
          *
          * @param shape Tensor dimensions
          * @param precision Activation precision (FP32, BF16, FP16, Q8_1)
-         * @param device_idx Optional device index (-1 = CPU)
+         * @param device Device identifier (default: CPU)
          * @return Tensor of appropriate type
          */
         std::unique_ptr<TensorBase> createActivation(const std::vector<size_t> &shape,
                                                      ActivationPrecision precision,
-                                                     int device_idx = -1);
+                                                     DeviceId device = DeviceId::cpu());
 
         /**
          * @brief Create activation tensor with explicit head_dim for Q16 block size
@@ -157,13 +158,13 @@ namespace llaminar2
          * @param shape Tensor dimensions
          * @param precision Activation precision
          * @param head_dim Attention head dimension (used for Q16 block size)
-         * @param device_idx Optional device index (-1 = CPU)
+         * @param device Device identifier
          * @return Tensor of appropriate type
          */
         std::unique_ptr<TensorBase> createActivation(const std::vector<size_t> &shape,
                                                      ActivationPrecision precision,
                                                      int head_dim,
-                                                     int device_idx);
+                                                     DeviceId device);
 
         /**
          * @brief Create quantized tensor from raw GGUF data

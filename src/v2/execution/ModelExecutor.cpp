@@ -41,24 +41,25 @@ namespace llaminar2
     // Device Context Management
     // =============================================================================
 
-    IDeviceContext *ModelExecutor::getDeviceContext(int device_idx)
+    IDeviceContext *ModelExecutor::getDeviceContext(DeviceId device)
     {
-        auto it = device_contexts_.find(device_idx);
+        int key = device.toLegacyIndex();
+        auto it = device_contexts_.find(key);
         if (it != device_contexts_.end())
         {
             return it->second.get();
         }
 
         // Create new context
-        auto ctx = IDeviceContext::create(device_idx);
+        auto ctx = IDeviceContext::create(device);
         if (!ctx)
         {
-            LOG_ERROR("[ModelExecutor] Failed to create device context for device " << device_idx);
+            LOG_ERROR("[ModelExecutor] Failed to create device context for device " << device.to_string());
             return nullptr;
         }
 
         IDeviceContext *raw_ptr = ctx.get();
-        device_contexts_[device_idx] = std::move(ctx);
+        device_contexts_[key] = std::move(ctx);
         return raw_ptr;
     }
 
@@ -87,7 +88,7 @@ namespace llaminar2
 
         LOG_TRACE("[ModelExecutor] executeForward: batch_size=" << input.batch_size
                                                                 << ", seq_len=" << input.seq_len
-                                                                << ", device=" << input.device_idx);
+                                                                << ", device=" << input.device.to_string());
 
         // Build and execute full forward graph
         ComputeGraph graph = buildFullForwardGraph(input, output);
@@ -99,7 +100,7 @@ namespace llaminar2
         }
 
         // Get device context
-        IDeviceContext *ctx = getDeviceContext(input.device_idx);
+        IDeviceContext *ctx = getDeviceContext(input.device);
         if (!ctx)
         {
             return false;
@@ -134,7 +135,7 @@ namespace llaminar2
         auto start = std::chrono::high_resolution_clock::now();
 
         ComputeGraph graph = buildEmbeddingGraph(input, output_hidden);
-        IDeviceContext *ctx = getDeviceContext(input.device_idx);
+        IDeviceContext *ctx = getDeviceContext(input.device);
 
         if (!ctx)
         {
@@ -154,7 +155,7 @@ namespace llaminar2
         TensorBase *hidden,
         ICPUKVCache *kv_cache,
         const int *position_ids,
-        int device_idx)
+        DeviceId device)
     {
         auto start = std::chrono::high_resolution_clock::now();
 
@@ -163,8 +164,8 @@ namespace llaminar2
             // Execute layers separately (for debugging)
             for (int i = 0; i < config_.n_layers; ++i)
             {
-                ComputeGraph graph = buildLayerGraph(i, hidden, kv_cache, position_ids, device_idx);
-                IDeviceContext *ctx = getDeviceContext(device_idx);
+                ComputeGraph graph = buildLayerGraph(i, hidden, kv_cache, position_ids, device);
+                IDeviceContext *ctx = getDeviceContext(device);
 
                 if (!ctx || !execute(graph, ctx))
                 {
@@ -176,8 +177,8 @@ namespace llaminar2
         else
         {
             // Execute all layers as single graph
-            ComputeGraph graph = buildTransformerLayersGraph(hidden, kv_cache, position_ids, device_idx);
-            IDeviceContext *ctx = getDeviceContext(device_idx);
+            ComputeGraph graph = buildTransformerLayersGraph(hidden, kv_cache, position_ids, device);
+            IDeviceContext *ctx = getDeviceContext(device);
 
             if (!ctx || !execute(graph, ctx))
             {
@@ -192,13 +193,13 @@ namespace llaminar2
         return true;
     }
 
-    bool ModelExecutor::executeLMHead(TensorBase *hidden, TensorBase *logits, int total_tokens, int device_idx,
+    bool ModelExecutor::executeLMHead(TensorBase *hidden, TensorBase *logits, int total_tokens, DeviceId device,
                                       TensorBase *logits_local)
     {
         auto start = std::chrono::high_resolution_clock::now();
 
-        ComputeGraph graph = buildLMHeadGraph(hidden, logits, total_tokens, device_idx, logits_local);
-        IDeviceContext *ctx = getDeviceContext(device_idx);
+        ComputeGraph graph = buildLMHeadGraph(hidden, logits, total_tokens, device, logits_local);
+        IDeviceContext *ctx = getDeviceContext(device);
 
         if (!ctx)
         {

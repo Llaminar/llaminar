@@ -222,8 +222,12 @@ namespace llaminar2
     {
         assertValid("FP32Tensor::data");
 
-        // If on device, sync to host
-        // TODO: Implement lazy sync when device support is added
+        // If on device and device has newer data, sync to host
+        if (device_data_ && device_dirty_)
+        {
+            // Need to cast away const for sync (lazy sync pattern)
+            const_cast<FP32Tensor *>(this)->sync_from_device();
+        }
 
         if (is_view_)
         {
@@ -250,64 +254,116 @@ namespace llaminar2
     std::unique_ptr<ITensorGemm> FP32Tensor::createGemm()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_);
         return llaminar::v2::kernels::KernelFactory::createGemm(this, dev_type);
     }
 
     std::unique_ptr<ITensorRoPE> FP32Tensor::createRoPE()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_);
         return llaminar::v2::kernels::KernelFactory::createRoPE(this, dev_type);
     }
 
     std::unique_ptr<ITensorSwiGLU> FP32Tensor::createSwiGLU()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_);
         return llaminar::v2::kernels::KernelFactory::createSwiGLU(this, dev_type);
     }
 
     std::unique_ptr<ITensorSoftmax> FP32Tensor::createSoftmax()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_);
         return llaminar::v2::kernels::KernelFactory::createSoftmax(this, dev_type);
     }
 
     std::unique_ptr<ITensorRMSNorm> FP32Tensor::createRMSNorm()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_);
         return llaminar::v2::kernels::KernelFactory::createRMSNorm(this, dev_type);
     }
 
     std::unique_ptr<ITensorAttention> FP32Tensor::createAttention()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_);
         return llaminar::v2::kernels::KernelFactory::createAttention(this, dev_type);
     }
 
     std::unique_ptr<ITensorEmbedding> FP32Tensor::createEmbedding()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_);
         return llaminar::v2::kernels::KernelFactory::createEmbedding(this, dev_type);
     }
 
     bool FP32Tensor::sync_to_device()
     {
-        // TODO: Implement sync_to_device
-        LOG_ERROR("[FP32Tensor] sync_to_device not yet implemented");
-        return false;
+        // No device data to sync to - this is a CPU tensor or device allocation failed
+        if (!device_data_)
+        {
+            return true; // Nothing to sync, not an error
+        }
+
+        // Already synced (device not dirty means host data is fresh on device)
+        if (!host_dirty_)
+        {
+            return true; // Device is already up-to-date
+        }
+
+        // Get backend for the device
+        int device_idx = device_.toLegacyIndex();
+        IBackend *backend = getBackendForDeviceIdx(device_idx);
+        if (!backend)
+        {
+            LOG_ERROR("[FP32Tensor] sync_to_device: No backend for device " << device_.to_string());
+            return false;
+        }
+
+        // Copy host memory to device
+        size_t bytes = host_data_.size() * sizeof(float);
+        int backend_device_id = getBackendDeviceId(device_idx);
+        backend->hostToDevice(device_data_, host_data_.data(), bytes, backend_device_id);
+
+        host_dirty_ = false;
+        LOG_DEBUG("[FP32Tensor] Synced " << bytes << " bytes from host to device " << device_.to_string());
+        return true;
     }
 
     bool FP32Tensor::sync_from_device()
     {
-        // TODO: Implement sync_from_device
-        LOG_ERROR("[FP32Tensor] sync_from_device not yet implemented");
-        return false;
+        // No device data to sync - this is a CPU tensor or device allocation failed
+        if (!device_data_)
+        {
+            return true; // Nothing to sync, not an error
+        }
+
+        // Already synced (host not dirty means device data is fresh in host)
+        if (!device_dirty_)
+        {
+            return true; // Host is already up-to-date
+        }
+
+        // Get backend for the device
+        int device_idx = device_.toLegacyIndex();
+        IBackend *backend = getBackendForDeviceIdx(device_idx);
+        if (!backend)
+        {
+            LOG_ERROR("[FP32Tensor] sync_from_device: No backend for device " << device_.to_string());
+            return false;
+        }
+
+        // Copy device memory to host
+        size_t bytes = host_data_.size() * sizeof(float);
+        int backend_device_id = getBackendDeviceId(device_idx);
+        backend->deviceToHost(host_data_.data(), device_data_, bytes, backend_device_id);
+
+        device_dirty_ = false;
+        LOG_DEBUG("[FP32Tensor] Synced " << bytes << " bytes from device " << device_.to_string() << " to host");
+        return true;
     }
 
     // =========================================================================

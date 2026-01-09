@@ -596,6 +596,7 @@ add_library(llaminar2_core STATIC
     loaders/ModelContext.cpp
     loaders/WeightManager.cpp
     loaders/WeightPlacementMap.cpp
+    loaders/WeightPreloader.cpp
     loaders/DeviceOrchestrator.cpp
     models/qwen/Qwen2Graph.cpp
     tensors/cpu/CPUTensorBase.cpp

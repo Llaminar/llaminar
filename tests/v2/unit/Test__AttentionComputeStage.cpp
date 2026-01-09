@@ -13,6 +13,7 @@
 #include <cmath>
 #include <memory>
 
+#include "backends/DeviceId.h"
 #include "execution/compute_stages/ComputeStages.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/TensorFactory.h"
@@ -28,7 +29,7 @@ namespace
     {
     protected:
         MPIContext mpi_ctx_{0, 1, MPI_COMM_WORLD};
-        int device_idx_ = -1; // CPU
+        DeviceId device_id_ = DeviceId::cpu();
 
         void SetUp() override {}
         void TearDown() override {}
@@ -49,10 +50,10 @@ namespace
         size_t hidden_size = n_heads * head_dim;
 
         // Create tensors
-        auto Q = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_idx_);
-        auto K = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_idx_);
-        auto V = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_idx_);
-        auto output = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_idx_);
+        auto Q = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_id_);
+        auto K = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_id_);
+        auto V = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_id_);
+        auto output = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_id_);
 
         // Construct stage
         AttentionComputeStage::Params params;
@@ -68,7 +69,7 @@ namespace
         params.head_dim = head_dim;
         params.causal = true;
         params.mpi_ctx = &mpi_ctx_;
-        params.device_idx = device_idx_;
+        params.device_id = device_id_;
 
         auto stage = std::make_unique<AttentionComputeStage>(params);
         ASSERT_NE(stage, nullptr);
@@ -88,10 +89,10 @@ namespace
         int head_dim = 8;
         size_t hidden_size = n_heads * head_dim;
 
-        auto Q = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_idx_);
-        auto K = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_idx_);
-        auto V = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_idx_);
-        auto output = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_idx_);
+        auto Q = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_id_);
+        auto K = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_id_);
+        auto V = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_id_);
+        auto output = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_id_);
 
         AttentionComputeStage::Params params;
         params.Q = Q.get();
@@ -128,10 +129,10 @@ namespace
         int head_dim = 16;
         size_t hidden_size = n_heads * head_dim;
 
-        auto Q = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_idx_);
-        auto K = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_idx_);
-        auto V = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_idx_);
-        auto output = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_idx_);
+        auto Q = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_id_);
+        auto K = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_id_);
+        auto V = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_id_);
+        auto output = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_id_);
 
         AttentionComputeStage::Params params;
         params.Q = Q.get();
@@ -146,7 +147,7 @@ namespace
         params.head_dim = head_dim;
         params.causal = true;
         params.window_size = -1;
-        params.device_idx = device_idx_;
+        params.device_id = device_id_;
 
         auto stage = std::make_unique<AttentionComputeStage>(params);
         StageDumpInfo info = stage->getDumpInfo();
@@ -188,10 +189,10 @@ namespace
         int head_dim = 16;
         size_t hidden_size = n_heads * head_dim;
 
-        auto Q = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_idx_);
-        auto K = factory.createFP32({static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_idx_);
-        auto V = factory.createFP32({static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_idx_);
-        auto output = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_idx_);
+        auto Q = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_id_);
+        auto K = factory.createFP32({static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_id_);
+        auto V = factory.createFP32({static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_id_);
+        auto output = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_id_);
 
         AttentionComputeStage::Params params;
         params.Q = Q.get();
@@ -239,10 +240,10 @@ namespace
         size_t hidden_size = n_heads * head_dim;
 
         // Create tensors
-        auto Q = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_idx_);
-        auto K = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_idx_);
-        auto V = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_idx_);
-        auto output = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_idx_);
+        auto Q = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_id_);
+        auto K = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_id_);
+        auto V = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_id_);
+        auto output = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_id_);
 
         // Initialize with simple values
         float *Q_data = Q->mutable_data();
@@ -271,7 +272,7 @@ namespace
         // Create workspace for attention scores
         auto workspace_scores = factory.createFP32(
             {static_cast<size_t>(n_heads * seq_len), static_cast<size_t>(seq_len)},
-            device_idx_);
+            device_id_);
 
         // Configure stage params
         AttentionComputeStage::Params params;
@@ -289,7 +290,7 @@ namespace
         params.window_size = -1;
         params.workspace_scores = workspace_scores.get();
         params.mpi_ctx = &mpi_ctx_;
-        params.device_idx = device_idx_;
+        params.device_id = device_id_;
 
         // Create and execute stage
         auto stage = std::make_unique<AttentionComputeStage>(params);
@@ -331,10 +332,10 @@ namespace
         int head_dim = 8;
         size_t hidden_size = n_heads * head_dim;
 
-        auto Q = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_idx_);
-        auto K = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_idx_);
-        auto V = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_idx_);
-        auto output = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_idx_);
+        auto Q = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_id_);
+        auto K = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_id_);
+        auto V = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_id_);
+        auto output = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_id_);
 
         // Initialize with random-ish values
         float *Q_data = Q->mutable_data();
@@ -350,7 +351,7 @@ namespace
 
         auto workspace_scores = factory.createFP32(
             {static_cast<size_t>(n_heads * seq_len), static_cast<size_t>(seq_len)},
-            device_idx_);
+            device_id_);
 
         AttentionComputeStage::Params params;
         params.Q = Q.get();
@@ -366,7 +367,7 @@ namespace
         params.causal = true;
         params.workspace_scores = workspace_scores.get();
         params.mpi_ctx = &mpi_ctx_;
-        params.device_idx = device_idx_;
+        params.device_id = device_id_;
 
         auto stage = std::make_unique<AttentionComputeStage>(params);
         bool success = stage->execute(nullptr);
@@ -393,10 +394,10 @@ namespace
         int head_dim = 8;
         size_t hidden_size = n_heads * head_dim;
 
-        auto Q = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_idx_);
-        auto K = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_idx_);
-        auto V = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_idx_);
-        auto output = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_idx_);
+        auto Q = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_id_);
+        auto K = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_id_);
+        auto V = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, device_id_);
+        auto output = factory.createFP32({static_cast<size_t>(seq_len), hidden_size}, device_id_);
 
         AttentionComputeStage::Params params;
         params.Q = Q.get();

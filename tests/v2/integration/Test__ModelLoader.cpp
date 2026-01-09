@@ -24,6 +24,7 @@
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"
+#include "backends/DeviceId.h"
 #include <fstream>
 #include <cstring>
 #include <cstdio>
@@ -690,7 +691,7 @@ TEST_F(Test__ModelLoader, LoadQuantizedTensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("iq4nl.weight", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("iq4nl.weight", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::IQ4_NL);
 
@@ -1028,7 +1029,7 @@ TEST_F(Test__ModelLoader, LoadQ4_1Tensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("q4_1_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("q4_1_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::Q4_1);
 }
@@ -1092,7 +1093,7 @@ TEST_F(Test__ModelLoader, LoadQ4_0Tensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("q4_0_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("q4_0_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::Q4_0);
 }
@@ -1156,7 +1157,7 @@ TEST_F(Test__ModelLoader, LoadQ6_KTensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("q6_k_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("q6_k_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::Q6_K);
 }
@@ -1245,7 +1246,7 @@ TEST_F(Test__ModelLoader, LoadIQ4_NLTensorWithFactory)
 
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("iq4nl.weight", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("iq4nl.weight", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::IQ4_NL);
 }
@@ -1395,7 +1396,7 @@ TEST_F(Test__ModelLoader, LoadQ2_KTensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("q2_k_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("q2_k_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::Q2_K);
 }
@@ -1459,7 +1460,7 @@ TEST_F(Test__ModelLoader, LoadQ3_KTensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("q3_k_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("q3_k_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::Q3_K);
 }
@@ -1523,7 +1524,7 @@ TEST_F(Test__ModelLoader, LoadQ5_KTensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("q5_k_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("q5_k_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::Q5_K);
 }
@@ -1587,7 +1588,7 @@ TEST_F(Test__ModelLoader, LoadIQ2_XXSTensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("iq2_xxs_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("iq2_xxs_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::IQ2_XXS);
 }
@@ -1651,7 +1652,7 @@ TEST_F(Test__ModelLoader, LoadIQ3_STensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("iq3_s_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("iq3_s_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::IQ3_S);
 }
@@ -1715,7 +1716,7 @@ TEST_F(Test__ModelLoader, LoadIQ2_XSTensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("iq2_xs_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("iq2_xs_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::IQ2_XS);
 }
@@ -1779,7 +1780,7 @@ TEST_F(Test__ModelLoader, LoadIQ4_XSTensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("iq4_xs_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("iq4_xs_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::IQ4_XS);
 }
@@ -1847,7 +1848,7 @@ TEST_F(Test__ModelLoader, LoadQ8_0TensorWithFactory)
 
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("q8_0_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("q8_0_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::Q8_0);
 }
@@ -1915,7 +1916,7 @@ TEST_F(Test__ModelLoader, LoadQ4_0TensorWithFactory)
 
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("q4_0_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("q4_0_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::Q4_0);
 }
@@ -1983,7 +1984,7 @@ TEST_F(Test__ModelLoader, LoadQ4_1TensorWithFactory)
 
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("q4_1_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("q4_1_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::Q4_1);
 }
@@ -2048,7 +2049,7 @@ TEST_F(Test__ModelLoader, LoadIQ3_XXSTensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("iq3_xxs_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("iq3_xxs_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::IQ3_XXS);
 }
@@ -2112,7 +2113,7 @@ TEST_F(Test__ModelLoader, LoadIQ2_STensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("iq2_s_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("iq2_s_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::IQ2_S);
 }
@@ -2176,7 +2177,7 @@ TEST_F(Test__ModelLoader, LoadIQ1_STensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("iq1_s_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("iq1_s_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::IQ1_S);
 }
@@ -2240,7 +2241,7 @@ TEST_F(Test__ModelLoader, LoadIQ1_MTensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("iq1_m_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("iq1_m_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::IQ1_M);
 }
@@ -2304,7 +2305,7 @@ TEST_F(Test__ModelLoader, LoadQ4_KTensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("q4k_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("q4k_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::Q4_K);
 }
@@ -2368,7 +2369,7 @@ TEST_F(Test__ModelLoader, LoadQ8_KTensor)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("q8k_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("q8k_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::Q8_K);
 }
@@ -2435,7 +2436,7 @@ TEST_F(Test__ModelLoader, LoadQ4_KTensorWithFactory)
 
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("q4k_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("q4k_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::Q4_K);
 
@@ -2507,7 +2508,7 @@ TEST_F(Test__ModelLoader, LoadQ8_KTensorWithFactory)
 
     ASSERT_TRUE(loader.loadModel(path));
 
-    auto tensor = loader.loadTensor("q8k_tensor", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("q8k_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::Q8_K);
 }
@@ -2531,7 +2532,7 @@ TEST_F(Test__ModelLoader, PrecisionModeMixed_KeepsWeightsQuantized)
     ASSERT_TRUE(loader.loadModel(path));
 
     // Load attention weight (these are typically quantized, not embeddings)
-    auto tensor = loader.loadTensor("blk.0.attn_q.weight", 0, WeightPrecision::NATIVE);
+    auto tensor = loader.loadTensor("blk.0.attn_q.weight", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
 
     // Should remain in original quantized format (IQ4_NL)
@@ -2553,7 +2554,7 @@ TEST_F(Test__ModelLoader, PrecisionModeINT8_DequantizesWeights)
     ASSERT_TRUE(loader.loadModel(path));
 
     // Load with INT8 precision - should dequantize
-    auto tensor = loader.loadTensor("token_embd.weight", 0, WeightPrecision::CONVERT_TO_INT8);
+    auto tensor = loader.loadTensor("token_embd.weight", DeviceId::cpu(), WeightPrecision::CONVERT_TO_INT8);
     ASSERT_NE(tensor, nullptr);
 
     // Should be dequantized to INT8
@@ -2575,7 +2576,7 @@ TEST_F(Test__ModelLoader, PrecisionModeFP32_Dequantizes)
     ASSERT_TRUE(loader.loadModel(path));
 
     // Load attention weight with FP32 precision - should dequantize to FP32
-    auto tensor = loader.loadTensor("blk.0.attn_q.weight", 0, WeightPrecision::CONVERT_TO_FP32);
+    auto tensor = loader.loadTensor("blk.0.attn_q.weight", DeviceId::cpu(), WeightPrecision::CONVERT_TO_FP32);
     ASSERT_NE(tensor, nullptr);
 
     // Should be dequantized to FP32
@@ -2597,7 +2598,7 @@ TEST_F(Test__ModelLoader, PrecisionMode_FP32Tensors_Unchanged)
     ASSERT_TRUE(loader.loadModel(path));
 
     // Load with INT8 precision mode
-    auto tensor = loader.loadTensor("token_embd.weight", 0, WeightPrecision::CONVERT_TO_INT8);
+    auto tensor = loader.loadTensor("token_embd.weight", DeviceId::cpu(), WeightPrecision::CONVERT_TO_INT8);
     ASSERT_NE(tensor, nullptr);
 
     // FP32 tensors should remain FP32 (not dequantized since already float)
@@ -2619,7 +2620,7 @@ TEST_F(Test__ModelLoader, PrecisionModeINT8_MultipleFormats)
     ASSERT_TRUE(loader.loadModel(path));
 
     // Load Q4_0 tensor with INT8 precision - should dequantize
-    auto tensor = loader.loadTensor("blk.0.attn_q.weight", 0, WeightPrecision::CONVERT_TO_INT8);
+    auto tensor = loader.loadTensor("blk.0.attn_q.weight", DeviceId::cpu(), WeightPrecision::CONVERT_TO_INT8);
     ASSERT_NE(tensor, nullptr);
 
     // Should be dequantized to INT8

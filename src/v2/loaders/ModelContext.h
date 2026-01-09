@@ -13,6 +13,7 @@
 #include "ModelLoader.h"
 #include "WeightManager.h"
 #include "WeightPlacementMap.h"
+#include "../backends/DeviceId.h"
 #include "../utils/MPIContext.h"
 #include "../tensors/Tensors.h"
 #include <memory>
@@ -122,12 +123,12 @@ namespace llaminar2
          * Loads from GGUF with appropriate distribution strategy.
          *
          * @param name GGUF tensor name (e.g., "token_embd.weight", "blk.0.attn_q.weight")
-         * @param device_idx Device to place tensor on (-1 = CPU, ≥0 = GPU)
+         * @param device Device for tensor placement (default: CPU)
          * @return Shared pointer to tensor, or nullptr on error
          */
-        std::shared_ptr<TensorBase> getWeight(const std::string &name, int device_idx = -1)
+        std::shared_ptr<TensorBase> getWeight(const std::string &name, DeviceId device = DeviceId::cpu())
         {
-            return weight_manager_->getWeight(name, device_idx);
+            return weight_manager_->getWeight(name, device);
         }
 
         /**

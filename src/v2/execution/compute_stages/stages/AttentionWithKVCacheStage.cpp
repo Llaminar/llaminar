@@ -154,8 +154,7 @@ namespace llaminar2
         }
 
         // Step 4: Create attention kernel via KernelFactory (device-aware dispatch)
-        const int device_idx = params_.device_idx;
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
         auto attention_kernel = llaminar::v2::kernels::KernelFactory::createAttention(Q_view.get(), dev_type);
 
         if (!attention_kernel)
@@ -197,7 +196,7 @@ namespace llaminar2
             &scores_workspace,
             mask_tensor.get(),
             params_.mpi_ctx.get(),
-            device_idx,
+            params_.device_id.toLegacyIndex(),
             params_.head_start,
             params_.local_n_heads,
             params_.local_n_kv_heads);
@@ -272,8 +271,7 @@ namespace llaminar2
         // Step 4: Create attention kernel via KernelFactory (device-aware dispatch)
         // This uses the typed kernel path (CPUAttentionKernelT) which properly
         // handles decode mode where Q.seq_len != K.seq_len
-        const int device_idx = params_.device_idx;
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
         auto attention_kernel = llaminar::v2::kernels::KernelFactory::createAttention(Q_view.get(), dev_type);
 
         if (!attention_kernel)
@@ -315,7 +313,7 @@ namespace llaminar2
             &scores_workspace,
             &mask_tensor,
             params_.mpi_ctx.get(),
-            device_idx);
+            params_.device_id.toLegacyIndex());
 
         if (!success)
         {
@@ -376,8 +374,7 @@ namespace llaminar2
         }
 
         // Create attention kernel via KernelFactory (device-aware dispatch)
-        const int device_idx = params_.device_idx;
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
         auto attention_kernel = llaminar::v2::kernels::KernelFactory::createAttention(Q_base, dev_type);
 
         if (!attention_kernel)
@@ -438,7 +435,7 @@ namespace llaminar2
             &scores_workspace,
             mask_tensor.get(),
             params_.mpi_ctx.get(),
-            device_idx,
+            params_.device_id.toLegacyIndex(),
             params_.head_start,
             params_.local_n_heads,
             params_.local_n_kv_heads);

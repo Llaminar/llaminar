@@ -120,7 +120,7 @@ namespace llaminar2
             n_v_ = 64; // V output dimension
 
             // Create CPU device context
-            ctx_ = std::make_unique<CPUDeviceContext>(0, 4);
+            ctx_ = std::make_unique<CPUDeviceContext>(DeviceId::cpu(), 4);
             ASSERT_NE(ctx_, nullptr);
 
             // Create random input activations

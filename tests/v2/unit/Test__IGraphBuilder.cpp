@@ -80,9 +80,9 @@ TEST_F(Test__IGraphBuilder, BuildForwardGraph_ReturnsConfiguredMockGraph)
     mock_->setForwardGraphFactory([](const ForwardInput &, ForwardOutput &)
                                   {
         ComputeGraph graph;
-        graph.addNode("embedding", nullptr, 0);
-        graph.addNode("layer0", nullptr, 0);
-        graph.addNode("lm_head", nullptr, 0);
+        graph.addNode("embedding", nullptr, DeviceId::cpu());
+        graph.addNode("layer0", nullptr, DeviceId::cpu());
+        graph.addNode("lm_head", nullptr, DeviceId::cpu());
         graph.addDependency("layer0", "embedding");
         graph.addDependency("lm_head", "layer0");
         return graph; });
@@ -101,7 +101,7 @@ TEST_F(Test__IGraphBuilder, BuildForwardGraph_RecordsInput)
     ForwardInput input;
     input.seq_len = 128;
     input.batch_size = 4;
-    input.device_idx = 1;
+    input.device = DeviceId::cuda(0);
     ForwardOutput output;
 
     mock_->buildForwardGraph(input, output);
@@ -109,7 +109,7 @@ TEST_F(Test__IGraphBuilder, BuildForwardGraph_RecordsInput)
     ASSERT_NE(mock_->lastForwardInput(), nullptr);
     EXPECT_EQ(mock_->lastForwardInput()->seq_len, 128);
     EXPECT_EQ(mock_->lastForwardInput()->batch_size, 4);
-    EXPECT_EQ(mock_->lastForwardInput()->device_idx, 1);
+    EXPECT_EQ(mock_->lastForwardInput()->device, DeviceId::cuda(0));
 }
 
 TEST_F(Test__IGraphBuilder, BuildForwardGraph_RecordsOutput)
@@ -148,7 +148,7 @@ TEST_F(Test__IGraphBuilder, BuildForwardGraph_WithFactory)
         // Create nodes based on input
         for (int i = 0; i < input.seq_len; ++i)
         {
-            graph.addNode("token_" + std::to_string(i), nullptr, 0);
+            graph.addNode("token_" + std::to_string(i), nullptr, DeviceId::cpu());
         }
         return graph; });
 
@@ -183,8 +183,8 @@ TEST_F(Test__IGraphBuilder, BuildLayerGraph_ReturnsConfiguredMockGraph)
     mock_->setLayerGraphFactory([](const LayerContext &)
                                 {
         ComputeGraph graph;
-        graph.addNode("attn", nullptr, 0);
-        graph.addNode("ffn", nullptr, 0);
+        graph.addNode("attn", nullptr, DeviceId::cpu());
+        graph.addNode("ffn", nullptr, DeviceId::cpu());
         graph.addDependency("ffn", "attn");
         return graph; });
 
@@ -202,14 +202,14 @@ TEST_F(Test__IGraphBuilder, BuildLayerGraph_ReturnsPerLayerMockGraph)
     mock_->setLayerGraphFactory(0, [](const LayerContext &)
                                 {
         ComputeGraph graph;
-        graph.addNode("layer0_attn", nullptr, 0);
+        graph.addNode("layer0_attn", nullptr, DeviceId::cpu());
         return graph; });
 
     mock_->setLayerGraphFactory(1, [](const LayerContext &)
                                 {
         ComputeGraph graph;
-        graph.addNode("layer1_attn", nullptr, 0);
-        graph.addNode("layer1_ffn", nullptr, 0);
+        graph.addNode("layer1_attn", nullptr, DeviceId::cpu());
+        graph.addNode("layer1_ffn", nullptr, DeviceId::cpu());
         graph.addDependency("layer1_ffn", "layer1_attn");
         return graph; });
 
@@ -229,13 +229,13 @@ TEST_F(Test__IGraphBuilder, BuildLayerGraph_RecordsContext)
     LayerContext ctx;
     ctx.layer_idx = 7;
     ctx.seq_len = 64;
-    ctx.device_idx = 2;
+    ctx.device = DeviceId::cuda(1);
 
     mock_->buildLayerGraph(ctx);
 
     EXPECT_EQ(mock_->lastLayerContext().layer_idx, 7);
     EXPECT_EQ(mock_->lastLayerContext().seq_len, 64);
-    EXPECT_EQ(mock_->lastLayerContext().device_idx, 2);
+    EXPECT_EQ(mock_->lastLayerContext().device, DeviceId::cuda(1));
 }
 
 TEST_F(Test__IGraphBuilder, BuildLayerGraph_MultipleCallsTracked)
@@ -257,10 +257,10 @@ TEST_F(Test__IGraphBuilder, BuildLayerGraph_WithFactory)
                                 {
         ComputeGraph graph;
         std::string prefix = "layer" + std::to_string(ctx.layer_idx) + "_";
-        graph.addNode(prefix + "attn_norm", nullptr, ctx.device_idx);
-        graph.addNode(prefix + "attn", nullptr, ctx.device_idx);
-        graph.addNode(prefix + "ffn_norm", nullptr, ctx.device_idx);
-        graph.addNode(prefix + "ffn", nullptr, ctx.device_idx);
+        graph.addNode(prefix + "attn_norm", nullptr, ctx.device);
+        graph.addNode(prefix + "attn", nullptr, ctx.device);
+        graph.addNode(prefix + "ffn_norm", nullptr, ctx.device);
+        graph.addNode(prefix + "ffn", nullptr, ctx.device);
         graph.addDependency(prefix + "attn", prefix + "attn_norm");
         graph.addDependency(prefix + "ffn_norm", prefix + "attn");
         graph.addDependency(prefix + "ffn", prefix + "ffn_norm");
@@ -268,7 +268,7 @@ TEST_F(Test__IGraphBuilder, BuildLayerGraph_WithFactory)
 
     LayerContext ctx;
     ctx.layer_idx = 3;
-    ctx.device_idx = 1;
+    ctx.device = DeviceId::cuda(0);
 
     ComputeGraph graph = mock_->buildLayerGraph(ctx);
 
@@ -383,7 +383,7 @@ TEST_F(Test__IGraphBuilder, PolymorphicBuildForwardGraph_WorksCorrectly)
     mock_->setForwardGraphFactory([](const ForwardInput &, ForwardOutput &)
                                   {
         ComputeGraph graph;
-        graph.addNode("test", nullptr, 0);
+        graph.addNode("test", nullptr, DeviceId::cpu());
         return graph; });
 
     ForwardInput input;
@@ -407,7 +407,7 @@ TEST_F(Test__IGraphBuilder, ForwardInput_DefaultValues)
     EXPECT_EQ(input.batch_size, 1);
     EXPECT_EQ(input.seq_len, 0);
     EXPECT_EQ(input.position_offset, 0);
-    EXPECT_EQ(input.device_idx, 0);
+    EXPECT_EQ(input.device, DeviceId::cpu());
     EXPECT_EQ(input.kv_cache, nullptr);
 }
 
@@ -425,7 +425,7 @@ TEST_F(Test__IGraphBuilder, LayerContext_DefaultValues)
 
     EXPECT_EQ(ctx.layer_idx, 0);
     EXPECT_EQ(ctx.seq_len, 0);
-    EXPECT_EQ(ctx.device_idx, 0);
+    EXPECT_EQ(ctx.device, DeviceId::cpu());
     EXPECT_EQ(ctx.position_ids, nullptr);
     EXPECT_EQ(ctx.kv_cache, nullptr);
 }
@@ -440,14 +440,14 @@ TEST_F(Test__IGraphBuilder, BuildLayerGraph_FallbackToDefault)
     mock_->setLayerGraphFactory(0, [](const LayerContext &)
                                 {
         ComputeGraph graph;
-        graph.addNode("specific", nullptr, 0);
+        graph.addNode("specific", nullptr, DeviceId::cpu());
         return graph; });
 
     // Set default layer factory
     mock_->setLayerGraphFactory([](const LayerContext &)
                                 {
         ComputeGraph graph;
-        graph.addNode("default", nullptr, 0);
+        graph.addNode("default", nullptr, DeviceId::cpu());
         return graph; });
 
     // Layer 0 should use specific factory
@@ -471,8 +471,8 @@ TEST_F(Test__IGraphBuilder, MockGraphBuilder_FactoryCalledEachTime)
                                   {
         ++factory_call_count;
         ComputeGraph graph;
-        graph.addNode("node1", nullptr, 0);
-        graph.addNode("node2", nullptr, 0);
+        graph.addNode("node1", nullptr, DeviceId::cpu());
+        graph.addNode("node2", nullptr, DeviceId::cpu());
         graph.addDependency("node2", "node1");
         return graph; });
 

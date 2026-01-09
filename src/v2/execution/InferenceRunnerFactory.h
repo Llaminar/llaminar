@@ -28,6 +28,7 @@
 #include "IInferenceRunner.h"
 #include "../loaders/ModelContext.h"
 #include "RuntimeConfig.h"
+#include "../backends/DeviceId.h"
 #include "../utils/MPIContext.h"
 #include <memory>
 
@@ -68,14 +69,14 @@ namespace llaminar2
      *
      * @param model_ctx Model context with weights
      * @param mpi_ctx MPI context (nullptr for single-rank)
-     * @param device_idx Target device
+     * @param device Target device
      * @param config Runner configuration
      * @return Unique pointer to IInferenceRunner, or nullptr on failure
      */
     std::unique_ptr<IInferenceRunner> createInferenceRunner(
         std::shared_ptr<ModelContext> model_ctx,
         std::shared_ptr<MPIContext> mpi_ctx,
-        int device_idx,
+        DeviceId device,
         const InferenceRunnerConfig &config = {});
 
 } // namespace llaminar2

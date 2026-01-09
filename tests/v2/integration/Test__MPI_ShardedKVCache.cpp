@@ -18,6 +18,7 @@
 #include <vector>
 #include <iostream>
 
+#include "backends/DeviceId.h"
 #include "tensors/CPUKVCache.h"
 #include "tensors/Tensors.h"
 #include "utils/MPIContext.h"
@@ -84,8 +85,7 @@ namespace llaminar2
                 kNumLayers, kBatchSize, kMaxSeqLen,
                 kNKVHeads, local_n_kv_heads_, kv_head_start_,
                 kHeadDim,
-                -1 // CPU device
-            );
+                DeviceId::cpu());
 
             ASSERT_NE(cache, nullptr);
 
@@ -122,7 +122,7 @@ namespace llaminar2
                 kNumLayers, kBatchSize, kMaxSeqLen,
                 kNKVHeads, local_n_kv_heads_, kv_head_start_,
                 kHeadDim,
-                -1);
+                DeviceId::cpu());
 
             ASSERT_NE(cache, nullptr);
 
@@ -162,7 +162,7 @@ namespace llaminar2
                 kNumLayers, kBatchSize, kMaxSeqLen,
                 kNKVHeads, local_n_kv_heads_, kv_head_start_,
                 kHeadDim,
-                -1);
+                DeviceId::cpu());
 
             ASSERT_NE(cache, nullptr);
 
@@ -211,7 +211,7 @@ namespace llaminar2
                 kNumLayers, kBatchSize, kMaxSeqLen,
                 kNKVHeads, local_n_kv_heads_, kv_head_start_,
                 kHeadDim,
-                -1);
+                DeviceId::cpu());
 
             // Add some data
             std::vector<size_t> shape = {2, static_cast<size_t>(local_kv_dim_)};
@@ -254,7 +254,7 @@ namespace llaminar2
                 kNumLayers, kBatchSize, kMaxSeqLen,
                 kNKVHeads, local_n_kv_heads_, kv_head_start_,
                 kHeadDim,
-                -1);
+                DeviceId::cpu());
 
             const ITensor *k = cache->get_k(0, 0);
             EXPECT_EQ(k->numel(), static_cast<size_t>(kMaxSeqLen * local_kv_dim_));
@@ -291,7 +291,7 @@ namespace llaminar2
                     kNumLayers, kBatchSize, kMaxSeqLen,
                     kNKVHeads, local_n_kv_heads_, kv_head_start_,
                     kHeadDim,
-                    -1);
+                    DeviceId::cpu());
 
                 ASSERT_NE(cache, nullptr) << "Failed to create cache with precision "
                                           << static_cast<int>(precision) << " on rank " << rank_;
@@ -315,7 +315,7 @@ namespace llaminar2
                 kNumLayers, kBatchSize, kMaxSeqLen,
                 kNKVHeads, local_n_kv_heads_, kv_head_start_,
                 kHeadDim,
-                -1);
+                DeviceId::cpu());
 
             // Simulate prefill: add 10 tokens to all layers
             int prefill_tokens = 10;

@@ -41,6 +41,7 @@
 #include "../../../../src/v2/execution/InferenceRunnerFactory.h"
 #include "../../../../src/v2/execution/IInferenceRunner.h"
 #include "../../../../src/v2/backends/ComputeBackend.h"
+#include "../../../../src/v2/backends/DeviceId.h"
 #include "../../../../src/v2/utils/MPIContext.h"
 #include "../../../../src/v2/utils/Logger.h"
 #include "../../../../src/v2/kernels/KernelFactory.h"
@@ -109,7 +110,7 @@ protected:
             config.force_graph = true; // Use Graph path
 
             auto &dm = DeviceManager::instance();
-            int cpu_device = dm.cpuDeviceIndex();
+            DeviceId cpu_device = DeviceId::fromLegacyIndex(dm.cpuDeviceIndex());
 
             runner_single_ = createInferenceRunner(model_ctx_single_, nullptr, cpu_device, config);
             if (!runner_single_)
@@ -146,7 +147,7 @@ protected:
         config.force_graph = true; // Use Graph path
 
         auto &dm = DeviceManager::instance();
-        int cpu_device = dm.cpuDeviceIndex();
+        DeviceId cpu_device = DeviceId::fromLegacyIndex(dm.cpuDeviceIndex());
 
         runner_multi_ = createInferenceRunner(model_ctx_multi_, mpi_ctx_, cpu_device, config);
         if (!runner_multi_)
@@ -176,7 +177,7 @@ protected:
         config.force_graph = true;
 
         auto &dm = DeviceManager::instance();
-        int cpu_device = dm.cpuDeviceIndex();
+        DeviceId cpu_device = DeviceId::fromLegacyIndex(dm.cpuDeviceIndex());
 
         return createInferenceRunner(model_ctx, mpi_ctx, cpu_device, config);
     }

@@ -26,7 +26,7 @@ protected:
     {
         // Construct CPUDeviceContext directly (bypasses DeviceManager check)
         // This is the same pattern used in Test__DeviceContext.cpp
-        ctx_ = std::make_unique<CPUDeviceContext>(0, 4);
+        ctx_ = std::make_unique<CPUDeviceContext>(DeviceId::cpu(), 4);
         ASSERT_NE(ctx_, nullptr);
     }
 

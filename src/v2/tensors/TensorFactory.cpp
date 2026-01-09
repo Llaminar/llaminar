@@ -30,7 +30,7 @@ namespace llaminar2
         }
     }
 
-    std::unique_ptr<FP32Tensor> TensorFactory::createFP32(const std::vector<size_t> &shape, int device_idx)
+    std::unique_ptr<FP32Tensor> TensorFactory::createFP32(const std::vector<size_t> &shape, DeviceId device)
     {
         // Ensure we're on the correct NUMA node
         if (numa_node_ >= 0)
@@ -38,7 +38,7 @@ namespace llaminar2
             bindToNumaNode();
         }
 
-        return std::make_unique<FP32Tensor>(shape, device_idx);
+        return std::make_unique<FP32Tensor>(shape, device);
     }
 
     std::unique_ptr<FP16Tensor> TensorFactory::createFP16(const std::vector<size_t> &shape)
@@ -93,7 +93,7 @@ namespace llaminar2
         return std::make_unique<INT32Tensor>(shape);
     }
 
-    std::unique_ptr<Q8_1Tensor> TensorFactory::createQ8_1(const std::vector<size_t> &shape, int device_idx)
+    std::unique_ptr<Q8_1Tensor> TensorFactory::createQ8_1(const std::vector<size_t> &shape, DeviceId device)
     {
         if (numa_node_ >= 0)
         {
@@ -102,7 +102,7 @@ namespace llaminar2
 
         // Use the mutable activation buffer constructor (no raw_data, allocates internally)
         // This creates a Q8_1Tensor that supports mutable_data() and quantize_from_cache()
-        return std::make_unique<Q8_1Tensor>(shape, device_idx);
+        return std::make_unique<Q8_1Tensor>(shape, device.toLegacyIndex());
     }
 
     std::unique_ptr<Q8_1Tensor> TensorFactory::createQ8_1(const std::vector<size_t> &shape,
@@ -117,7 +117,7 @@ namespace llaminar2
     }
 
     std::unique_ptr<Q16_1Tensor> TensorFactory::createQ16_1(const std::vector<size_t> &shape,
-                                                            int device_idx)
+                                                            DeviceId device)
     {
         if (numa_node_ >= 0)
         {
@@ -125,13 +125,13 @@ namespace llaminar2
         }
 
         // Use the mutable activation buffer constructor
-        // Q16_1Tensor(shape, device_idx) creates an empty tensor for residual accumulation
-        return std::make_unique<Q16_1Tensor>(shape, device_idx);
+        // Q16_1Tensor(shape, device) creates an empty tensor for residual accumulation
+        return std::make_unique<Q16_1Tensor>(shape, device.toLegacyIndex());
     }
 
     std::unique_ptr<Q16_1Tensor> TensorFactory::createQ16_1(const std::vector<size_t> &shape,
                                                             Q16BlockSize block_size,
-                                                            int device_idx)
+                                                            DeviceId device)
     {
         if (numa_node_ >= 0)
         {
@@ -139,12 +139,12 @@ namespace llaminar2
         }
 
         // Use the mutable activation buffer constructor with custom block size
-        return std::make_unique<Q16_1Tensor>(shape, block_size, device_idx);
+        return std::make_unique<Q16_1Tensor>(shape, block_size, device.toLegacyIndex());
     }
 
     std::unique_ptr<CPUTensorBase> TensorFactory::createActivation(const std::vector<size_t> &shape,
                                                                    ActivationPrecision precision,
-                                                                   int device_idx)
+                                                                   DeviceId device)
     {
         if (numa_node_ >= 0)
         {
@@ -156,8 +156,8 @@ namespace llaminar2
         switch (precision)
         {
         case ActivationPrecision::FP32:
-            // FP32 createFP32 already accepts device_idx
-            return createFP32(shape, device_idx);
+            // FP32 createFP32 already accepts device
+            return createFP32(shape, device);
 
         case ActivationPrecision::BF16:
             tensor = createBF16(shape);
@@ -173,26 +173,26 @@ namespace llaminar2
 
         case ActivationPrecision::Q16_1:
             // Q16_1: High-precision quantized format for residual stream
-            return createQ16_1(shape, device_idx);
+            return createQ16_1(shape, device);
 
         case ActivationPrecision::HybridQ16:
             // For HybridQ16 mode, createActivation returns Q16_1 for residual buffers
             // Buffer allocation logic in GraphOrchestrator handles specific buffer types
-            return createQ16_1(shape, device_idx);
+            return createQ16_1(shape, device);
 
         default:
             LOG_ERROR("TensorFactory::createActivation: unknown precision, defaulting to FP32");
-            return createFP32(shape, device_idx);
+            return createFP32(shape, device);
         }
 
-        // Set device_idx on the created tensor to ensure consistent device tracking
+        // Set device on the created tensor to ensure consistent device tracking
         // This is critical for pipelines that use placement maps to route tensors
-        // between devices. Without this, Q8_1/BF16/FP16 tensors would have device_idx=-1
+        // between devices. Without this, Q8_1/BF16/FP16 tensors would have device=-1
         // even when they should be associated with device 0 (CPU), causing spurious
         // "device transfer" attempts in prepareActivationForDevice().
-        if (tensor && device_idx >= 0)
+        if (tensor && device.is_valid())
         {
-            tensor->set_device(device_idx);
+            tensor->set_device(device.toLegacyIndex());
         }
 
         return tensor;
@@ -201,7 +201,7 @@ namespace llaminar2
     std::unique_ptr<CPUTensorBase> TensorFactory::createActivation(const std::vector<size_t> &shape,
                                                                    ActivationPrecision precision,
                                                                    int head_dim,
-                                                                   int device_idx)
+                                                                   DeviceId device)
     {
         // For Q16_1 and HybridQ16, use optimal block size based on head_dim
         if (precision == ActivationPrecision::Q16_1 ||
@@ -210,11 +210,11 @@ namespace llaminar2
             Q16BlockSize block_size = optimal_q16_block_size(head_dim);
             LOG_DEBUG("TensorFactory::createActivation: Q16 with head_dim=" << head_dim
                                                                             << " -> block_size=" << static_cast<int>(block_size));
-            return createQ16_1(shape, block_size, device_idx);
+            return createQ16_1(shape, block_size, device);
         }
 
         // All other precisions: delegate to base overload
-        return createActivation(shape, precision, device_idx);
+        return createActivation(shape, precision, device);
     }
 
     std::unique_ptr<CPUTensorBase> TensorFactory::createQuantized(TensorType type,

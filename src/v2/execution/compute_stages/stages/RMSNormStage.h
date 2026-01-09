@@ -6,6 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "backends/DeviceId.h"
 
 namespace llaminar2
 {
@@ -33,7 +34,7 @@ namespace llaminar2
 
             // Optional MPI context for distributed execution
             const MPIContext *mpi_ctx = nullptr;
-            int device_idx = -1;
+            DeviceId device_id = DeviceId::cpu();
 
             // Explicit seq_len override for pre-allocated buffers
             // If 0, derives from input tensor dimensions

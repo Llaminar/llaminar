@@ -938,7 +938,7 @@ namespace llaminar2
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarBool("causal", params_.causal);
         info.addScalarInt("backend", static_cast<int>(params_.backend));
-        info.addScalarInt("device_idx", params_.device_idx);
+        info.addScalarInt("device_id", params_.device_id.toLegacyIndex());
 
         return info;
     }

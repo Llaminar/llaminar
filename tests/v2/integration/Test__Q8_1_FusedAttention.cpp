@@ -1665,10 +1665,10 @@ TEST_F(Test__Q8_1_FusedAttention, JIT_vs_FP32_Strided_Qwen05B_CausalMask)
     // ========================================================================
     // Load embedding and QKV projection weights from layer 0
     // ========================================================================
-    auto embd_weight = model_ctx->getWeight("token_embd.weight", -1);
-    auto wq = model_ctx->getWeight("blk.0.attn_q.weight", -1);
-    auto wk = model_ctx->getWeight("blk.0.attn_k.weight", -1);
-    auto wv = model_ctx->getWeight("blk.0.attn_v.weight", -1);
+    auto embd_weight = model_ctx->getWeight("token_embd.weight");
+    auto wq = model_ctx->getWeight("blk.0.attn_q.weight");
+    auto wk = model_ctx->getWeight("blk.0.attn_k.weight");
+    auto wv = model_ctx->getWeight("blk.0.attn_v.weight");
 
     if (!embd_weight || !wq || !wk || !wv)
     {

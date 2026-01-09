@@ -184,49 +184,49 @@ namespace llaminar2
     std::unique_ptr<ITensorGemm> FP16Tensor::createGemm()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_);
         return llaminar::v2::kernels::KernelFactory::createGemm(this, dev_type);
     }
 
     std::unique_ptr<ITensorRoPE> FP16Tensor::createRoPE()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_);
         return llaminar::v2::kernels::KernelFactory::createRoPE(this, dev_type);
     }
 
     std::unique_ptr<ITensorSwiGLU> FP16Tensor::createSwiGLU()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_);
         return llaminar::v2::kernels::KernelFactory::createSwiGLU(this, dev_type);
     }
 
     std::unique_ptr<ITensorSoftmax> FP16Tensor::createSoftmax()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_);
         return llaminar::v2::kernels::KernelFactory::createSoftmax(this, dev_type);
     }
 
     std::unique_ptr<ITensorRMSNorm> FP16Tensor::createRMSNorm()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_);
         return llaminar::v2::kernels::KernelFactory::createRMSNorm(this, dev_type);
     }
 
     std::unique_ptr<ITensorAttention> FP16Tensor::createAttention()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_);
         return llaminar::v2::kernels::KernelFactory::createAttention(this, dev_type);
     }
 
     std::unique_ptr<ITensorEmbedding> FP16Tensor::createEmbedding()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_);
         return llaminar::v2::kernels::KernelFactory::createEmbedding(this, dev_type);
     }
 

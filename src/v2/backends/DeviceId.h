@@ -14,6 +14,7 @@
 #include <cassert>
 #include <string>
 #include <stdexcept>
+#include <ostream>
 
 namespace llaminar2
 {
@@ -36,11 +37,15 @@ namespace llaminar2
         static DeviceId cuda(int gpu_ordinal) { return {DeviceType::CUDA, gpu_ordinal}; }
         static DeviceId rocm(int gpu_ordinal) { return {DeviceType::ROCm, gpu_ordinal}; }
 
+        /// Invalid/unset device marker (ordinal = -1)
+        static DeviceId invalid() { return {DeviceType::CPU, -1}; }
+
         // Predicates
-        bool is_cpu() const { return type == DeviceType::CPU; }
+        bool is_cpu() const { return type == DeviceType::CPU && ordinal >= 0; }
         bool is_cuda() const { return type == DeviceType::CUDA; }
         bool is_rocm() const { return type == DeviceType::ROCm; }
-        bool is_gpu() const { return type != DeviceType::CPU; }
+        bool is_gpu() const { return type != DeviceType::CPU && ordinal >= 0; }
+        bool is_valid() const { return ordinal >= 0; }
 
         // Get CUDA device ordinal - asserts if not CUDA
         int cuda_ordinal() const
@@ -61,6 +66,23 @@ namespace llaminar2
         {
             assert(is_gpu() && "gpu_ordinal() called on CPU device");
             return ordinal;
+        }
+
+        /**
+         * @brief Get device index for kernel API calls
+         *
+         * Returns the appropriate device index for CUDA/ROCm API calls:
+         * - CPU: returns -1 (convention for CPU execution)
+         * - CUDA/ROCm: returns the 0-based GPU ordinal
+         *
+         * This differs from toLegacyIndex() which uses 1-based GPU indexing
+         * for DeviceManager compatibility.
+         */
+        int toKernelDeviceIndex() const
+        {
+            if (is_cpu())
+                return -1;
+            return ordinal; // Direct GPU ordinal for cudaSetDevice/hipSetDevice
         }
 
         // String representation for logging
@@ -122,6 +144,37 @@ namespace llaminar2
             // GPU: legacy index = ordinal + 1 (GPU:0=1, GPU:1=2, etc.)
             return ordinal + 1;
         }
+
+        // =========================================================================
+        // String Conversion (for logging)
+        // =========================================================================
+
+        /**
+         * @brief Get string representation of the device
+         * @return String like "CPU", "CUDA:0", "ROCm:1", etc.
+         */
+        std::string toString() const
+        {
+            switch (type)
+            {
+            case DeviceType::CPU:
+                return "CPU";
+            case DeviceType::CUDA:
+                return "CUDA:" + std::to_string(ordinal);
+            case DeviceType::ROCm:
+                return "ROCm:" + std::to_string(ordinal);
+            default:
+                return "Unknown";
+            }
+        }
     };
+
+    /**
+     * @brief Stream output operator for DeviceId (enables LOG_* macros)
+     */
+    inline std::ostream &operator<<(std::ostream &os, const DeviceId &device)
+    {
+        return os << device.toString();
+    }
 
 } // namespace llaminar2

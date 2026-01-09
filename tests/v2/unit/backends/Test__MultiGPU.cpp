@@ -16,6 +16,7 @@
 #include "backends/ComputeBackend.h"
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
+#include "backends/DeviceId.h"
 #include "tensors/Tensors.h"
 #include "kernels/KernelFactory.h"
 #include "utils/Logger.h"
@@ -237,13 +238,44 @@ protected:
         return -1;
     }
 
+    // Convert legacy DeviceManager index to DeviceId
+    DeviceId legacyToDeviceId(int legacy_idx) const
+    {
+        if (legacy_idx < 0 || static_cast<size_t>(legacy_idx) >= devices_.size())
+        {
+            return DeviceId::cpu();
+        }
+        const auto &dev = devices_[legacy_idx];
+        if (dev.type == ComputeBackendType::GPU_CUDA)
+        {
+            int cuda_ordinal = 0;
+            for (int i = 1; i < legacy_idx; ++i)
+            {
+                if (devices_[i].type == ComputeBackendType::GPU_CUDA)
+                    ++cuda_ordinal;
+            }
+            return DeviceId::cuda(cuda_ordinal);
+        }
+        else if (dev.type == ComputeBackendType::GPU_ROCM)
+        {
+            int rocm_ordinal = 0;
+            for (int i = 1; i < legacy_idx; ++i)
+            {
+                if (devices_[i].type == ComputeBackendType::GPU_ROCM)
+                    ++rocm_ordinal;
+            }
+            return DeviceId::rocm(rocm_ordinal);
+        }
+        return DeviceId::cpu();
+    }
+
     std::vector<ComputeDevice> devices_;
 };
 
 /**
- * @test FP32Tensor ensureOnDevice with CPU target (no-op)
+ * @test FP32Tensor ensureOnDevice with CPU target (should fail, ensureOnDevice is for GPU)
  */
-TEST_F(Test__MultiGPU_TensorTransfer, FP32_EnsureOnCPU_NoOp)
+TEST_F(Test__MultiGPU_TensorTransfer, FP32_EnsureOnCPU_Fails)
 {
     std::vector<size_t> shape = {8, 16};
     auto tensor = std::make_unique<FP32Tensor>(shape, -1); // CPU tensor
@@ -255,9 +287,10 @@ TEST_F(Test__MultiGPU_TensorTransfer, FP32_EnsureOnCPU_NoOp)
         data[i] = static_cast<float>(i);
     }
 
-    // ensureOnDevice with device < 0 should fail (invalid device)
-    bool success = tensor->ensureOnDevice(-1);
-    EXPECT_FALSE(success) << "ensureOnDevice(-1) should fail for invalid device index";
+    // ensureOnDevice with CPU DeviceId should fail (ensureOnDevice is for GPU targets)
+    DeviceId cpu_device = DeviceId::cpu();
+    bool success = tensor->ensureOnDevice(cpu_device);
+    EXPECT_FALSE(success) << "ensureOnDevice(DeviceId::cpu()) should fail - use ensureOnHost() for CPU";
 
     // Data should still be accessible
     EXPECT_FLOAT_EQ(tensor->data()[0], 0.0f);
@@ -275,6 +308,8 @@ TEST_F(Test__MultiGPU_TensorTransfer, FP32_EnsureOnGPU)
         GTEST_SKIP() << "No GPU available for testing";
     }
 
+    DeviceId gpu_device = legacyToDeviceId(gpu_idx);
+
     std::vector<size_t> shape = {8, 16};
     auto tensor = std::make_unique<FP32Tensor>(shape, -1); // Start on CPU
 
@@ -286,8 +321,8 @@ TEST_F(Test__MultiGPU_TensorTransfer, FP32_EnsureOnGPU)
     }
 
     // Transfer to GPU
-    bool success = tensor->ensureOnDevice(gpu_idx);
-    EXPECT_TRUE(success) << "ensureOnDevice should succeed for GPU " << gpu_idx;
+    bool success = tensor->ensureOnDevice(gpu_device);
+    EXPECT_TRUE(success) << "ensureOnDevice should succeed for GPU " << gpu_device.toString();
     EXPECT_TRUE(tensor->isOnGPU()) << "Tensor should be on GPU after transfer";
     EXPECT_TRUE(tensor->is_on_device(gpu_idx))
         << "is_on_device(gpu_idx) should return true after transfer to that GPU";
@@ -305,6 +340,8 @@ TEST_F(Test__MultiGPU_TensorTransfer, FP32_RoundTrip)
         GTEST_SKIP() << "No GPU available for testing";
     }
 
+    DeviceId gpu_device = legacyToDeviceId(gpu_idx);
+
     std::vector<size_t> shape = {32, 64}; // Larger tensor
     auto tensor = std::make_unique<FP32Tensor>(shape, -1);
 
@@ -320,7 +357,7 @@ TEST_F(Test__MultiGPU_TensorTransfer, FP32_RoundTrip)
     std::memcpy(original.data(), data, 32 * 64 * sizeof(float));
 
     // Transfer to GPU
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device));
     EXPECT_TRUE(tensor->isOnGPU());
 
     // Transfer back to host (host should already be valid since we did dual-residency upload)
@@ -347,6 +384,8 @@ TEST_F(Test__MultiGPU_TensorTransfer, FP32_ReleaseDeviceMemory)
         GTEST_SKIP() << "No GPU available for testing";
     }
 
+    DeviceId gpu_device = legacyToDeviceId(gpu_idx);
+
     std::vector<size_t> shape = {8, 16};
     auto tensor = std::make_unique<FP32Tensor>(shape, -1);
 
@@ -358,7 +397,7 @@ TEST_F(Test__MultiGPU_TensorTransfer, FP32_ReleaseDeviceMemory)
     }
 
     // Transfer to GPU
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device));
     EXPECT_TRUE(tensor->isOnGPU());
 
     // Release device memory
@@ -398,6 +437,35 @@ protected:
             }
         }
         return -1;
+    }
+
+    DeviceId legacyToDeviceId(int legacy_idx) const
+    {
+        // Convert legacy DeviceManager index to DeviceId
+        // Legacy index: CPU = 0, GPUs = 1, 2, 3...
+        // DeviceId: DeviceId::cpu() or DeviceId::cuda(ordinal)
+        int ordinal = 0;
+        for (size_t i = 0; i < devices_.size(); ++i)
+        {
+            if (static_cast<int>(i) == legacy_idx)
+            {
+                if (devices_[i].type == ComputeBackendType::GPU_CUDA)
+                {
+                    return DeviceId::cuda(ordinal);
+                }
+                else if (devices_[i].type == ComputeBackendType::GPU_ROCM)
+                {
+                    return DeviceId::rocm(ordinal);
+                }
+                return DeviceId::cpu();
+            }
+            if (devices_[i].type == ComputeBackendType::GPU_CUDA ||
+                devices_[i].type == ComputeBackendType::GPU_ROCM)
+            {
+                ordinal++;
+            }
+        }
+        return DeviceId::cpu();
     }
 
     std::vector<ComputeDevice> devices_;
@@ -440,6 +508,8 @@ TEST_F(Test__MultiGPU_Q4_0Transfer, EnsureOnGPU)
         GTEST_SKIP() << "No GPU available for testing";
     }
 
+    DeviceId gpu_device = legacyToDeviceId(gpu_idx);
+
     // Create Q4_0 tensor
     std::vector<size_t> shape = {32, 64};
     size_t blocks_per_row = (shape[1] + Q4_0Block::BLOCK_SIZE - 1) / Q4_0Block::BLOCK_SIZE;
@@ -460,7 +530,7 @@ TEST_F(Test__MultiGPU_Q4_0Transfer, EnsureOnGPU)
     auto tensor = std::make_unique<Q4_0Tensor>(shape, std::move(raw_data));
 
     // Transfer to GPU
-    bool success = tensor->ensureOnDevice(gpu_idx);
+    bool success = tensor->ensureOnDevice(gpu_device);
     EXPECT_TRUE(success) << "Q4_0 tensor should transfer to GPU";
     EXPECT_TRUE(tensor->isOnGPU()) << "Tensor should be on GPU after transfer";
     EXPECT_TRUE(tensor->is_on_device(gpu_idx))
@@ -577,16 +647,28 @@ protected:
         // DeviceManager initializes lazily on first access
         devices_ = DeviceManager::instance().devices();
 
-        // Find CUDA and ROCm devices
+        // Find CUDA and ROCm devices and compute their ordinals
+        int cuda_ordinal = 0;
+        int rocm_ordinal = 0;
         for (size_t i = 0; i < devices_.size(); ++i)
         {
-            if (devices_[i].type == ComputeBackendType::GPU_CUDA && cuda_idx_ < 0)
+            if (devices_[i].type == ComputeBackendType::GPU_CUDA)
             {
-                cuda_idx_ = static_cast<int>(i);
+                if (cuda_idx_ < 0)
+                {
+                    cuda_idx_ = static_cast<int>(i);
+                    cuda_device_ = DeviceId::cuda(cuda_ordinal);
+                }
+                cuda_ordinal++;
             }
-            else if (devices_[i].type == ComputeBackendType::GPU_ROCM && rocm_idx_ < 0)
+            else if (devices_[i].type == ComputeBackendType::GPU_ROCM)
             {
-                rocm_idx_ = static_cast<int>(i);
+                if (rocm_idx_ < 0)
+                {
+                    rocm_idx_ = static_cast<int>(i);
+                    rocm_device_ = DeviceId::rocm(rocm_ordinal);
+                }
+                rocm_ordinal++;
             }
         }
     }
@@ -594,6 +676,8 @@ protected:
     std::vector<ComputeDevice> devices_;
     int cuda_idx_ = -1;
     int rocm_idx_ = -1;
+    DeviceId cuda_device_ = DeviceId::cpu();
+    DeviceId rocm_device_ = DeviceId::cpu();
 };
 
 /**
@@ -621,12 +705,12 @@ TEST_F(Test__MultiGPU_HeterogeneousBackends, CrossBackendTransfer)
     std::vector<float> original(data, data + 16 * 32);
 
     // Transfer to CUDA
-    ASSERT_TRUE(tensor->ensureOnDevice(cuda_idx_));
+    ASSERT_TRUE(tensor->ensureOnDevice(cuda_device_));
     EXPECT_TRUE(tensor->isOnGPU()) << "Should be on CUDA GPU";
     EXPECT_TRUE(tensor->is_on_device(cuda_idx_)) << "Should report on CUDA device";
 
     // Transfer from CUDA to ROCm (will go via host since cross-backend)
-    ASSERT_TRUE(tensor->ensureOnDevice(rocm_idx_));
+    ASSERT_TRUE(tensor->ensureOnDevice(rocm_device_));
     EXPECT_TRUE(tensor->isOnGPU()) << "Should be on ROCm GPU";
     EXPECT_TRUE(tensor->is_on_device(rocm_idx_)) << "Should report on ROCm device";
 

@@ -31,6 +31,7 @@
 #include "../../execution/IGraphBuilder.h"
 #include "../../execution/RuntimeConfig.h"
 #include "../../execution/GraphResolver.h"
+#include "../../backends/DeviceId.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../tensors/CPUKVCache.h"
@@ -114,7 +115,7 @@ namespace llaminar2
         float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must cover Q projection max (~130)
 
         // Execution settings
-        int default_device = 0;
+        DeviceId default_device = DeviceId::cpu(); ///< Default device for execution
         bool enable_profiling = false;
         bool enable_validation = false;
 
@@ -298,13 +299,13 @@ namespace llaminar2
      */
     struct Qwen2ForwardInput
     {
-        const int *token_ids = nullptr;      ///< Token IDs [batch_size * seq_len]
-        const int *position_ids = nullptr;   ///< Position IDs [batch_size * seq_len] (required)
-        int batch_size = 1;                  ///< Number of sequences
-        int seq_len = 0;                     ///< Sequence length
-        int position_offset = 0;             ///< KV cache position offset (legacy, used if position_ids == nullptr)
-        int device_idx = 0;                  ///< Target device
-        ICPUKVCache *kv_cache = nullptr; ///< KV cache for attention (optional)
+        const int *token_ids = nullptr;    ///< Token IDs [batch_size * seq_len]
+        const int *position_ids = nullptr; ///< Position IDs [batch_size * seq_len] (required)
+        int batch_size = 1;                ///< Number of sequences
+        int seq_len = 0;                   ///< Sequence length
+        int position_offset = 0;           ///< KV cache position offset (legacy, used if position_ids == nullptr)
+        DeviceId device = DeviceId::cpu(); ///< Target device
+        ICPUKVCache *kv_cache = nullptr;   ///< KV cache for attention (optional)
 
         /// Sequence lengths for variable-length batching (nullptr = all equal to seq_len)
         /// When set, this enables proper batch-separating attention masks that
@@ -536,7 +537,7 @@ namespace llaminar2
             TensorBase *input_hidden,
             ICPUKVCache *kv_cache,
             const int *position_ids,
-            int device_idx);
+            DeviceId device);
 
         /**
          * @brief Build single transformer layer graph
@@ -546,7 +547,7 @@ namespace llaminar2
             TensorBase *input_hidden,
             ICPUKVCache *kv_cache,
             const int *position_ids,
-            int device_idx);
+            DeviceId device);
 
         /**
          * @brief Build LM head projection graph
@@ -564,7 +565,7 @@ namespace llaminar2
             TensorBase *hidden_states,
             TensorBase *output_logits,
             int total_tokens,
-            int device_idx,
+            DeviceId device,
             TensorBase *logits_local = nullptr);
 
         // =====================================================================
@@ -584,7 +585,7 @@ namespace llaminar2
             int batch_size,
             ICPUKVCache *kv_cache,
             const int *position_ids,
-            int device_idx,
+            DeviceId device,
             const std::vector<int> *sequence_lengths = nullptr);
 
         /**
@@ -596,7 +597,7 @@ namespace llaminar2
             int layer_idx,
             int seq_len,
             int batch_size,
-            int device_idx);
+            DeviceId device);
 
     private:
         // =====================================================================
@@ -636,7 +637,7 @@ namespace llaminar2
             TensorBase *normalized_out,
             const std::string &prev_node,
             int seq_len,
-            int device_idx);
+            DeviceId device);
     };
 
 } // namespace llaminar2

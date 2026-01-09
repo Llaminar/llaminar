@@ -534,7 +534,10 @@ namespace llaminar2
                     return false;
                 }
 
-                return multiply_q8_to_fp32(d_A_q8, d_C, m, n, k, alpha, beta);
+                bool success = multiply_q8_to_fp32(d_A_q8, d_C, m, n, k, alpha, beta);
+                if (success)
+                    C->mark_device_dirty();
+                return success;
             }
             else if (a_type == TensorType::FP32 && c_type == TensorType::FP32)
             {
@@ -548,7 +551,10 @@ namespace llaminar2
                     return false;
                 }
 
-                return multiply_fp32_to_fp32(d_A, d_C, m, n, k, alpha, beta);
+                bool success = multiply_fp32_to_fp32(d_A, d_C, m, n, k, alpha, beta);
+                if (success)
+                    C->mark_device_dirty();
+                return success;
             }
             else if (a_type == TensorType::Q8_1 && c_type == TensorType::Q8_1)
             {
@@ -564,7 +570,10 @@ namespace llaminar2
                 const Q8_1Block *d_A_q8 = static_cast<const Q8_1Block *>(q8_A->gpu_data_ptr());
                 Q8_1Block *d_C_q8 = static_cast<Q8_1Block *>(q8_C->gpu_data_ptr());
 
-                return multiply_q8_to_q8(d_A_q8, d_C_q8, m, n, k);
+                bool success = multiply_q8_to_q8(d_A_q8, d_C_q8, m, n, k);
+                if (success)
+                    C->mark_device_dirty();
+                return success;
             }
             else if (a_type == TensorType::FP32 && c_type == TensorType::Q8_1)
             {
@@ -579,7 +588,10 @@ namespace llaminar2
 
                 Q8_1Block *d_C_q8 = static_cast<Q8_1Block *>(q8_C->gpu_data_ptr());
 
-                return multiply_fp32_to_q8(d_A, d_C_q8, m, n, k);
+                bool success = multiply_fp32_to_q8(d_A, d_C_q8, m, n, k);
+                if (success)
+                    C->mark_device_dirty();
+                return success;
             }
             else
             {

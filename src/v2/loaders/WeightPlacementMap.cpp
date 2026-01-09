@@ -13,10 +13,10 @@
 namespace llaminar2
 {
 
-    WeightPlacementMap::WeightPlacementMap(int default_device_idx)
-        : default_device_idx_(default_device_idx) {}
+    WeightPlacementMap::WeightPlacementMap(DeviceId default_device)
+        : default_device_(default_device) {}
 
-    int WeightPlacementMap::getDeviceForWeight(const std::string &tensor_name, int layer_idx) const
+    DeviceId WeightPlacementMap::getDeviceForWeight(const std::string &tensor_name, int layer_idx) const
     {
         // Priority 1: Exact tensor name match
         auto tensor_it = tensor_to_device_.find(tensor_name);
@@ -42,43 +42,43 @@ namespace llaminar2
         }
 
         // Priority 3: Pattern-based match
-        for (const auto &[pattern, device_idx] : pattern_to_device_)
+        for (const auto &[pattern, device] : pattern_to_device_)
         {
             if (matchesPattern(tensor_name, pattern))
             {
-                return device_idx;
+                return device;
             }
         }
 
         // Priority 4: Default device
-        return default_device_idx_;
+        return default_device_;
     }
 
-    void WeightPlacementMap::setTensorDevice(const std::string &tensor_name, int device_idx)
+    void WeightPlacementMap::setTensorDevice(const std::string &tensor_name, DeviceId device)
     {
-        tensor_to_device_[tensor_name] = device_idx;
+        tensor_to_device_[tensor_name] = device;
     }
 
-    void WeightPlacementMap::setLayerDevice(int layer_idx, int device_idx)
+    void WeightPlacementMap::setLayerDevice(int layer_idx, DeviceId device)
     {
         if (layer_idx >= static_cast<int>(layer_to_device_.size()))
         {
-            layer_to_device_.resize(layer_idx + 1, default_device_idx_);
+            layer_to_device_.resize(layer_idx + 1, default_device_);
         }
-        layer_to_device_[layer_idx] = device_idx;
+        layer_to_device_[layer_idx] = device;
     }
 
-    void WeightPlacementMap::setLayerRange(int start_layer, int end_layer, int device_idx)
+    void WeightPlacementMap::setLayerRange(int start_layer, int end_layer, DeviceId device)
     {
         for (int layer = start_layer; layer <= end_layer; ++layer)
         {
-            setLayerDevice(layer, device_idx);
+            setLayerDevice(layer, device);
         }
     }
 
-    void WeightPlacementMap::setPatternDevice(const std::string &pattern, int device_idx)
+    void WeightPlacementMap::setPatternDevice(const std::string &pattern, DeviceId device)
     {
-        pattern_to_device_[pattern] = device_idx;
+        pattern_to_device_[pattern] = device;
     }
 
     void WeightPlacementMap::clear()
@@ -92,34 +92,34 @@ namespace llaminar2
 
     // ========== Block-Level Convenience Methods (Phase 2) ==========
 
-    void WeightPlacementMap::setAttentionDevice(int layer_idx, int device_idx)
+    void WeightPlacementMap::setAttentionDevice(int layer_idx, DeviceId device)
     {
         // Set all attention tensors for this layer
         std::string base = "blk." + std::to_string(layer_idx) + ".";
-        setTensorDevice(base + "attn_q.weight", device_idx);
-        setTensorDevice(base + "attn_k.weight", device_idx);
-        setTensorDevice(base + "attn_v.weight", device_idx);
-        setTensorDevice(base + "attn_output.weight", device_idx);
-        setTensorDevice(base + "attn_norm.weight", device_idx);
+        setTensorDevice(base + "attn_q.weight", device);
+        setTensorDevice(base + "attn_k.weight", device);
+        setTensorDevice(base + "attn_v.weight", device);
+        setTensorDevice(base + "attn_output.weight", device);
+        setTensorDevice(base + "attn_norm.weight", device);
     }
 
-    int WeightPlacementMap::getAttentionDevice(int layer_idx) const
+    DeviceId WeightPlacementMap::getAttentionDevice(int layer_idx) const
     {
         std::string attn_q_name = "blk." + std::to_string(layer_idx) + ".attn_q.weight";
         return getDeviceForWeight(attn_q_name, layer_idx);
     }
 
-    void WeightPlacementMap::setFFNDevice(int layer_idx, int device_idx)
+    void WeightPlacementMap::setFFNDevice(int layer_idx, DeviceId device)
     {
         // Set all FFN tensors for this layer
         std::string base = "blk." + std::to_string(layer_idx) + ".";
-        setTensorDevice(base + "ffn_gate.weight", device_idx);
-        setTensorDevice(base + "ffn_up.weight", device_idx);
-        setTensorDevice(base + "ffn_down.weight", device_idx);
-        setTensorDevice(base + "ffn_norm.weight", device_idx);
+        setTensorDevice(base + "ffn_gate.weight", device);
+        setTensorDevice(base + "ffn_up.weight", device);
+        setTensorDevice(base + "ffn_down.weight", device);
+        setTensorDevice(base + "ffn_norm.weight", device);
     }
 
-    int WeightPlacementMap::getFFNDevice(int layer_idx) const
+    DeviceId WeightPlacementMap::getFFNDevice(int layer_idx) const
     {
         std::string ffn_gate_name = "blk." + std::to_string(layer_idx) + ".ffn_gate.weight";
         return getDeviceForWeight(ffn_gate_name, layer_idx);
@@ -127,36 +127,36 @@ namespace llaminar2
 
     // ========== MoE-Specific Methods (Phase 2) ==========
 
-    void WeightPlacementMap::setSharedExpertDevice(int expert_idx, int device_idx)
+    void WeightPlacementMap::setSharedExpertDevice(int expert_idx, DeviceId device)
     {
-        shared_expert_to_device_[expert_idx] = device_idx;
+        shared_expert_to_device_[expert_idx] = device;
 
         // Also set pattern for all tensors matching this expert
         std::string pattern = "shared_expert." + std::to_string(expert_idx) + ".*";
-        setPatternDevice(pattern, device_idx);
+        setPatternDevice(pattern, device);
     }
 
-    int WeightPlacementMap::getSharedExpertDevice(int expert_idx) const
+    DeviceId WeightPlacementMap::getSharedExpertDevice(int expert_idx) const
     {
         auto it = shared_expert_to_device_.find(expert_idx);
-        return (it != shared_expert_to_device_.end()) ? it->second : default_device_idx_;
+        return (it != shared_expert_to_device_.end()) ? it->second : default_device_;
     }
 
-    void WeightPlacementMap::setLocalExpertDevice(int layer_idx, int expert_idx, int device_idx)
+    void WeightPlacementMap::setLocalExpertDevice(int layer_idx, int expert_idx, DeviceId device)
     {
         std::string key = "layer_" + std::to_string(layer_idx) + ":expert_" + std::to_string(expert_idx);
-        local_expert_to_device_[key] = device_idx;
+        local_expert_to_device_[key] = device;
 
         // Also set pattern for all tensors matching this expert
         std::string pattern = "blk." + std::to_string(layer_idx) + ".expert." + std::to_string(expert_idx) + ".*";
-        setPatternDevice(pattern, device_idx);
+        setPatternDevice(pattern, device);
     }
 
-    int WeightPlacementMap::getLocalExpertDevice(int layer_idx, int expert_idx) const
+    DeviceId WeightPlacementMap::getLocalExpertDevice(int layer_idx, int expert_idx) const
     {
         std::string key = "layer_" + std::to_string(layer_idx) + ":expert_" + std::to_string(expert_idx);
         auto it = local_expert_to_device_.find(key);
-        return (it != local_expert_to_device_.end()) ? it->second : default_device_idx_;
+        return (it != local_expert_to_device_.end()) ? it->second : default_device_;
     }
 
     int WeightPlacementMap::extractLayerIndex(const std::string &tensor_name) const
@@ -228,6 +228,16 @@ namespace llaminar2
 
     // ========== PlacementPlan Integration ==========
 
+    namespace
+    {
+        // Helper to convert PlacementDevice enum to DeviceId
+        DeviceId toDeviceId(PlacementDevice device)
+        {
+            int legacy_idx = toDeviceIndex(device);
+            return DeviceId::fromLegacyIndex(legacy_idx);
+        }
+    } // anonymous namespace
+
     void WeightPlacementMap::applyPlan(const PlacementPlan &plan)
     {
         // Clear existing mappings
@@ -239,20 +249,17 @@ namespace llaminar2
 
         // Apply global tensor placements
         // Embedding tensor
-        int embed_device = toDeviceIndex(plan.global.embedding_device);
-        setPatternDevice("token_embd*", embed_device);
-        setPatternDevice("embed*", embed_device);
+        setPatternDevice("token_embd*", toDeviceId(plan.global.embedding_device));
+        setPatternDevice("embed*", toDeviceId(plan.global.embedding_device));
 
         // LM head tensor
-        int lm_head_device = toDeviceIndex(plan.global.lm_head_device);
-        setPatternDevice("output*", lm_head_device);
-        setPatternDevice("lm_head*", lm_head_device);
+        setPatternDevice("output*", toDeviceId(plan.global.lm_head_device));
+        setPatternDevice("lm_head*", toDeviceId(plan.global.lm_head_device));
 
         // Final norm
-        int final_norm_device = toDeviceIndex(plan.global.final_norm_device);
-        setPatternDevice("output_norm*", final_norm_device);
-        setPatternDevice("final_norm*", final_norm_device);
-        setPatternDevice("norm*", final_norm_device); // Some models use just "norm"
+        setPatternDevice("output_norm*", toDeviceId(plan.global.final_norm_device));
+        setPatternDevice("final_norm*", toDeviceId(plan.global.final_norm_device));
+        setPatternDevice("norm*", toDeviceId(plan.global.final_norm_device)); // Some models use just "norm"
 
         // Apply per-layer placements
         for (const auto &layer : plan.layers)
@@ -266,14 +273,13 @@ namespace llaminar2
             if (layer.split_attention_ffn)
             {
                 // Separate devices for attention and FFN
-                setAttentionDevice(layer_idx, layer.getAttentionDeviceIdx());
-                setFFNDevice(layer_idx, layer.getFFNDeviceIdx());
+                setAttentionDevice(layer_idx, DeviceId::fromLegacyIndex(layer.getAttentionDeviceIdx()));
+                setFFNDevice(layer_idx, DeviceId::fromLegacyIndex(layer.getFFNDeviceIdx()));
             }
             else
             {
                 // Same device for entire layer
-                int device = toDeviceIndex(layer.device);
-                setLayerDevice(layer_idx, device);
+                setLayerDevice(layer_idx, toDeviceId(layer.device));
             }
         }
     }

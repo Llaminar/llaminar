@@ -12,6 +12,7 @@
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/BlockStructures.h"
 #include "v2/utils/MPIContext.h"
+#include "v2/backends/DeviceId.h"
 
 using namespace llaminar2;
 
@@ -35,7 +36,7 @@ protected:
 TEST_F(Test__TensorFactory_Q16BlockSize, DefaultBlockSizeIs32)
 {
     // Default createQ16_1 should create BLOCK_32 tensor
-    auto tensor = factory_->createQ16_1({4, 128}, -1);
+    auto tensor = factory_->createQ16_1({4, 128}, DeviceId::cpu());
 
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->block_size(), 32);
@@ -48,7 +49,7 @@ TEST_F(Test__TensorFactory_Q16BlockSize, DefaultBlockSizeIs32)
 
 TEST_F(Test__TensorFactory_Q16BlockSize, CreateBlock64)
 {
-    auto tensor = factory_->createQ16_1({4, 64}, Q16BlockSize::BLOCK_64, -1);
+    auto tensor = factory_->createQ16_1({4, 64}, Q16BlockSize::BLOCK_64, DeviceId::cpu());
 
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->block_size(), 64);
@@ -58,7 +59,7 @@ TEST_F(Test__TensorFactory_Q16BlockSize, CreateBlock64)
 
 TEST_F(Test__TensorFactory_Q16BlockSize, CreateBlock128)
 {
-    auto tensor = factory_->createQ16_1({4, 128}, Q16BlockSize::BLOCK_128, -1);
+    auto tensor = factory_->createQ16_1({4, 128}, Q16BlockSize::BLOCK_128, DeviceId::cpu());
 
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->block_size(), 128);
@@ -72,10 +73,10 @@ TEST_F(Test__TensorFactory_Q16BlockSize, CreateBlock128)
 
 TEST_F(Test__TensorFactory_Q16BlockSize, BlockSizeOverloadRespectsDeviceIdx)
 {
-    auto tensor = factory_->createQ16_1({4, 128}, Q16BlockSize::BLOCK_128, 0);
+    auto tensor = factory_->createQ16_1({4, 128}, Q16BlockSize::BLOCK_128, DeviceId::cpu());
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_TRUE(tensor->is_on_cpu()) << "Tensor should be on CPU with device_idx=0";
+    EXPECT_TRUE(tensor->is_on_cpu()) << "Tensor should be on CPU with DeviceId::cpu()";
     EXPECT_EQ(tensor->block_size(), 128);
 }
 
@@ -98,7 +99,7 @@ TEST_F(Test__TensorFactory_Q16BlockSize, MemorySizesCorrect)
 
     // BLOCK_64: 136 bytes per block, 1 block per row for 64-elem rows
     {
-        auto tensor = factory_->createQ16_1({rows, 64}, Q16BlockSize::BLOCK_64, -1);
+        auto tensor = factory_->createQ16_1({rows, 64}, Q16BlockSize::BLOCK_64, DeviceId::cpu());
         ASSERT_NE(tensor, nullptr);
         EXPECT_EQ(tensor->size_bytes(), rows * 1 * sizeof(Q16_1Block_64));
         EXPECT_EQ(tensor->size_bytes(), rows * 136);
@@ -106,7 +107,7 @@ TEST_F(Test__TensorFactory_Q16BlockSize, MemorySizesCorrect)
 
     // BLOCK_128: 264 bytes per block, 1 block per row for 128-elem rows
     {
-        auto tensor = factory_->createQ16_1({rows, 128}, Q16BlockSize::BLOCK_128, -1);
+        auto tensor = factory_->createQ16_1({rows, 128}, Q16BlockSize::BLOCK_128, DeviceId::cpu());
         ASSERT_NE(tensor, nullptr);
         EXPECT_EQ(tensor->size_bytes(), rows * 1 * sizeof(Q16_1Block_128));
         EXPECT_EQ(tensor->size_bytes(), rows * 264);
@@ -127,7 +128,7 @@ TEST_F(Test__TensorFactory_Q16BlockSize, Qwen2_05B_HeadDim64)
     auto tensor = factory_->createQ16_1(
         {batch_size * n_heads, head_dim},
         Q16BlockSize::BLOCK_64,
-        -1);
+        DeviceId::cpu());
 
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->block_size(), 64);
@@ -145,7 +146,7 @@ TEST_F(Test__TensorFactory_Q16BlockSize, Llama3_HeadDim128)
     auto tensor = factory_->createQ16_1(
         {batch_size * n_heads, head_dim},
         Q16BlockSize::BLOCK_128,
-        -1);
+        DeviceId::cpu());
 
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->block_size(), 128);
@@ -167,7 +168,7 @@ TEST_F(Test__TensorFactory_Q16BlockSize, MultipleBlocksPerRow)
 
     // 256 elements with BLOCK_128 = 2 blocks per row
     {
-        auto tensor = factory_->createQ16_1({rows, 256}, Q16BlockSize::BLOCK_128, -1);
+        auto tensor = factory_->createQ16_1({rows, 256}, Q16BlockSize::BLOCK_128, DeviceId::cpu());
         ASSERT_NE(tensor, nullptr);
         EXPECT_EQ(tensor->blocks_per_row(), 2);
         EXPECT_EQ(tensor->total_blocks(), rows * 2);

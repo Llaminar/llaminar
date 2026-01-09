@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include "../mocks/MockComputeStage.h"
+#include "backends/DeviceId.h"
 #include "execution/ILayerExecutor.h"
 #include "execution/LayerExecutor.h"
 #include "execution/compute_stages/ComputeStages.h"
@@ -363,7 +364,7 @@ TEST(LayerExecutorConfigTest, DefaultConfig)
     EXPECT_EQ(config.mode, ExecutionMode::SEQUENTIAL);
     EXPECT_FALSE(config.enable_profiling);
     EXPECT_FALSE(config.enable_validation);
-    EXPECT_EQ(config.default_device, 0);
+    EXPECT_EQ(config.default_device, DeviceId::cpu());
     EXPECT_EQ(config.snapshot_callback, nullptr);
 }
 
@@ -373,12 +374,12 @@ TEST(LayerExecutorConfigTest, CustomConfig)
     config.mode = ExecutionMode::PARALLEL;
     config.enable_profiling = true;
     config.enable_validation = true;
-    config.default_device = 2;
+    config.default_device = DeviceId::cuda(2);
 
     EXPECT_EQ(config.mode, ExecutionMode::PARALLEL);
     EXPECT_TRUE(config.enable_profiling);
     EXPECT_TRUE(config.enable_validation);
-    EXPECT_EQ(config.default_device, 2);
+    EXPECT_EQ(config.default_device, DeviceId::cuda(2));
 }
 
 // =============================================================================
@@ -424,7 +425,7 @@ TEST_F(LayerExecutorInterfaceTest, MultiDeviceExecute_ThroughInterface)
     ComputeGraph graph;
     auto stage = std::make_unique<MockComputeStage>();
     stage->setShouldSucceed(true);
-    graph.addNode("A", std::move(stage), 0); // Device 0
+    graph.addNode("A", std::move(stage), DeviceId::cpu()); // Device 0
 
     std::unordered_map<int, IDeviceContext *> contexts;
     contexts[0] = ctx_.get();

@@ -91,6 +91,16 @@ namespace llaminar2
          * @return Total bytes for storage
          */
         virtual size_t size_bytes() const = 0;
+
+        // =====================================================================
+        // GPU Dirty Flag - track device modifications for lazy sync
+        // =====================================================================
+
+        /**
+         * @brief Mark tensor as modified on device (requires sync to host before host access)
+         * @note Call this after GPU kernels write to the tensor via gpu_data_ptr()
+         */
+        virtual void mark_device_dirty() = 0;
     };
 
 } // namespace llaminar2

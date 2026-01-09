@@ -114,12 +114,8 @@ namespace llaminar2
             return false;
         }
 
-        // Get device index
-        int device_idx = params_.device_idx;
-        if (device_idx < 0 && ctx)
-        {
-            device_idx = ctx->deviceIndex();
-        }
+        // Get device index using proper ordinal for GPU devices (0-based), not legacy index
+        int device_idx = params_.device_id.toKernelDeviceIndex();
 
         // Build proper causal mask for decode mode
         // In decode mode (seq_len < kv_len), we need to account for position offset
@@ -353,7 +349,7 @@ namespace llaminar2
         info.addScalarInt("head_dim", params_.head_dim);
         info.addScalarBool("causal", params_.causal);
         info.addScalarInt("window_size", params_.window_size);
-        info.addScalarInt("device_idx", params_.device_idx);
+        info.addScalarInt("device_id", params_.device_id.toLegacyIndex());
 
         // Add attention mode info (as int - PREFILL=0, DECODE=1, BATCHED_DECODE=2, CHUNKED_PREFILL=3)
         AttentionMode mode = params_.auto_detect_mode

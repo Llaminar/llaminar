@@ -12,6 +12,7 @@
 #include "../../utils/Logger.h"
 #include "../../backends/BackendManager.h"
 #include "../../backends/ComputeBackend.h"
+#include "../../backends/DeviceId.h"
 #include "../../kernels/KernelFactory.h"
 #include <stdexcept>
 #include <cmath>
@@ -44,7 +45,7 @@ namespace llaminar2
         if (static_cast<size_t>(device_idx) >= devices.size())
         {
             LOG_ERROR("[CPUTensorBase] Invalid device index: " << device_idx
-                                                            << " (max: " << devices.size() - 1 << ")");
+                                                               << " (max: " << devices.size() - 1 << ")");
             return nullptr;
         }
 
@@ -126,8 +127,8 @@ namespace llaminar2
     }
 
     bool CPUTensorBase::to_int8_perchannel_via_blocks(int8_t *dst_int8,
-                                                   float *dst_col_scales,
-                                                   float *dst_row_scales) const
+                                                      float *dst_col_scales,
+                                                      float *dst_row_scales) const
     {
         // Verify this is an ITensorGemmTileDataProvider tensor
         const ITensorGemmTileDataProvider *decoder = dynamic_cast<const ITensorGemmTileDataProvider *>(this);
@@ -523,35 +524,38 @@ namespace llaminar2
                                  "Override in derived class to support GPU transfer.");
     }
 
-    bool CPUTensorBase::ensureOnDevice(int target_device)
+    bool CPUTensorBase::ensureOnDevice(DeviceId target_device)
     {
-        // Validate target device
-        if (target_device < 0)
+        // Validate target device - must be a GPU
+        if (!target_device.is_gpu())
         {
-            LOG_ERROR("[CPUTensorBase::ensureOnDevice] Invalid device index: " << target_device);
+            LOG_ERROR("[CPUTensorBase::ensureOnDevice] Invalid device (must be GPU): " << target_device.toString());
             return false;
         }
 
+        // Convert DeviceId to legacy DeviceManager index for backend lookup
+        int legacy_idx = target_device.toLegacyIndex();
+
         // Check if already on target device with valid data
-        if (gpu_data_ptr_ && gpu_device_idx_ == target_device && !host_invalid_)
+        if (gpu_data_ptr_ && gpu_device_idx_ == legacy_idx && !host_invalid_)
         {
             // Already on correct device with valid data
             return true;
         }
 
         // Get backend for target device (uses DeviceManager to determine CUDA vs ROCm)
-        IBackend *target_backend = getBackendForGlobalDeviceIdx(target_device);
+        IBackend *target_backend = getBackendForGlobalDeviceIdx(legacy_idx);
         if (!target_backend)
         {
-            LOG_ERROR("[CPUTensorBase::ensureOnDevice] No backend available for device " << target_device);
+            LOG_ERROR("[CPUTensorBase::ensureOnDevice] No backend available for device " << target_device.toString());
             return false;
         }
 
         // Get backend-specific device ID (e.g., global idx 2 -> ROCm device 0)
-        int backend_device_id = getBackendSpecificDeviceId(target_device);
+        int backend_device_id = getBackendSpecificDeviceId(legacy_idx);
 
         // Free existing device memory if on different device
-        if (gpu_data_ptr_ && gpu_device_idx_ != target_device)
+        if (gpu_data_ptr_ && gpu_device_idx_ != legacy_idx)
         {
             // Use the OLD device's backend and device ID for freeing
             IBackend *old_backend = getBackendForGlobalDeviceIdx(gpu_device_idx_);
@@ -572,11 +576,11 @@ namespace llaminar2
             if (!gpu_data_ptr_)
             {
                 LOG_ERROR("[CPUTensorBase::ensureOnDevice] Failed to allocate " << bytes
-                                                                             << " bytes on device " << target_device
-                                                                             << " (backend device ID: " << backend_device_id << ")");
+                                                                                << " bytes on device " << target_device.toString()
+                                                                                << " (backend device ID: " << backend_device_id << ")");
                 return false;
             }
-            gpu_device_idx_ = target_device; // Store GLOBAL device index
+            gpu_device_idx_ = legacy_idx; // Store GLOBAL device index
         }
 
         // Upload data from host
@@ -602,8 +606,8 @@ namespace llaminar2
         host_invalid_ = false; // Host still has valid data (dual residency)
 
         LOG_DEBUG("[CPUTensorBase::ensureOnDevice] Uploaded " << bytes
-                                                           << " bytes to device " << target_device
-                                                           << " (backend device ID: " << backend_device_id << ")");
+                                                              << " bytes to device " << target_device.toString()
+                                                              << " (backend device ID: " << backend_device_id << ")");
         return true;
     }
 
@@ -643,8 +647,8 @@ namespace llaminar2
 
             host_invalid_ = false;
             LOG_DEBUG("[CPUTensorBase::ensureOnHost] Downloaded " << bytes
-                                                               << " bytes from device " << gpu_device_idx_
-                                                               << " (backend device ID: " << backend_device_id << ")");
+                                                                  << " bytes from device " << gpu_device_idx_
+                                                                  << " (backend device ID: " << backend_device_id << ")");
         }
 
         return true;

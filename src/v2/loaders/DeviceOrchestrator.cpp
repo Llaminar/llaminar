@@ -75,7 +75,7 @@ namespace llaminar2
         logPlacementDecision("ALL_GPU: Placing all weights on GPU device " +
                              std::to_string(config_.gpu_device_idx));
 
-        auto map = std::make_shared<WeightPlacementMap>(config_.gpu_device_idx);
+        auto map = std::make_shared<WeightPlacementMap>(DeviceId::fromLegacyIndex(config_.gpu_device_idx));
 
         // No additional rules needed - default device is GPU
         return map;
@@ -88,7 +88,7 @@ namespace llaminar2
         logPlacementDecision("ALL_CPU: Placing all weights on CPU device " +
                              std::to_string(config_.cpu_device_idx));
 
-        auto map = std::make_shared<WeightPlacementMap>(config_.cpu_device_idx);
+        auto map = std::make_shared<WeightPlacementMap>(DeviceId::fromLegacyIndex(config_.cpu_device_idx));
 
         // No additional rules needed - default device is CPU
         return map;
@@ -112,21 +112,21 @@ namespace llaminar2
                              (layer_count > 0 ? (", " + std::to_string(layer_count - gpu_layers) + " layers on CPU") : ""));
 
         // Default to CPU, then override GPU layers
-        auto map = std::make_shared<WeightPlacementMap>(config_.cpu_device_idx);
+        auto map = std::make_shared<WeightPlacementMap>(DeviceId::fromLegacyIndex(config_.cpu_device_idx));
 
         // First N layers on GPU
         if (gpu_layers > 0)
         {
-            map->setLayerRange(0, gpu_layers - 1, config_.gpu_device_idx);
+            map->setLayerRange(0, gpu_layers - 1, DeviceId::fromLegacyIndex(config_.gpu_device_idx));
         }
 
         // Embeddings typically on GPU for best performance
-        map->setPatternDevice("*embd*", config_.gpu_device_idx);
-        map->setPatternDevice("token_embd.weight", config_.gpu_device_idx);
+        map->setPatternDevice("*embd*", DeviceId::fromLegacyIndex(config_.gpu_device_idx));
+        map->setPatternDevice("token_embd.weight", DeviceId::fromLegacyIndex(config_.gpu_device_idx));
 
         // Output head on GPU (accessed every token)
-        map->setPatternDevice("output.weight", config_.gpu_device_idx);
-        map->setPatternDevice("*lm_head*", config_.gpu_device_idx);
+        map->setPatternDevice("output.weight", DeviceId::fromLegacyIndex(config_.gpu_device_idx));
+        map->setPatternDevice("*lm_head*", DeviceId::fromLegacyIndex(config_.gpu_device_idx));
 
         return map;
     }
@@ -312,35 +312,35 @@ namespace llaminar2
         if (config_.moe_shared_experts_gpu)
         {
             // Shared experts on GPU (accessed every token)
-            map->setPatternDevice("*shared_expert*", config_.gpu_device_idx);
-            map->setPatternDevice("*shared_experts*", config_.gpu_device_idx);
-            map->setPatternDevice("*gate*", config_.gpu_device_idx);
+            map->setPatternDevice("*shared_expert*", DeviceId::fromLegacyIndex(config_.gpu_device_idx));
+            map->setPatternDevice("*shared_experts*", DeviceId::fromLegacyIndex(config_.gpu_device_idx));
+            map->setPatternDevice("*gate*", DeviceId::fromLegacyIndex(config_.gpu_device_idx));
             logPlacementDecision("MOE_OPTIMIZED: Shared experts placed on GPU");
         }
         else
         {
-            map->setPatternDevice("*shared_expert*", config_.cpu_device_idx);
-            map->setPatternDevice("*shared_experts*", config_.cpu_device_idx);
+            map->setPatternDevice("*shared_expert*", DeviceId::fromLegacyIndex(config_.cpu_device_idx));
+            map->setPatternDevice("*shared_experts*", DeviceId::fromLegacyIndex(config_.cpu_device_idx));
             logPlacementDecision("MOE_OPTIMIZED: Shared experts placed on CPU");
         }
 
         if (config_.moe_sparse_experts_cpu)
         {
             // Sparse experts on CPU (rarely accessed)
-            map->setPatternDevice("*experts.0.*", config_.cpu_device_idx);
-            map->setPatternDevice("*experts.1.*", config_.cpu_device_idx);
-            map->setPatternDevice("*experts.2.*", config_.cpu_device_idx);
-            map->setPatternDevice("*experts.3.*", config_.cpu_device_idx);
-            map->setPatternDevice("*experts.4.*", config_.cpu_device_idx);
-            map->setPatternDevice("*experts.5.*", config_.cpu_device_idx);
-            map->setPatternDevice("*experts.6.*", config_.cpu_device_idx);
-            map->setPatternDevice("*experts.7.*", config_.cpu_device_idx);
+            map->setPatternDevice("*experts.0.*", DeviceId::fromLegacyIndex(config_.cpu_device_idx));
+            map->setPatternDevice("*experts.1.*", DeviceId::fromLegacyIndex(config_.cpu_device_idx));
+            map->setPatternDevice("*experts.2.*", DeviceId::fromLegacyIndex(config_.cpu_device_idx));
+            map->setPatternDevice("*experts.3.*", DeviceId::fromLegacyIndex(config_.cpu_device_idx));
+            map->setPatternDevice("*experts.4.*", DeviceId::fromLegacyIndex(config_.cpu_device_idx));
+            map->setPatternDevice("*experts.5.*", DeviceId::fromLegacyIndex(config_.cpu_device_idx));
+            map->setPatternDevice("*experts.6.*", DeviceId::fromLegacyIndex(config_.cpu_device_idx));
+            map->setPatternDevice("*experts.7.*", DeviceId::fromLegacyIndex(config_.cpu_device_idx));
             logPlacementDecision("MOE_OPTIMIZED: Sparse experts placed on CPU");
         }
         else
         {
             // Sparse experts on GPU
-            map->setPatternDevice("*experts.*", config_.gpu_device_idx);
+            map->setPatternDevice("*experts.*", DeviceId::fromLegacyIndex(config_.gpu_device_idx));
             logPlacementDecision("MOE_OPTIMIZED: Sparse experts placed on GPU");
         }
 
@@ -360,7 +360,7 @@ namespace llaminar2
         logPlacementDecision("CUSTOM: Parsing device map: " + config_.device_map);
 
         // Start with CPU as default
-        auto map = std::make_shared<WeightPlacementMap>(config_.cpu_device_idx);
+        auto map = std::make_shared<WeightPlacementMap>(DeviceId::fromLegacyIndex(config_.cpu_device_idx));
 
         // Parse device map string (format: "0-11:gpu:0,12-23:cpu,embed:gpu:0")
         auto rules = parseDeviceMapString(config_.device_map);
@@ -446,7 +446,7 @@ namespace llaminar2
         }
 
         // Determine device index from type and id
-        rule.device_idx = parseDeviceString(device_type, device_id);
+        rule.device = DeviceId::fromLegacyIndex(parseDeviceString(device_type, device_id));
 
         // Parse target (layer range, percentage, or pattern)
         if (target.find('-') != std::string::npos)
@@ -540,10 +540,10 @@ namespace llaminar2
         switch (rule.type)
         {
         case DeviceMapRuleType::LAYER_RANGE:
-            map->setLayerRange(rule.start_layer, rule.end_layer, rule.device_idx);
+            map->setLayerRange(rule.start_layer, rule.end_layer, rule.device);
             logPlacementDecision("CUSTOM: Layers " + std::to_string(rule.start_layer) +
                                  "-" + std::to_string(rule.end_layer) +
-                                 " -> device " + std::to_string(rule.device_idx));
+                                 " -> device " + std::to_string(rule.device.toLegacyIndex()));
             break;
 
         case DeviceMapRuleType::PERCENTAGE:
@@ -554,19 +554,19 @@ namespace llaminar2
                 int num_layers = static_cast<int>(layer_count * rule.percentage / 100.0f);
                 int start = rule.is_first ? 0 : (layer_count - num_layers);
                 int end = rule.is_first ? (num_layers - 1) : (layer_count - 1);
-                map->setLayerRange(start, end, rule.device_idx);
+                map->setLayerRange(start, end, rule.device);
                 logPlacementDecision("CUSTOM: " + std::string(rule.is_first ? "First" : "Last") +
                                      " " + std::to_string(static_cast<int>(rule.percentage)) + "% (" +
                                      std::to_string(num_layers) + " layers) -> device " +
-                                     std::to_string(rule.device_idx));
+                                     std::to_string(rule.device.toLegacyIndex()));
             }
             break;
         }
 
         case DeviceMapRuleType::PATTERN:
-            map->setPatternDevice(rule.pattern, rule.device_idx);
+            map->setPatternDevice(rule.pattern, rule.device);
             logPlacementDecision("CUSTOM: Pattern '" + rule.pattern +
-                                 "' -> device " + std::to_string(rule.device_idx));
+                                 "' -> device " + std::to_string(rule.device.toLegacyIndex()));
             break;
 
         case DeviceMapRuleType::INVALID:
@@ -653,7 +653,7 @@ namespace llaminar2
         }
 
         // Default device is first GPU (for embeddings, etc.)
-        auto map = std::make_shared<WeightPlacementMap>(gpus[0]);
+        auto map = std::make_shared<WeightPlacementMap>(DeviceId::fromLegacyIndex(gpus[0]));
 
         // Parse split strategy
         std::vector<float> weights;
@@ -734,7 +734,7 @@ namespace llaminar2
                 int start_layer = current_layer;
                 int end_layer = std::min(current_layer + layers_for_gpu - 1, layer_count - 1);
 
-                map->setLayerRange(start_layer, end_layer, gpus[i]);
+                map->setLayerRange(start_layer, end_layer, DeviceId::fromLegacyIndex(gpus[i]));
 
                 logPlacementDecision("MULTI_GPU: Layers " + std::to_string(start_layer) +
                                      "-" + std::to_string(end_layer) +
@@ -746,14 +746,14 @@ namespace llaminar2
         }
 
         // Embeddings on first GPU (high bandwidth access)
-        map->setPatternDevice("*embd*", gpus[0]);
-        map->setPatternDevice("token_embd.weight", gpus[0]);
+        map->setPatternDevice("*embd*", DeviceId::fromLegacyIndex(gpus[0]));
+        map->setPatternDevice("token_embd.weight", DeviceId::fromLegacyIndex(gpus[0]));
         logPlacementDecision("MULTI_GPU: Embeddings -> GPU " + std::to_string(gpus[0]));
 
         // Output head on last GPU (close to final layers)
         int last_gpu = gpus.back();
-        map->setPatternDevice("output.weight", last_gpu);
-        map->setPatternDevice("*lm_head*", last_gpu);
+        map->setPatternDevice("output.weight", DeviceId::fromLegacyIndex(last_gpu));
+        map->setPatternDevice("*lm_head*", DeviceId::fromLegacyIndex(last_gpu));
         logPlacementDecision("MULTI_GPU: Output head -> GPU " + std::to_string(last_gpu));
 
         return map;

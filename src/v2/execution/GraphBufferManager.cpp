@@ -286,7 +286,7 @@ namespace llaminar2
                                                                                                                                                                                    : 4;
             size_t num_elements = group.max_size_bytes / element_size;
             group_desc.shape = {num_elements};
-            group_desc.device_idx = -1; // CPU
+            group_desc.device = DeviceId::cpu();
 
             auto tensor = createTensorFromDescriptor(group_desc);
             if (!tensor)
@@ -477,12 +477,12 @@ namespace llaminar2
 
         // Convert shape to vector<size_t>
         std::vector<size_t> shape = desc.shape;
-        int device_idx = desc.device_idx;
+        DeviceId device = desc.device;
 
         switch (desc.tensor_type)
         {
         case BufferTensorType::FP32:
-            return factory_->createFP32(shape, device_idx);
+            return factory_->createFP32(shape, device);
 
         case BufferTensorType::FP16:
             return factory_->createFP16(shape);
@@ -504,14 +504,14 @@ namespace llaminar2
             LOG_WARN("GraphBufferManager: Quantized type " << bufferTensorTypeName(desc.tensor_type)
                                                            << " not directly creatable without raw data, "
                                                            << "falling back to FP32 for buffer '" << desc.name << "'");
-            return factory_->createFP32(shape, device_idx);
+            return factory_->createFP32(shape, device);
 
         case BufferTensorType::UNKNOWN:
         default:
             // Default to FP32
             LOG_DEBUG("GraphBufferManager: Unknown tensor type, defaulting to FP32 for '"
                       << desc.name << "'");
-            return factory_->createFP32(shape, device_idx);
+            return factory_->createFP32(shape, device);
         }
     }
 

@@ -18,6 +18,7 @@
 #include <memory>
 #include <iomanip>
 
+#include "backends/DeviceId.h"
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/DeviceContext.h"
 #include "backends/ComputeBackend.h"
@@ -144,7 +145,7 @@ namespace
             DeviceManager::instance().initialize(-1); // -1 = no NUMA filtering
 
             // Create device context for stages that require it
-            ctx_ = std::make_unique<CPUDeviceContext>(0, 4);
+            ctx_ = std::make_unique<CPUDeviceContext>(DeviceId::cpu(), 4);
         }
 
         // Create random FP32 embedding table
@@ -223,7 +224,7 @@ namespace
             params.num_tokens = seq_len;
             params.d_model = d_model_;
             params.vocab_size = vocab_size_;
-            params.device_idx = 0;
+            params.device_id = DeviceId::cpu();
 
             auto stage = ComputeStageFactory::createEmbedding(params);
             ASSERT_TRUE(stage->execute(ctx_.get()));
@@ -247,7 +248,7 @@ namespace
             params.num_tokens = seq_len;
             params.d_model = d_model_;
             params.vocab_size = vocab_size_;
-            params.device_idx = 0;
+            params.device_id = DeviceId::cpu();
 
             auto stage = ComputeStageFactory::createEmbedding(params);
             ASSERT_TRUE(stage->execute(ctx_.get()));
@@ -270,7 +271,7 @@ namespace
             params.gamma = rms_weights.get();
             params.eps = rms_norm_eps_;
             params.seq_len = seq_len;
-            params.device_idx = 0;
+            params.device_id = DeviceId::cpu();
 
             auto stage = ComputeStageFactory::createRMSNorm(params);
             ASSERT_TRUE(stage->execute(ctx_.get()));
@@ -292,7 +293,7 @@ namespace
             params.gamma = rms_weights.get();
             params.eps = rms_norm_eps_;
             params.seq_len = seq_len;
-            params.device_idx = 0;
+            params.device_id = DeviceId::cpu();
 
             auto stage = ComputeStageFactory::createRMSNorm(params);
             ASSERT_TRUE(stage->execute(ctx_.get()));
@@ -348,7 +349,7 @@ namespace
             params.num_tokens = seq_len;
             params.d_model = d_model_;
             params.vocab_size = vocab_size_;
-            params.device_idx = 0;
+            params.device_id = DeviceId::cpu();
 
             auto stage = ComputeStageFactory::createEmbedding(params);
             ASSERT_TRUE(stage->execute(ctx_.get()));

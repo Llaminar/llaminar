@@ -66,9 +66,14 @@ namespace llaminar2
             return false;
         }
 
-        // Get cached kernels from KernelFactory (handles weight packing once)
-        auto *gemm_gate = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(w_gate_base);
-        auto *gemm_up = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(w_up_base);
+        // Get the target device type from device_id
+        DeviceType target_dev_type = params_.device_id.is_gpu()
+                                         ? DeviceType::CUDA
+                                         : DeviceType::CPU;
+
+        // Get cached kernels from KernelFactory with device targeting
+        auto *gemm_gate = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(w_gate_base, target_dev_type);
+        auto *gemm_up = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(w_up_base, target_dev_type);
 
         if (!gemm_gate || !gemm_up)
         {
@@ -105,7 +110,7 @@ namespace llaminar2
                 params_.m, params_.n_gate, params_.k,
                 false,      // transpose_B
                 1.0f, 0.0f, // alpha, beta
-                params_.mpi_ctx, params_.device_idx);
+                params_.mpi_ctx, params_.device_id.toLegacyIndex());
 
             if (!gate_ok)
             {
@@ -119,7 +124,7 @@ namespace llaminar2
                 params_.m, params_.n_up, params_.k,
                 false,      // transpose_B
                 1.0f, 0.0f, // alpha, beta
-                params_.mpi_ctx, params_.device_idx);
+                params_.mpi_ctx, params_.device_id.toLegacyIndex());
 
             if (!up_ok)
             {

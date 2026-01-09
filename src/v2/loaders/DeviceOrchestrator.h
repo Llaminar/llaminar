@@ -9,6 +9,7 @@
 
 #include "WeightPlacementMap.h"
 #include "backends/ComputeBackend.h"
+#include "backends/DeviceId.h"
 #include "utils/MPIContext.h"
 #include "ModelContext.h"
 #include <memory>
@@ -36,7 +37,7 @@ namespace llaminar2
     struct DeviceMapRule
     {
         DeviceMapRuleType type = DeviceMapRuleType::INVALID;
-        int device_idx = -1;
+        DeviceId device = DeviceId::cpu();
 
         // LAYER_RANGE fields
         int start_layer = -1;

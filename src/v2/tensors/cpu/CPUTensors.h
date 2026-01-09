@@ -93,6 +93,7 @@
 #include "../TensorLayout.h"    // Tensor memory layout contracts
 #include "../SIMDHelpers.h"
 #include "../AlignedVector.h"
+#include "../../backends/DeviceId.h" // DeviceId for ensureOnDevice
 #include <vector>
 #include <memory>
 #include <cstddef>
@@ -727,7 +728,7 @@ namespace llaminar2
          * Performs lazy upload: if data is already on target device, returns immediately.
          * If data is on host (home_dm_device_index() == NOT_ON_GPU), allocates GPU memory and uploads.
          *
-         * @param target_device DeviceManager GPU device index (typically 1+ for GPUs)
+         * @param target_device DeviceId for the target GPU device
          * @return true if data is now available on target device, false on error
          *
          * **Thread Safety**: Caller must ensure no concurrent modifications to tensor data
@@ -736,7 +737,7 @@ namespace llaminar2
          * @note For quantized weight tensors, uploads quantized blocks (not dequantized FP32)
          * @note Implementation in TensorBase.cpp - uses raw_host_data_ptr() and byte_size()
          */
-        bool ensureOnDevice(int target_device);
+        bool ensureOnDevice(DeviceId target_device);
 
         /**
          * @brief Ensure tensor data is available on host (CPU)
@@ -766,6 +767,12 @@ namespace llaminar2
          */
         virtual void *gpu_data_ptr() { return gpu_data_ptr_; }
         virtual const void *gpu_data_ptr() const { return gpu_data_ptr_; }
+
+        /**
+         * @brief Mark tensor as modified on device (requires sync to host before host access)
+         * @note Call this after GPU kernels write to the tensor via gpu_data_ptr()
+         */
+        virtual void mark_device_dirty() { /* Base class no-op - derived classes override */ }
 
         /**
          * @brief Check if tensor data is currently resident on host (CPU)
@@ -1421,6 +1428,12 @@ namespace llaminar2
         size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
         const void *raw_data() const final { return CPUTensorBase::raw_data(); }
         void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
+
+        // ===== GPU Data Pointer Override =====
+        // FP32Tensor manages its own device_data_ instead of CPUTensorBase::gpu_data_ptr_
+        void *gpu_data_ptr() override { return device_data_; }
+        const void *gpu_data_ptr() const override { return device_data_; }
+        void mark_device_dirty() override { device_dirty_ = true; }
 
         // ===== Unified FP32 Access (Phase 1 Infrastructure) =====
         float *mutable_fp32_data() override { return mutable_data(); }

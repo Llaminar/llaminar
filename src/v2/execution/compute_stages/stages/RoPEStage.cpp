@@ -98,7 +98,7 @@ namespace llaminar2
                                                   << " k_is_q16_1=" << (k_is_q16_1 ? "true" : "false"));
 
         // Create kernel via KernelFactory with automatic type dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
         auto kernel = llaminar::v2::kernels::KernelFactory::createRoPE(Q_base, dev_type);
         if (!kernel)
         {
@@ -146,7 +146,7 @@ namespace llaminar2
                 params_.head_dim,
                 params_.theta_base,
                 params_.mpi_ctx,
-                params_.device_idx);
+                params_.device_id.toLegacyIndex());
         }
 
         // HybridQ16 mode with K precision fix: Q=Q8_1→Q16_1, K=Q16_1→Q16_1 (dynamic scale)
@@ -209,7 +209,7 @@ namespace llaminar2
                 params_.theta_base,
                 params_.kv_cache_scale, // Fixed scale for Q output
                 params_.mpi_ctx,
-                params_.device_idx);
+                params_.device_id.toLegacyIndex());
 
             if (success)
             {
@@ -263,7 +263,7 @@ namespace llaminar2
                 params_.theta_base,
                 params_.kv_cache_scale, // Fixed scale for integer attention
                 params_.mpi_ctx,
-                params_.device_idx);
+                params_.device_id.toLegacyIndex());
 
             // Debug: verify RoPE Q16_1 output
             if (success)
@@ -292,7 +292,7 @@ namespace llaminar2
             params_.head_dim,
             params_.theta_base,
             params_.mpi_ctx,
-            params_.device_idx);
+            params_.device_id.toLegacyIndex());
     }
 
     size_t RoPEStage::estimatedFlops() const

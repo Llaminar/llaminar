@@ -9,6 +9,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../../src/v2/backends/DeviceId.h"
 #include "../../../src/v2/execution/GraphOrchestrator.h"
 #include "../../../src/v2/execution/RuntimeConfig.h"
 #include "../../../src/v2/models/qwen/Qwen2Graph.h"
@@ -43,7 +44,7 @@ protected:
         config_.vocab_size = 151936;
         config_.rms_norm_eps = 1e-6f;
         config_.rope_theta = 1000000.0f;
-        config_.default_device = 0;
+        config_.default_device = DeviceId::cpu();
 
         // Create graph builder
         graph_builder_ = std::make_shared<Qwen2Graph>(config_, nullptr);
@@ -173,14 +174,14 @@ TEST_F(Test__GraphOrchestrator, GetDeviceContextLazyCreation)
     auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
 
     // First call creates context (may fail without DeviceManager init)
-    IDeviceContext *ctx1 = orchestrator->getDeviceContext(0);
+    IDeviceContext *ctx1 = orchestrator->getDeviceContext(DeviceId::cpu());
     if (ctx1 == nullptr)
     {
         GTEST_SKIP() << "DeviceContext creation not available in this environment";
     }
 
     // Second call returns same context (cached)
-    IDeviceContext *ctx2 = orchestrator->getDeviceContext(0);
+    IDeviceContext *ctx2 = orchestrator->getDeviceContext(DeviceId::cpu());
     EXPECT_EQ(ctx1, ctx2);
 }
 
@@ -189,14 +190,14 @@ TEST_F(Test__GraphOrchestrator, GetDeviceContextMultipleDevices)
     auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
 
     // Get context for device 0 (may fail without DeviceManager init)
-    IDeviceContext *ctx0 = orchestrator->getDeviceContext(0);
+    IDeviceContext *ctx0 = orchestrator->getDeviceContext(DeviceId::cpu());
     if (ctx0 == nullptr)
     {
         GTEST_SKIP() << "DeviceContext creation not available in this environment";
     }
 
     // Device 1 might not exist, which is fine
-    IDeviceContext *ctx1 = orchestrator->getDeviceContext(1);
+    IDeviceContext *ctx1 = orchestrator->getDeviceContext(DeviceId::cuda(0));
     if (ctx1 != nullptr)
     {
         EXPECT_NE(ctx0, ctx1);
@@ -208,7 +209,7 @@ TEST_F(Test__GraphOrchestrator, ClearCacheClearsDeviceContexts)
     auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
 
     // Create a device context (may fail without DeviceManager init)
-    IDeviceContext *ctx_before = orchestrator->getDeviceContext(0);
+    IDeviceContext *ctx_before = orchestrator->getDeviceContext(DeviceId::cpu());
     if (ctx_before == nullptr)
     {
         GTEST_SKIP() << "DeviceContext creation not available in this environment";
@@ -218,7 +219,7 @@ TEST_F(Test__GraphOrchestrator, ClearCacheClearsDeviceContexts)
     orchestrator->clearCache();
 
     // New context should be created (different pointer)
-    IDeviceContext *ctx_after = orchestrator->getDeviceContext(0);
+    IDeviceContext *ctx_after = orchestrator->getDeviceContext(DeviceId::cpu());
     EXPECT_NE(ctx_after, nullptr);
     // Note: Can't guarantee different pointer since OS might reuse memory
 }
@@ -361,11 +362,11 @@ TEST_F(Test__GraphOrchestrator, SetWeightsDelegatesToGraphBuilder)
     // Create mock weights (don't need valid data, just pointers)
     Qwen2ModelWeights weights;
     std::unique_ptr<FP32Tensor> embed = std::make_unique<FP32Tensor>(
-        std::vector<size_t>{151936, 896}, 0);
+        std::vector<size_t>{151936, 896}, DeviceId::cpu());
     std::unique_ptr<FP32Tensor> norm = std::make_unique<FP32Tensor>(
-        std::vector<size_t>{896}, 0);
+        std::vector<size_t>{896}, DeviceId::cpu());
     std::unique_ptr<FP32Tensor> lm = std::make_unique<FP32Tensor>(
-        std::vector<size_t>{151936, 896}, 0);
+        std::vector<size_t>{151936, 896}, DeviceId::cpu());
 
     weights.embedding_table = embed.get();
     weights.final_norm = norm.get();
@@ -387,9 +388,9 @@ TEST_F(Test__GraphOrchestrator, SetBuffersDelegatesToGraphBuilder)
     // Create mock buffers
     Qwen2ModelBuffers buffers;
     std::unique_ptr<FP32Tensor> hidden = std::make_unique<FP32Tensor>(
-        std::vector<size_t>{128, 896}, 0);
+        std::vector<size_t>{128, 896}, DeviceId::cpu());
     std::unique_ptr<FP32Tensor> logits = std::make_unique<FP32Tensor>(
-        std::vector<size_t>{128, 151936}, 0);
+        std::vector<size_t>{128, 151936}, DeviceId::cpu());
 
     buffers.current_hidden = hidden.get();
     buffers.logits = logits.get();
@@ -414,11 +415,11 @@ TEST_F(Test__GraphOrchestrator, HasGlobalWeightsReturnsTrueWhenSet)
     // Set up minimal weights with layer accessor
     Qwen2ModelWeights weights;
     std::unique_ptr<FP32Tensor> embed = std::make_unique<FP32Tensor>(
-        std::vector<size_t>{151936, 896}, 0);
+        std::vector<size_t>{151936, 896}, DeviceId::cpu());
     std::unique_ptr<FP32Tensor> norm = std::make_unique<FP32Tensor>(
-        std::vector<size_t>{896}, 0);
+        std::vector<size_t>{896}, DeviceId::cpu());
     std::unique_ptr<FP32Tensor> lm = std::make_unique<FP32Tensor>(
-        std::vector<size_t>{151936, 896}, 0);
+        std::vector<size_t>{151936, 896}, DeviceId::cpu());
 
     weights.embedding_table = embed.get();
     weights.final_norm = norm.get();
@@ -450,9 +451,8 @@ TEST_F(Test__GraphOrchestrator, InitializeInferenceStateSuccess)
     // Initialize state
     int batch_size = 2;
     int max_seq_len = 64;
-    int device_idx = 0;
 
-    bool success = orchestrator->initializeInferenceState(batch_size, max_seq_len, device_idx);
+    bool success = orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu());
 
     EXPECT_TRUE(success);
     EXPECT_TRUE(orchestrator->hasInferenceState());
@@ -464,9 +464,8 @@ TEST_F(Test__GraphOrchestrator, InitializeInferenceStateAllocatesBuffers)
 
     int batch_size = 2;
     int max_seq_len = 64;
-    int device_idx = 0;
 
-    bool success = orchestrator->initializeInferenceState(batch_size, max_seq_len, device_idx);
+    bool success = orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu());
     ASSERT_TRUE(success);
 
     // Should be able to access logits (nullptr check, not actual data yet)
@@ -480,9 +479,8 @@ TEST_F(Test__GraphOrchestrator, ClearInferenceStateResetsPositions)
 
     int batch_size = 2;
     int max_seq_len = 64;
-    int device_idx = 0;
 
-    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, device_idx));
+    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
 
     // Clear state
@@ -526,7 +524,7 @@ TEST_F(Test__GraphOrchestrator, ForwardFailsWithoutWeights)
     auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
 
     // Initialize state but not weights
-    ASSERT_TRUE(orchestrator->initializeInferenceState(1, 64, 0));
+    ASSERT_TRUE(orchestrator->initializeInferenceState(1, 64, DeviceId::cpu()));
 
     // forward() should fail without weights
     std::vector<int> tokens = {1, 2, 3};
@@ -541,9 +539,8 @@ TEST_F(Test__GraphOrchestrator, InferenceStateMultipleBatches)
 
     int batch_size = 4;
     int max_seq_len = 128;
-    int device_idx = 0;
 
-    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, device_idx));
+    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu()));
 
     // All batch positions should start at 0
     for (int b = 0; b < batch_size; ++b)
@@ -566,9 +563,8 @@ TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_FP32_UsesPositionMajor)
     // Initialize state
     int batch_size = 1;
     int max_seq_len = 64;
-    int device_idx = 0;
 
-    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, device_idx));
+    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
 
     // KV cache should exist and use POSITION_MAJOR layout
@@ -587,9 +583,8 @@ TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_BF16_UsesPositionMajor)
     // Initialize state
     int batch_size = 1;
     int max_seq_len = 64;
-    int device_idx = 0;
 
-    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, device_idx));
+    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
 
     // KV cache should use POSITION_MAJOR layout for BF16
@@ -609,9 +604,8 @@ TEST_F(Test__GraphOrchestrator, DISABLED_KVCacheLayoutMode_HybridQ16_UsesHeadMaj
     // Initialize state
     int batch_size = 1;
     int max_seq_len = 64;
-    int device_idx = 0;
 
-    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, device_idx));
+    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
 
     // KV cache should use HEAD_MAJOR layout for Q16_1 (required by Q16IntegerAttention)
@@ -631,9 +625,8 @@ TEST_F(Test__GraphOrchestrator, DISABLED_KVCacheLayoutMode_Hybrid_UsesPositionMa
     // Initialize state
     int batch_size = 1;
     int max_seq_len = 64;
-    int device_idx = 0;
 
-    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, device_idx));
+    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
 
     // KV cache should use POSITION_MAJOR layout for Hybrid (BF16 KV cache)

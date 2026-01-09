@@ -59,7 +59,7 @@ namespace llaminar2
                                                     << " tensor_type=" << gate_base->dtype_name());
 
         // Create kernel via KernelFactory with automatic type dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
         auto kernel = llaminar::v2::kernels::KernelFactory::createSwiGLU(gate_base, dev_type);
         if (!kernel)
         {
@@ -77,7 +77,7 @@ namespace llaminar2
             intermediate_dim,
             false, // add_residual
             params_.mpi_ctx,
-            params_.device_idx);
+            params_.device_id.toKernelDeviceIndex());
     }
 
     size_t SwiGLUStage::estimatedFlops() const

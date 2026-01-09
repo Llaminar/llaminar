@@ -87,7 +87,7 @@ namespace llaminar2
         qwen_input.batch_size = input.batch_size;
         qwen_input.seq_len = input.seq_len;
         qwen_input.position_offset = input.position_offset;
-        qwen_input.device_idx = input.device_idx;
+        qwen_input.device = input.device;
         qwen_input.kv_cache = input.kv_cache;
 
         // Adapt generic ForwardOutput to Qwen2ForwardOutput
@@ -126,13 +126,13 @@ namespace llaminar2
         // Build attention graph
         ComputeGraph attn_graph = buildAttentionGraph(
             layer_weights, buffers_.layer_buffers, ctx.layer_idx, ctx.seq_len,
-            ctx.batch_size, ctx.kv_cache, ctx.position_ids, ctx.device_idx,
+            ctx.batch_size, ctx.kv_cache, ctx.position_ids, ctx.device,
             ctx.sequence_lengths);
 
         // Build FFN graph
         ComputeGraph ffn_graph = buildFFNGraph(
             layer_weights, buffers_.layer_buffers, ctx.layer_idx, ctx.seq_len,
-            ctx.batch_size, ctx.device_idx);
+            ctx.batch_size, ctx.device);
 
         // Merge: attention -> FFN
         std::string attn_last = "layer" + std::to_string(ctx.layer_idx) + "_attn_residual";
@@ -165,7 +165,7 @@ namespace llaminar2
             throw std::runtime_error("Qwen2Graph buffers not initialized");
         }
 
-        int device_idx = config_.default_device;
+        DeviceId device = config_.default_device;
         int total_tokens = input.batch_size * input.seq_len;
 
         ComputeGraph graph;
@@ -188,11 +188,11 @@ namespace llaminar2
         embed_params.num_tokens = total_tokens;
         embed_params.d_model = config_.d_model;
         embed_params.vocab_size = config_.vocab_size;
-        embed_params.device_idx = device_idx;
+        embed_params.device_id = config_.default_device;
 
         graph.addNode("embedding",
                       ComputeStageFactory::createEmbedding(embed_params),
-                      device_idx);
+                      device);
 
         // -------------------------------------------------------------------------
         // Stage 2: Transformer Layers (complete graphs, not placeholders)
@@ -227,7 +227,7 @@ namespace llaminar2
             // Pass sequence_lengths for proper batch-aware attention masking
             ComputeGraph attn_graph = buildAttentionGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
-                input.batch_size, input.kv_cache, position_ids, device_idx,
+                input.batch_size, input.kv_cache, position_ids, device,
                 input.sequence_lengths);
 
             // Get the leaf node(s) of attention graph before merging
@@ -254,7 +254,7 @@ namespace llaminar2
             // Build FFN graph for this layer
             ComputeGraph ffn_graph = buildFFNGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
-                input.batch_size, device_idx);
+                input.batch_size, device);
 
             // Get the leaf node(s) of FFN graph before merging (we need the last node)
             auto ffn_leaves = ffn_graph.getLeafNodes();
@@ -297,7 +297,7 @@ namespace llaminar2
                                            : buffers_.current_hidden;
 
         addFinalNormToGraph(graph, final_norm_input, buffers_.layer_buffers.normalized,
-                            prev_node, total_tokens, device_idx);
+                            prev_node, total_tokens, device);
         prev_node = "final_norm";
 
         // -------------------------------------------------------------------------
@@ -326,11 +326,11 @@ namespace llaminar2
         lm_params.d_model = config_.d_model;
         lm_params.vocab_size = lm_head_vocab_size;
         lm_params.bias = nullptr; // Qwen2 has no LM head bias
-        lm_params.device_idx = device_idx;
+        lm_params.device_id = config_.default_device;
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),
-                      device_idx);
+                      device);
         graph.addDependency("lm_head", prev_node);
         prev_node = "lm_head";
 
@@ -348,7 +348,7 @@ namespace llaminar2
 
             graph.addNode("lm_head_allgather",
                           ComputeStageFactory::createAllGather(allgather_params),
-                          device_idx);
+                          device);
             graph.addDependency("lm_head_allgather", prev_node);
         }
 
@@ -528,7 +528,7 @@ namespace llaminar2
         params.num_tokens = input.batch_size * input.seq_len;
         params.d_model = config_.d_model;
         params.vocab_size = config_.vocab_size;
-        params.device_idx = config_.default_device;
+        params.device_id = config_.default_device;
 
         graph.addNode("embedding",
                       ComputeStageFactory::createEmbedding(params),
@@ -541,7 +541,7 @@ namespace llaminar2
         TensorBase *input_hidden,
         ICPUKVCache *kv_cache,
         const int *position_ids,
-        int device_idx)
+        DeviceId device)
     {
         LOG_DEBUG("[Qwen2Graph] Building transformer layers graph: "
                   << config_.n_layers << " layers");
@@ -555,7 +555,7 @@ namespace llaminar2
             std::string layer_name = "layer_" + std::to_string(layer);
 
             // Add node with nullptr stage - placeholder for sequencing
-            graph.addNode(layer_name, nullptr, device_idx);
+            graph.addNode(layer_name, nullptr, device);
 
             if (!prev_node.empty())
             {
@@ -573,12 +573,12 @@ namespace llaminar2
         TensorBase *input_hidden,
         ICPUKVCache *kv_cache,
         const int *position_ids,
-        int device_idx)
+        DeviceId device)
     {
         LOG_DEBUG("[Qwen2Graph] Building layer " << layer_idx << " graph");
 
         ComputeGraph graph;
-        graph.addNode("layer_" + std::to_string(layer_idx), nullptr, device_idx);
+        graph.addNode("layer_" + std::to_string(layer_idx), nullptr, device);
 
         return graph;
     }
@@ -587,7 +587,7 @@ namespace llaminar2
         TensorBase *hidden_states,
         TensorBase *output_logits,
         int total_tokens,
-        int device_idx,
+        DeviceId device,
         TensorBase *logits_local)
     {
         LOG_DEBUG("[Qwen2Graph] Building LM head graph for " << total_tokens << " tokens"
@@ -603,11 +603,11 @@ namespace llaminar2
         norm_params.gamma = weights_.final_norm;
         norm_params.eps = config_.rms_norm_eps;
         norm_params.seq_len = total_tokens;
-        norm_params.device_idx = device_idx;
+        norm_params.device_id = device;
 
         graph.addNode("final_norm",
                       ComputeStageFactory::createRMSNorm(norm_params),
-                      device_idx);
+                      device);
 
         // =================================================================
         // LM Head Projection - Column-Parallel or Full
@@ -637,11 +637,11 @@ namespace llaminar2
         lm_params.d_model = config_.d_model;
         lm_params.vocab_size = lm_head_vocab_size;
         lm_params.bias = nullptr;
-        lm_params.device_idx = device_idx;
+        lm_params.device_id = device;
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),
-                      device_idx);
+                      device);
         graph.addDependency("lm_head", "final_norm");
 
         // =================================================================
@@ -660,7 +660,7 @@ namespace llaminar2
 
             graph.addNode("lm_head_allgather",
                           ComputeStageFactory::createAllGather(allgather_params),
-                          device_idx);
+                          device);
             graph.addDependency("lm_head_allgather", "lm_head");
         }
 
@@ -679,7 +679,7 @@ namespace llaminar2
         int batch_size,
         ICPUKVCache *kv_cache,
         const int *position_ids,
-        int device_idx,
+        DeviceId device,
         const std::vector<int> *sequence_lengths)
     {
         ComputeGraph graph;
@@ -701,6 +701,7 @@ namespace llaminar2
         // Determine backend type for stage creation
         auto &dm = DeviceManager::instance();
         ComputeBackendType backend = ComputeBackendType::CPU;
+        int device_idx = device.toLegacyIndex();
         if (static_cast<size_t>(device_idx) < dm.devices().size())
         {
             backend = dm.devices()[device_idx].type;
@@ -724,7 +725,7 @@ namespace llaminar2
 
             graph.addNode(prefix + "attn_norm",
                           ComputeStageFactory::createRMSNorm(attn_norm_params),
-                          device_idx);
+                          device);
         }
 
         // Stage 2: Q/K/V projections using FusedQKVGEMMStage
@@ -765,10 +766,11 @@ namespace llaminar2
             qkv_params.output_v = buffers.V;
             qkv_params.n_v = v_n;
             qkv_params.bias_v = v_bias_ptr;
+            qkv_params.device_id = device;
 
             graph.addNode(prefix + "qkv_proj",
                           ComputeStageFactory::createFusedQKVGEMM(qkv_params),
-                          device_idx);
+                          device);
 
             if (env.execution.exec_rmsnorm)
             {
@@ -845,7 +847,7 @@ namespace llaminar2
 
             graph.addNode(prefix + "rope",
                           ComputeStageFactory::createRoPE(rope_params),
-                          device_idx);
+                          device);
 
             if (env.execution.exec_gemm)
             {
@@ -905,7 +907,7 @@ namespace llaminar2
 
                 graph.addNode(prefix + "kv_append",
                               ComputeStageFactory::createKVCacheAppend(kv_append_params),
-                              device_idx);
+                              device);
 
                 if (env.execution.exec_rope)
                 {
@@ -1002,7 +1004,7 @@ namespace llaminar2
 
                 graph.addNode(prefix + "kv_gather",
                               ComputeStageFactory::createKVCacheGather(gather_params),
-                              device_idx);
+                              device);
 
                 // Gather depends on append (must append new tokens before gathering full history)
                 graph.addDependency(prefix + "kv_gather", prefix + "kv_append");
@@ -1093,7 +1095,7 @@ namespace llaminar2
                 fused_params.kv_cache = kv_cache;
                 fused_params.layer_idx = layer_idx;
                 fused_params.mpi_ctx = mpi_ctx_.get();
-                fused_params.device_idx = device_idx;
+                fused_params.device_id = device;
 
                 // Hybrid/HybridQ16 mode: enable streaming dequantization for FP32-equivalent Wo projection
                 // This gives highest numerical precision by dequantizing VNNI-packed weights to FP32
@@ -1140,7 +1142,7 @@ namespace llaminar2
                 wo_producer_node = prefix + "fused_attn_wo";
                 graph.addNode(wo_producer_node,
                               ComputeStageFactory::createFusedAttentionWo(fused_params),
-                              device_idx);
+                              device);
 
                 if (use_gather_stage)
                     graph.addDependency(wo_producer_node, prefix + "kv_gather");
@@ -1184,11 +1186,11 @@ namespace llaminar2
                     attn_params.layer_idx = layer_idx;
                     attn_params.position_offset = position_ids ? position_ids[0] : 0;
                     attn_params.mpi_ctx = mpi_ctx_.get();
-                    attn_params.device_idx = device_idx;
+                    attn_params.device_id = device;
 
                     graph.addNode(prefix + "attention",
                                   ComputeStageFactory::createAttentionCompute(attn_params),
-                                  device_idx);
+                                  device);
 
                     if (use_gather_stage)
                         graph.addDependency(prefix + "attention", prefix + "kv_gather");
@@ -1225,8 +1227,9 @@ namespace llaminar2
                                           .k = wo_k,
                                           .alpha = 1.0f,
                                           .beta = 0.0f,
-                                          .transpose_B = false}),
-                                  device_idx);
+                                          .transpose_B = false,
+                                          .device_id = device}),
+                                  device);
 
                     if (env.execution.exec_attention)
                     {
@@ -1258,7 +1261,7 @@ namespace llaminar2
                                           allreduce_buffer,
                                           mpi_ctx_.get(),
                                           allreduce_count}),
-                                  device_idx);
+                                  device);
 
                     graph.addDependency(prefix + "wo_allreduce", wo_producer_node);
                     wo_producer_node = prefix + "wo_allreduce";
@@ -1282,7 +1285,7 @@ namespace llaminar2
 
             graph.addNode(prefix + "attn_residual",
                           ComputeStageFactory::createResidualAdd(res_params),
-                          device_idx);
+                          device);
 
             if (env.execution.exec_gemm && layer.wo && !wo_producer_node.empty())
             {
@@ -1299,7 +1302,7 @@ namespace llaminar2
         int layer_idx,
         int seq_len,
         int batch_size,
-        int device_idx)
+        DeviceId device)
     {
         ComputeGraph graph;
         const auto &env = debugEnv();
@@ -1311,6 +1314,7 @@ namespace llaminar2
         // Determine backend type
         auto &dm = DeviceManager::instance();
         ComputeBackendType backend = ComputeBackendType::CPU;
+        int device_idx = device.toLegacyIndex();
         if (static_cast<size_t>(device_idx) < dm.devices().size())
         {
             backend = dm.devices()[device_idx].type;
@@ -1333,7 +1337,7 @@ namespace llaminar2
 
             graph.addNode(prefix + "ffn_norm",
                           ComputeStageFactory::createRMSNorm(ffn_norm_params),
-                          device_idx);
+                          device);
         }
 
         // Stage 2: Gate and Up projections using FusedGateUpGEMMStage
@@ -1356,11 +1360,11 @@ namespace llaminar2
             gate_up_params.output_up = buffers.up;
             gate_up_params.n_up = up_n;
             gate_up_params.mpi_ctx = mpi_ctx_.get();
-            gate_up_params.device_idx = device_idx;
+            gate_up_params.device_id = device;
 
             graph.addNode(prefix + "gate_up_proj",
                           ComputeStageFactory::createFusedGateUpGEMM(gate_up_params),
-                          device_idx);
+                          device);
 
             if (env.execution.exec_rmsnorm)
             {
@@ -1379,7 +1383,7 @@ namespace llaminar2
 
             graph.addNode(prefix + "swiglu",
                           ComputeStageFactory::createSwiGLU(swiglu_params),
-                          device_idx);
+                          device);
 
             if (env.execution.exec_gemm)
             {
@@ -1404,8 +1408,9 @@ namespace llaminar2
                                   .k = down_k,
                                   .alpha = 1.0f,
                                   .beta = 0.0f,
-                                  .transpose_B = false}),
-                          device_idx);
+                                  .transpose_B = false,
+                                  .device_id = device}),
+                          device);
 
             if (env.execution.exec_swiglu)
             {
@@ -1429,7 +1434,7 @@ namespace llaminar2
                                       buffers.attn_proj,
                                       mpi_ctx_.get(),
                                       allreduce_count}),
-                              device_idx);
+                              device);
 
                 graph.addDependency(prefix + "down_allreduce", prefix + "down_proj");
             }
@@ -1453,7 +1458,7 @@ namespace llaminar2
 
             graph.addNode(prefix + "ffn_residual",
                           ComputeStageFactory::createResidualAdd(res_params),
-                          device_idx);
+                          device);
 
             if (env.execution.exec_gemm && layer.down_proj)
             {
@@ -1578,7 +1583,7 @@ namespace llaminar2
         TensorBase *normalized_out,
         const std::string &prev_node,
         int n_tokens,
-        int device_idx)
+        DeviceId device)
     {
         RMSNormStage::Params norm_params;
         norm_params.input = hidden;
@@ -1586,11 +1591,11 @@ namespace llaminar2
         norm_params.gamma = weights_.final_norm;
         norm_params.eps = config_.rms_norm_eps;
         norm_params.seq_len = n_tokens;
-        norm_params.device_idx = device_idx;
+        norm_params.device_id = device;
 
         graph.addNode("final_norm",
                       ComputeStageFactory::createRMSNorm(norm_params),
-                      device_idx);
+                      device);
 
         if (!prev_node.empty())
         {

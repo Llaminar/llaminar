@@ -36,7 +36,7 @@ namespace llaminar2::test
 
         void SetUp() override
         {
-            ctx_ = std::make_unique<CPUDeviceContext>(0, 4);
+            ctx_ = std::make_unique<CPUDeviceContext>(DeviceId::cpu(), 4);
         }
 
         // Helper: Create Q16_1 tensor with random data using static factory

@@ -21,6 +21,7 @@
 
 #include "ModelLoader.h"
 #include "WeightPlacementMap.h"
+#include "../backends/DeviceId.h"
 #include "../execution/GraphSchema.h"
 #include "../utils/MPIContext.h"
 #include "../tensors/Tensors.h"
@@ -92,11 +93,11 @@ namespace llaminar2
          * Device placement is determined by placement_map if provided.
          *
          * @param name GGUF tensor name (e.g., "token_embd.weight", "blk.0.attn_q.weight")
-         * @param device_idx Device override (if -1, use placement_map or default)
+         * @param device Device for tensor placement (default: CPU)
          * @param layer_idx Optional layer index for placement map lookup
          * @return Shared pointer to tensor, or nullptr on error
          */
-        std::shared_ptr<TensorBase> getWeight(const std::string &name, int device_idx = -1, int layer_idx = -1);
+        std::shared_ptr<TensorBase> getWeight(const std::string &name, DeviceId device = DeviceId::cpu(), int layer_idx = -1);
 
         /**
          * @brief Get current distribution strategy
@@ -194,12 +195,14 @@ namespace llaminar2
         std::shared_ptr<WeightPlacementMap> placementMap() const { return placement_map_; }
 
     private:
+        // Allow WeightPreloader to access cache_ directly for iteration
+        friend class WeightPreloader;
         /**
          * @brief Load weight with replicated strategy
          *
          * Each rank loads full tensor independently.
          */
-        std::shared_ptr<TensorBase> getReplicatedWeight(const std::string &name, int device_idx);
+        std::shared_ptr<TensorBase> getReplicatedWeight(const std::string &name, DeviceId device);
 
         /**
          * @brief Load weight with sharded strategy
@@ -209,14 +212,14 @@ namespace llaminar2
          * - Row-parallel: Wo, Down projections (split input dim)
          * - Replicated: Norms, biases, embeddings (full copy)
          */
-        std::shared_ptr<TensorBase> getShardedWeight(const std::string &name, int device_idx);
+        std::shared_ptr<TensorBase> getShardedWeight(const std::string &name, DeviceId device);
 
         /**
          * @brief Load weight with interleaved strategy (not yet implemented)
          *
          * NUMA-aware allocation with page interleaving.
          */
-        std::shared_ptr<TensorBase> getInterleavedWeight(const std::string &name, int device_idx);
+        std::shared_ptr<TensorBase> getInterleavedWeight(const std::string &name, DeviceId device);
 
         /**
          * @brief Determine sharding mode using config or legacy patterns

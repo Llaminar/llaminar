@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include "../backends/DeviceId.h"
 #include "../execution/RuntimeConfig.h" // for WeightPrecision
 #include "../tensors/TensorFactory.h"   // for owned_factory_
 #include <cstdint>
@@ -243,7 +244,7 @@ namespace llaminar2
         /**
          * @brief Load tensor from GGUF file with new weight precision API
          * @param tensor_name Name of tensor (e.g., "token_embd.weight", "blk.0.attn_q.weight")
-         * @param device_idx Device index for tensor placement (0 = CPU, 1+ = GPU)
+         * @param device Device for tensor placement (default: CPU)
          * @param weight_precision How to load the weight:
          *       - NATIVE: Keep in original GGUF format (default, dequantize on-the-fly)
          *       - CONVERT_TO_FP32: Dequantize to FP32 at load time
@@ -253,7 +254,7 @@ namespace llaminar2
          * @return Tensor with appropriate type or nullptr on error
          */
         std::shared_ptr<TensorBase> loadTensor(const std::string &tensor_name,
-                                               int device_idx = 0,
+                                               DeviceId device = DeviceId::cpu(),
                                                WeightPrecision weight_precision = WeightPrecision::NATIVE);
 
         /**
@@ -266,7 +267,7 @@ namespace llaminar2
          * @param tensor_name Name of tensor (e.g., "blk.0.attn_output.weight")
          * @param row_start First row to load (0-indexed)
          * @param row_end One past the last row to load
-         * @param device_idx Device index for tensor placement
+         * @param device Device for tensor placement (default: CPU)
          * @param weight_precision How to load the weight (NATIVE recommended)
          * @return Tensor with shape [row_end - row_start, cols] or nullptr on error
          *
@@ -275,7 +276,7 @@ namespace llaminar2
          */
         std::shared_ptr<TensorBase> loadTensorRowSlice(const std::string &tensor_name,
                                                        size_t row_start, size_t row_end,
-                                                       int device_idx = 0,
+                                                       DeviceId device = DeviceId::cpu(),
                                                        WeightPrecision weight_precision = WeightPrecision::NATIVE);
 
         /**
@@ -291,7 +292,7 @@ namespace llaminar2
          * @param tensor_name Name of tensor (e.g., "blk.0.ffn_down.weight")
          * @param col_start First column to load (0-indexed, block-aligned for quantized)
          * @param col_end One past the last column to load (block-aligned for quantized)
-         * @param device_idx Device index for tensor placement
+         * @param device Device for tensor placement (default: CPU)
          * @param weight_precision How to load the weight (NATIVE recommended)
          * @return Tensor with shape [rows, col_end - col_start] or nullptr on error
          *
@@ -300,7 +301,7 @@ namespace llaminar2
          */
         std::shared_ptr<TensorBase> loadTensorColumnSlice(const std::string &tensor_name,
                                                           size_t col_start, size_t col_end,
-                                                          int device_idx = 0,
+                                                          DeviceId device = DeviceId::cpu(),
                                                           WeightPrecision weight_precision = WeightPrecision::NATIVE);
 
     private:

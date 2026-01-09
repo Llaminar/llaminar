@@ -6,12 +6,14 @@
  */
 
 #include "InferenceRunnerFactory.h"
+#include "../backends/DeviceId.h"
 #include "../models/qwen/Qwen2Graph.h"
 #include "../models/qwen/Qwen2Schema.h"
 #include "GraphOrchestrator.h"
 #include "../loaders/ModelContext.h"
 #include "../loaders/ModelLoader.h"
 #include "../loaders/WeightManager.h"
+#include "../loaders/WeightPreloader.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 
@@ -22,13 +24,14 @@ namespace llaminar2
     static std::unique_ptr<IInferenceRunner> createGraphOrchestratorImpl(
         std::shared_ptr<ModelContext> model_ctx,
         std::shared_ptr<MPIContext> mpi_ctx,
-        int device_idx,
+        DeviceId device,
         const InferenceRunnerConfig &config,
         const std::string &architecture);
 
     static bool configureOrchestratorWeightsImpl(
         GraphOrchestrator *orchestrator,
-        std::shared_ptr<ModelContext> model_ctx);
+        std::shared_ptr<ModelContext> model_ctx,
+        DeviceId device);
 
     // =========================================================================
     // Factory Function
@@ -37,7 +40,7 @@ namespace llaminar2
     std::unique_ptr<IInferenceRunner> createInferenceRunner(
         std::shared_ptr<ModelContext> model_ctx,
         std::shared_ptr<MPIContext> mpi_ctx,
-        int device_idx,
+        DeviceId device,
         const InferenceRunnerConfig &config)
     {
         LOG_DEBUG("[InferenceRunner] createInferenceRunner called with mpi_ctx="
@@ -50,21 +53,19 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Validate device index - no magic values allowed
-        auto &dm = DeviceManager::instance();
-        if (!dm.isValidDeviceIndex(device_idx))
+        // Validate device
+        if (!device.is_valid())
         {
-            LOG_ERROR("[InferenceRunner] Invalid device_idx " << device_idx
-                                                              << ". Use DeviceManager::cpuDeviceIndex() for CPU, not -1.");
+            LOG_ERROR("[InferenceRunner] Invalid device " << device
+                                                          << ". Use DeviceId::cpu() for CPU.");
             return nullptr;
         }
-        LOG_DEBUG("[InferenceRunner] Using device index " << device_idx
-                                                          << " (type: " << static_cast<int>(dm.devices()[device_idx].type) << ")");
+        LOG_DEBUG("[InferenceRunner] Using device " << device);
 
         // Graph is the only execution path (as of January 2025 cleanup)
         std::string architecture = model_ctx->architecture();
         LOG_INFO("[InferenceRunner] Using GRAPH path");
-        return createGraphOrchestratorImpl(model_ctx, mpi_ctx, device_idx, config, architecture);
+        return createGraphOrchestratorImpl(model_ctx, mpi_ctx, device, config, architecture);
     }
 
     // =========================================================================
@@ -74,7 +75,7 @@ namespace llaminar2
     static std::unique_ptr<IInferenceRunner> createGraphOrchestratorImpl(
         std::shared_ptr<ModelContext> model_ctx,
         std::shared_ptr<MPIContext> mpi_ctx,
-        int device_idx,
+        DeviceId device,
         const InferenceRunnerConfig &config,
         const std::string &architecture)
     {
@@ -110,6 +111,11 @@ namespace llaminar2
         graph_config.max_seq_len = config.max_seq_len;
         graph_config.rope_theta = model.rope_theta;
         graph_config.rms_norm_eps = model.rms_norm_eps;
+
+        // CRITICAL: Set default device for kernel dispatch
+        // This determines which kernels (CPU vs CUDA) are selected for execution
+        graph_config.default_device = device;
+        LOG_DEBUG("[InferenceRunner] Default device: " << graph_config.default_device.to_string());
 
         // Propagate activation precision from runtime config
         // This determines buffer types (FP32/Q8_1) and kernel selection
@@ -315,14 +321,14 @@ namespace llaminar2
 
         // Initialize inference state (allocates buffers)
         if (!orchestrator->initializeInferenceState(
-                config.batch_size, config.max_seq_len, device_idx))
+                config.batch_size, config.max_seq_len, device))
         {
             LOG_ERROR("[InferenceRunner] Failed to initialize inference state");
             return nullptr;
         }
 
         // Load weights and configure orchestrator
-        if (!configureOrchestratorWeightsImpl(orchestrator.get(), model_ctx))
+        if (!configureOrchestratorWeightsImpl(orchestrator.get(), model_ctx, device))
         {
             LOG_ERROR("[InferenceRunner] Failed to configure orchestrator weights");
             return nullptr;
@@ -336,7 +342,8 @@ namespace llaminar2
 
     static bool configureOrchestratorWeightsImpl(
         GraphOrchestrator *orchestrator,
-        std::shared_ptr<ModelContext> model_ctx)
+        std::shared_ptr<ModelContext> model_ctx,
+        DeviceId device)
     {
         if (!orchestrator || !model_ctx)
         {
@@ -348,6 +355,29 @@ namespace llaminar2
         {
             LOG_ERROR("[InferenceRunner] No weight manager in model context");
             return false;
+        }
+
+        // =====================================================================
+        // Preload weights for target device BEFORE accessing them
+        // =====================================================================
+        // WeightPreloader creates device-targeted GEMM kernels (CPU or CUDA) and
+        // optionally releases raw tensor data to save memory.
+        // This MUST happen before weights are retrieved, as GEMM kernel creation
+        // requires the raw tensor data to still be available for packing.
+        // =====================================================================
+        DeviceType target_device = device.is_gpu() ? DeviceType::CUDA : DeviceType::CPU;
+        WeightPreloader preloader(weight_mgr);
+        if (!preloader.preloadForDevice(target_device))
+        {
+            LOG_WARN("[InferenceRunner] Weight preloading failed for device "
+                     << (target_device == DeviceType::CUDA ? "CUDA" : "CPU")
+                     << ", will use lazy kernel creation");
+            // Not fatal - kernels will be created lazily on first use
+        }
+        else
+        {
+            LOG_INFO("[InferenceRunner] Preloaded weights for "
+                     << (target_device == DeviceType::CUDA ? "CUDA" : "CPU"));
         }
 
         // Build Qwen2ModelWeights

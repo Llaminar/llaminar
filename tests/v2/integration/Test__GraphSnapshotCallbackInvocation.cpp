@@ -72,7 +72,7 @@ protected:
         rank_ = rank;
         world_size_ = world_size;
         mpi_ctx_ = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
-        ctx_ = std::make_unique<CPUDeviceContext>(0, 4); // device 0, 4 threads
+        ctx_ = std::make_unique<CPUDeviceContext>(DeviceId::cpu(), 4); // device 0, 4 threads
 
         // Clear tracking state
         invoked_stages_.clear();
@@ -178,7 +178,7 @@ TEST_F(GraphSnapshotCallbackTest, RMSNormStage_CallbackInvoked)
 
     // Build graph
     ComputeGraph graph;
-    graph.addNode("test_rmsnorm", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("test_rmsnorm", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
     // Create executor with snapshot callback
     GraphExecutorConfig config;
@@ -219,7 +219,7 @@ TEST_F(GraphSnapshotCallbackTest, SwiGLUStage_CallbackInvoked)
     params.seq_len = static_cast<int>(seq_len);
 
     ComputeGraph graph;
-    graph.addNode("test_swiglu", ComputeStageFactory::createSwiGLU(params), 0);
+    graph.addNode("test_swiglu", ComputeStageFactory::createSwiGLU(params), DeviceId::cpu());
 
     GraphExecutorConfig config;
     config.snapshot_callback = createTrackingCallback();
@@ -258,7 +258,7 @@ TEST_F(GraphSnapshotCallbackTest, ResidualAddStage_CallbackInvoked)
     params.num_elements = num_elements;
 
     ComputeGraph graph;
-    graph.addNode("test_residual", ComputeStageFactory::createResidualAdd(params), 0);
+    graph.addNode("test_residual", ComputeStageFactory::createResidualAdd(params), DeviceId::cpu());
 
     GraphExecutorConfig config;
     config.snapshot_callback = createTrackingCallback();
@@ -338,7 +338,7 @@ TEST_F(GraphSnapshotCallbackTest, FusedAttentionWoStage_CallbackInvoked)
     params.context_snapshot = context_snapshot;
 
     ComputeGraph graph;
-    graph.addNode("test_fused_attn_wo", ComputeStageFactory::createFusedAttentionWo(params), 0);
+    graph.addNode("test_fused_attn_wo", ComputeStageFactory::createFusedAttentionWo(params), DeviceId::cpu());
 
     GraphExecutorConfig config;
     config.snapshot_callback = createTrackingCallback();
@@ -440,7 +440,7 @@ TEST_F(GraphSnapshotCallbackTest, DISABLED_FusedAttentionWoStage_Q16IntegerBacke
     params.context_snapshot = context_snapshot;
 
     ComputeGraph graph;
-    graph.addNode("test_fused_attn_wo_q16", ComputeStageFactory::createFusedAttentionWo(params), 0);
+    graph.addNode("test_fused_attn_wo_q16", ComputeStageFactory::createFusedAttentionWo(params), DeviceId::cpu());
 
     GraphExecutorConfig config;
     config.snapshot_callback = createTrackingCallback();
@@ -545,7 +545,7 @@ TEST_F(GraphSnapshotCallbackTest, DISABLED_Q16IntegerBackend_SnapshotOutputsCorr
     params.context_snapshot = context_snapshot;
 
     ComputeGraph graph;
-    graph.addNode("attn_q16", ComputeStageFactory::createFusedAttentionWo(params), 0);
+    graph.addNode("attn_q16", ComputeStageFactory::createFusedAttentionWo(params), DeviceId::cpu());
 
     GraphExecutorConfig config;
     config.snapshot_callback = createTrackingCallback();
@@ -714,7 +714,7 @@ TEST_F(GraphSnapshotCallbackTest, DISABLED_Q16IntegerBackend_RejectsWrongTensorT
     params.fuse_residual_add = true;
 
     ComputeGraph graph;
-    graph.addNode("wrong_type_test", ComputeStageFactory::createFusedAttentionWo(params), 0);
+    graph.addNode("wrong_type_test", ComputeStageFactory::createFusedAttentionWo(params), DeviceId::cpu());
 
     GraphExecutorConfig config;
     GraphExecutor executor(config);
@@ -770,7 +770,7 @@ TEST_F(GraphSnapshotCallbackTest, MultiStageGraph_AllCallbacksInvoked)
         params.gamma = gamma;
         params.eps = 1e-5f;
         params.seq_len = static_cast<int>(seq_len);
-        graph.addNode("stage1_norm", ComputeStageFactory::createRMSNorm(params), 0);
+        graph.addNode("stage1_norm", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
     }
 
     // Stage 2: SwiGLU (simulating FFN activation)
@@ -780,7 +780,7 @@ TEST_F(GraphSnapshotCallbackTest, MultiStageGraph_AllCallbacksInvoked)
         params.up = up;
         params.output = swiglu_out;
         params.seq_len = static_cast<int>(seq_len);
-        graph.addNode("stage2_swiglu", ComputeStageFactory::createSwiGLU(params), 0);
+        graph.addNode("stage2_swiglu", ComputeStageFactory::createSwiGLU(params), DeviceId::cpu());
         graph.addDependency("stage2_swiglu", "stage1_norm");
     }
 
@@ -791,7 +791,7 @@ TEST_F(GraphSnapshotCallbackTest, MultiStageGraph_AllCallbacksInvoked)
         params.residual = input;
         params.output = residual_out;
         params.num_elements = seq_len * d_model;
-        graph.addNode("stage3_residual", ComputeStageFactory::createResidualAdd(params), 0);
+        graph.addNode("stage3_residual", ComputeStageFactory::createResidualAdd(params), DeviceId::cpu());
         graph.addDependency("stage3_residual", "stage2_swiglu");
     }
 
@@ -838,7 +838,7 @@ TEST_F(GraphSnapshotCallbackTest, NoCallback_NoFailure)
     params.seq_len = static_cast<int>(seq_len);
 
     ComputeGraph graph;
-    graph.addNode("test_norm", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("test_norm", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
     // NO callback set
     GraphExecutorConfig config;
@@ -877,7 +877,7 @@ TEST_F(GraphSnapshotCallbackTest, CallbackCanBeChanged)
     params.seq_len = static_cast<int>(seq_len);
 
     ComputeGraph graph;
-    graph.addNode("test_norm", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("test_norm", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
     GraphExecutorConfig config;
     config.snapshot_callback = createTrackingCallback();
@@ -928,7 +928,7 @@ TEST_F(GraphSnapshotCallbackTest, CallbackReceivesValidDumpInfo)
     params.seq_len = static_cast<int>(seq_len);
 
     ComputeGraph graph;
-    graph.addNode("test_norm", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("test_norm", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
     bool callback_invoked = false;
     StageDumpInfo captured_info;

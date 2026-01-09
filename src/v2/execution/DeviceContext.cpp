@@ -23,38 +23,24 @@ namespace llaminar2
     // Factory
     // =============================================================================
 
-    std::unique_ptr<IDeviceContext> IDeviceContext::create(int device_idx, int num_threads)
+    std::unique_ptr<IDeviceContext> IDeviceContext::create(DeviceId device, int num_threads)
     {
-        auto &dm = DeviceManager::instance();
-        const auto &devices = dm.devices();
-
-        if (device_idx < 0 || static_cast<size_t>(device_idx) >= devices.size())
-        {
-            LOG_ERROR("IDeviceContext::create: invalid device_idx " << device_idx
-                                                                    << " (valid range: 0-" << (devices.size() - 1) << ")"
-                                                                    << ". Use DeviceManager::cpuDeviceIndex() for CPU, not -1.");
-            throw std::invalid_argument("Invalid device_idx " + std::to_string(device_idx) +
-                                        ". Use DeviceManager::cpuDeviceIndex() for CPU.");
-        }
-
-        const auto &device = devices[device_idx];
-
         switch (device.type)
         {
-        case ComputeBackendType::CPU:
-            return std::make_unique<CPUDeviceContext>(device_idx, num_threads);
+        case DeviceType::CPU:
+            return std::make_unique<CPUDeviceContext>(device, num_threads);
 
-        case ComputeBackendType::GPU_CUDA:
+        case DeviceType::CUDA:
 #ifdef HAVE_CUDA
-            return std::make_unique<CUDADeviceContext>(device_idx, device.device_id);
+            return std::make_unique<CUDADeviceContext>(device, device.cuda_ordinal());
 #else
             LOG_ERROR("CUDA support not compiled in");
             return nullptr;
 #endif
 
-        case ComputeBackendType::GPU_ROCM:
+        case DeviceType::ROCm:
 #ifdef HAVE_ROCM
-            return std::make_unique<ROCmDeviceContext>(device_idx, device.device_id);
+            return std::make_unique<ROCmDeviceContext>(device, device.rocm_ordinal());
 #else
             LOG_ERROR("ROCm support not compiled in");
             return nullptr;
@@ -70,11 +56,11 @@ namespace llaminar2
     // CPUDeviceContext
     // =============================================================================
 
-    CPUDeviceContext::CPUDeviceContext(int device_idx, int num_threads)
-        : device_idx_(device_idx), num_threads_(num_threads > 0 ? num_threads : omp_get_max_threads())
+    CPUDeviceContext::CPUDeviceContext(DeviceId device, int num_threads)
+        : device_(device), num_threads_(num_threads > 0 ? num_threads : omp_get_max_threads())
     {
-        LOG_DEBUG("CPUDeviceContext created: device_idx=" << device_idx_
-                                                          << ", threads=" << num_threads_);
+        LOG_DEBUG("CPUDeviceContext created: device=" << device_.to_string()
+                                                      << ", threads=" << num_threads_);
     }
 
     CPUDeviceContext::~CPUDeviceContext()
@@ -262,12 +248,12 @@ namespace llaminar2
     // IGPUDeviceContext (Base for CUDA and ROCm)
     // =============================================================================
 
-    IGPUDeviceContext::IGPUDeviceContext(int device_idx, int gpu_device_id, ComputeBackendType backend_type)
-        : device_idx_(device_idx), gpu_device_id_(gpu_device_id), backend_type_(backend_type)
+    IGPUDeviceContext::IGPUDeviceContext(DeviceId device, int gpu_device_id, ComputeBackendType backend_type)
+        : device_(device), gpu_device_id_(gpu_device_id), backend_type_(backend_type)
     {
-        LOG_DEBUG("IGPUDeviceContext created: device_idx=" << device_idx_
-                                                           << ", gpu_device_id=" << gpu_device_id_
-                                                           << ", backend=" << static_cast<int>(backend_type_));
+        LOG_DEBUG("IGPUDeviceContext created: device=" << device_.to_string()
+                                                       << ", gpu_device_id=" << gpu_device_id_
+                                                       << ", backend=" << static_cast<int>(backend_type_));
     }
 
     IGPUDeviceContext::~IGPUDeviceContext()
@@ -360,8 +346,8 @@ namespace llaminar2
         return instance;
     }
 
-    CUDADeviceContext::CUDADeviceContext(int device_idx, int cuda_device_id)
-        : IGPUDeviceContext(device_idx, cuda_device_id, ComputeBackendType::GPU_CUDA)
+    CUDADeviceContext::CUDADeviceContext(DeviceId device, int cuda_device_id)
+        : IGPUDeviceContext(device, cuda_device_id, ComputeBackendType::GPU_CUDA)
     {
         // Set device to ensure proper context
         auto &backend = getCUDABackend();
@@ -485,8 +471,8 @@ namespace llaminar2
         return instance;
     }
 
-    ROCmDeviceContext::ROCmDeviceContext(int device_idx, int hip_device_id)
-        : IGPUDeviceContext(device_idx, hip_device_id, ComputeBackendType::GPU_ROCM)
+    ROCmDeviceContext::ROCmDeviceContext(DeviceId device, int hip_device_id)
+        : IGPUDeviceContext(device, hip_device_id, ComputeBackendType::GPU_ROCM)
     {
         // Set device to ensure proper context
         auto &backend = getROCmBackend();

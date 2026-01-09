@@ -120,7 +120,7 @@ protected:
     std::shared_ptr<IQ4_NLTensor> getWeightTensor()
     {
         // Get blk.0.attn_q.weight (896 x 896)
-        auto weight_base = loader_->loadTensor("blk.0.attn_q.weight", -1); // -1 = CPU
+        auto weight_base = loader_->loadTensor("blk.0.attn_q.weight", DeviceId::cpu()); // -1 = CPU
         EXPECT_NE(weight_base, nullptr) << "Failed to load weight tensor";
 
         auto weight = std::dynamic_pointer_cast<IQ4_NLTensor>(weight_base);

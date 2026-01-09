@@ -121,21 +121,7 @@ protected:
         config.max_seq_len = 512;
         config.activation_precision = ActivationPrecision::FP32;
 
-        // Convert DeviceId to device index
-        // CPU: use DeviceManager::instance().cpuDeviceIndex() (returns 0)
-        // GPU: use ordinal + 1 (GPU 0 -> index 1, GPU 1 -> index 2, etc.)
-        int device_idx;
-        if (device_id.is_cpu())
-        {
-            device_idx = DeviceManager::instance().cpuDeviceIndex();
-        }
-        else
-        {
-            // GPU ordinal to device index: GPU 0 -> 1, GPU 1 -> 2, etc.
-            device_idx = device_id.ordinal + 1;
-        }
-
-        result.runner = createInferenceRunner(result.model_ctx, nullptr, device_idx, config);
+        result.runner = createInferenceRunner(result.model_ctx, nullptr, device_id, config);
         return result;
     }
 

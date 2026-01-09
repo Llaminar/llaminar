@@ -47,8 +47,17 @@ namespace llaminar
             // Device Type Resolution
             // ==========================================================================
 
+            DeviceType KernelFactory::getDeviceType(llaminar2::DeviceId device_id)
+            {
+                // Direct type extraction from DeviceId - no DeviceManager lookup needed
+                // DeviceId already carries the type information
+                return device_id.type;
+            }
+
             DeviceType KernelFactory::getDeviceType(int device_idx)
             {
+                // Legacy overload: convert to DeviceId then delegate
+                // This maintains backward compatibility with existing callers
                 if (device_idx < 0)
                 {
                     return DeviceType::CPU;
@@ -2237,6 +2246,7 @@ namespace llaminar
             std::unordered_map<const llaminar2::TensorBase *, std::unique_ptr<llaminar2::ITensorGemm>> KernelFactory::kernel_cache_;
             std::mutex KernelFactory::cache_mutex_;
             std::unordered_map<KernelFactory::SlicedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, KernelFactory::SlicedKeyHash> KernelFactory::sliced_cache_;
+            std::unordered_map<KernelFactory::DeviceTargetedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, KernelFactory::DeviceTargetedKeyHash> KernelFactory::device_targeted_cache_;
 
             // ==========================================================================
             // Kernel Cache - Implementation
@@ -2662,6 +2672,132 @@ namespace llaminar
                 return raw_ptr;
             }
 
+            llaminar2::ITensorGemm *KernelFactory::getOrCreateGemm(
+                const llaminar2::TensorBase *tensor,
+                DeviceType target_device)
+            {
+                // If target is CPU, just delegate to the regular version
+                // Do this BEFORE acquiring lock to avoid deadlock
+                if (target_device == DeviceType::CPU)
+                {
+                    return getOrCreateGemm(tensor);
+                }
+
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+
+                // Check device-targeted cache first
+                DeviceTargetedCacheKey key{tensor, target_device};
+                auto it = device_targeted_cache_.find(key);
+                if (it != device_targeted_cache_.end())
+                {
+                    return it->second.get();
+                }
+
+                // Get tensor dimensions for validation
+                const auto &shape = tensor->shape();
+                if (shape.size() != 2)
+                {
+                    LOG_ERROR("[KernelFactory] Tensor must be 2D for GEMM, got " << shape.size() << "D");
+                    throw std::runtime_error("KernelFactory: tensor must be 2D");
+                }
+
+                auto tensor_dev_type = getDeviceType(tensor->current_dm_device_index());
+                LOG_DEBUG("[KernelFactory::getOrCreateGemm] Creating kernel with target device "
+                          << static_cast<int>(target_device)
+                          << " for tensor on device " << static_cast<int>(tensor_dev_type));
+
+                std::unique_ptr<llaminar2::ITensorGemm> kernel;
+
+                // Dispatch by tensor type, creating kernel for target_device
+#ifdef HAVE_CUDA
+                if (target_device == DeviceType::CUDA)
+                {
+                    // For CUDA target, create CUDA kernel regardless of where weights are stored
+                    // The weights will be uploaded to GPU on first use
+                    const auto *dispatch_tensor = tensor;
+
+                    // Handle TensorSlice - get inner tensor for type dispatch
+                    if (auto *slice = dynamic_cast<const llaminar2::TensorSlice *>(tensor))
+                    {
+                        if (!slice->supports_int8_unpack())
+                        {
+                            // Fall back to CPU for non-quantized slices on CUDA
+                            LOG_WARN("[KernelFactory] TensorSlice of non-quantized type not yet supported on CUDA, falling back to CPU");
+                            // Create CPU kernel inline instead of recursive call
+                            auto cpu_kernel = createGemm(dynamic_cast<const llaminar2::FP32Tensor *>(slice->inner()), DeviceType::CPU);
+                            if (cpu_kernel)
+                            {
+                                auto *raw_ptr = cpu_kernel.get();
+                                device_targeted_cache_[key] = std::move(cpu_kernel);
+                                return raw_ptr;
+                            }
+                            return nullptr;
+                        }
+                    }
+
+                    // Create CUDA kernel based on tensor type
+                    if (auto *t = dynamic_cast<const llaminar2::IQ4_NLTensor *>(dispatch_tensor))
+                    {
+                        kernel = createGemm(t, target_device);
+                    }
+                    else if (auto *t = dynamic_cast<const llaminar2::Q4_0Tensor *>(dispatch_tensor))
+                    {
+                        kernel = createGemm(t, target_device);
+                    }
+                    else if (auto *t = dynamic_cast<const llaminar2::Q8_0Tensor *>(dispatch_tensor))
+                    {
+                        kernel = createGemm(t, target_device);
+                    }
+                    else if (auto *t = dynamic_cast<const llaminar2::Q8_1Tensor *>(dispatch_tensor))
+                    {
+                        kernel = createGemm(t, target_device);
+                    }
+                    else if (auto *t = dynamic_cast<const llaminar2::FP32Tensor *>(dispatch_tensor))
+                    {
+                        kernel = createGemm(t, target_device);
+                    }
+                    else if (auto *t = dynamic_cast<const llaminar2::FP16Tensor *>(dispatch_tensor))
+                    {
+                        kernel = createGemm(t, target_device);
+                    }
+                    else if (auto *t = dynamic_cast<const llaminar2::BF16Tensor *>(dispatch_tensor))
+                    {
+                        kernel = createGemm(t, target_device);
+                    }
+                    else
+                    {
+                        LOG_WARN("[KernelFactory] Tensor type " << static_cast<int>(tensor->native_type())
+                                                                << " not supported on CUDA, falling back to CPU kernel");
+                        // Fall through to cache nullptr and return
+                    }
+                }
+#endif
+#ifdef HAVE_ROCM
+                else if (target_device == DeviceType::ROCm)
+                {
+                    LOG_WARN("[KernelFactory] ROCm device-targeted kernels not yet implemented");
+                    // Fall through
+                }
+#endif
+                else
+                {
+                    LOG_ERROR("[KernelFactory] Unsupported target device type: " << static_cast<int>(target_device));
+                }
+
+                if (!kernel)
+                {
+                    LOG_ERROR("[KernelFactory] Failed to create kernel for target device");
+                    return nullptr;
+                }
+
+                // Cache and return
+                auto *raw_ptr = kernel.get();
+                device_targeted_cache_[key] = std::move(kernel);
+                LOG_DEBUG("[KernelFactory] Cached device-targeted kernel: tensor="
+                          << static_cast<const void *>(tensor) << " device=" << static_cast<int>(target_device));
+                return raw_ptr;
+            }
+
             llaminar2::ITensorGemm *KernelFactory::getOrCreateGemmSliced(
                 const llaminar2::TensorBase *tensor,
                 size_t row_start,
@@ -2834,6 +2970,7 @@ namespace llaminar
 
                 kernel_cache_.clear();
                 sliced_cache_.clear();
+                device_targeted_cache_.clear();
             }
 
             std::pair<size_t, size_t> KernelFactory::cacheStats()
@@ -2841,8 +2978,8 @@ namespace llaminar
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 size_t total_bytes = 0;
                 // Note: Can't easily compute packed_bytes without RTTI to QuantisedGemmKernel
-                // For now, just return count (includes both caches)
-                return {kernel_cache_.size() + sliced_cache_.size(), total_bytes};
+                // For now, just return count (includes all caches)
+                return {kernel_cache_.size() + sliced_cache_.size() + device_targeted_cache_.size(), total_bytes};
             }
 
             // ==========================================================================

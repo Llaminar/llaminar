@@ -25,6 +25,7 @@
 #include "../../src/v2/tensors/TensorFactory.h"
 #include "../../src/v2/utils/MPIContext.h"
 #include "../../src/v2/utils/Logger.h"
+#include "../../src/v2/backends/DeviceId.h"
 
 namespace llaminar2
 {
@@ -121,7 +122,7 @@ namespace llaminar2
             LOG_DEBUG("Rank " << rank_ << " row slice: [" << row_start << ", " << row_end << ") = " << slice_rows << " rows");
 
             // Load only the row slice for this rank (memory-efficient)
-            auto slice_tensor = loader.loadTensorRowSlice(tensor_name, row_start, row_end, 0);
+            auto slice_tensor = loader.loadTensorRowSlice(tensor_name, row_start, row_end, DeviceId::cpu());
             ASSERT_NE(slice_tensor, nullptr) << "Failed to load tensor slice";
             ASSERT_EQ(slice_tensor->shape()[0], slice_rows);
             ASSERT_EQ(slice_tensor->shape()[1], full_cols);
@@ -222,7 +223,7 @@ namespace llaminar2
             if (rank_ == 0)
             {
                 // Load the full tensor for reference
-                auto full_tensor = loader.loadTensor(tensor_name, 0);
+                auto full_tensor = loader.loadTensor(tensor_name, DeviceId::cpu());
                 ASSERT_NE(full_tensor, nullptr) << "Failed to load full tensor";
 
                 auto full_gemm = full_tensor->createGemm();
@@ -297,7 +298,7 @@ namespace llaminar2
             size_t slice_rows = row_end - row_start;
 
             // Load pre-sliced tensor and wrap in TensorSlice
-            auto inner_tensor = loader.loadTensorRowSlice(tensor_name, row_start, row_end, 0);
+            auto inner_tensor = loader.loadTensorRowSlice(tensor_name, row_start, row_end, DeviceId::cpu());
             ASSERT_NE(inner_tensor, nullptr);
 
             // Create TensorSlice with inner_is_presliced=true
@@ -363,7 +364,7 @@ namespace llaminar2
             std::vector<float> full_output(M * N, 0.0f);
             if (rank_ == 0)
             {
-                auto full_tensor = loader.loadTensor(tensor_name, 0);
+                auto full_tensor = loader.loadTensor(tensor_name, DeviceId::cpu());
                 ASSERT_NE(full_tensor, nullptr);
                 auto full_gemm = full_tensor->createGemm();
                 ASSERT_NE(full_gemm, nullptr);
@@ -412,7 +413,7 @@ namespace llaminar2
             size_t row_end = (rank_ == world_size_ - 1) ? full_rows : (rank_ + 1) * rows_per_rank;
             size_t slice_rows = row_end - row_start;
 
-            auto slice_tensor = loader.loadTensorRowSlice(tensor_name, row_start, row_end, 0);
+            auto slice_tensor = loader.loadTensorRowSlice(tensor_name, row_start, row_end, DeviceId::cpu());
             ASSERT_NE(slice_tensor, nullptr);
 
             // Large batch
@@ -465,7 +466,7 @@ namespace llaminar2
             std::vector<float> full_output(M * N, 0.0f);
             if (rank_ == 0)
             {
-                auto full_tensor = loader.loadTensor(tensor_name, 0);
+                auto full_tensor = loader.loadTensor(tensor_name, DeviceId::cpu());
                 ASSERT_NE(full_tensor, nullptr);
                 auto full_gemm = full_tensor->createGemm();
                 ASSERT_NE(full_gemm, nullptr);

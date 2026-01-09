@@ -127,26 +127,28 @@ namespace llaminar2
     // Device Context Management
     // =========================================================================
 
-    IDeviceContext *GraphOrchestrator::getDeviceContext(int device_idx)
+    IDeviceContext *GraphOrchestrator::getDeviceContext(DeviceId device)
     {
-        auto it = device_contexts_.find(device_idx);
+        // Use legacy index as map key (device_contexts_ uses int keys)
+        int device_key = device.toLegacyIndex();
+        auto it = device_contexts_.find(device_key);
         if (it != device_contexts_.end())
         {
             return it->second.get();
         }
 
-        // Create new context
-        auto ctx = IDeviceContext::create(device_idx);
+        // Create new context using DeviceId
+        auto ctx = IDeviceContext::create(device);
         if (!ctx)
         {
-            LOG_ERROR("[GraphOrchestrator] Failed to create device context for device " << device_idx);
+            LOG_ERROR("[GraphOrchestrator] Failed to create device context for device " << device.toString());
             return nullptr;
         }
 
         IDeviceContext *raw_ptr = ctx.get();
-        device_contexts_[device_idx] = std::move(ctx);
+        device_contexts_[device_key] = std::move(ctx);
 
-        LOG_DEBUG("[GraphOrchestrator] Created device context for device " << device_idx);
+        LOG_DEBUG("[GraphOrchestrator] Created device context for device " << device.to_string());
         return raw_ptr;
     }
 
@@ -377,7 +379,7 @@ namespace llaminar2
 
         LOG_TRACE("[GraphOrchestrator] executeForward: batch_size=" << input.batch_size
                                                                     << ", seq_len=" << input.seq_len
-                                                                    << ", device=" << input.device_idx);
+                                                                    << ", device=" << input.device);
 
         // Build position IDs if not provided externally
         std::vector<int> position_ids_storage;
@@ -400,7 +402,7 @@ namespace llaminar2
         }
 
         // Get device context
-        IDeviceContext *ctx = getDeviceContext(input.device_idx);
+        IDeviceContext *ctx = getDeviceContext(input.device);
         if (!ctx)
         {
             LOG_ERROR("[GraphOrchestrator] Failed to get device context");
@@ -430,7 +432,7 @@ namespace llaminar2
         int seq_len,
         ICPUKVCache *kv_cache,
         const int *position_ids,
-        int device_idx)
+        DeviceId device)
     {
         // Debug: dump input to attention (for layer 0 only)
         if (layer_idx == 0)
@@ -442,7 +444,7 @@ namespace llaminar2
         }
 
         // Get device context
-        IDeviceContext *ctx = getDeviceContext(device_idx);
+        IDeviceContext *ctx = getDeviceContext(device);
         if (!ctx)
         {
             return false;
@@ -486,7 +488,7 @@ namespace llaminar2
 
             cache.attention_decode = std::make_unique<ComputeGraph>(
                 graph_builder_->buildAttentionGraph(layer, buffers, layer_idx, seq_len,
-                                                    1, kv_cache, position_ids, device_idx, nullptr));
+                                                    1, kv_cache, position_ids, device, nullptr));
             cache.cached_seq_len = seq_len;
             cache.valid = true;
             cache_stats_.attention_cache_misses++;
@@ -508,7 +510,7 @@ namespace llaminar2
         cache_stats_.attention_cache_misses++;
 
         ComputeGraph graph = graph_builder_->buildAttentionGraph(
-            layer, buffers, layer_idx, seq_len, 1, kv_cache, position_ids, device_idx, nullptr);
+            layer, buffers, layer_idx, seq_len, 1, kv_cache, position_ids, device, nullptr);
 
         // Debug: log graph structure
         if (layer_idx == 0)
@@ -546,10 +548,10 @@ namespace llaminar2
         Qwen2ActivationBuffers &buffers,
         int layer_idx,
         int seq_len,
-        int device_idx)
+        DeviceId device)
     {
         // Get device context
-        IDeviceContext *ctx = getDeviceContext(device_idx);
+        IDeviceContext *ctx = getDeviceContext(device);
         if (!ctx)
         {
             return false;
@@ -586,7 +588,7 @@ namespace llaminar2
                       << layer_idx << " (decode mode)");
 
             cache.ffn_decode = std::make_unique<ComputeGraph>(
-                graph_builder_->buildFFNGraph(layer, buffers, layer_idx, seq_len, 1, device_idx)); // batch_size=1 for decode
+                graph_builder_->buildFFNGraph(layer, buffers, layer_idx, seq_len, 1, device)); // batch_size=1 for decode
             cache_stats_.ffn_cache_misses++;
 
             // Execute the newly built graph
@@ -605,7 +607,7 @@ namespace llaminar2
         // =============================================================================
         cache_stats_.ffn_cache_misses++;
 
-        ComputeGraph graph = graph_builder_->buildFFNGraph(layer, buffers, layer_idx, seq_len, 1, device_idx); // batch_size=1 for deprecated path
+        ComputeGraph graph = graph_builder_->buildFFNGraph(layer, buffers, layer_idx, seq_len, 1, device); // batch_size=1 for deprecated path
 
         bool success = executor_.execute(graph, ctx);
 
@@ -624,19 +626,19 @@ namespace llaminar2
         int seq_len,
         ICPUKVCache *kv_cache,
         const int *position_ids,
-        int device_idx)
+        DeviceId device)
     {
         LOG_INFO("[GraphOrchestrator::executeLayer] LAYER_EXEC_ENTERED layer_idx="
                  << layer_idx << " seq_len=" << seq_len);
 
         // Execute attention block
-        if (!executeAttention(layer, buffers, layer_idx, seq_len, kv_cache, position_ids, device_idx))
+        if (!executeAttention(layer, buffers, layer_idx, seq_len, kv_cache, position_ids, device))
         {
             return false;
         }
 
         // Execute FFN block
-        if (!executeFFN(layer, buffers, layer_idx, seq_len, device_idx))
+        if (!executeFFN(layer, buffers, layer_idx, seq_len, device))
         {
             return false;
         }
@@ -729,7 +731,7 @@ namespace llaminar2
     bool GraphOrchestrator::initializeInferenceState(
         int batch_size,
         int max_seq_len,
-        int device_idx)
+        DeviceId device)
     {
         if (!graph_builder_)
         {
@@ -783,17 +785,17 @@ namespace llaminar2
         // Allocate core buffers (always FP32 - interface with embeddings/softmax)
         state_.hidden = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-            device_idx);
+            device);
         state_.logits = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(vocab_size)},
-            device_idx);
+            device);
 
         // Phase 5: Allocate local logits buffer for column-parallel LM head
         if (config.lm_head_column_parallel && config.vocab_local > 0)
         {
             state_.logits_local = factory.createFP32(
                 std::vector<size_t>{static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(config.vocab_local)},
-                device_idx);
+                device);
             LOG_DEBUG("[GraphOrchestrator] Allocated logits_local buffer: ["
                       << batch_size * max_seq_len << ", " << config.vocab_local << "]");
         }
@@ -801,7 +803,7 @@ namespace llaminar2
         // Allocate norm buffer (FP32 - output of RMSNorm for GEMM input)
         state_.normalized = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-            device_idx);
+            device);
 
         // Allocate residual buffer based on activation precision mode
         // HybridQ16 uses Q16_1 for 266× better precision than Q8_1 in the residual stream
@@ -810,13 +812,13 @@ namespace llaminar2
             LOG_INFO("[GraphOrchestrator] Using Q16_1 residual stream for HybridQ16 mode");
             state_.residual = factory.createQ16_1(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-                device_idx);
+                device);
         }
         else
         {
             state_.residual = factory.createFP32(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-                device_idx);
+                device);
         }
 
         // QKV buffers - use per-projection precision for HybridQ16 mode
@@ -835,15 +837,15 @@ namespace llaminar2
 
         state_.Q = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
-            q_prec, device_idx);
+            q_prec, device);
         // K buffer: Q16_1 for HybridQ16 mode to preserve small values
         // Pass head_dim for optimal Q16 block size (1 block per head)
         state_.K = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-            k_prec, head_dim, device_idx);
+            k_prec, head_dim, device);
         state_.V = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-            v_prec, device_idx);
+            v_prec, device);
 
         // Hybrid/HybridQ16 mode: Allocate separate FP32 buffers for Q/K after RoPE
         // This eliminates the requantization step in RoPE
@@ -863,13 +865,13 @@ namespace llaminar2
             // Pass head_dim for Q16 block size selection (must match KV cache block size)
             state_.Q_rope = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
-                q_rope_prec, head_dim, device_idx);
+                q_rope_prec, head_dim, device);
             LOG_INFO("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
                                             << " mode: allocating K_rope buffer ("
                                             << activationPrecisionToString(k_rope_prec) << ")");
             state_.K_rope = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-                k_rope_prec, head_dim, device_idx);
+                k_rope_prec, head_dim, device);
 
             // V_dequant: buffer for V before KV cache append
             // V is Q8_1 from GEMM, needs to match KV cache precision (FP32 for Hybrid, Q16_1 for HybridQ16)
@@ -877,7 +879,7 @@ namespace llaminar2
                 act_prec, HybridBufferType::KV_Cache, nullptr);
             state_.V_dequant = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-                kv_cache_prec, head_dim, device_idx);
+                kv_cache_prec, head_dim, device);
             LOG_INFO("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
                                             << " mode: allocating V_dequant buffer ("
                                             << activationPrecisionToString(kv_cache_prec) << ")");
@@ -900,7 +902,7 @@ namespace llaminar2
             act_prec, HybridBufferType::Attention_Context, nullptr);
         state_.attn_output = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
-            attn_ctx_prec, device_idx);
+            attn_ctx_prec, device);
 
         // attn_proj is the output of Wo projection which feeds into the residual stream
         // HybridQ16 mode: Q8_1 (native add to Q16_1 residual via q16_1_add_q8_1)
@@ -909,13 +911,13 @@ namespace llaminar2
         {
             state_.attn_proj = factory.createQ8_1(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-                device_idx);
+                device);
         }
         else
         {
             state_.attn_proj = factory.createFP32(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-                device_idx);
+                device);
         }
 
         // FFN buffers - gate and up are kept FP32 to avoid triple quantization in SwiGLU
@@ -923,12 +925,12 @@ namespace llaminar2
             act_prec, HybridBufferType::FFN_Gate, nullptr);
         state_.gate = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
-            gate_prec, device_idx);
+            gate_prec, device);
         ActivationPrecision up_prec = resolveBufferPrecision(
             act_prec, HybridBufferType::FFN_Up, nullptr);
         state_.up = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
-            up_prec, device_idx);
+            up_prec, device);
         // ffn_output is the output of FFN Down projection which feeds into the residual stream
         // HybridQ16 mode: Q8_1 (native add to Q16_1 residual via q16_1_add_q8_1)
         // Other modes: FP32 for numerical stability in residual connections
@@ -936,35 +938,35 @@ namespace llaminar2
         {
             state_.ffn_output = factory.createQ8_1(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-                device_idx);
+                device);
         }
         else
         {
             state_.ffn_output = factory.createFP32(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-                device_idx);
+                device);
         }
 
         // Attention workspace - use local head counts for tensor parallelism
         // scores: [batch_size * buffer_n_heads, max_seq_len, max_seq_len]
         state_.workspace_scores = factory.createFP32(
             {static_cast<size_t>(batch_size * buffer_n_heads * max_seq_len), static_cast<size_t>(max_seq_len)},
-            device_idx);
+            device);
         // context: [batch_size * buffer_n_heads, max_seq_len, head_dim]
         state_.workspace_context = factory.createFP32(
             {static_cast<size_t>(batch_size * buffer_n_heads * max_seq_len), static_cast<size_t>(head_dim)},
-            device_idx);
+            device);
         // mask: [batch_size, max_seq_len, max_seq_len]
         state_.workspace_mask = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(max_seq_len)},
-            device_idx);
+            device);
 
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
         // Allocate context snapshot buffer for debugging attention
         // Shape: [batch_size * max_seq_len, buffer_n_heads * head_dim]
         state_.context_snapshot = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
-            device_idx);
+            device);
         LOG_DEBUG("[GraphOrchestrator] Allocated context_snapshot buffer: ["
                   << batch_size * max_seq_len << ", " << buffer_n_heads * head_dim << "]");
 
@@ -972,7 +974,7 @@ namespace llaminar2
         // Shape: [batch_size * max_seq_len, d_model]
         state_.attention_output_snapshot = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-            device_idx);
+            device);
         LOG_DEBUG("[GraphOrchestrator] Allocated attention_output_snapshot buffer: ["
                   << batch_size * max_seq_len << ", " << d_model << "]");
 
@@ -980,7 +982,7 @@ namespace llaminar2
         // Shape: [batch_size * max_seq_len, d_model]
         state_.attention_residual_snapshot = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-            device_idx);
+            device);
         LOG_DEBUG("[GraphOrchestrator] Allocated attention_residual_snapshot buffer: ["
                   << batch_size * max_seq_len << ", " << d_model << "]");
 #endif
@@ -1023,7 +1025,7 @@ namespace llaminar2
                 config.local_n_kv_heads,
                 kv_head_start,
                 head_dim,
-                device_idx,
+                device,
                 kv_layout_mode);
         }
         else
@@ -1037,7 +1039,7 @@ namespace llaminar2
                 max_seq_len,
                 n_kv_heads,
                 head_dim,
-                device_idx,
+                device,
                 kv_layout_mode);
         }
 
@@ -1050,7 +1052,7 @@ namespace llaminar2
         state_.max_seq_len = max_seq_len;
         state_.d_model = d_model;
         state_.vocab_size = vocab_size;
-        state_.device_idx = device_idx;
+        state_.device_id = device;
 
         LOG_INFO("[GraphOrchestrator] Inference state initialized successfully");
         return true;
@@ -1158,7 +1160,7 @@ namespace llaminar2
         input.batch_size = batch_size;
         input.seq_len = seq_len;
         input.position_offset = state_.positions[0]; // Legacy compat
-        input.device_idx = state_.device_idx;
+        input.device = state_.device_id;
         input.kv_cache = state_.kv_cache.get();
         // Pass sequence_lengths for batch-aware attention masking
         // This enables proper separation of sequences in batched execution

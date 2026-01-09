@@ -44,7 +44,7 @@ protected:
 TEST_F(IQ4_NL_Alignment_Layout, CheckAlignedVectorUsage)
 {
     // Load a weight tensor
-    auto weight = loader_->loadTensor("blk.0.attn_q.weight", -1);
+    auto weight = loader_->loadTensor("blk.0.attn_q.weight", DeviceId::cpu());
     ASSERT_NE(weight, nullptr);
 
     auto iq4_nl = std::dynamic_pointer_cast<IQ4_NLTensor>(weight);
@@ -87,7 +87,7 @@ TEST_F(IQ4_NL_Alignment_Layout, CheckAlignedVectorUsage)
 TEST_F(IQ4_NL_Alignment_Layout, CheckWeightLayout)
 {
     // Load Q-projection weight (should be [d_model, d_model] = [896, 896])
-    auto q_weight = loader_->loadTensor("blk.0.attn_q.weight", -1);
+    auto q_weight = loader_->loadTensor("blk.0.attn_q.weight", DeviceId::cpu());
     ASSERT_NE(q_weight, nullptr);
 
     auto iq4_nl = std::dynamic_pointer_cast<IQ4_NLTensor>(q_weight);
@@ -145,7 +145,7 @@ TEST_F(IQ4_NL_Alignment_Layout, CheckWeightLayout)
  */
 TEST_F(IQ4_NL_Alignment_Layout, CheckGEMMAlignment)
 {
-    auto q_weight = loader_->loadTensor("blk.0.attn_q.weight", -1);
+    auto q_weight = loader_->loadTensor("blk.0.attn_q.weight", DeviceId::cpu());
     ASSERT_NE(q_weight, nullptr);
 
     auto iq4_nl = std::dynamic_pointer_cast<IQ4_NLTensor>(q_weight);
@@ -191,7 +191,7 @@ TEST_F(IQ4_NL_Alignment_Layout, CheckGEMMAlignment)
  */
 TEST_F(IQ4_NL_Alignment_Layout, CheckTransposeFlag)
 {
-    auto q_weight = loader_->loadTensor("blk.0.attn_q.weight", -1);
+    auto q_weight = loader_->loadTensor("blk.0.attn_q.weight", DeviceId::cpu());
     ASSERT_NE(q_weight, nullptr);
 
     auto iq4_nl = std::dynamic_pointer_cast<IQ4_NLTensor>(q_weight);

@@ -34,7 +34,7 @@ class ResidualAddStagePrecisionTest : public ::testing::Test
 protected:
     void SetUp() override
     {
-        ctx_ = std::make_unique<CPUDeviceContext>(0, 4);
+        ctx_ = std::make_unique<CPUDeviceContext>(DeviceId::cpu(), 4);
         ASSERT_NE(ctx_, nullptr);
 
         // Initialize RNG for test data

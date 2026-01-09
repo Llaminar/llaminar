@@ -33,6 +33,7 @@
 #include "DeviceContext.h"
 #include "WorkDistributor.h"
 #include "GraphBufferManager.h"
+#include "../backends/DeviceId.h"
 #include "../utils/DebugEnv.h" // For LLAMINAR_ASSERTIONS_ACTIVE
 #include <memory>
 #include <vector>
@@ -55,12 +56,12 @@ namespace llaminar2
         std::string name;                      ///< Node identifier
         std::unique_ptr<IComputeStage> stage;  ///< The compute stage
         std::vector<std::string> dependencies; ///< Names of nodes this depends on
-        int device_idx;                        ///< Target device for execution
+        DeviceId device;                       ///< Target device for execution
         bool completed;                        ///< Execution complete flag
 
-        ComputeNode() : device_idx(-1), completed(false) {}
-        ComputeNode(std::string n, std::unique_ptr<IComputeStage> s, int dev = -1)
-            : name(std::move(n)), stage(std::move(s)), device_idx(dev), completed(false) {}
+        ComputeNode() : device(DeviceId::cpu()), completed(false) {}
+        ComputeNode(std::string n, std::unique_ptr<IComputeStage> s, DeviceId dev = DeviceId::cpu())
+            : name(std::move(n)), stage(std::move(s)), device(dev), completed(false) {}
     };
 
     /**
@@ -88,12 +89,12 @@ namespace llaminar2
          * @brief Add a node to the graph
          * @param name Unique node identifier
          * @param stage The compute stage to execute
-         * @param device_idx Target device (-1 for auto)
+         * @param device Target device (DeviceId::cpu() for auto/CPU)
          * @return Reference to this graph for chaining
          */
         ComputeGraph &addNode(const std::string &name,
                               std::unique_ptr<IComputeStage> stage,
-                              int device_idx = -1);
+                              DeviceId device = DeviceId::cpu());
 
         /**
          * @brief Add a dependency between nodes

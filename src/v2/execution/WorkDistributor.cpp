@@ -54,11 +54,11 @@ namespace llaminar2
         }
     }
 
-    WorkDistributor::WorkDistributor(int world_size, int rank, int device_idx)
+    WorkDistributor::WorkDistributor(int world_size, int rank, DeviceId device)
         : WorkDistributor(Config{
               .world_size = world_size,
               .rank = rank,
-              .devices = device_idx >= 0 ? std::vector<int>{device_idx} : std::vector<int>{0},
+              .devices = device.is_valid() ? std::vector<int>{device.toLegacyIndex()} : std::vector<int>{0},
               .device_weights = {}})
     {
     }
@@ -161,13 +161,14 @@ namespace llaminar2
         return weights;
     }
 
-    WorkDistributor::WorkSlice WorkDistributor::getDeviceSlice(size_t rank_elements, int device_idx) const
+    WorkDistributor::WorkSlice WorkDistributor::getDeviceSlice(size_t rank_elements, DeviceId device) const
     {
         // Find device position in our list
+        int device_idx = device.toLegacyIndex();
         auto it = std::find(config_.devices.begin(), config_.devices.end(), device_idx);
         if (it == config_.devices.end())
         {
-            throw std::invalid_argument("WorkDistributor::getDeviceSlice: device_idx not in devices list");
+            throw std::invalid_argument("WorkDistributor::getDeviceSlice: device not in devices list");
         }
         size_t device_pos = std::distance(config_.devices.begin(), it);
 
@@ -286,7 +287,7 @@ namespace llaminar2
         {
             result.push_back(HierarchicalSlice{
                 .rank = config_.rank,
-                .device_idx = dev_slice.owner,
+                .device = DeviceId::fromLegacyIndex(dev_slice.owner),
                 .global_start = rank_slice.start + dev_slice.start,
                 .global_end = rank_slice.start + dev_slice.end,
                 .local_start = dev_slice.start,
@@ -303,7 +304,7 @@ namespace llaminar2
         {
             return HierarchicalSlice{
                 .rank = config_.rank,
-                .device_idx = config_.devices.empty() ? 0 : config_.devices[0],
+                .device = DeviceId::fromLegacyIndex(config_.devices.empty() ? 0 : config_.devices[0]),
                 .global_start = 0,
                 .global_end = 0,
                 .local_start = 0,
@@ -364,12 +365,12 @@ namespace llaminar2
 
         if (config_.devices.empty() || num_experts == 0)
         {
-            // No devices configured - all experts on "device -1"
+            // No devices configured - all experts on invalid device
             for (int e = 0; e < num_experts; ++e)
             {
                 assignments.push_back(ExpertAssignment{
                     .expert_id = e,
-                    .device_idx = -1,
+                    .device = DeviceId::invalid(),
                     .rank = config_.rank});
             }
             return assignments;
@@ -405,7 +406,7 @@ namespace llaminar2
             {
                 assignments.push_back(ExpertAssignment{
                     .expert_id = expert_idx++,
-                    .device_idx = config_.devices[d],
+                    .device = DeviceId::fromLegacyIndex(config_.devices[d]),
                     .rank = config_.rank});
             }
         }
@@ -421,12 +422,12 @@ namespace llaminar2
         int num_experts) const
     {
         // Build expert-to-device lookup
-        std::vector<int> expert_to_device(num_experts, -1);
+        std::vector<DeviceId> expert_to_device(num_experts, DeviceId::invalid());
         for (const auto &assignment : expert_assignments)
         {
             if (assignment.expert_id >= 0 && assignment.expert_id < num_experts)
             {
-                expert_to_device[assignment.expert_id] = assignment.device_idx;
+                expert_to_device[assignment.expert_id] = assignment.device;
             }
         }
 
@@ -436,7 +437,7 @@ namespace llaminar2
         for (int e = 0; e < num_experts; ++e)
         {
             routings[e].expert_id = e;
-            routings[e].device_idx = expert_to_device[e];
+            routings[e].device = expert_to_device[e];
         }
 
         for (int s = 0; s < seq_len; ++s)
@@ -495,12 +496,12 @@ namespace llaminar2
 
     std::vector<int> WorkDistributor::getExpertsForDevice(
         const std::vector<ExpertAssignment> &expert_assignments,
-        int device_idx)
+        DeviceId device)
     {
         std::vector<int> experts;
         for (const auto &assignment : expert_assignments)
         {
-            if (assignment.device_idx == device_idx)
+            if (assignment.device == device)
             {
                 experts.push_back(assignment.expert_id);
             }

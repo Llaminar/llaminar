@@ -359,7 +359,7 @@ namespace llaminar2
     }
 
     std::shared_ptr<TensorBase> ModelLoader::loadTensor(const std::string &tensor_name,
-                                                        int device_idx,
+                                                        DeviceId device,
                                                         WeightPrecision weight_precision)
     {
         if (!loaded_)
@@ -424,8 +424,8 @@ namespace llaminar2
             shape.push_back(static_cast<size_t>(d));
         }
 
-        // TODO: Use device_idx for device placement when V2 supports it
-        (void)device_idx; // Suppress unused parameter warning
+        // TODO: Use device for device placement when V2 supports it
+        (void)device; // Suppress unused parameter warning
 
         // WEIGHT PRECISION HANDLING:
         // - NATIVE (default): Keep weights in original GGUF format, no conversion
@@ -747,7 +747,7 @@ namespace llaminar2
     std::shared_ptr<TensorBase> ModelLoader::loadTensorRowSlice(
         const std::string &tensor_name,
         size_t row_start, size_t row_end,
-        int device_idx,
+        DeviceId device,
         WeightPrecision weight_precision)
     {
         if (!loaded_)
@@ -883,7 +883,7 @@ namespace llaminar2
         case GGUFTensorType::F32:
             if (factory_)
             {
-                auto fp32_tensor = factory_->createFP32(slice_shape, device_idx);
+                auto fp32_tensor = factory_->createFP32(slice_shape, device);
                 std::memcpy(fp32_tensor->mutable_data(), raw.data(), raw.size());
                 tensor = std::move(fp32_tensor);
             }
@@ -1156,7 +1156,7 @@ namespace llaminar2
     std::shared_ptr<TensorBase> ModelLoader::loadTensorColumnSlice(
         const std::string &tensor_name,
         size_t col_start, size_t col_end,
-        int device_idx,
+        DeviceId device,
         WeightPrecision weight_precision)
     {
         if (!loaded_)
@@ -1330,7 +1330,7 @@ namespace llaminar2
         case GGUFTensorType::F32:
             if (factory_)
             {
-                auto fp32_tensor = factory_->createFP32(slice_shape, device_idx);
+                auto fp32_tensor = factory_->createFP32(slice_shape, device);
                 std::memcpy(fp32_tensor->mutable_data(), raw.data(), raw.size());
                 tensor = std::move(fp32_tensor);
             }

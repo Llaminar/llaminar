@@ -61,7 +61,7 @@ namespace llaminar2
                                                      << " tensor_type=" << input_base->dtype_name());
 
         // Create kernel via KernelFactory with automatic type dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
         auto kernel = llaminar::v2::kernels::KernelFactory::createRMSNorm(input_base, dev_type);
         if (!kernel)
         {
@@ -79,7 +79,7 @@ namespace llaminar2
             hidden_dim,
             params_.eps,
             params_.mpi_ctx,
-            params_.device_idx);
+            params_.device_id.toLegacyIndex());
 
         // === Stage Tracing (Task 3) ===
         if (success)

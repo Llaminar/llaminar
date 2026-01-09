@@ -6,6 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "backends/DeviceId.h"
 #include <memory>
 
 namespace llaminar2
@@ -68,7 +69,7 @@ namespace llaminar2
 
             // Optional MPI context
             const MPIContext *mpi_ctx = nullptr;
-            int device_idx = -1;
+            DeviceId device_id = DeviceId::cpu();
 
             // Optional context snapshot buffer for debugging
             ITensor *context_snapshot = nullptr;

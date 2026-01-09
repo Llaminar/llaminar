@@ -279,13 +279,12 @@ namespace llaminar2::test
         // Create graph with mock stage
         ComputeGraph graph;
         graph.addNode("test_stage",
-                      std::make_unique<MockValidationStage>(data.data(), 4, 4),
-                      0);
+                      std::make_unique<MockValidationStage>(data.data(), 4, 4), DeviceId::cpu());
 
         // Execute
         GraphExecutorConfig config;
         GraphExecutor executor(config);
-        CPUDeviceContext ctx(0);
+        CPUDeviceContext ctx(DeviceId::cpu());
 
         bool success = executor.execute(graph, &ctx);
 
@@ -305,13 +304,12 @@ namespace llaminar2::test
         // Create graph with mock stage
         ComputeGraph graph;
         graph.addNode("test_stage",
-                      std::make_unique<MockValidationStage>(data.data(), 4, 4),
-                      0);
+                      std::make_unique<MockValidationStage>(data.data(), 4, 4), DeviceId::cpu());
 
         // Execute - should succeed (warning only)
         GraphExecutorConfig config;
         GraphExecutor executor(config);
-        CPUDeviceContext ctx(0);
+        CPUDeviceContext ctx(DeviceId::cpu());
 
         bool success = executor.execute(graph, &ctx);
 
@@ -331,13 +329,12 @@ namespace llaminar2::test
         // Create graph with mock stage
         ComputeGraph graph;
         graph.addNode("test_stage",
-                      std::make_unique<MockValidationStage>(data.data(), 4, 4),
-                      0);
+                      std::make_unique<MockValidationStage>(data.data(), 4, 4), DeviceId::cpu());
 
         // Execute - should throw VerificationFailure exception (fail-fast behavior)
         GraphExecutorConfig config;
         GraphExecutor executor(config);
-        CPUDeviceContext ctx(0);
+        CPUDeviceContext ctx(DeviceId::cpu());
 
         EXPECT_THROW({
             executor.execute(graph, &ctx);
@@ -361,13 +358,12 @@ namespace llaminar2::test
         // Create graph with mock stage
         ComputeGraph graph;
         graph.addNode("test_stage",
-                      std::make_unique<MockValidationStage>(data.data(), 4, 4),
-                      0);
+                      std::make_unique<MockValidationStage>(data.data(), 4, 4), DeviceId::cpu());
 
         // Execute - should succeed (warning only)
         GraphExecutorConfig config;
         GraphExecutor executor(config);
-        CPUDeviceContext ctx(0);
+        CPUDeviceContext ctx(DeviceId::cpu());
 
         bool success = executor.execute(graph, &ctx);
 
@@ -391,13 +387,12 @@ namespace llaminar2::test
         // Create graph with mock stage
         ComputeGraph graph;
         graph.addNode("test_stage",
-                      std::make_unique<MockValidationStage>(data.data(), 4, 4),
-                      0);
+                      std::make_unique<MockValidationStage>(data.data(), 4, 4), DeviceId::cpu());
 
         // Execute - should throw VerificationFailure exception (fail-fast behavior)
         GraphExecutorConfig config;
         GraphExecutor executor(config);
-        CPUDeviceContext ctx(0);
+        CPUDeviceContext ctx(DeviceId::cpu());
 
         EXPECT_THROW({
             executor.execute(graph, &ctx);
@@ -417,13 +412,12 @@ namespace llaminar2::test
         // Create graph with mock stage
         ComputeGraph graph;
         graph.addNode("test_stage",
-                      std::make_unique<MockValidationStage>(data.data(), 4, 4),
-                      0);
+                      std::make_unique<MockValidationStage>(data.data(), 4, 4), DeviceId::cpu());
 
         // Execute - should succeed because validation is disabled
         GraphExecutorConfig config;
         GraphExecutor executor(config);
-        CPUDeviceContext ctx(0);
+        CPUDeviceContext ctx(DeviceId::cpu());
 
         bool success = executor.execute(graph, &ctx);
 

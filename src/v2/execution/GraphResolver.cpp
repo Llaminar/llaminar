@@ -16,6 +16,7 @@
 #include "GraphResolver.h"
 #include "GraphExecutor.h" // For ComputeGraph
 #include "compute_stages/ComputeStages.h"
+#include "../backends/DeviceId.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 #include "../tensors/Tensors.h"
@@ -296,7 +297,7 @@ namespace llaminar2
         ResolvedStage resolved;
         resolved.name = expandStageName(spec.name, layer_idx);
         resolved.type = spec.type;
-        resolved.device_idx = (spec.device_idx >= 0) ? spec.device_idx : runtime.default_device;
+        resolved.device = spec.device.is_valid() ? spec.device : runtime.default_device;
 
         // ==============================================================
         // Resolve tensor references
@@ -390,7 +391,7 @@ namespace llaminar2
             ResolvedStage allreduce;
             allreduce.name = resolved.name + "_allreduce";
             allreduce.type = StageType::Allreduce;
-            allreduce.device_idx = resolved.device_idx;
+            allreduce.device = resolved.device;
             allreduce.dependencies.push_back(resolved.name);
 
             // The output buffer is the first output of the resolved stage
@@ -433,7 +434,7 @@ namespace llaminar2
             ResolvedStage allgather;
             allgather.name = resolved.name + "_allgather";
             allgather.type = StageType::Allgather;
-            allgather.device_idx = resolved.device_idx;
+            allgather.device = resolved.device;
             allgather.dependencies.push_back(resolved.name);
 
             // Input is local logits, output is full logits
@@ -625,7 +626,7 @@ namespace llaminar2
             params.num_tokens = stage.int_params.count("num_tokens") ? stage.int_params.at("num_tokens") : seq_len;
             params.d_model = d_model;
             params.vocab_size = stage.int_params.count("vocab_size") ? stage.int_params.at("vocab_size") : 0;
-            params.device_idx = stage.device_idx;
+            params.device_id = stage.device;
             return ComputeStageFactory::createEmbedding(params);
         }
 
@@ -637,7 +638,7 @@ namespace llaminar2
             params.output = stage.outputs.size() > 0 ? stage.outputs[0] : nullptr;
             params.eps = stage.float_params.count("eps") ? stage.float_params.at("eps") : 1e-6f;
             params.seq_len = seq_len;
-            params.device_idx = stage.device_idx;
+            params.device_id = stage.device;
             return ComputeStageFactory::createRMSNorm(params);
         }
 
@@ -720,7 +721,7 @@ namespace llaminar2
             params.attention_mode = static_cast<AttentionMode>(
                 stage.int_params.count("attention_mode") ? stage.int_params.at("attention_mode") : 0);
             params.auto_detect_mode = true;
-            params.device_idx = stage.device_idx;
+            params.device_id = stage.device;
             return ComputeStageFactory::createAttentionCompute(params);
         }
 
@@ -756,7 +757,7 @@ namespace llaminar2
                 params.n_gate = static_cast<int>(params.w_gate->shape()[0]);
             if (params.w_up)
                 params.n_up = static_cast<int>(params.w_up->shape()[0]);
-            params.device_idx = stage.device_idx;
+            params.device_id = stage.device;
             return ComputeStageFactory::createFusedGateUpGEMM(params);
         }
 
@@ -792,7 +793,7 @@ namespace llaminar2
             params.d_model = d_model;
             params.vocab_size = stage.int_params.count("vocab_size") ? stage.int_params.at("vocab_size") : 0;
             params.bias = nullptr;
-            params.device_idx = stage.device_idx;
+            params.device_id = stage.device;
             return ComputeStageFactory::createLMHead(params);
         }
 
@@ -842,7 +843,7 @@ namespace llaminar2
             std::unique_ptr<IComputeStage> compute_stage = createStage(stage);
 
             // Add node to graph
-            graph.addNode(stage.name, std::move(compute_stage), stage.device_idx);
+            graph.addNode(stage.name, std::move(compute_stage), stage.device);
 
             // Add dependencies
             for (const auto &dep : stage.dependencies)
@@ -950,7 +951,7 @@ namespace llaminar2
         resolved.alias_group = spec.alias_group;
         resolved.alias_priority = spec.alias_priority;
         resolved.description = spec.description;
-        resolved.device_idx = 0; // Default device
+        resolved.device = DeviceId::cpu(); // Default device
 
         // Resolve each shape dimension
         resolved.shape.reserve(spec.shape.size());
@@ -1080,7 +1081,7 @@ namespace llaminar2
             desc.shape = buf.shape;
             desc.tensor_type = tensor_type;
             desc.role = role;
-            desc.device_idx = buf.device_idx;
+            desc.device = buf.device;
 
             reqs.buffers.push_back(std::move(desc));
         }

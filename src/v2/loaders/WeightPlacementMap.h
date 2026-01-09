@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "../backends/DeviceId.h"
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -40,12 +41,12 @@ namespace llaminar2
     public:
         /**
          * @brief Construct a placement map with a default device
-         * @param default_device_idx Device index to use when no specific rule matches
+         * @param default_device Default device to use when no specific rule matches
          */
-        explicit WeightPlacementMap(int default_device_idx = 0);
+        explicit WeightPlacementMap(DeviceId default_device = DeviceId::cpu());
 
         /**
-         * @brief Get the device index for a specific weight tensor
+         * @brief Get the device for a specific weight tensor
          *
          * Lookup priority:
          * 1. Exact tensor name match
@@ -55,43 +56,43 @@ namespace llaminar2
          *
          * @param tensor_name Full tensor name (e.g., "blk.0.attn_q.weight")
          * @param layer_idx Optional layer index for layer-based lookup (-1 = not a layer weight)
-         * @return Device index where this tensor should be allocated
+         * @return DeviceId where this tensor should be allocated
          */
-        int getDeviceForWeight(const std::string &tensor_name, int layer_idx = -1) const;
+        DeviceId getDeviceForWeight(const std::string &tensor_name, int layer_idx = -1) const;
 
         /**
          * @brief Explicitly map a specific tensor to a device
          * @param tensor_name Exact tensor name
-         * @param device_idx Target device index
+         * @param device Target device
          */
-        void setTensorDevice(const std::string &tensor_name, int device_idx);
+        void setTensorDevice(const std::string &tensor_name, DeviceId device);
 
         /**
          * @brief Map an entire layer to a device (bulk assignment)
          * @param layer_idx Layer index (0-based)
-         * @param device_idx Target device index
+         * @param device Target device
          */
-        void setLayerDevice(int layer_idx, int device_idx);
+        void setLayerDevice(int layer_idx, DeviceId device);
 
         /**
          * @brief Map a range of layers to a device
          * @param start_layer First layer (inclusive)
          * @param end_layer Last layer (inclusive)
-         * @param device_idx Target device index
+         * @param device Target device
          */
-        void setLayerRange(int start_layer, int end_layer, int device_idx);
+        void setLayerRange(int start_layer, int end_layer, DeviceId device);
 
         /**
          * @brief Set a pattern-based rule (e.g., all "embed.*" → device 0)
          * @param pattern Regex or simple glob pattern
-         * @param device_idx Target device index
+         * @param device Target device
          */
-        void setPatternDevice(const std::string &pattern, int device_idx);
+        void setPatternDevice(const std::string &pattern, DeviceId device);
 
         /**
          * @brief Get the default device for unmapped weights
          */
-        int defaultDevice() const { return default_device_idx_; }
+        DeviceId defaultDevice() const { return default_device_; }
 
         /**
          * @brief Get total number of explicit tensor mappings
@@ -116,9 +117,9 @@ namespace llaminar2
          * - blk.{layer_idx}.attn_norm.weight
          *
          * @param layer_idx Layer index
-         * @param device_idx Device index
+         * @param device Target device
          */
-        void setAttentionDevice(int layer_idx, int device_idx);
+        void setAttentionDevice(int layer_idx, DeviceId device);
 
         /**
          * @brief Get device for attention block in a layer
@@ -126,9 +127,9 @@ namespace llaminar2
          * Returns device for attn_q (assumes all attention tensors co-located)
          *
          * @param layer_idx Layer index
-         * @return Device index where attention tensors reside
+         * @return DeviceId where attention tensors reside
          */
-        int getAttentionDevice(int layer_idx) const;
+        DeviceId getAttentionDevice(int layer_idx) const;
 
         /**
          * @brief Set device for all FFN tensors in a layer
@@ -140,9 +141,9 @@ namespace llaminar2
          * - blk.{layer_idx}.ffn_norm.weight
          *
          * @param layer_idx Layer index
-         * @param device_idx Device index
+         * @param device Target device
          */
-        void setFFNDevice(int layer_idx, int device_idx);
+        void setFFNDevice(int layer_idx, DeviceId device);
 
         /**
          * @brief Get device for FFN block in a layer
@@ -150,9 +151,9 @@ namespace llaminar2
          * Returns device for ffn_gate (assumes all FFN tensors co-located)
          *
          * @param layer_idx Layer index
-         * @return Device index where FFN tensors reside
+         * @return DeviceId where FFN tensors reside
          */
-        int getFFNDevice(int layer_idx) const;
+        DeviceId getFFNDevice(int layer_idx) const;
 
         // ========== MoE-Specific Methods (Phase 2) ==========
 
@@ -163,17 +164,17 @@ namespace llaminar2
          * Maps tensor name pattern: "shared_expert.{expert_idx}.*"
          *
          * @param expert_idx Expert index
-         * @param device_idx Device index
+         * @param device Target device
          */
-        void setSharedExpertDevice(int expert_idx, int device_idx);
+        void setSharedExpertDevice(int expert_idx, DeviceId device);
 
         /**
          * @brief Get device for shared expert
          *
          * @param expert_idx Expert index
-         * @return Device index, or default if not set
+         * @return DeviceId, or default if not set
          */
-        int getSharedExpertDevice(int expert_idx) const;
+        DeviceId getSharedExpertDevice(int expert_idx) const;
 
         /**
          * @brief Set device for local expert in specific layer (MoE models)
@@ -183,18 +184,18 @@ namespace llaminar2
          *
          * @param layer_idx Layer index
          * @param expert_idx Expert index within layer
-         * @param device_idx Device index
+         * @param device Target device
          */
-        void setLocalExpertDevice(int layer_idx, int expert_idx, int device_idx);
+        void setLocalExpertDevice(int layer_idx, int expert_idx, DeviceId device);
 
         /**
          * @brief Get device for local expert in specific layer
          *
          * @param layer_idx Layer index
          * @param expert_idx Expert index within layer
-         * @return Device index, or default if not set
+         * @return DeviceId, or default if not set
          */
-        int getLocalExpertDevice(int layer_idx, int expert_idx) const;
+        DeviceId getLocalExpertDevice(int layer_idx, int expert_idx) const;
 
         /**
          * @brief Clear all mappings (reset to default device only)
@@ -245,14 +246,14 @@ namespace llaminar2
          */
         bool matchesPattern(const std::string &tensor_name, const std::string &pattern) const;
 
-        int default_device_idx_;                                 ///< Fallback device
-        std::unordered_map<std::string, int> tensor_to_device_;  ///< Explicit tensor → device
-        std::vector<int> layer_to_device_;                       ///< Layer index → device
-        std::unordered_map<std::string, int> pattern_to_device_; ///< Pattern → device
+        DeviceId default_device_;                                     ///< Fallback device
+        std::unordered_map<std::string, DeviceId> tensor_to_device_;  ///< Explicit tensor → device
+        std::vector<DeviceId> layer_to_device_;                       ///< Layer index → device
+        std::unordered_map<std::string, DeviceId> pattern_to_device_; ///< Pattern → device
 
         // MoE-specific mappings (Phase 2)
-        std::unordered_map<int, int> shared_expert_to_device_;        ///< Shared expert index → device
-        std::unordered_map<std::string, int> local_expert_to_device_; ///< "layer_X:expert_Y" → device
+        std::unordered_map<int, DeviceId> shared_expert_to_device_;        ///< Shared expert index → device
+        std::unordered_map<std::string, DeviceId> local_expert_to_device_; ///< "layer_X:expert_Y" → device
 
         // PlacementPlan tracking
         bool plan_applied_ = false;         ///< Whether applyPlan() has been called

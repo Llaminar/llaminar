@@ -26,7 +26,7 @@ protected:
     void SetUp() override
     {
         // Construct CPUDeviceContext directly (bypasses DeviceManager check)
-        ctx_ = std::make_unique<CPUDeviceContext>(0, 4);
+        ctx_ = std::make_unique<CPUDeviceContext>(DeviceId::cpu(), 4);
         ASSERT_NE(ctx_, nullptr);
     }
 
@@ -118,7 +118,7 @@ TEST_F(LayerExecutorTest, SingleNodeGraph)
     params.eps = 1e-5f;
 
     auto stage = ComputeStageFactory::createRMSNorm(params);
-    graph.addNode("norm", std::move(stage), 0);
+    graph.addNode("norm", std::move(stage), DeviceId::cpu());
 
     EXPECT_EQ(graph.size(), 1);
     EXPECT_FALSE(graph.allCompleted());
@@ -144,9 +144,9 @@ TEST_F(LayerExecutorTest, LinearDependencyChain)
     params.gamma = gamma.get();
     params.eps = 1e-5f;
 
-    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), 0);
-    graph.addNode("B", ComputeStageFactory::createRMSNorm(params), 0);
-    graph.addNode("C", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
+    graph.addNode("B", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
+    graph.addNode("C", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
     graph.addDependency("B", "A");
     graph.addDependency("C", "B");
@@ -181,10 +181,10 @@ TEST_F(LayerExecutorTest, DiamondDependency)
     params.gamma = gamma.get();
     params.eps = 1e-5f;
 
-    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), 0);
-    graph.addNode("B", ComputeStageFactory::createRMSNorm(params), 0);
-    graph.addNode("C", ComputeStageFactory::createRMSNorm(params), 0);
-    graph.addNode("D", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
+    graph.addNode("B", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
+    graph.addNode("C", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
+    graph.addNode("D", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
     graph.addDependency("B", "A");
     graph.addDependency("C", "A");
@@ -222,9 +222,9 @@ TEST_F(LayerExecutorTest, GetReadyNodes)
     params.eps = 1e-5f;
 
     // A -> B, C (no deps)
-    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), 0);
-    graph.addNode("B", ComputeStageFactory::createRMSNorm(params), 0);
-    graph.addNode("C", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
+    graph.addNode("B", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
+    graph.addNode("C", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
     graph.addDependency("B", "A");
 
@@ -260,8 +260,8 @@ TEST_F(LayerExecutorTest, GraphReset)
     params.gamma = gamma.get();
     params.eps = 1e-5f;
 
-    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), 0);
-    graph.addNode("B", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
+    graph.addNode("B", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
     // Mark both complete
     graph.markCompleted("A");
@@ -292,8 +292,8 @@ TEST_F(LayerExecutorTest, TotalEstimatedFlops)
     params.gamma = gamma.get();
     params.eps = 1e-5f;
 
-    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), 0);
-    graph.addNode("B", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
+    graph.addNode("B", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
     size_t expected_flops = 2 * (4 * 10 * 64); // Two stages
     EXPECT_EQ(graph.totalEstimatedFlops(), expected_flops);
@@ -327,7 +327,7 @@ TEST_F(LayerExecutorTest, ExecuteNullContext)
     params.gamma = gamma.get();
     params.eps = 1e-5f;
 
-    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
     EXPECT_FALSE(executor.execute(graph, nullptr));
 }
@@ -352,7 +352,7 @@ TEST_F(LayerExecutorTest, ExecuteSequential)
     params.gamma = gamma.get();
     params.eps = 1e-5f;
 
-    graph.addNode("norm", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("norm", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
     bool result = false;
     try
@@ -394,7 +394,7 @@ TEST_F(LayerExecutorTest, ExecuteParallel)
     params.gamma = gamma.get();
     params.eps = 1e-5f;
 
-    graph.addNode("norm", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("norm", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
     bool result = false;
     try
@@ -429,8 +429,8 @@ TEST_F(LayerExecutorTest, ExecuteWithDependencies)
     params.gamma = gamma.get();
     params.eps = 1e-5f;
 
-    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), 0);
-    graph.addNode("B", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
+    graph.addNode("B", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
     graph.addDependency("B", "A");
 
     bool result = false;
@@ -471,7 +471,7 @@ TEST_F(LayerExecutorTest, StatsTracking)
     params.gamma = gamma.get();
     params.eps = 1e-5f;
 
-    graph.addNode("norm", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("norm", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
     try
     {
@@ -506,7 +506,7 @@ TEST_F(LayerExecutorTest, StatsReset)
     params.gamma = gamma.get();
     params.eps = 1e-5f;
 
-    graph.addNode("norm", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("norm", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
     try
     {
@@ -552,7 +552,7 @@ TEST_F(LayerExecutorTest, ExecuteMultiDeviceEmptyContexts)
     params.gamma = gamma.get();
     params.eps = 1e-5f;
 
-    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
     std::unordered_map<int, IDeviceContext *> contexts; // Empty
     EXPECT_FALSE(executor.executeMultiDevice(graph, contexts));
@@ -576,7 +576,7 @@ TEST_F(LayerExecutorTest, ExecuteMultiDeviceSingleContext)
     params.gamma = gamma.get();
     params.eps = 1e-5f;
 
-    graph.addNode("norm", ComputeStageFactory::createRMSNorm(params), 0);
+    graph.addNode("norm", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
 
     std::unordered_map<int, IDeviceContext *> contexts;
     contexts[0] = ctx_.get();
@@ -613,13 +613,13 @@ TEST_F(LayerExecutorTest, DuplicateNodeName)
     params.eps = 1e-5f;
 
     // Add same name twice - should replace
-    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), 0);
-    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), 1);
+    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), DeviceId::cpu());
+    graph.addNode("A", ComputeStageFactory::createRMSNorm(params), DeviceId::cuda(1));
 
     EXPECT_EQ(graph.size(), 1);
 
     auto *node = graph.getNode("A");
-    EXPECT_EQ(node->device_idx, 1); // Second assignment should win
+    EXPECT_EQ(node->device, DeviceId::cuda(1)); // Second assignment should win
 }
 
 TEST_F(LayerExecutorTest, GetNodeNotFound)

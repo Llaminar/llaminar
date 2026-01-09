@@ -103,7 +103,7 @@ namespace llaminar2
 
             // Delegate to kernel's apply_tensor - handles all type dispatch internally
             if (!kernel->apply_tensor(embed_table_base, flat_token_ids.data(), total_positions,
-                                      params_.d_model, output_base, params_.mpi_ctx, params_.device_idx))
+                                      params_.d_model, output_base, params_.mpi_ctx, params_.device_id.toLegacyIndex()))
             {
                 LOG_ERROR("[EmbeddingStage] Kernel apply_tensor failed (batched)");
                 return false;
@@ -128,7 +128,7 @@ namespace llaminar2
         {
             // Single sequence input: delegate directly to kernel
             if (!kernel->apply_tensor(embed_table_base, params_.token_ids, params_.num_tokens,
-                                      params_.d_model, output_base, params_.mpi_ctx, params_.device_idx))
+                                      params_.d_model, output_base, params_.mpi_ctx, params_.device_id.toLegacyIndex()))
             {
                 LOG_ERROR("[EmbeddingStage] Kernel apply_tensor failed");
                 return false;
@@ -323,7 +323,7 @@ namespace llaminar2
         info.addScalarInt("num_tokens", params_.num_tokens);
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarInt("vocab_size", params_.vocab_size);
-        info.addScalarInt("device_idx", params_.device_idx);
+        info.addScalarInt("device_id", params_.device_id.toLegacyIndex());
 
         return info;
     }

@@ -6,6 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "backends/DeviceId.h"
 
 namespace llaminar2
 {
@@ -32,10 +33,10 @@ namespace llaminar2
             const ITensor *A = nullptr; ///< Input activation tensor [m, k]
             const ITensor *B = nullptr; ///< Weight tensor [k, n] (may be quantized)
             ITensor *C = nullptr;       ///< Output tensor [m, n]
-            int m = 0, n = 0, k = 0;       ///< Matrix dimensions
-            float alpha = 1.0f;            ///< Scale factor for A*B
-            float beta = 0.0f;             ///< Scale factor for existing C
-            bool transpose_B = false;      ///< Whether B is transposed (n × k)
+            int m = 0, n = 0, k = 0;    ///< Matrix dimensions
+            float alpha = 1.0f;         ///< Scale factor for A*B
+            float beta = 0.0f;          ///< Scale factor for existing C
+            bool transpose_B = false;   ///< Whether B is transposed (n × k)
 
             // =================================================================
             // Bias Configuration (Enhanced for Tensor Parallelism)
@@ -73,7 +74,7 @@ namespace llaminar2
 
             // MPI context for tensor-parallel execution (optional)
             const MPIContext *mpi_ctx = nullptr;
-            int device_idx = -1;
+            DeviceId device_id = DeviceId::cpu();
 
             // =================================================================
             // Tensor Parallelism Parameters (Phase 2)

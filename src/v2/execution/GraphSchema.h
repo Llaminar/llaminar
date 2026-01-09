@@ -23,6 +23,7 @@
 
 #pragma once
 
+#include "../backends/DeviceId.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -173,8 +174,8 @@ namespace llaminar2
         /// Only used if is_optional = true
         std::string exec_policy_key;
 
-        /// Device index override (-1 = use default)
-        int device_idx = -1;
+        /// Device override (CPU = use default)
+        DeviceId device = DeviceId::cpu();
 
         // =================================================================
         // Stage-specific parameters (declarative, not pointers)
@@ -447,7 +448,7 @@ namespace llaminar2
         std::vector<TensorBase *> outputs; ///< Resolved output tensors
         std::vector<std::string> dependencies;
 
-        int device_idx = 0;
+        DeviceId device = DeviceId::cpu();
 
         // =================================================================
         // Stage-specific resolved parameters

@@ -18,6 +18,7 @@
 #include "execution/DeviceContext.h"
 #include "execution/ILayerExecutor.h" // For ILayerExecutor interface
 #include "execution/LayerExecutor.h"  // For ComputeGraph
+#include "backends/DeviceId.h"
 #include <vector>
 #include <string>
 #include <functional>
@@ -336,12 +337,12 @@ namespace llaminar2
         public:
             MockGraphBuilder &addNode(const std::string &name,
                                       ComputeStageType type = ComputeStageType::GEMM,
-                                      int device_idx = 0)
+                                      DeviceId device = DeviceId::cpu())
             {
                 auto stage = std::make_unique<MockComputeStage>(type, name);
                 stage->setExecutionLog(&execution_log_);
                 stages_[name] = stage.get();
-                nodes_.push_back({name, std::move(stage), device_idx});
+                nodes_.push_back({name, std::move(stage), device});
                 return *this;
             }
 
@@ -362,9 +363,9 @@ namespace llaminar2
             ComputeGraph build()
             {
                 ComputeGraph graph;
-                for (auto &[name, stage, device_idx] : nodes_)
+                for (auto &[name, stage, device] : nodes_)
                 {
-                    graph.addNode(name, std::move(stage), device_idx);
+                    graph.addNode(name, std::move(stage), device);
                 }
                 for (auto &[node, depends_on] : dependencies_)
                 {
@@ -384,7 +385,7 @@ namespace llaminar2
             {
                 std::string name;
                 std::unique_ptr<MockComputeStage> stage;
-                int device_idx;
+                DeviceId device;
             };
 
             std::vector<NodeInfo> nodes_;

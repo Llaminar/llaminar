@@ -6,6 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "backends/DeviceId.h"
 
 namespace llaminar2
 {
@@ -80,7 +81,7 @@ namespace llaminar2
             int position_offset = 0;
 
             // Device placement
-            int device_idx = -1;
+            DeviceId device_id = DeviceId::cpu();
 
             // Tensor Parallelism Parameters
             int head_start = 0;

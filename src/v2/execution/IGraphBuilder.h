@@ -17,6 +17,7 @@
 #pragma once
 
 #include "GraphExecutor.h"
+#include "../backends/DeviceId.h"
 
 namespace llaminar2
 {
@@ -40,13 +41,13 @@ namespace llaminar2
      */
     struct ForwardInput
     {
-        const int *token_ids = nullptr;      ///< Token IDs [batch_size * seq_len]
-        const int *position_ids = nullptr;   ///< Position IDs [batch_size * seq_len]
-        int batch_size = 1;                  ///< Number of sequences
-        int seq_len = 0;                     ///< Sequence length per batch
-        int position_offset = 0;             ///< KV cache position offset (legacy fallback)
-        int device_idx = 0;                  ///< Target device index
-        ICPUKVCache *kv_cache = nullptr; ///< KV cache (optional)
+        const int *token_ids = nullptr;    ///< Token IDs [batch_size * seq_len]
+        const int *position_ids = nullptr; ///< Position IDs [batch_size * seq_len]
+        int batch_size = 1;                ///< Number of sequences
+        int seq_len = 0;                   ///< Sequence length per batch
+        int position_offset = 0;           ///< KV cache position offset (legacy fallback)
+        DeviceId device = DeviceId::cpu(); ///< Target device
+        ICPUKVCache *kv_cache = nullptr;   ///< KV cache (optional)
 
         virtual ~ForwardInput() = default;
     };
@@ -67,12 +68,12 @@ namespace llaminar2
      */
     struct LayerContext
     {
-        int layer_idx = 0;                   ///< Layer index
-        int seq_len = 0;                     ///< Sequence length
-        int batch_size = 1;                  ///< Batch size (number of sequences)
-        int device_idx = 0;                  ///< Target device
-        const int *position_ids = nullptr;   ///< Position IDs for RoPE
-        ICPUKVCache *kv_cache = nullptr; ///< KV cache
+        int layer_idx = 0;                 ///< Layer index
+        int seq_len = 0;                   ///< Sequence length
+        int batch_size = 1;                ///< Batch size (number of sequences)
+        DeviceId device = DeviceId::cpu(); ///< Target device
+        const int *position_ids = nullptr; ///< Position IDs for RoPE
+        ICPUKVCache *kv_cache = nullptr;   ///< KV cache
         /// Sequence lengths for variable-length batching (nullptr = all equal)
         const std::vector<int> *sequence_lengths = nullptr;
     };

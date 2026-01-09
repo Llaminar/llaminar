@@ -29,6 +29,7 @@
 #include "tensors/CPUKVCache.h"
 #include "tensors/BlockStructures.h"
 #include "utils/MPIContext.h"
+#include "backends/DeviceId.h"
 #include <cstring>
 #include <cmath>
 #include <vector>
@@ -171,7 +172,7 @@ namespace llaminar2
 
             // Use the type alias for Q16_1 cache
             CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
-                                      n_kv_heads, head_dim, -1);
+                                  n_kv_heads, head_dim, DeviceId::cpu());
 
             // Get the K and V tensors via the polymorphic interface (layer 0, seq 0)
             const ITensor *k_base = cache.get_k(0, 0);

@@ -162,10 +162,14 @@ namespace llaminar2
         auto *B_base = requireTensorBase(params_.B, "weight B");
 
         // Get kernel - either full or sliced
+        // Use device-targeted kernel creation if params specifies GPU device
         llaminar2::ITensorGemm *gemm = nullptr;
+        auto target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+
         if (is_sliced)
         {
             // Use sliced kernel for tensor parallelism
+            // TODO: Add device-targeted version of getOrCreateGemmSliced if needed
             gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmSliced(
                 B_base, params_.output_range.start, params_.output_range.end);
             LOG_DEBUG("[GEMMStage] Using sliced kernel for rows [" << params_.output_range.start
@@ -173,8 +177,8 @@ namespace llaminar2
         }
         else
         {
-            // Use full kernel
-            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(B_base);
+            // Use device-targeted kernel creation
+            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(B_base, target_dev_type);
         }
 
         if (!gemm)
@@ -230,7 +234,7 @@ namespace llaminar2
                     params_.m, effective_n, params_.k,
                     params_.transpose_B,
                     params_.alpha, params_.beta,
-                    params_.mpi_ctx, params_.device_idx);
+                    params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
 
                 // === Stage Tracing (Task 3) ===
                 if (success)
@@ -263,7 +267,7 @@ namespace llaminar2
                 nullptr, nullptr,       // No softmax buffers
                 (params_.beta != 0.0f), // Accumulate if beta != 0
                 params_.alpha, params_.beta,
-                params_.mpi_ctx, params_.device_idx,
+                params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),
                 gate_fp32,
                 params_.do_swiglu);
 
@@ -281,7 +285,7 @@ namespace llaminar2
         // Use multiply_tensor if available for type-aware dispatch
         if (gemm->multiply_tensor(A_base_fallback, C_base_fallback, params_.m, effective_n, params_.k,
                                   params_.transpose_B, params_.alpha, params_.beta,
-                                  params_.mpi_ctx, params_.device_idx))
+                                  params_.mpi_ctx, params_.device_id.toKernelDeviceIndex()))
         {
             // === Stage Tracing (Task 3) ===
             traceOutput("C", params_.C);
@@ -395,7 +399,7 @@ namespace llaminar2
         info.addScalar("beta", params_.beta);
         info.addScalarBool("transpose_B", params_.transpose_B);
         info.addScalarBool("do_swiglu", params_.do_swiglu);
-        info.addScalarInt("device_idx", params_.device_idx);
+        info.addScalarInt("device_id", params_.device_id.toLegacyIndex());
 
         return info;
     }

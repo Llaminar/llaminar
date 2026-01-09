@@ -26,16 +26,17 @@ using namespace llaminar2;
 TEST(Test__DeviceContext, CreateCPUContextDirect)
 {
     // Construct CPUDeviceContext directly (bypasses DeviceManager check)
-    auto ctx = std::make_unique<CPUDeviceContext>(0);
+    auto ctx = std::make_unique<CPUDeviceContext>(DeviceId::cpu());
 
     ASSERT_NE(ctx, nullptr);
-    EXPECT_EQ(ctx->deviceIndex(), 0);
+    // DeviceId::cpu().toLegacyIndex() returns -1 (NOT_ON_GPU convention)
+    EXPECT_EQ(ctx->deviceIndex(), -1);
     EXPECT_FALSE(ctx->isGPU());
 }
 
 TEST(Test__DeviceContext, CreateWithThreadCount)
 {
-    auto ctx = std::make_unique<CPUDeviceContext>(0, 4);
+    auto ctx = std::make_unique<CPUDeviceContext>(DeviceId::cpu(), 4);
 
     ASSERT_NE(ctx, nullptr);
     // Thread count should be either 4 or fall back to OMP_NUM_THREADS
@@ -51,7 +52,7 @@ class CPUDeviceContextTest : public ::testing::Test
 protected:
     void SetUp() override
     {
-        ctx = std::make_unique<CPUDeviceContext>(0);
+        ctx = std::make_unique<CPUDeviceContext>(DeviceId::cpu());
         ASSERT_NE(ctx, nullptr);
     }
 
@@ -316,14 +317,14 @@ TEST_F(CPUDeviceContextTest, NestedRunForSafe)
 
 TEST(Test__DeviceContext, BackendTypeProperties)
 {
-    auto ctx = std::make_unique<CPUDeviceContext>(0); // CPU device
+    auto ctx = std::make_unique<CPUDeviceContext>(DeviceId::cpu()); // CPU device
     ASSERT_NE(ctx, nullptr);
     EXPECT_FALSE(ctx->isGPU());
 }
 
 TEST(Test__DeviceContext, NumThreads)
 {
-    auto ctx = std::make_unique<CPUDeviceContext>(0);
+    auto ctx = std::make_unique<CPUDeviceContext>(DeviceId::cpu());
     ASSERT_NE(ctx, nullptr);
 
     // Should have at least 1 thread
@@ -349,7 +350,7 @@ TEST(Test__DeviceContext, IGPUDeviceContextInterface)
 
     // We can't instantiate IGPUDeviceContext directly, but we can verify
     // the CPU context properly returns false for isGPU
-    auto cpu_ctx = std::make_unique<CPUDeviceContext>(0);
+    auto cpu_ctx = std::make_unique<CPUDeviceContext>(DeviceId::cpu());
     EXPECT_FALSE(cpu_ctx->isGPU());
 }
 
@@ -371,7 +372,7 @@ TEST(Test__DeviceContext, CUDAContextRequiresGPU)
         if (devices[i].type == ComputeBackendType::GPU_CUDA)
         {
             found_cuda = true;
-            auto ctx = IDeviceContext::create(static_cast<int>(i));
+            auto ctx = IDeviceContext::create(DeviceId::cuda(devices[i].device_id));
             if (ctx)
             {
                 EXPECT_TRUE(ctx->isGPU());
@@ -402,7 +403,7 @@ TEST(Test__DeviceContext, ROCmContextRequiresGPU)
         if (devices[i].type == ComputeBackendType::GPU_ROCM)
         {
             found_rocm = true;
-            auto ctx = IDeviceContext::create(static_cast<int>(i));
+            auto ctx = IDeviceContext::create(DeviceId::rocm(devices[i].device_id));
             if (ctx)
             {
                 EXPECT_TRUE(ctx->isGPU());

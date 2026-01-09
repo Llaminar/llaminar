@@ -40,6 +40,8 @@
 #include <iomanip>
 #include <cstring>
 
+#include "backends/DeviceId.h" // DeviceId for GPU tests
+
 // Project headers are expected to be included BEFORE this file
 // (DeviceManager.h, DeviceContext.h, CUDABackend.h)
 
@@ -105,7 +107,7 @@ namespace llaminar2::test::cuda
      * @brief Base test fixture for CUDA tests
      *
      * Automatically skips tests when no GPU is available.
-     * Provides gpu_idx_ and ctx_ for derived tests.
+     * Provides gpu_device_ (DeviceId) and gpu_idx_ (legacy int) for derived tests.
      */
     class CUDATestBase : public ::testing::Test
     {
@@ -131,6 +133,12 @@ namespace llaminar2::test::cuda
                 GTEST_SKIP() << "No CUDA device found";
             }
 
+            // Create DeviceId from the discovered device
+            // gpu_idx_ is the DeviceManager legacy index (CPU=0, GPU=1+)
+            // DeviceId::cuda(0) means CUDA device ordinal 0
+            int cuda_ordinal = gpu_idx_ - 1; // Convert DeviceManager index to CUDA ordinal
+            gpu_device_ = DeviceId::cuda(cuda_ordinal);
+
             backend_ = std::make_unique<CUDABackend>();
             device_count_ = backend_->deviceCount();
 
@@ -149,7 +157,8 @@ namespace llaminar2::test::cuda
             backend_.reset();
         }
 
-        int gpu_idx_ = -1;
+        int gpu_idx_ = -1;                      ///< Legacy DeviceManager index (for backward compat)
+        DeviceId gpu_device_ = DeviceId::cpu(); ///< Preferred: DeviceId for the CUDA device
         int device_count_ = 0;
 
 #ifdef HAVE_CUDA

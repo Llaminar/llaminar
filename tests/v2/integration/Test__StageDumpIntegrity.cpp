@@ -26,6 +26,7 @@
 #include "execution/compute_stages/IComputeStage.h"
 #include "loaders/ModelContext.h"
 #include "backends/ComputeBackend.h"
+#include "backends/DeviceId.h"
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
 #include "utils/MPIContext.h"
@@ -110,7 +111,7 @@ namespace llaminar2::test
 
         void SetUp() override
         {
-            // Initialize DeviceManager first (required before cpuDeviceIndex())
+            // Initialize DeviceManager (required for device backends)
             DeviceManager::instance().initialize(-1); // -1 = no NUMA filtering
 
             // Clean up any existing dumps
@@ -160,7 +161,7 @@ namespace llaminar2::test
 
             // Create inference runner
             auto runner = createInferenceRunner(model_ctx, mpi_ctx,
-                                                DeviceManager::instance().cpuDeviceIndex());
+                                                DeviceId::cpu());
             ASSERT_NE(runner, nullptr) << "Failed to create inference runner";
 
             // Run minimal prefill (just a few tokens)
@@ -640,7 +641,7 @@ namespace llaminar2::test
         ASSERT_NE(model_ctx, nullptr);
 
         auto runner = createInferenceRunner(model_ctx, mpi_ctx,
-                                            DeviceManager::instance().cpuDeviceIndex());
+                                            DeviceId::cpu());
         ASSERT_NE(runner, nullptr);
 
         std::vector<int32_t> tokens = {151644, 872, 198};

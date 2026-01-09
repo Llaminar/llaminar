@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 #include "execution/BufferRole.h"
+#include "backends/DeviceId.h"
 
 using namespace llaminar2;
 
@@ -67,7 +68,7 @@ TEST(Test__BufferDescriptor, DefaultConstruction)
     EXPECT_EQ(desc.tensor_type, BufferTensorType::FP32);
     EXPECT_TRUE(desc.required);
     EXPECT_EQ(desc.alignment, 64);
-    EXPECT_EQ(desc.device_idx, -1);
+    EXPECT_EQ(desc.device, DeviceId::cpu()); // Default device is CPU
 }
 
 TEST(Test__BufferDescriptor, BuilderPatternInput)
@@ -256,9 +257,9 @@ TEST(Test__StageBufferRequirements, GetByName)
 TEST(Test__StageBufferRequirements, TotalBytesCalculation)
 {
     StageBufferRequirements reqs;
-    reqs.addInput("input", {16, 896}, BufferTensorType::FP32);     // 16*896*4 = 57344
-    reqs.addOutput("output", {16, 896}, BufferTensorType::FP32);   // 16*896*4 = 57344
-    reqs.addScratch("workspace", {1024}, BufferTensorType::FP32);  // 1024*4 = 4096
+    reqs.addInput("input", {16, 896}, BufferTensorType::FP32);    // 16*896*4 = 57344
+    reqs.addOutput("output", {16, 896}, BufferTensorType::FP32);  // 16*896*4 = 57344
+    reqs.addScratch("workspace", {1024}, BufferTensorType::FP32); // 1024*4 = 4096
 
     EXPECT_EQ(reqs.totalInputBytes(), 57344);
     EXPECT_EQ(reqs.totalOutputBytes(), 57344);
@@ -275,7 +276,7 @@ TEST(Test__StageBufferRequirements, CustomDescriptor)
     custom.tensor_type = BufferTensorType::BF16;
     custom.required = false;
     custom.alignment = 128;
-    custom.device_idx = 0;
+    custom.device = DeviceId::cpu();
 
     StageBufferRequirements reqs;
     reqs.add(std::move(custom));
@@ -285,7 +286,7 @@ TEST(Test__StageBufferRequirements, CustomDescriptor)
     EXPECT_EQ(found->tensor_type, BufferTensorType::BF16);
     EXPECT_FALSE(found->required);
     EXPECT_EQ(found->alignment, 128);
-    EXPECT_EQ(found->device_idx, 0);
+    EXPECT_EQ(found->device, DeviceId::cpu());
 }
 
 // =============================================================================
@@ -471,9 +472,9 @@ TEST(Test__StageBufferRequirements, MixedLayoutDeclarations)
 
     // Some buffers have layouts, others don't
     reqs.addInput("Q", {16, 896}, BufferTensorType::FP32, TensorLayout::Q_SEQ_HEAD_DIM)
-        .addInput("Wo", {896, 896})  // Weight - no layout
+        .addInput("Wo", {896, 896}) // Weight - no layout
         .addOutput("output", {16, 896}, BufferTensorType::FP32, TensorLayout::ROW_MAJOR_2D)
-        .addScratch("temp", {1024});  // Scratch - no layout
+        .addScratch("temp", {1024}); // Scratch - no layout
 
     auto *q = reqs.getByName("Q");
     EXPECT_EQ(q->expected_layout, TensorLayout::Q_SEQ_HEAD_DIM);

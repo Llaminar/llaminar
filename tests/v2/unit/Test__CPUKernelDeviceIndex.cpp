@@ -33,6 +33,7 @@
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/TensorFactory.h"
 #include "v2/utils/MPIContext.h"
+#include "v2/backends/DeviceId.h"
 
 using namespace llaminar2;
 
@@ -65,19 +66,19 @@ namespace
             auto Q_tensor = factory.createFP32({static_cast<size_t>(seq_len),
                                                 static_cast<size_t>(n_heads),
                                                 static_cast<size_t>(head_dim)},
-                                               -1);
+                                               DeviceId::cpu());
             auto K_tensor = factory.createFP32({static_cast<size_t>(seq_len),
                                                 static_cast<size_t>(n_kv_heads),
                                                 static_cast<size_t>(head_dim)},
-                                               -1);
+                                               DeviceId::cpu());
             auto V_tensor = factory.createFP32({static_cast<size_t>(seq_len),
                                                 static_cast<size_t>(n_kv_heads),
                                                 static_cast<size_t>(head_dim)},
-                                               -1);
+                                               DeviceId::cpu());
             auto output_tensor = factory.createFP32({static_cast<size_t>(seq_len),
                                                      static_cast<size_t>(n_heads),
                                                      static_cast<size_t>(head_dim)},
-                                                    -1);
+                                                    DeviceId::cpu());
 
             float *Q = Q_tensor->mutable_data();
             float *K = K_tensor->mutable_data();
@@ -194,7 +195,7 @@ namespace
         // Test tensor creation with device_idx=-1 (CPU)
         // Note: device_idx >= 0 requires actual GPU devices to be present
         // This test focuses on CPU execution, so we only test -1
-        auto tensor_neg1 = factory.createFP32({1, 1}, -1);
+        auto tensor_neg1 = factory.createFP32({1, 1}, DeviceId::cpu());
         ASSERT_NE(tensor_neg1, nullptr);
 
         // Should be able to create attention kernel from CPU tensor
@@ -212,7 +213,7 @@ namespace
     TEST_F(Test__CPUKernelDeviceIndex, SupportsDevice_ReturnsTrueForAllCPUIndices)
     {
         TensorFactory factory(mpi_ctx_);
-        auto tensor = factory.createFP32({1, 1}, -1);
+        auto tensor = factory.createFP32({1, 1}, DeviceId::cpu());
         auto *activation = dynamic_cast<IActivationTensor *>(tensor.get());
         ASSERT_NE(activation, nullptr);
 

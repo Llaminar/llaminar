@@ -26,6 +26,7 @@
 #include "IModelExecutor.h"
 #include "LayerExecutor.h"
 #include "DeviceContext.h"
+#include "../backends/DeviceId.h"
 #include "../loaders/ModelContext.h"
 #include "../utils/MPIContext.h"
 #include "../tensors/TensorFactory.h"
@@ -93,20 +94,20 @@ namespace llaminar2
             TensorBase *input_hidden,
             ICPUKVCache *kv_cache,
             const int *position_ids,
-            int device_idx) override = 0;
+            DeviceId device) override = 0;
 
         ComputeGraph buildLayerGraph(
             int layer_idx,
             TensorBase *input_hidden,
             ICPUKVCache *kv_cache,
             const int *position_ids,
-            int device_idx) override = 0;
+            DeviceId device) override = 0;
 
         ComputeGraph buildLMHeadGraph(
             TensorBase *hidden_states,
             TensorBase *output_logits,
             int total_tokens,
-            int device_idx,
+            DeviceId device,
             TensorBase *logits_local = nullptr) override = 0;
 
         // =========================================================================
@@ -158,7 +159,7 @@ namespace llaminar2
         /**
          * @brief Get or create device context for given device
          */
-        IDeviceContext *getDeviceContext(int device_idx);
+        IDeviceContext *getDeviceContext(DeviceId device);
 
         /**
          * @brief Execute embedding phase with timing
@@ -172,17 +173,17 @@ namespace llaminar2
             TensorBase *hidden,
             ICPUKVCache *kv_cache,
             const int *position_ids,
-            int device_idx);
+            DeviceId device);
 
         /**
          * @brief Execute LM head with timing
          * @param hidden Hidden states tensor
          * @param logits Output logits tensor (full vocab size)
          * @param total_tokens Number of tokens (batch_size * seq_len)
-         * @param device_idx Target device
+         * @param device Target device
          * @param logits_local Optional local logits for column-parallel LM head
          */
-        bool executeLMHead(TensorBase *hidden, TensorBase *logits, int total_tokens, int device_idx,
+        bool executeLMHead(TensorBase *hidden, TensorBase *logits, int total_tokens, DeviceId device,
                            TensorBase *logits_local = nullptr);
 
         /**

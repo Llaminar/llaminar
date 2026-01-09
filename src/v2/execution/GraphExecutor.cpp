@@ -45,19 +45,19 @@ namespace llaminar2
 
     ComputeGraph &ComputeGraph::addNode(const std::string &name,
                                         std::unique_ptr<IComputeStage> stage,
-                                        int device_idx)
+                                        DeviceId device)
     {
         if (node_index_.find(name) != node_index_.end())
         {
             LOG_WARN("[ComputeGraph] Node '" << name << "' already exists, replacing");
             size_t idx = node_index_[name];
             nodes_[idx]->stage = std::move(stage);
-            nodes_[idx]->device_idx = device_idx;
+            nodes_[idx]->device = device;
             nodes_[idx]->completed = false;
             return *this;
         }
 
-        auto node = std::make_unique<ComputeNode>(name, std::move(stage), device_idx);
+        auto node = std::make_unique<ComputeNode>(name, std::move(stage), device);
         node_index_[name] = nodes_.size();
         nodes_.push_back(std::move(node));
         return *this;
@@ -473,9 +473,9 @@ namespace llaminar2
 
             // Find appropriate context for this node's device
             IDeviceContext *ctx = default_ctx;
-            if (node->device_idx >= 0)
+            if (node->device.is_gpu())
             {
-                auto it = contexts.find(node->device_idx);
+                auto it = contexts.find(node->device.toLegacyIndex());
                 if (it != contexts.end())
                 {
                     ctx = it->second;
@@ -484,7 +484,7 @@ namespace llaminar2
 
             if (!executeNode(*node, ctx))
             {
-                LOG_ERROR("[GraphExecutor] Stage failed: " << name << " on device " << node->device_idx);
+                LOG_ERROR("[GraphExecutor] Stage failed: " << name << " on device " << node->device.to_string());
                 return false;
             }
 

@@ -18,6 +18,7 @@
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/TensorFactory.h"
 #include "v2/utils/MPIContext.h"
+#include "v2/backends/DeviceId.h"
 
 using namespace llaminar2;
 
@@ -31,7 +32,7 @@ namespace
     {
     protected:
         MPIContext mpi_ctx_{0, 1, MPI_COMM_WORLD}; // Mock MPI context
-        int device_idx_ = -1;                      // CPU
+        DeviceId device_id_ = DeviceId::cpu();     // CPU device
 
         void SetUp() override
         {
@@ -47,7 +48,7 @@ namespace
     TEST_F(Test__CPUAttentionKernelT, FactoryWiring_FP32)
     {
         TensorFactory factory(mpi_ctx_);
-        auto tensor = factory.createFP32({1, 1}, device_idx_);
+        auto tensor = factory.createFP32({1, 1}, device_id_);
         auto *activation = dynamic_cast<IActivationTensor *>(tensor.get());
         ASSERT_NE(activation, nullptr);
 
@@ -91,10 +92,10 @@ namespace
 
         // Create tensors
         TensorFactory factory(mpi_ctx_);
-        auto Q_tensor = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads), static_cast<size_t>(head_dim)}, device_idx_);
-        auto K_tensor = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads), static_cast<size_t>(head_dim)}, device_idx_);
-        auto V_tensor = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads), static_cast<size_t>(head_dim)}, device_idx_);
-        auto output_tensor = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads), static_cast<size_t>(head_dim)}, device_idx_);
+        auto Q_tensor = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads), static_cast<size_t>(head_dim)}, device_id_);
+        auto K_tensor = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads), static_cast<size_t>(head_dim)}, device_id_);
+        auto V_tensor = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads), static_cast<size_t>(head_dim)}, device_id_);
+        auto output_tensor = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads), static_cast<size_t>(head_dim)}, device_id_);
 
         // Initialize data
         float *Q = Q_tensor->mutable_data();

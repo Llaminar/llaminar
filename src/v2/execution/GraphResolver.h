@@ -33,6 +33,7 @@
 
 #include "GraphSchema.h"
 #include "BufferRole.h"
+#include "../backends/DeviceId.h"
 #include "../utils/MPIContext.h"
 #include <memory>
 #include <unordered_map>
@@ -130,7 +131,7 @@ namespace llaminar2
         // Device Configuration
         // =================================================================
 
-        int default_device = 0; ///< Default device index
+        DeviceId default_device = DeviceId::cpu(); ///< Default device
 
         // =================================================================
         // Model Configuration (from schema params)
@@ -341,7 +342,7 @@ namespace llaminar2
         std::string alias_group;   ///< Alias group (from schema)
         int alias_priority;        ///< Alias priority (from schema)
         std::string description;   ///< Description (from schema)
-        int device_idx;            ///< Target device
+        DeviceId device;           ///< Target device
 
         /// Calculate total bytes for this buffer
         size_t totalBytes() const;

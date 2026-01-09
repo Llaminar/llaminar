@@ -30,6 +30,7 @@
 
 #include "../backends/ComputeBackend.h"
 #include "../backends/DeviceType.h" // Type-safe device type enum
+#include "../backends/DeviceId.h"   // Type-safe device identification
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -244,15 +245,15 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Create a device context for the given device index
+         * @brief Create a device context for the given device
          *
          * Automatically selects CPU or GPU context based on device type.
          *
-         * @param device_idx Device index in DeviceManager
+         * @param device Device identifier
          * @param num_threads Number of threads for CPU devices (ignored for GPU)
          * @return Unique pointer to device context (nullptr on failure)
          */
-        static std::unique_ptr<IDeviceContext> create(int device_idx, int num_threads = 0);
+        static std::unique_ptr<IDeviceContext> create(DeviceId device, int num_threads = 0);
     };
 
     /**
@@ -263,14 +264,14 @@ namespace llaminar2
     public:
         /**
          * @brief Construct CPU context
-         * @param device_idx Logical device index
+         * @param device Device identifier
          * @param num_threads OpenMP thread count (0 = use OMP_NUM_THREADS)
          */
-        explicit CPUDeviceContext(int device_idx, int num_threads = 0);
+        explicit CPUDeviceContext(DeviceId device, int num_threads = 0);
         ~CPUDeviceContext() override;
 
         // Device info
-        int deviceIndex() const override { return device_idx_; }
+        int deviceIndex() const override { return device_.toLegacyIndex(); }
         ComputeBackendType backendType() const override { return ComputeBackendType::CPU; }
         DeviceType deviceType() const override { return DeviceType::CPU; }
         bool isGPU() const override { return false; }
@@ -305,7 +306,7 @@ namespace llaminar2
         bool inParallelRegion() const;
 
     private:
-        int device_idx_;
+        DeviceId device_;
         int num_threads_;
         std::vector<char> workspace_;
         size_t workspace_size_ = 0;
@@ -327,15 +328,15 @@ namespace llaminar2
     public:
         /**
          * @brief Construct GPU context
-         * @param device_idx Logical device index in DeviceManager
+         * @param device Device identifier
          * @param gpu_device_id Physical GPU device ID
          * @param backend_type CUDA or ROCm backend type
          */
-        IGPUDeviceContext(int device_idx, int gpu_device_id, ComputeBackendType backend_type);
+        IGPUDeviceContext(DeviceId device, int gpu_device_id, ComputeBackendType backend_type);
         ~IGPUDeviceContext() override;
 
         // Device info
-        int deviceIndex() const override { return device_idx_; }
+        int deviceIndex() const override { return device_.toLegacyIndex(); }
         ComputeBackendType backendType() const override { return backend_type_; }
         DeviceType deviceType() const override;
         bool isGPU() const override { return true; }
@@ -350,7 +351,7 @@ namespace llaminar2
         int numThreads() const override { return 1; }
 
     protected:
-        int device_idx_;
+        DeviceId device_;
         int gpu_device_id_;
         ComputeBackendType backend_type_;
         void *workspace_ = nullptr;
@@ -370,10 +371,10 @@ namespace llaminar2
     public:
         /**
          * @brief Construct CUDA context
-         * @param device_idx Logical device index
+         * @param device Device identifier
          * @param cuda_device_id Physical CUDA device ID
          */
-        CUDADeviceContext(int device_idx, int cuda_device_id);
+        CUDADeviceContext(DeviceId device, int cuda_device_id);
         ~CUDADeviceContext() override;
 
         std::string deviceName() const override;
@@ -408,10 +409,10 @@ namespace llaminar2
     public:
         /**
          * @brief Construct ROCm context
-         * @param device_idx Logical device index
+         * @param device Device identifier
          * @param hip_device_id Physical HIP device ID
          */
-        ROCmDeviceContext(int device_idx, int hip_device_id);
+        ROCmDeviceContext(DeviceId device, int hip_device_id);
         ~ROCmDeviceContext() override;
 
         std::string deviceName() const override;

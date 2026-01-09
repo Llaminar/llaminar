@@ -16,6 +16,7 @@
 #include "execution/compute_stages/ComputeStages.h"
 #include "tensors/Tensors.h"
 #include "tensors/CPUKVCache.h"
+#include "backends/DeviceId.h"
 
 namespace llaminar2
 {
@@ -138,10 +139,10 @@ namespace llaminar2
                 (void)tokens_to_evict;
             }
 
-            int get_layer_device(int layer) const override
+            DeviceId get_layer_device(int layer) const override
             {
                 (void)layer;
-                return 0;
+                return DeviceId::cpu();
             }
 
             int get_total_evicted() const override { return 0; }

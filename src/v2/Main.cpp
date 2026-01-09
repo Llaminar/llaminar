@@ -562,7 +562,7 @@ int main(int argc, char *argv[])
     runner_config.activation_precision = runtime_config.activation_precision;
     runner_config.fused_attention_backend = runtime_config.fused_attention_backend;
 
-    auto runner = createInferenceRunner(model_ctx, mpi_ctx, device_idx, runner_config);
+    auto runner = createInferenceRunner(model_ctx, mpi_ctx, DeviceId::fromLegacyIndex(device_idx), runner_config);
     if (!runner)
     {
         if (mpi_ctx->rank() == 0)

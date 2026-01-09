@@ -27,6 +27,7 @@
 #include "tensors/Tensors.h"
 #include "kernels/KernelFactory.h"
 #include "execution/compute_stages/ComputeStages.h"
+#include "backends/DeviceId.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
 
@@ -191,11 +192,11 @@ TEST_F(Test__MPI_ColumnParallelLMHead, AllGatherStageIntegration)
 
     // Create local logits buffer [seq_len, vocab_local]
     auto local_logits = factory_->createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(vocab_local)}, 0);
+        {static_cast<size_t>(seq_len), static_cast<size_t>(vocab_local)}, DeviceId::cpu());
 
     // Create full logits buffer [seq_len, vocab_size]
     auto full_logits = factory_->createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(VOCAB_SIZE)}, 0);
+        {static_cast<size_t>(seq_len), static_cast<size_t>(VOCAB_SIZE)}, DeviceId::cpu());
 
     // Fill local logits with rank-specific values
     // Rank 0: fill with values [0, vocab_local)
@@ -282,7 +283,7 @@ TEST_F(Test__MPI_ColumnParallelLMHead, FullForwardDataFlow)
 
     // Create mock hidden states [seq_len, d_model]
     auto hidden = factory_->createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(D_MODEL)}, 0);
+        {static_cast<size_t>(seq_len), static_cast<size_t>(D_MODEL)}, DeviceId::cpu());
 
     // Fill hidden with deterministic pattern
     float *hidden_data = static_cast<FP32Tensor *>(hidden.get())->mutable_data();
@@ -297,9 +298,9 @@ TEST_F(Test__MPI_ColumnParallelLMHead, FullForwardDataFlow)
 
     // Create local and full logits buffers
     auto local_logits = factory_->createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(vocab_local)}, 0);
+        {static_cast<size_t>(seq_len), static_cast<size_t>(vocab_local)}, DeviceId::cpu());
     auto full_logits = factory_->createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(VOCAB_SIZE)}, 0);
+        {static_cast<size_t>(seq_len), static_cast<size_t>(VOCAB_SIZE)}, DeviceId::cpu());
 
     // Compute local logits: hidden @ lm_head.T
     // (This would be done by GEMMStage in full pipeline)
@@ -369,11 +370,11 @@ TEST_F(Test__MPI_ColumnParallelLMHead, AllGatherMultiRowInterleaving)
 
     // Create local logits buffer [seq_len, vocab_local]
     auto local_logits = factory_->createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(vocab_local)}, 0);
+        {static_cast<size_t>(seq_len), static_cast<size_t>(vocab_local)}, DeviceId::cpu());
 
     // Create full logits buffer [seq_len, vocab_size]
     auto full_logits = factory_->createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(VOCAB_SIZE)}, 0);
+        {static_cast<size_t>(seq_len), static_cast<size_t>(VOCAB_SIZE)}, DeviceId::cpu());
 
     // Fill local logits with rank-specific values
     // Each element encodes: (seq_idx * 10000) + (global_vocab_idx)
@@ -442,9 +443,9 @@ TEST_F(Test__MPI_ColumnParallelLMHead, AllGatherLargeSequence)
     const int seq_len = 32;
 
     auto local_logits = factory_->createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(vocab_local)}, 0);
+        {static_cast<size_t>(seq_len), static_cast<size_t>(vocab_local)}, DeviceId::cpu());
     auto full_logits = factory_->createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(VOCAB_SIZE)}, 0);
+        {static_cast<size_t>(seq_len), static_cast<size_t>(VOCAB_SIZE)}, DeviceId::cpu());
 
     // Fill with deterministic pattern
     float *local_data = static_cast<FP32Tensor *>(local_logits.get())->mutable_data();
@@ -499,9 +500,9 @@ TEST_F(Test__MPI_ColumnParallelLMHead, AllGatherOutputConsistency)
     const int seq_len = 4;
 
     auto local_logits = factory_->createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(vocab_local)}, 0);
+        {static_cast<size_t>(seq_len), static_cast<size_t>(vocab_local)}, DeviceId::cpu());
     auto full_logits = factory_->createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(VOCAB_SIZE)}, 0);
+        {static_cast<size_t>(seq_len), static_cast<size_t>(VOCAB_SIZE)}, DeviceId::cpu());
 
     // Fill each rank with different data
     float *local_data = static_cast<FP32Tensor *>(local_logits.get())->mutable_data();

@@ -281,10 +281,61 @@ namespace llaminar2
 
         // FP32 output path (original implementation)
         // Extract FP32 data from tensors - works for all tensor types via fp32_data()
-        const float *input_fp32 = params_.input->fp32_data();
-        float *output_q_fp32 = params_.output_q->mutable_data();
-        float *output_k_fp32 = params_.output_k->mutable_data();
-        float *output_v_fp32 = params_.output_v->mutable_data();
+        // NOTE: For GPU execution, we need device pointers
+        const float *input_fp32 = nullptr;
+        float *output_q_fp32 = nullptr;
+        float *output_k_fp32 = nullptr;
+        float *output_v_fp32 = nullptr;
+
+        // Cast to FP32Tensor to access GPU methods
+        auto *input_t = dynamic_cast<FP32Tensor *>(const_cast<ITensor *>(params_.input));
+        auto *output_q_t = dynamic_cast<FP32Tensor *>(params_.output_q);
+        auto *output_k_t = dynamic_cast<FP32Tensor *>(params_.output_k);
+        auto *output_v_t = dynamic_cast<FP32Tensor *>(params_.output_v);
+
+        const bool gpu_execution = params_.device_id.is_gpu();
+
+        if (gpu_execution)
+        {
+            // GPU path: Use device pointers
+            if (!input_t || !output_q_t || !output_k_t || !output_v_t)
+            {
+                LOG_ERROR("[FusedQKVGEMMStage] GPU execution requires FP32Tensor types");
+                return false;
+            }
+
+            // Ensure input is synced to device
+            if (!input_t->ensureOnDevice(params_.device_id))
+            {
+                LOG_ERROR("[FusedQKVGEMMStage] Failed to ensure input on device " << params_.device_id.toString());
+                return false;
+            }
+
+            // Ensure output buffers are allocated on device
+            if (!output_q_t->ensureOnDevice(params_.device_id) ||
+                !output_k_t->ensureOnDevice(params_.device_id) ||
+                !output_v_t->ensureOnDevice(params_.device_id))
+            {
+                LOG_ERROR("[FusedQKVGEMMStage] Failed to ensure outputs on device " << params_.device_id.toString());
+                return false;
+            }
+
+            // Get device pointers
+            input_fp32 = static_cast<const float *>(input_t->gpu_data_ptr());
+            output_q_fp32 = static_cast<float *>(output_q_t->gpu_data_ptr());
+            output_k_fp32 = static_cast<float *>(output_k_t->gpu_data_ptr());
+            output_v_fp32 = static_cast<float *>(output_v_t->gpu_data_ptr());
+
+            LOG_DEBUG("[FusedQKVGEMMStage] GPU execution using device pointers (" << params_.device_id.toString() << ")");
+        }
+        else
+        {
+            // CPU path: Use host pointers
+            input_fp32 = params_.input->fp32_data();
+            output_q_fp32 = params_.output_q->mutable_data();
+            output_k_fp32 = params_.output_k->mutable_data();
+            output_v_fp32 = params_.output_v->mutable_data();
+        }
 
         if (!input_fp32 || !output_q_fp32 || !output_k_fp32 || !output_v_fp32)
         {
@@ -306,10 +357,15 @@ namespace llaminar2
         auto *wk_base_fp32 = requireTensorBase(params_.wk, "wk");
         auto *wv_base_fp32 = requireTensorBase(params_.wv, "wv");
 
-        // Get cached kernels from KernelFactory (handles weight packing once)
-        auto *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq_base_fp32);
-        auto *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk_base_fp32);
-        auto *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv_base_fp32);
+        // Get the target device type from device_id
+        DeviceType target_dev_type = params_.device_id.is_gpu()
+                                         ? DeviceType::CUDA
+                                         : DeviceType::CPU;
+
+        // Get cached kernels from KernelFactory with device targeting
+        auto *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq_base_fp32, target_dev_type);
+        auto *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk_base_fp32, target_dev_type);
+        auto *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv_base_fp32, target_dev_type);
 
         if (!gemm_q || !gemm_k || !gemm_v)
         {
@@ -338,11 +394,24 @@ namespace llaminar2
             return false;
         }
 
-        // Debug: Log Q output for comparison
-        LOG_TRACE("[FusedQKVGEMMStage] Q output[0:8]=" << std::setprecision(10)
-                                                       << output_q_fp32[0] << "," << output_q_fp32[1] << "," << output_q_fp32[2] << "," << output_q_fp32[3] << ","
-                                                       << output_q_fp32[4] << "," << output_q_fp32[5] << "," << output_q_fp32[6] << "," << output_q_fp32[7]
-                                                       << " n_q=" << params_.n_q);
+        // After GPU execution, mark outputs as device-dirty
+        // This tells the tensor that device has latest data, host is stale
+        if (gpu_execution)
+        {
+            output_q_t->mark_device_dirty();
+            output_k_t->mark_device_dirty();
+            output_v_t->mark_device_dirty();
+            LOG_DEBUG("[FusedQKVGEMMStage] Marked Q/K/V outputs as device-dirty");
+        }
+
+        // Debug: Log Q output for comparison (only for CPU - device memory not accessible)
+        if (!gpu_execution)
+        {
+            LOG_TRACE("[FusedQKVGEMMStage] Q output[0:8]=" << std::setprecision(10)
+                                                           << output_q_fp32[0] << "," << output_q_fp32[1] << "," << output_q_fp32[2] << "," << output_q_fp32[3] << ","
+                                                           << output_q_fp32[4] << "," << output_q_fp32[5] << "," << output_q_fp32[6] << "," << output_q_fp32[7]
+                                                           << " n_q=" << params_.n_q);
+        }
 
         LOG_DEBUG("[FusedQKVGEMMStage] Complete");
         return true;

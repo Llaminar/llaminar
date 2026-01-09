@@ -6,6 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "backends/DeviceId.h"
 
 namespace llaminar2
 {
@@ -29,8 +30,8 @@ namespace llaminar2
         {
             // Type-safe tensor pointers (required)
             const ITensor *input = nullptr; ///< Input activation tensor [m, k]
-            int m = 0;                         ///< Batch size * seq_len
-            int k = 0;                         ///< Input dimension (d_model)
+            int m = 0;                      ///< Batch size * seq_len
+            int k = 0;                      ///< Input dimension (d_model)
 
             // Gate projection
             const ITensor *w_gate = nullptr;
@@ -46,7 +47,7 @@ namespace llaminar2
 
             // Optional MPI context
             const MPIContext *mpi_ctx = nullptr;
-            int device_idx = -1;
+            DeviceId device_id = DeviceId::cpu();
         };
 
         explicit FusedGateUpGEMMStage(Params params);

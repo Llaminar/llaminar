@@ -28,7 +28,7 @@ namespace llaminar2
     {
         // Get all cached weight names from the weight manager
         // Note: We iterate the cache, so weights must already be loaded
-        auto &cache = weight_manager_->cache();
+        auto &cache = weight_manager_->cache_;
         if (cache.empty())
         {
             LOG_WARN("[WeightPreloader] No weights loaded in cache - nothing to preload");
@@ -104,7 +104,7 @@ namespace llaminar2
         PreloadProgressCallback progress_callback,
         bool release_raw_data)
     {
-        auto &cache = weight_manager_->cache();
+        auto &cache = weight_manager_->cache_;
 
         std::vector<std::string> matching_names;
         for (const auto &[name, tensor] : cache)
@@ -125,27 +125,18 @@ namespace llaminar2
             return DeviceType::CPU; // Default to CPU
         }
 
-        int device_idx = placement_map_->getDeviceForWeight(weight_name);
-        if (device_idx < 0)
+        DeviceId device_id = placement_map_->getDeviceForWeight(weight_name);
+        if (!device_id.is_valid() || device_id.is_cpu())
         {
             return DeviceType::CPU;
         }
 
-        // Device index 0 typically means CPU, >0 means GPU
-        // Check with DeviceManager to be sure
-        const auto &dm = DeviceManager::instance();
-        if (static_cast<size_t>(device_idx) < dm.devices().size())
+        // DeviceId knows its backend type
+        if (device_id.is_gpu())
         {
-            const auto &device = dm.devices()[device_idx];
-            // ComputeBackendType maps to DeviceType
-            if (device.type == ComputeBackendType::GPU_CUDA)
-            {
-                return DeviceType::CUDA;
-            }
-            else if (device.type == ComputeBackendType::GPU_ROCM)
-            {
-                return DeviceType::ROCm;
-            }
+            // For now, assume CUDA for GPU devices
+            // TODO: Check device_id.backend() when ROCm support is added
+            return DeviceType::CUDA;
         }
 
         return DeviceType::CPU;
@@ -161,10 +152,13 @@ namespace llaminar2
             return false;
         }
 
-        // Use the unified packing API
+        // Use device-targeted kernel creation API
+        // This ensures the kernel is created for the correct device from the start
         using namespace llaminar::v2::kernels;
 
-        bool success = KernelFactory::ensurePackedWeightsInTensorCache(tensor, target_device);
+        // Create kernel for target device (this also packs weights appropriately)
+        auto *kernel = KernelFactory::getOrCreateGemm(tensor, target_device);
+        bool success = (kernel != nullptr);
 
         if (success)
         {

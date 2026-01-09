@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include "backends/DeviceId.h"
 #include "tensors/CPUKVCache.h"
 #include "utils/MPIContext.h"
 
@@ -62,8 +63,7 @@ namespace llaminar2
                 *mpi_ctx_,
                 kNumLayers, kBatchSize, kMaxSeqLen,
                 kNKVHeads, kHeadDim,
-                -1 // CPU device
-            );
+                DeviceId::cpu());
 
             ASSERT_NE(cache, nullptr);
 
@@ -82,7 +82,7 @@ namespace llaminar2
                 *mpi_ctx_,
                 kNumLayers, kBatchSize, kMaxSeqLen,
                 kNKVHeads, kHeadDim,
-                -1);
+                DeviceId::cpu());
 
             ASSERT_NE(cache, nullptr);
 
@@ -118,8 +118,7 @@ namespace llaminar2
                 kNumLayers, kBatchSize, kMaxSeqLen,
                 kNKVHeads, kLocalKVHeads, kv_head_start,
                 kHeadDim,
-                -1 // CPU device
-            );
+                DeviceId::cpu());
 
             ASSERT_NE(cache, nullptr);
 
@@ -143,7 +142,7 @@ namespace llaminar2
                 kNumLayers, kBatchSize, kMaxSeqLen,
                 kNKVHeads, kLocalKVHeads, kv_head_start,
                 kHeadDim,
-                -1);
+                DeviceId::cpu());
 
             ASSERT_NE(cache, nullptr);
 
@@ -166,7 +165,7 @@ namespace llaminar2
                 kNumLayers, kBatchSize, kMaxSeqLen,
                 kNKVHeads, kLocalKVHeads, kv_head_start,
                 kHeadDim,
-                -1);
+                DeviceId::cpu());
 
             ASSERT_NE(cache, nullptr);
 
@@ -206,12 +205,12 @@ namespace llaminar2
             auto full_cache = createCPUKVCache(
                 ActivationPrecision::FP32, *mpi_ctx_,
                 kNumLayers, kBatchSize, kMaxSeqLen,
-                kNKVHeads, kHeadDim, -1);
+                kNKVHeads, kHeadDim, DeviceId::cpu());
 
             auto sharded_cache = createShardedCPUKVCache(
                 ActivationPrecision::FP32, *mpi_ctx_,
                 kNumLayers, kBatchSize, kMaxSeqLen,
-                kNKVHeads, kLocalKVHeads, 0, kHeadDim, -1);
+                kNKVHeads, kLocalKVHeads, 0, kHeadDim, DeviceId::cpu());
 
             // Get actual tensor sizes
             const ITensor *full_k = full_cache->get_k(0, 0);
@@ -229,7 +228,7 @@ namespace llaminar2
             auto cache = createShardedCPUKVCache(
                 ActivationPrecision::FP32, *mpi_ctx_,
                 kNumLayers, kBatchSize, kMaxSeqLen,
-                kNKVHeads, kLocalKVHeads, 0, kHeadDim, -1);
+                kNKVHeads, kLocalKVHeads, 0, kHeadDim, DeviceId::cpu());
 
             ASSERT_NE(cache, nullptr);
 
@@ -260,7 +259,7 @@ namespace llaminar2
             auto cache = createShardedCPUKVCache(
                 ActivationPrecision::FP32, *mpi_ctx_,
                 kNumLayers, kBatchSize, kMaxSeqLen,
-                kNKVHeads, kLocalKVHeads, 0, kHeadDim, -1);
+                kNKVHeads, kLocalKVHeads, 0, kHeadDim, DeviceId::cpu());
 
             // Create batch input (4 tokens)
             int num_tokens = 4;
@@ -301,7 +300,7 @@ namespace llaminar2
             auto cache = createShardedCPUKVCache(
                 ActivationPrecision::FP32, *mpi_ctx_,
                 kNumLayers, kBatchSize, kMaxSeqLen,
-                kNKVHeads, kLocalKVHeads, 0, kHeadDim, -1);
+                kNKVHeads, kLocalKVHeads, 0, kHeadDim, DeviceId::cpu());
 
             // Create and append some data
             std::vector<size_t> shape = {2, static_cast<size_t>(kLocalKVDim)};
@@ -327,7 +326,7 @@ namespace llaminar2
             auto cache = createShardedCPUKVCache(
                 ActivationPrecision::BF16, *mpi_ctx_,
                 kNumLayers, kBatchSize, kMaxSeqLen,
-                kNKVHeads, kLocalKVHeads, 0, kHeadDim, -1);
+                kNKVHeads, kLocalKVHeads, 0, kHeadDim, DeviceId::cpu());
 
             ASSERT_NE(cache, nullptr);
             EXPECT_EQ(cache->precision(), ActivationPrecision::BF16);
@@ -340,7 +339,7 @@ namespace llaminar2
             auto cache = createShardedCPUKVCache(
                 ActivationPrecision::FP16, *mpi_ctx_,
                 kNumLayers, kBatchSize, kMaxSeqLen,
-                kNKVHeads, kLocalKVHeads, 0, kHeadDim, -1);
+                kNKVHeads, kLocalKVHeads, 0, kHeadDim, DeviceId::cpu());
 
             ASSERT_NE(cache, nullptr);
             EXPECT_EQ(cache->precision(), ActivationPrecision::FP16);
@@ -353,7 +352,7 @@ namespace llaminar2
             auto cache = createShardedCPUKVCache(
                 ActivationPrecision::Q8_1, *mpi_ctx_,
                 kNumLayers, kBatchSize, kMaxSeqLen,
-                kNKVHeads, kLocalKVHeads, 0, kHeadDim, -1);
+                kNKVHeads, kLocalKVHeads, 0, kHeadDim, DeviceId::cpu());
 
             ASSERT_NE(cache, nullptr);
             EXPECT_EQ(cache->precision(), ActivationPrecision::Q8_1);
@@ -386,7 +385,7 @@ namespace llaminar2
             // Verify per-layer device placement
             for (int layer = 0; layer < kNumLayers; ++layer)
             {
-                EXPECT_EQ(cache->get_layer_device(layer), layer % 2)
+                EXPECT_EQ(cache->get_layer_device(layer), DeviceId::fromLegacyIndex(layer % 2))
                     << "Wrong device at layer " << layer;
             }
         }

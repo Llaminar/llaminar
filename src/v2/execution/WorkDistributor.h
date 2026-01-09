@@ -27,6 +27,7 @@
 
 #pragma once
 
+#include "../backends/DeviceId.h"
 #include <cstddef>
 #include <vector>
 
@@ -77,7 +78,7 @@ namespace llaminar2
         struct HierarchicalSlice
         {
             int rank;            ///< MPI rank that owns this slice
-            int device_idx;      ///< Device index within the rank
+            DeviceId device;     ///< Device within the rank
             size_t global_start; ///< Start offset in global work
             size_t global_end;   ///< End offset in global work (exclusive)
             size_t local_start;  ///< Start offset within this device's portion
@@ -91,9 +92,9 @@ namespace llaminar2
          */
         struct ExpertAssignment
         {
-            int expert_id;  ///< Expert index (0 to num_experts-1)
-            int device_idx; ///< Device that owns this expert
-            int rank;       ///< MPI rank (for distributed experts)
+            int expert_id;   ///< Expert index (0 to num_experts-1)
+            DeviceId device; ///< Device that owns this expert
+            int rank;        ///< MPI rank (for distributed experts)
         };
 
         /**
@@ -105,7 +106,7 @@ namespace llaminar2
         struct TokenRouting
         {
             int expert_id;                  ///< Target expert
-            int device_idx;                 ///< Device hosting this expert
+            DeviceId device;                ///< Device hosting this expert
             std::vector<int> token_indices; ///< Tokens routed to this expert
             std::vector<float> weights;     ///< Router weights for combining
         };
@@ -124,9 +125,9 @@ namespace llaminar2
          * @brief Convenience constructor for single-device per rank
          * @param world_size Total MPI ranks
          * @param rank This rank's index
-         * @param device_idx Device index (-1 = no device, just MPI distribution)
+         * @param device Device (DeviceId::cpu() = no device, just MPI distribution)
          */
-        WorkDistributor(int world_size, int rank, int device_idx = -1);
+        WorkDistributor(int world_size, int rank, DeviceId device = DeviceId::cpu());
 
         // =========================================================================
         // Rank-Level Distribution (Tensor Parallelism)
@@ -168,10 +169,10 @@ namespace llaminar2
          * If no weights specified, splits evenly.
          *
          * @param rank_elements Elements assigned to this rank
-         * @param device_idx Device index within this rank
+         * @param device Device identifier
          * @return WorkSlice for the specified device
          */
-        WorkSlice getDeviceSlice(size_t rank_elements, int device_idx) const;
+        WorkSlice getDeviceSlice(size_t rank_elements, DeviceId device) const;
 
         /**
          * @brief Get work slices for all devices in this rank
@@ -248,12 +249,12 @@ namespace llaminar2
         /**
          * @brief Get experts assigned to a specific device
          * @param expert_assignments Full expert mapping
-         * @param device_idx Device to query
+         * @param device Device to query
          * @return Expert IDs hosted on this device
          */
         static std::vector<int> getExpertsForDevice(
             const std::vector<ExpertAssignment> &expert_assignments,
-            int device_idx);
+            DeviceId device);
 
         // =========================================================================
         // Utility Methods

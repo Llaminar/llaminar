@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 #include "execution/WorkDistributor.h"
+#include "backends/DeviceId.h"
 
 using namespace llaminar2;
 
@@ -170,14 +171,14 @@ TEST(Test__WorkDistributor, RankHasWork)
 
 TEST(Test__WorkDistributor, SingleDeviceGetsAll)
 {
-    WorkDistributor dist(2, 0, 0); // Single CPU device
+    WorkDistributor dist(2, 0, DeviceId::cpu()); // Single CPU device
 
-    auto slice = dist.getDeviceSlice(500, 0);
+    auto slice = dist.getDeviceSlice(500, DeviceId::cpu());
 
     EXPECT_EQ(slice.start, 0);
     EXPECT_EQ(slice.end, 500);
     EXPECT_EQ(slice.count, 500);
-    EXPECT_EQ(slice.owner, 0);
+    EXPECT_EQ(slice.owner, -1); // Legacy index for CPU is -1
 }
 
 TEST(Test__WorkDistributor, TwoDevicesEqualWeight)
@@ -256,11 +257,11 @@ TEST(Test__WorkDistributor, GetDeviceForElement)
 
 TEST(Test__WorkDistributor, HierarchicalDistribute)
 {
-    // 2 ranks, 2 devices each
+    // 2 ranks, 2 GPU devices each (legacy convention: 1=GPU:0, 2=GPU:1)
     WorkDistributor::Config config{
         .world_size = 2,
         .rank = 0,
-        .devices = {0, 1},
+        .devices = {1, 2}, // Legacy: GPU:0, GPU:1
         .device_weights = {}};
     WorkDistributor dist(config);
 
@@ -270,15 +271,15 @@ TEST(Test__WorkDistributor, HierarchicalDistribute)
     EXPECT_EQ(slices.size(), 2);
 
     // Rank 0 gets elements 0-1999
-    // Device 0 gets 0-999, Device 1 gets 1000-1999
+    // Device GPU:0 gets 0-999, Device GPU:1 gets 1000-1999
     EXPECT_EQ(slices[0].rank, 0);
-    EXPECT_EQ(slices[0].device_idx, 0);
+    EXPECT_EQ(slices[0].device.ordinal, 0); // GPU:0 ordinal
     EXPECT_EQ(slices[0].global_start, 0);
     EXPECT_EQ(slices[0].global_end, 1000);
     EXPECT_EQ(slices[0].local_count, 1000);
 
     EXPECT_EQ(slices[1].rank, 0);
-    EXPECT_EQ(slices[1].device_idx, 1);
+    EXPECT_EQ(slices[1].device.ordinal, 1); // GPU:1 ordinal
     EXPECT_EQ(slices[1].global_start, 1000);
     EXPECT_EQ(slices[1].global_end, 2000);
     EXPECT_EQ(slices[1].local_count, 1000);
@@ -298,7 +299,7 @@ TEST(Test__WorkDistributor, PrimaryDeviceSlice)
     // Rank 1 gets elements 2000-3999
     // Primary device (0) gets first half
     EXPECT_EQ(primary.rank, 1);
-    EXPECT_EQ(primary.device_idx, 0);
+    EXPECT_EQ(primary.device.ordinal, 0);
     EXPECT_EQ(primary.global_start, 2000);
     EXPECT_EQ(primary.global_end, 3000);
 }

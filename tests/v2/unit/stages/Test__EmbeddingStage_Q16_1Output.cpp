@@ -24,6 +24,7 @@
 #include <memory>
 #include <numeric>
 
+#include "backends/DeviceId.h"
 #include "execution/compute_stages/ComputeStages.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
@@ -142,7 +143,7 @@ namespace
         params.num_tokens = 1;
         params.d_model = d_model_;
         params.vocab_size = vocab_size_;
-        params.device_idx = 0;
+        params.device_id = DeviceId::cpu();
 
         // Execute
         auto stage = ComputeStageFactory::createEmbedding(params);
@@ -181,7 +182,7 @@ namespace
         params.num_tokens = num_tokens;
         params.d_model = d_model_;
         params.vocab_size = vocab_size_;
-        params.device_idx = 0;
+        params.device_id = DeviceId::cpu();
 
         auto stage = ComputeStageFactory::createEmbedding(params);
         ASSERT_TRUE(stage->execute(nullptr));
@@ -233,7 +234,7 @@ namespace
             params.num_tokens = num_tokens;
             params.d_model = d_model_;
             params.vocab_size = vocab_size_;
-            params.device_idx = 0;
+            params.device_id = DeviceId::cpu();
 
             auto stage = ComputeStageFactory::createEmbedding(params);
             ASSERT_TRUE(stage->execute(nullptr));
@@ -248,7 +249,7 @@ namespace
             params.num_tokens = num_tokens;
             params.d_model = d_model_;
             params.vocab_size = vocab_size_;
-            params.device_idx = 0;
+            params.device_id = DeviceId::cpu();
 
             auto stage = ComputeStageFactory::createEmbedding(params);
             ASSERT_TRUE(stage->execute(nullptr));
@@ -291,7 +292,7 @@ namespace
         params.num_tokens = num_tokens;
         params.d_model = d_model_;
         params.vocab_size = vocab_size_;
-        params.device_idx = 0;
+        params.device_id = DeviceId::cpu();
 
         auto stage = ComputeStageFactory::createEmbedding(params);
         ASSERT_TRUE(stage->execute(nullptr));
@@ -324,7 +325,7 @@ namespace
         params.num_tokens = 1;
         params.d_model = d_model_;
         params.vocab_size = vocab_size_;
-        params.device_idx = 0;
+        params.device_id = DeviceId::cpu();
 
         auto stage = ComputeStageFactory::createEmbedding(params);
         ASSERT_TRUE(stage->execute(nullptr));
@@ -357,7 +358,7 @@ namespace
         params.num_tokens = 1;
         params.d_model = d_model_;
         params.vocab_size = vocab_size_;
-        params.device_idx = 0;
+        params.device_id = DeviceId::cpu();
 
         auto stage = ComputeStageFactory::createEmbedding(params);
         ASSERT_TRUE(stage->execute(nullptr));
@@ -402,7 +403,7 @@ namespace
         params.num_tokens = num_tokens;
         params.d_model = d_model_;
         params.vocab_size = vocab_size_;
-        params.device_idx = 0;
+        params.device_id = DeviceId::cpu();
 
         auto stage = ComputeStageFactory::createEmbedding(params);
         ASSERT_TRUE(stage->execute(nullptr));
@@ -460,7 +461,7 @@ namespace
         params.num_tokens = seq_len;
         params.d_model = d_model_;
         params.vocab_size = vocab_size_;
-        params.device_idx = 0;
+        params.device_id = DeviceId::cpu();
 
         auto stage = ComputeStageFactory::createEmbedding(params);
         ASSERT_TRUE(stage->execute(nullptr));

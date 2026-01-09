@@ -246,7 +246,7 @@ TEST_F(Test__CUDAGemmParity, FP32_SmallMatrix_128x256x512)
 
     // ===== CUDA =====
     // Upload weights to GPU
-    ASSERT_TRUE(weights->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
     EXPECT_TRUE(weights->isOnGPU());
 
     // Create CUDA kernel via KernelFactory
@@ -302,7 +302,7 @@ TEST_F(Test__CUDAGemmParity, FP32_DecodeSize_1x896x896)
     ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
 
     // CUDA
-    ASSERT_TRUE(weights->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CUDA);
     ASSERT_NE(cuda_kernel, nullptr);
@@ -346,7 +346,7 @@ TEST_F(Test__CUDAGemmParity, FP32_PrefillSize_512x896x896)
     ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
 
     // CUDA
-    ASSERT_TRUE(weights->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CUDA);
     ASSERT_NE(cuda_kernel, nullptr);
@@ -401,7 +401,7 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_SmallMatrix_128x896x896)
 
     // ===== CUDA =====
     // Upload weights to GPU
-    ASSERT_TRUE(weights->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
     EXPECT_TRUE(weights->isOnGPU());
 
     // Create CUDA kernel via KernelFactory
@@ -460,7 +460,7 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_DecodeSize_1x896x896)
     ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
 
     // CUDA
-    ASSERT_TRUE(weights->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CUDA);
     ASSERT_NE(cuda_kernel, nullptr);
@@ -503,7 +503,7 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
     ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
 
     // CUDA
-    ASSERT_TRUE(weights->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CUDA);
     ASSERT_NE(cuda_kernel, nullptr);
@@ -561,7 +561,7 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
         ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), M * N)) << "CPU result has NaN/Inf";         \
                                                                                             \
         /* CUDA */                                                                          \
-        ASSERT_TRUE(weights->ensureOnDevice(gpu_idx_));                                     \
+        ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));                                     \
         auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(                \
             weights.get(), KernelDeviceType::CUDA);                                         \
         ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel for " #TensorType; \
@@ -610,7 +610,7 @@ TEST_F(Test__CUDAGemmParity, Q8_0_DecodeSize_1x896x896)
         weights.get(), KernelDeviceType::CPU);
     ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
 
-    ASSERT_TRUE(weights->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CUDA);
 
@@ -654,7 +654,7 @@ TEST_F(Test__CUDAGemmParity, Q4_0_DecodeSize_1x896x896)
         weights.get(), KernelDeviceType::CPU);
     ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));
 
-    ASSERT_TRUE(weights->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CUDA);
 

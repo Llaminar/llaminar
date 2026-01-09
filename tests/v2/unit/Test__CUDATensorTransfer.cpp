@@ -61,7 +61,7 @@ TEST_F(Test__CUDATensorTransfer, FP32_Upload)
 
     // Upload to GPU
     ASSERT_FALSE(tensor->isOnGPU()) << "Tensor should start on host";
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx_)) << "GPU upload failed";
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_)) << "GPU upload failed";
     EXPECT_TRUE(tensor->isOnGPU()) << "Tensor should be on GPU after ensureOnDevice";
 }
 
@@ -84,7 +84,7 @@ TEST_F(Test__CUDATensorTransfer, FP32_RoundTrip)
     }
 
     // Upload to GPU
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
     EXPECT_TRUE(tensor->isOnGPU());
 
     // Download back to host
@@ -118,7 +118,7 @@ TEST_F(Test__CUDATensorTransfer, FP32_LargeTensor)
     }
 
     // Upload
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
 
     // Download
     ASSERT_TRUE(tensor->ensureOnHost());
@@ -146,11 +146,11 @@ TEST_F(Test__CUDATensorTransfer, FP32_AlreadyOnDevice)
     }
 
     // First upload
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
     EXPECT_TRUE(tensor->isOnGPU());
 
     // Second upload should succeed (no-op)
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
     EXPECT_TRUE(tensor->isOnGPU());
 }
 
@@ -177,7 +177,7 @@ TEST_F(Test__CUDATensorTransfer, BF16_Upload)
 
     // Upload to GPU
     ASSERT_FALSE(tensor->isOnGPU());
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
     EXPECT_TRUE(tensor->isOnGPU());
 }
 
@@ -198,7 +198,7 @@ TEST_F(Test__CUDATensorTransfer, BF16_RoundTrip)
     }
 
     // Round trip
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
     ASSERT_TRUE(tensor->ensureOnHost());
 
     // Verify BF16 data
@@ -228,7 +228,7 @@ TEST_F(Test__CUDATensorTransfer, FP16_Upload)
     }
 
     ASSERT_FALSE(tensor->isOnGPU());
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
     EXPECT_TRUE(tensor->isOnGPU());
 }
 
@@ -248,7 +248,7 @@ TEST_F(Test__CUDATensorTransfer, FP16_RoundTrip)
         original[i] = val;
     }
 
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
     ASSERT_TRUE(tensor->ensureOnHost());
 
     const uint16_t *result = tensor->fp16_data();
@@ -268,7 +268,7 @@ TEST_F(Test__CUDATensorTransfer, SmallTensor_1x1)
     auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{1, 1});
     tensor->mutable_data()[0] = 3.14159f;
 
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
     ASSERT_TRUE(tensor->ensureOnHost());
 
     EXPECT_FLOAT_EQ(tensor->data()[0], 3.14159f);
@@ -289,7 +289,7 @@ TEST_F(Test__CUDATensorTransfer, SingleRow)
         original[i] = data[i];
     }
 
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
     ASSERT_TRUE(tensor->ensureOnHost());
 
     const float *result = tensor->data();
@@ -315,7 +315,7 @@ TEST_F(Test__CUDATensorTransfer, TallSkinny)
         original[i] = data[i];
     }
 
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
     ASSERT_TRUE(tensor->ensureOnHost());
 
     const float *result = tensor->data();

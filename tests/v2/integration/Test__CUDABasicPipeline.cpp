@@ -123,7 +123,7 @@ TEST_F(Test__CUDABasicPipeline, KernelFactory_FP32_CUDA_Dispatch)
     fillRandom(weights.get());
 
     // Upload to GPU
-    ASSERT_TRUE(weights->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
 
     // Create kernel via KernelFactory with CUDA device type
     auto kernel = llaminar::v2::kernels::KernelFactory::createGemm(weights.get(), KernelDeviceType::CUDA);
@@ -188,12 +188,12 @@ TEST_F(Test__CUDABasicPipeline, TensorTransfer_GEMMPipeline)
         M, N, K);
 
     // Now upload to GPU
-    ASSERT_TRUE(weights->ensureOnDevice(gpu_idx_));
-    ASSERT_TRUE(activations->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(activations->ensureOnDevice(gpu_device_));
 
     // Create output on GPU
     auto output = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)N});
-    ASSERT_TRUE(output->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(output->ensureOnDevice(gpu_device_));
 
     // Verify all tensors are on GPU
     EXPECT_TRUE(weights->isOnGPU());
@@ -228,10 +228,10 @@ TEST_F(Test__CUDABasicPipeline, MultiTensor_Pipeline)
     fillRandom(W_o.get());
 
     // Upload all to GPU (simulating model loading)
-    ASSERT_TRUE(input->ensureOnDevice(gpu_idx_));
-    ASSERT_TRUE(W_qkv->ensureOnDevice(gpu_idx_));
-    ASSERT_TRUE(W_o->ensureOnDevice(gpu_idx_));
-    ASSERT_TRUE(output->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(input->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(W_qkv->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(W_o->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(output->ensureOnDevice(gpu_device_));
 
     // Verify all on GPU
     EXPECT_TRUE(input->isOnGPU());
@@ -261,7 +261,7 @@ TEST_F(Test__CUDABasicPipeline, SmallBatch_Decode)
     auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)seq_len, (size_t)hidden});
     fillRandom(tensor.get());
 
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
     EXPECT_TRUE(tensor->isOnGPU());
 
     // Release GPU memory and move back to CPU
@@ -282,7 +282,7 @@ TEST_F(Test__CUDABasicPipeline, LargePrefill)
     auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)seq_len, (size_t)hidden});
     fillRandom(tensor.get());
 
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx_));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
     EXPECT_TRUE(tensor->isOnGPU());
 
     // Release GPU memory and move back to CPU

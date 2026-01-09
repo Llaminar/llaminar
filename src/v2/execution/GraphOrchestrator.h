@@ -30,6 +30,7 @@
 #pragma once
 
 #include "../models/qwen/Qwen2Graph.h"
+#include "../backends/DeviceId.h"
 #include "IInferenceRunner.h"
 #include "GraphExecutor.h"
 #include "GraphBufferManager.h"
@@ -163,7 +164,7 @@ namespace llaminar2
         int max_seq_len = 0;
         int d_model = 0;
         int vocab_size = 0;
-        int device_idx = 0;
+        DeviceId device_id = DeviceId::cpu();
 
         /**
          * @brief Check if state is initialized
@@ -284,7 +285,7 @@ namespace llaminar2
             int seq_len,
             ICPUKVCache *kv_cache,
             const int *position_ids,
-            int device_idx);
+            DeviceId device);
 
         /**
          * @brief Execute FFN block for a single layer
@@ -302,7 +303,7 @@ namespace llaminar2
          * @param buffers Activation buffers
          * @param layer_idx Layer index
          * @param seq_len Sequence length
-         * @param device_idx Target device
+         * @param device Target device
          * @return true if execution succeeded
          */
         bool executeFFN(
@@ -310,7 +311,7 @@ namespace llaminar2
             Qwen2ActivationBuffers &buffers,
             int layer_idx,
             int seq_len,
-            int device_idx);
+            DeviceId device);
 
         /**
          * @brief Execute complete transformer layer (attention + FFN)
@@ -323,7 +324,7 @@ namespace llaminar2
          * @param seq_len Sequence length
          * @param kv_cache KV cache for attention
          * @param position_ids Position IDs for RoPE
-         * @param device_idx Target device
+         * @param device Target device
          * @return true if execution succeeded
          */
         bool executeLayer(
@@ -333,7 +334,7 @@ namespace llaminar2
             int seq_len,
             ICPUKVCache *kv_cache,
             const int *position_ids,
-            int device_idx);
+            DeviceId device);
 
         /**
          * @brief Execute a pre-built compute graph
@@ -503,7 +504,7 @@ namespace llaminar2
         bool initializeInferenceState(
             int batch_size,
             int max_seq_len,
-            int device_idx = 0);
+            DeviceId device_id = DeviceId::cpu());
 
         /**
          * @brief Check if inference state is initialized
@@ -570,10 +571,10 @@ namespace llaminar2
         /**
          * @brief Get device context for a device (creates if needed)
          *
-         * @param device_idx Device index
+         * @param device Device identifier
          * @return Device context pointer (owned by orchestrator)
          */
-        IDeviceContext *getDeviceContext(int device_idx);
+        IDeviceContext *getDeviceContext(DeviceId device);
 
         // =========================================================================
         // IInferenceRunner Interface Implementation

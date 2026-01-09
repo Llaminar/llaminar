@@ -70,6 +70,7 @@
 #pragma once
 
 #include "../backends/DeviceType.h" // Shared DeviceType enum
+#include "../backends/DeviceId.h"   // Type-safe device identification
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -170,10 +171,21 @@ namespace llaminar
             {
             public:
                 /**
-                 * @brief Get the DeviceType for a given device index
+                 * @brief Get the DeviceType for a given DeviceId
+                 *
+                 * @param device_id Type-safe device identifier
+                 * @return DeviceType for the device
+                 *
+                 * @throws std::runtime_error if device_id is invalid
+                 */
+                static DeviceType getDeviceType(llaminar2::DeviceId device_id);
+
+                /**
+                 * @brief Get the DeviceType for a given device index (legacy)
                  *
                  * @param device_idx Device index (-1 for CPU, 0+ for GPU devices)
                  * @return DeviceType for the device
+                 * @deprecated Use getDeviceType(DeviceId) instead
                  *
                  * @throws std::runtime_error if device_idx is invalid
                  */
@@ -712,6 +724,22 @@ namespace llaminar
                 static llaminar2::ITensorGemm *getOrCreateGemm(const llaminar2::TensorBase *tensor);
 
                 /**
+                 * @brief Get or create a cached GEMM kernel with explicit target device
+                 *
+                 * Same as getOrCreateGemm but allows specifying the target device for execution.
+                 * Use this when weights are on CPU but computation should happen on GPU.
+                 *
+                 * @param tensor Weight tensor to create kernel for
+                 * @param target_device Device type where computation should execute
+                 * @return Raw pointer to cached kernel (lifetime managed by cache)
+                 *
+                 * @note Cache key includes both tensor pointer AND device type
+                 */
+                static llaminar2::ITensorGemm *getOrCreateGemm(
+                    const llaminar2::TensorBase *tensor,
+                    DeviceType target_device);
+
+                /**
                  * @brief Get or create a cached row-sliced GEMM kernel for tensor parallelism
                  *
                  * Creates a kernel that only packs rows [row_start, row_end) from the weight tensor.
@@ -828,6 +856,30 @@ namespace llaminar
                 };
 
                 static std::unordered_map<SlicedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, SlicedKeyHash> sliced_cache_;
+
+                // Device-targeted GEMM cache - keyed by (tensor, target_device)
+                // Used when caller explicitly specifies target device different from weight tensor's device
+                struct DeviceTargetedCacheKey
+                {
+                    const llaminar2::TensorBase *tensor;
+                    DeviceType device;
+
+                    bool operator==(const DeviceTargetedCacheKey &other) const
+                    {
+                        return tensor == other.tensor && device == other.device;
+                    }
+                };
+
+                struct DeviceTargetedKeyHash
+                {
+                    size_t operator()(const DeviceTargetedCacheKey &k) const
+                    {
+                        return std::hash<const void *>()(k.tensor) ^
+                               (std::hash<int>()(static_cast<int>(k.device)) << 1);
+                    }
+                };
+
+                static std::unordered_map<DeviceTargetedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, DeviceTargetedKeyHash> device_targeted_cache_;
             };
 
         } // namespace kernels

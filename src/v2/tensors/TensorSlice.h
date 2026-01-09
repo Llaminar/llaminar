@@ -33,6 +33,7 @@
 #pragma once
 
 #include "Tensors.h"
+#include "../backends/DeviceId.h"
 #include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 #include "../utils/Logger.h"
 #include <memory>

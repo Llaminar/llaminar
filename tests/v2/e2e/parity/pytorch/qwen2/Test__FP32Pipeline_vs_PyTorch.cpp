@@ -48,6 +48,7 @@
 #include "../../../../src/v2/execution/IInferenceRunner.h"
 #include "../../../../src/v2/kernels/KernelFactory.h"
 #include "../../../../src/v2/utils/Logger.h"
+#include "../../../../src/v2/backends/DeviceId.h"
 
 // NumPy .npz file loading (simple C++ implementation)
 #include <cnpy.h>
@@ -588,9 +589,8 @@ protected:
         // Use Graph path - the GraphOrchestrator with full declarative execution
         runner_config.force_graph = true;
 
-        // Get CPU device index explicitly (no magic -1 values)
-        auto &dm = DeviceManager::instance();
-        int cpu_device = dm.cpuDeviceIndex();
+        // Use explicit DeviceId for CPU
+        DeviceId cpu_device = DeviceId::cpu();
 
         runner_ = createInferenceRunner(
             model_ctx_,

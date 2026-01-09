@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 #include "backends/ComputeBackend.h"
+#include "backends/DeviceId.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
@@ -91,6 +92,44 @@ protected:
         return -1;
     }
 
+    /**
+     * @brief Convert legacy DeviceManager index to DeviceId
+     */
+    DeviceId legacyToDeviceId(int legacy_idx) const
+    {
+        if (legacy_idx < 0 || static_cast<size_t>(legacy_idx) >= devices_.size())
+        {
+            return DeviceId::cpu();
+        }
+        const auto &dev = devices_[legacy_idx];
+        if (dev.type == ComputeBackendType::GPU_CUDA)
+        {
+            // Convert legacy idx to CUDA ordinal (legacy idx - 1 assuming CPU is at 0)
+            int cuda_ordinal = 0;
+            for (int i = 1; i < legacy_idx; ++i)
+            {
+                if (devices_[i].type == ComputeBackendType::GPU_CUDA)
+                {
+                    ++cuda_ordinal;
+                }
+            }
+            return DeviceId::cuda(cuda_ordinal);
+        }
+        else if (dev.type == ComputeBackendType::GPU_ROCM)
+        {
+            int rocm_ordinal = 0;
+            for (int i = 1; i < legacy_idx; ++i)
+            {
+                if (devices_[i].type == ComputeBackendType::GPU_ROCM)
+                {
+                    ++rocm_ordinal;
+                }
+            }
+            return DeviceId::rocm(rocm_ordinal);
+        }
+        return DeviceId::cpu();
+    }
+
     std::vector<ComputeDevice> devices_;
     int cuda_idx_ = -1;
     int rocm_idx_ = -1;
@@ -118,6 +157,9 @@ TEST_F(Test__MultiGPU_RealModel, Q4_0_AttentionWeight_GPUTransfer)
         GTEST_SKIP() << "No GPU available for testing";
     }
 
+    // Convert legacy index to DeviceId
+    DeviceId gpu_device = legacyToDeviceId(gpu_idx);
+
     // Load a Q4_0 attention weight tensor
     auto tensor = loader_->loadTensor("blk.0.attn_q.weight");
     ASSERT_NE(tensor, nullptr) << "Failed to load blk.0.attn_q.weight";
@@ -137,8 +179,8 @@ TEST_F(Test__MultiGPU_RealModel, Q4_0_AttentionWeight_GPUTransfer)
     double original_sum = std::accumulate(original_fp32.begin(), original_fp32.end(), 0.0);
 
     // Transfer to GPU
-    ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_idx))
-        << "Failed to transfer Q4_0 tensor to GPU " << gpu_idx;
+    ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device))
+        << "Failed to transfer Q4_0 tensor to GPU " << gpu_device.toString();
     EXPECT_TRUE(q4_tensor->isOnGPU());
     EXPECT_TRUE(q4_tensor->is_on_device(gpu_idx));
 
@@ -173,6 +215,9 @@ TEST_F(Test__MultiGPU_RealModel, Q4_0_FFNWeight_TransferAndCompute)
         GTEST_SKIP() << "No GPU available for testing";
     }
 
+    // Convert legacy index to DeviceId
+    DeviceId gpu_device = legacyToDeviceId(gpu_idx);
+
     // Load FFN gate weight (larger tensor)
     auto tensor = loader_->loadTensor("blk.0.ffn_gate.weight");
     ASSERT_NE(tensor, nullptr) << "Failed to load blk.0.ffn_gate.weight";
@@ -204,7 +249,7 @@ TEST_F(Test__MultiGPU_RealModel, Q4_0_FFNWeight_TransferAndCompute)
     ASSERT_TRUE(gemm_kernel->multiply(activations.data(), output_cpu.data(), m, n, k));
 
     // Transfer weight to GPU
-    ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_idx));
+    ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device));
     EXPECT_TRUE(q4_tensor->isOnGPU());
 
     // Compute GEMM again (should use CPU fallback with GPU-resident data)
@@ -242,6 +287,9 @@ TEST_F(Test__MultiGPU_RealModel, MultipleWeights_SameGPU)
         GTEST_SKIP() << "No GPU available for testing";
     }
 
+    // Convert legacy index to DeviceId
+    DeviceId gpu_device = legacyToDeviceId(gpu_idx);
+
     // Load multiple weights from layer 0
     std::vector<std::string> weight_names = {
         "blk.0.attn_q.weight",
@@ -266,13 +314,13 @@ TEST_F(Test__MultiGPU_RealModel, MultipleWeights_SameGPU)
     // Transfer all to GPU
     for (size_t i = 0; i < tensors.size(); ++i)
     {
-        ASSERT_TRUE(tensors[i]->ensureOnDevice(gpu_idx))
+        ASSERT_TRUE(tensors[i]->ensureOnDevice(gpu_device))
             << "Failed to transfer " << weight_names[i] << " to GPU";
         EXPECT_TRUE(tensors[i]->isOnGPU());
         EXPECT_TRUE(tensors[i]->is_on_device(gpu_idx));
     }
 
-    std::cout << "All " << tensors.size() << " tensors transferred to GPU " << gpu_idx << "\n";
+    std::cout << "All " << tensors.size() << " tensors transferred to GPU " << gpu_device.toString() << "\n";
 
     // Verify all still accessible (dual residency)
     for (size_t i = 0; i < tensors.size(); ++i)
@@ -310,6 +358,10 @@ TEST_F(Test__MultiGPU_RealModel, CrossBackend_CUDAtoROCm)
         GTEST_SKIP() << "Need both CUDA and ROCm GPUs for cross-backend test";
     }
 
+    // Convert legacy indices to DeviceId
+    DeviceId cuda_device = legacyToDeviceId(cuda_idx_);
+    DeviceId rocm_device = legacyToDeviceId(rocm_idx_);
+
     // Load attention output weight
     auto tensor = loader_->loadTensor("blk.0.attn_output.weight");
     ASSERT_NE(tensor, nullptr);
@@ -326,11 +378,11 @@ TEST_F(Test__MultiGPU_RealModel, CrossBackend_CUDAtoROCm)
               << ") -> ROCm (idx " << rocm_idx_ << ")\n";
 
     // Transfer to CUDA
-    ASSERT_TRUE(q4_tensor->ensureOnDevice(cuda_idx_));
+    ASSERT_TRUE(q4_tensor->ensureOnDevice(cuda_device));
     EXPECT_TRUE(q4_tensor->is_on_device(cuda_idx_));
 
     // Transfer to ROCm (will go via host)
-    ASSERT_TRUE(q4_tensor->ensureOnDevice(rocm_idx_));
+    ASSERT_TRUE(q4_tensor->ensureOnDevice(rocm_device));
     EXPECT_TRUE(q4_tensor->is_on_device(rocm_idx_));
     // After cross-backend, should no longer be on CUDA
     // (current implementation releases old device when moving to new)
@@ -368,6 +420,9 @@ TEST_F(Test__MultiGPU_RealModel, FP32_Embedding_GPUTransfer)
         GTEST_SKIP() << "No GPU available for testing";
     }
 
+    // Convert legacy index to DeviceId
+    DeviceId gpu_device = legacyToDeviceId(gpu_idx);
+
     // Token embeddings are typically FP16 or Q8_0 in this model
     // Let's check if there's an FP32 tensor we can use
     auto tensor = loader_->loadTensor("output_norm.weight");
@@ -386,7 +441,7 @@ TEST_F(Test__MultiGPU_RealModel, FP32_Embedding_GPUTransfer)
     std::copy(data, data + numel, original.begin());
 
     // Transfer to GPU
-    ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device));
     EXPECT_TRUE(tensor->isOnGPU());
     EXPECT_TRUE(tensor->is_on_device(gpu_idx));
 
@@ -423,6 +478,9 @@ TEST_F(Test__MultiGPU_RealModel, EntireLayer_GPUTransfer)
     {
         GTEST_SKIP() << "No GPU available for testing";
     }
+
+    // Convert legacy index to DeviceId
+    DeviceId gpu_device = legacyToDeviceId(gpu_idx);
 
     // All weight tensors in layer 0
     std::vector<std::string> layer0_weights = {
@@ -466,7 +524,7 @@ TEST_F(Test__MultiGPU_RealModel, EntireLayer_GPUTransfer)
     auto start = std::chrono::high_resolution_clock::now();
     for (auto &tensor : tensors)
     {
-        ASSERT_TRUE(tensor->ensureOnDevice(gpu_idx));
+        ASSERT_TRUE(tensor->ensureOnDevice(gpu_device));
     }
     auto end = std::chrono::high_resolution_clock::now();
     double transfer_ms = std::chrono::duration<double, std::milli>(end - start).count();

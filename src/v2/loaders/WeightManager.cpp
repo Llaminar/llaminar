@@ -76,7 +76,7 @@ namespace llaminar2
         }
     }
 
-    std::shared_ptr<TensorBase> WeightManager::getWeight(const std::string &name, int device_idx, int layer_idx)
+    std::shared_ptr<TensorBase> WeightManager::getWeight(const std::string &name, DeviceId device, int layer_idx)
     {
         // Check cache first
         auto it = cache_.find(name);
@@ -86,14 +86,14 @@ namespace llaminar2
         }
 
         // Determine device from placement map if not explicitly provided
-        int target_device = device_idx;
-        if (target_device < 0 && placement_map_)
+        DeviceId target_device = device;
+        if (!target_device.is_valid() && placement_map_)
         {
             target_device = placement_map_->getDeviceForWeight(name, layer_idx);
         }
-        if (target_device < 0)
+        if (!target_device.is_valid())
         {
-            target_device = 0; // Default to device 0
+            target_device = DeviceId::cpu(); // Default to CPU
         }
 
         // Load based on strategy
@@ -118,23 +118,13 @@ namespace llaminar2
             return nullptr;
         }
 
-        // For GEMM weight matrices, pack to INT8 for CPU VNNI kernel
-        // Only release raw data if NOT using multi-GPU placement (GPU needs the data for transfer)
-        if (tensor && isGemmWeight(name))
-        {
-            // Pack weights into INT8 VNNI format (creates cached kernel via KernelFactory)
-            auto *gemm_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(tensor.get());
-            if (gemm_kernel)
-            {
-                // Only release raw data if single-device (CPU only)
-                // Multi-GPU needs the raw data for device transfer
-                bool needs_gpu_transfer = placement_map_ && placement_map_->getDeviceForWeight(name, -1) > 0;
-                if (!needs_gpu_transfer)
-                {
-                    tensor->release_raw_data();
-                }
-            }
-        }
+        // NOTE: Weight packing is now handled by WeightPreloader, NOT here.
+        // WeightPreloader.preloadAll() or preloadForDevice() should be called
+        // after all weights are loaded to pack them for the target device.
+        // This separation ensures:
+        // 1. WeightManager only handles loading and distribution
+        // 2. WeightPreloader handles device-specific packing
+        // 3. Raw data isn't released until we know the target device
 
         // Cache the loaded tensor
         if (tensor)
@@ -156,12 +146,12 @@ namespace llaminar2
         return !sharding_config_.isNonGemmWeight(name);
     }
 
-    std::shared_ptr<TensorBase> WeightManager::getReplicatedWeight(const std::string &name, int device_idx)
+    std::shared_ptr<TensorBase> WeightManager::getReplicatedWeight(const std::string &name, DeviceId device)
     {
         // Phase 1: Simple replication - each rank loads independently
         // No MPI coordination needed
 
-        auto tensor = loader_.loadTensor(name, device_idx, weight_precision_);
+        auto tensor = loader_.loadTensor(name, device, weight_precision_);
         if (!tensor)
         {
             int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
@@ -333,7 +323,7 @@ namespace llaminar2
         return sliced;
     }
 
-    std::shared_ptr<TensorBase> WeightManager::getShardedWeight(const std::string &name, int device_idx)
+    std::shared_ptr<TensorBase> WeightManager::getShardedWeight(const std::string &name, DeviceId device)
     {
         // For SHARDED strategy:
         // 1. Determine sharding mode based on weight name
@@ -344,7 +334,7 @@ namespace llaminar2
         if (!mpi_ctx_ || mpi_ctx_->world_size() == 1)
         {
             // Single rank: no sharding needed
-            return getReplicatedWeight(name, device_idx);
+            return getReplicatedWeight(name, device);
         }
 
         ShardingMode mode = getShardingMode(name);
@@ -354,7 +344,7 @@ namespace llaminar2
         if (mode == ShardingMode::REPLICATE)
         {
             // This weight should not be sharded (norms, biases, etc.)
-            return getReplicatedWeight(name, device_idx);
+            return getReplicatedWeight(name, device);
         }
 
         if (mode == ShardingMode::ROW_PARALLEL)
@@ -378,7 +368,7 @@ namespace llaminar2
 
             // Load ONLY the slice from GGUF file (memory efficient!)
             auto slice_tensor = loader_.loadTensorRowSlice(
-                name, row_start, row_end, device_idx, WeightPrecision::NATIVE);
+                name, row_start, row_end, device, WeightPrecision::NATIVE);
 
             if (!slice_tensor)
             {
@@ -443,7 +433,7 @@ namespace llaminar2
                 size_t slice_elements = end - start;
 
                 // Load full 1D tensor first (biases are small, ~3KB)
-                auto full_tensor = loader_.loadTensor(name, device_idx, WeightPrecision::NATIVE);
+                auto full_tensor = loader_.loadTensor(name, device, WeightPrecision::NATIVE);
                 if (!full_tensor)
                 {
                     LOG_ERROR("[WeightManager] Rank " << rank << " failed to load 1D tensor for: " << name);
@@ -496,7 +486,7 @@ namespace llaminar2
 
             // Load only this rank's row slice (preserves quantized format)
             auto slice_tensor = loader_.loadTensorRowSlice(
-                name, row_start, row_end, device_idx, WeightPrecision::NATIVE);
+                name, row_start, row_end, device, WeightPrecision::NATIVE);
 
             if (!slice_tensor)
             {
@@ -554,7 +544,7 @@ namespace llaminar2
 
             // Load only this rank's column slice (preserves quantized format)
             auto slice_tensor = loader_.loadTensorColumnSlice(
-                name, col_start, col_end, device_idx, WeightPrecision::NATIVE);
+                name, col_start, col_end, device, WeightPrecision::NATIVE);
 
             if (!slice_tensor)
             {
@@ -581,7 +571,7 @@ namespace llaminar2
         return nullptr;
     }
 
-    std::shared_ptr<TensorBase> WeightManager::getInterleavedWeight(const std::string &name, int device_idx)
+    std::shared_ptr<TensorBase> WeightManager::getInterleavedWeight(const std::string &name, DeviceId device)
     {
         // Phase 3: Interleaved strategy (not yet implemented)
         // TODO: Implement NUMA-aware allocation with page interleaving
@@ -593,7 +583,7 @@ namespace llaminar2
         // 4. Good for systems with fast interconnect (NVLink, etc.)
 
         LOG_ERROR("[WeightManager] INTERLEAVED strategy not yet implemented, falling back to REPLICATED");
-        return getReplicatedWeight(name, device_idx);
+        return getReplicatedWeight(name, device);
     }
 
 } // namespace llaminar2

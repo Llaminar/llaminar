@@ -18,6 +18,7 @@
 
 #include "compute_stages/ComputeStages.h"
 #include "DeviceContext.h"
+#include "../backends/DeviceId.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -61,9 +62,9 @@ namespace llaminar2
     struct GraphExecutorConfig
     {
         ExecutionMode mode = ExecutionMode::SEQUENTIAL;
-        bool enable_profiling = false;  ///< Track per-stage timing
-        bool enable_validation = false; ///< Validate outputs after each stage
-        int default_device = 0;         ///< Default device for stages
+        bool enable_profiling = false;             ///< Track per-stage timing
+        bool enable_validation = false;            ///< Validate outputs after each stage
+        DeviceId default_device = DeviceId::cpu(); ///< Default device for stages
 
         /// Callback invoked after each stage executes (for snapshot capture)
         StageSnapshotCallback snapshot_callback = nullptr;

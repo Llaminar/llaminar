@@ -174,7 +174,7 @@ namespace llaminar2
                   << residual[0] << "," << residual[1] << "," << residual[2] << "," << residual[3]);
 
         // Create kernel via KernelFactory with automatic device dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
         auto kernel = llaminar::v2::kernels::KernelFactory::createResidualAdd(input_base, dev_type);
         if (!kernel)
         {
@@ -182,7 +182,7 @@ namespace llaminar2
             return false;
         }
 
-        bool ok = kernel->apply(input, residual, output, n, params_.mpi_ctx, params_.device_idx);
+        bool ok = kernel->apply(input, residual, output, n, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
 
         LOG_DEBUG("[ResidualAddStage::FP32] output[0:4]="
                   << output[0] << "," << output[1] << "," << output[2] << "," << output[3]);
@@ -210,7 +210,7 @@ namespace llaminar2
         LOG_DEBUG("[ResidualAddStage::BF16] Converting and adding " << n << " elements");
 
         // Create kernel via KernelFactory with automatic device dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
         auto kernel = llaminar::v2::kernels::KernelFactory::createResidualAdd(input_base, dev_type);
         if (!kernel)
         {
@@ -218,7 +218,7 @@ namespace llaminar2
             return false;
         }
 
-        return kernel->apply_bf16(input, residual, output, n, params_.mpi_ctx, params_.device_idx);
+        return kernel->apply_bf16(input, residual, output, n, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
     }
 
     bool ResidualAddStage::executeFP16(IDeviceContext *ctx, size_t num_elements)
@@ -241,7 +241,7 @@ namespace llaminar2
         LOG_DEBUG("[ResidualAddStage::FP16] Converting and adding " << n << " elements");
 
         // Create kernel via KernelFactory with automatic device dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
         auto kernel = llaminar::v2::kernels::KernelFactory::createResidualAdd(input_base, dev_type);
         if (!kernel)
         {
@@ -249,7 +249,7 @@ namespace llaminar2
             return false;
         }
 
-        return kernel->apply_fp16(input, residual, output, n, params_.mpi_ctx, params_.device_idx);
+        return kernel->apply_fp16(input, residual, output, n, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
     }
 
     bool ResidualAddStage::executeQ8_1(IDeviceContext *ctx, size_t num_elements)

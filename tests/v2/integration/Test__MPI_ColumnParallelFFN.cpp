@@ -21,6 +21,7 @@
 #include "tensors/TensorFactory.h"
 #include "tensors/Tensors.h"
 #include "kernels/KernelFactory.h"
+#include "backends/DeviceId.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
 
@@ -152,7 +153,7 @@ TEST_F(Test__MPI_ColumnParallelFFN, GateWeightLocalShape)
     int d_ff_local = D_FF / world_size;
 
     // Load gate weight (will be column-sliced)
-    auto gate_weight = weight_manager_->getWeight("blk.0.ffn_gate.weight", 0);
+    auto gate_weight = weight_manager_->getWeight("blk.0.ffn_gate.weight", DeviceId::cpu());
     ASSERT_NE(gate_weight, nullptr) << "Failed to load gate weight";
 
     // Check shape: should be [d_ff_local, d_model]
@@ -184,7 +185,7 @@ TEST_F(Test__MPI_ColumnParallelFFN, UpWeightLocalShape)
     int d_ff_local = D_FF / world_size;
 
     // Load up weight (will be column-sliced)
-    auto up_weight = weight_manager_->getWeight("blk.0.ffn_up.weight", 0);
+    auto up_weight = weight_manager_->getWeight("blk.0.ffn_up.weight", DeviceId::cpu());
     ASSERT_NE(up_weight, nullptr) << "Failed to load up weight";
 
     // Check shape: should be [d_ff_local, d_model]
@@ -216,7 +217,7 @@ TEST_F(Test__MPI_ColumnParallelFFN, DownWeightLocalShape)
     int d_ff_local = D_FF / world_size;
 
     // Load down weight (will be input-parallel sliced)
-    auto down_weight = weight_manager_->getWeight("blk.0.ffn_down.weight", 0);
+    auto down_weight = weight_manager_->getWeight("blk.0.ffn_down.weight", DeviceId::cpu());
     ASSERT_NE(down_weight, nullptr) << "Failed to load down weight";
 
     // Check shape: should be [d_model, d_ff_local]
@@ -249,13 +250,13 @@ TEST_F(Test__MPI_ColumnParallelFFN, GateProjectionLocalOutput)
     int seq_len = 8;
 
     // Load gate weight
-    auto gate_weight = weight_manager_->getWeight("blk.0.ffn_gate.weight", 0);
+    auto gate_weight = weight_manager_->getWeight("blk.0.ffn_gate.weight", DeviceId::cpu());
     ASSERT_NE(gate_weight, nullptr);
 
     // Create input tensor [seq_len, d_model]
     auto input = factory_->createFP32({static_cast<size_t>(seq_len),
                                        static_cast<size_t>(D_MODEL)},
-                                      0);
+                                      DeviceId::cpu());
     ASSERT_NE(input, nullptr);
 
     // Initialize with deterministic values
@@ -268,7 +269,7 @@ TEST_F(Test__MPI_ColumnParallelFFN, GateProjectionLocalOutput)
     // Create output tensor [seq_len, d_ff_local]
     auto output = factory_->createFP32({static_cast<size_t>(seq_len),
                                         static_cast<size_t>(d_ff_local)},
-                                       0);
+                                       DeviceId::cpu());
     ASSERT_NE(output, nullptr);
 
     // Use KernelFactory for sliced tensor GEMM
@@ -313,17 +314,17 @@ TEST_F(Test__MPI_ColumnParallelFFN, BufferDimensionsWithLocalFFN)
     // Simulate buffer allocation with local FFN dimension
     // Gate buffer should be [seq_len, d_ff_local]
     auto gate_buffer = factory_->createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_local)}, 0);
+        {static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_local)}, DeviceId::cpu());
     ASSERT_NE(gate_buffer, nullptr);
 
     // Up buffer should be [seq_len, d_ff_local]
     auto up_buffer = factory_->createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_local)}, 0);
+        {static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_local)}, DeviceId::cpu());
     ASSERT_NE(up_buffer, nullptr);
 
     // FFN output buffer (after SwiGLU) should be [seq_len, d_ff_local]
     auto ffn_output = factory_->createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_local)}, 0);
+        {static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_local)}, DeviceId::cpu());
     ASSERT_NE(ffn_output, nullptr);
 
     EXPECT_EQ(gate_buffer->shape()[1], static_cast<size_t>(d_ff_local));

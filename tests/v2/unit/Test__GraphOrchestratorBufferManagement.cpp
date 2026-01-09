@@ -15,6 +15,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../../src/v2/backends/DeviceId.h"
 #include "../../../src/v2/execution/GraphOrchestrator.h"
 #include "../../../src/v2/models/qwen/Qwen2Graph.h"
 #include "../../../src/v2/tensors/TensorFactory.h"
@@ -54,7 +55,7 @@ protected:
         config.n_layers = 24;
         config.use_graph_buffer_management = true;
         config.max_seq_len = 128; // Small for tests
-        config.default_device = 0;
+        config.default_device = DeviceId::cpu();
         return config;
     }
 
