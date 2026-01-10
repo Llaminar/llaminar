@@ -24,6 +24,7 @@
 
 // Include project headers BEFORE CUDATestUtils.h
 #include "tensors/Tensors.h"
+#include "tensors/TensorKernels.h" // For TensorProjectionDesc
 #include "kernels/KernelFactory.h"
 #include "backends/ComputeBackend.h"
 #include "execution/DeviceContext.h"
@@ -51,6 +52,9 @@ using namespace llaminar2::test; // For TestTensorFactory
 
 // Alias for kernel DeviceType to avoid ambiguity
 using KernelDeviceType = llaminar::v2::kernels::DeviceType;
+
+// Alias for TensorProjectionDesc
+using TensorProjectionDesc = llaminar2::ITensorGemm::TensorProjectionDesc;
 
 namespace
 {
@@ -1177,6 +1181,928 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
     EXPECT_GE(result.cosine_similarity, 0.99)
         << "multiply_tensor() API shows divergence!";
     EXPECT_FALSE(result.has_nan_inf);
+}
+
+/**
+ * @test Fused QKV GEMM parity: multiply_fused_tensor() vs 3x multiply_tensor()
+ *
+ * This test validates the new multiply_fused_tensor() method which:
+ * 1. Uploads input to GPU once
+ * 2. Quantizes activations to INT8 once (shared across all projections)
+ * 3. Runs all Q/K/V projections using the shared quantized activations
+ *
+ * **Key validation**: The fused path should produce identical results to
+ * calling multiply_tensor() three times separately, since the quantization
+ * of activations should be deterministic.
+ *
+ * This test was written to verify the fix for CUDA full model divergence
+ * where the default multiply_fused_tensor() implementation was calling
+ * multiply_tensor() in a loop, which requantized activations for each
+ * projection (inefficient and potentially inconsistent).
+ */
+TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
+{
+    if (!std::filesystem::exists(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
+    }
+
+    auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
+    TensorFactory factory(*mpi_ctx);
+    ModelLoader loader(&factory);
+
+    if (!loader.loadModel(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
+    }
+
+    // Load Q, K, V projection weights
+    auto weights_q_base = loader.loadTensor("blk.0.attn_q.weight", DeviceId::cpu());
+    auto weights_k_base = loader.loadTensor("blk.0.attn_k.weight", DeviceId::cpu());
+    auto weights_v_base = loader.loadTensor("blk.0.attn_v.weight", DeviceId::cpu());
+    ASSERT_NE(weights_q_base, nullptr) << "Failed to load attn_q.weight";
+    ASSERT_NE(weights_k_base, nullptr) << "Failed to load attn_k.weight";
+    ASSERT_NE(weights_v_base, nullptr) << "Failed to load attn_v.weight";
+
+    // Cast to concrete Q4_0 type
+    auto *weights_q = dynamic_cast<Q4_0Tensor *>(weights_q_base.get());
+    auto *weights_k = dynamic_cast<Q4_0Tensor *>(weights_k_base.get());
+    auto *weights_v = dynamic_cast<Q4_0Tensor *>(weights_v_base.get());
+    ASSERT_NE(weights_q, nullptr) << "Expected Q4_0Tensor for Q weights";
+    ASSERT_NE(weights_k, nullptr) << "Expected Q4_0Tensor for K weights";
+    ASSERT_NE(weights_v, nullptr) << "Expected Q4_0Tensor for V weights";
+
+    // Get dimensions
+    const int M = 4; // Small batch for testing (could also test M=1 for decode)
+    const int N_q = static_cast<int>(weights_q->shape()[0]);
+    const int N_k = static_cast<int>(weights_k->shape()[0]);
+    const int N_v = static_cast<int>(weights_v->shape()[0]);
+    const int K = static_cast<int>(weights_q->shape()[1]);
+
+    std::cout << "FusedQKV test: M=" << M << " K=" << K
+              << " N_q=" << N_q << " N_k=" << N_k << " N_v=" << N_v << "\n";
+
+    // Ensure all weights are on GPU
+    ASSERT_TRUE(weights_q->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(weights_k->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(weights_v->ensureOnDevice(gpu_device_));
+
+    // Create CUDA kernels for each projection
+    auto cuda_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights_q, KernelDeviceType::CUDA);
+    auto cuda_kernel_k = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights_k, KernelDeviceType::CUDA);
+    auto cuda_kernel_v = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights_v, KernelDeviceType::CUDA);
+    ASSERT_NE(cuda_kernel_q, nullptr) << "Failed to create CUDA kernel for Q";
+    ASSERT_NE(cuda_kernel_k, nullptr) << "Failed to create CUDA kernel for K";
+    ASSERT_NE(cuda_kernel_v, nullptr) << "Failed to create CUDA kernel for V";
+
+    // Create input tensor with random data
+    auto input_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    float *input_data = input_tensor->mutable_data();
+    for (int i = 0; i < M * K; ++i)
+    {
+        input_data[i] = dist_(rng_);
+    }
+    ASSERT_TRUE(input_tensor->ensureOnDevice(gpu_device_));
+
+    // Create output tensors for SEPARATE path
+    auto output_q_separate = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_q)});
+    auto output_k_separate = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_k)});
+    auto output_v_separate = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_v)});
+    ASSERT_TRUE(output_q_separate->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(output_k_separate->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(output_v_separate->ensureOnDevice(gpu_device_));
+
+    // Create output tensors for FUSED path
+    auto output_q_fused = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_q)});
+    auto output_k_fused = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_k)});
+    auto output_v_fused = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_v)});
+    ASSERT_TRUE(output_q_fused->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(output_k_fused->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(output_v_fused->ensureOnDevice(gpu_device_));
+
+    // ===== SEPARATE PATH: 3x multiply_tensor() =====
+    std::cout << "Running SEPARATE path (3x multiply_tensor)...\n";
+    ASSERT_TRUE(cuda_kernel_q->multiply_tensor(
+        input_tensor.get(), output_q_separate.get(),
+        M, N_q, K, true, 1.0f, 0.0f, nullptr, -1));
+    ASSERT_TRUE(cuda_kernel_k->multiply_tensor(
+        input_tensor.get(), output_k_separate.get(),
+        M, N_k, K, true, 1.0f, 0.0f, nullptr, -1));
+    ASSERT_TRUE(cuda_kernel_v->multiply_tensor(
+        input_tensor.get(), output_v_separate.get(),
+        M, N_v, K, true, 1.0f, 0.0f, nullptr, -1));
+
+    // ===== FUSED PATH: multiply_fused_tensor() =====
+    std::cout << "Running FUSED path (multiply_fused_tensor)...\n";
+
+    // Build projection descriptors
+    std::vector<TensorProjectionDesc> projections;
+    projections.emplace_back(cuda_kernel_q.get(), output_q_fused.get(), N_q,
+                             nullptr, nullptr, false, "Q");
+    projections.emplace_back(cuda_kernel_k.get(), output_k_fused.get(), N_k,
+                             nullptr, nullptr, false, "K");
+    projections.emplace_back(cuda_kernel_v.get(), output_v_fused.get(), N_v,
+                             nullptr, nullptr, false, "V");
+
+    // Call fused method (uses the Q kernel to coordinate, but each projection uses its own kernel)
+    ASSERT_TRUE(cuda_kernel_q->multiply_fused_tensor(
+        input_tensor.get(), projections, M, K, nullptr));
+
+    // ===== COMPARE: Fused vs Separate =====
+    std::cout << "\nComparing FUSED vs SEPARATE results:\n";
+
+    // Sync back to host for comparison
+    const float *q_separate = output_q_separate->data();
+    const float *k_separate = output_k_separate->data();
+    const float *v_separate = output_v_separate->data();
+    const float *q_fused = output_q_fused->data();
+    const float *k_fused = output_k_fused->data();
+    const float *v_fused = output_v_fused->data();
+
+    // Q projection parity
+    auto result_q = checkParity(q_fused, q_separate, M * N_q, 0.9999, 0.001);
+    result_q.print("Q projection (fused vs separate)");
+    EXPECT_GE(result_q.cosine_similarity, 0.9999)
+        << "Q projection: fused and separate should be nearly identical";
+    EXPECT_FALSE(result_q.has_nan_inf);
+
+    // K projection parity
+    auto result_k = checkParity(k_fused, k_separate, M * N_k, 0.9999, 0.001);
+    result_k.print("K projection (fused vs separate)");
+    EXPECT_GE(result_k.cosine_similarity, 0.9999)
+        << "K projection: fused and separate should be nearly identical";
+    EXPECT_FALSE(result_k.has_nan_inf);
+
+    // V projection parity
+    auto result_v = checkParity(v_fused, v_separate, M * N_v, 0.9999, 0.001);
+    result_v.print("V projection (fused vs separate)");
+    EXPECT_GE(result_v.cosine_similarity, 0.9999)
+        << "V projection: fused and separate should be nearly identical";
+    EXPECT_FALSE(result_v.has_nan_inf);
+
+    // Also compare against CPU to ensure correctness
+    std::cout << "\nComparing FUSED vs CPU reference:\n";
+
+    auto cpu_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights_q, KernelDeviceType::CPU);
+    auto cpu_kernel_k = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights_k, KernelDeviceType::CPU);
+    auto cpu_kernel_v = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights_v, KernelDeviceType::CPU);
+
+    std::vector<float> q_cpu(M * N_q), k_cpu(M * N_k), v_cpu(M * N_v);
+    const float *h_input = input_tensor->data(); // Sync input to host
+    ASSERT_TRUE(cpu_kernel_q->multiply(h_input, q_cpu.data(), M, N_q, K));
+    ASSERT_TRUE(cpu_kernel_k->multiply(h_input, k_cpu.data(), M, N_k, K));
+    ASSERT_TRUE(cpu_kernel_v->multiply(h_input, v_cpu.data(), M, N_v, K));
+
+    auto result_q_cpu = checkParity(q_fused, q_cpu.data(), M * N_q, 0.99, 0.10);
+    result_q_cpu.print("Q projection (CUDA fused vs CPU)");
+    EXPECT_GE(result_q_cpu.cosine_similarity, 0.99);
+
+    auto result_k_cpu = checkParity(k_fused, k_cpu.data(), M * N_k, 0.99, 0.10);
+    result_k_cpu.print("K projection (CUDA fused vs CPU)");
+    EXPECT_GE(result_k_cpu.cosine_similarity, 0.99);
+
+    auto result_v_cpu = checkParity(v_fused, v_cpu.data(), M * N_v, 0.99, 0.10);
+    result_v_cpu.print("V projection (CUDA fused vs CPU)");
+    EXPECT_GE(result_v_cpu.cosine_similarity, 0.99);
+}
+
+/**
+ * @test Fused QKV with decode-size batch (M=1)
+ *
+ * Tests the fused path with M=1 which is the common case during autoregressive
+ * decoding. This is important because the quantization behavior might differ
+ * with single-row inputs.
+ */
+TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
+{
+    if (!std::filesystem::exists(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
+    }
+
+    auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
+    TensorFactory factory(*mpi_ctx);
+    ModelLoader loader(&factory);
+
+    if (!loader.loadModel(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
+    }
+
+    auto weights_q_base = loader.loadTensor("blk.0.attn_q.weight", DeviceId::cpu());
+    auto weights_k_base = loader.loadTensor("blk.0.attn_k.weight", DeviceId::cpu());
+    auto weights_v_base = loader.loadTensor("blk.0.attn_v.weight", DeviceId::cpu());
+    ASSERT_NE(weights_q_base, nullptr);
+    ASSERT_NE(weights_k_base, nullptr);
+    ASSERT_NE(weights_v_base, nullptr);
+
+    // Cast to concrete Q4_0 type
+    auto *weights_q = dynamic_cast<Q4_0Tensor *>(weights_q_base.get());
+    auto *weights_k = dynamic_cast<Q4_0Tensor *>(weights_k_base.get());
+    auto *weights_v = dynamic_cast<Q4_0Tensor *>(weights_v_base.get());
+    ASSERT_NE(weights_q, nullptr) << "Expected Q4_0Tensor for Q weights";
+    ASSERT_NE(weights_k, nullptr) << "Expected Q4_0Tensor for K weights";
+    ASSERT_NE(weights_v, nullptr) << "Expected Q4_0Tensor for V weights";
+
+    const int M = 1; // Decode size!
+    const int N_q = static_cast<int>(weights_q->shape()[0]);
+    const int N_k = static_cast<int>(weights_k->shape()[0]);
+    const int N_v = static_cast<int>(weights_v->shape()[0]);
+    const int K = static_cast<int>(weights_q->shape()[1]);
+
+    std::cout << "FusedQKV DECODE test: M=" << M << " K=" << K
+              << " N_q=" << N_q << " N_k=" << N_k << " N_v=" << N_v << "\n";
+
+    ASSERT_TRUE(weights_q->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(weights_k->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(weights_v->ensureOnDevice(gpu_device_));
+
+    auto cuda_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights_q, KernelDeviceType::CUDA);
+    auto cuda_kernel_k = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights_k, KernelDeviceType::CUDA);
+    auto cuda_kernel_v = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights_v, KernelDeviceType::CUDA);
+
+    auto input_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    float *input_data = input_tensor->mutable_data();
+    for (int i = 0; i < M * K; ++i)
+    {
+        input_data[i] = dist_(rng_);
+    }
+    ASSERT_TRUE(input_tensor->ensureOnDevice(gpu_device_));
+
+    // Fused outputs
+    auto output_q_fused = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_q)});
+    auto output_k_fused = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_k)});
+    auto output_v_fused = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_v)});
+    ASSERT_TRUE(output_q_fused->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(output_k_fused->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(output_v_fused->ensureOnDevice(gpu_device_));
+
+    // Run fused
+    std::vector<TensorProjectionDesc> projections;
+    projections.emplace_back(cuda_kernel_q.get(), output_q_fused.get(), N_q,
+                             nullptr, nullptr, false, "Q");
+    projections.emplace_back(cuda_kernel_k.get(), output_k_fused.get(), N_k,
+                             nullptr, nullptr, false, "K");
+    projections.emplace_back(cuda_kernel_v.get(), output_v_fused.get(), N_v,
+                             nullptr, nullptr, false, "V");
+
+    ASSERT_TRUE(cuda_kernel_q->multiply_fused_tensor(
+        input_tensor.get(), projections, M, K, nullptr));
+
+    // Compare against CPU
+    auto cpu_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights_q, KernelDeviceType::CPU);
+    auto cpu_kernel_k = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights_k, KernelDeviceType::CPU);
+    auto cpu_kernel_v = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights_v, KernelDeviceType::CPU);
+
+    std::vector<float> q_cpu(M * N_q), k_cpu(M * N_k), v_cpu(M * N_v);
+    const float *h_input = input_tensor->data();
+    ASSERT_TRUE(cpu_kernel_q->multiply(h_input, q_cpu.data(), M, N_q, K));
+    ASSERT_TRUE(cpu_kernel_k->multiply(h_input, k_cpu.data(), M, N_k, K));
+    ASSERT_TRUE(cpu_kernel_v->multiply(h_input, v_cpu.data(), M, N_v, K));
+
+    const float *q_fused = output_q_fused->data();
+    const float *k_fused = output_k_fused->data();
+    const float *v_fused = output_v_fused->data();
+
+    auto result_q = checkParity(q_fused, q_cpu.data(), M * N_q, 0.99, 0.10);
+    result_q.print("Q decode (CUDA fused vs CPU)");
+    EXPECT_GE(result_q.cosine_similarity, 0.99);
+    EXPECT_FALSE(result_q.has_nan_inf);
+
+    auto result_k = checkParity(k_fused, k_cpu.data(), M * N_k, 0.99, 0.10);
+    result_k.print("K decode (CUDA fused vs CPU)");
+    EXPECT_GE(result_k.cosine_similarity, 0.99);
+    EXPECT_FALSE(result_k.has_nan_inf);
+
+    auto result_v = checkParity(v_fused, v_cpu.data(), M * N_v, 0.99, 0.10);
+    result_v.print("V decode (CUDA fused vs CPU)");
+    EXPECT_GE(result_v.cosine_similarity, 0.99);
+    EXPECT_FALSE(result_v.has_nan_inf);
+}
+
+// ============================================================================
+// Cached Kernel Tests
+// ============================================================================
+
+/**
+ * @test Cached kernel parity: getOrCreateGemm() vs createGemm()
+ *
+ * This test verifies that kernels obtained via getOrCreateGemm() (the caching API
+ * used by the full pipeline) produce identical results to kernels created via
+ * createGemm() (fresh kernel creation).
+ *
+ * **Why this matters**: If there's a bug in kernel caching (stale weights, incorrect
+ * scale factors), this will catch it. The full pipeline uses getOrCreateGemm().
+ */
+TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
+{
+    if (!std::filesystem::exists(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
+    }
+
+    // Clear any existing cached kernels
+    llaminar::v2::kernels::KernelFactory::clearCache();
+
+    auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
+    TensorFactory factory(*mpi_ctx);
+    ModelLoader loader(&factory);
+
+    if (!loader.loadModel(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
+    }
+
+    auto weights = loader.loadTensor("blk.0.attn_q.weight", DeviceId::cpu());
+    ASSERT_NE(weights, nullptr);
+
+    auto *q4_tensor = dynamic_cast<Q4_0Tensor *>(weights.get());
+    ASSERT_NE(q4_tensor, nullptr);
+
+    const int M = 4;
+    const int N = static_cast<int>(q4_tensor->shape()[0]);
+    const int K = static_cast<int>(q4_tensor->shape()[1]);
+
+    std::cout << "Testing cached kernel parity: attn_q " << N << "x" << K << "\n";
+
+    // Ensure on GPU
+    ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
+
+    // Create fresh kernel (not cached)
+    auto fresh_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        q4_tensor, KernelDeviceType::CUDA);
+    ASSERT_NE(fresh_kernel, nullptr);
+
+    // Get cached kernel (this is what the pipeline uses)
+    auto *cached_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(
+        q4_tensor);
+    ASSERT_NE(cached_kernel, nullptr);
+
+    // Create input and outputs
+    auto input_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    auto output_fresh = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+    auto output_cached = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+
+    // Fill input
+    float *input_data = input_tensor->mutable_data();
+    for (int i = 0; i < M * K; ++i)
+    {
+        input_data[i] = dist_(rng_);
+    }
+
+    // Upload to GPU
+    ASSERT_TRUE(input_tensor->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(output_fresh->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(output_cached->ensureOnDevice(gpu_device_));
+
+    // Run fresh kernel
+    ASSERT_TRUE(fresh_kernel->multiply_tensor(
+        input_tensor.get(), output_fresh.get(),
+        M, N, K, true, 1.0f, 0.0f, nullptr, -1));
+
+    // Run cached kernel
+    ASSERT_TRUE(cached_kernel->multiply_tensor(
+        input_tensor.get(), output_cached.get(),
+        M, N, K, true, 1.0f, 0.0f, nullptr, -1));
+
+    // Compare: should be EXACTLY the same (same kernel, same weights)
+    const float *fresh_data = output_fresh->data();
+    const float *cached_data = output_cached->data();
+
+    auto result = checkParity(cached_data, fresh_data, M * N, 0.9999, 0.001);
+    result.print("Cached kernel vs Fresh kernel");
+
+    EXPECT_GE(result.cosine_similarity, 0.9999)
+        << "Cached and fresh kernels should produce nearly identical results";
+    EXPECT_FALSE(result.has_nan_inf);
+
+    // Clear cache for next test
+    llaminar::v2::kernels::KernelFactory::clearCache();
+}
+
+/**
+ * @test Cached kernel reuse: multiple calls with same kernel
+ *
+ * Verifies that cached kernels produce consistent results across multiple calls.
+ * This catches issues like stale GPU state or incorrect memory management.
+ */
+TEST_F(Test__CUDAGemmParity, CachedKernel_MultipleCallsConsistent)
+{
+    if (!std::filesystem::exists(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
+    }
+
+    llaminar::v2::kernels::KernelFactory::clearCache();
+
+    auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
+    TensorFactory factory(*mpi_ctx);
+    ModelLoader loader(&factory);
+
+    if (!loader.loadModel(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
+    }
+
+    auto weights = loader.loadTensor("blk.0.attn_q.weight", DeviceId::cpu());
+    ASSERT_NE(weights, nullptr);
+
+    auto *q4_tensor = dynamic_cast<Q4_0Tensor *>(weights.get());
+    ASSERT_NE(q4_tensor, nullptr);
+
+    const int M = 1; // Decode size
+    const int N = static_cast<int>(q4_tensor->shape()[0]);
+    const int K = static_cast<int>(q4_tensor->shape()[1]);
+
+    ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
+
+    // Get cached kernel
+    auto *kernel = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(q4_tensor);
+    ASSERT_NE(kernel, nullptr);
+
+    // Create input
+    auto input = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    float *input_data = input->mutable_data();
+    for (int i = 0; i < M * K; ++i)
+    {
+        input_data[i] = dist_(rng_);
+    }
+    ASSERT_TRUE(input->ensureOnDevice(gpu_device_));
+
+    // Run 3 times with same input, compare all outputs
+    std::vector<std::vector<float>> outputs(3);
+    for (int run = 0; run < 3; ++run)
+    {
+        auto output = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+        ASSERT_TRUE(output->ensureOnDevice(gpu_device_));
+
+        ASSERT_TRUE(kernel->multiply_tensor(
+            input.get(), output.get(),
+            M, N, K, true, 1.0f, 0.0f, nullptr, -1));
+
+        outputs[run].resize(M * N);
+        const float *data = output->data();
+        std::copy(data, data + M * N, outputs[run].begin());
+    }
+
+    // All runs should be identical
+    auto result_1_vs_2 = checkParity(outputs[0].data(), outputs[1].data(), M * N, 0.99999, 0.0001);
+    auto result_1_vs_3 = checkParity(outputs[0].data(), outputs[2].data(), M * N, 0.99999, 0.0001);
+
+    std::cout << "Run 1 vs Run 2: cosine=" << result_1_vs_2.cosine_similarity << "\n";
+    std::cout << "Run 1 vs Run 3: cosine=" << result_1_vs_3.cosine_similarity << "\n";
+
+    EXPECT_GE(result_1_vs_2.cosine_similarity, 0.99999)
+        << "Multiple runs with same input should be identical";
+    EXPECT_GE(result_1_vs_3.cosine_similarity, 0.99999)
+        << "Multiple runs with same input should be identical";
+
+    llaminar::v2::kernels::KernelFactory::clearCache();
+}
+
+/**
+ * @test Cached kernel across different input sizes
+ *
+ * The full pipeline may use the same cached kernel for both prefill (large M)
+ * and decode (M=1). This test verifies the cached kernel works correctly
+ * across different input sizes.
+ */
+TEST_F(Test__CUDAGemmParity, CachedKernel_VaryingBatchSizes)
+{
+    if (!std::filesystem::exists(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
+    }
+
+    llaminar::v2::kernels::KernelFactory::clearCache();
+
+    auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
+    TensorFactory factory(*mpi_ctx);
+    ModelLoader loader(&factory);
+
+    if (!loader.loadModel(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
+    }
+
+    auto weights = loader.loadTensor("blk.0.attn_q.weight", DeviceId::cpu());
+    ASSERT_NE(weights, nullptr);
+
+    auto *q4_tensor = dynamic_cast<Q4_0Tensor *>(weights.get());
+    ASSERT_NE(q4_tensor, nullptr);
+
+    const int N = static_cast<int>(q4_tensor->shape()[0]);
+    const int K = static_cast<int>(q4_tensor->shape()[1]);
+
+    ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
+
+    // Get ONE cached kernel
+    auto *kernel = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(q4_tensor);
+    ASSERT_NE(kernel, nullptr);
+
+    // Also create a CPU kernel for reference
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        q4_tensor, KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+
+    // Test multiple batch sizes
+    std::vector<int> batch_sizes = {1, 4, 16, 64, 128};
+
+    for (int M : batch_sizes)
+    {
+        std::cout << "Testing M=" << M << "...\n";
+
+        // Create input with fresh random data
+        auto input = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+        float *input_data = input->mutable_data();
+        for (int i = 0; i < M * K; ++i)
+        {
+            input_data[i] = dist_(rng_);
+        }
+        ASSERT_TRUE(input->ensureOnDevice(gpu_device_));
+
+        // CUDA output
+        auto output_cuda = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+        ASSERT_TRUE(output_cuda->ensureOnDevice(gpu_device_));
+
+        ASSERT_TRUE(kernel->multiply_tensor(
+            input.get(), output_cuda.get(),
+            M, N, K, true, 1.0f, 0.0f, nullptr, -1));
+
+        // CPU reference
+        std::vector<float> cpu_output(M * N);
+        ASSERT_TRUE(cpu_kernel->multiply(input->data(), cpu_output.data(), M, N, K));
+
+        // Compare
+        const float *cuda_data = output_cuda->data();
+        auto result = checkParity(cuda_data, cpu_output.data(), M * N, 0.99, 0.10);
+        result.print(("Cached kernel M=" + std::to_string(M)).c_str());
+
+        EXPECT_GE(result.cosine_similarity, 0.99)
+            << "Cached kernel should work for M=" << M;
+        EXPECT_FALSE(result.has_nan_inf);
+    }
+
+    llaminar::v2::kernels::KernelFactory::clearCache();
+}
+
+// ============================================================================
+// Bias Tests (if model has biases)
+// ============================================================================
+
+/**
+ * @test QKV projection with biases from GGUF
+ *
+ * Qwen models have biases for Q, K, V projections. This test verifies that
+ * CUDA GEMM + bias produces correct results compared to CPU.
+ */
+TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
+{
+    if (!std::filesystem::exists(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
+    }
+
+    llaminar::v2::kernels::KernelFactory::clearCache();
+
+    auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
+    TensorFactory factory(*mpi_ctx);
+    ModelLoader loader(&factory);
+
+    if (!loader.loadModel(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
+    }
+
+    // Load weights
+    auto weights_q = loader.loadTensor("blk.0.attn_q.weight", DeviceId::cpu());
+    auto weights_k = loader.loadTensor("blk.0.attn_k.weight", DeviceId::cpu());
+    auto weights_v = loader.loadTensor("blk.0.attn_v.weight", DeviceId::cpu());
+    ASSERT_NE(weights_q, nullptr);
+    ASSERT_NE(weights_k, nullptr);
+    ASSERT_NE(weights_v, nullptr);
+
+    // Try to load biases (may not exist in all models)
+    auto bias_q = loader.loadTensor("blk.0.attn_q.bias", DeviceId::cpu());
+    auto bias_k = loader.loadTensor("blk.0.attn_k.bias", DeviceId::cpu());
+    auto bias_v = loader.loadTensor("blk.0.attn_v.bias", DeviceId::cpu());
+
+    if (!bias_q && !bias_k && !bias_v)
+    {
+        GTEST_SKIP() << "Model has no QKV biases";
+    }
+
+    std::cout << "Biases found: Q=" << (bias_q ? "yes" : "no")
+              << " K=" << (bias_k ? "yes" : "no")
+              << " V=" << (bias_v ? "yes" : "no") << "\n";
+
+    // Cast weights to Q4_0
+    auto *wq = dynamic_cast<Q4_0Tensor *>(weights_q.get());
+    auto *wk = dynamic_cast<Q4_0Tensor *>(weights_k.get());
+    auto *wv = dynamic_cast<Q4_0Tensor *>(weights_v.get());
+    ASSERT_NE(wq, nullptr);
+    ASSERT_NE(wk, nullptr);
+    ASSERT_NE(wv, nullptr);
+
+    const int M = 1; // Decode
+    const int N_q = static_cast<int>(wq->shape()[0]);
+    const int N_k = static_cast<int>(wk->shape()[0]);
+    const int N_v = static_cast<int>(wv->shape()[0]);
+    const int K = static_cast<int>(wq->shape()[1]);
+
+    std::cout << "FusedQKV with bias: M=" << M << " K=" << K
+              << " N_q=" << N_q << " N_k=" << N_k << " N_v=" << N_v << "\n";
+
+    // Upload weights to GPU
+    ASSERT_TRUE(wq->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(wk->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(wv->ensureOnDevice(gpu_device_));
+
+    // Upload biases to GPU if present
+    if (bias_q)
+        ASSERT_TRUE(bias_q->ensureOnDevice(gpu_device_));
+    if (bias_k)
+        ASSERT_TRUE(bias_k->ensureOnDevice(gpu_device_));
+    if (bias_v)
+        ASSERT_TRUE(bias_v->ensureOnDevice(gpu_device_));
+
+    // Create kernels
+    auto cuda_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
+        wq, KernelDeviceType::CUDA);
+    auto cuda_kernel_k = llaminar::v2::kernels::KernelFactory::createGemm(
+        wk, KernelDeviceType::CUDA);
+    auto cuda_kernel_v = llaminar::v2::kernels::KernelFactory::createGemm(
+        wv, KernelDeviceType::CUDA);
+
+    // Create input
+    auto input = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    float *input_data = input->mutable_data();
+    for (int i = 0; i < M * K; ++i)
+    {
+        input_data[i] = dist_(rng_);
+    }
+    ASSERT_TRUE(input->ensureOnDevice(gpu_device_));
+
+    // Create outputs
+    auto output_q = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_q)});
+    auto output_k = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_k)});
+    auto output_v = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_v)});
+    ASSERT_TRUE(output_q->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(output_k->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(output_v->ensureOnDevice(gpu_device_));
+
+    // Run fused GEMM with biases
+    std::vector<TensorProjectionDesc> projections;
+    projections.emplace_back(cuda_kernel_q.get(), output_q.get(), N_q,
+                             bias_q.get(), nullptr, false, "Q");
+    projections.emplace_back(cuda_kernel_k.get(), output_k.get(), N_k,
+                             bias_k.get(), nullptr, false, "K");
+    projections.emplace_back(cuda_kernel_v.get(), output_v.get(), N_v,
+                             bias_v.get(), nullptr, false, "V");
+
+    ASSERT_TRUE(cuda_kernel_q->multiply_fused_tensor(
+        input.get(), projections, M, K, nullptr));
+
+    // ===== CPU reference (GEMM + manual bias add) =====
+    auto cpu_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
+        wq, KernelDeviceType::CPU);
+    auto cpu_kernel_k = llaminar::v2::kernels::KernelFactory::createGemm(
+        wk, KernelDeviceType::CPU);
+    auto cpu_kernel_v = llaminar::v2::kernels::KernelFactory::createGemm(
+        wv, KernelDeviceType::CPU);
+
+    std::vector<float> q_cpu(M * N_q), k_cpu(M * N_k), v_cpu(M * N_v);
+    const float *h_input = input->data();
+    ASSERT_TRUE(cpu_kernel_q->multiply(h_input, q_cpu.data(), M, N_q, K));
+    ASSERT_TRUE(cpu_kernel_k->multiply(h_input, k_cpu.data(), M, N_k, K));
+    ASSERT_TRUE(cpu_kernel_v->multiply(h_input, v_cpu.data(), M, N_v, K));
+
+    // Add biases (CPU side)
+    if (bias_q)
+    {
+        const float *bq = static_cast<const FP32Tensor *>(bias_q.get())->data();
+        for (int i = 0; i < M; ++i)
+        {
+            for (int j = 0; j < N_q; ++j)
+            {
+                q_cpu[i * N_q + j] += bq[j];
+            }
+        }
+    }
+    if (bias_k)
+    {
+        const float *bk = static_cast<const FP32Tensor *>(bias_k.get())->data();
+        for (int i = 0; i < M; ++i)
+        {
+            for (int j = 0; j < N_k; ++j)
+            {
+                k_cpu[i * N_k + j] += bk[j];
+            }
+        }
+    }
+    if (bias_v)
+    {
+        const float *bv = static_cast<const FP32Tensor *>(bias_v.get())->data();
+        for (int i = 0; i < M; ++i)
+        {
+            for (int j = 0; j < N_v; ++j)
+            {
+                v_cpu[i * N_v + j] += bv[j];
+            }
+        }
+    }
+
+    // Compare
+    const float *q_cuda = output_q->data();
+    const float *k_cuda = output_k->data();
+    const float *v_cuda = output_v->data();
+
+    auto result_q = checkParity(q_cuda, q_cpu.data(), M * N_q, 0.99, 0.10);
+    result_q.print("Q with bias (CUDA vs CPU)");
+    EXPECT_GE(result_q.cosine_similarity, 0.99);
+    EXPECT_FALSE(result_q.has_nan_inf);
+
+    auto result_k = checkParity(k_cuda, k_cpu.data(), M * N_k, 0.99, 0.10);
+    result_k.print("K with bias (CUDA vs CPU)");
+    EXPECT_GE(result_k.cosine_similarity, 0.99);
+    EXPECT_FALSE(result_k.has_nan_inf);
+
+    auto result_v = checkParity(v_cuda, v_cpu.data(), M * N_v, 0.99, 0.10);
+    result_v.print("V with bias (CUDA vs CPU)");
+    EXPECT_GE(result_v.cosine_similarity, 0.99);
+    EXPECT_FALSE(result_v.has_nan_inf);
+
+    llaminar::v2::kernels::KernelFactory::clearCache();
+}
+
+/**
+ * @test Fused QKV using cached kernels (simulating full pipeline)
+ *
+ * This test mimics the full pipeline's kernel usage:
+ * 1. Uses getOrCreateGemm() to get cached kernels
+ * 2. Uses real model weights and biases
+ * 3. Runs multiple iterations like decode
+ */
+TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
+{
+    if (!std::filesystem::exists(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
+    }
+
+    llaminar::v2::kernels::KernelFactory::clearCache();
+
+    auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
+    TensorFactory factory(*mpi_ctx);
+    ModelLoader loader(&factory);
+
+    if (!loader.loadModel(REAL_MODEL_PATH))
+    {
+        GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
+    }
+
+    // Load weights
+    auto weights_q = loader.loadTensor("blk.0.attn_q.weight", DeviceId::cpu());
+    auto weights_k = loader.loadTensor("blk.0.attn_k.weight", DeviceId::cpu());
+    auto weights_v = loader.loadTensor("blk.0.attn_v.weight", DeviceId::cpu());
+    ASSERT_NE(weights_q, nullptr);
+    ASSERT_NE(weights_k, nullptr);
+    ASSERT_NE(weights_v, nullptr);
+
+    auto *wq = dynamic_cast<Q4_0Tensor *>(weights_q.get());
+    auto *wk = dynamic_cast<Q4_0Tensor *>(weights_k.get());
+    auto *wv = dynamic_cast<Q4_0Tensor *>(weights_v.get());
+    ASSERT_NE(wq, nullptr);
+    ASSERT_NE(wk, nullptr);
+    ASSERT_NE(wv, nullptr);
+
+    const int M = 1;
+    const int N_q = static_cast<int>(wq->shape()[0]);
+    const int N_k = static_cast<int>(wk->shape()[0]);
+    const int N_v = static_cast<int>(wv->shape()[0]);
+    const int K = static_cast<int>(wq->shape()[1]);
+
+    // Upload to GPU
+    ASSERT_TRUE(wq->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(wk->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(wv->ensureOnDevice(gpu_device_));
+
+    // Get CACHED kernels (this is what the pipeline does)
+    auto *kernel_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq);
+    auto *kernel_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk);
+    auto *kernel_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv);
+    ASSERT_NE(kernel_q, nullptr);
+    ASSERT_NE(kernel_k, nullptr);
+    ASSERT_NE(kernel_v, nullptr);
+
+    // CPU kernels for reference
+    auto cpu_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
+        wq, KernelDeviceType::CPU);
+    auto cpu_kernel_k = llaminar::v2::kernels::KernelFactory::createGemm(
+        wk, KernelDeviceType::CPU);
+    auto cpu_kernel_v = llaminar::v2::kernels::KernelFactory::createGemm(
+        wv, KernelDeviceType::CPU);
+
+    std::cout << "Testing cached kernels over 5 iterations (simulating decode)...\n";
+
+    // Run 5 iterations with different inputs
+    for (int iter = 0; iter < 5; ++iter)
+    {
+        // Create fresh input for each iteration
+        auto input = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+        float *input_data = input->mutable_data();
+        for (int i = 0; i < M * K; ++i)
+        {
+            input_data[i] = dist_(rng_);
+        }
+        ASSERT_TRUE(input->ensureOnDevice(gpu_device_));
+
+        // Create outputs
+        auto out_q = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_q)});
+        auto out_k = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_k)});
+        auto out_v = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_v)});
+        ASSERT_TRUE(out_q->ensureOnDevice(gpu_device_));
+        ASSERT_TRUE(out_k->ensureOnDevice(gpu_device_));
+        ASSERT_TRUE(out_v->ensureOnDevice(gpu_device_));
+
+        // Run fused with cached kernels
+        std::vector<TensorProjectionDesc> projections;
+        projections.emplace_back(kernel_q, out_q.get(), N_q,
+                                 nullptr, nullptr, false, "Q");
+        projections.emplace_back(kernel_k, out_k.get(), N_k,
+                                 nullptr, nullptr, false, "K");
+        projections.emplace_back(kernel_v, out_v.get(), N_v,
+                                 nullptr, nullptr, false, "V");
+
+        ASSERT_TRUE(kernel_q->multiply_fused_tensor(
+            input.get(), projections, M, K, nullptr));
+
+        // CPU reference
+        std::vector<float> q_cpu(M * N_q), k_cpu(M * N_k), v_cpu(M * N_v);
+        const float *h_input = input->data();
+        ASSERT_TRUE(cpu_kernel_q->multiply(h_input, q_cpu.data(), M, N_q, K));
+        ASSERT_TRUE(cpu_kernel_k->multiply(h_input, k_cpu.data(), M, N_k, K));
+        ASSERT_TRUE(cpu_kernel_v->multiply(h_input, v_cpu.data(), M, N_v, K));
+
+        // Compare
+        auto result_q = checkParity(out_q->data(), q_cpu.data(), M * N_q, 0.99, 0.10);
+        auto result_k = checkParity(out_k->data(), k_cpu.data(), M * N_k, 0.99, 0.10);
+        auto result_v = checkParity(out_v->data(), v_cpu.data(), M * N_v, 0.99, 0.10);
+
+        std::cout << "  Iter " << iter << ": Q=" << result_q.cosine_similarity
+                  << " K=" << result_k.cosine_similarity
+                  << " V=" << result_v.cosine_similarity << "\n";
+
+        EXPECT_GE(result_q.cosine_similarity, 0.99)
+            << "Q failed at iteration " << iter;
+        EXPECT_GE(result_k.cosine_similarity, 0.99)
+            << "K failed at iteration " << iter;
+        EXPECT_GE(result_v.cosine_similarity, 0.99)
+            << "V failed at iteration " << iter;
+        EXPECT_FALSE(result_q.has_nan_inf);
+        EXPECT_FALSE(result_k.has_nan_inf);
+        EXPECT_FALSE(result_v.has_nan_inf);
+    }
+
+    llaminar::v2::kernels::KernelFactory::clearCache();
 }
 
 #endif // HAVE_CUDA

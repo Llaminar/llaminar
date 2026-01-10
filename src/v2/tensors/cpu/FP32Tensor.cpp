@@ -104,6 +104,7 @@ namespace llaminar2
     {
         assertValid("FP32Tensor::data");
 
+        LOG_DEBUG("[FP32Tensor::data] Called for tensor, host_valid_=" << host_valid_ << " device_valid_=" << device_valid_ << " gpu_data_ptr_=" << (gpu_data_ptr_ ? "set" : "null"));
         // Use base class to ensure host has current data
         const_cast<FP32Tensor *>(this)->ensureOnHost();
 

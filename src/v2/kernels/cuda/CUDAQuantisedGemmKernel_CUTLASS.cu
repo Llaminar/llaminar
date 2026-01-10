@@ -59,6 +59,32 @@ using CutlassInt8Gemm = cutlass::gemm::device::Gemm<
 // CUDA Error Checking Macros
 // =========================================================================
 
+#include <stdexcept>
+#include <sstream>
+
+/**
+ * @brief CUDA error check that throws on failure
+ *
+ * CUDA errors should never be silently ignored - they indicate serious problems
+ * that will cascade if execution continues. Throwing ensures:
+ * 1. Immediate failure with clear error message
+ * 2. Stack trace in debug builds
+ * 3. No corrupted state from partial execution
+ */
+#define CUDA_CHECK_THROW(call)                                               \
+    do                                                                       \
+    {                                                                        \
+        cudaError_t err = call;                                              \
+        if (err != cudaSuccess)                                              \
+        {                                                                    \
+            std::ostringstream oss;                                          \
+            oss << "[CUDAQuantGemm] CUDA error: " << cudaGetErrorString(err) \
+                << " at " << __FILE__ << ":" << __LINE__;                    \
+            throw std::runtime_error(oss.str());                             \
+        }                                                                    \
+    } while (0)
+
+// Legacy macro - returns false (being phased out)
 #define CUDA_CHECK(call)                                                           \
     do                                                                             \
     {                                                                              \
@@ -295,7 +321,18 @@ extern "C"
         int M, int N, int K,
         int cuda_device_id)
     {
-        CUDA_CHECK(cudaSetDevice(cuda_device_id));
+        // Validate pointers
+        if (!d_A_int8 || !d_weights_int8 || !d_C_int32)
+        {
+            std::ostringstream oss;
+            oss << "[CUDAQuantGemm::execute] Null pointer: "
+                << "d_A_int8=" << (void *)d_A_int8
+                << " d_weights_int8=" << (void *)d_weights_int8
+                << " d_C_int32=" << (void *)d_C_int32;
+            throw std::runtime_error(oss.str());
+        }
+
+        CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
 
         CutlassInt8Gemm gemm_op;
 
@@ -316,8 +353,10 @@ extern "C"
 
         if (status != cutlass::Status::kSuccess)
         {
-            std::cerr << "[CUDAQuantGemm] CUTLASS GEMM failed: " << static_cast<int>(status) << "\n";
-            return false;
+            std::ostringstream oss;
+            oss << "[CUDAQuantGemm] CUTLASS GEMM failed with status " << static_cast<int>(status)
+                << " (M=" << M << ", N=" << N << ", K=" << K << ")";
+            throw std::runtime_error(oss.str());
         }
 
         return true;
@@ -337,7 +376,19 @@ extern "C"
         const float *d_bias,
         int cuda_device_id)
     {
-        CUDA_CHECK(cudaSetDevice(cuda_device_id));
+        // Validate pointers before launching kernel
+        if (!d_C_int32 || !d_C_fp32 || !d_scales_A || !d_scales_B)
+        {
+            std::ostringstream oss;
+            oss << "[CUDAQuantGemm::applyScaling] Null pointer: "
+                << "d_C_int32=" << (void *)d_C_int32
+                << " d_C_fp32=" << (void *)d_C_fp32
+                << " d_scales_A=" << (void *)d_scales_A
+                << " d_scales_B=" << (void *)d_scales_B;
+            throw std::runtime_error(oss.str());
+        }
+
+        CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
 
         dim3 block(16, 16);
         dim3 grid((N + 15) / 16, (M + 15) / 16);
@@ -349,11 +400,14 @@ extern "C"
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            std::cerr << "[CUDAQuantGemm] apply_scaling kernel failed: " << cudaGetErrorString(err) << "\n";
-            return false;
+            std::ostringstream oss;
+            oss << "[CUDAQuantGemm] apply_scaling kernel launch failed: "
+                << cudaGetErrorString(err)
+                << " (M=" << M << ", N=" << N << ")";
+            throw std::runtime_error(oss.str());
         }
 
-        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK_THROW(cudaDeviceSynchronize());
         return true;
     }
 
@@ -367,7 +421,18 @@ extern "C"
         int M, int K,
         int cuda_device_id)
     {
-        CUDA_CHECK(cudaSetDevice(cuda_device_id));
+        // Validate pointers
+        if (!d_A_fp32 || !d_A_int8 || !d_scales_A)
+        {
+            std::ostringstream oss;
+            oss << "[CUDAQuantGemm::quantizeActivations] Null pointer: "
+                << "d_A_fp32=" << (void *)d_A_fp32
+                << " d_A_int8=" << (void *)d_A_int8
+                << " d_scales_A=" << (void *)d_scales_A;
+            throw std::runtime_error(oss.str());
+        }
+
+        CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
 
         dim3 grid(M);
         dim3 block(std::min(K, 256));
@@ -377,11 +442,14 @@ extern "C"
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            std::cerr << "[CUDAQuantGemm] quantize kernel failed: " << cudaGetErrorString(err) << "\n";
-            return false;
+            std::ostringstream oss;
+            oss << "[CUDAQuantGemm] quantize kernel launch failed: "
+                << cudaGetErrorString(err)
+                << " (M=" << M << ", K=" << K << ")";
+            throw std::runtime_error(oss.str());
         }
 
-        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK_THROW(cudaDeviceSynchronize());
         return true;
     }
 

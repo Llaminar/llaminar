@@ -171,6 +171,22 @@ namespace llaminar2
 
         if (is_gpu_tensor)
         {
+            // GPU path: ensure output tensor has GPU memory allocated
+            // The output tensor may have been created on CPU and needs GPU allocation
+            // before we can write to it from the GPU kernel
+            auto *output_base = dynamic_cast<TensorBase *>(params_.output);
+            if (output_base)
+            {
+                // Ensure output has GPU memory on the same device as Q
+                // ensureOnDevice will allocate GPU memory if not present
+                if (!output_base->ensureOnDevice(params_.device_id))
+                {
+                    LOG_ERROR("[AttentionComputeStage] Failed to ensure output tensor on device "
+                              << params_.device_id.toString());
+                    return false;
+                }
+            }
+
             // GPU path: use active_data_ptr() which returns GPU pointer when tensor is on GPU
             const float *Q_ptr = static_cast<const float *>(params_.Q->active_data_ptr());
             const float *K_ptr = static_cast<const float *>(params_.K->active_data_ptr());
@@ -212,6 +228,16 @@ namespace llaminar2
                     false,
                     params_.mpi_ctx,
                     device_idx);
+            }
+
+            // Mark output as dirty on device (valid on GPU, not on CPU)
+            if (success)
+            {
+                auto *output_base = dynamic_cast<TensorBase *>(params_.output);
+                if (output_base)
+                {
+                    output_base->mark_device_dirty();
+                }
             }
         }
         else
@@ -261,6 +287,7 @@ namespace llaminar2
             {
                 LOG_DEBUG("[AttentionComputeStage] output=" << (void *)params_.output
                                                             << " Q_type=" << (params_.Q ? params_.Q->dtype_name() : "null")
+                                                            << " device=" << params_.device_id.to_string()
                                                             << " out[0:8]=" << out_data[0] << "," << out_data[1] << "," << out_data[2] << "," << out_data[3]
                                                             << "," << out_data[4] << "," << out_data[5] << "," << out_data[6] << "," << out_data[7]);
             }

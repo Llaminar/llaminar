@@ -221,9 +221,11 @@ namespace llaminar2
             // Create weights
             auto [weights_tensor, weights_dequant] = create_q4_0_weights(n_, k_, 123);
 
-            // Create bias
-            std::vector<float> bias(n_);
-            fill_random(bias.data(), n_, 0.5f, 456);
+            // Create bias tensor
+            std::vector<float> bias_data(n_);
+            fill_random(bias_data.data(), n_, 0.5f, 456);
+            auto bias = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(n_)}, DeviceId::cpu());
+            std::copy(bias_data.begin(), bias_data.end(), bias->mutable_data());
 
             // Create kernel
             auto kernel = weights_tensor->createGemm();
@@ -241,7 +243,7 @@ namespace llaminar2
             ASSERT_TRUE(kernel->quantize_activations(input_.data(), q8_buffer.data(), m_, k_));
             ASSERT_TRUE(kernel->multiply_with_precomputed_q8_1(
                 q8_buffer.data(), output_fused.data(), m_, n_, k_,
-                bias.data(), false, 1.0f, 0.0f, nullptr, -1,
+                bias.get(), false, 1.0f, 0.0f, nullptr, -1,
                 GemmFusedOps::none()));
 
             // 2. Reference: GEMM + bias add
@@ -250,7 +252,7 @@ namespace llaminar2
             {
                 for (int j = 0; j < n_; ++j)
                 {
-                    output_reference[i * n_ + j] += bias[j];
+                    output_reference[i * n_ + j] += bias_data[j];
                 }
             }
 
@@ -618,8 +620,10 @@ namespace llaminar2
 
             auto [weights_tensor, weights_dequant] = create_q4_0_weights(n_, k_, 123);
 
-            std::vector<float> bias(n_);
-            fill_random(bias.data(), n_, 0.1f, 456);
+            std::vector<float> bias_data(n_);
+            fill_random(bias_data.data(), n_, 0.1f, 456);
+            auto bias = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(n_)}, DeviceId::cpu());
+            std::copy(bias_data.begin(), bias_data.end(), bias->mutable_data());
 
             float scale = 1.0f / std::sqrt(static_cast<float>(k_));
 
@@ -638,7 +642,7 @@ namespace llaminar2
             ASSERT_TRUE(kernel->quantize_activations(input_.data(), q8_buffer.data(), m_, k_));
             ASSERT_TRUE(kernel->multiply_with_precomputed_q8_1(
                 q8_buffer.data(), output_fused.data(), m_, n_, k_,
-                bias.data(), false, 1.0f, 0.0f, nullptr, -1,
+                bias.get(), false, 1.0f, 0.0f, nullptr, -1,
                 GemmFusedOps::online_softmax(scale, online_max.data(), online_sum.data(), nullptr, false)));
 
             // Reference: GEMM + bias + softmax
@@ -649,7 +653,7 @@ namespace llaminar2
             {
                 for (int j = 0; j < n_; ++j)
                 {
-                    output_separate[i * n_ + j] = output_separate[i * n_ + j] * scale + bias[j];
+                    output_separate[i * n_ + j] = output_separate[i * n_ + j] * scale + bias_data[j];
                 }
                 primitives::softmax_row_fp32(output_separate.data() + i * n_, n_, false, 1.0f, i);
             }

@@ -122,12 +122,18 @@ namespace llaminar2
             output_up_ = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(n_up_)}, DeviceId::cpu());
 
             // Create bias vectors (filled with known values for easy verification)
-            bias_gate_.resize(n_gate_);
-            bias_up_.resize(n_up_);
+            bias_gate_data_.resize(n_gate_);
+            bias_up_data_.resize(n_up_);
 
             // Use distinct constant values for easy checking
-            fill_constant(bias_gate_.data(), n_gate_, 2.0f);
-            fill_constant(bias_up_.data(), n_up_, 3.0f);
+            fill_constant(bias_gate_data_.data(), n_gate_, 2.0f);
+            fill_constant(bias_up_data_.data(), n_up_, 3.0f);
+
+            // Wrap in FP32Tensor for API
+            bias_gate_ = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(n_gate_)}, DeviceId::cpu());
+            bias_up_ = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(n_up_)}, DeviceId::cpu());
+            std::copy(bias_gate_data_.begin(), bias_gate_data_.end(), bias_gate_->mutable_data());
+            std::copy(bias_up_data_.begin(), bias_up_data_.end(), bias_up_->mutable_data());
         }
 
         // Dimensions
@@ -141,8 +147,9 @@ namespace llaminar2
         std::unique_ptr<TensorBase> w_gate_, w_up_;
         std::unique_ptr<FP32Tensor> output_gate_, output_up_;
 
-        // Bias vectors
-        std::vector<float> bias_gate_, bias_up_;
+        // Bias tensors (FP32Tensor for API compatibility)
+        std::vector<float> bias_gate_data_, bias_up_data_;
+        std::unique_ptr<FP32Tensor> bias_gate_, bias_up_;
     };
 
     // =============================================================================
@@ -247,11 +254,11 @@ namespace llaminar2
                 .w_gate = w_gate_.get(),
                 .output_gate = output_gate_.get(),
                 .n_gate = n_gate_,
-                .bias_gate = bias_gate_.data(),
+                .bias_gate = bias_gate_.get(),
                 .w_up = w_up_.get(),
                 .output_up = output_up_.get(),
                 .n_up = n_up_,
-                .bias_up = bias_up_.data()};
+                .bias_up = bias_up_.get()};
 
             FusedGateUpGEMMStage stage(params);
             ASSERT_TRUE(stage.execute(ctx_.get()));
@@ -271,7 +278,7 @@ namespace llaminar2
             {
                 int idx = row * n_gate_ + col;
                 float diff = output_gate_with_bias[idx] - output_gate_no_bias[idx];
-                float expected = bias_gate_[col];
+                float expected = bias_gate_data_[col];
                 EXPECT_NEAR(diff, expected, tol)
                     << "Gate bias mismatch at row=" << row << " col=" << col
                     << " diff=" << diff << " expected=" << expected;
@@ -285,7 +292,7 @@ namespace llaminar2
             {
                 int idx = row * n_up_ + col;
                 float diff = output_up_with_bias[idx] - output_up_no_bias[idx];
-                float expected = bias_up_[col];
+                float expected = bias_up_data_[col];
                 EXPECT_NEAR(diff, expected, tol)
                     << "Up bias mismatch at row=" << row << " col=" << col
                     << " diff=" << diff << " expected=" << expected;
@@ -339,7 +346,7 @@ namespace llaminar2
                 .w_gate = w_gate_.get(),
                 .output_gate = output_gate_.get(),
                 .n_gate = n_gate_,
-                .bias_gate = bias_gate_.data(), // Only Gate has bias
+                .bias_gate = bias_gate_.get(), // Only Gate has bias
                 .w_up = w_up_.get(),
                 .output_up = output_up_.get(),
                 .n_up = n_up_,
@@ -361,7 +368,7 @@ namespace llaminar2
             {
                 int idx = row * n_gate_ + col;
                 float diff = output_gate_with_bias[idx] - output_gate_no_bias[idx];
-                EXPECT_NEAR(diff, bias_gate_[col], tol)
+                EXPECT_NEAR(diff, bias_gate_data_[col], tol)
                     << "Gate bias should be applied at row=" << row << " col=" << col;
             }
         }

@@ -567,7 +567,7 @@ namespace llaminar2
                 QuantisedGemmKernel *kernel;       ///< Kernel with packed weights [n, k]
                 float *output;                     ///< Output buffer [m, n]
                 int n;                             ///< Output dimension (columns)
-                const float *bias = nullptr;       ///< Optional bias [n]
+                const TensorBase *bias = nullptr;  ///< Optional bias tensor [n]
                 const float *gate_input = nullptr; ///< Optional gate for SwiGLU [m, n]
                 bool do_swiglu = false;            ///< Whether to apply SwiGLU fusion
                 const char *name = nullptr;        ///< Name for debug logging
@@ -1602,7 +1602,7 @@ namespace llaminar2
                 const void *q8_1_activations,
                 float *C,
                 int m, int n, int k,
-                const float *bias,
+                const TensorBase *bias,
                 bool accumulate,
                 float alpha, float beta,
                 const MPIContext *mpi_ctx,
@@ -1614,6 +1614,9 @@ namespace llaminar2
 
                 if (!q8_1_activations || !C)
                     return false;
+
+                // Extract raw bias pointer from TensorBase
+                const float *bias_ptr = bias ? bias->fp32_data() : nullptr;
 
                 // DEBUG: Log thread state at entry point
                 if (n == 896 && k == 896)
@@ -1831,7 +1834,7 @@ namespace llaminar2
                                 params_v.K_blocks = k_blocks;
                                 params_v.N = 64;
                                 params_v.ldc = N_padded; // Stride for comp/scales arrays, NOT C output
-                                params_v.bias = bias ? bias + n_blk : nullptr;
+                                params_v.bias = bias_ptr ? bias_ptr + n_blk : nullptr;
                                 params_v.mask = softmax_mask ? (softmax_mask + i * n + n_blk) : nullptr;
                                 params_v.A_stride = k_blocks * sizeof(Q8_1Block);
                                 params_v.local_max = local_max;
@@ -1995,7 +1998,7 @@ namespace llaminar2
                 const void *q8_1_activations,
                 void *C_q8_1,
                 int m, int n, int k,
-                const float *bias = nullptr,
+                const TensorBase *bias = nullptr,
                 bool accumulate = false,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override
@@ -2006,6 +2009,9 @@ namespace llaminar2
 
                 if (!q8_1_activations || !C_q8_1)
                     return false;
+
+                // Extract raw bias pointer from TensorBase
+                const float *bias_ptr = bias ? bias->fp32_data() : nullptr;
 
                 // Get reference to packed weights
                 const auto &pw = packed_weights();
@@ -2121,7 +2127,7 @@ namespace llaminar2
                                 params_v.N = 64;
                                 params_v.ldc = N_padded; // Stride for comp/scales arrays, NOT C output
                                 // Bias is added before Q8_1 requantization (if provided)
-                                params_v.bias = bias ? (bias + n_blk) : nullptr;
+                                params_v.bias = bias_ptr ? (bias_ptr + n_blk) : nullptr;
                                 params_v.mask = nullptr;
                                 params_v.A_stride = k_blocks * sizeof(Q8_1Block);
                                 params_v.local_max = nullptr;
@@ -2222,7 +2228,7 @@ namespace llaminar2
                 void *C_q16_1,
                 int m, int n, int k,
                 int q16_block_size = 64,
-                const float *bias = nullptr,
+                const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override
             {
@@ -2231,6 +2237,9 @@ namespace llaminar2
 
                 if (!q8_1_activations || !C_q16_1)
                     return false;
+
+                // Extract raw bias pointer from TensorBase
+                const float *bias_ptr = bias ? bias->fp32_data() : nullptr;
 
                 // Validate block size
                 if (q16_block_size != 32 && q16_block_size != 64 && q16_block_size != 128)
@@ -2357,7 +2366,7 @@ namespace llaminar2
                                 params_v.K_blocks = k_blocks;
                                 params_v.N = 64;
                                 params_v.ldc = N_padded;
-                                params_v.bias = bias ? (bias + n_blk) : nullptr;
+                                params_v.bias = bias_ptr ? (bias_ptr + n_blk) : nullptr;
                                 params_v.mask = nullptr;
                                 params_v.A_stride = k_blocks * sizeof(Q8_1Block);
                                 params_v.local_max = nullptr;

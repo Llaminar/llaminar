@@ -35,19 +35,19 @@ namespace llaminar2
             const ITensor *wq = nullptr;
             ITensor *output_q = nullptr;
             int n_q = 0;
-            const float *bias_q = nullptr;
+            const TensorBase *bias_q = nullptr; ///< Optional bias tensor for tensor-aware GPU path
 
             // K projection
             const ITensor *wk = nullptr;
             ITensor *output_k = nullptr;
             int n_k = 0;
-            const float *bias_k = nullptr;
+            const TensorBase *bias_k = nullptr; ///< Optional bias tensor for tensor-aware GPU path
 
             // V projection
             const ITensor *wv = nullptr;
             ITensor *output_v = nullptr;
             int n_v = 0;
-            const float *bias_v = nullptr;
+            const TensorBase *bias_v = nullptr; ///< Optional bias tensor for tensor-aware GPU path
 
             // Device target for kernel dispatch
             DeviceId device_id = DeviceId::cpu();

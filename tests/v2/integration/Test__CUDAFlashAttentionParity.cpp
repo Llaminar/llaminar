@@ -116,16 +116,16 @@ namespace
      *               For standard decode, position_offset=0 means Q can see all of KV cache.
      */
     void cpuDecodeAttentionReference(
-        const float *Q,       // [n_heads, head_dim]
-        const float *K,       // [kv_len, n_kv_heads, head_dim]
-        const float *V,       // [kv_len, n_kv_heads, head_dim]
-        float *O,             // [n_heads, head_dim]
+        const float *Q, // [n_heads, head_dim]
+        const float *K, // [kv_len, n_kv_heads, head_dim]
+        const float *V, // [kv_len, n_kv_heads, head_dim]
+        float *O,       // [n_heads, head_dim]
         int kv_len,
         int n_heads,
         int n_kv_heads,
         int head_dim,
         bool causal,
-        int position_offset)  // Q's logical position = kv_len - 1 + position_offset
+        int position_offset) // Q's logical position = kv_len - 1 + position_offset
     {
         const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
         const int gqa_ratio = n_heads / n_kv_heads;
@@ -490,7 +490,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Short_Parity)
     constexpr int n_heads = 14;
     constexpr int n_kv_heads = 2; // GQA
     constexpr int head_dim = 64;
-    const size_t q_size = n_heads * head_dim;           // [n_heads, head_dim]
+    const size_t q_size = n_heads * head_dim; // [n_heads, head_dim]
     const size_t kv_size = kv_len * n_kv_heads * head_dim;
     const size_t out_size = n_heads * head_dim;
 
@@ -500,12 +500,15 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Short_Parity)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    // CPU reference: decode attention (Q attends to full KV cache)
-    cpuDecodeAttentionReference(
+    // CPU reference using CPUAttentionKernelT::compute_decode() - apples-to-apples comparison
+    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
-        kv_len, n_heads, n_kv_heads, head_dim,
-        true,  // causal
-        0);    // position_offset = 0 means Q is at position kv_len-1
+        1, // seq_len = 1 (single query token)
+        kv_len,
+        n_heads, n_kv_heads, head_dim,
+        true); // causal
+    ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     // CUDA decode
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
@@ -523,11 +526,11 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Short_Parity)
 
     bool cuda_success = cuda_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
-        1,       // seq_len = 1 (single query token)
+        1, // seq_len = 1 (single query token)
         kv_len,
         n_heads, n_kv_heads, head_dim,
-        true,    // causal
-        0);      // position_offset
+        true, // causal
+        0);   // position_offset
     cudaDeviceSynchronize();
 
     ASSERT_TRUE(cuda_success) << "CUDA Flash Decoding failed";
@@ -572,11 +575,13 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Long_Parity)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    // CPU reference
-    cpuDecodeAttentionReference(
+    // CPU reference using CPUAttentionKernelT::compute_decode() - apples-to-apples comparison
+    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
-        kv_len, n_heads, n_kv_heads, head_dim,
-        true, 0);
+        1, kv_len, n_heads, n_kv_heads, head_dim,
+        true); // causal
+    ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     // CUDA decode
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
@@ -595,7 +600,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Long_Parity)
     bool cuda_success = cuda_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
         1, kv_len, n_heads, n_kv_heads, head_dim,
-        true, 0);
+        true); // causal
     cudaDeviceSynchronize();
 
     ASSERT_TRUE(cuda_success);
@@ -613,7 +618,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Long_Parity)
     double l2_error = relativeL2Error(cuda_output.data(), cpu_output.data(), out_size);
     double max_error = maxAbsError(cuda_output.data(), cpu_output.data(), out_size);
 
-    printComparisonStats("FlashDecode FP32 Long Parity (split-K)", cosine, l2_error, max_error, out_size);
+    printComparisonStats("FlashDecode FP32 Long Parity (split-K) vs CPUAttentionKernelT", cosine, l2_error, max_error, out_size);
 
     EXPECT_GE(cosine, 0.99) << "Cosine similarity too low - split-K reduction may be incorrect";
     EXPECT_LE(l2_error, 0.05) << "L2 error too high";
@@ -638,11 +643,12 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_VeryLong_Parity)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    // CPU reference
-    cpuDecodeAttentionReference(
+    // CPU reference using production CPUAttentionKernelT::compute_decode()
+    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
-        kv_len, n_heads, n_kv_heads, head_dim,
-        true, 0);
+        1, kv_len, n_heads, n_kv_heads, head_dim, true);
+    ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     // CUDA decode
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
@@ -704,10 +710,12 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_MHA_Parity)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    cpuDecodeAttentionReference(
+    // CPU reference using production CPUAttentionKernelT::compute_decode()
+    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
-        kv_len, n_heads, n_kv_heads, head_dim,
-        true, 0);
+        1, kv_len, n_heads, n_kv_heads, head_dim, true);
+    ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
 
@@ -743,7 +751,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_MHA_Parity)
     double l2_error = relativeL2Error(cuda_output.data(), cpu_output.data(), out_size);
     double max_error = maxAbsError(cuda_output.data(), cpu_output.data(), out_size);
 
-    printComparisonStats("FlashDecode FP32 MHA Parity", cosine, l2_error, max_error, out_size);
+    printComparisonStats("FlashDecode FP32 MHA Parity (CPUAttentionKernelT vs CUDA)", cosine, l2_error, max_error, out_size);
 
     EXPECT_GE(cosine, 0.99);
     EXPECT_LE(l2_error, 0.05);
@@ -768,10 +776,12 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_HeadDim128_Parity)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    cpuDecodeAttentionReference(
+    // CPU reference using production CPUAttentionKernelT::compute_decode()
+    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
-        kv_len, n_heads, n_kv_heads, head_dim,
-        true, 0);
+        1, kv_len, n_heads, n_kv_heads, head_dim, true);
+    ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
 
@@ -832,11 +842,12 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_NonCausal_Parity)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    cpuDecodeAttentionReference(
+    // CPU reference using production CPUAttentionKernelT::compute_decode()
+    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
-        kv_len, n_heads, n_kv_heads, head_dim,
-        false,  // non-causal
-        0);
+        1, kv_len, n_heads, n_kv_heads, head_dim, false); // non-causal
+    ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
 
@@ -855,7 +866,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_NonCausal_Parity)
     bool cuda_success = cuda_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
         1, kv_len, n_heads, n_kv_heads, head_dim,
-        false,  // non-causal
+        false, // non-causal
         0);
     cudaDeviceSynchronize();
 

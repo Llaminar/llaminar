@@ -735,13 +735,16 @@ TEST(Test__QuantisedGemmKernel, SwiGLU_WithBias)
 
     std::vector<float> gate_weights_fp32(N * K);
     std::vector<float> up_weights_fp32(N * K);
-    std::vector<float> up_bias(N);
+    std::vector<float> up_bias_data(N);
     for (auto &x : gate_weights_fp32)
         x = dist(gen);
     for (auto &x : up_weights_fp32)
         x = dist(gen);
-    for (auto &x : up_bias)
+    for (auto &x : up_bias_data)
         x = dist(gen) * 0.1f;
+
+    auto up_bias = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(N)}, DeviceId::cpu());
+    std::copy(up_bias_data.begin(), up_bias_data.end(), up_bias->mutable_data());
 
     auto gate_weights = Q8_1Tensor::quantize_from_fp32(gate_weights_fp32.data(),
                                                        {static_cast<size_t>(N), static_cast<size_t>(K)});
@@ -766,7 +769,7 @@ TEST(Test__QuantisedGemmKernel, SwiGLU_WithBias)
     {
         for (int n = 0; n < N; ++n)
         {
-            up_output_with_bias[m * N + n] += up_bias[n];
+            up_output_with_bias[m * N + n] += up_bias_data[n];
         }
     }
 
@@ -787,7 +790,7 @@ TEST(Test__QuantisedGemmKernel, SwiGLU_WithBias)
         q8_1_buffer.data(),
         swiglu_actual_output.data(),
         M, N, K,
-        up_bias.data(), // bias
+        up_bias.get(), // bias
         false, 1.0f, 0.0f,
         nullptr, -1,
         GemmFusedOps::swiglu(gate_output.data())));

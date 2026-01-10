@@ -97,22 +97,36 @@ namespace llaminar2
      * For Q8_1 tensors, uses fp32_data() (explicit dequant for debugging only)
      * For other tensors, uses data()
      *
-     * @note This function only works with CPU tensors (TensorBase).
-     *       For GPU tensors, returns nullptr.
+     * For GPU tensors: calls ensureOnHost() to sync GPU data to CPU before access.
+     * This enables snapshot capture for CUDA inference.
+     *
+     * @note This function modifies tensor state (via ensureOnHost) for GPU tensors.
+     *       The const_cast is intentional - snapshot capture is a debugging/testing
+     *       facility that should not affect normal operation semantics.
      */
     inline const float *getSafeFp32Data(const ITensor *tensor)
     {
         if (!tensor)
             return nullptr;
 
-        // For GPU tensors, we can't access data directly - return nullptr
-        if (!tensor->is_on_cpu())
-            return nullptr;
-
-        // Try to get as TensorBase for CPU tensor operations
+        // Try to get as TensorBase for CPU/GPU tensor operations
         auto *cpu_tensor = dynamic_cast<const TensorBase *>(tensor);
         if (!cpu_tensor)
             return nullptr;
+
+        // For GPU tensors, sync data to host first
+        // This enables snapshot capture for CUDA inference
+        if (!tensor->is_on_cpu())
+        {
+            // const_cast is safe here - ensureOnHost() only copies GPU->CPU without
+            // affecting the logical tensor data, and snapshot capture is a debugging facility
+            auto *mutable_tensor = const_cast<TensorBase *>(cpu_tensor);
+            if (!mutable_tensor->ensureOnHost())
+            {
+                LOG_WARN("[getSafeFp32Data] Failed to sync GPU tensor to host for snapshot");
+                return nullptr;
+            }
+        }
 
         if (cpu_tensor->native_type() == TensorType::Q8_1)
         {

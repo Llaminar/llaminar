@@ -144,11 +144,16 @@ namespace llaminar2
 
         FusedGEMM fused_kernel(gate_weight.get(), up_weight.get());
 
-        // Create bias vectors
-        std::vector<float> gate_bias(n_);
-        std::vector<float> up_bias(n_);
-        fill_random(gate_bias.data(), n_, 0.1f, 333);
-        fill_random(up_bias.data(), n_, 0.1f, 444);
+        // Create bias tensors
+        std::vector<float> gate_bias_data(n_);
+        std::vector<float> up_bias_data(n_);
+        fill_random(gate_bias_data.data(), n_, 0.1f, 333);
+        fill_random(up_bias_data.data(), n_, 0.1f, 444);
+
+        auto gate_bias = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(n_)}, DeviceId::cpu());
+        auto up_bias = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(n_)}, DeviceId::cpu());
+        std::copy(gate_bias_data.begin(), gate_bias_data.end(), gate_bias->mutable_data());
+        std::copy(up_bias_data.begin(), up_bias_data.end(), up_bias->mutable_data());
 
         std::vector<float> gate_output(m_ * n_);
         std::vector<float> up_output(m_ * n_);
@@ -156,7 +161,7 @@ namespace llaminar2
         bool success = fused_kernel.execute(
             input_fp32_.data(),
             gate_output.data(), up_output.data(),
-            gate_bias.data(), up_bias.data(),
+            gate_bias.get(), up_bias.get(),
             m_, n_, k_);
 
         ASSERT_TRUE(success) << "FusedGEMM dual with bias failed";

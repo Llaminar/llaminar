@@ -368,12 +368,14 @@ TEST(Test__QuantisedGemmKernel_Q8_1_Output, PrecomputedQ8_1_WithBias)
     for (auto &x : A_fp32)
         x = dist(gen);
 
-    // Create bias vector with noticeable values
-    std::vector<float> bias(N);
+    // Create bias tensor with noticeable values
+    std::vector<float> bias_data(N);
     for (int i = 0; i < N; ++i)
     {
-        bias[i] = (i % 2 == 0) ? 0.5f : -0.5f; // Alternating +/- bias
+        bias_data[i] = (i % 2 == 0) ? 0.5f : -0.5f; // Alternating +/- bias
     }
+    auto bias = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(N)}, DeviceId::cpu());
+    std::copy(bias_data.begin(), bias_data.end(), bias->mutable_data());
 
     // Pre-quantize activations
     const int a_blocks = M * ((K + 31) / 32);
@@ -387,7 +389,7 @@ TEST(Test__QuantisedGemmKernel_Q8_1_Output, PrecomputedQ8_1_WithBias)
 
     // Run Q8_1→Q8_1 GEMM WITH bias
     bool ok = q_kernel->multiply_with_precomputed_q8_1_to_q8_1(
-        A_q8.data(), output_q8.data(), M, N, K, bias.data(), false, nullptr, -1);
+        A_q8.data(), output_q8.data(), M, N, K, bias.get(), false, nullptr, -1);
     ASSERT_TRUE(ok);
 
     // Compute reference: FP32 GEMM + bias
@@ -399,7 +401,7 @@ TEST(Test__QuantisedGemmKernel_Q8_1_Output, PrecomputedQ8_1_WithBias)
     {
         for (int n = 0; n < N; ++n)
         {
-            C_ref[m * N + n] += bias[n];
+            C_ref[m * N + n] += bias_data[n];
         }
     }
 
@@ -436,7 +438,7 @@ TEST(Test__QuantisedGemmKernel_Q8_1_Output, PrecomputedQ8_1_WithBias)
     float bias_diff_sum = 0.0f;
     for (int i = 0; i < M * N; ++i)
     {
-        bias_diff_sum += std::abs(C_dequant[i] - C_no_bias[i] - bias[i % N]);
+        bias_diff_sum += std::abs(C_dequant[i] - C_no_bias[i] - bias_data[i % N]);
     }
     float avg_bias_diff = bias_diff_sum / (M * N);
     EXPECT_LT(avg_bias_diff, 0.1f) << "Bias application appears incorrect";

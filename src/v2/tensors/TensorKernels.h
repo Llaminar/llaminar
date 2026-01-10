@@ -493,7 +493,7 @@ namespace llaminar2
             ITensorGemm *kernel;               ///< GEMM kernel for this projection (with packed weights)
             float *output;                     ///< Output buffer [m, n]
             int n;                             ///< Output dimension (columns)
-            const float *bias = nullptr;       ///< Optional bias [n]
+            const TensorBase *bias = nullptr;  ///< Optional bias tensor [n]
             const float *gate_input = nullptr; ///< Optional gate for SwiGLU [m, n]
             bool do_swiglu = false;            ///< Whether to apply SwiGLU fusion
             const char *name = nullptr;        ///< Name for debug logging
@@ -550,18 +550,13 @@ namespace llaminar2
                 {
                     return false;
                 }
-                // Note: bias and SwiGLU fusion are not handled in default implementation
-                // Optimized implementations should handle these in fused manner
-                if (proj.bias)
+                // Note: bias and SwiGLU fusion are NOT handled in default implementation
+                // This fallback is for kernels without optimized fused projection support
+                // Such kernels should override multiply_fused() for bias support
+                if (proj.bias || proj.do_swiglu)
                 {
-                    // Simple bias add (not fused)
-                    for (int i = 0; i < m; ++i)
-                    {
-                        for (int j = 0; j < proj.n; ++j)
-                        {
-                            proj.output[i * proj.n + j] += proj.bias[j];
-                        }
-                    }
+                    // Cannot apply bias/SwiGLU in fallback - would need full TensorBase definition
+                    // Real kernels (QuantisedGemmKernel, CUDAQuantisedGemmKernel) override this
                 }
             }
             return true;
@@ -686,7 +681,7 @@ namespace llaminar2
             const void *q8_1_activations,
             void *C_q8_1,
             int m, int n, int k,
-            const float *bias = nullptr,
+            const TensorBase *bias = nullptr,
             bool accumulate = false,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
@@ -731,7 +726,7 @@ namespace llaminar2
             void *C_q16_1,
             int m, int n, int k,
             int q16_block_size = 64,
-            const float *bias = nullptr,
+            const TensorBase *bias = nullptr,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
@@ -1330,7 +1325,7 @@ namespace llaminar2
             const void *q8_1_activations,
             float *C,
             int m, int n, int k,
-            const float *bias = nullptr,
+            const TensorBase *bias = nullptr,
             bool accumulate = false,
             float alpha = 1.0f, float beta = 0.0f,
             const MPIContext *mpi_ctx = nullptr,
@@ -1379,7 +1374,7 @@ namespace llaminar2
             const void *q8_1_activations,
             float *C,
             int m, int n, int k,
-            const float *bias,
+            const TensorBase *bias,
             bool accumulate,
             float alpha, float beta,
             const MPIContext *mpi_ctx,

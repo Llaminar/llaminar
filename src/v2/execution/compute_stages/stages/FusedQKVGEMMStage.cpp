@@ -301,6 +301,8 @@ namespace llaminar2
         }
 
         const bool gpu_execution = params_.device_id.is_gpu();
+        LOG_DEBUG("[FusedQKVGEMMStage] device_id=" << params_.device_id.to_string()
+                                                   << " is_gpu=" << gpu_execution);
         bool success = false;
 
         if (gpu_execution)
@@ -322,9 +324,9 @@ namespace llaminar2
 
             // Build tensor projection descriptors
             std::vector<ITensorGemm::TensorProjectionDesc> projections = {
-                {gemm_q, output_q_base, params_.n_q, nullptr, nullptr, false, "Q"},
-                {gemm_k, output_k_base, params_.n_k, nullptr, nullptr, false, "K"},
-                {gemm_v, output_v_base, params_.n_v, nullptr, nullptr, false, "V"}};
+                {gemm_q, output_q_base, params_.n_q, params_.bias_q, nullptr, false, "Q"},
+                {gemm_k, output_k_base, params_.n_k, params_.bias_k, nullptr, false, "K"},
+                {gemm_v, output_v_base, params_.n_v, params_.bias_v, nullptr, false, "V"}};
 
             // Use tensor-aware fused API - handles all device sync internally
             success = gemm_q->multiply_fused_tensor(
@@ -356,6 +358,7 @@ namespace llaminar2
                                                         << " output_type=" << params_.output_q->dtype_name());
 
             // Build projection descriptors for raw pointer API
+            // FusedProjectionDesc takes TensorBase* for bias directly
             std::vector<ITensorGemm::FusedProjectionDesc> projections = {
                 {gemm_q, output_q_fp32, params_.n_q, params_.bias_q, nullptr, false, "Q"},
                 {gemm_k, output_k_fp32, params_.n_k, params_.bias_k, nullptr, false, "K"},

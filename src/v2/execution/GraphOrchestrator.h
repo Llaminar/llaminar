@@ -36,6 +36,8 @@
 #include "GraphBufferManager.h"
 #include "DeviceContext.h"
 #include "compute_stages/ComputeStages.h" // For StageDumpInfo
+#include "../tensors/FP16Utils.h"         // For fp16_to_fp32, bf16_to_fp32
+#include "../tensors/BlockStructures.h"   // For Q8_1Block, Q16_1Block
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -658,6 +660,105 @@ namespace llaminar2
         // =========================================================================
 
         /**
+         * @brief Extract FP32 data from a StageDumpInfo output buffer
+         *
+         * Handles dequantization for Q8_1, Q16_1, and other quantized formats.
+         * For FP32 outputs, performs a simple copy.
+         *
+         * @param out Output buffer from StageDumpInfo
+         * @return Vector of FP32 values, or empty if extraction fails
+         */
+        static std::vector<float> extractFp32FromOutput(const StageDumpInfo::OutputBuffer &out)
+        {
+            if (!out.data)
+                return {};
+
+            size_t count = out.rows * out.cols;
+            if (count == 0)
+                return {};
+
+            std::vector<float> data(count);
+            std::string dtype_str = out.dtype ? out.dtype : "FP32";
+
+            LOG_TRACE("[extractFp32FromOutput] name=" << (out.name ? out.name : "?")
+                                                      << " dtype=" << dtype_str << " rows=" << out.rows << " cols=" << out.cols);
+
+            // FP32: direct copy
+            if (dtype_str == "FP32")
+            {
+                std::memcpy(data.data(), out.data, count * sizeof(float));
+                return data;
+            }
+
+            // Q8_1: dequantize blocks
+            if (dtype_str == "Q8_1")
+            {
+                const Q8_1Block *blocks = static_cast<const Q8_1Block *>(out.data);
+                constexpr int BLOCK_SIZE = 32;
+                size_t num_blocks = (count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+                for (size_t b = 0; b < num_blocks; ++b)
+                {
+                    const Q8_1Block &block = blocks[b];
+                    float scale = fp16_to_fp32(block.d);
+                    for (int i = 0; i < BLOCK_SIZE && b * BLOCK_SIZE + i < count; ++i)
+                    {
+                        data[b * BLOCK_SIZE + i] = static_cast<float>(block.qs[i]) * scale;
+                    }
+                }
+                return data;
+            }
+
+            // Q16_1 variants: dequantize blocks (block sizes 32, 64, 128)
+            if (dtype_str.find("Q16_1") == 0)
+            {
+                // Determine block size from dtype string (Q16_1_32, Q16_1_64, Q16_1_128)
+                int block_size = 32; // Default
+                if (dtype_str.find("_64") != std::string::npos)
+                    block_size = 64;
+                else if (dtype_str.find("_128") != std::string::npos)
+                    block_size = 128;
+
+                const Q16_1Block *blocks = static_cast<const Q16_1Block *>(out.data);
+                size_t num_blocks = (count + block_size - 1) / block_size;
+
+                for (size_t b = 0; b < num_blocks; ++b)
+                {
+                    const Q16_1Block &block = blocks[b];
+                    float scale = fp16_to_fp32(block.d);
+                    for (int i = 0; i < block_size && b * block_size + i < count; ++i)
+                    {
+                        data[b * block_size + i] = static_cast<float>(block.qs[i]) * scale;
+                    }
+                }
+                return data;
+            }
+
+            // BF16 or FP16: convert to FP32
+            if (dtype_str == "BF16" || dtype_str == "FP16")
+            {
+                const uint16_t *half_data = static_cast<const uint16_t *>(out.data);
+                for (size_t i = 0; i < count; ++i)
+                {
+                    if (dtype_str == "BF16")
+                    {
+                        data[i] = simd::bf16_to_fp32(half_data[i]);
+                    }
+                    else
+                    {
+                        data[i] = simd::fp16_to_fp32(half_data[i]);
+                    }
+                }
+                return data;
+            }
+
+            // Unknown dtype - warn and try FP32 (may be garbage)
+            LOG_WARN("[extractFp32FromOutput] Unknown dtype '" << dtype_str << "', assuming FP32");
+            std::memcpy(data.data(), out.data, count * sizeof(float));
+            return data;
+        }
+
+        /**
          * @brief Enable snapshot capture of intermediate activations
          *
          * When enabled, orchestrator stores copies of intermediate tensors from
@@ -671,6 +772,7 @@ namespace llaminar2
             snapshots_.clear();
             snapshot_enabled_ = true;
 
+            LOG_INFO("[GraphOrchestrator::enableSnapshotCapture] Setting callback on executor_");
             executor_.setSnapshotCallback(
                 [this](const std::string &name, const StageDumpInfo &dump)
                 {
@@ -689,29 +791,23 @@ namespace llaminar2
                             // Output 0 = Q
                             if (dump.outputs[0].data)
                             {
-                                const auto &out = dump.outputs[0];
-                                size_t count = out.rows * out.cols;
-                                std::vector<float> data(count);
-                                std::memcpy(data.data(), out.data, count * sizeof(float));
-                                snapshots_[prefix + "_Q_PROJECTION"] = std::move(data);
+                                auto data = extractFp32FromOutput(dump.outputs[0]);
+                                if (!data.empty())
+                                    snapshots_[prefix + "_Q_PROJECTION"] = std::move(data);
                             }
                             // Output 1 = K
                             if (dump.outputs[1].data)
                             {
-                                const auto &out = dump.outputs[1];
-                                size_t count = out.rows * out.cols;
-                                std::vector<float> data(count);
-                                std::memcpy(data.data(), out.data, count * sizeof(float));
-                                snapshots_[prefix + "_K_PROJECTION"] = std::move(data);
+                                auto data = extractFp32FromOutput(dump.outputs[1]);
+                                if (!data.empty())
+                                    snapshots_[prefix + "_K_PROJECTION"] = std::move(data);
                             }
                             // Output 2 = V
                             if (dump.outputs[2].data)
                             {
-                                const auto &out = dump.outputs[2];
-                                size_t count = out.rows * out.cols;
-                                std::vector<float> data(count);
-                                std::memcpy(data.data(), out.data, count * sizeof(float));
-                                snapshots_[prefix + "_V_PROJECTION"] = std::move(data);
+                                auto data = extractFp32FromOutput(dump.outputs[2]);
+                                if (!data.empty())
+                                    snapshots_[prefix + "_V_PROJECTION"] = std::move(data);
                             }
                         }
                         return;
@@ -728,20 +824,16 @@ namespace llaminar2
                             // Output 0 = gate
                             if (dump.outputs[0].data)
                             {
-                                const auto &out = dump.outputs[0];
-                                size_t count = out.rows * out.cols;
-                                std::vector<float> data(count);
-                                std::memcpy(data.data(), out.data, count * sizeof(float));
-                                snapshots_[prefix + "_FFN_GATE"] = std::move(data);
+                                auto data = extractFp32FromOutput(dump.outputs[0]);
+                                if (!data.empty())
+                                    snapshots_[prefix + "_FFN_GATE"] = std::move(data);
                             }
                             // Output 1 = up
                             if (dump.outputs[1].data)
                             {
-                                const auto &out = dump.outputs[1];
-                                size_t count = out.rows * out.cols;
-                                std::vector<float> data(count);
-                                std::memcpy(data.data(), out.data, count * sizeof(float));
-                                snapshots_[prefix + "_FFN_UP"] = std::move(data);
+                                auto data = extractFp32FromOutput(dump.outputs[1]);
+                                if (!data.empty())
+                                    snapshots_[prefix + "_FFN_UP"] = std::move(data);
                             }
                         }
                         return;
@@ -759,19 +851,15 @@ namespace llaminar2
                         {
                             if (dump.outputs[0].data)
                             {
-                                const auto &out = dump.outputs[0];
-                                size_t count = out.rows * out.cols;
-                                std::vector<float> data(count);
-                                std::memcpy(data.data(), out.data, count * sizeof(float));
-                                snapshots_[prefix + "_Q_ROPE"] = std::move(data);
+                                auto data = extractFp32FromOutput(dump.outputs[0]);
+                                if (!data.empty())
+                                    snapshots_[prefix + "_Q_ROPE"] = std::move(data);
                             }
                             if (dump.outputs[1].data)
                             {
-                                const auto &out = dump.outputs[1];
-                                size_t count = out.rows * out.cols;
-                                std::vector<float> data(count);
-                                std::memcpy(data.data(), out.data, count * sizeof(float));
-                                snapshots_[prefix + "_K_ROPE"] = std::move(data);
+                                auto data = extractFp32FromOutput(dump.outputs[1]);
+                                if (!data.empty())
+                                    snapshots_[prefix + "_K_ROPE"] = std::move(data);
                             }
                         }
                         return;
@@ -826,12 +914,11 @@ namespace llaminar2
                                 continue;
                             }
 
-                            size_t count = out.rows * out.cols;
                             LOG_TRACE("[Snapshot] Storing " << key << ": rows=" << out.rows
-                                                            << " cols=" << out.cols << " count=" << count);
-                            std::vector<float> data(count);
-                            std::memcpy(data.data(), out.data, count * sizeof(float));
-                            snapshots_[key] = std::move(data);
+                                                            << " cols=" << out.cols);
+                            auto data = extractFp32FromOutput(out);
+                            if (!data.empty())
+                                snapshots_[key] = std::move(data);
                         }
                         return;
                     }
@@ -843,14 +930,13 @@ namespace llaminar2
                     if (!dump.outputs.empty() && dump.outputs[0].data)
                     {
                         const auto &out = dump.outputs[0];
-                        size_t count = out.rows * out.cols;
-                        std::vector<float> data(count);
-                        std::memcpy(data.data(), out.data, count * sizeof(float));
+                        auto data = extractFp32FromOutput(out);
 
                         // Convert graph stage name to pipeline-style key
                         std::string key = convertStageNameToSnapshotKey(name);
-                        LOG_DEBUG("[Snapshot] Storing key=" << key << " count=" << count);
-                        snapshots_[key] = std::move(data);
+                        LOG_DEBUG("[Snapshot] Storing key=" << key << " count=" << data.size());
+                        if (!data.empty())
+                            snapshots_[key] = std::move(data);
                     }
                 });
         }

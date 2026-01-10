@@ -138,14 +138,22 @@ namespace llaminar2
             output_v_ = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(n_v_)}, DeviceId::cpu());
 
             // Create bias vectors (filled with known values for easy verification)
-            bias_q_.resize(n_q_);
-            bias_k_.resize(n_k_);
-            bias_v_.resize(n_v_);
+            bias_q_data_.resize(n_q_);
+            bias_k_data_.resize(n_k_);
+            bias_v_data_.resize(n_v_);
 
             // Use distinct constant values for easy checking
-            fill_constant(bias_q_.data(), n_q_, 1.5f);
-            fill_constant(bias_k_.data(), n_k_, 2.5f);
-            fill_constant(bias_v_.data(), n_v_, 3.5f);
+            fill_constant(bias_q_data_.data(), n_q_, 1.5f);
+            fill_constant(bias_k_data_.data(), n_k_, 2.5f);
+            fill_constant(bias_v_data_.data(), n_v_, 3.5f);
+
+            // Wrap in FP32Tensor for API
+            bias_q_ = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(n_q_)}, DeviceId::cpu());
+            bias_k_ = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(n_k_)}, DeviceId::cpu());
+            bias_v_ = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(n_v_)}, DeviceId::cpu());
+            std::copy(bias_q_data_.begin(), bias_q_data_.end(), bias_q_->mutable_data());
+            std::copy(bias_k_data_.begin(), bias_k_data_.end(), bias_k_->mutable_data());
+            std::copy(bias_v_data_.begin(), bias_v_data_.end(), bias_v_->mutable_data());
         }
 
         // Dimensions
@@ -159,8 +167,9 @@ namespace llaminar2
         std::unique_ptr<TensorBase> wq_, wk_, wv_;
         std::unique_ptr<FP32Tensor> output_q_, output_k_, output_v_;
 
-        // Bias vectors
-        std::vector<float> bias_q_, bias_k_, bias_v_;
+        // Bias tensors (FP32Tensor for API compatibility)
+        std::vector<float> bias_q_data_, bias_k_data_, bias_v_data_;
+        std::unique_ptr<FP32Tensor> bias_q_, bias_k_, bias_v_;
     };
 
     // =============================================================================
@@ -288,15 +297,15 @@ namespace llaminar2
                 .wq = wq_.get(),
                 .output_q = output_q_.get(),
                 .n_q = n_q_,
-                .bias_q = bias_q_.data(),
+                .bias_q = bias_q_.get(),
                 .wk = wk_.get(),
                 .output_k = output_k_.get(),
                 .n_k = n_k_,
-                .bias_k = bias_k_.data(),
+                .bias_k = bias_k_.get(),
                 .wv = wv_.get(),
                 .output_v = output_v_.get(),
                 .n_v = n_v_,
-                .bias_v = bias_v_.data()};
+                .bias_v = bias_v_.get()};
 
             FusedQKVGEMMStage stage(params);
             ASSERT_TRUE(stage.execute(ctx_.get()));
@@ -319,7 +328,7 @@ namespace llaminar2
             {
                 int idx = row * n_q_ + col;
                 float diff = output_q_with_bias[idx] - output_q_no_bias[idx];
-                float expected = bias_q_[col];
+                float expected = bias_q_data_[col];
                 EXPECT_NEAR(diff, expected, tol)
                     << "Q bias mismatch at row=" << row << " col=" << col
                     << " diff=" << diff << " expected=" << expected;
@@ -333,7 +342,7 @@ namespace llaminar2
             {
                 int idx = row * n_k_ + col;
                 float diff = output_k_with_bias[idx] - output_k_no_bias[idx];
-                float expected = bias_k_[col];
+                float expected = bias_k_data_[col];
                 EXPECT_NEAR(diff, expected, tol)
                     << "K bias mismatch at row=" << row << " col=" << col
                     << " diff=" << diff << " expected=" << expected;
@@ -347,7 +356,7 @@ namespace llaminar2
             {
                 int idx = row * n_v_ + col;
                 float diff = output_v_with_bias[idx] - output_v_no_bias[idx];
-                float expected = bias_v_[col];
+                float expected = bias_v_data_[col];
                 EXPECT_NEAR(diff, expected, tol)
                     << "V bias mismatch at row=" << row << " col=" << col
                     << " diff=" << diff << " expected=" << expected;
@@ -410,7 +419,7 @@ namespace llaminar2
                 .wq = wq_.get(),
                 .output_q = output_q_.get(),
                 .n_q = n_q_,
-                .bias_q = bias_q_.data(), // Only Q has bias
+                .bias_q = bias_q_.get(), // Only Q has bias
                 .wk = wk_.get(),
                 .output_k = output_k_.get(),
                 .n_k = n_k_,
@@ -437,7 +446,7 @@ namespace llaminar2
             {
                 int idx = row * n_q_ + col;
                 float diff = output_q_with_bias[idx] - output_q_no_bias[idx];
-                EXPECT_NEAR(diff, bias_q_[col], tol)
+                EXPECT_NEAR(diff, bias_q_data_[col], tol)
                     << "Q bias should be applied at row=" << row << " col=" << col;
             }
         }

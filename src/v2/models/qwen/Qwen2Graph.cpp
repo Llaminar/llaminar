@@ -67,7 +67,8 @@ namespace llaminar2
                                                                     << " n_heads=" << config_.n_heads
                                                                     << " n_kv_heads=" << config_.n_kv_heads
                                                                     << " mpi_ctx=" << (mpi_ctx_ ? "valid" : "nullptr")
-                                                                    << " world_size=" << (mpi_ctx_ ? mpi_ctx_->world_size() : -1));
+                                                                    << " world_size=" << (mpi_ctx_ ? mpi_ctx_->world_size() : -1)
+                                                                    << " default_device=" << config_.default_device.to_string());
 
         LOG_DEBUG("[Qwen2Graph] Initialized (layer-only)");
     }
@@ -695,6 +696,7 @@ namespace llaminar2
                                                      << " layer.wq=" << static_cast<const void *>(layer.wq)
                                                      << " layer.wo=" << layer.wo << " world_size="
                                                      << (mpi_ctx_ ? mpi_ctx_->world_size() : 1)
+                                                     << " device=" << device.to_string()
                                                      << " sequence_lengths=" << (sequence_lengths ? "valid" : "nullptr")
                                                      << (sequence_lengths ? " size=" + std::to_string(sequence_lengths->size()) : ""));
 
@@ -746,13 +748,6 @@ namespace llaminar2
                                             << " wq_shape=[" << layer.wq->shape()[0] << "," << layer.wq->shape()[1] << "]"
                                             << " wk_shape=[" << layer.wk->shape()[0] << "," << layer.wk->shape()[1] << "]");
 
-            // Extract bias pointers
-            // Note: Use TensorBase::data() directly - works for both raw tensors and TensorSlice
-            // (TensorSlice delegates data() to its inner tensor)
-            const float *q_bias_ptr = layer.q_bias ? layer.q_bias->data() : nullptr;
-            const float *k_bias_ptr = layer.k_bias ? layer.k_bias->data() : nullptr;
-            const float *v_bias_ptr = layer.v_bias ? layer.v_bias->data() : nullptr;
-
             FusedQKVGEMMStage::Params qkv_params;
             qkv_params.input = buffers.normalized;
             qkv_params.m = total_tokens; // Use total_tokens = batch_size * seq_len
@@ -760,16 +755,17 @@ namespace llaminar2
             qkv_params.wq = layer.wq;
             qkv_params.output_q = buffers.Q;
             qkv_params.n_q = q_n;
-            qkv_params.bias_q = q_bias_ptr;
+            qkv_params.bias_q = layer.q_bias; // TensorBase* for tensor-aware GPU path
             qkv_params.wk = layer.wk;
             qkv_params.output_k = buffers.K;
             qkv_params.n_k = k_n;
-            qkv_params.bias_k = k_bias_ptr;
+            qkv_params.bias_k = layer.k_bias; // TensorBase* for tensor-aware GPU path
             qkv_params.wv = layer.wv;
             qkv_params.output_v = buffers.V;
             qkv_params.n_v = v_n;
-            qkv_params.bias_v = v_bias_ptr;
+            qkv_params.bias_v = layer.v_bias; // TensorBase* for tensor-aware GPU path
             qkv_params.device_id = device;
+            LOG_DEBUG("[Qwen2Graph] Creating FusedQKVGEMM with device_id=" << device.to_string());
 
             graph.addNode(prefix + "qkv_proj",
                           ComputeStageFactory::createFusedQKVGEMM(qkv_params),

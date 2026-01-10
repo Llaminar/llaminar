@@ -662,9 +662,10 @@ namespace llaminar2
             if (params.wv)
                 params.n_v = static_cast<int>(params.wv->shape()[0]);
             // Biases (optional - indices 4,5,6 in inputs)
-            params.bias_q = stage.inputs.size() > 4 && stage.inputs[4] ? stage.inputs[4]->data() : nullptr;
-            params.bias_k = stage.inputs.size() > 5 && stage.inputs[5] ? stage.inputs[5]->data() : nullptr;
-            params.bias_v = stage.inputs.size() > 6 && stage.inputs[6] ? stage.inputs[6]->data() : nullptr;
+            params.bias_q = stage.inputs.size() > 4 ? stage.inputs[4] : nullptr;
+            params.bias_k = stage.inputs.size() > 5 ? stage.inputs[5] : nullptr;
+            params.bias_v = stage.inputs.size() > 6 ? stage.inputs[6] : nullptr;
+            params.device_id = stage.device; // FIX: propagate device to kernel dispatch
             return ComputeStageFactory::createFusedQKVGEMM(params);
         }
 
@@ -740,6 +741,7 @@ namespace llaminar2
             params.alpha = stage.float_params.count("alpha") ? stage.float_params.at("alpha") : 1.0f;
             params.beta = stage.float_params.count("beta") ? stage.float_params.at("beta") : 0.0f;
             params.transpose_B = false;
+            params.device_id = stage.device;
             return ComputeStageFactory::createGEMM(params);
         }
 

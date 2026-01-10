@@ -271,6 +271,63 @@ namespace llaminar2
         virtual void *active_mutable_data_ptr() { return raw_mutable_data(); }
 
         // =========================================================================
+        // Device Coherence API
+        // =========================================================================
+
+        /**
+         * @brief Mark tensor as modified on device (GPU data is current, host is stale)
+         * @note Call this after GPU kernels write to the tensor via gpu_data_ptr()
+         *
+         * After calling this:
+         *   - GPU data is considered current
+         *   - Host data is considered stale
+         *   - Next data() call will sync from device
+         */
+        virtual void mark_device_dirty() {}
+
+        /**
+         * @brief Mark tensor as modified on host (host data is current, GPU is stale)
+         * @note Call this after CPU code writes to the tensor via mutable_data()
+         *
+         * After calling this:
+         *   - Host data is considered current
+         *   - GPU data is considered stale (if any)
+         *   - Next ensureOnDevice() will sync to device
+         */
+        virtual void mark_host_dirty() {}
+
+        /**
+         * @brief Ensure tensor data is present on the specified device
+         * @param target_device Device to ensure data is on
+         * @return true if data is now available on target device
+         * @note For CPU tensors, this may upload to GPU; for GPU tensors, may be no-op
+         */
+        virtual bool ensureOnDevice(DeviceId target_device)
+        {
+            (void)target_device;
+            return true; // CPU tensors are always "on device" (CPU)
+        }
+
+        /**
+         * @brief Ensure tensor data is synchronized to host (CPU)
+         * @return true if host data is now current
+         * @note Downloads from GPU if tensor was modified on device
+         */
+        virtual bool ensureOnHost() { return true; }
+
+        /**
+         * @brief Check if tensor data is valid on host
+         * @return true if host buffer contains current data
+         */
+        virtual bool isHostValid() const { return true; }
+
+        /**
+         * @brief Check if tensor data is valid on device
+         * @return true if device buffer is allocated AND contains current data
+         */
+        virtual bool isDeviceValid() const { return false; }
+
+        // =========================================================================
         // Type-Safe Downcasting
         // =========================================================================
 

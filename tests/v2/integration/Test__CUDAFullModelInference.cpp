@@ -150,6 +150,38 @@ protected:
     }
 
     /**
+     * @brief Compute cosine similarity between two float vectors
+     */
+    static float cosineSimilarity(const float *a, const float *b, size_t n)
+    {
+        double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            dot += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+            norm_a += static_cast<double>(a[i]) * static_cast<double>(a[i]);
+            norm_b += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+        }
+        if (norm_a < 1e-12 || norm_b < 1e-12)
+            return 0.0f;
+        return static_cast<float>(dot / (std::sqrt(norm_a) * std::sqrt(norm_b)));
+    }
+
+    /**
+     * @brief Compute max absolute error between two float vectors
+     */
+    static float maxAbsError(const float *a, const float *b, size_t n)
+    {
+        float max_err = 0.0f;
+        for (size_t i = 0; i < n; ++i)
+        {
+            float err = std::abs(a[i] - b[i]);
+            if (err > max_err)
+                max_err = err;
+        }
+        return max_err;
+    }
+
+    /**
      * @brief Run forward pass and get logits
      * @param runner Inference runner
      * @param tokens Input token IDs
@@ -359,52 +391,29 @@ TEST_F(Test__CUDAFullModelInference, SingleTokenPrediction_MatchesCPU)
         LOG_INFO("  Token " << token << ": " << logit);
     }
 
-    // Primary check: top-1 token should match
+    // Compute cosine similarity between full logit vectors
+    float cosine = cosineSimilarity(cpu_logits.data(), gpu_logits.data(), cpu_logits.size());
+    float max_err = maxAbsError(cpu_logits.data(), gpu_logits.data(), cpu_logits.size());
+
+    LOG_INFO("[Test] Logit comparison: cosine=" << cosine << ", max_error=" << max_err);
+
+    // Strict expectations: GPU should match CPU closely
+    EXPECT_GE(cosine, 0.999f) << "Logit cosine similarity too low: " << cosine;
+
+    // Top-1 prediction must match
     EXPECT_EQ(cpu_top5[0].first, gpu_top5[0].first)
-        << "Top-1 token mismatch: CPU=" << cpu_top5[0].first
+        << "Top-1 prediction mismatch: CPU=" << cpu_top5[0].first
         << ", GPU=" << gpu_top5[0].first;
 
-    // Secondary check: top-5 tokens should match (order may vary slightly)
-    std::vector<int> cpu_top5_tokens, gpu_top5_tokens;
+    // Top-5 tokens should match (order may vary slightly due to numerical precision)
+    std::set<int> cpu_top5_set, gpu_top5_set;
     for (const auto &[token, logit] : cpu_top5)
-        cpu_top5_tokens.push_back(token);
+        cpu_top5_set.insert(token);
     for (const auto &[token, logit] : gpu_top5)
-        gpu_top5_tokens.push_back(token);
+        gpu_top5_set.insert(token);
 
-    std::sort(cpu_top5_tokens.begin(), cpu_top5_tokens.end());
-    std::sort(gpu_top5_tokens.begin(), gpu_top5_tokens.end());
-
-    EXPECT_EQ(cpu_top5_tokens, gpu_top5_tokens)
+    EXPECT_EQ(cpu_top5_set, gpu_top5_set)
         << "Top-5 token sets don't match";
-
-    // Tertiary check: logit values should be close
-    // (Only check top-100 to avoid noise in low-probability tokens)
-    auto cpu_top100 = getTopK(cpu_logits, 100);
-    auto gpu_top100 = getTopK(gpu_logits, 100);
-
-    int mismatches = 0;
-    for (int i = 0; i < 100; ++i)
-    {
-        float cpu_val = cpu_top100[i].second;
-        float gpu_val = gpu_top100[i].second;
-        float diff = std::abs(cpu_val - gpu_val);
-        float ref = std::abs(cpu_val);
-
-        if (diff > LOGIT_ATOL + LOGIT_RTOL * ref)
-        {
-            ++mismatches;
-            if (mismatches <= 5)
-            {
-                LOG_WARN("[Test] Logit mismatch at rank " << i
-                                                          << ": CPU=" << cpu_val
-                                                          << ", GPU=" << gpu_val
-                                                          << ", diff=" << diff);
-            }
-        }
-    }
-
-    EXPECT_LE(mismatches, 10)
-        << "Too many logit mismatches in top-100: " << mismatches;
 }
 
 TEST_F(Test__CUDAFullModelInference, LongerPrompt_MatchesCPU)
@@ -563,38 +572,6 @@ TEST_F(Test__CUDAFullModelInference, SingleTokenPrompt)
 // Diagnostic Test: Stage-by-Stage Comparison
 // ============================================================================
 
-/**
- * @brief Compute cosine similarity between two float vectors
- */
-static float cosineSimilarity(const float *a, const float *b, size_t n)
-{
-    double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
-    for (size_t i = 0; i < n; ++i)
-    {
-        dot += static_cast<double>(a[i]) * static_cast<double>(b[i]);
-        norm_a += static_cast<double>(a[i]) * static_cast<double>(a[i]);
-        norm_b += static_cast<double>(b[i]) * static_cast<double>(b[i]);
-    }
-    if (norm_a < 1e-12 || norm_b < 1e-12)
-        return 0.0f;
-    return static_cast<float>(dot / (std::sqrt(norm_a) * std::sqrt(norm_b)));
-}
-
-/**
- * @brief Compute max absolute error between two float vectors
- */
-static float maxAbsError(const float *a, const float *b, size_t n)
-{
-    float max_err = 0.0f;
-    for (size_t i = 0; i < n; ++i)
-    {
-        float err = std::abs(a[i] - b[i]);
-        if (err > max_err)
-            max_err = err;
-    }
-    return max_err;
-}
-
 TEST_F(Test__CUDAFullModelInference, DiagnosticStageByStageComparison)
 {
     // This test captures snapshots at each stage for both CPU and GPU
@@ -629,9 +606,79 @@ TEST_F(Test__CUDAFullModelInference, DiagnosticStageByStageComparison)
     LOG_INFO("[Diagnostic] CPU captured " << cpu_keys.size() << " snapshots");
     LOG_INFO("[Diagnostic] GPU captured " << gpu_keys.size() << " snapshots");
 
-    // Sort keys for consistent ordering
-    std::sort(cpu_keys.begin(), cpu_keys.end());
-    std::sort(gpu_keys.begin(), gpu_keys.end());
+    // Collect all unique keys
+    std::set<std::string> all_keys_set(cpu_keys.begin(), cpu_keys.end());
+    all_keys_set.insert(gpu_keys.begin(), gpu_keys.end());
+
+    // Convert to vector for custom sorting
+    std::vector<std::string> all_keys(all_keys_set.begin(), all_keys_set.end());
+
+    // Custom comparator for chronological pipeline order
+    auto getStageOrder = [](const std::string &key) -> std::pair<int, int>
+    {
+        // Global stages
+        if (key == "EMBEDDING")
+            return {-1, 0};
+        if (key == "FINAL_NORM")
+            return {1000000, 0};
+        if (key == "LM_HEAD")
+            return {1000001, 0};
+
+        // Extract layer number
+        int layer = -1;
+        size_t layer_pos = key.find("layer");
+        if (layer_pos != std::string::npos)
+        {
+            size_t num_start = layer_pos + 5;
+            size_t num_end = key.find('_', num_start);
+            if (num_end != std::string::npos)
+            {
+                layer = std::stoi(key.substr(num_start, num_end - num_start));
+            }
+        }
+
+        // Stage order within a layer (matches transformer execution order)
+        int stage_order = 99; // Default for unknown stages
+        if (key.find("ATTENTION_NORM") != std::string::npos)
+            stage_order = 0;
+        else if (key.find("Q_PROJECTION") != std::string::npos)
+            stage_order = 1;
+        else if (key.find("K_PROJECTION") != std::string::npos)
+            stage_order = 2;
+        else if (key.find("V_PROJECTION") != std::string::npos)
+            stage_order = 3;
+        else if (key.find("Q_ROPE") != std::string::npos)
+            stage_order = 4;
+        else if (key.find("K_ROPE") != std::string::npos)
+            stage_order = 5;
+        else if (key.find("ATTENTION_CONTEXT") != std::string::npos)
+            stage_order = 6;
+        else if (key.find("ATTENTION_OUTPUT") != std::string::npos)
+            stage_order = 7;
+        else if (key.find("ATTENTION_RESIDUAL") != std::string::npos)
+            stage_order = 8;
+        else if (key.find("FFN_NORM") != std::string::npos)
+            stage_order = 9;
+        else if (key.find("FFN_GATE") != std::string::npos)
+            stage_order = 10;
+        else if (key.find("FFN_UP") != std::string::npos)
+            stage_order = 11;
+        else if (key.find("FFN_SWIGLU") != std::string::npos)
+            stage_order = 12;
+        else if (key.find("FFN_DOWN") != std::string::npos)
+            stage_order = 13;
+        else if (key.find("FFN_RESIDUAL") != std::string::npos)
+            stage_order = 14;
+
+        return {layer, stage_order};
+    };
+
+    std::sort(all_keys.begin(), all_keys.end(), [&](const std::string &a, const std::string &b)
+              {
+        auto orderA = getStageOrder(a);
+        auto orderB = getStageOrder(b);
+        if (orderA.first != orderB.first) return orderA.first < orderB.first;
+        return orderA.second < orderB.second; });
 
     // Print header
     std::cout << "\n";
@@ -640,10 +687,6 @@ TEST_F(Test__CUDAFullModelInference, DiagnosticStageByStageComparison)
     std::cout << "╠══════════════════════════════════════════════════════════════════════════════════╣\n";
     std::cout << "║ Stage Key                           │ Elements  │ Cosine Sim │ Max Abs Err │ OK? ║\n";
     std::cout << "╠═════════════════════════════════════╪═══════════╪════════════╪═════════════╪═════╣\n";
-
-    // Find common keys and compare
-    std::set<std::string> all_keys(cpu_keys.begin(), cpu_keys.end());
-    all_keys.insert(gpu_keys.begin(), gpu_keys.end());
 
     int pass_count = 0;
     int fail_count = 0;

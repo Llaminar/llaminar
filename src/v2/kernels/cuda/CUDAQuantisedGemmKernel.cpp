@@ -736,7 +736,7 @@ namespace llaminar2
                         all_success = false;
                         break;
                     }
-                    if (!cudaQuantGemm_copyHostToDevice(d_bias, proj.bias, n, cuda_device_id_))
+                    if (!cudaQuantGemm_copyHostToDevice(d_bias, proj.bias->data(), n, cuda_device_id_))
                     {
                         LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused] Failed to copy bias to device for projection " << i);
                         cudaQuantGemm_freeDevice(d_bias);
@@ -772,6 +772,223 @@ namespace llaminar2
             }
 
             cudaQuantGemm_freeDevice(d_input);
+            return all_success;
+        }
+
+        // =====================================================================
+        // ITensorGemm interface - multiply_fused_tensor() for TensorBase API
+        // =====================================================================
+
+        bool CUDAQuantisedGemmKernel::multiply_fused_tensor(
+            const TensorBase *input,
+            const std::vector<TensorProjectionDesc> &projections,
+            int m, int k,
+            const MPIContext * /*mpi_ctx*/)
+        {
+            if (!input || projections.empty())
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Null input or empty projections");
+                return false;
+            }
+
+            if (m <= 0 || k <= 0)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Invalid dimensions: m=" << m << " k=" << k);
+                return false;
+            }
+
+            cudaQuantGemm_setDevice(cuda_device_id_);
+            DeviceId target_device = DeviceId::cuda(cuda_device_id_);
+
+            // Step 1: Ensure input is on the GPU
+            const float *d_input = nullptr;
+            if (input->native_type() == TensorType::FP32)
+            {
+                auto *fp32_input = dynamic_cast<FP32Tensor *>(const_cast<TensorBase *>(input));
+                if (!fp32_input)
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Failed to cast input to FP32Tensor");
+                    return false;
+                }
+                if (!fp32_input->ensureOnDevice(target_device))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Failed to ensure input on device");
+                    return false;
+                }
+                d_input = static_cast<const float *>(fp32_input->gpu_data_ptr());
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input << " cpu_ptr=" << fp32_input->data());
+            }
+            else
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Unsupported input type: "
+                          << static_cast<int>(input->native_type()));
+                return false;
+            }
+
+            if (!d_input)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Input has no GPU data");
+                return false;
+            }
+
+            // Step 2: Allocate activation quantization buffers (shared across all projections)
+            // Use this kernel's work buffers for quantized activations
+            ensureWorkBuffers(m);
+
+            LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Quantizing activations once, m=" << m << " k=" << k);
+
+            // Step 3: Quantize activations ONCE (shared across all projections)
+            if (!cudaQuantGemm_quantizeActivations(
+                    d_input, impl_->d_A_int8, impl_->d_scales_A, m, k, cuda_device_id_))
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Activation quantization failed");
+                return false;
+            }
+
+            // Step 4: Execute each projection using the SHARED quantized activations
+            bool all_success = true;
+            for (size_t i = 0; i < projections.size() && all_success; ++i)
+            {
+                const auto &proj = projections[i];
+                if (!proj.kernel || !proj.output)
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " has null kernel or output");
+                    all_success = false;
+                    break;
+                }
+
+                // Get the CUDA kernel for this projection
+                auto *cuda_kernel = dynamic_cast<CUDAQuantisedGemmKernel *>(proj.kernel);
+                if (!cuda_kernel)
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                             << " kernel is not a CUDAQuantisedGemmKernel");
+                    all_success = false;
+                    break;
+                }
+
+                const int n = proj.n;
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                         << " (" << (proj.name ? proj.name : "unnamed") << "): m=" << m << " n=" << n << " k=" << k);
+
+                // Ensure the projection's weights are converted
+                cuda_kernel->ensureWeightsConverted();
+
+                // Ensure this projection has enough work buffer capacity for the output
+                // Note: We need d_C_int32 sized for this projection's N
+                cuda_kernel->ensureWorkBuffers(m);
+
+                // Ensure output tensor is on device
+                if (proj.output->native_type() != TensorType::FP32)
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                             << " output must be FP32, got " << static_cast<int>(proj.output->native_type()));
+                    all_success = false;
+                    break;
+                }
+
+                auto *fp32_output = dynamic_cast<FP32Tensor *>(proj.output);
+                if (!fp32_output)
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Failed to cast output to FP32Tensor");
+                    all_success = false;
+                    break;
+                }
+
+                if (!fp32_output->ensureOnDevice(target_device))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Failed to ensure output on device for projection " << i);
+                    all_success = false;
+                    break;
+                }
+
+                float *d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
+                if (!d_output)
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Output has no GPU data for projection " << i);
+                    all_success = false;
+                    break;
+                }
+
+                // Execute CUTLASS INT8 GEMM using SHARED quantized activations and this kernel's weights
+                if (!cudaQuantGemm_execute(
+                        impl_->d_A_int8,                    // SHARED quantized activations from this kernel
+                        cuda_kernel->impl_->d_weights_int8, // This projection's weights
+                        cuda_kernel->impl_->d_C_int32,      // This projection's INT32 work buffer
+                        m, n, k, cuda_device_id_))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] CUTLASS GEMM failed for projection " << i);
+                    all_success = false;
+                    break;
+                }
+
+                // Get bias pointer if present
+                const float *d_bias = nullptr;
+                if (proj.bias)
+                {
+                    if (proj.bias->native_type() != TensorType::FP32)
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                                 << " bias must be FP32, got " << static_cast<int>(proj.bias->native_type()));
+                        all_success = false;
+                        break;
+                    }
+
+                    auto *fp32_bias = dynamic_cast<FP32Tensor *>(const_cast<TensorBase *>(proj.bias));
+                    if (!fp32_bias)
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Failed to cast bias to FP32Tensor");
+                        all_success = false;
+                        break;
+                    }
+
+                    if (!fp32_bias->ensureOnDevice(target_device))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Failed to ensure bias on device for projection " << i);
+                        all_success = false;
+                        break;
+                    }
+
+                    d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
+                    if (!d_bias)
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Bias has no GPU data for projection " << i);
+                        all_success = false;
+                        break;
+                    }
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                             << " using bias ptr=" << static_cast<const void *>(d_bias));
+                }
+
+                // Apply scaling: output = int32_accum * scales_A * scales_B + bias
+                // Note: Use the SHARED scales_A from the quantized activations
+                if (!cudaQuantGemm_applyScaling(
+                        cuda_kernel->impl_->d_C_int32,  // This projection's INT32 result
+                        d_output,                       // Output FP32
+                        impl_->d_scales_A,              // SHARED activation scales
+                        cuda_kernel->impl_->d_scales_B, // This projection's weight scales
+                        m, n, 1.0f, 0.0f, nullptr, d_bias, cuda_device_id_))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Scaling failed for projection " << i);
+                    all_success = false;
+                    break;
+                }
+
+                // Debug: Log output values after scaling
+                if (d_output && m > 0 && n > 0)
+                {
+                    size_t copy_count = std::min(static_cast<size_t>(m) * static_cast<size_t>(n), static_cast<size_t>(8));
+                    std::vector<float> h_output(copy_count);
+                    cudaQuantGemm_copyDeviceToHost(h_output.data(), d_output, h_output.size(), cuda_device_id_);
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] " << (proj.name ? proj.name : "unnamed")
+                                                                                  << " output[0:4]=" << h_output[0] << "," << (h_output.size() > 1 ? h_output[1] : 0.f) << ","
+                                                                                  << (h_output.size() > 2 ? h_output[2] : 0.f) << "," << (h_output.size() > 3 ? h_output[3] : 0.f));
+                }
+
+                // Mark output as dirty on device (valid on GPU, not on CPU)
+                proj.output->mark_device_dirty();
+            }
+
             return all_success;
         }
 

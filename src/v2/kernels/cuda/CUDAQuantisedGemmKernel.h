@@ -236,6 +236,30 @@ namespace llaminar2
                 int device_idx = -1) override;
 
             /**
+             * @brief Tensor-aware fused multi-projection GEMM
+             *
+             * Optimized implementation that:
+             * 1. Ensures input is on GPU (uploads if needed)
+             * 2. Quantizes input to INT8 ONCE
+             * 3. Runs all projections with the same quantized input
+             * 4. Marks output tensors as device-dirty
+             *
+             * This is the preferred path for FusedQKVGEMMStage on GPU.
+             *
+             * @param input Input tensor [m, k] (will be uploaded to GPU if needed)
+             * @param projections Vector of TensorProjectionDesc (kernels + output tensors)
+             * @param m Number of rows (seq_len)
+             * @param k Input dimension (d_model)
+             * @param mpi_ctx MPI context (unused)
+             * @return true on success
+             */
+            bool multiply_fused_tensor(
+                const TensorBase *input,
+                const std::vector<TensorProjectionDesc> &projections,
+                int m, int k,
+                const MPIContext *mpi_ctx = nullptr) override;
+
+            /**
              * @brief Activation-activation GEMM (not supported for quantized kernel)
              *
              * CUDAQuantisedGemmKernel is for weight projections only.

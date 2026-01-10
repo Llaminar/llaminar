@@ -567,9 +567,11 @@ namespace llaminar2
 #endif
 
         // Invoke snapshot callback if configured (uses same dump info for efficiency)
+        LOG_DEBUG("[GraphExecutor::executeNode] success=" << success << " callback=" << (config_.snapshot_callback ? "set" : "null") << " node=" << node.name);
         if (success && config_.snapshot_callback)
         {
             auto dump_info = node.stage->getDumpInfo();
+            LOG_DEBUG("[GraphExecutor::executeNode] Invoking callback for " << node.name);
             config_.snapshot_callback(node.name, dump_info);
         }
 

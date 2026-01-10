@@ -41,7 +41,7 @@ namespace llaminar2
     struct GEMMProjection
     {
         float *output;                     ///< Output buffer [m, n]
-        const float *bias;                 ///< Optional bias [n] (nullptr if none)
+        const TensorBase *bias;            ///< Optional bias tensor [n] (nullptr if none)
         int n;                             ///< Output dimension
         std::string name;                  ///< Name for error messages (optional)
         const float *gate_input = nullptr; ///< Optional gate input for SwiGLU [m, n]
@@ -56,10 +56,10 @@ namespace llaminar2
      */
     struct GEMMProjectionQ8_1
     {
-        void *output_q8_1; ///< Output Q8_1 buffer [m, ceil(n/32)] Q8_1Blocks
-        const float *bias; ///< Optional bias [n] to add before requantization (nullptr if none)
-        int n;             ///< Output dimension (rounded up to 32 for Q8_1)
-        std::string name;  ///< Name for error messages (optional)
+        void *output_q8_1;      ///< Output Q8_1 buffer [m, ceil(n/32)] Q8_1Blocks
+        const TensorBase *bias; ///< Optional bias tensor [n] to add before requantization (nullptr if none)
+        int n;                  ///< Output dimension (rounded up to 32 for Q8_1)
+        std::string name;       ///< Name for error messages (optional)
     };
 
     /**
@@ -71,11 +71,11 @@ namespace llaminar2
      */
     struct GEMMProjectionQ16_1
     {
-        void *output_q16_1; ///< Output Q16_1 buffer [m, n/block_size] blocks
-        const float *bias;  ///< Optional bias [n] to add before requantization (nullptr if none)
-        int n;              ///< Output dimension (must be divisible by block_size)
-        int q16_block_size; ///< Block size: 32, 64, or 128 (should match head_dim)
-        std::string name;   ///< Name for error messages (optional)
+        void *output_q16_1;     ///< Output Q16_1 buffer [m, n/block_size] blocks
+        const TensorBase *bias; ///< Optional bias tensor [n] to add before requantization (nullptr if none)
+        int n;                  ///< Output dimension (must be divisible by block_size)
+        int q16_block_size;     ///< Block size: 32, 64, or 128 (should match head_dim)
+        std::string name;       ///< Name for error messages (optional)
     };
 
     /**
@@ -149,7 +149,7 @@ namespace llaminar2
         bool execute(
             const float *input,
             float *output1, float *output2,
-            const float *bias1, const float *bias2,
+            const TensorBase *bias1, const TensorBase *bias2,
             int m, int n, int k,
             const MPIContext *ctx = nullptr,
             int device_idx = -1);
@@ -160,7 +160,7 @@ namespace llaminar2
         bool execute(
             const float *input,
             float *output1, float *output2, float *output3,
-            const float *bias1, const float *bias2, const float *bias3,
+            const TensorBase *bias1, const TensorBase *bias2, const TensorBase *bias3,
             int m, int n1, int n2, int n3, int k,
             const MPIContext *ctx = nullptr,
             int device_idx = -1);
@@ -211,7 +211,7 @@ namespace llaminar2
         bool execute_to_q8_1(
             const float *input,
             void *output_q, void *output_k, void *output_v,
-            const float *bias_q, const float *bias_k, const float *bias_v,
+            const TensorBase *bias_q, const TensorBase *bias_k, const TensorBase *bias_v,
             int m, int n_q, int n_kv, int k,
             const MPIContext *ctx = nullptr,
             int device_idx = -1);
@@ -261,7 +261,7 @@ namespace llaminar2
         bool execute_q8_1_to_q8_1(
             const void *input_q8_1,
             void *output_q, void *output_k, void *output_v,
-            const float *bias_q, const float *bias_k, const float *bias_v,
+            const TensorBase *bias_q, const TensorBase *bias_k, const TensorBase *bias_v,
             int m, int n_q, int n_kv, int k,
             const MPIContext *ctx = nullptr,
             int device_idx = -1);
@@ -301,7 +301,7 @@ namespace llaminar2
             void *output_q, // Q8_1 output
             void *output_k, // Q16_1 output (high precision!)
             void *output_v, // Q8_1 output
-            const float *bias_q, const float *bias_k, const float *bias_v,
+            const TensorBase *bias_q, const TensorBase *bias_k, const TensorBase *bias_v,
             int m, int n_q, int n_kv, int k,
             int k_block_size = 64, // Q16 block size for K (should match head_dim)
             const MPIContext *ctx = nullptr,

@@ -37,13 +37,13 @@ namespace llaminar2
             const ITensor *w_gate = nullptr;
             ITensor *output_gate = nullptr;
             int n_gate = 0;
-            const float *bias_gate = nullptr;
+            const TensorBase *bias_gate = nullptr;
 
             // Up projection
             const ITensor *w_up = nullptr;
             ITensor *output_up = nullptr;
             int n_up = 0;
-            const float *bias_up = nullptr;
+            const TensorBase *bias_up = nullptr;
 
             // Optional MPI context
             const MPIContext *mpi_ctx = nullptr;

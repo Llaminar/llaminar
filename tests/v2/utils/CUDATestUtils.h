@@ -40,6 +40,10 @@
 #include <iomanip>
 #include <cstring>
 
+#ifdef HAVE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include "backends/DeviceId.h" // DeviceId for GPU tests
 
 // Project headers are expected to be included BEFORE this file
@@ -104,10 +108,46 @@ namespace llaminar2::test::cuda
     // =========================================================================
 
     /**
+     * @brief Clear any lingering CUDA errors from previous operations
+     *
+     * CUDA errors are "sticky" - once an error occurs, all subsequent CUDA calls
+     * will return the same error until it is cleared. This function clears the
+     * error state and optionally synchronizes the device.
+     *
+     * @param sync If true, also synchronize all CUDA devices (slower but more thorough)
+     * @return The error that was cleared, or cudaSuccess if no error
+     */
+#ifdef HAVE_CUDA
+    inline cudaError_t clearCudaErrors(bool sync = false)
+    {
+        // Get and clear the last error
+        cudaError_t err = cudaGetLastError();
+
+        if (sync)
+        {
+            // Synchronize all devices to ensure all async work is complete
+            int device_count = 0;
+            cudaGetDeviceCount(&device_count);
+            for (int i = 0; i < device_count; ++i)
+            {
+                cudaSetDevice(i);
+                cudaDeviceSynchronize();
+                cudaGetLastError(); // Clear any sync errors
+            }
+        }
+
+        return err;
+    }
+#endif
+
+    /**
      * @brief Base test fixture for CUDA tests
      *
      * Automatically skips tests when no GPU is available.
      * Provides gpu_device_ (DeviceId) and gpu_idx_ (legacy int) for derived tests.
+     *
+     * IMPORTANT: Clears CUDA error state in SetUp and TearDown to prevent
+     * errors from one test affecting subsequent tests.
      */
     class CUDATestBase : public ::testing::Test
     {
@@ -117,6 +157,14 @@ namespace llaminar2::test::cuda
 #ifndef HAVE_CUDA
             GTEST_SKIP() << "Built without CUDA support";
 #else
+            // Clear any lingering CUDA errors from previous tests
+            cudaError_t prior_err = clearCudaErrors(true);
+            if (prior_err != cudaSuccess)
+            {
+                std::cerr << "[CUDATestBase::SetUp] Cleared prior CUDA error: "
+                          << cudaGetErrorString(prior_err) << std::endl;
+            }
+
             // Initialize DeviceManager to enumerate GPU devices
             // Must be called before has_gpu() or find_device()
             auto &dm = DeviceManager::instance();
@@ -154,6 +202,15 @@ namespace llaminar2::test::cuda
 
         void TearDown() override
         {
+#ifdef HAVE_CUDA
+            // Clear CUDA errors to prevent cascading to next test
+            cudaError_t err = clearCudaErrors(true);
+            if (err != cudaSuccess)
+            {
+                std::cerr << "[CUDATestBase::TearDown] Test left CUDA error: "
+                          << cudaGetErrorString(err) << std::endl;
+            }
+#endif
             backend_.reset();
         }
 
