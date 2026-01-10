@@ -56,7 +56,8 @@ namespace llaminar2
         LOG_DEBUG("[SwiGLUStage] Execute: seq_len=" << seq_len
                                                     << " (params_.seq_len=" << params_.seq_len << ")"
                                                     << " intermediate_dim=" << intermediate_dim
-                                                    << " tensor_type=" << gate_base->dtype_name());
+                                                    << " tensor_type=" << gate_base->dtype_name()
+                                                    << " device_id=" << params_.device_id.to_string());
 
         // Create kernel via KernelFactory with automatic type dispatch
         auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);

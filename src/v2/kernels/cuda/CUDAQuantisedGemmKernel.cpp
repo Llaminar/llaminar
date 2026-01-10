@@ -509,29 +509,7 @@ namespace llaminar2
                 return false;
             }
 
-            // Ensure tensors are on the correct CUDA device
-            DeviceId target_device = DeviceId::cuda(cuda_device_id_);
-
-            // For FP32 tensors, ensure they're on device
-            if (A->native_type() == TensorType::FP32)
-            {
-                auto *fp32_A = dynamic_cast<FP32Tensor *>(const_cast<TensorBase *>(A));
-                if (fp32_A && !fp32_A->ensureOnDevice(target_device))
-                {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_tensor] Failed to ensure input A on device");
-                    return false;
-                }
-            }
-
-            if (C->native_type() == TensorType::FP32)
-            {
-                auto *fp32_C = dynamic_cast<FP32Tensor *>(C);
-                if (fp32_C && !fp32_C->ensureOnDevice(target_device))
-                {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_tensor] Failed to ensure output C on device");
-                    return false;
-                }
-            }
+            // Coherence handled automatically by GraphExecutor
 
             // Ensure weights are converted
             ensureWeightsConverted();
@@ -568,8 +546,6 @@ namespace llaminar2
                 }
 
                 bool success = multiply_q8_to_fp32(d_A_q8, d_C, m, n, k, alpha, beta);
-                if (success)
-                    C->mark_device_dirty();
                 return success;
             }
             else if (a_type == TensorType::FP32 && c_type == TensorType::FP32)
@@ -585,8 +561,6 @@ namespace llaminar2
                 }
 
                 bool success = multiply_fp32_to_fp32(d_A, d_C, m, n, k, alpha, beta);
-                if (success)
-                    C->mark_device_dirty();
                 return success;
             }
             else if (a_type == TensorType::Q8_1 && c_type == TensorType::Q8_1)
@@ -604,8 +578,6 @@ namespace llaminar2
                 Q8_1Block *d_C_q8 = static_cast<Q8_1Block *>(q8_C->gpu_data_ptr());
 
                 bool success = multiply_q8_to_q8(d_A_q8, d_C_q8, m, n, k);
-                if (success)
-                    C->mark_device_dirty();
                 return success;
             }
             else if (a_type == TensorType::FP32 && c_type == TensorType::Q8_1)
@@ -622,8 +594,6 @@ namespace llaminar2
                 Q8_1Block *d_C_q8 = static_cast<Q8_1Block *>(q8_C->gpu_data_ptr());
 
                 bool success = multiply_fp32_to_q8(d_A, d_C_q8, m, n, k);
-                if (success)
-                    C->mark_device_dirty();
                 return success;
             }
             else
@@ -810,11 +780,7 @@ namespace llaminar2
                     LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Failed to cast input to FP32Tensor");
                     return false;
                 }
-                if (!fp32_input->ensureOnDevice(target_device))
-                {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Failed to ensure input on device");
-                    return false;
-                }
+                // Coherence handled automatically by GraphExecutor
                 d_input = static_cast<const float *>(fp32_input->gpu_data_ptr());
                 LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input << " cpu_ptr=" << fp32_input->data());
             }
@@ -895,13 +861,7 @@ namespace llaminar2
                     break;
                 }
 
-                if (!fp32_output->ensureOnDevice(target_device))
-                {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Failed to ensure output on device for projection " << i);
-                    all_success = false;
-                    break;
-                }
-
+                // Coherence handled automatically by GraphExecutor
                 float *d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
                 if (!d_output)
                 {
@@ -942,13 +902,7 @@ namespace llaminar2
                         break;
                     }
 
-                    if (!fp32_bias->ensureOnDevice(target_device))
-                    {
-                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Failed to ensure bias on device for projection " << i);
-                        all_success = false;
-                        break;
-                    }
-
+                    // Coherence handled automatically by GraphExecutor
                     d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
                     if (!d_bias)
                     {
@@ -984,9 +938,6 @@ namespace llaminar2
                                                                                   << " output[0:4]=" << h_output[0] << "," << (h_output.size() > 1 ? h_output[1] : 0.f) << ","
                                                                                   << (h_output.size() > 2 ? h_output[2] : 0.f) << "," << (h_output.size() > 3 ? h_output[3] : 0.f));
                 }
-
-                // Mark output as dirty on device (valid on GPU, not on CPU)
-                proj.output->mark_device_dirty();
             }
 
             return all_success;

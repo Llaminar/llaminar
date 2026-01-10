@@ -1788,6 +1788,19 @@ add_v2_test(V2_Unit_CPUKVCache
     MPI_PROCS 1
 )
 
+# Test: KernelFactory KVCache methods (unified factory interface for KV cache creation)
+add_executable(v2_test_kernelfactory_kvcache unit/Test__KernelFactory_KVCache.cpp)
+target_link_libraries(v2_test_kernelfactory_kvcache 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_KernelFactory_KVCache 
+    COMMAND $<TARGET_FILE:v2_test_kernelfactory_kvcache>
+    LABELS "V2;Unit;KernelFactory;KVCache;FP32;BF16;FP16;Q8_1;Q16_1;Sharding;TensorParallelism"
+    MPI_PROCS 1
+)
+
 # Test: Q16SafeBlockAccess (Phase 2 - Safe Q16 block accessors and dispatch helpers)
 add_executable(v2_test_q16_safe_block_access unit/tensors/Test__Q16SafeBlockAccess.cpp)
 target_link_libraries(v2_test_q16_safe_block_access 
@@ -2869,6 +2882,18 @@ target_link_libraries(v2_test_validation_config llaminar2_core GTest::gtest GTes
 add_v2_test(V2_Unit_ValidationConfig
     COMMAND $<TARGET_FILE:v2_test_validation_config>
     LABELS "V2;Unit;Execution;Validation;ValidationConfig;BufferContracts;DebugEnv"
+    MPI_PROCS 1
+)
+
+# Test: StageCoherence (automatic device coherence at stage boundaries)
+# Tests CoherencePolicy enum, cohereInputs/markOutputsDirty, buffer extraction,
+# and stage coherence policy reporting.
+# Part of Device Abstraction Phase 2: Automatic Stage Boundary Coherence
+add_executable(v2_test_stage_coherence unit/Test__StageCoherence.cpp)
+target_link_libraries(v2_test_stage_coherence llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_StageCoherence
+    COMMAND $<TARGET_FILE:v2_test_stage_coherence>
+    LABELS "V2;Unit;Coherence;GraphExecutor;DeviceAbstraction;Execution"
     MPI_PROCS 1
 )
 

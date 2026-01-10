@@ -31,6 +31,7 @@
 #pragma once
 
 // Minimal includes - avoid MPI headers for nvcc compatibility
+#include "../IKVCache.h"                   // Unified KVCache interface
 #include "../../execution/RuntimeConfig.h" // For ActivationPrecision
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -49,8 +50,12 @@ namespace llaminar2
      * @brief Abstract interface for CUDA ring buffer KV cache
      *
      * Enables polymorphic use when precision is determined at runtime.
+     * Inherits from IKVCache to provide unified CPU/GPU interface.
+     *
+     * NOTE: CUDA KV cache uses device pointers internally, so the ITensor-based
+     * get_kv() returns CUDATensor wrappers around the device buffers.
      */
-    class ICUDARingKVCache
+    class ICUDARingKVCache : public IKVCache
     {
     public:
         virtual ~ICUDARingKVCache() = default;
@@ -60,9 +65,10 @@ namespace llaminar2
         // =====================================================================
 
         virtual ActivationPrecision precision() const = 0;
+        int n_layers() const override { return num_layers(); }
         virtual int num_layers() const = 0;
         virtual int batch_size() const = 0;
-        virtual int max_seq_len() const = 0;
+        int max_seq_len() const override = 0;
         virtual int n_kv_heads() const = 0;
         virtual int head_dim() const = 0;
         virtual int kv_dim() const = 0; ///< n_kv_heads * head_dim
@@ -74,7 +80,7 @@ namespace llaminar2
         /**
          * @brief Get number of cached tokens for a sequence
          */
-        virtual int get_cached_tokens(int layer, int seq_idx = 0) const = 0;
+        int get_cached_tokens(int layer, int seq_idx = 0) const override = 0;
 
         /**
          * @brief Get head (write) position for a sequence
@@ -257,6 +263,74 @@ namespace llaminar2
          * @brief Reset linearization counter
          */
         virtual void reset_linearization_counter() = 0;
+
+        // =====================================================================
+        // IKVCache Interface Implementation
+        // =====================================================================
+        // CUDA KV cache primarily uses device pointer APIs (get_kv_for_attention,
+        // append with void*). These IKVCache methods provide the ITensor-based
+        // interface for compatibility with GraphOrchestrator.
+
+        /**
+         * @brief Get K/V as ITensor pointers
+         *
+         * NOTE: For CUDA caches, this creates temporary CUDATensor wrappers
+         * around device buffers. Prefer get_kv_for_attention() for performance.
+         *
+         * @return false - not yet implemented, use get_kv_for_attention() directly
+         */
+        bool get_kv(int layer, int seq_idx,
+                    ITensor **out_k, ITensor **out_v,
+                    int *out_kv_len = nullptr) override
+        {
+            // TODO: Implement with CUDATensor wrappers if needed
+            // For now, CUDA attention kernels use get_kv_for_attention() directly
+            (void)layer;
+            (void)seq_idx;
+            (void)out_k;
+            (void)out_v;
+            (void)out_kv_len;
+            return false;
+        }
+
+        bool get_kv(int layer, int seq_idx,
+                    const ITensor **out_k, const ITensor **out_v,
+                    int *out_kv_len = nullptr) const override
+        {
+            // TODO: Implement with CUDATensor wrappers if needed
+            (void)layer;
+            (void)seq_idx;
+            (void)out_k;
+            (void)out_v;
+            (void)out_kv_len;
+            return false;
+        }
+
+        /**
+         * @brief Append K/V from ITensor pointers
+         *
+         * Extracts device pointers from tensors and delegates to the
+         * void* append method. Tensors must have GPU data available
+         * (call ensureOnDevice() before if needed).
+         *
+         * @param layer Layer index
+         * @param seq_idx Sequence index
+         * @param K Key tensor with GPU data
+         * @param V Value tensor with GPU data
+         * @param num_tokens Number of tokens to append
+         * @return true on success, false if tensors lack GPU data or append fails
+         *
+         * @note Implementation in CUDARingKVCacheTensorAdapter.cpp to avoid
+         *       including heavy tensor headers in CUDA code.
+         */
+        bool append(int layer, int seq_idx,
+                    const ITensor *K, const ITensor *V,
+                    int num_tokens) override;
+
+        // Bring in convenience overloads from IKVCache
+        using IKVCache::append;
+        using IKVCache::clear_sequence;
+        using IKVCache::get_kv;
     };
 
     // =========================================================================

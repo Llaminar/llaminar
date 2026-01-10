@@ -64,7 +64,7 @@ namespace llaminar2
             FusedAttentionBackend backend = FusedAttentionBackend::JIT;
 
             // KV cache for dynamic kv_len query
-            ICPUKVCache *kv_cache = nullptr;
+            IKVCache *kv_cache = nullptr;
             int layer_idx = -1;
 
             // Optional MPI context

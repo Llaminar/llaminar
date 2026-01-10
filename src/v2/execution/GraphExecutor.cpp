@@ -7,12 +7,14 @@
 
 #include "GraphExecutor.h"
 #include "StageDumper.h"
+#include "StageCoherence.h"
 #include "../tensors/TensorVerification.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include <algorithm>
 #include <chrono>
 #include <queue>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -493,6 +495,92 @@ namespace llaminar2
         return true;
     }
 
+    // =========================================================================
+    // Stage Output Debug Printing
+    // =========================================================================
+
+    /**
+     * @brief Print first N elements of stage outputs for debugging
+     *
+     * Called AFTER markOutputsDirty() so GPU→host sync has occurred.
+     * Controlled by LLAMINAR_STAGE_OUTPUT_PRINT environment variable.
+     */
+    static void printStageOutputs(const std::string &stage_name, const StageDumpInfo &dump_info)
+    {
+        const auto &config = debugEnv().stage_output_print;
+        if (!config.shouldPrint(stage_name))
+        {
+            return;
+        }
+
+        const int num_elements = config.num_elements;
+        const int num_rows = config.num_rows;
+
+        for (const auto &output : dump_info.outputs)
+        {
+            if (!output.tensor || !output.data)
+            {
+                continue;
+            }
+
+            // Get FP32 data - use TensorBase::data() which handles GPU→host sync
+            const float *data = nullptr;
+
+            // Always use TensorBase::data() for coherence-aware access
+            auto *tensor_base = dynamic_cast<TensorBase *>(output.tensor);
+            if (tensor_base)
+            {
+                data = tensor_base->data();
+            }
+
+            if (!data || output.rows == 0 || output.cols == 0)
+            {
+                continue;
+            }
+
+            const size_t cols = output.cols;
+            const size_t rows = output.rows;
+            const size_t print_cols = std::min(static_cast<size_t>(num_elements), cols);
+
+            // Build header
+            std::ostringstream header;
+            header << "[StageOutput] " << stage_name << "/" << (output.name ? output.name : "output")
+                   << " [" << rows << "x" << cols << "]";
+
+            // Build first row data
+            std::ostringstream first_row;
+            first_row << " row[0]: ";
+            for (size_t c = 0; c < print_cols; ++c)
+            {
+                if (c > 0)
+                    first_row << ",";
+                first_row << data[c];
+            }
+            if (cols > print_cols)
+                first_row << "...";
+
+            // Build last row data if requested
+            std::ostringstream last_row;
+            if (num_rows > 1 && rows > 1)
+            {
+                size_t last_idx = rows - 1;
+                size_t offset = last_idx * cols;
+                last_row << " | row[" << last_idx << "]: ";
+                for (size_t c = 0; c < print_cols; ++c)
+                {
+                    if (c > 0)
+                        last_row << ",";
+                    last_row << data[offset + c];
+                }
+                if (cols > print_cols)
+                    last_row << "...";
+            }
+
+            // Use stream directly with LOG_INFO
+            LOG_INFO(header.str() << first_row.str() << last_row.str());
+        }
+    }
+
     bool GraphExecutor::executeNode(ComputeNode &node, IDeviceContext *ctx)
     {
         if (!node.stage)
@@ -503,6 +591,48 @@ namespace llaminar2
 
         // Extract layer index from config
         const int layer_idx = config_.current_layer_idx;
+
+        // =========================================================================
+        // Stage Coherence: Ensure inputs are on target device BEFORE execution
+        // =========================================================================
+        {
+            auto policy = node.stage->coherencePolicy();
+            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->preferredDevice();
+
+            if (policy == CoherencePolicy::INPUT || policy == CoherencePolicy::FULL)
+            {
+                auto dump_info = node.stage->getDumpInfo();
+
+                // Cohere inputs
+                auto inputs = extractInputBuffers(dump_info);
+                if (!cohereInputs(inputs, target_device))
+                {
+                    LOG_ERROR("[GraphExecutor] Failed to cohere inputs for stage '" << node.name << "'");
+                    return false;
+                }
+
+                // Cohere weights (needed for GPU execution - biases, etc.)
+                auto weights = extractWeightBuffers(dump_info);
+                if (!cohereInputs(weights, target_device)) // Weights are read-only like inputs
+                {
+                    LOG_ERROR("[GraphExecutor] Failed to cohere weights for stage '" << node.name << "'");
+                    return false;
+                }
+            }
+
+            // For GPU targets, outputs also need GPU buffers allocated before kernel runs
+            if (policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL)
+            {
+                auto dump_info = node.stage->getDumpInfo();
+                auto outputs = extractOutputBuffers(dump_info);
+
+                if (!cohereOutputs(outputs, target_device))
+                {
+                    LOG_ERROR("[GraphExecutor] Failed to allocate output buffers for stage '" << node.name << "'");
+                    return false;
+                }
+            }
+        }
 
 #if LLAMINAR_ASSERTIONS_ACTIVE
         // ENTRY verification - validate inputs BEFORE execute()
@@ -538,6 +668,26 @@ namespace llaminar2
 
         auto end = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+        // =========================================================================
+        // Stage Coherence: Mark outputs as device-dirty IMMEDIATELY after execution
+        // This must happen BEFORE any output data access (dump, verification, callback)
+        // so that data() calls will sync from GPU when needed.
+        // =========================================================================
+        if (success)
+        {
+            auto policy = node.stage->coherencePolicy();
+
+            if (policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL)
+            {
+                auto dump_info = node.stage->getDumpInfo();
+                auto outputs = extractOutputBuffers(dump_info);
+                markOutputsDirty(outputs);
+
+                // Stage output printing (after coherence, so GPU→host sync has occurred)
+                printStageOutputs(node.name, dump_info);
+            }
+        }
 
         if (config_.enable_profiling)
         {

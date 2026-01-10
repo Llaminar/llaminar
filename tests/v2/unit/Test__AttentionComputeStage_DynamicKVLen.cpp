@@ -66,6 +66,52 @@ namespace llaminar2
                 return cached_tokens_[layer];
             }
 
+            // Unified KV access (new interface)
+            bool get_kv(int layer, int seq_idx, ITensor **out_k, ITensor **out_v, int *out_kv_len = nullptr) override
+            {
+                (void)seq_idx;
+                if (layer < 0 || layer >= num_layers_)
+                {
+                    if (out_k)
+                        *out_k = nullptr;
+                    if (out_v)
+                        *out_v = nullptr;
+                    if (out_kv_len)
+                        *out_kv_len = 0;
+                    return false;
+                }
+                if (out_k)
+                    *out_k = k_tensors_[layer].get();
+                if (out_v)
+                    *out_v = v_tensors_[layer].get();
+                if (out_kv_len)
+                    *out_kv_len = cached_tokens_[layer];
+                return true;
+            }
+
+            bool get_kv(int layer, int seq_idx, const ITensor **out_k, const ITensor **out_v, int *out_kv_len = nullptr) const override
+            {
+                (void)seq_idx;
+                if (layer < 0 || layer >= num_layers_)
+                {
+                    if (out_k)
+                        *out_k = nullptr;
+                    if (out_v)
+                        *out_v = nullptr;
+                    if (out_kv_len)
+                        *out_kv_len = 0;
+                    return false;
+                }
+                if (out_k)
+                    *out_k = k_tensors_[layer].get();
+                if (out_v)
+                    *out_v = v_tensors_[layer].get();
+                if (out_kv_len)
+                    *out_kv_len = cached_tokens_[layer];
+                return true;
+            }
+
+            // Legacy individual accessors (deprecated)
             ITensor *get_k(int layer, int seq_idx = 0) override
             {
                 (void)seq_idx;
@@ -130,7 +176,11 @@ namespace llaminar2
                 }
             }
 
-            void clear_sequence(int seq_idx) override { (void)seq_idx; }
+            void clear_sequence(int layer, int seq_idx) override
+            {
+                (void)layer;
+                (void)seq_idx;
+            }
             void clear_layer(int layer) override { (void)layer; }
             void evict_oldest(int tokens_to_evict) override { (void)tokens_to_evict; }
             void evict_oldest_from_sequence(int seq_idx, int tokens_to_evict) override

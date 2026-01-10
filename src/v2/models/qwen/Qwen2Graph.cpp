@@ -540,7 +540,7 @@ namespace llaminar2
 
     ComputeGraph Qwen2Graph::buildTransformerLayersGraph(
         TensorBase *input_hidden,
-        ICPUKVCache *kv_cache,
+        IKVCache *kv_cache,
         const int *position_ids,
         DeviceId device)
     {
@@ -572,7 +572,7 @@ namespace llaminar2
     ComputeGraph Qwen2Graph::buildLayerGraph(
         int layer_idx,
         TensorBase *input_hidden,
-        ICPUKVCache *kv_cache,
+        IKVCache *kv_cache,
         const int *position_ids,
         DeviceId device)
     {
@@ -678,7 +678,7 @@ namespace llaminar2
         int layer_idx,
         int seq_len,
         int batch_size,
-        ICPUKVCache *kv_cache,
+        IKVCache *kv_cache,
         const int *position_ids,
         DeviceId device,
         const std::vector<int> *sequence_lengths)
@@ -1382,6 +1382,7 @@ namespace llaminar2
             swiglu_params.up = buffers.up;
             swiglu_params.output = buffers.up;    // In-place
             swiglu_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
+            swiglu_params.device_id = device;     // Use graph's target device for kernel dispatch
 
             graph.addNode(prefix + "swiglu",
                           ComputeStageFactory::createSwiGLU(swiglu_params),

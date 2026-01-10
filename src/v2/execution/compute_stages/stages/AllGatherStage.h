@@ -40,6 +40,9 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
         StageDumpInfo getDumpInfo() const override;
 
+        /// MPI stages handle their own synchronization - no automatic coherence
+        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
+
     private:
         Params params_;
     };

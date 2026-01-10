@@ -610,6 +610,167 @@ class IUnifiedKVCache {
 };
 ```
 
+### 4.6 Device Coherence Protocol
+
+Location: `src/v2/tensors/cpu/CPUTensors.h`, `src/v2/execution/StageCoherence.h`, `src/v2/execution/GpuCoherence.h`
+
+Llaminar uses a **coherence protocol** to manage tensor data movement between host (CPU) and device (GPU) memory. Each `CPUTensorBase` tracks whether the authoritative data resides on CPU or GPU.
+
+#### Coherence State Machine
+
+```
+                    ┌─────────────────────────────────────┐
+                    │        TENSOR COHERENCE STATE       │
+                    └─────────────────────────────────────┘
+                                    │
+        ┌───────────────────────────┼───────────────────────────┐
+        ▼                           ▼                           ▼
+┌───────────────┐         ┌───────────────┐         ┌───────────────┐
+│ CPU_AUTHORITATIVE │     │ GPU_AUTHORITATIVE │     │ NEVER_UPLOADED │
+│ (default)     │         │               │         │               │
+└───────────────┘         └───────────────┘         └───────────────┘
+        │                         │                         │
+        │ ensureOnDevice()        │ data()                  │ ensureOnDevice()
+        │ [uploads to GPU]        │ [syncs from GPU]        │ [allocates + uploads]
+        ▼                         ▼                         ▼
+┌───────────────┐         ┌───────────────┐         ┌───────────────┐
+│ GPU has copy  │         │ CPU updated   │         │ GPU has copy  │
+│ CPU authoritative│      │ CPU authoritative│      │ CPU authoritative│
+└───────────────┘         └───────────────┘         └───────────────┘
+        │
+        │ mark_device_dirty()
+        │ [after GPU kernel writes]
+        ▼
+┌───────────────┐
+│ GPU AUTHORITATIVE │
+│ (CPU stale)   │
+└───────────────┘
+```
+
+#### Core CPUTensorBase Methods
+
+```cpp
+class CPUTensorBase {
+    // Upload tensor to GPU (allocates device buffer on first call)
+    // Returns false if upload fails
+    bool ensureOnDevice(DeviceId device);
+    
+    // Mark GPU as having authoritative data (MUST call after GPU kernel writes)
+    void mark_device_dirty();
+    
+    // Get host data pointer - if GPU is authoritative, syncs from GPU first
+    const float* data();
+    float* mutable_data();  // Also marks CPU as authoritative
+    
+    // Query device placement
+    DeviceId current_device() const;       // Where data currently resides
+    bool is_device_dirty() const;          // True if GPU is authoritative
+};
+```
+
+#### ITensor Interface (Virtual)
+
+Location: `src/v2/tensors/ITensor.h`
+
+The abstract `ITensor` interface exposes device management virtualized:
+
+```cpp
+class ITensor {
+    // Device management (virtual - overridden by CPUTensorBase)
+    virtual DeviceId device_id() const = 0;
+    virtual bool ensureOnDevice(DeviceId target) = 0;
+    virtual void mark_device_dirty() = 0;
+};
+```
+
+This allows polymorphic device management across all tensor types.
+
+#### Automatic Coherence via StageCoherence
+
+Location: `src/v2/execution/StageCoherence.h`
+
+When using `GraphExecutor`, coherence is handled **automatically** at stage boundaries:
+
+```cpp
+// GraphExecutor stage execution flow
+void GraphExecutor::executeStage(const ComputeNode& node) {
+    // 1. ENTRY: Upload inputs to GPU
+    if (policy == FULL || policy == INPUT) {
+        StageCoherence::ensureInputsOnDevice(node.stage, device_);
+    }
+    
+    // 2. EXECUTE: Run the kernel
+    node.stage->execute();
+    
+    // 3. EXIT: Mark outputs as GPU-authoritative
+    if (policy == FULL || policy == OUTPUT) {
+        StageCoherence::markOutputsDirty(node.stage);
+    }
+}
+```
+
+**CoherencePolicy Enum:**
+
+| Policy | Entry Behavior | Exit Behavior |
+|--------|----------------|---------------|
+| `FULL` (default) | Upload inputs | Mark outputs dirty |
+| `INPUT` | Upload inputs | No-op |
+| `OUTPUT` | No-op | Mark outputs dirty |
+| `NONE` | No-op | No-op |
+
+Stages declare their policy via `coherencePolicy()`:
+
+```cpp
+class GEMMStage : public IComputeStage {
+    CoherencePolicy coherencePolicy() const override { return CoherencePolicy::FULL; }
+};
+
+class AllreduceStage : public IComputeStage {
+    CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }  // MPI handles sync
+};
+```
+
+#### Manual Coherence Utilities
+
+Location: `src/v2/execution/GpuCoherence.h`
+
+For tests and custom pipelines that bypass GraphExecutor, use RAII utilities:
+
+```cpp
+#include "execution/GpuCoherence.h"
+
+// Pattern 1: Lambda wrapper (preferred for complex cases)
+bool ok = with_gpu_coherence(
+    gpu_device,
+    {input.get()},                           // inputs to upload
+    {output_q.get(), output_k.get()},        // outputs to upload + mark dirty
+    [&] {
+        return kernel->multiply_fused(input.get(), projections, M, K);
+    });
+
+// Pattern 2: RAII wrapper for single output
+{
+    auto output = GpuOutput<FP32Tensor>(output_tensor.get(), gpu_device);
+    kernel->compute(input.get(), output.get(), ...);
+}  // ← output marked dirty on scope exit
+
+// Pattern 3: RAII for read-only inputs
+{
+    auto weights = GpuInput<Q4_0Tensor>(weight_tensor.get(), gpu_device);
+    kernel->compute(weights.get(), ...);
+}  // ← weights NOT marked dirty (read-only)
+```
+
+**C++20 Concept:**
+
+```cpp
+template <typename T>
+concept CoherableTensor = requires(T *t, DeviceId d) {
+    { t->ensureOnDevice(d) } -> std::same_as<bool>;
+    { t->mark_device_dirty() } -> std::same_as<void>;
+};
+```
+
 ---
 
 ## 5. Kernels and KernelFactory

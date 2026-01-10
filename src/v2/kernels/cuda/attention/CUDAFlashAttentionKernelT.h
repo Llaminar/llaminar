@@ -267,6 +267,33 @@ namespace llaminar2
                 bool causal, int window_size, int position_offset,
                 int device_idx);
 
+            /**
+             * @brief Tensor-based attention dispatch
+             *
+             * Extracts GPU pointers from TensorBase and dispatches to compute() or compute_decode().
+             * This is the primary entry point for AttentionComputeStage using ITensor* API.
+             */
+            bool compute_tensor(
+                const TensorBase *Q,
+                const TensorBase *K,
+                const TensorBase *V,
+                TensorBase *output,
+                int batch_size,
+                int seq_len,
+                int kv_len,
+                int n_heads,
+                int n_kv_heads,
+                int head_dim,
+                bool causal = false,
+                int window_size = -1,
+                TensorBase *workspace_scores = nullptr,
+                TensorBase *workspace_mask = nullptr,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1,
+                int head_start = 0,
+                int local_n_heads = -1,
+                int local_n_kv_heads = -1) override;
+
         private:
             int device_idx_;
             void *stream_ = nullptr;
@@ -338,6 +365,30 @@ namespace llaminar2
                 bool causal, int window_size, int position_offset,
                 int device_idx);
 
+            /**
+             * @brief Tensor-based attention dispatch for FP16
+             */
+            bool compute_tensor(
+                const TensorBase *Q,
+                const TensorBase *K,
+                const TensorBase *V,
+                TensorBase *output,
+                int batch_size,
+                int seq_len,
+                int kv_len,
+                int n_heads,
+                int n_kv_heads,
+                int head_dim,
+                bool causal = false,
+                int window_size = -1,
+                TensorBase *workspace_scores = nullptr,
+                TensorBase *workspace_mask = nullptr,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1,
+                int head_start = 0,
+                int local_n_heads = -1,
+                int local_n_kv_heads = -1) override;
+
         private:
             int device_idx_;
             void *stream_ = nullptr;
@@ -408,6 +459,30 @@ namespace llaminar2
                 int n_heads, int n_kv_heads, int head_dim,
                 bool causal, int window_size, int position_offset,
                 int device_idx);
+
+            /**
+             * @brief Tensor-based attention dispatch for BF16
+             */
+            bool compute_tensor(
+                const TensorBase *Q,
+                const TensorBase *K,
+                const TensorBase *V,
+                TensorBase *output,
+                int batch_size,
+                int seq_len,
+                int kv_len,
+                int n_heads,
+                int n_kv_heads,
+                int head_dim,
+                bool causal = false,
+                int window_size = -1,
+                TensorBase *workspace_scores = nullptr,
+                TensorBase *workspace_mask = nullptr,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1,
+                int head_start = 0,
+                int local_n_heads = -1,
+                int local_n_kv_heads = -1) override;
 
         private:
             int device_idx_;

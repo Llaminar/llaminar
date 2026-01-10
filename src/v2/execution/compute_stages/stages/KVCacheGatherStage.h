@@ -22,7 +22,7 @@ namespace llaminar2
     public:
         struct Params
         {
-            ICPUKVCache *kv_cache = nullptr;
+            IKVCache *kv_cache = nullptr;
             int layer_idx = 0;
             int batch_size = 1;
 

@@ -588,6 +588,7 @@ add_library(llaminar2_core STATIC
     execution/GraphOrchestrator.cpp
     execution/HybridPrecisionConfig.cpp
     execution/InferenceMode.cpp
+    execution/StageCoherence.cpp
     # Placement strategy (weight/compute distribution)
     execution/PlacementPlan.cpp
     execution/PlacementStrategy.cpp
@@ -772,6 +773,7 @@ if(HAVE_CUDA)
     target_sources(llaminar2_core PRIVATE
         kernels/cuda/CUDAFloatingPointGemmKernel.cpp
         kernels/cuda/CUDAQuantisedGemmKernel.cpp
+        kernels/cuda/CUDARingKVCacheTensorAdapter.cpp # ICUDARingKVCache::append(TensorBase*) impl
         kernels/cuda/ops/CUDAOpsKernels.cpp           # RMSNorm, SwiGLU, RoPE, Embedding ITensor implementations
         kernels/cuda/attention/CUDAFlashAttentionKernelT.cpp  # Flash Attention ITensor implementation
     )

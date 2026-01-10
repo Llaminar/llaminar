@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include "../IKVCache.h" // Unified KVCache interface
 #include "../../tensors/Tensors.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../tensors/TensorLayout.h"
@@ -73,14 +74,17 @@ namespace llaminar2
      *
      * Enables polymorphic use when precision is determined at runtime.
      * Supports both single-sequence (batch_size=1) and batched modes.
+     *
+     * Inherits from IKVCache to provide unified CPU/GPU interface.
      */
-    class ICPUKVCache
+    class ICPUKVCache : public IKVCache
     {
     public:
         virtual ~ICPUKVCache() = default;
 
         // Metadata
         virtual ActivationPrecision precision() const = 0;
+        int n_layers() const override { return num_layers(); }
         virtual int num_layers() const = 0;
         virtual int batch_size() const = 0;
         virtual int max_seq_len() const = 0;
@@ -99,10 +103,52 @@ namespace llaminar2
         // Per-sequence token tracking
         virtual int get_cached_tokens(int layer, int seq_idx = 0) const = 0;
 
-        // Polymorphic tensor access (returns ITensor* for unified CPU/GPU access)
+        // =================================================================
+        // Unified KV Access (preferred interface)
+        // =================================================================
+
+        /**
+         * @brief Get both K and V cache tensors for attention computation
+         *
+         * This is the preferred interface - fetches both K and V in a single call.
+         *
+         * @param layer Layer index
+         * @param seq_idx Sequence index (default 0)
+         * @param out_k Output: pointer to K cache tensor
+         * @param out_v Output: pointer to V cache tensor
+         * @param out_kv_len Output: number of cached tokens (optional)
+         * @return true on success
+         */
+        virtual bool get_kv(int layer, int seq_idx,
+                            ITensor **out_k, ITensor **out_v,
+                            int *out_kv_len = nullptr) = 0;
+
+        virtual bool get_kv(int layer, int seq_idx,
+                            const ITensor **out_k, const ITensor **out_v,
+                            int *out_kv_len = nullptr) const = 0;
+
+        // Convenience overloads for seq_idx=0
+        bool get_kv(int layer, ITensor **out_k, ITensor **out_v, int *out_kv_len = nullptr)
+        {
+            return get_kv(layer, 0, out_k, out_v, out_kv_len);
+        }
+
+        bool get_kv(int layer, const ITensor **out_k, const ITensor **out_v, int *out_kv_len = nullptr) const
+        {
+            return get_kv(layer, 0, out_k, out_v, out_kv_len);
+        }
+
+        // =================================================================
+        // Legacy tensor access (deprecated - use get_kv() instead)
+        // =================================================================
+
+        /// @deprecated Use get_kv() instead
         virtual ITensor *get_k(int layer, int seq_idx = 0) = 0;
+        /// @deprecated Use get_kv() instead
         virtual const ITensor *get_k(int layer, int seq_idx = 0) const = 0;
+        /// @deprecated Use get_kv() instead
         virtual ITensor *get_v(int layer, int seq_idx = 0) = 0;
+        /// @deprecated Use get_kv() instead
         virtual const ITensor *get_v(int layer, int seq_idx = 0) const = 0;
 
         /**
@@ -161,12 +207,47 @@ namespace llaminar2
             TensorBase *out_v,
             std::vector<int> &out_kv_lens) = 0;
 
+        // IKVCache::gather_kv_batched bridge
+        int gather_kv_batched(
+            int layer,
+            int num_sequences,
+            ITensor *out_k,
+            ITensor *out_v,
+            std::vector<int> &out_kv_lens) override
+        {
+            // dynamic_cast required due to virtual inheritance in ITensor hierarchy
+            return gather_kv_batched(layer, num_sequences,
+                                     dynamic_cast<TensorBase *>(out_k),
+                                     dynamic_cast<TensorBase *>(out_v),
+                                     out_kv_lens);
+        }
+
         // Cache management
-        virtual void clear() = 0;
-        virtual void clear_sequence(int seq_idx) = 0;
-        virtual void clear_layer(int layer) = 0;
+        void clear() override = 0;
+        void clear_sequence(int layer, int seq_idx) override = 0;
+        void clear_layer(int layer) override = 0;
         virtual void evict_oldest(int tokens_to_evict) = 0;
         virtual void evict_oldest_from_sequence(int seq_idx, int tokens_to_evict) = 0;
+
+        // Bring in IKVCache::clear_sequence(seq_idx) default implementation
+        using IKVCache::clear_sequence;
+
+        // =================================================================
+        // IKVCache interface bridging
+        // =================================================================
+
+        // Bridge IKVCache::append(ITensor*) to ICPUKVCache::append_kv(TensorBase*)
+        // dynamic_cast required due to virtual inheritance in ITensor hierarchy
+        bool append(int layer, int seq_idx, const ITensor *K, const ITensor *V, int num_tokens) override
+        {
+            return append_kv(layer, seq_idx,
+                             dynamic_cast<const TensorBase *>(K),
+                             dynamic_cast<const TensorBase *>(V),
+                             num_tokens);
+        }
+
+        // Bring in IKVCache convenience overloads
+        using IKVCache::append;
 
         // Device placement
         virtual DeviceId get_layer_device(int layer) const = 0;
@@ -337,6 +418,19 @@ namespace llaminar2
 
         int get_cached_tokens(int layer, int seq_idx = 0) const override;
 
+        // Unified KV access (preferred interface)
+        bool get_kv(int layer, int seq_idx,
+                    ITensor **out_k, ITensor **out_v,
+                    int *out_kv_len = nullptr) override;
+
+        bool get_kv(int layer, int seq_idx,
+                    const ITensor **out_k, const ITensor **out_v,
+                    int *out_kv_len = nullptr) const override;
+
+        // Bring in convenience methods from interface
+        using ICPUKVCache::get_kv;
+
+        // Legacy individual accessors (deprecated - use get_kv() instead)
         ITensor *get_k(int layer, int seq_idx = 0) override;
         const ITensor *get_k(int layer, int seq_idx = 0) const override;
         ITensor *get_v(int layer, int seq_idx = 0) override;
@@ -352,10 +446,13 @@ namespace llaminar2
                               std::vector<int> &out_kv_lens) override;
 
         void clear() override;
-        void clear_sequence(int seq_idx) override;
+        void clear_sequence(int layer, int seq_idx) override;
         void clear_layer(int layer) override;
         void evict_oldest(int tokens_to_evict) override;
         void evict_oldest_from_sequence(int seq_idx, int tokens_to_evict) override;
+
+        // Bring in IKVCache::clear_sequence(seq_idx) default implementation
+        using ICPUKVCache::clear_sequence;
 
         DeviceId get_layer_device(int layer) const override;
         int get_total_evicted() const override { return total_evicted_; }

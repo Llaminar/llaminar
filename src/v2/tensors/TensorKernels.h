@@ -22,6 +22,7 @@ namespace llaminar2
     class CPUTensorBase;
     using TensorBase = CPUTensorBase; // Backward compatibility alias
     struct Q8_1Block;                 // For apply_q8_1() interface
+    class IDeviceContext;             // For kernel execute() interface
 
     // =============================================================================
     // Fused Operation Configuration
@@ -2213,6 +2214,172 @@ namespace llaminar2
          * @return true if Wo_packed must be provided, false if Wo_fp32 is used
          */
         virtual bool requires_packed_wo() const = 0;
+    };
+
+    /**
+     * @brief Interface for fused Gate/Up projection GEMM (FFN)
+     *
+     * Performs two concurrent GEMM operations for SwiGLU FFN:
+     * gate = input × W_gate [m, n_intermediate]
+     * up   = input × W_up   [m, n_intermediate]
+     *
+     * These outputs are then used by SwiGLU: output = gate * silu(up)
+     *
+     * This interface wraps two ITensorGemm kernels internally, providing
+     * a unified interface for the FusedGateUpGEMMStage.
+     */
+    class ITensorFusedGateUpGemm : public ITensorKernel
+    {
+    public:
+        /**
+         * @brief Execute fused Gate/Up GEMM with tensor inputs/outputs
+         *
+         * @param input Input activations tensor [m, k]
+         * @param output_gate Gate output buffer [m, n_gate]
+         * @param output_up Up output buffer [m, n_up]
+         * @param m Batch size (rows)
+         * @param k Input dimension
+         * @param n_gate Gate output dimension (n_intermediate)
+         * @param n_up Up output dimension (should equal n_gate)
+         * @param ctx Device context (optional)
+         * @param device_idx Device index for kernel execution
+         * @return true on success
+         */
+        virtual bool execute(
+            const TensorBase *input,
+            TensorBase *output_gate,
+            TensorBase *output_up,
+            int m, int k, int n_gate, int n_up,
+            IDeviceContext *ctx = nullptr,
+            int device_idx = -1) = 0;
+
+        /**
+         * @brief Execute fused Gate/Up GEMM with bias tensors
+         *
+         * @param input Input activations tensor [m, k]
+         * @param output_gate Gate output buffer [m, n_gate]
+         * @param output_up Up output buffer [m, n_up]
+         * @param bias_gate Optional bias tensor for gate projection (nullptr if none)
+         * @param bias_up Optional bias tensor for up projection (nullptr if none)
+         * @param m Batch size (rows)
+         * @param k Input dimension
+         * @param n_gate Gate output dimension
+         * @param n_up Up output dimension
+         * @param ctx Device context (optional)
+         * @param device_idx Device index
+         * @return true on success
+         */
+        virtual bool execute_with_bias(
+            const TensorBase *input,
+            TensorBase *output_gate,
+            TensorBase *output_up,
+            const TensorBase *bias_gate,
+            const TensorBase *bias_up,
+            int m, int k, int n_gate, int n_up,
+            IDeviceContext *ctx = nullptr,
+            int device_idx = -1) = 0;
+    };
+
+    /**
+     * @brief Interface for fused QKV projection GEMM
+     *
+     * Performs three concurrent GEMM operations for Q, K, V projections:
+     * Q = input × Wq [m, n_q]
+     * K = input × Wk [m, n_k]
+     * V = input × Wv [m, n_v]
+     *
+     * Supports both FP32 and Q8_1 input activations, with mixed-precision
+     * output (Q8_1 for Q/V, Q16_1 for K in HybridQ16 mode).
+     *
+     * Key benefits:
+     * - Single activation quantization shared across all three GEMMs
+     * - Better cache locality (input stays hot across projections)
+     * - Native support for mixed-precision K output (Q16_1 for precision)
+     */
+    class ITensorFusedQKVGemm : public ITensorKernel
+    {
+    public:
+        /**
+         * @brief Execute fused QKV GEMM with FP32 input
+         *
+         * @param input_fp32 Input activations [m, k]
+         * @param output_q Q output buffer (Q8_1Block* or float*)
+         * @param output_k K output buffer (Q16_1Block* for mixed mode, or Q8_1Block*)
+         * @param output_v V output buffer (Q8_1Block* or float*)
+         * @param bias_q Q bias tensor (optional, nullptr if none)
+         * @param bias_k K bias tensor (optional)
+         * @param bias_v V bias tensor (optional)
+         * @param m Batch size (rows)
+         * @param n_q Q output columns
+         * @param n_k K output columns
+         * @param k Input/weight inner dimension
+         * @param k_block_size Block size for K quantization (32, 64, or 128)
+         * @return true on success
+         */
+        virtual bool execute_fp32(
+            const float *input_fp32,
+            void *output_q,
+            void *output_k,
+            void *output_v,
+            const TensorBase *bias_q,
+            const TensorBase *bias_k,
+            const TensorBase *bias_v,
+            int m, int n_q, int n_k, int k,
+            int k_block_size = 64) = 0;
+
+        /**
+         * @brief Execute fused QKV GEMM with Q8_1 input
+         *
+         * @param input_q8_1 Pre-quantized input [m, k] as Q8_1 blocks
+         * @param output_q Q output buffer (Q8_1Block*)
+         * @param output_k K output buffer (Q16_1Block* for mixed mode)
+         * @param output_v V output buffer (Q8_1Block*)
+         * @param bias_q Q bias tensor (optional)
+         * @param bias_k K bias tensor (optional)
+         * @param bias_v V bias tensor (optional)
+         * @param m Batch size (rows)
+         * @param n_q Q output columns
+         * @param n_k K output columns
+         * @param k Input/weight inner dimension
+         * @param k_block_size Block size for K quantization
+         * @return true on success
+         */
+        virtual bool execute_q8_1(
+            const Q8_1Block *input_q8_1,
+            void *output_q,
+            void *output_k,
+            void *output_v,
+            const TensorBase *bias_q,
+            const TensorBase *bias_k,
+            const TensorBase *bias_v,
+            int m, int n_q, int n_k, int k,
+            int k_block_size = 64) = 0;
+
+        /**
+         * @brief Execute fused QKV GEMM with Q8_1 input and uniform Q8_1 output
+         *
+         * @param input_q8_1 Pre-quantized input [m, k] as Q8_1 blocks
+         * @param output_q Q output buffer (Q8_1Block*)
+         * @param output_k K output buffer (Q8_1Block*)
+         * @param output_v V output buffer (Q8_1Block*)
+         * @param bias_q Q bias tensor (optional)
+         * @param bias_k K bias tensor (optional)
+         * @param bias_v V bias tensor (optional)
+         * @param m Batch size (rows)
+         * @param n_q Q output columns
+         * @param n_k K output columns
+         * @param k Input/weight inner dimension
+         * @return true on success
+         */
+        virtual bool execute_q8_1_to_q8_1(
+            const Q8_1Block *input_q8_1,
+            void *output_q,
+            void *output_k,
+            void *output_v,
+            const TensorBase *bias_q,
+            const TensorBase *bias_k,
+            const TensorBase *bias_v,
+            int m, int n_q, int n_k, int k) = 0;
     };
 
     /**

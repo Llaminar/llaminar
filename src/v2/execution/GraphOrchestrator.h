@@ -49,7 +49,7 @@ namespace llaminar2
 
     // Forward declarations
     class MPIContext;
-    class ICPUKVCache;
+    class IKVCache;
 
     /**
      * @brief Configuration for graph caching behavior
@@ -111,7 +111,7 @@ namespace llaminar2
         std::shared_ptr<TensorBase> logits_local;
 
         // === KV Cache ===
-        std::unique_ptr<ICPUKVCache> kv_cache; ///< Attention KV history
+        std::unique_ptr<IKVCache> kv_cache; ///< Attention KV history
 
         // === Position Tracking ===
         std::vector<int> positions;        ///< Per-sequence position offset
@@ -285,7 +285,7 @@ namespace llaminar2
             Qwen2ActivationBuffers &buffers,
             int layer_idx,
             int seq_len,
-            ICPUKVCache *kv_cache,
+            IKVCache *kv_cache,
             const int *position_ids,
             DeviceId device);
 
@@ -334,7 +334,7 @@ namespace llaminar2
             Qwen2ActivationBuffers &buffers,
             int layer_idx,
             int seq_len,
-            ICPUKVCache *kv_cache,
+            IKVCache *kv_cache,
             const int *position_ids,
             DeviceId device);
 

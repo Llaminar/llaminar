@@ -1316,6 +1316,107 @@ namespace llaminar2
     };
 
     /**
+     * @brief Stage output debug print configuration
+     *
+     * Enables printing first N elements of stage outputs AFTER coherence is handled,
+     * ensuring proper GPU→host synchronization before reading data.
+     *
+     * Environment Variables:
+     *   LLAMINAR_STAGE_OUTPUT_PRINT=1       - Enable output printing
+     *   LLAMINAR_STAGE_OUTPUT_PRINT_N=8     - Number of elements to print per row
+     *   LLAMINAR_STAGE_OUTPUT_PRINT_ROWS=2  - Number of rows to print (first + last)
+     *   LLAMINAR_STAGE_OUTPUT_PRINT_STAGES  - Comma-separated stage names to print
+     *
+     * Usage:
+     * @code
+     *   # Print first 8 elements of all stage outputs
+     *   LLAMINAR_STAGE_OUTPUT_PRINT=1 ./build_v2/llaminar2 ...
+     *
+     *   # Print only LM_HEAD stage output
+     *   LLAMINAR_STAGE_OUTPUT_PRINT=1 LLAMINAR_STAGE_OUTPUT_PRINT_STAGES=lm_head ./build_v2/llaminar2 ...
+     * @endcode
+     */
+    struct StageOutputPrintConfig
+    {
+        bool enabled = false;         ///< Enable stage output printing
+        int num_elements = 8;         ///< Number of elements to print per row
+        int num_rows = 2;             ///< Number of rows to print (first N and last)
+        std::set<std::string> stages; ///< Specific stages to print (empty = all)
+
+        StageOutputPrintConfig()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            const char *enabled_env = std::getenv("LLAMINAR_STAGE_OUTPUT_PRINT");
+            if (enabled_env)
+            {
+                enabled = (std::atoi(enabled_env) != 0);
+            }
+
+            const char *num_elements_env = std::getenv("LLAMINAR_STAGE_OUTPUT_PRINT_N");
+            if (num_elements_env)
+            {
+                num_elements = std::atoi(num_elements_env);
+                if (num_elements < 1)
+                    num_elements = 1;
+            }
+
+            const char *num_rows_env = std::getenv("LLAMINAR_STAGE_OUTPUT_PRINT_ROWS");
+            if (num_rows_env)
+            {
+                num_rows = std::atoi(num_rows_env);
+                if (num_rows < 1)
+                    num_rows = 1;
+            }
+
+            const char *stages_env = std::getenv("LLAMINAR_STAGE_OUTPUT_PRINT_STAGES");
+            if (stages_env)
+            {
+                std::string stages_str(stages_env);
+                std::stringstream ss(stages_str);
+                std::string stage;
+                while (std::getline(ss, stage, ','))
+                {
+                    // Trim whitespace and convert to lowercase
+                    stage.erase(0, stage.find_first_not_of(" \t"));
+                    stage.erase(stage.find_last_not_of(" \t") + 1);
+                    std::transform(stage.begin(), stage.end(), stage.begin(), ::tolower);
+                    if (!stage.empty())
+                    {
+                        stages.insert(stage);
+                    }
+                }
+            }
+        }
+
+        /// Check if a stage should have its output printed
+        bool shouldPrint(const std::string &stage_name) const
+        {
+            if (!enabled)
+                return false;
+            if (stages.empty())
+                return true; // Print all stages if no filter specified
+
+            // Convert stage name to lowercase for comparison
+            std::string lower_name = stage_name;
+            std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+
+            // Check for substring match (e.g., "lm_head" matches "layer23_lm_head")
+            for (const auto &pattern : stages)
+            {
+                if (lower_name.find(pattern) != std::string::npos)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+    };
+
+    /**
      * @brief Buffer validation configuration
      *
      * Controls runtime validation of tensor buffers to catch uninitialized
@@ -1423,11 +1524,12 @@ namespace llaminar2
         RMSNormConfig rmsnorm;
         AttentionConfig attention; ///< Q8_1 attention precision configuration
         Q16AttentionDumpConfig q16_attention_dump;
-        ExecutionConfig execution;    ///< LayerExecutor framework configuration
-        SnapshotConfig snapshot;      ///< Snapshot and tensor dump configuration
-        StageDumpConfig stage_dump;   ///< Compute stage input/output dumping
-        MPILoggingConfig mpi_logging; ///< MPI collective operation logging
-        ValidationConfig validation;  ///< Buffer validation configuration
+        ExecutionConfig execution;                 ///< LayerExecutor framework configuration
+        SnapshotConfig snapshot;                   ///< Snapshot and tensor dump configuration
+        StageDumpConfig stage_dump;                ///< Compute stage input/output dumping
+        MPILoggingConfig mpi_logging;              ///< MPI collective operation logging
+        StageOutputPrintConfig stage_output_print; ///< Stage output debug printing
+        ValidationConfig validation;               ///< Buffer validation configuration
 
         DebugEnv() = default;
 
@@ -1442,6 +1544,7 @@ namespace llaminar2
             snapshot.reload();
             stage_dump.reload();
             mpi_logging.reload();
+            stage_output_print.reload();
             validation.reload();
         }
     };

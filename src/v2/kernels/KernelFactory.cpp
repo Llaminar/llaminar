@@ -7,6 +7,7 @@
 #include "KernelFactory.h"
 #include "cpu/gemm_v4/QuantisedGemmKernel.h"
 #include "cpu/gemm_v4/FloatingPointGemmKernel.h"
+#include "cpu/gemm_v4/FusedGEMM.h"
 #include "../tensors/TensorSlice.h"
 #include "cpu/ops/CPURoPEKernelT.h"
 #include "cpu/ops/CPUSwiGLUKernelT.h"
@@ -16,7 +17,15 @@
 #include "cpu/ops/CPUEmbeddingKernelT.h"
 #include "cpu/attention/CPUAttentionKernelT.h"
 
+// KVCache includes
+#include "cpu/CPUKVCache.h"
+#ifdef HAVE_CUDA
+#include "cuda/CUDARingKVCache.h"
+#endif
+
 #include "../tensors/Tensors.h"
+#include "../tensors/TensorKernels.h"
+#include "../execution/DeviceContext.h"
 #include "../backends/ComputeBackend.h"
 #include "../utils/Logger.h"
 
@@ -2235,6 +2244,8 @@ namespace llaminar
             std::mutex KernelFactory::cache_mutex_;
             std::unordered_map<KernelFactory::SlicedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, KernelFactory::SlicedKeyHash> KernelFactory::sliced_cache_;
             std::unordered_map<KernelFactory::DeviceTargetedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, KernelFactory::DeviceTargetedKeyHash> KernelFactory::device_targeted_cache_;
+            std::unordered_map<KernelFactory::FusedQKVCacheKey, std::unique_ptr<llaminar2::ITensorFusedQKVGemm>, KernelFactory::FusedQKVKeyHash> KernelFactory::fused_qkv_cache_;
+            std::unordered_map<KernelFactory::FusedGateUpCacheKey, std::unique_ptr<llaminar2::ITensorFusedGateUpGemm>, KernelFactory::FusedGateUpKeyHash> KernelFactory::fused_gate_up_cache_;
 
             // ==========================================================================
             // Kernel Cache - Implementation
@@ -2915,6 +2926,32 @@ namespace llaminar
                     }
                 }
 #endif
+
+                // Clear any fused QKV kernels that reference this tensor
+                for (auto it = fused_qkv_cache_.begin(); it != fused_qkv_cache_.end();)
+                {
+                    if (it->first.wq == tensor || it->first.wk == tensor || it->first.wv == tensor)
+                    {
+                        it = fused_qkv_cache_.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+
+                // Clear any fused Gate/Up kernels that reference this tensor
+                for (auto it = fused_gate_up_cache_.begin(); it != fused_gate_up_cache_.end();)
+                {
+                    if (it->first.w_gate == tensor || it->first.w_up == tensor)
+                    {
+                        it = fused_gate_up_cache_.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
             }
 
             void KernelFactory::clearCache()
@@ -2970,6 +3007,8 @@ namespace llaminar
                 kernel_cache_.clear();
                 sliced_cache_.clear();
                 device_targeted_cache_.clear();
+                fused_qkv_cache_.clear();
+                fused_gate_up_cache_.clear();
             }
 
             std::pair<size_t, size_t> KernelFactory::cacheStats()
@@ -2978,8 +3017,560 @@ namespace llaminar
                 size_t total_bytes = 0;
                 // Note: Can't easily compute packed_bytes without RTTI to QuantisedGemmKernel
                 // For now, just return count (includes all caches)
-                return {kernel_cache_.size() + sliced_cache_.size() + device_targeted_cache_.size(), total_bytes};
+                return {kernel_cache_.size() + sliced_cache_.size() + device_targeted_cache_.size() + fused_qkv_cache_.size() + fused_gate_up_cache_.size(), total_bytes};
             }
+
+            // ==========================================================================
+            // Fused QKV GEMM Adapter and Factory Methods
+            // ==========================================================================
+
+            /**
+             * @brief Adapter class that wraps FusedGEMM to implement ITensorFusedQKVGemm
+             *
+             * This adapter bridges the FusedGEMM implementation to the ITensorFusedQKVGemm
+             * interface, enabling KernelFactory to provide cached fused QKV GEMM kernels.
+             */
+            class FusedQKVGemmAdapter : public llaminar2::ITensorFusedQKVGemm
+            {
+            public:
+                FusedQKVGemmAdapter(const llaminar2::TensorBase *wq,
+                                    const llaminar2::TensorBase *wk,
+                                    const llaminar2::TensorBase *wv)
+                    : impl_(std::make_unique<llaminar2::FusedGEMM>(wq, wk, wv))
+                {
+                }
+
+                bool execute_fp32(
+                    const float *input_fp32,
+                    void *output_q,
+                    void *output_k,
+                    void *output_v,
+                    const llaminar2::TensorBase *bias_q,
+                    const llaminar2::TensorBase *bias_k,
+                    const llaminar2::TensorBase *bias_v,
+                    int m, int n_q, int n_k, int k,
+                    int k_block_size) override
+                {
+                    // FusedGEMM.execute_to_q8_1 handles FP32→Q8_1 quantization internally
+                    return impl_->execute_to_q8_1(
+                        input_fp32,
+                        output_q, output_k, output_v,
+                        bias_q, bias_k, bias_v,
+                        m, n_q, n_k, k,
+                        nullptr, -1);
+                }
+
+                bool execute_q8_1(
+                    const llaminar2::Q8_1Block *input_q8_1,
+                    void *output_q,
+                    void *output_k,
+                    void *output_v,
+                    const llaminar2::TensorBase *bias_q,
+                    const llaminar2::TensorBase *bias_k,
+                    const llaminar2::TensorBase *bias_v,
+                    int m, int n_q, int n_k, int k,
+                    int k_block_size) override
+                {
+                    // Use mixed-precision path: Q=Q8_1, K=Q16_1, V=Q8_1
+                    return impl_->execute_q8_1_mixed_qkv(
+                        input_q8_1,
+                        output_q, output_k, output_v,
+                        bias_q, bias_k, bias_v,
+                        m, n_q, n_k, k,
+                        k_block_size,
+                        nullptr, -1);
+                }
+
+                bool execute_q8_1_to_q8_1(
+                    const llaminar2::Q8_1Block *input_q8_1,
+                    void *output_q,
+                    void *output_k,
+                    void *output_v,
+                    const llaminar2::TensorBase *bias_q,
+                    const llaminar2::TensorBase *bias_k,
+                    const llaminar2::TensorBase *bias_v,
+                    int m, int n_q, int n_k, int k) override
+                {
+                    // Uniform Q8_1 output path
+                    return impl_->execute_q8_1_to_q8_1(
+                        input_q8_1,
+                        output_q, output_k, output_v,
+                        bias_q, bias_k, bias_v,
+                        m, n_q, n_k, k,
+                        nullptr, -1);
+                }
+
+                bool supports_device(int device_idx) const override
+                {
+                    // FusedQKVGemm currently only supports CPU (device_idx == -1)
+                    return device_idx == -1;
+                }
+
+            private:
+                std::unique_ptr<llaminar2::FusedGEMM> impl_;
+            };
+
+            std::unique_ptr<llaminar2::ITensorFusedQKVGemm> KernelFactory::createFusedQKVGemm(
+                const llaminar2::TensorBase *wq,
+                const llaminar2::TensorBase *wk,
+                const llaminar2::TensorBase *wv,
+                DeviceType dev_type)
+            {
+                if (dev_type != DeviceType::CPU)
+                {
+                    LOG_ERROR("[KernelFactory] FusedQKVGemm currently only supports CPU device");
+                    throw std::runtime_error("FusedQKVGemm only supports CPU device");
+                }
+
+                if (!wq || !wk || !wv)
+                {
+                    LOG_ERROR("[KernelFactory] createFusedQKVGemm: null weight tensor(s)");
+                    throw std::runtime_error("FusedQKVGemm requires non-null weight tensors");
+                }
+
+                return std::make_unique<FusedQKVGemmAdapter>(wq, wk, wv);
+            }
+
+            llaminar2::ITensorFusedQKVGemm *KernelFactory::getOrCreateFusedQKVGemm(
+                const llaminar2::TensorBase *wq,
+                const llaminar2::TensorBase *wk,
+                const llaminar2::TensorBase *wv,
+                DeviceType dev_type)
+            {
+                FusedQKVCacheKey key{wq, wk, wv, dev_type};
+
+                // Check cache with lock held
+                {
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    auto it = fused_qkv_cache_.find(key);
+                    if (it != fused_qkv_cache_.end())
+                    {
+                        LOG_TRACE("[KernelFactory::getOrCreateFusedQKVGemm] CACHE HIT");
+                        return it->second.get();
+                    }
+                }
+
+                LOG_DEBUG("[KernelFactory::getOrCreateFusedQKVGemm] CACHE MISS - creating new kernel");
+
+                // Create kernel WITHOUT holding cache_mutex_ to avoid deadlock
+                // (FusedGEMM constructor calls getOrCreateGemm which also needs the mutex)
+                auto kernel = createFusedQKVGemm(wq, wk, wv, dev_type);
+
+                // Re-acquire lock to insert into cache (double-checked locking)
+                {
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+
+                    // Double-check another thread didn't create it while we were unlocked
+                    auto it = fused_qkv_cache_.find(key);
+                    if (it != fused_qkv_cache_.end())
+                    {
+                        LOG_TRACE("[KernelFactory::getOrCreateFusedQKVGemm] Lost race, returning existing kernel");
+                        return it->second.get();
+                    }
+
+                    auto *raw_ptr = kernel.get();
+                    fused_qkv_cache_[key] = std::move(kernel);
+                    return raw_ptr;
+                }
+            }
+
+            // ==========================================================================
+            // Fused Gate/Up GEMM Adapter and Factory Methods
+            // ==========================================================================
+
+            /**
+             * @brief Adapter class that wraps two ITensorGemm kernels for Gate/Up fusion
+             *
+             * This adapter holds raw pointers to cached GEMM kernels from KernelFactory.
+             * The kernels are obtained via getOrCreateGemm() which ensures proper caching.
+             *
+             * Note: The adapter does NOT own the GEMM kernels - they are owned by
+             * KernelFactory's kernel cache. The adapter must not outlive the cache.
+             */
+            class FusedGateUpGemmAdapter : public llaminar2::ITensorFusedGateUpGemm
+            {
+            public:
+                FusedGateUpGemmAdapter(llaminar2::ITensorGemm *gemm_gate,
+                                       llaminar2::ITensorGemm *gemm_up,
+                                       DeviceType dev_type)
+                    : gemm_gate_(gemm_gate), gemm_up_(gemm_up), dev_type_(dev_type)
+                {
+                }
+
+                bool execute(
+                    const llaminar2::TensorBase *input,
+                    llaminar2::TensorBase *output_gate,
+                    llaminar2::TensorBase *output_up,
+                    int m, int k, int n_gate, int n_up,
+                    llaminar2::IDeviceContext *ctx,
+                    int device_idx) override
+                {
+                    (void)ctx; // Currently unused, kernels use device_idx directly
+
+                    if (!gemm_gate_ || !gemm_up_)
+                    {
+                        LOG_ERROR("[FusedGateUpGemmAdapter] Null GEMM kernel(s)");
+                        return false;
+                    }
+
+                    // Execute both GEMMs via multiply_tensor for proper type dispatch
+                    bool gate_ok = gemm_gate_->multiply_tensor(
+                        input, output_gate,
+                        m, n_gate, k,
+                        false,      // transpose_B
+                        1.0f, 0.0f, // alpha, beta
+                        nullptr,    // mpi_ctx
+                        device_idx);
+
+                    if (!gate_ok)
+                    {
+                        LOG_ERROR("[FusedGateUpGemmAdapter] Gate GEMM failed");
+                        return false;
+                    }
+
+                    bool up_ok = gemm_up_->multiply_tensor(
+                        input, output_up,
+                        m, n_up, k,
+                        false,      // transpose_B
+                        1.0f, 0.0f, // alpha, beta
+                        nullptr,    // mpi_ctx
+                        device_idx);
+
+                    if (!up_ok)
+                    {
+                        LOG_ERROR("[FusedGateUpGemmAdapter] Up GEMM failed");
+                        return false;
+                    }
+
+                    return true;
+                }
+
+                bool execute_with_bias(
+                    const llaminar2::TensorBase *input,
+                    llaminar2::TensorBase *output_gate,
+                    llaminar2::TensorBase *output_up,
+                    const llaminar2::TensorBase *bias_gate,
+                    const llaminar2::TensorBase *bias_up,
+                    int m, int k, int n_gate, int n_up,
+                    llaminar2::IDeviceContext *ctx,
+                    int device_idx) override
+                {
+                    (void)ctx;
+
+                    // For bias support, we need to use the optimized fused path
+                    // which is available on FP32 outputs via multiply_fused
+                    if (!gemm_gate_ || !gemm_up_)
+                    {
+                        LOG_ERROR("[FusedGateUpGemmAdapter] Null GEMM kernel(s)");
+                        return false;
+                    }
+
+                    // Check if output is FP32 - if so, use multiply_fused
+                    if (output_gate->native_type() == llaminar2::TensorType::FP32 &&
+                        output_up->native_type() == llaminar2::TensorType::FP32)
+                    {
+                        // Get FP32 pointers
+                        const float *input_fp32 = input->fp32_data();
+                        float *output_gate_fp32 = output_gate->mutable_data();
+                        float *output_up_fp32 = output_up->mutable_data();
+
+                        if (!input_fp32 || !output_gate_fp32 || !output_up_fp32)
+                        {
+                            LOG_ERROR("[FusedGateUpGemmAdapter] Failed to get FP32 data");
+                            return false;
+                        }
+
+                        // Build projection descriptors for fused multiply
+                        // FusedProjectionDesc takes TensorBase* for bias
+                        std::vector<llaminar2::ITensorGemm::FusedProjectionDesc> projections = {
+                            {gemm_gate_, output_gate_fp32, n_gate, bias_gate, nullptr, false, "gate"},
+                            {gemm_up_, output_up_fp32, n_up, bias_up, nullptr, false, "up"}};
+
+                        return gemm_gate_->multiply_fused(input_fp32, projections, m, k);
+                    }
+
+                    // For non-FP32 outputs (e.g., Q8_1), bias is not supported
+                    if (bias_gate || bias_up)
+                    {
+                        LOG_WARN("[FusedGateUpGemmAdapter] Bias not supported with non-FP32 output - ignoring");
+                    }
+
+                    // Fall back to regular execute without bias
+                    return execute(input, output_gate, output_up, m, k, n_gate, n_up, ctx, device_idx);
+                }
+
+                bool supports_device(int device_idx) const override
+                {
+                    // Supports same device as underlying kernels
+                    if (dev_type_ == DeviceType::CPU)
+                    {
+                        return device_idx == -1;
+                    }
+                    return device_idx >= 0;
+                }
+
+            private:
+                llaminar2::ITensorGemm *gemm_gate_;
+                llaminar2::ITensorGemm *gemm_up_;
+                DeviceType dev_type_;
+            };
+
+            std::unique_ptr<llaminar2::ITensorFusedGateUpGemm> KernelFactory::createFusedGateUpGemm(
+                const llaminar2::TensorBase *w_gate,
+                const llaminar2::TensorBase *w_up,
+                DeviceType dev_type)
+            {
+                if (!w_gate || !w_up)
+                {
+                    LOG_ERROR("[KernelFactory] createFusedGateUpGemm: null weight tensor(s)");
+                    throw std::runtime_error("FusedGateUpGemm requires non-null weight tensors");
+                }
+
+                // Get or create GEMM kernels for each weight
+                auto *gemm_gate = getOrCreateGemm(w_gate, dev_type);
+                auto *gemm_up = getOrCreateGemm(w_up, dev_type);
+
+                if (!gemm_gate || !gemm_up)
+                {
+                    LOG_ERROR("[KernelFactory] createFusedGateUpGemm: Failed to create GEMM kernels");
+                    throw std::runtime_error("FusedGateUpGemm failed to create underlying GEMM kernels");
+                }
+
+                return std::make_unique<FusedGateUpGemmAdapter>(gemm_gate, gemm_up, dev_type);
+            }
+
+            llaminar2::ITensorFusedGateUpGemm *KernelFactory::getOrCreateFusedGateUpGemm(
+                const llaminar2::TensorBase *w_gate,
+                const llaminar2::TensorBase *w_up,
+                DeviceType dev_type)
+            {
+                FusedGateUpCacheKey key{w_gate, w_up, dev_type};
+
+                // First check: acquire lock and check cache
+                {
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    auto it = fused_gate_up_cache_.find(key);
+                    if (it != fused_gate_up_cache_.end())
+                    {
+                        LOG_TRACE("[KernelFactory::getOrCreateFusedGateUpGemm] CACHE HIT");
+                        return it->second.get();
+                    }
+                }
+
+                LOG_DEBUG("[KernelFactory::getOrCreateFusedGateUpGemm] CACHE MISS - creating new kernel");
+
+                // Create kernel WITHOUT holding lock (createFusedGateUpGemm calls getOrCreateGemm
+                // which also acquires cache_mutex_, so we must release first to avoid deadlock)
+                auto kernel = createFusedGateUpGemm(w_gate, w_up, dev_type);
+
+                // Second check: re-acquire lock and insert (double-checked locking)
+                {
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    auto it = fused_gate_up_cache_.find(key);
+                    if (it != fused_gate_up_cache_.end())
+                    {
+                        // Another thread inserted while we were creating - use theirs
+                        LOG_TRACE("[KernelFactory::getOrCreateFusedGateUpGemm] Race detected - using existing kernel");
+                        return it->second.get();
+                    }
+                    auto *raw_ptr = kernel.get();
+                    fused_gate_up_cache_[key] = std::move(kernel);
+                    return raw_ptr;
+                }
+            }
+
+            // ==========================================================================
+            // KVCache Factory Methods
+            // ==========================================================================
+
+            std::unique_ptr<llaminar2::IKVCache> KernelFactory::createKVCache(const KVCacheConfig &config)
+            {
+                if (config.device.is_cpu())
+                {
+                    return createCPUKVCache(config);
+                }
+                else if (config.device.is_cuda())
+                {
+#ifdef HAVE_CUDA
+                    return createCUDAKVCache(config);
+#else
+                    LOG_ERROR("[KernelFactory] CUDA KVCache requested but HAVE_CUDA not defined");
+                    throw std::runtime_error("KernelFactory::createKVCache: CUDA support not compiled in");
+#endif
+                }
+                else if (config.device.is_rocm())
+                {
+                    LOG_ERROR("[KernelFactory] ROCm KVCache not yet implemented");
+                    throw std::runtime_error("KernelFactory::createKVCache: ROCm backend not yet supported");
+                }
+                else
+                {
+                    LOG_ERROR("[KernelFactory] Unsupported device type for KVCache: " << config.device.to_string());
+                    throw std::runtime_error("KernelFactory::createKVCache: Unsupported device type");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ICPUKVCache> KernelFactory::createCPUKVCache(const KVCacheConfig &config)
+            {
+                // Validate MPI context
+                if (!config.mpi_ctx)
+                {
+                    LOG_ERROR("[KernelFactory] createCPUKVCache requires non-null mpi_ctx");
+                    throw std::runtime_error("KernelFactory::createCPUKVCache: mpi_ctx is required");
+                }
+
+                // Validate basic parameters
+                if (config.num_layers <= 0)
+                {
+                    LOG_ERROR("[KernelFactory] createCPUKVCache: num_layers must be positive, got " << config.num_layers);
+                    throw std::runtime_error("KernelFactory::createCPUKVCache: invalid num_layers");
+                }
+                if (config.n_kv_heads <= 0)
+                {
+                    LOG_ERROR("[KernelFactory] createCPUKVCache: n_kv_heads must be positive, got " << config.n_kv_heads);
+                    throw std::runtime_error("KernelFactory::createCPUKVCache: invalid n_kv_heads");
+                }
+                if (config.head_dim <= 0)
+                {
+                    LOG_ERROR("[KernelFactory] createCPUKVCache: head_dim must be positive, got " << config.head_dim);
+                    throw std::runtime_error("KernelFactory::createCPUKVCache: invalid head_dim");
+                }
+
+                if (config.is_sharded())
+                {
+                    LOG_DEBUG("[KernelFactory] Creating sharded CPU KVCache: "
+                              << "precision=" << llaminar2::activationPrecisionToString(config.precision)
+                              << ", layers=" << config.num_layers
+                              << ", n_kv_heads=" << config.n_kv_heads
+                              << ", local_n_kv_heads=" << config.local_n_kv_heads
+                              << ", kv_head_start=" << config.kv_head_start
+                              << ", head_dim=" << config.head_dim
+                              << ", max_seq_len=" << config.max_seq_len);
+
+                    return llaminar2::createShardedCPUKVCache(
+                        config.precision,
+                        *config.mpi_ctx,
+                        config.num_layers,
+                        config.batch_size,
+                        config.max_seq_len,
+                        config.n_kv_heads,
+                        config.local_n_kv_heads,
+                        config.kv_head_start,
+                        config.head_dim,
+                        config.device,
+                        config.layout_mode);
+                }
+                else
+                {
+                    LOG_DEBUG("[KernelFactory] Creating standard CPU KVCache: "
+                              << "precision=" << llaminar2::activationPrecisionToString(config.precision)
+                              << ", layers=" << config.num_layers
+                              << ", n_kv_heads=" << config.n_kv_heads
+                              << ", head_dim=" << config.head_dim
+                              << ", max_seq_len=" << config.max_seq_len);
+
+                    return llaminar2::createCPUKVCache(
+                        config.precision,
+                        *config.mpi_ctx,
+                        config.num_layers,
+                        config.batch_size,
+                        config.max_seq_len,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        config.device,
+                        config.layout_mode);
+                }
+            }
+
+#ifdef HAVE_CUDA
+            std::unique_ptr<llaminar2::ICUDARingKVCache> KernelFactory::createCUDAKVCache(const KVCacheConfig &config)
+            {
+                // Validate precision - CUDA ring cache only supports FP32/BF16/FP16
+                switch (config.precision)
+                {
+                case llaminar2::ActivationPrecision::FP32:
+                case llaminar2::ActivationPrecision::BF16:
+                case llaminar2::ActivationPrecision::FP16:
+                    break; // Supported
+
+                case llaminar2::ActivationPrecision::Q8_1:
+                case llaminar2::ActivationPrecision::Q16_1:
+                case llaminar2::ActivationPrecision::Hybrid:
+                case llaminar2::ActivationPrecision::HybridQ16:
+                    LOG_ERROR("[KernelFactory] CUDA KVCache does not support precision: "
+                              << llaminar2::activationPrecisionToString(config.precision)
+                              << ". Use FP32, BF16, or FP16.");
+                    throw std::runtime_error("KernelFactory::createCUDAKVCache: Unsupported precision");
+
+                default:
+                    LOG_ERROR("[KernelFactory] Unknown precision for CUDA KVCache: "
+                              << static_cast<int>(config.precision));
+                    throw std::runtime_error("KernelFactory::createCUDAKVCache: Unknown precision");
+                }
+
+                // Validate basic parameters
+                if (config.num_layers <= 0 || config.n_kv_heads <= 0 || config.head_dim <= 0)
+                {
+                    LOG_ERROR("[KernelFactory] createCUDAKVCache: invalid parameters");
+                    throw std::runtime_error("KernelFactory::createCUDAKVCache: invalid parameters");
+                }
+
+                // Handle sharding - not yet supported for CUDA
+                int effective_n_kv_heads = config.n_kv_heads;
+                if (config.is_sharded())
+                {
+                    LOG_WARN("[KernelFactory] Sharded CUDA KVCache not yet supported. "
+                             << "Using full n_kv_heads=" << config.n_kv_heads
+                             << " instead of local_n_kv_heads=" << config.local_n_kv_heads);
+                    // Continue with full heads - caller should handle partial KV or implement sharding
+                }
+
+                int cuda_device = config.device.cuda_ordinal();
+
+                LOG_DEBUG("[KernelFactory] Creating CUDA Ring KVCache: "
+                          << "precision=" << llaminar2::activationPrecisionToString(config.precision)
+                          << ", device=CUDA:" << cuda_device
+                          << ", layers=" << config.num_layers
+                          << ", n_kv_heads=" << effective_n_kv_heads
+                          << ", head_dim=" << config.head_dim
+                          << ", max_seq_len=" << config.max_seq_len);
+
+                // Create appropriate precision variant using ActivationPrecision template parameter
+                switch (config.precision)
+                {
+                case llaminar2::ActivationPrecision::FP32:
+                    return std::make_unique<llaminar2::CUDARingKVCache<llaminar2::ActivationPrecision::FP32>>(
+                        config.num_layers,
+                        config.batch_size,
+                        config.max_seq_len,
+                        effective_n_kv_heads,
+                        config.head_dim,
+                        cuda_device);
+
+                case llaminar2::ActivationPrecision::BF16:
+                    return std::make_unique<llaminar2::CUDARingKVCache<llaminar2::ActivationPrecision::BF16>>(
+                        config.num_layers,
+                        config.batch_size,
+                        config.max_seq_len,
+                        effective_n_kv_heads,
+                        config.head_dim,
+                        cuda_device);
+
+                case llaminar2::ActivationPrecision::FP16:
+                    return std::make_unique<llaminar2::CUDARingKVCache<llaminar2::ActivationPrecision::FP16>>(
+                        config.num_layers,
+                        config.batch_size,
+                        config.max_seq_len,
+                        effective_n_kv_heads,
+                        config.head_dim,
+                        cuda_device);
+
+                default:
+                    // Should not reach here due to earlier validation
+                    throw std::runtime_error("KernelFactory::createCUDAKVCache: Unexpected precision");
+                }
+            }
+#endif // HAVE_CUDA
 
             // ==========================================================================
             // Activation/Weight Type Compatibility

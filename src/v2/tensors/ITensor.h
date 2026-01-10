@@ -271,6 +271,24 @@ namespace llaminar2
         virtual void *active_mutable_data_ptr() { return raw_mutable_data(); }
 
         // =========================================================================
+        // GPU Data Access
+        // =========================================================================
+
+        /**
+         * @brief Get const pointer to GPU device memory
+         * @return Pointer to GPU buffer, or nullptr if tensor has no GPU allocation
+         * @note Returns nullptr if ensureOnDevice() has not been called
+         */
+        virtual const void *gpu_data_ptr() const = 0;
+
+        /**
+         * @brief Get mutable pointer to GPU device memory
+         * @return Pointer to GPU buffer, or nullptr if tensor has no GPU allocation
+         * @note Returns nullptr if ensureOnDevice() has not been called
+         */
+        virtual void *gpu_data_ptr() = 0;
+
+        // =========================================================================
         // Device Coherence API
         // =========================================================================
 

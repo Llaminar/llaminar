@@ -15,6 +15,7 @@
 #include "../utils/MPIContext.h"
 #include "../tensors/TensorFactory.h"
 #include "../kernels/cpu/CPUKVCache.h"
+#include "../kernels/KernelFactory.h"
 #include <chrono>
 
 namespace llaminar2
@@ -428,7 +429,7 @@ namespace llaminar2
         Qwen2ActivationBuffers &buffers,
         int layer_idx,
         int seq_len,
-        ICPUKVCache *kv_cache,
+        IKVCache *kv_cache,
         const int *position_ids,
         DeviceId device)
     {
@@ -622,7 +623,7 @@ namespace llaminar2
         Qwen2ActivationBuffers &buffers,
         int layer_idx,
         int seq_len,
-        ICPUKVCache *kv_cache,
+        IKVCache *kv_cache,
         const int *position_ids,
         DeviceId device)
     {
@@ -1001,45 +1002,33 @@ namespace llaminar2
         LOG_DEBUG("[GraphOrchestrator] KV cache layout mode: "
                   << (kv_layout_mode == KVCacheLayoutMode::HEAD_MAJOR ? "HEAD_MAJOR" : "POSITION_MAJOR"));
 
+        // Build KVCacheConfig for factory
+        llaminar::v2::kernels::KVCacheConfig kv_config;
+        kv_config.precision = kv_cache_prec;
+        kv_config.device = device;
+        kv_config.num_layers = n_layers;
+        kv_config.batch_size = batch_size;
+        kv_config.max_seq_len = max_seq_len;
+        kv_config.n_kv_heads = n_kv_heads;
+        kv_config.head_dim = head_dim;
+        kv_config.layout_mode = kv_layout_mode;
+        kv_config.mpi_ctx = local_mpi_ctx.get();
+
+        // Set sharding parameters if needed (tensor parallelism)
         bool use_sharded_cache = (config.local_n_kv_heads > 0 && config.local_n_kv_heads < n_kv_heads);
         if (use_sharded_cache && mpi_ctx_ && mpi_ctx_->world_size() > 1)
         {
-            // Compute KV head distribution from local_n_kv_heads
-            // kv_head_start = rank * local_n_kv_heads (assumes even distribution)
-            int kv_head_start = mpi_ctx_->rank() * config.local_n_kv_heads;
+            kv_config.local_n_kv_heads = config.local_n_kv_heads;
+            kv_config.kv_head_start = mpi_ctx_->rank() * config.local_n_kv_heads;
 
             LOG_DEBUG("[GraphOrchestrator] Creating sharded KV cache: "
                       << n_kv_heads << " total KV heads, "
-                      << config.local_n_kv_heads << " local KV heads (start=" << kv_head_start << ")"
+                      << config.local_n_kv_heads << " local KV heads (start=" << kv_config.kv_head_start << ")"
                       << " precision=" << activationPrecisionToString(kv_cache_prec));
+        }
 
-            state_.kv_cache = createShardedCPUKVCache(
-                kv_cache_prec,
-                *local_mpi_ctx,
-                n_layers,
-                batch_size,
-                max_seq_len,
-                n_kv_heads,
-                config.local_n_kv_heads,
-                kv_head_start,
-                head_dim,
-                device,
-                kv_layout_mode);
-        }
-        else
-        {
-            // Non-sharded (replicated) KV cache for single-rank or non-tensor-parallel
-            state_.kv_cache = createCPUKVCache(
-                kv_cache_prec,
-                *local_mpi_ctx,
-                n_layers,
-                batch_size,
-                max_seq_len,
-                n_kv_heads,
-                head_dim,
-                device,
-                kv_layout_mode);
-        }
+        // Create cache via factory (handles sharded vs non-sharded automatically)
+        state_.kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(kv_config);
 
         // Initialize position tracking
         state_.positions.assign(batch_size, 0);

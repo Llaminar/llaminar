@@ -52,6 +52,9 @@ namespace llaminar2
         StageDumpInfo getDumpInfo() const override;
         StageBufferRequirements getBufferRequirements() const override;
 
+        /// Target device for coherence management
+        DeviceId preferredDevice() const override { return params_.device_id; }
+
         const Params &getParams() const { return params_; }
 
     private:

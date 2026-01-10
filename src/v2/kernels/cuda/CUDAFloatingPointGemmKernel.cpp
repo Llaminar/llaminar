@@ -205,11 +205,6 @@ namespace llaminar2
             }
 
             bool success = multiply(d_A, d_C, m, n, k, transpose_B, alpha, beta, nullptr, -1);
-            if (success)
-            {
-                // Mark output tensor as modified on device (requires sync to host for CPU access)
-                C->mark_device_dirty();
-            }
             return success;
         }
 

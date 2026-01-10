@@ -570,7 +570,9 @@ TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_FP32_UsesPositionMajor)
     // KV cache should exist and use POSITION_MAJOR layout
     const auto &state = orchestrator->inferenceState();
     ASSERT_NE(state.kv_cache, nullptr);
-    EXPECT_EQ(state.kv_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
+    auto *cpu_cache = dynamic_cast<ICPUKVCache *>(state.kv_cache.get());
+    ASSERT_NE(cpu_cache, nullptr);
+    EXPECT_EQ(cpu_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
 }
 
 TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_BF16_UsesPositionMajor)
@@ -590,7 +592,9 @@ TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_BF16_UsesPositionMajor)
     // KV cache should use POSITION_MAJOR layout for BF16
     const auto &state = orchestrator->inferenceState();
     ASSERT_NE(state.kv_cache, nullptr);
-    EXPECT_EQ(state.kv_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
+    auto *cpu_cache = dynamic_cast<ICPUKVCache *>(state.kv_cache.get());
+    ASSERT_NE(cpu_cache, nullptr);
+    EXPECT_EQ(cpu_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
 }
 
 // HybridQ16 tests disabled - HybridQ16 project on hold (2025-01)
@@ -611,7 +615,9 @@ TEST_F(Test__GraphOrchestrator, DISABLED_KVCacheLayoutMode_HybridQ16_UsesHeadMaj
     // KV cache should use HEAD_MAJOR layout for Q16_1 (required by Q16IntegerAttention)
     const auto &state = orchestrator->inferenceState();
     ASSERT_NE(state.kv_cache, nullptr);
-    EXPECT_EQ(state.kv_cache->layout_mode(), KVCacheLayoutMode::HEAD_MAJOR);
+    auto *cpu_cache = dynamic_cast<ICPUKVCache *>(state.kv_cache.get());
+    ASSERT_NE(cpu_cache, nullptr);
+    EXPECT_EQ(cpu_cache->layout_mode(), KVCacheLayoutMode::HEAD_MAJOR);
 }
 
 // Hybrid tests disabled - HybridQ16 project on hold (2025-01)
@@ -632,5 +638,7 @@ TEST_F(Test__GraphOrchestrator, DISABLED_KVCacheLayoutMode_Hybrid_UsesPositionMa
     // KV cache should use POSITION_MAJOR layout for Hybrid (BF16 KV cache)
     const auto &state = orchestrator->inferenceState();
     ASSERT_NE(state.kv_cache, nullptr);
-    EXPECT_EQ(state.kv_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
+    auto *cpu_cache = dynamic_cast<ICPUKVCache *>(state.kv_cache.get());
+    ASSERT_NE(cpu_cache, nullptr);
+    EXPECT_EQ(cpu_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
 }

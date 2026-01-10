@@ -20,7 +20,7 @@ namespace llaminar2
     public:
         struct Params
         {
-            ITensor *buffer = nullptr;        ///< Buffer to allreduce (in-place)
+            ITensor *buffer = nullptr;           ///< Buffer to allreduce (in-place)
             const MPIContext *mpi_ctx = nullptr; ///< MPI context (required)
             size_t count = 0;                    ///< Number of elements to reduce (0 = use buffer->numel())
         };
@@ -33,6 +33,9 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageDumpInfo getDumpInfo() const override;
+
+        /// MPI stages handle their own synchronization - no automatic coherence
+        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
 
     private:
         Params params_;

@@ -9,14 +9,13 @@
 
 #pragma once
 
-#include "../tensors/ITensor.h"
+#include "../execution/RuntimeConfig.h" // ActivationPrecision
+#include "../tensors/ITensor.h"         // Lightweight interface (no MPI)
 #include "../tensors/TensorLayout.h"
 #include <vector>
 
 namespace llaminar2
 {
-    class CPUTensorBase;
-    using TensorBase = CPUTensorBase; // Backward compatibility alias
 
     /**
      * @brief Unified interface for KV cache implementations
@@ -33,6 +32,12 @@ namespace llaminar2
         // =================================================================
         // Query Operations
         // =================================================================
+
+        /**
+         * @brief Get the precision/data type of cached K/V tensors
+         * @return ActivationPrecision (FP32, BF16, FP16, Q8_1, etc.)
+         */
+        virtual ActivationPrecision precision() const = 0;
 
         /**
          * @brief Get number of cached tokens for a layer/sequence
@@ -65,11 +70,46 @@ namespace llaminar2
         // =================================================================
 
         /**
+         * @brief Get both K and V cache tensors for attention computation
+         *
+         * This is the preferred interface for accessing KV cache - fetches both
+         * K and V in a single call, which aligns with GPU batch operations and
+         * enables potential optimizations.
+         *
+         * For CPU caches: returns TensorBase* pointers (which inherit ITensor)
+         * For GPU caches: returns CUDATensorBase* pointers (which inherit ITensor)
+         *
+         * @param layer Layer index
+         * @param seq_idx Sequence index (default 0)
+         * @param out_k Output: pointer to K cache tensor
+         * @param out_v Output: pointer to V cache tensor
+         * @param out_kv_len Output: number of cached tokens (optional, can be nullptr)
+         * @return true on success, false if layer/seq_idx invalid
+         */
+        virtual bool get_kv(int layer, int seq_idx,
+                            ITensor **out_k, ITensor **out_v,
+                            int *out_kv_len = nullptr) = 0;
+
+        virtual bool get_kv(int layer, int seq_idx,
+                            const ITensor **out_k, const ITensor **out_v,
+                            int *out_kv_len = nullptr) const = 0;
+
+        // Convenience overloads for seq_idx=0
+        bool get_kv(int layer, ITensor **out_k, ITensor **out_v, int *out_kv_len = nullptr)
+        {
+            return get_kv(layer, 0, out_k, out_v, out_kv_len);
+        }
+
+        bool get_kv(int layer, const ITensor **out_k, const ITensor **out_v, int *out_kv_len = nullptr) const
+        {
+            return get_kv(layer, 0, out_k, out_v, out_kv_len);
+        }
+
+        /**
          * @brief Get K cache tensor as ITensor for a layer/sequence
          *
-         * This is the preferred interface - works for both CPU and GPU caches.
-         * For CPU caches: returns TensorBase* (which inherits ITensor)
-         * For GPU caches: returns CUDATensorBase* (which inherits ITensor)
+         * @deprecated Use get_kv() instead for unified access to both K and V.
+         *             This method will be removed in a future version.
          *
          * @param layer Layer index
          * @param seq_idx Sequence index (default 0)
@@ -91,9 +131,8 @@ namespace llaminar2
         /**
          * @brief Get V cache tensor as ITensor for a layer/sequence
          *
-         * This is the preferred interface - works for both CPU and GPU caches.
-         * For CPU caches: returns TensorBase* (which inherits ITensor)
-         * For GPU caches: returns CUDATensorBase* (which inherits ITensor)
+         * @deprecated Use get_kv() instead for unified access to both K and V.
+         *             This method will be removed in a future version.
          *
          * @param layer Layer index
          * @param seq_idx Sequence index (default 0)
@@ -129,10 +168,10 @@ namespace llaminar2
          * @param num_tokens Number of tokens to append
          * @return true on success
          */
-        virtual bool append(int layer, int seq_idx, const TensorBase *K, const TensorBase *V, int num_tokens) = 0;
+        virtual bool append(int layer, int seq_idx, const ITensor *K, const ITensor *V, int num_tokens) = 0;
 
         // Convenience overload for seq_idx=0
-        bool append(int layer, const TensorBase *K, const TensorBase *V, int num_tokens)
+        bool append(int layer, const ITensor *K, const ITensor *V, int num_tokens)
         {
             return append(layer, 0, K, V, num_tokens);
         }
@@ -147,10 +186,28 @@ namespace llaminar2
         virtual void clear() = 0;
 
         /**
-         * @brief Clear a specific sequence
+         * @brief Clear a specific sequence across all layers
          * @param seq_idx Sequence index to clear
+         *
+         * Default implementation clears sequence in each layer.
+         * Subclasses may override for more efficient implementation.
          */
-        virtual void clear_sequence(int seq_idx) = 0;
+        virtual void clear_sequence(int seq_idx)
+        {
+            for (int layer = 0; layer < n_layers(); ++layer)
+            {
+                clear_sequence(layer, seq_idx);
+            }
+        }
+
+        /**
+         * @brief Clear a specific sequence in a specific layer
+         * @param layer Layer index
+         * @param seq_idx Sequence index to clear
+         *
+         * This is the primitive operation that subclasses should implement.
+         */
+        virtual void clear_sequence(int layer, int seq_idx) = 0;
 
         /**
          * @brief Clear all sequences in a specific layer
@@ -180,8 +237,8 @@ namespace llaminar2
         virtual int gather_kv_batched(
             int layer,
             int num_sequences,
-            TensorBase *out_k,
-            TensorBase *out_v,
+            ITensor *out_k,
+            ITensor *out_v,
             std::vector<int> &out_kv_lens)
         {
             // Default: not supported (for caches that don't implement batched gather)

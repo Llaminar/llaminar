@@ -7,9 +7,9 @@
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
-#include "../../../kernels/cpu/gemm_v4/FusedGEMM.h"
 
 namespace llaminar2
 {
@@ -67,103 +67,56 @@ namespace llaminar2
         }
 
         // Get the target device type from device_id
-        DeviceType target_dev_type = params_.device_id.is_gpu()
-                                         ? DeviceType::CUDA
-                                         : DeviceType::CPU;
+        DeviceType target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
 
-        // Get cached kernels from KernelFactory with device targeting
-        auto *gemm_gate = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(w_gate_base, target_dev_type);
-        auto *gemm_up = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(w_up_base, target_dev_type);
+        // Get fused Gate/Up kernel from KernelFactory
+        auto *fused_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
+            w_gate_base, w_up_base, target_dev_type);
 
-        if (!gemm_gate || !gemm_up)
+        if (!fused_kernel)
         {
-            LOG_ERROR("[FusedGateUpGEMMStage] Failed to get GEMM kernel(s)");
+            LOG_ERROR("[FusedGateUpGEMMStage] Failed to get fused Gate/Up kernel");
             return false;
         }
 
-        // Check if outputs are Q8_1 - if so, use multiply_tensor for type-aware dispatch
-        // The fused FP32 path doesn't support Q8_1 output directly
-        bool gate_is_q8_1 = (params_.output_gate->native_type() == TensorType::Q8_1);
-        bool up_is_q8_1 = (params_.output_up->native_type() == TensorType::Q8_1);
+        // Cast input/output tensors
+        auto *input_base = requireTensorBase(params_.input, "input");
+        auto *output_gate_base = asTensorBase(params_.output_gate, "output_gate");
+        auto *output_up_base = asTensorBase(params_.output_up, "output_up");
 
-        if (gate_is_q8_1 || up_is_q8_1)
+        if (!input_base || !output_gate_base || !output_up_base)
         {
-            LOG_DEBUG("[FusedGateUpGEMMStage] Using multiply_tensor for Q8_1 output type dispatch");
+            LOG_ERROR("[FusedGateUpGEMMStage] Failed to cast input/output tensors");
+            return false;
+        }
 
-            // Cast tensors for multiply_tensor
-            auto *input_base = requireTensorBase(params_.input, "input");
-            auto *output_gate_base = asTensorBase(params_.output_gate, "output_gate");
-            auto *output_up_base = asTensorBase(params_.output_up, "output_up");
+        // Check if we have bias - use appropriate execute method
+        if (params_.bias_gate || params_.bias_up)
+        {
+            bool success = fused_kernel->execute_with_bias(
+                input_base, output_gate_base, output_up_base,
+                params_.bias_gate, params_.bias_up,
+                params_.m, params_.k, params_.n_gate, params_.n_up,
+                ctx, params_.device_id.toKernelDeviceIndex());
 
-            // For Q8_1 outputs, we need to use multiply_tensor which handles the type-aware dispatch
-            // This means we lose the fusion optimization, but Q8_1 output is more important
-            // TODO: Implement fused multiply_tensor_multi for Q8_1 outputs
-            // TODO: multiply_tensor doesn't support bias - would need separate bias add pass
-            if (params_.bias_gate || params_.bias_up)
+            if (!success)
             {
-                LOG_WARN("[FusedGateUpGEMMStage] Q8_1 output path does not support bias - bias will be ignored!");
-            }
-
-            // Gate projection
-            bool gate_ok = gemm_gate->multiply_tensor(
-                input_base, output_gate_base,
-                params_.m, params_.n_gate, params_.k,
-                false,      // transpose_B
-                1.0f, 0.0f, // alpha, beta
-                params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
-
-            if (!gate_ok)
-            {
-                LOG_ERROR("[FusedGateUpGEMMStage] Gate GEMM multiply_tensor failed");
+                LOG_ERROR("[FusedGateUpGEMMStage] execute_with_bias failed");
                 return false;
             }
+        }
+        else
+        {
+            bool success = fused_kernel->execute(
+                input_base, output_gate_base, output_up_base,
+                params_.m, params_.k, params_.n_gate, params_.n_up,
+                ctx, params_.device_id.toKernelDeviceIndex());
 
-            // Up projection
-            bool up_ok = gemm_up->multiply_tensor(
-                input_base, output_up_base,
-                params_.m, params_.n_up, params_.k,
-                false,      // transpose_B
-                1.0f, 0.0f, // alpha, beta
-                params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
-
-            if (!up_ok)
+            if (!success)
             {
-                LOG_ERROR("[FusedGateUpGEMMStage] Up GEMM multiply_tensor failed");
+                LOG_ERROR("[FusedGateUpGEMMStage] execute failed");
                 return false;
             }
-
-            LOG_DEBUG("[FusedGateUpGEMMStage] Q8_1 path complete");
-            return true;
-        }
-
-        // FP32/BF16/FP16 output path - use optimized fused multiply
-        const float *input_fp32 = params_.input->fp32_data();
-        float *output_gate_fp32 = params_.output_gate->mutable_data();
-        float *output_up_fp32 = params_.output_up->mutable_data();
-
-        if (!input_fp32 || !output_gate_fp32 || !output_up_fp32)
-        {
-            LOG_ERROR("[FusedGateUpGEMMStage] Failed to get FP32 data from tensors");
-            return false;
-        }
-
-        // Build projection descriptors using device-agnostic interface
-        // Pass through bias pointers from params_
-        std::vector<ITensorGemm::FusedProjectionDesc> projections = {
-            {gemm_gate, output_gate_fp32, params_.n_gate, params_.bias_gate, nullptr, false, "gate"},
-            {gemm_up, output_up_fp32, params_.n_up, params_.bias_up, nullptr, false, "up"}};
-
-        // Use the interface method - kernel decides if it can do optimized fusion
-        bool success = gemm_gate->multiply_fused(
-            input_fp32,
-            projections,
-            params_.m,
-            params_.k);
-
-        if (!success)
-        {
-            LOG_ERROR("[FusedGateUpGEMMStage] multiply_fused failed");
-            return false;
         }
 
         LOG_DEBUG("[FusedGateUpGEMMStage] Complete");

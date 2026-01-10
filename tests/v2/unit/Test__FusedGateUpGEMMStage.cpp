@@ -25,6 +25,7 @@
 #include "tensors/Tensors.h"
 #include "tensors/IQQuantTables.h"
 #include "tensors/FP16Utils.h"
+#include "kernels/KernelFactory.h"
 #include "utils/Logger.h"
 
 namespace llaminar2
@@ -99,6 +100,9 @@ namespace llaminar2
     protected:
         void SetUp() override
         {
+            // Clear kernel cache to prevent stale pointers from previous tests
+            llaminar::v2::kernels::KernelFactory::clearCache();
+
             // Default dimensions (small for fast tests)
             m_ = 4;        // sequence length
             k_ = 64;       // d_model (input features)
@@ -134,6 +138,12 @@ namespace llaminar2
             bias_up_ = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(n_up_)}, DeviceId::cpu());
             std::copy(bias_gate_data_.begin(), bias_gate_data_.end(), bias_gate_->mutable_data());
             std::copy(bias_up_data_.begin(), bias_up_data_.end(), bias_up_->mutable_data());
+        }
+
+        void TearDown() override
+        {
+            // Clear kernel cache to prevent stale pointers
+            llaminar::v2::kernels::KernelFactory::clearCache();
         }
 
         // Dimensions

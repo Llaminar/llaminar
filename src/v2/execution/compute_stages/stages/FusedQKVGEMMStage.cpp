@@ -10,7 +10,6 @@
 #include "../../../tensors/FP16Utils.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
-#include "../../../kernels/cpu/gemm_v4/FusedGEMM.h"
 
 #include <cmath>
 #include <cstring>
@@ -71,13 +70,22 @@ namespace llaminar2
         {
             LOG_DEBUG("[FusedQKVGEMMStage] Mixed-precision QKV detected: Q=Q8_1, K=Q16_1, V=Q8_1");
 
-            // Cast weights to TensorBase for FusedGEMM
+            // Cast weights to TensorBase for KernelFactory
             auto *wq_base = requireTensorBase(params_.wq, "wq");
             auto *wk_base = requireTensorBase(params_.wk, "wk");
             auto *wv_base = requireTensorBase(params_.wv, "wv");
 
-            // Create FusedGEMM kernel
-            FusedGEMM fused_gemm(wq_base, wk_base, wv_base);
+            // Get target device type
+            DeviceType target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+
+            // Get cached fused QKV GEMM kernel from KernelFactory
+            auto *fused_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateFusedQKVGemm(
+                wq_base, wk_base, wv_base, target_dev_type);
+            if (!fused_kernel)
+            {
+                LOG_ERROR("[FusedQKVGEMMStage] Failed to get fused QKV kernel");
+                return false;
+            }
 
             // Determine Q16 block size from K output tensor
             // LIMITATION: JIT kernel only properly supports block_size=64 or 32.
@@ -92,7 +100,7 @@ namespace llaminar2
             if (input_q8_1)
             {
                 LOG_DEBUG("[FusedQKVGEMMStage] Q8_1 input, using direct Q8_1→mixed path");
-                bool success = fused_gemm.execute_q8_1_mixed_qkv(
+                bool success = fused_kernel->execute_q8_1(
                     input_q8_1->typed_data(),
                     output_q_q8_1->mutable_typed_data(),
                     output_k_q16_1->mutable_typed_data(),
@@ -100,12 +108,11 @@ namespace llaminar2
                     params_.bias_q, params_.bias_k, params_.bias_v,
                     params_.m, params_.n_q, params_.n_k,
                     params_.k,
-                    k_block_size,
-                    nullptr, -1); // ctx, device_idx
+                    k_block_size);
 
                 if (!success)
                 {
-                    LOG_ERROR("[FusedQKVGEMMStage] execute_q8_1_mixed_qkv failed");
+                    LOG_ERROR("[FusedQKVGEMMStage] execute_q8_1 failed");
                     return false;
                 }
 
@@ -124,10 +131,8 @@ namespace llaminar2
             LOG_DEBUG("[FusedQKVGEMMStage] FP32 input, quantizing to Q8_1 for mixed path");
 
             // Allocate temporary Q8_1 buffer for quantized activations
-            // Use the first kernel to get buffer size
-            size_t buffer_size = fused_gemm.num_projections() > 0
-                                     ? static_cast<size_t>(params_.m) * static_cast<size_t>(params_.k) / 32 * sizeof(Q8_1Block)
-                                     : 0;
+            // Need to get buffer size from params
+            size_t buffer_size = static_cast<size_t>(params_.m) * static_cast<size_t>(params_.k) / 32 * sizeof(Q8_1Block);
 
             if (buffer_size == 0)
             {
@@ -186,8 +191,8 @@ namespace llaminar2
 
             LOG_DEBUG("[FusedQKVGEMMStage] Quantized FP32 to Q8_1: " << params_.m << "x" << params_.k);
 
-            // Now use the Q8_1 mixed path
-            bool success = fused_gemm.execute_q8_1_mixed_qkv(
+            // Now use the Q8_1 mixed path via the cached kernel
+            bool success = fused_kernel->execute_q8_1(
                 q8_1_buffer.data(),
                 output_q_q8_1->mutable_typed_data(),
                 output_k_q16_1->mutable_typed_data(),
@@ -195,12 +200,11 @@ namespace llaminar2
                 params_.bias_q, params_.bias_k, params_.bias_v,
                 params_.m, params_.n_q, params_.n_k,
                 params_.k,
-                k_block_size,
-                nullptr, -1); // ctx, device_idx
+                k_block_size);
 
             if (!success)
             {
-                LOG_ERROR("[FusedQKVGEMMStage] execute_q8_1_mixed_qkv failed (FP32 input)");
+                LOG_ERROR("[FusedQKVGEMMStage] execute_q8_1 failed (FP32 input)");
                 return false;
             }
 
@@ -214,13 +218,22 @@ namespace llaminar2
         {
             LOG_DEBUG("[FusedQKVGEMMStage] Q8_1 output detected, using Q8_1 execution path");
 
-            // Cast weights to TensorBase for FusedGEMM
+            // Cast weights to TensorBase for KernelFactory
             auto *wq_base2 = requireTensorBase(params_.wq, "wq");
             auto *wk_base2 = requireTensorBase(params_.wk, "wk");
             auto *wv_base2 = requireTensorBase(params_.wv, "wv");
 
-            // Create FusedGEMM kernel for Q8_1 output support
-            FusedGEMM fused_gemm(wq_base2, wk_base2, wv_base2);
+            // Get target device type
+            DeviceType target_dev_type2 = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+
+            // Get cached fused QKV GEMM kernel from KernelFactory
+            auto *fused_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateFusedQKVGemm(
+                wq_base2, wk_base2, wv_base2, target_dev_type2);
+            if (!fused_kernel)
+            {
+                LOG_ERROR("[FusedQKVGEMMStage] Failed to get fused QKV kernel for Q8_1 output");
+                return false;
+            }
 
             // Check if input is also Q8_1 - use Q8_1→Q8_1 path to avoid double quantization
             auto *input_q8_1 = dynamic_cast<const Q8_1Tensor *>(params_.input);
@@ -230,15 +243,14 @@ namespace llaminar2
                 LOG_DEBUG("[FusedQKVGEMMStage] Q8_1 input detected, using Q8_1→Q8_1 path");
 
                 // Pure Q8_1 path: Q8_1 input → Q8_1 output
-                bool success = fused_gemm.execute_q8_1_to_q8_1(
+                bool success = fused_kernel->execute_q8_1_to_q8_1(
                     input_q8_1->typed_data(),
                     output_q_q8_1->mutable_typed_data(),
                     output_k_q8_1->mutable_typed_data(),
                     output_v_q8_1->mutable_typed_data(),
                     params_.bias_q, params_.bias_k, params_.bias_v,
                     params_.m, params_.n_q, params_.n_k,
-                    params_.k,
-                    nullptr, -1); // ctx, device_idx
+                    params_.k);
 
                 if (!success)
                 {
@@ -258,7 +270,7 @@ namespace llaminar2
                     return false;
                 }
 
-                bool success = fused_gemm.execute_to_q8_1(
+                bool success = fused_kernel->execute_fp32(
                     input_fp32,
                     output_q_q8_1->mutable_typed_data(),
                     output_k_q8_1->mutable_typed_data(),
@@ -266,11 +278,11 @@ namespace llaminar2
                     params_.bias_q, params_.bias_k, params_.bias_v,
                     params_.m, params_.n_q, params_.n_k,
                     params_.k,
-                    nullptr, -1); // ctx, device_idx
+                    64); // default block size
 
                 if (!success)
                 {
-                    LOG_ERROR("[FusedQKVGEMMStage] execute_to_q8_1 failed");
+                    LOG_ERROR("[FusedQKVGEMMStage] execute_fp32 failed");
                     return false;
                 }
             }
@@ -285,9 +297,7 @@ namespace llaminar2
         auto *wv_base = requireTensorBase(params_.wv, "wv");
 
         // Get the target device type from device_id
-        DeviceType target_dev_type = params_.device_id.is_gpu()
-                                         ? DeviceType::CUDA
-                                         : DeviceType::CPU;
+        DeviceType target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
 
         // Get cached kernels from KernelFactory with device targeting
         auto *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq_base, target_dev_type);
@@ -300,7 +310,7 @@ namespace llaminar2
             return false;
         }
 
-        const bool gpu_execution = params_.device_id.is_gpu();
+        const bool gpu_execution = (target_dev_type == DeviceType::CUDA || target_dev_type == DeviceType::ROCm);
         LOG_DEBUG("[FusedQKVGEMMStage] device_id=" << params_.device_id.to_string()
                                                    << " is_gpu=" << gpu_execution);
         bool success = false;
@@ -443,6 +453,20 @@ namespace llaminar2
         info.addWeight("wq", params_.wq);
         info.addWeight("wk", params_.wk);
         info.addWeight("wv", params_.wv);
+
+        // Bias tensors (optional but needed for coherence)
+        if (params_.bias_q)
+        {
+            info.addWeight("bias_q", params_.bias_q);
+        }
+        if (params_.bias_k)
+        {
+            info.addWeight("bias_k", params_.bias_k);
+        }
+        if (params_.bias_v)
+        {
+            info.addWeight("bias_v", params_.bias_v);
+        }
 
         // Outputs
         info.addOutput("output_q", params_.output_q, params_.m, params_.n_q);

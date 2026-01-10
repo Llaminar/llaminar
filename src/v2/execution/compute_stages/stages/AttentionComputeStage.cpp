@@ -79,31 +79,9 @@ namespace llaminar2
             return false;
         }
 
-        // Determine device type: check tensor location FIRST, then fall back to context
+        // Determine device type from params_.device_id (device-agnostic)
         using DeviceType = llaminar::v2::kernels::DeviceType;
-        DeviceType dev_type = DeviceType::CPU;
-        const bool is_gpu_tensor = params_.Q->is_on_gpu();
-
-        if (is_gpu_tensor)
-        {
-#if defined(HAVE_CUDA)
-            dev_type = DeviceType::CUDA;
-#elif defined(HAVE_ROCM)
-            dev_type = DeviceType::ROCm;
-#endif
-        }
-        else if (ctx)
-        {
-            auto *gpu_ctx = dynamic_cast<IGPUDeviceContext *>(ctx);
-            if (gpu_ctx)
-            {
-#if defined(HAVE_CUDA)
-                dev_type = DeviceType::CUDA;
-#elif defined(HAVE_ROCM)
-                dev_type = DeviceType::ROCm;
-#endif
-            }
-        }
+        DeviceType dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
 
         // Create attention kernel via KernelFactory using ITensor* overload (supports both CPU and GPU)
         auto kernel = llaminar::v2::kernels::KernelFactory::createAttention(params_.Q, dev_type);
@@ -167,111 +145,49 @@ namespace llaminar2
         // double-masking (kernel would apply "n > m" on top of our mask)
         const bool kernel_causal = params_.causal && !is_decode_mode;
 
-        bool success = false;
+        // Device-agnostic unified path using compute_tensor()
+        // The kernel factory creates the appropriate kernel (CPU or GPU) based on dev_type,
+        // and compute_tensor() handles type dispatch internally
 
-        if (is_gpu_tensor)
+        // Cast tensors to TensorBase* for compute_tensor()
+        auto *Q_base = asTensorBase(params_.Q, "Q");
+        auto *K_base = asTensorBase(params_.K, "K");
+        auto *V_base = asTensorBase(params_.V, "V");
+        auto *output_base = asTensorBase(params_.output, "output");
+
+        if (!Q_base || !K_base || !V_base || !output_base)
         {
-            // GPU path: ensure output tensor has GPU memory allocated
-            // The output tensor may have been created on CPU and needs GPU allocation
-            // before we can write to it from the GPU kernel
-            auto *output_base = dynamic_cast<TensorBase *>(params_.output);
-            if (output_base)
-            {
-                // Ensure output has GPU memory on the same device as Q
-                // ensureOnDevice will allocate GPU memory if not present
-                if (!output_base->ensureOnDevice(params_.device_id))
-                {
-                    LOG_ERROR("[AttentionComputeStage] Failed to ensure output tensor on device "
-                              << params_.device_id.toString());
-                    return false;
-                }
-            }
-
-            // GPU path: use active_data_ptr() which returns GPU pointer when tensor is on GPU
-            const float *Q_ptr = static_cast<const float *>(params_.Q->active_data_ptr());
-            const float *K_ptr = static_cast<const float *>(params_.K->active_data_ptr());
-            const float *V_ptr = static_cast<const float *>(params_.V->active_data_ptr());
-            float *output_ptr = static_cast<float *>(params_.output->active_mutable_data_ptr());
-
-            LOG_DEBUG("[AttentionComputeStage] GPU path: Q=" << (void *)Q_ptr
-                                                             << " K=" << (void *)K_ptr
-                                                             << " V=" << (void *)V_ptr
-                                                             << " output=" << (void *)output_ptr);
-
-            // For decode mode (seq_len != kv_len), use compute_decode()
-            // For prefill mode (seq_len == kv_len), use compute()
-            if (is_decode_mode)
-            {
-                // Use compute_decode() which properly handles different seq_len and kv_len
-                success = kernel->compute_decode(
-                    Q_ptr, K_ptr, V_ptr, output_ptr,
-                    params_.seq_len,
-                    effective_kv_len,
-                    params_.n_heads,
-                    params_.n_kv_heads,
-                    params_.head_dim,
-                    kernel_causal,
-                    params_.position_offset);
-            }
-            else
-            {
-                // Prefill: seq_len == kv_len, use standard compute()
-                success = kernel->compute(
-                    Q_ptr, K_ptr, V_ptr, output_ptr,
-                    params_.seq_len,
-                    params_.n_heads,
-                    params_.n_kv_heads,
-                    params_.head_dim,
-                    kernel_causal,
-                    params_.window_size,
-                    nullptr, nullptr, nullptr, nullptr, // workspaces not used for GPU flash attention
-                    false,
-                    params_.mpi_ctx,
-                    device_idx);
-            }
-
-            // Mark output as dirty on device (valid on GPU, not on CPU)
-            if (success)
-            {
-                auto *output_base = dynamic_cast<TensorBase *>(params_.output);
-                if (output_base)
-                {
-                    output_base->mark_device_dirty();
-                }
-            }
+            LOG_ERROR("[AttentionComputeStage] Failed to get TensorBase pointers");
+            return false;
         }
-        else
-        {
-            // CPU path: use TensorBase* via compute_tensor()
-            auto *Q_base = asTensorBase(params_.Q, "Q");
-            auto *K_base = asTensorBase(params_.K, "K");
-            auto *V_base = asTensorBase(params_.V, "V");
-            auto *output_base = asTensorBase(params_.output, "output");
 
-            if (!Q_base || !K_base || !V_base || !output_base)
-            {
-                LOG_ERROR("[AttentionComputeStage] CPU path requires TensorBase tensors");
-                return false;
-            }
+        // Device coherence is now handled automatically by GraphExecutor at stage boundaries
+        // based on the stage's coherencePolicy() (FULL by default)
 
-            // Cast workspace_scores to TensorBase* (can be null)
-            auto *workspace_scores_base = asTensorBase(params_.workspace_scores, "workspace_scores");
+        // Cast workspace_scores to TensorBase* (can be null)
+        auto *workspace_scores_base = asTensorBase(params_.workspace_scores, "workspace_scores");
 
-            success = kernel->compute_tensor(
-                Q_base, K_base, V_base, output_base,
-                params_.batch_size,
-                params_.seq_len,
-                effective_kv_len,
-                params_.n_heads,
-                params_.n_kv_heads,
-                params_.head_dim,
-                kernel_causal, // Pass false for decode (we built the mask explicitly)
-                params_.window_size,
-                workspace_scores_base,
-                mask_to_use, // Use our decode mask if we built one
-                params_.mpi_ctx,
-                device_idx);
-        }
+        LOG_DEBUG("[AttentionComputeStage] Executing kernel: dev_type=" << llaminar::v2::kernels::to_string(dev_type)
+                                                                        << " Q_type=" << Q_base->dtype_name()
+                                                                        << " device_idx=" << device_idx);
+
+        bool success = kernel->compute_tensor(
+            Q_base, K_base, V_base, output_base,
+            params_.batch_size,
+            params_.seq_len,
+            effective_kv_len,
+            params_.n_heads,
+            params_.n_kv_heads,
+            params_.head_dim,
+            kernel_causal, // Pass false for decode (we built the mask explicitly)
+            params_.window_size,
+            workspace_scores_base,
+            mask_to_use, // Use our decode mask if we built one
+            params_.mpi_ctx,
+            device_idx);
+
+        // Device coherence (mark_device_dirty) is now handled automatically by GraphExecutor
+        // at stage boundaries based on the stage's coherencePolicy() (FULL by default)
 
         if (!success)
         {
@@ -341,26 +257,37 @@ namespace llaminar2
     {
         StageDumpInfo info;
 
+        // Input: Q, K, V tensors
+        // Q shape: [batch_size * seq_len, n_heads * head_dim]
+        // K/V shape: [batch_size * kv_len, n_kv_heads * head_dim]
+        const size_t total_q_tokens = static_cast<size_t>(params_.batch_size * params_.seq_len);
+        const size_t total_kv_tokens = static_cast<size_t>(params_.batch_size * params_.kv_len);
+
+        if (params_.Q)
+        {
+            info.addInput("Q", params_.Q, total_q_tokens, params_.n_heads * params_.head_dim);
+        }
+        if (params_.K)
+        {
+            info.addInput("K", params_.K, total_kv_tokens, params_.n_kv_heads * params_.head_dim);
+        }
+        if (params_.V)
+        {
+            info.addInput("V", params_.V, total_kv_tokens, params_.n_kv_heads * params_.head_dim);
+        }
+
         // Output: attention context
         // Output shape: [batch_size * seq_len, n_heads * head_dim]
         if (params_.output)
         {
-            const float *out_data = getSafeFp32Data(params_.output);
-            const size_t total_tokens = static_cast<size_t>(params_.batch_size * params_.seq_len);
             LOG_DEBUG("[AttentionComputeStage::getDumpInfo] output=" << (void *)params_.output
                                                                      << " type=" << params_.output->dtype_name()
-                                                                     << " out_data=" << (void *)out_data
                                                                      << " batch_size=" << params_.batch_size
                                                                      << " seq_len=" << params_.seq_len
-                                                                     << " total_tokens=" << total_tokens
+                                                                     << " total_tokens=" << total_q_tokens
                                                                      << " n_heads*head_dim=" << (params_.n_heads * params_.head_dim));
-            if (out_data)
-            {
-                info.addOutput("output",
-                               out_data,
-                               total_tokens,
-                               params_.n_heads * params_.head_dim);
-            }
+            // Use ITensor* overload to enable coherence tracking
+            info.addOutput("output", params_.output, total_q_tokens, params_.n_heads * params_.head_dim);
         }
         else
         {

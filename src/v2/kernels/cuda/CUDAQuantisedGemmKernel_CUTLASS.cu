@@ -349,12 +349,114 @@ extern "C"
             {1, 0}               // alpha=1, beta=0
         );
 
+        // Debug: Log problem configuration
+        std::cerr << "[CUDAQuantGemm::execute] M=" << M << " N=" << N << " K=" << K
+                  << " d_A=" << (void *)d_A_int8 << " d_B=" << (void *)d_weights_int8
+                  << " d_C=" << (void *)d_C_int32 << "\n";
+
+        // Memory validation: read first and last byte of each buffer to verify they're accessible
+        {
+            int8_t probe_byte;
+            size_t A_size = static_cast<size_t>(M) * K;
+            size_t B_size = static_cast<size_t>(K) * N;
+            size_t C_size = static_cast<size_t>(M) * N;
+
+            // Probe A first and last
+            cudaError_t err = cudaMemcpy(&probe_byte, d_A_int8, 1, cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess)
+            {
+                std::ostringstream oss;
+                oss << "[CUDAQuantGemm] A buffer probe (first) failed: " << cudaGetErrorString(err);
+                throw std::runtime_error(oss.str());
+            }
+            err = cudaMemcpy(&probe_byte, d_A_int8 + A_size - 1, 1, cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess)
+            {
+                std::ostringstream oss;
+                oss << "[CUDAQuantGemm] A buffer probe (last @" << (A_size - 1) << ") failed: " << cudaGetErrorString(err);
+                throw std::runtime_error(oss.str());
+            }
+
+            // Probe B first and last
+            err = cudaMemcpy(&probe_byte, d_weights_int8, 1, cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess)
+            {
+                std::ostringstream oss;
+                oss << "[CUDAQuantGemm] B buffer probe (first) failed: " << cudaGetErrorString(err);
+                throw std::runtime_error(oss.str());
+            }
+            err = cudaMemcpy(&probe_byte, d_weights_int8 + B_size - 1, 1, cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess)
+            {
+                std::ostringstream oss;
+                oss << "[CUDAQuantGemm] B buffer probe (last @" << (B_size - 1) << ") failed: " << cudaGetErrorString(err);
+                throw std::runtime_error(oss.str());
+            }
+
+            // Probe C - write test
+            int32_t zero = 0;
+            err = cudaMemcpy(d_C_int32, &zero, sizeof(int32_t), cudaMemcpyHostToDevice);
+            if (err != cudaSuccess)
+            {
+                std::ostringstream oss;
+                oss << "[CUDAQuantGemm] C buffer probe (first) failed: " << cudaGetErrorString(err);
+                throw std::runtime_error(oss.str());
+            }
+            err = cudaMemcpy(d_C_int32 + C_size - 1, &zero, sizeof(int32_t), cudaMemcpyHostToDevice);
+            if (err != cudaSuccess)
+            {
+                std::ostringstream oss;
+                oss << "[CUDAQuantGemm] C buffer probe (last @" << (C_size - 1) << ") failed: " << cudaGetErrorString(err);
+                throw std::runtime_error(oss.str());
+            }
+
+            std::cerr << "[CUDAQuantGemm::execute] Memory probes passed: A[0," << (A_size - 1)
+                      << "] B[0," << (B_size - 1) << "] C[0," << (C_size - 1) << "]\n";
+        }
+
+        // Check if CUTLASS can execute this problem
+        cutlass::Status can_status = CutlassInt8Gemm::can_implement(args);
+        if (can_status != cutlass::Status::kSuccess)
+        {
+            std::ostringstream oss;
+            oss << "[CUDAQuantGemm] CUTLASS can_implement failed with status " << static_cast<int>(can_status)
+                << " (M=" << M << ", N=" << N << ", K=" << K << ")";
+            throw std::runtime_error(oss.str());
+        }
+
+        // Debug: Check workspace requirements
+        size_t workspace_size = CutlassInt8Gemm::get_workspace_size(args);
+        std::cerr << "[CUDAQuantGemm::execute] workspace_size=" << workspace_size << "\n";
+        if (workspace_size > 0)
+        {
+            std::ostringstream oss;
+            oss << "[CUDAQuantGemm] CUTLASS requires non-zero workspace: " << workspace_size
+                << " bytes (M=" << M << ", N=" << N << ", K=" << K << ")";
+            throw std::runtime_error(oss.str());
+        }
+
+        // Verify buffer sizes
+        size_t A_bytes = static_cast<size_t>(M) * K * sizeof(int8_t);
+        size_t B_bytes = static_cast<size_t>(K) * N * sizeof(int8_t);
+        size_t C_bytes = static_cast<size_t>(M) * N * sizeof(int32_t);
+        std::cerr << "[CUDAQuantGemm::execute] Buffer sizes: A=" << A_bytes << " B=" << B_bytes << " C=" << C_bytes << "\n";
+
         cutlass::Status status = gemm_op(args);
 
         if (status != cutlass::Status::kSuccess)
         {
             std::ostringstream oss;
             oss << "[CUDAQuantGemm] CUTLASS GEMM failed with status " << static_cast<int>(status)
+                << " (M=" << M << ", N=" << N << ", K=" << K << ")";
+            throw std::runtime_error(oss.str());
+        }
+
+        // Synchronize to catch any async errors from the kernel
+        cudaError_t sync_err = cudaDeviceSynchronize();
+        if (sync_err != cudaSuccess)
+        {
+            std::ostringstream oss;
+            oss << "[CUDAQuantGemm] CUTLASS kernel async error: " << cudaGetErrorString(sync_err)
                 << " (M=" << M << ", N=" << N << ", K=" << K << ")";
             throw std::runtime_error(oss.str());
         }

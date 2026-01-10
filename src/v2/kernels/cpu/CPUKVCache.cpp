@@ -608,6 +608,66 @@ namespace llaminar2
         return entries_[layer][seq_idx].cached_tokens;
     }
 
+    // =========================================================================
+    // Unified KV Access (preferred interface)
+    // =========================================================================
+
+    template <ActivationPrecision Precision>
+    bool CPUKVCache<Precision>::get_kv(int layer, int seq_idx,
+                                       ITensor **out_k, ITensor **out_v,
+                                       int *out_kv_len)
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        {
+            if (out_k)
+                *out_k = nullptr;
+            if (out_v)
+                *out_v = nullptr;
+            if (out_kv_len)
+                *out_kv_len = 0;
+            return false;
+        }
+
+        auto &entry = entries_[layer][seq_idx];
+        if (out_k)
+            *out_k = entry.K.get();
+        if (out_v)
+            *out_v = entry.V.get();
+        if (out_kv_len)
+            *out_kv_len = entry.cached_tokens;
+        return true;
+    }
+
+    template <ActivationPrecision Precision>
+    bool CPUKVCache<Precision>::get_kv(int layer, int seq_idx,
+                                       const ITensor **out_k, const ITensor **out_v,
+                                       int *out_kv_len) const
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        {
+            if (out_k)
+                *out_k = nullptr;
+            if (out_v)
+                *out_v = nullptr;
+            if (out_kv_len)
+                *out_kv_len = 0;
+            return false;
+        }
+
+        const auto &entry = entries_[layer][seq_idx];
+        if (out_k)
+            *out_k = entry.K.get();
+        if (out_v)
+            *out_v = entry.V.get();
+        if (out_kv_len)
+            *out_kv_len = entry.cached_tokens;
+        return true;
+    }
+
+    // =========================================================================
+    // Legacy Individual Accessors (deprecated - use get_kv() instead)
+    // =========================================================================
+
     template <ActivationPrecision Precision>
     ITensor *CPUKVCache<Precision>::get_k(int layer, int seq_idx)
     {
@@ -797,20 +857,18 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
-    void CPUKVCache<Precision>::clear_sequence(int seq_idx)
+    void CPUKVCache<Precision>::clear_sequence(int layer, int seq_idx)
     {
+        if (layer < 0 || layer >= n_layers_)
+        {
+            return;
+        }
         if (seq_idx < 0 || seq_idx >= batch_size_)
         {
             return;
         }
-
-// Parallelize across layers - independent scalar writes
-#pragma omp parallel for schedule(static) if (n_layers_ >= 8)
-        for (int layer = 0; layer < n_layers_; ++layer)
-        {
-            entries_[layer][seq_idx].cached_tokens = 0;
-        }
-        LOG_DEBUG("CPUKVCache: cleared sequence " << seq_idx);
+        entries_[layer][seq_idx].cached_tokens = 0;
+        LOG_DEBUG("CPUKVCache: cleared layer " << layer << " sequence " << seq_idx);
     }
 
     template <ActivationPrecision Precision>

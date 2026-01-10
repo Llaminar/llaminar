@@ -111,7 +111,7 @@ namespace llaminar2
         // Step 1: Append new K/V to cache (if cache provided)
         if (params_.kv_cache)
         {
-            bool append_ok = params_.kv_cache->append_kv(
+            bool append_ok = params_.kv_cache->append(
                 params_.layer_idx, 0, K_base, V_base, params_.seq_len);
             if (!append_ok)
             {
@@ -236,7 +236,7 @@ namespace llaminar2
         }
 
         // Step 1: Append single token K/V to cache
-        bool append_ok = params_.kv_cache->append_kv(
+        bool append_ok = params_.kv_cache->append(
             params_.layer_idx, 0, K_base, V_base, 1);
         if (!append_ok)
         {
@@ -363,7 +363,7 @@ namespace llaminar2
                 // Note: This assumes K/V are [batch * seq_len, n_kv_heads * head_dim]
                 // TODO: Implement proper batch slicing
 
-                bool append_ok = params_.kv_cache->append_kv(
+                bool append_ok = params_.kv_cache->append(
                     params_.layer_idx, b, K_base, V_base, actual_len);
                 if (!append_ok)
                 {

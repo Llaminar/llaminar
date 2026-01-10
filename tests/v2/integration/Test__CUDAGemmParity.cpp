@@ -28,6 +28,7 @@
 #include "kernels/KernelFactory.h"
 #include "backends/ComputeBackend.h"
 #include "execution/DeviceContext.h"
+#include "execution/GpuCoherence.h" // For gpu_output(), with_gpu_coherence()
 #include "loaders/ModelLoader.h"
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"
@@ -1158,17 +1159,21 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
     // First ensure weights are on GPU
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
 
-    // Upload input and output to GPU
-    ASSERT_TRUE(input_tensor->ensureOnDevice(gpu_device_));
-    ASSERT_TRUE(output_cuda->ensureOnDevice(gpu_device_));
-
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         q4_tensor, KernelDeviceType::CUDA);
     ASSERT_NE(cuda_kernel, nullptr);
 
-    ASSERT_TRUE(cuda_kernel->multiply_tensor(
-        input_tensor.get(), output_cuda.get(),
-        M, N, K, true, 1.0f, 0.0f, nullptr, -1));
+    // Use with_gpu_coherence for automatic input/output coherence management
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {input_tensor.get()}, // inputs
+        {output_cuda.get()},  // outputs (will be marked dirty after kernel)
+        [&]
+        {
+            return cuda_kernel->multiply_tensor(
+                input_tensor.get(), output_cuda.get(),
+                M, N, K, true, 1.0f, 0.0f, nullptr, -1);
+        }));
 
     // ===== Compare =====
     // data() will automatically sync to host if needed
@@ -1266,7 +1271,6 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
     {
         input_data[i] = dist_(rng_);
     }
-    ASSERT_TRUE(input_tensor->ensureOnDevice(gpu_device_));
 
     // Create output tensors for SEPARATE path
     auto output_q_separate = std::make_unique<FP32Tensor>(
@@ -1275,9 +1279,6 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
         std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_k)});
     auto output_v_separate = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_v)});
-    ASSERT_TRUE(output_q_separate->ensureOnDevice(gpu_device_));
-    ASSERT_TRUE(output_k_separate->ensureOnDevice(gpu_device_));
-    ASSERT_TRUE(output_v_separate->ensureOnDevice(gpu_device_));
 
     // Create output tensors for FUSED path
     auto output_q_fused = std::make_unique<FP32Tensor>(
@@ -1286,21 +1287,25 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
         std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_k)});
     auto output_v_fused = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_v)});
-    ASSERT_TRUE(output_q_fused->ensureOnDevice(gpu_device_));
-    ASSERT_TRUE(output_k_fused->ensureOnDevice(gpu_device_));
-    ASSERT_TRUE(output_v_fused->ensureOnDevice(gpu_device_));
 
     // ===== SEPARATE PATH: 3x multiply_tensor() =====
     std::cout << "Running SEPARATE path (3x multiply_tensor)...\n";
-    ASSERT_TRUE(cuda_kernel_q->multiply_tensor(
-        input_tensor.get(), output_q_separate.get(),
-        M, N_q, K, true, 1.0f, 0.0f, nullptr, -1));
-    ASSERT_TRUE(cuda_kernel_k->multiply_tensor(
-        input_tensor.get(), output_k_separate.get(),
-        M, N_k, K, true, 1.0f, 0.0f, nullptr, -1));
-    ASSERT_TRUE(cuda_kernel_v->multiply_tensor(
-        input_tensor.get(), output_v_separate.get(),
-        M, N_v, K, true, 1.0f, 0.0f, nullptr, -1));
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {input_tensor.get()},
+        {output_q_separate.get(), output_k_separate.get(), output_v_separate.get()},
+        [&]
+        {
+            return cuda_kernel_q->multiply_tensor(
+                       input_tensor.get(), output_q_separate.get(),
+                       M, N_q, K, true, 1.0f, 0.0f, nullptr, -1) &&
+                   cuda_kernel_k->multiply_tensor(
+                       input_tensor.get(), output_k_separate.get(),
+                       M, N_k, K, true, 1.0f, 0.0f, nullptr, -1) &&
+                   cuda_kernel_v->multiply_tensor(
+                       input_tensor.get(), output_v_separate.get(),
+                       M, N_v, K, true, 1.0f, 0.0f, nullptr, -1);
+        }));
 
     // ===== FUSED PATH: multiply_fused_tensor() =====
     std::cout << "Running FUSED path (multiply_fused_tensor)...\n";
@@ -1314,9 +1319,16 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
     projections.emplace_back(cuda_kernel_v.get(), output_v_fused.get(), N_v,
                              nullptr, nullptr, false, "V");
 
-    // Call fused method (uses the Q kernel to coordinate, but each projection uses its own kernel)
-    ASSERT_TRUE(cuda_kernel_q->multiply_fused_tensor(
-        input_tensor.get(), projections, M, K, nullptr));
+    // Call fused method with coherence wrapper
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {input_tensor.get()},
+        {output_q_fused.get(), output_k_fused.get(), output_v_fused.get()},
+        [&]
+        {
+            return cuda_kernel_q->multiply_fused_tensor(
+                input_tensor.get(), projections, M, K, nullptr);
+        }));
 
     // ===== COMPARE: Fused vs Separate =====
     std::cout << "\nComparing FUSED vs SEPARATE results:\n";
@@ -1444,7 +1456,6 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
     {
         input_data[i] = dist_(rng_);
     }
-    ASSERT_TRUE(input_tensor->ensureOnDevice(gpu_device_));
 
     // Fused outputs
     auto output_q_fused = std::make_unique<FP32Tensor>(
@@ -1453,11 +1464,8 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
         std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_k)});
     auto output_v_fused = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_v)});
-    ASSERT_TRUE(output_q_fused->ensureOnDevice(gpu_device_));
-    ASSERT_TRUE(output_k_fused->ensureOnDevice(gpu_device_));
-    ASSERT_TRUE(output_v_fused->ensureOnDevice(gpu_device_));
 
-    // Run fused
+    // Run fused with coherence wrapper
     std::vector<TensorProjectionDesc> projections;
     projections.emplace_back(cuda_kernel_q.get(), output_q_fused.get(), N_q,
                              nullptr, nullptr, false, "Q");
@@ -1466,8 +1474,15 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
     projections.emplace_back(cuda_kernel_v.get(), output_v_fused.get(), N_v,
                              nullptr, nullptr, false, "V");
 
-    ASSERT_TRUE(cuda_kernel_q->multiply_fused_tensor(
-        input_tensor.get(), projections, M, K, nullptr));
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {input_tensor.get()},
+        {output_q_fused.get(), output_k_fused.get(), output_v_fused.get()},
+        [&]
+        {
+            return cuda_kernel_q->multiply_fused_tensor(
+                input_tensor.get(), projections, M, K, nullptr);
+        }));
 
     // Compare against CPU
     auto cpu_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
@@ -1576,20 +1591,29 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
         input_data[i] = dist_(rng_);
     }
 
-    // Upload to GPU
-    ASSERT_TRUE(input_tensor->ensureOnDevice(gpu_device_));
-    ASSERT_TRUE(output_fresh->ensureOnDevice(gpu_device_));
-    ASSERT_TRUE(output_cached->ensureOnDevice(gpu_device_));
+    // Run fresh kernel with coherence wrapper
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {input_tensor.get()},
+        {output_fresh.get()},
+        [&]
+        {
+            return fresh_kernel->multiply_tensor(
+                input_tensor.get(), output_fresh.get(),
+                M, N, K, true, 1.0f, 0.0f, nullptr, -1);
+        }));
 
-    // Run fresh kernel
-    ASSERT_TRUE(fresh_kernel->multiply_tensor(
-        input_tensor.get(), output_fresh.get(),
-        M, N, K, true, 1.0f, 0.0f, nullptr, -1));
-
-    // Run cached kernel
-    ASSERT_TRUE(cached_kernel->multiply_tensor(
-        input_tensor.get(), output_cached.get(),
-        M, N, K, true, 1.0f, 0.0f, nullptr, -1));
+    // Run cached kernel with coherence wrapper
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {input_tensor.get()},
+        {output_cached.get()},
+        [&]
+        {
+            return cached_kernel->multiply_tensor(
+                input_tensor.get(), output_cached.get(),
+                M, N, K, true, 1.0f, 0.0f, nullptr, -1);
+        }));
 
     // Compare: should be EXACTLY the same (same kernel, same weights)
     const float *fresh_data = output_fresh->data();
@@ -1654,7 +1678,6 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_MultipleCallsConsistent)
     {
         input_data[i] = dist_(rng_);
     }
-    ASSERT_TRUE(input->ensureOnDevice(gpu_device_));
 
     // Run 3 times with same input, compare all outputs
     std::vector<std::vector<float>> outputs(3);
@@ -1662,11 +1685,18 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_MultipleCallsConsistent)
     {
         auto output = std::make_unique<FP32Tensor>(
             std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
-        ASSERT_TRUE(output->ensureOnDevice(gpu_device_));
 
-        ASSERT_TRUE(kernel->multiply_tensor(
-            input.get(), output.get(),
-            M, N, K, true, 1.0f, 0.0f, nullptr, -1));
+        // Use with_gpu_coherence for clean coherence handling
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {input.get()},
+            {output.get()},
+            [&]
+            {
+                return kernel->multiply_tensor(
+                    input.get(), output.get(),
+                    M, N, K, true, 1.0f, 0.0f, nullptr, -1);
+            }));
 
         outputs[run].resize(M * N);
         const float *data = output->data();
@@ -1748,16 +1778,22 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_VaryingBatchSizes)
         {
             input_data[i] = dist_(rng_);
         }
-        ASSERT_TRUE(input->ensureOnDevice(gpu_device_));
 
         // CUDA output
         auto output_cuda = std::make_unique<FP32Tensor>(
             std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
-        ASSERT_TRUE(output_cuda->ensureOnDevice(gpu_device_));
 
-        ASSERT_TRUE(kernel->multiply_tensor(
-            input.get(), output_cuda.get(),
-            M, N, K, true, 1.0f, 0.0f, nullptr, -1));
+        // Use with_gpu_coherence for clean coherence handling
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {input.get()},
+            {output_cuda.get()},
+            [&]
+            {
+                return kernel->multiply_tensor(
+                    input.get(), output_cuda.get(),
+                    M, N, K, true, 1.0f, 0.0f, nullptr, -1);
+            }));
 
         // CPU reference
         std::vector<float> cpu_output(M * N);
@@ -1896,6 +1932,11 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
 
     ASSERT_TRUE(cuda_kernel_q->multiply_fused_tensor(
         input.get(), projections, M, K, nullptr));
+
+    // Mark outputs as device-dirty (tests bypass GraphExecutor auto-coherence)
+    output_q->mark_device_dirty();
+    output_k->mark_device_dirty();
+    output_v->mark_device_dirty();
 
     // ===== CPU reference (GEMM + manual bias add) =====
     auto cpu_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
@@ -2074,6 +2115,11 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
 
         ASSERT_TRUE(kernel_q->multiply_fused_tensor(
             input.get(), projections, M, K, nullptr));
+
+        // Mark outputs as device-dirty (tests bypass GraphExecutor auto-coherence)
+        out_q->mark_device_dirty();
+        out_k->mark_device_dirty();
+        out_v->mark_device_dirty();
 
         // CPU reference
         std::vector<float> q_cpu(M * N_q), k_cpu(M * N_k), v_cpu(M * N_v);

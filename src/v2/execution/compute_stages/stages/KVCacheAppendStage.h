@@ -37,7 +37,7 @@ namespace llaminar2
         {
             const ITensor *K = nullptr; ///< Key to append
             const ITensor *V = nullptr; ///< Value to append
-            ICPUKVCache *kv_cache = nullptr;
+            IKVCache *kv_cache = nullptr;
             int layer_idx = 0;
             int seq_idx = 0;
             int num_tokens = 0;

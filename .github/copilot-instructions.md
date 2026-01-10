@@ -16,8 +16,11 @@ This document provides practical guidelines for working with the **Llaminar V2**
 - [Benchmark Mode](#benchmark-mode)
 - [Testing Guidelines](#testing-guidelines)
 - [Debugging](#debugging)
+- [Stage Dump Framework](#stage-dump-framework)
+- [Stage Output Print Facility](#stage-output-print-facility)
 - [Snapshot Framework and E2E Testing](#snapshot-framework-and-e2e-testing)
 - [Kernel Development](#kernel-development)
+- [GPU Tensor Coherence](#gpu-tensor-coherence)
 - [Weight Sharding and Tensor Parallelism](#weight-sharding-and-tensor-parallelism)
 - [MPI Development Best Practices](#mpi-development-best-practices)
 - [Performance Optimization](#performance-optimization)
@@ -488,9 +491,87 @@ See `tests/v2/integration/replay/Test__HybridQ16AttentionReplay.cpp` for a compl
 
 ---
 
+## Stage Output Print Facility
+
+### Overview
+
+The Stage Output Print facility provides a lightweight way to inspect tensor values at stage boundaries during inference. Unlike the Stage Dump Framework (which writes binary files for replay testing), this facility prints tensor samples directly to the log output, making it ideal for quick debugging of buffer wiring and data flow issues.
+
+**When to Use**:
+- Debugging buffer wiring issues (e.g., wrong tensor passed to a stage)
+- Verifying data is being computed correctly at each stage
+- Comparing CPU vs GPU execution paths
+- Quick sanity checks without writing files to disk
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LLAMINAR_STAGE_OUTPUT_PRINT` | Master enable (0/1) | Disabled |
+| `LLAMINAR_STAGE_OUTPUT_PRINT_N` | Number of elements to print per row | 8 |
+| `LLAMINAR_STAGE_OUTPUT_PRINT_ROWS` | Number of rows to print (first and last) | 2 |
+| `LLAMINAR_STAGE_OUTPUT_PRINT_STAGES` | Comma-separated stage name patterns (substring match) | `all` |
+
+### Example Usage
+
+```bash
+# Print outputs for all stages (verbose!)
+LLAMINAR_STAGE_OUTPUT_PRINT=1 ./build_v2_release/llaminar2 -m model.gguf -p "Hello"
+
+# Print only FFN stages for layer 0
+LLAMINAR_STAGE_OUTPUT_PRINT=1 \
+LLAMINAR_STAGE_OUTPUT_PRINT_STAGES=layer0_gate_up_proj,layer0_swiglu,layer0_down_proj \
+./build_v2_release/llaminar2 -m model.gguf -p "Hello"
+
+# Print with more elements per row
+LLAMINAR_STAGE_OUTPUT_PRINT=1 \
+LLAMINAR_STAGE_OUTPUT_PRINT_N=16 \
+LLAMINAR_STAGE_OUTPUT_PRINT_STAGES=layer0_swiglu \
+./build_v2_release/llaminar2 -m model.gguf -p "Hello"
+```
+
+### Output Format
+
+```
+[StageOutput] layer0_gate_up_proj/output_gate [2x4864] row[0]: -0.074,-1.148,-0.085... | row[1]: 0.023,-0.439,0.652...
+[StageOutput] layer0_gate_up_proj/output_up [2x4864] row[0]: -0.360,0.594,0.074...
+[StageOutput] layer0_swiglu/output [2x4864] row[0]: 0.012,-0.164,-0.003...
+```
+
+The format is: `[StageOutput] <stage_name>/<tensor_name> [<rows>x<cols>] row[0]: <values>... | row[<last>]: <values>...`
+
+### Debugging Example: Buffer Wiring Bug
+
+This facility was instrumental in diagnosing a bug where SwiGLU was producing incorrect output on GPU:
+
+```bash
+# Compare CPU vs GPU SwiGLU outputs
+LLAMINAR_STAGE_OUTPUT_PRINT=1 \
+LLAMINAR_STAGE_OUTPUT_PRINT_STAGES=layer0_swiglu \
+./test_cpu_vs_gpu 2>&1 | grep StageOutput
+
+# CPU output (correct):
+# [StageOutput] layer0_swiglu/output [2x4864] row[0]: 0.012,-0.164,-0.003...
+
+# GPU output (wrong - identical to input_up!):
+# [StageOutput] layer0_swiglu/output [2x4864] row[0]: -0.360,0.594,0.074...
+```
+
+This revealed that the GPU SwiGLU output was identical to its `up` input, indicating the kernel wasn't being called. The root cause was a missing `device_id` assignment in the stage params.
+
+### Implementation Details
+
+- Output is printed via `LOG_INFO` after `markOutputsDirty()` completes (GPU→host sync has occurred)
+- Uses `TensorBase::data()` for coherence-aware access
+- Stage name filtering uses case-insensitive substring matching
+- Zero overhead when disabled (no string formatting occurs)
+
+---
+
 ## Snapshot Framework and E2E Testing
 
 ### Overview
+
 
 The snapshot framework captures intermediate tensors during inference for comparison against PyTorch ground truth. This is essential for debugging numerical divergence.
 
@@ -875,6 +956,156 @@ If you attempt to borrow a register that's already borrowed, you get a detailed 
 
 ---
 
+## GPU Tensor Coherence
+
+### Overview
+
+Llaminar uses a **coherence protocol** to manage tensor data movement between host (CPU) and device (GPU) memory. This system:
+- Tracks whether tensor data is "dirty" on CPU or GPU
+- Automatically synchronizes data when needed
+- Provides both automatic (GraphExecutor) and manual (test/utility) patterns
+
+**Key Files:**
+- `src/v2/tensors/cpu/CPUTensors.h` - `CPUTensorBase` coherence methods (`ensureOnDevice()`, `mark_device_dirty()`, `ensureOnHost()`, `data()`)
+- `src/v2/execution/StageCoherence.h` - `StageCoherence` helper for GraphExecutor
+- `src/v2/execution/GpuCoherence.h` - RAII utilities for tests and direct kernel calls
+
+### Coherence Protocol
+
+Every `CPUTensorBase` tracks its coherence state:
+
+| State | Meaning | `data()` Returns |
+|-------|---------|------------------|
+| CPU is authoritative | Data was last modified on host | Host data directly |
+| GPU is authoritative | `mark_device_dirty()` was called | Syncs GPU→host first |
+| Never uploaded | No GPU buffer allocated | Host data directly |
+
+**Core Methods on CPUTensorBase:**
+
+```cpp
+// Upload to GPU if needed (allocates buffer on first call)
+bool ensureOnDevice(DeviceId device);
+
+// Mark GPU as having authoritative data (after GPU kernel writes)
+void mark_device_dirty();
+
+// Get host data pointer (syncs from GPU if device-dirty)
+const float* data();
+float* mutable_data();  // Also marks CPU as authoritative
+```
+
+### Automatic Coherence (GraphExecutor)
+
+When using `GraphExecutor` (the standard inference path), **coherence is automatic**:
+
+1. **Stage Entry**: `StageCoherence::ensureInputsOnDevice()` uploads all stage inputs
+2. **Stage Execution**: Kernel runs on GPU
+3. **Stage Exit**: `StageCoherence::markOutputsDirty()` marks outputs as device-authoritative
+
+```cpp
+// GraphExecutor automatically handles this:
+void GraphExecutor::executeStage(const ComputeNode& node) {
+    // 1. Auto-cohere inputs to GPU
+    StageCoherence::ensureInputsOnDevice(node.stage, device_);
+    
+    // 2. Run the stage
+    node.stage->execute();
+    
+    // 3. Auto-mark outputs as GPU-authoritative
+    StageCoherence::markOutputsDirty(node.stage);
+}
+```
+
+**Stages declare their coherence policy** via `coherencePolicy()`:
+
+| Policy | Behavior |
+|--------|----------|
+| `FULL` (default) | Cohere inputs on entry, mark outputs dirty on exit |
+| `INPUT` | Only cohere inputs (outputs managed manually) |
+| `OUTPUT` | Only mark outputs dirty (inputs already on device) |
+| `NONE` | No automatic coherence (MPI stages, custom management) |
+
+### Manual Coherence (Tests and Direct Kernel Calls)
+
+When calling kernels **directly** (bypassing GraphExecutor), you must handle coherence manually. Use the utilities in `execution/GpuCoherence.h`:
+
+#### Preferred Pattern: `with_gpu_coherence()`
+
+```cpp
+#include "execution/GpuCoherence.h"
+
+// Clean, self-documenting pattern for kernel calls
+ASSERT_TRUE(with_gpu_coherence(
+    gpu_device,
+    {input.get()},                              // inputs to upload
+    {output_q.get(), output_k.get()},           // outputs to upload + mark dirty
+    [&] {
+        return kernel->multiply_fused_tensor(input.get(), projections, M, K, nullptr);
+    }));
+
+// After the lambda completes:
+// - All outputs are marked device-dirty
+// - Calling output->data() will sync GPU→host
+```
+
+#### Alternative: RAII Wrappers
+
+```cpp
+// For single outputs - wraps ensureOnDevice + mark_device_dirty
+{
+    auto output = GpuOutput<FP32Tensor>(output_tensor.get(), gpu_device);
+    kernel->multiply_tensor(input.get(), output.get(), M, N, K, ...);
+} // ← output automatically marked dirty when scope exits
+
+// For read-only inputs (no dirty marking)
+{
+    auto weights = GpuInput<Q4_0Tensor>(weight_tensor.get(), gpu_device);
+    kernel->compute(weights.get(), ...);
+} // ← weights NOT marked dirty (read-only)
+```
+
+#### C++20 Concept
+
+The utilities use a concept to ensure type safety:
+
+```cpp
+template <typename T>
+concept CoherableTensor = requires(T *t, DeviceId d) {
+    { t->ensureOnDevice(d) } -> std::same_as<bool>;
+    { t->mark_device_dirty() } -> std::same_as<void>;
+};
+```
+
+### Anti-Pattern: Manual Coherence Without RAII
+
+Avoid manual `ensureOnDevice()` and `mark_device_dirty()` calls in tests:
+
+```cpp
+// ❌ BAD - Easy to forget mark_device_dirty, leads to stale data
+input->ensureOnDevice(gpu_device);
+output->ensureOnDevice(gpu_device);
+kernel->compute(input.get(), output.get(), ...);
+// OOPS! Forgot: output->mark_device_dirty();
+const float* result = output->data();  // Returns stale host data!
+
+// ✅ GOOD - RAII ensures correctness
+ASSERT_TRUE(with_gpu_coherence(gpu_device, {input.get()}, {output.get()}, [&] {
+    return kernel->compute(input.get(), output.get(), ...);
+}));
+const float* result = output->data();  // Correctly syncs GPU→host
+```
+
+### When to Use Which Pattern
+
+| Context | Pattern |
+|---------|--------|
+| Pipeline stages (via GraphExecutor) | Automatic - do nothing special |
+| Integration tests calling kernels directly | `with_gpu_coherence()` lambda wrapper |
+| Simple single-output tests | `GpuOutput<T>` RAII wrapper |
+| Custom pipelines bypassing GraphExecutor | `GpuCoherenceScope` for fine-grained control |
+
+---
+
 ## Weight Sharding and Tensor Parallelism
 
 ### Overview
@@ -1151,6 +1382,10 @@ TEST(Test__MyNewKernel, BasicFunctionality) {
 | `LLAMINAR_STAGE_DUMP_LAYERS` | Comma-separated layer indices to dump | `all` |
 | `LLAMINAR_STAGE_DUMP_ITERATION` | Decode iterations to dump | `all` |
 | `LLAMINAR_STAGE_DUMP_RANK` | MPI rank to dump (-1 for all) | 0 |
+| `LLAMINAR_STAGE_OUTPUT_PRINT` | Print stage outputs to log (0/1) | Disabled |
+| `LLAMINAR_STAGE_OUTPUT_PRINT_N` | Elements per row in stage output print | 8 |
+| `LLAMINAR_STAGE_OUTPUT_PRINT_ROWS` | Rows to print (first and last) | 2 |
+| `LLAMINAR_STAGE_OUTPUT_PRINT_STAGES` | Stage names to print (substring match) | `all` |
 | `LLAMINAR_DETERMINISTIC` | Force deterministic execution | Disabled |
 | `LLAMINAR_SNAPSHOT_TENSOR_DUMP` | Enable raw tensor dump to disk | Disabled |
 | `LLAMINAR_SNAPSHOT_DUMP_DIR` | Output directory for tensor dumps | `/tmp/llaminar_tensor_dumps` |

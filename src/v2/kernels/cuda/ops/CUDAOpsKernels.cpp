@@ -120,29 +120,7 @@ namespace llaminar2
             if (!input_fp32 || !weight_fp32 || !output_fp32)
                 return false;
 
-            // Construct target device
-            DeviceId target_device(DeviceType::CUDA, dev);
-
-            // Ensure input data is on GPU
-            if (!input_fp32->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDARMSNormKernel] Failed to upload input to GPU\n");
-                return false;
-            }
-
-            // Ensure weight data is on GPU
-            if (!weight_fp32->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDARMSNormKernel] Failed to upload weight to GPU\n");
-                return false;
-            }
-
-            // Ensure output buffer is on GPU
-            if (!output_fp32->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDARMSNormKernel] Failed to ensure output on GPU\n");
-                return false;
-            }
+            // Coherence handled automatically by GraphExecutor
 
             // Get device pointers
             const float *d_input = static_cast<const float *>(input_fp32->gpu_data_ptr());
@@ -153,7 +131,6 @@ namespace llaminar2
             if (ok)
             {
                 cudaDeviceSynchronize();
-                output_fp32->mark_device_dirty();
             }
             return ok;
         }
@@ -208,25 +185,7 @@ namespace llaminar2
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Construct target device
-            DeviceId target_device(DeviceType::CUDA, dev);
-
-            // Ensure data is on GPU
-            if (!in_bf16->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDARMSNormKernel BF16] Failed to upload input to GPU\n");
-                return false;
-            }
-            if (weight_fp32 && !weight_fp32->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDARMSNormKernel BF16] Failed to upload weight to GPU\n");
-                return false;
-            }
-            if (!out_bf16->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDARMSNormKernel BF16] Failed to ensure output on GPU\n");
-                return false;
-            }
+            // Coherence handled automatically by GraphExecutor
 
             // Get device pointers
             const uint16_t *d_input = static_cast<const uint16_t *>(in_bf16->gpu_data_ptr());
@@ -237,7 +196,6 @@ namespace llaminar2
             if (ok)
             {
                 cudaDeviceSynchronize();
-                out_bf16->mark_device_dirty();
             }
             return ok;
         }
@@ -292,25 +250,7 @@ namespace llaminar2
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Construct target device
-            DeviceId target_device(DeviceType::CUDA, dev);
-
-            // Ensure data is on GPU
-            if (!in_fp16->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDARMSNormKernel FP16] Failed to upload input to GPU\n");
-                return false;
-            }
-            if (weight_fp32 && !weight_fp32->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDARMSNormKernel FP16] Failed to upload weight to GPU\n");
-                return false;
-            }
-            if (!out_fp16->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDARMSNormKernel FP16] Failed to ensure output on GPU\n");
-                return false;
-            }
+            // Coherence handled automatically by GraphExecutor
 
             // Get device pointers
             const uint16_t *d_input = static_cast<const uint16_t *>(in_fp16->gpu_data_ptr());
@@ -321,7 +261,6 @@ namespace llaminar2
             if (ok)
             {
                 cudaDeviceSynchronize();
-                out_fp16->mark_device_dirty();
             }
             return ok;
         }
@@ -386,25 +325,7 @@ namespace llaminar2
             if (!gate_fp32 || !up_fp32 || !output_fp32)
                 return false;
 
-            // Construct target device
-            DeviceId target_device(DeviceType::CUDA, dev);
-
-            // Ensure data is on GPU
-            if (!gate_fp32->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDASwiGLUKernel] Failed to upload gate to GPU\n");
-                return false;
-            }
-            if (!up_fp32->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDASwiGLUKernel] Failed to upload up to GPU\n");
-                return false;
-            }
-            if (!output_fp32->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDASwiGLUKernel] Failed to ensure output on GPU\n");
-                return false;
-            }
+            // Coherence handled automatically by GraphExecutor
 
             // Get device pointers
             const float *d_gate = static_cast<const float *>(gate_fp32->gpu_data_ptr());
@@ -416,7 +337,6 @@ namespace llaminar2
             if (ok)
             {
                 cudaDeviceSynchronize();
-                output_fp32->mark_device_dirty();
             }
             return ok;
         }
@@ -479,25 +399,7 @@ namespace llaminar2
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Construct target device
-            DeviceId target_device(DeviceType::CUDA, dev);
-
-            // Ensure data is on GPU
-            if (!gate_bf16->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDASwiGLUKernel BF16] Failed to upload gate to GPU\n");
-                return false;
-            }
-            if (!up_bf16->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDASwiGLUKernel BF16] Failed to upload up to GPU\n");
-                return false;
-            }
-            if (!out_bf16->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDASwiGLUKernel BF16] Failed to ensure output on GPU\n");
-                return false;
-            }
+            // Coherence handled automatically by GraphExecutor
 
             // Get device pointers
             const uint16_t *d_gate = static_cast<const uint16_t *>(gate_bf16->gpu_data_ptr());
@@ -509,7 +411,6 @@ namespace llaminar2
             if (ok)
             {
                 cudaDeviceSynchronize();
-                out_bf16->mark_device_dirty();
             }
             return ok;
         }
@@ -572,25 +473,7 @@ namespace llaminar2
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Construct target device
-            DeviceId target_device(DeviceType::CUDA, dev);
-
-            // Ensure data is on GPU
-            if (!gate_fp16->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDASwiGLUKernel FP16] Failed to upload gate to GPU\n");
-                return false;
-            }
-            if (!up_fp16->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDASwiGLUKernel FP16] Failed to upload up to GPU\n");
-                return false;
-            }
-            if (!out_fp16->ensureOnDevice(target_device))
-            {
-                fprintf(stderr, "[CUDASwiGLUKernel FP16] Failed to ensure output on GPU\n");
-                return false;
-            }
+            // Coherence handled automatically by GraphExecutor
 
             // Get device pointers
             const uint16_t *d_gate = static_cast<const uint16_t *>(gate_fp16->gpu_data_ptr());
@@ -602,7 +485,6 @@ namespace llaminar2
             if (ok)
             {
                 cudaDeviceSynchronize();
-                out_fp16->mark_device_dirty();
             }
             return ok;
         }
@@ -879,14 +761,8 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Step 2: Ensure output tensor is on GPU
+        // Step 2: Get GPU pointer for output (coherence handled by GraphExecutor)
         // =====================================================================
-        if (!output_fp32->ensureOnDevice(target_device))
-        {
-            fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to ensure output on GPU\n");
-            cudaFree(d_token_ids);
-            return false;
-        }
         float *d_output = static_cast<float *>(output_fp32->gpu_data_ptr());
         if (!d_output)
         {
@@ -940,12 +816,6 @@ namespace llaminar2
         // Step 4: Execute kernel with all GPU pointers
         // =====================================================================
         bool result = apply(d_embed, d_token_ids, num_tokens, d_model, d_output, mpi_ctx, device_idx);
-
-        // Mark output as dirty (GPU has newer data)
-        if (result)
-        {
-            output_fp32->mark_device_dirty();
-        }
 
         // =====================================================================
         // Step 5: Cleanup temporary GPU buffers

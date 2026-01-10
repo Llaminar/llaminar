@@ -257,7 +257,7 @@ namespace llaminar2
                 // Always use this path for seq_len=1, even for short KV
                 int num_splits = DEFAULT_NUM_SPLITS;
                 if (kv_len <= 64)
-                    num_splits = 1;  // No splitting for very short KV
+                    num_splits = 1; // No splitting for very short KV
                 else if (kv_len < 128)
                     num_splits = 2;
                 else if (kv_len < 256)
@@ -308,6 +308,87 @@ namespace llaminar2
             }
 
             return true;
+        }
+
+        bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::compute_tensor(
+            const TensorBase *Q,
+            const TensorBase *K,
+            const TensorBase *V,
+            TensorBase *output,
+            int batch_size,
+            int seq_len,
+            int kv_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal,
+            int window_size,
+            TensorBase *workspace_scores,
+            TensorBase *workspace_mask,
+            const MPIContext *mpi_ctx,
+            int device_idx,
+            int head_start,
+            int local_n_heads,
+            int local_n_kv_heads)
+        {
+            (void)workspace_scores;
+            (void)workspace_mask;
+            (void)mpi_ctx;
+            (void)head_start;
+            (void)local_n_heads;
+            (void)local_n_kv_heads;
+
+            if (!Q || !K || !V || !output)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Null tensor provided");
+                return false;
+            }
+
+            // Verify tensor types match FP32
+            if (Q->native_type() != TensorType::FP32)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Q tensor type mismatch: expected FP32, got "
+                          << Q->dtype_name());
+                return false;
+            }
+
+            // Extract GPU pointers - tensors should already be coherent on device
+            const float *Q_ptr = static_cast<const float *>(Q->gpu_data_ptr());
+            const float *K_ptr = static_cast<const float *>(K->gpu_data_ptr());
+            const float *V_ptr = static_cast<const float *>(V->gpu_data_ptr());
+            float *output_ptr = static_cast<float *>(output->gpu_data_ptr());
+
+            if (!Q_ptr || !K_ptr || !V_ptr || !output_ptr)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] GPU data pointer is null. "
+                          << "Ensure tensors are coherent on device (ensureOnDevice).");
+                return false;
+            }
+
+            LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] batch=" << batch_size
+                                                                                 << " seq_len=" << seq_len << " kv_len=" << kv_len
+                                                                                 << " n_heads=" << n_heads << " n_kv_heads=" << n_kv_heads
+                                                                                 << " head_dim=" << head_dim << " causal=" << causal);
+
+            int dev = (device_idx >= 0) ? device_idx : device_idx_;
+
+            // Dispatch to apply_typed which handles algorithm selection
+            if (kv_len != seq_len)
+            {
+                // Decode path (different Q and KV lengths)
+                return apply_typed(Q_ptr, K_ptr, V_ptr, output_ptr,
+                                   batch_size, seq_len, kv_len,
+                                   n_heads, n_kv_heads, head_dim,
+                                   causal, window_size, 0, dev);
+            }
+            else
+            {
+                // Prefill path
+                return apply_typed(Q_ptr, K_ptr, V_ptr, output_ptr,
+                                   batch_size, seq_len, seq_len,
+                                   n_heads, n_kv_heads, head_dim,
+                                   causal, window_size, 0, dev);
+            }
         }
 
         // =====================================================================
@@ -461,6 +542,36 @@ namespace llaminar2
             return false;
         }
 
+        bool CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::compute_tensor(
+            const TensorBase *Q,
+            const TensorBase *K,
+            const TensorBase *V,
+            TensorBase *output,
+            int batch_size,
+            int seq_len,
+            int kv_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal,
+            int window_size,
+            TensorBase *workspace_scores,
+            TensorBase *workspace_mask,
+            const MPIContext *mpi_ctx,
+            int device_idx,
+            int head_start,
+            int local_n_heads,
+            int local_n_kv_heads)
+        {
+            // FP16 compute_tensor: delegate to FP32 for now
+            LOG_WARN("[CUDAFlashAttentionKernelT<FP16>] FP16 compute_tensor not yet implemented, using FP32");
+            CUDAFlashAttentionKernelT<ActivationPrecision::FP32> fp32_kernel(device_idx_);
+            return fp32_kernel.compute_tensor(Q, K, V, output, batch_size, seq_len, kv_len,
+                                              n_heads, n_kv_heads, head_dim, causal, window_size,
+                                              workspace_scores, workspace_mask, mpi_ctx, device_idx,
+                                              head_start, local_n_heads, local_n_kv_heads);
+        }
+
         // =====================================================================
         // BF16 Specialization Implementation (stub - delegates to FP32)
         // =====================================================================
@@ -608,6 +719,36 @@ namespace llaminar2
             (void)device_idx;
             LOG_ERROR("[CUDAFlashAttentionKernelT<BF16>] apply_typed not yet implemented");
             return false;
+        }
+
+        bool CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::compute_tensor(
+            const TensorBase *Q,
+            const TensorBase *K,
+            const TensorBase *V,
+            TensorBase *output,
+            int batch_size,
+            int seq_len,
+            int kv_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal,
+            int window_size,
+            TensorBase *workspace_scores,
+            TensorBase *workspace_mask,
+            const MPIContext *mpi_ctx,
+            int device_idx,
+            int head_start,
+            int local_n_heads,
+            int local_n_kv_heads)
+        {
+            // BF16 compute_tensor: delegate to FP32 for now
+            LOG_WARN("[CUDAFlashAttentionKernelT<BF16>] BF16 compute_tensor not yet implemented, using FP32");
+            CUDAFlashAttentionKernelT<ActivationPrecision::FP32> fp32_kernel(device_idx_);
+            return fp32_kernel.compute_tensor(Q, K, V, output, batch_size, seq_len, kv_len,
+                                              n_heads, n_kv_heads, head_dim, causal, window_size,
+                                              workspace_scores, workspace_mask, mpi_ctx, device_idx,
+                                              head_start, local_n_heads, local_n_kv_heads);
         }
 
     } // namespace cuda

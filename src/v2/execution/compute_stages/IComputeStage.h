@@ -26,6 +26,7 @@
 #include "../DeviceContext.h"
 #include "../BufferRole.h"
 #include "../RuntimeConfig.h"
+#include "../StageCoherence.h"
 #include "../../tensors/BlockStructures.h"
 #include "../../tensors/TensorKernels.h"
 #include "../../utils/MPITopology.h"
@@ -148,7 +149,8 @@ namespace llaminar2
             size_t cols = 0;
             const char *dtype = "FP32";
             size_t element_size = sizeof(float);
-            size_t byte_size = 0; ///< Total byte size for native format (0 = use rows*cols*element_size)
+            size_t byte_size = 0;      ///< Total byte size for native format (0 = use rows*cols*element_size)
+            ITensor *tensor = nullptr; ///< Optional tensor pointer for coherence management
         };
 
         // Output buffers (written during execute)
@@ -160,7 +162,8 @@ namespace llaminar2
             size_t cols = 0;
             const char *dtype = "FP32";
             size_t element_size = sizeof(float);
-            size_t byte_size = 0; ///< Total byte size for native format (0 = use rows*cols*element_size)
+            size_t byte_size = 0;      ///< Total byte size for native format (0 = use rows*cols*element_size)
+            ITensor *tensor = nullptr; ///< Optional tensor pointer for coherence management
         };
 
         // Weight/parameter buffers (read-only during execute)
@@ -448,6 +451,37 @@ namespace llaminar2
          * @return false by default (all-zero outputs are bugs)
          */
         virtual bool allowsZeroOutput() const { return false; }
+
+        // =========================================================================
+        // Device Coherence (Phase 2: Automatic Stage Boundary Coherence)
+        // =========================================================================
+
+        /**
+         * @brief Get coherence policy for this stage
+         *
+         * Controls automatic device coherence at stage boundaries:
+         * - NONE: No automatic coherence (for MPI stages, custom management)
+         * - INPUT: Only cohere inputs (outputs managed manually)
+         * - OUTPUT: Only mark outputs dirty (assume inputs are ready)
+         * - FULL: Both inputs and outputs (default for most stages)
+         *
+         * Override for stages that manage their own coherence (e.g., MPI stages
+         * that coordinate data movement across ranks).
+         *
+         * @return FULL by default for automatic input coherence and output marking
+         */
+        virtual CoherencePolicy coherencePolicy() const { return CoherencePolicy::FULL; }
+
+        /**
+         * @brief Get preferred device for execution
+         *
+         * Returns the device ID where this stage should execute.
+         * Used by coherence system to determine target device for
+         * automatic ensureOnDevice() calls.
+         *
+         * @return DeviceId::cpu() by default
+         */
+        virtual DeviceId preferredDevice() const { return DeviceId::cpu(); }
 
         /**
          * @brief Update dynamic parameters for graph reuse

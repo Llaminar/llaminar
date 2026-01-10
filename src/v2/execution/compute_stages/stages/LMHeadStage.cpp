@@ -100,36 +100,6 @@ namespace llaminar2
             return false;
         }
 
-        // Debug: dump local logits at last position
-        {
-            const float *logits_data = logits->fp32_data();
-            if (logits_data && params_.seq_len > 0)
-            {
-                // Print first row (row 0)
-                LOG_DEBUG("[LMHeadStage] Local logits (row 0, first 8): "
-                          << logits_data[0] << ","
-                          << logits_data[1] << ","
-                          << logits_data[2] << ","
-                          << logits_data[3] << ","
-                          << logits_data[4] << ","
-                          << logits_data[5] << ","
-                          << logits_data[6] << ","
-                          << logits_data[7]);
-
-                // Get last row logits
-                size_t last_row_offset = (params_.seq_len - 1) * params_.vocab_size;
-                LOG_DEBUG("[LMHeadStage] Local logits (last row, first 8): "
-                          << logits_data[last_row_offset + 0] << ","
-                          << logits_data[last_row_offset + 1] << ","
-                          << logits_data[last_row_offset + 2] << ","
-                          << logits_data[last_row_offset + 3] << ","
-                          << logits_data[last_row_offset + 4] << ","
-                          << logits_data[last_row_offset + 5] << ","
-                          << logits_data[last_row_offset + 6] << ","
-                          << logits_data[last_row_offset + 7]);
-            }
-        }
-
         // Apply bias if present
         if (params_.bias)
         {

@@ -54,7 +54,7 @@ namespace llaminar2
             ITensor *workspace_mask = nullptr;
 
             // KV cache for dynamic length query at execution time
-            ICPUKVCache *kv_cache = nullptr;
+            IKVCache *kv_cache = nullptr;
             int layer_idx = -1;
 
             // Position offset for decode mode causal masking
@@ -74,6 +74,9 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo getDumpInfo() const override;
         StageBufferRequirements getBufferRequirements() const override;
+
+        /// Target device for coherence management
+        DeviceId preferredDevice() const override { return params_.device_id; }
 
         void updateDynamicParams(int pos_offset, int seq_len) override
         {

@@ -102,6 +102,9 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
         bool requiresAllreduce() const override { return params_.needs_allreduce; }
 
+        /// Target device for coherence management
+        DeviceId preferredDevice() const override { return params_.device_id; }
+
         const Params &getParams() const { return params_; }
 
     private:

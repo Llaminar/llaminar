@@ -92,13 +92,13 @@ namespace llaminar2
                 LOG_TRACE("[KVCacheAppendStage] Appending " << seq_len << " tokens to layer "
                                                             << params_.layer_idx << " seq_idx=" << seq_idx);
 
-                bool success = params_.kv_cache->append_kv(
+                bool success = params_.kv_cache->append(
                     params_.layer_idx, seq_idx,
                     k_slice.get(), v_slice.get(), seq_len);
 
                 if (!success)
                 {
-                    LOG_ERROR("[KVCacheAppendStage] append_kv failed for batch " << b);
+                    LOG_ERROR("[KVCacheAppendStage] append failed for batch " << b);
                     return false;
                 }
             }
@@ -236,13 +236,13 @@ namespace llaminar2
                 }
             }
 
-            bool success = params_.kv_cache->append_kv(
+            bool success = params_.kv_cache->append(
                 params_.layer_idx, params_.seq_idx,
                 k_slice.get(), v_slice.get(), total_tokens);
 
             if (!success)
             {
-                LOG_ERROR("[KVCacheAppendStage] append_kv failed (after conversion)");
+                LOG_ERROR("[KVCacheAppendStage] append failed (after conversion)");
                 return false;
             }
 
@@ -477,13 +477,13 @@ namespace llaminar2
                 }
             }
 
-            bool success = params_.kv_cache->append_kv(
+            bool success = params_.kv_cache->append(
                 params_.layer_idx, params_.seq_idx,
                 k_for_cache, v_for_cache, total_tokens);
 
             if (!success)
             {
-                LOG_ERROR("[KVCacheAppendStage] append_kv failed (Q16_1 cache)");
+                LOG_ERROR("[KVCacheAppendStage] append failed (Q16_1 cache)");
                 return false;
             }
 
@@ -500,13 +500,13 @@ namespace llaminar2
             return false;
         }
 
-        bool success = params_.kv_cache->append_kv(
+        bool success = params_.kv_cache->append(
             params_.layer_idx, params_.seq_idx,
             K_base, V_base, total_tokens);
 
         if (!success)
         {
-            LOG_ERROR("[KVCacheAppendStage] append_kv failed");
+            LOG_ERROR("[KVCacheAppendStage] append failed");
             return false;
         }
 

@@ -305,7 +305,7 @@ namespace llaminar2
         int seq_len = 0;                   ///< Sequence length
         int position_offset = 0;           ///< KV cache position offset (legacy, used if position_ids == nullptr)
         DeviceId device = DeviceId::cpu(); ///< Target device
-        ICPUKVCache *kv_cache = nullptr;   ///< KV cache for attention (optional)
+        IKVCache *kv_cache = nullptr;      ///< KV cache for attention (optional)
 
         /// Sequence lengths for variable-length batching (nullptr = all equal to seq_len)
         /// When set, this enables proper batch-separating attention masks that
@@ -535,7 +535,7 @@ namespace llaminar2
          */
         ComputeGraph buildTransformerLayersGraph(
             TensorBase *input_hidden,
-            ICPUKVCache *kv_cache,
+            IKVCache *kv_cache,
             const int *position_ids,
             DeviceId device);
 
@@ -545,7 +545,7 @@ namespace llaminar2
         ComputeGraph buildLayerGraph(
             int layer_idx,
             TensorBase *input_hidden,
-            ICPUKVCache *kv_cache,
+            IKVCache *kv_cache,
             const int *position_ids,
             DeviceId device);
 
@@ -583,7 +583,7 @@ namespace llaminar2
             int layer_idx,
             int seq_len,
             int batch_size,
-            ICPUKVCache *kv_cache,
+            IKVCache *kv_cache,
             const int *position_ids,
             DeviceId device,
             const std::vector<int> *sequence_lengths = nullptr);

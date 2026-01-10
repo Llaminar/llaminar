@@ -69,8 +69,9 @@
 
 #pragma once
 
-#include "../backends/DeviceType.h" // Shared DeviceType enum
-#include "../backends/DeviceId.h"   // Type-safe device identification
+#include "../backends/DeviceType.h"     // Shared DeviceType enum
+#include "../backends/DeviceId.h"       // Type-safe device identification
+#include "../execution/RuntimeConfig.h" // ActivationPrecision
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -80,6 +81,12 @@
 // Forward declarations
 namespace llaminar2
 {
+    // KVCache types
+    class IKVCache;
+    class ICPUKVCache;
+    class ICUDARingKVCache;
+    class MPIContext;
+    enum class KVCacheLayoutMode : uint8_t;
     class ITensor;
     class CPUTensorBase;
     using TensorBase = CPUTensorBase; // Backward compatibility alias
@@ -91,6 +98,8 @@ namespace llaminar2
     class ITensorResidualAdd;
     class ITensorAttention;
     class ITensorEmbedding;
+    class ITensorFusedQKVGemm;
+    class ITensorFusedGateUpGemm;
     class IQ4_NLTensor;
     class Q4_0Tensor;
     class Q4_1Tensor;
@@ -160,6 +169,58 @@ namespace llaminar
                     return "Unknown";
                 }
             }
+
+            // ==========================================================================
+            // KVCache Configuration
+            // ==========================================================================
+
+            /**
+             * @brief Configuration for KV cache creation
+             *
+             * Encapsulates all parameters needed to create a KV cache, supporting both
+             * CPU and CUDA backends with optional tensor parallelism (sharding).
+             *
+             * @see KernelFactory::createKVCache()
+             */
+            struct KVCacheConfig
+            {
+                // Required parameters
+                ::llaminar2::ActivationPrecision precision = ::llaminar2::ActivationPrecision::FP32;
+                ::llaminar2::DeviceId device = ::llaminar2::DeviceId::cpu();
+                int num_layers = 0;
+                int batch_size = 1;
+                int max_seq_len = 2048;
+                int n_kv_heads = 0;
+                int head_dim = 64;
+
+                // Optional sharding (for tensor parallelism)
+                int local_n_kv_heads = 0; ///< 0 = use full n_kv_heads (no sharding)
+                int kv_head_start = 0;    ///< Starting KV head index for this rank
+
+                // Layout mode - forward declared, defined in CPUKVCache.h
+                ::llaminar2::KVCacheLayoutMode layout_mode{}; // Default-initialized (POSITION_MAJOR = 0)
+
+                // MPI context (required for CPU cache)
+                const ::llaminar2::MPIContext *mpi_ctx = nullptr;
+
+                /**
+                 * @brief Check if this config requests sharded (tensor-parallel) cache
+                 * @return true if local_n_kv_heads > 0 and < n_kv_heads
+                 */
+                bool is_sharded() const
+                {
+                    return local_n_kv_heads > 0 && local_n_kv_heads < n_kv_heads;
+                }
+
+                /**
+                 * @brief Check if this config targets a CUDA device
+                 * @return true if device is a CUDA GPU
+                 */
+                bool is_cuda() const
+                {
+                    return device.is_cuda();
+                }
+            };
 
             /**
              * @brief Centralized kernel factory for device-aware dispatch
@@ -410,6 +471,83 @@ namespace llaminar
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
                     const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+
+                // ==========================================================================
+                // Fused QKV GEMM Kernel Creation
+                // ==========================================================================
+
+                /**
+                 * @brief Create fused QKV GEMM kernel
+                 *
+                 * Creates a kernel that performs three concurrent GEMM operations
+                 * for Q, K, V projections with shared activation quantization.
+                 *
+                 * @param wq Q weight tensor
+                 * @param wk K weight tensor
+                 * @param wv V weight tensor
+                 * @param dev_type Target device type
+                 * @return Kernel instance (caller owns)
+                 */
+                static std::unique_ptr<llaminar2::ITensorFusedQKVGemm> createFusedQKVGemm(
+                    const llaminar2::TensorBase *wq,
+                    const llaminar2::TensorBase *wk,
+                    const llaminar2::TensorBase *wv,
+                    DeviceType dev_type = DeviceType::CPU);
+
+                /**
+                 * @brief Get or create cached fused QKV GEMM kernel
+                 *
+                 * Maintains a cache of kernels keyed by (wq, wk, wv, device_type),
+                 * ensuring weight packing happens only once per set of weights.
+                 *
+                 * @param wq Q weight tensor (used as primary cache key)
+                 * @param wk K weight tensor
+                 * @param wv V weight tensor
+                 * @param dev_type Target device type
+                 * @return Kernel pointer (factory owns lifetime)
+                 */
+                static llaminar2::ITensorFusedQKVGemm *getOrCreateFusedQKVGemm(
+                    const llaminar2::TensorBase *wq,
+                    const llaminar2::TensorBase *wk,
+                    const llaminar2::TensorBase *wv,
+                    DeviceType dev_type = DeviceType::CPU);
+
+                // ==========================================================================
+                // Fused Gate/Up GEMM Kernel Creation
+                // ==========================================================================
+
+                /**
+                 * @brief Create fused Gate/Up GEMM kernel for SwiGLU FFN
+                 *
+                 * Creates a kernel that wraps two individual GEMM kernels for
+                 * gate and up projections. The adapter manages the underlying
+                 * GEMM kernels via KernelFactory::getOrCreateGemm().
+                 *
+                 * @param w_gate Gate weight tensor
+                 * @param w_up Up weight tensor
+                 * @param dev_type Target device type
+                 * @return Kernel instance (caller owns)
+                 */
+                static std::unique_ptr<llaminar2::ITensorFusedGateUpGemm> createFusedGateUpGemm(
+                    const llaminar2::TensorBase *w_gate,
+                    const llaminar2::TensorBase *w_up,
+                    DeviceType dev_type = DeviceType::CPU);
+
+                /**
+                 * @brief Get or create cached fused Gate/Up GEMM kernel
+                 *
+                 * Maintains a cache of kernels keyed by (w_gate, w_up, device_type).
+                 * The cached kernel holds raw pointers to the underlying GEMM kernels.
+                 *
+                 * @param w_gate Gate weight tensor
+                 * @param w_up Up weight tensor
+                 * @param dev_type Target device type
+                 * @return Kernel pointer (factory owns lifetime)
+                 */
+                static llaminar2::ITensorFusedGateUpGemm *getOrCreateFusedGateUpGemm(
+                    const llaminar2::TensorBase *w_gate,
+                    const llaminar2::TensorBase *w_up,
+                    DeviceType dev_type = DeviceType::CPU);
 
                 // ==========================================================================
                 // RoPE Kernel Creation - Device-aware dispatch
@@ -703,6 +841,54 @@ namespace llaminar
                     const llaminar2::ITensor *tensor, DeviceType dev_type);
 
                 // ==========================================================================
+                // KVCache Factory Methods
+                // ==========================================================================
+
+                /**
+                 * @brief Create a KV cache with device-aware dispatch
+                 *
+                 * Dispatches to the appropriate backend based on config.device:
+                 * - CPU device → createCPUKVCache()
+                 * - CUDA device → createCUDAKVCache() (with HAVE_CUDA guard)
+                 *
+                 * @param config KVCacheConfig with all required parameters
+                 * @return Unique pointer to IKVCache (unified interface for CPU/CUDA)
+                 * @throws std::runtime_error if device type is not supported or config is invalid
+                 */
+                static std::unique_ptr<llaminar2::IKVCache> createKVCache(const KVCacheConfig &config);
+
+                /**
+                 * @brief Create a CPU KV cache
+                 *
+                 * Creates either a standard or sharded CPU KV cache based on config:
+                 * - If config.is_sharded() → sharded cache for tensor parallelism
+                 * - Otherwise → standard cache
+                 *
+                 * @param config KVCacheConfig with all required parameters
+                 *               - mpi_ctx must be non-null
+                 * @return Unique pointer to ICPUKVCache implementation
+                 * @throws std::runtime_error if mpi_ctx is null or parameters are invalid
+                 */
+                static std::unique_ptr<llaminar2::ICPUKVCache> createCPUKVCache(const KVCacheConfig &config);
+
+#ifdef HAVE_CUDA
+                /**
+                 * @brief Create a CUDA ring buffer KV cache
+                 *
+                 * Creates a CUDARingKVCache with O(1) append and eviction.
+                 *
+                 * Limitations:
+                 * - Only FP32, BF16, FP16 precisions supported (no Q8_1/Q16_1)
+                 * - Sharded CUDA KV cache not yet supported (logs warning, uses full heads)
+                 *
+                 * @param config KVCacheConfig with CUDA device
+                 * @return Unique pointer to ICUDARingKVCache implementation
+                 * @throws std::runtime_error if precision is not supported
+                 */
+                static std::unique_ptr<llaminar2::ICUDARingKVCache> createCUDAKVCache(const KVCacheConfig &config);
+#endif
+
+                // ==========================================================================
                 // Cached GEMM Kernel API - Pack Once, Use Many
                 // ==========================================================================
 
@@ -880,6 +1066,60 @@ namespace llaminar
                 };
 
                 static std::unordered_map<DeviceTargetedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, DeviceTargetedKeyHash> device_targeted_cache_;
+
+                // Fused QKV GEMM cache - keyed by (wq, wk, wv, device)
+                struct FusedQKVCacheKey
+                {
+                    const llaminar2::TensorBase *wq;
+                    const llaminar2::TensorBase *wk;
+                    const llaminar2::TensorBase *wv;
+                    DeviceType device;
+
+                    bool operator==(const FusedQKVCacheKey &other) const
+                    {
+                        return wq == other.wq && wk == other.wk &&
+                               wv == other.wv && device == other.device;
+                    }
+                };
+
+                struct FusedQKVKeyHash
+                {
+                    size_t operator()(const FusedQKVCacheKey &k) const
+                    {
+                        return std::hash<const void *>()(k.wq) ^
+                               (std::hash<const void *>()(k.wk) << 1) ^
+                               (std::hash<const void *>()(k.wv) << 2) ^
+                               (std::hash<int>()(static_cast<int>(k.device)) << 3);
+                    }
+                };
+
+                static std::unordered_map<FusedQKVCacheKey, std::unique_ptr<llaminar2::ITensorFusedQKVGemm>, FusedQKVKeyHash> fused_qkv_cache_;
+
+                // Fused Gate/Up GEMM cache - keyed by (w_gate, w_up, device)
+                struct FusedGateUpCacheKey
+                {
+                    const llaminar2::TensorBase *w_gate;
+                    const llaminar2::TensorBase *w_up;
+                    DeviceType device;
+
+                    bool operator==(const FusedGateUpCacheKey &other) const
+                    {
+                        return w_gate == other.w_gate && w_up == other.w_up &&
+                               device == other.device;
+                    }
+                };
+
+                struct FusedGateUpKeyHash
+                {
+                    size_t operator()(const FusedGateUpCacheKey &k) const
+                    {
+                        return std::hash<const void *>()(k.w_gate) ^
+                               (std::hash<const void *>()(k.w_up) << 1) ^
+                               (std::hash<int>()(static_cast<int>(k.device)) << 2);
+                    }
+                };
+
+                static std::unordered_map<FusedGateUpCacheKey, std::unique_ptr<llaminar2::ITensorFusedGateUpGemm>, FusedGateUpKeyHash> fused_gate_up_cache_;
             };
 
         } // namespace kernels

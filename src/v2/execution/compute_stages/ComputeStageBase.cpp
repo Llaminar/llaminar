@@ -489,7 +489,9 @@ namespace llaminar2
         LOG_DEBUG("[StageDumpInfo::addInput] Final dtype=" << dtype << " byte_size=" << byte_size);
         size_t element_size = (rows > 0 && cols > 0) ? byte_size / (rows * cols) : sizeof(float);
 
-        inputs.push_back({name, data, rows, cols, dtype, element_size, byte_size});
+        InputBuffer buf{name, data, rows, cols, dtype, element_size, byte_size};
+        buf.tensor = const_cast<ITensor *>(tensor); // Store tensor pointer for coherence
+        inputs.push_back(buf);
         return *this;
     }
 
@@ -532,7 +534,9 @@ namespace llaminar2
         size_t byte_size = computeByteSizeForDtype(dtype, rows, cols);
         size_t element_size = (rows > 0 && cols > 0) ? byte_size / (rows * cols) : sizeof(float);
 
-        outputs.push_back({name, data, rows, cols, dtype, element_size, byte_size});
+        OutputBuffer buf{name, data, rows, cols, dtype, element_size, byte_size};
+        buf.tensor = const_cast<ITensor *>(tensor); // Store tensor pointer for coherence
+        outputs.push_back(buf);
         return *this;
     }
 
