@@ -278,20 +278,30 @@ namespace llaminar2
          * @brief Get device index for attention in a layer (for this rank)
          * @param layer_idx Layer index
          * @return Device index (0 = CPU, 1+ = GPU)
+         * @deprecated Use getLayerPlacement(layer_idx).getAttentionDevice() instead
          */
+        [[deprecated("Use getLayerPlacement(layer_idx).getAttentionDevice() instead")]]
         int getAttentionDevice(int layer_idx) const
         {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
             return getLayerPlacement(layer_idx).getAttentionDeviceIdx();
+#pragma GCC diagnostic pop
         }
 
         /**
          * @brief Get device index for FFN in a layer (for this rank)
          * @param layer_idx Layer index
          * @return Device index (0 = CPU, 1+ = GPU)
+         * @deprecated Use getLayerPlacement(layer_idx).getFFNDevice() instead
          */
+        [[deprecated("Use getLayerPlacement(layer_idx).getFFNDevice() instead")]]
         int getFFNDevice(int layer_idx) const
         {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
             return getLayerPlacement(layer_idx).getFFNDeviceIdx();
+#pragma GCC diagnostic pop
         }
 
         /**

@@ -112,7 +112,7 @@ namespace llaminar2
                 size_t free_bytes = 0, total_bytes = 0;
                 if (hipSetDevice(i) == hipSuccess)
                 {
-                    hipMemGetInfo(&free_bytes, &total_bytes);
+                    (void)hipMemGetInfo(&free_bytes, &total_bytes);
                     dev.free_memory_bytes = free_bytes;
                 }
                 else

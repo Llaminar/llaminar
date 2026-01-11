@@ -148,8 +148,8 @@ TEST_F(IQ3_S_GEMM, QuantizedVsFP32Parity)
             blocks[i].qs[j] = byte_dist(rng);
         }
 
-        // Randomize qh (32 bytes)
-        for (int j = 0; j < 32; ++j)
+        // Randomize qh (8 bytes per IQ3_SBlock)
+        for (int j = 0; j < 8; ++j)
         {
             blocks[i].qh[j] = byte_dist(rng);
         }
@@ -160,8 +160,8 @@ TEST_F(IQ3_S_GEMM, QuantizedVsFP32Parity)
             blocks[i].signs[j] = byte_dist(rng);
         }
 
-        // Randomize scales (8 bytes)
-        for (int j = 0; j < 8; ++j)
+        // Randomize scales (4 bytes per IQ3_SBlock)
+        for (int j = 0; j < 4; ++j)
         {
             blocks[i].scales[j] = byte_dist(rng);
         }

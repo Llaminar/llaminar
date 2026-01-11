@@ -73,7 +73,7 @@ namespace
             -1); // CPU device
 
         // Initialize with test pattern
-        Q16_1Block *blocks = tensor->mutable_q16_1_blocks();
+        Q16_1Block *blocks = tensor->mutable_as_block_32();
         size_t num_blocks = tensor->total_blocks();
 
         for (size_t i = 0; i < num_blocks; ++i)

@@ -48,7 +48,7 @@ public:
         jge(".outer_end", T_NEAR);
 
         // Zero accumulator
-        Zmm zmm_acc = zmm_scratch(0);
+        Zmm zmm_acc = zmm_scratch0();
         vxorps(zmm_acc, zmm_acc, zmm_acc);
 
         // Calculate Wo row pointer: Wo + out_idx * d_model * 4
@@ -64,13 +64,13 @@ public:
         jge(".inner_end", T_NEAR);
 
         // Load context chunk from pointer
-        Zmm zmm_ctx = zmm_scratch(1);
+        Zmm zmm_ctx = zmm_scratch1();
         // Original: lea(rdi, ptr[rsp + context_buffer_offset]); vmovups(zmm_ctx, ptr[rdi + reg_j * 4]);
         // Adapted:
         vmovups(zmm_ctx, ptr[reg_ctx_base + reg_j * 4]);
 
         // Load Wo row chunk
-        Zmm zmm_wo = zmm_scratch(2);
+        Zmm zmm_wo = zmm_scratch2();
         vmovups(zmm_wo, ptr[reg_wo_row + reg_j * 4]);
 
         // FMA: acc += ctx * wo

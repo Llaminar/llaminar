@@ -373,6 +373,15 @@ namespace llaminar::v2::kernels::jit
         static constexpr Xbyak::Zmm zmm_accum6() { return Xbyak::Zmm(llaminar2::jit::Accum6::absolute_index); }
         static constexpr Xbyak::Zmm zmm_accum7() { return Xbyak::Zmm(llaminar2::jit::Accum7::absolute_index); }
 
+        // Scratch registers (zmm20-25) - for direct access when not using borrow system
+        // WARNING: Scratch0-3 alias Score0-3 (xmm20-23)
+        static constexpr Xbyak::Zmm zmm_scratch0() { return Xbyak::Zmm(llaminar2::jit::Scratch0::absolute_index); }
+        static constexpr Xbyak::Zmm zmm_scratch1() { return Xbyak::Zmm(llaminar2::jit::Scratch1::absolute_index); }
+        static constexpr Xbyak::Zmm zmm_scratch2() { return Xbyak::Zmm(llaminar2::jit::Scratch2::absolute_index); }
+        static constexpr Xbyak::Zmm zmm_scratch3() { return Xbyak::Zmm(llaminar2::jit::Scratch3::absolute_index); }
+        static constexpr Xbyak::Zmm zmm_scratch4() { return Xbyak::Zmm(llaminar2::jit::Scratch4::absolute_index); }
+        static constexpr Xbyak::Zmm zmm_scratch5() { return Xbyak::Zmm(llaminar2::jit::Scratch5::absolute_index); }
+
         // ========================================================================
         // Type-to-Register Converters (for template parameters)
         // ========================================================================

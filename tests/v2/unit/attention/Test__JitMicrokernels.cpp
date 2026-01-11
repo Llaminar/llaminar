@@ -144,8 +144,8 @@ namespace llaminar::v2::kernels::jit::test
             mov(rbp, rsp);
 
             // Emit some SIMD operations using helper methods
-            vxorps(zmm_accum(0), zmm_accum(0), zmm_accum(0));
-            vxorps(zmm_scratch(0), zmm_scratch(0), zmm_scratch(0));
+            vxorps(zmm_accum0(), zmm_accum0(), zmm_accum0());
+            vxorps(zmm_scratch0(), zmm_scratch0(), zmm_scratch0());
 
             // Epilogue
             pop(rbp);

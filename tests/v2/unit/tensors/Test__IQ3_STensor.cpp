@@ -111,9 +111,9 @@ protected:
             block.qs[i] = qs_values[i];
         }
 
-        // qh: 16 bytes (high bit for 9-bit grid index, 2 bytes per super-block)
-        std::memset(block.qh, 0, 16);
-        for (size_t i = 0; i < std::min(qh_values.size(), size_t(16)); ++i)
+        // qh: 8 bytes (high bit for 9-bit grid index)
+        std::memset(block.qh, 0, 8);
+        for (size_t i = 0; i < std::min(qh_values.size(), size_t(8)); ++i)
         {
             block.qh[i] = qh_values[i];
         }

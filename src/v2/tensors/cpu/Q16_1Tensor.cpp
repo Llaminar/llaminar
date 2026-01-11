@@ -7,6 +7,11 @@
  * where quantization error accumulation is critical.
  */
 
+// Suppress deprecation warnings for internal usage of mutable_q16_1_blocks()
+// This is the implementation file - we know what we're doing here
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
 #include "CPUTensors.h"
 #include "../../utils/Logger.h"
 #include "../../utils/Assertions.h"
@@ -1717,3 +1722,5 @@ namespace llaminar2
     }
 
 } // namespace llaminar2
+
+#pragma GCC diagnostic pop

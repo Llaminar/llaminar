@@ -141,32 +141,32 @@ TEST_F(Test__PlacementPlan, ToStringProducesOutput)
 // PlacementDevice Tests
 // =============================================================================
 
-TEST(Test__PlacementDevice, ToDeviceIndexMapsCorrectly)
+TEST(Test__PlacementDevice, ToDeviceIdMapsCorrectly)
 {
-    EXPECT_EQ(toDeviceIndex(PlacementDevice::CPU), 0);
-    EXPECT_EQ(toDeviceIndex(PlacementDevice::GPU_0), 1);
-    EXPECT_EQ(toDeviceIndex(PlacementDevice::GPU_1), 2);
-    EXPECT_EQ(toDeviceIndex(PlacementDevice::GPU_2), 3);
-    EXPECT_EQ(toDeviceIndex(PlacementDevice::GPU_3), 4);
-    EXPECT_EQ(toDeviceIndex(PlacementDevice::GPU_ANY), 1);
-    EXPECT_EQ(toDeviceIndex(PlacementDevice::REPLICATED), 0);
+    EXPECT_EQ(toDeviceId(PlacementDevice::CPU), DeviceId::cpu());
+    EXPECT_EQ(toDeviceId(PlacementDevice::GPU_0), DeviceId::cuda(0));
+    EXPECT_EQ(toDeviceId(PlacementDevice::GPU_1), DeviceId::cuda(1));
+    EXPECT_EQ(toDeviceId(PlacementDevice::GPU_2), DeviceId::cuda(2));
+    EXPECT_EQ(toDeviceId(PlacementDevice::GPU_3), DeviceId::cuda(3));
+    EXPECT_EQ(toDeviceId(PlacementDevice::GPU_ANY), DeviceId::cuda(0));
+    EXPECT_EQ(toDeviceId(PlacementDevice::REPLICATED), DeviceId::cpu());
 }
 
 // =============================================================================
 // LayerPlacement Tests
 // =============================================================================
 
-TEST(Test__LayerPlacement, GetDeviceIdxWithoutSplit)
+TEST(Test__LayerPlacement, GetDeviceWithoutSplit)
 {
     LayerPlacement lp;
     lp.device = PlacementDevice::GPU_0;
     lp.split_attention_ffn = false;
 
-    EXPECT_EQ(lp.getAttentionDeviceIdx(), 1); // GPU_0 = device 1
-    EXPECT_EQ(lp.getFFNDeviceIdx(), 1);
+    EXPECT_EQ(lp.getAttentionDevice(), DeviceId::cuda(0)); // GPU_0
+    EXPECT_EQ(lp.getFFNDevice(), DeviceId::cuda(0));
 }
 
-TEST(Test__LayerPlacement, GetDeviceIdxWithSplit)
+TEST(Test__LayerPlacement, GetDeviceWithSplit)
 {
     LayerPlacement lp;
     lp.device = PlacementDevice::CPU;
@@ -174,8 +174,8 @@ TEST(Test__LayerPlacement, GetDeviceIdxWithSplit)
     lp.ffn_device = PlacementDevice::GPU_1;
     lp.split_attention_ffn = true;
 
-    EXPECT_EQ(lp.getAttentionDeviceIdx(), 1); // GPU_0 = device 1
-    EXPECT_EQ(lp.getFFNDeviceIdx(), 2);       // GPU_1 = device 2
+    EXPECT_EQ(lp.getAttentionDevice(), DeviceId::cuda(0)); // GPU_0
+    EXPECT_EQ(lp.getFFNDevice(), DeviceId::cuda(1));       // GPU_1
 }
 
 // =============================================================================
