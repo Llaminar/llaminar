@@ -30,8 +30,11 @@ protected:
 
     BackendThresholds getBackendThresholds() override
     {
+        // CUDA uses per-row symmetric INT8 quantization which accumulates more
+        // error than CPU's per-block Q8_1. Relax thresholds accordingly.
         return {
             .cosine_threshold = 0.99f,
+            .decode_cosine_threshold = 0.985f, // Relaxed for INT8 accumulation error
             .early_layers_count = 6,
             .min_early_layers_passed = 6,
             .kl_threshold = 0.15f};

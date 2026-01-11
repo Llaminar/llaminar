@@ -188,7 +188,8 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[GEMMStage] Got kernel ptr=" << static_cast<const void *>(gemm)
-                                                << " for weight ptr=" << static_cast<const void *>(params_.B));
+                                                << " for weight ITensor*=" << static_cast<const void *>(params_.B)
+                                                << " TensorBase*=" << static_cast<const void *>(B_base));
 
         // Cast to QuantisedGemmKernel for full API access
         auto *qgemm = dynamic_cast<gemm_v4::QuantisedGemmKernel *>(gemm);

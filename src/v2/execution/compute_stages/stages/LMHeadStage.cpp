@@ -73,7 +73,12 @@ namespace llaminar2
         // Get or create GEMM kernel for LM head weight
         // Use device-targeted kernel creation to ensure GPU kernel when needed
         auto target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+        LOG_DEBUG("[LMHeadStage] Requesting kernel with target_dev_type=" << static_cast<int>(target_dev_type)
+                                                                          << " device_id=" << params_.device_id.toKernelDeviceIndex()
+                                                                          << " lm_head_weight=" << (void *)lm_head_weight
+                                                                          << " shape=" << lm_head_weight->shape()[0] << "x" << lm_head_weight->shape()[1]);
         ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(lm_head_weight, target_dev_type);
+        LOG_DEBUG("[LMHeadStage] Got kernel=" << (void *)lm_gemm);
         if (!lm_gemm)
         {
             LOG_ERROR("[LMHeadStage] Failed to get/create LM head GEMM kernel");

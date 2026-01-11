@@ -2695,8 +2695,15 @@ namespace llaminar
                 auto it = device_targeted_cache_.find(key);
                 if (it != device_targeted_cache_.end())
                 {
+                    LOG_DEBUG("[KernelFactory::getOrCreateGemm(tensor,device)] Cache hit: tensor="
+                              << (void *)tensor << " device=" << static_cast<int>(target_device)
+                              << " returning kernel=" << (void *)it->second.get());
                     return it->second.get();
                 }
+
+                LOG_DEBUG("[KernelFactory::getOrCreateGemm(tensor,device)] Cache miss: tensor="
+                          << (void *)tensor << " shape=" << tensor->shape()[0] << "x" << tensor->shape()[1]
+                          << " device=" << static_cast<int>(target_device));
 
                 // Get tensor dimensions for validation
                 const auto &shape = tensor->shape();
@@ -2946,6 +2953,19 @@ namespace llaminar
                     if (it->first.w_gate == tensor || it->first.w_up == tensor)
                     {
                         it = fused_gate_up_cache_.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+
+                // Clear any device-targeted kernels that reference this tensor
+                for (auto it = device_targeted_cache_.begin(); it != device_targeted_cache_.end();)
+                {
+                    if (it->first.tensor == tensor)
+                    {
+                        it = device_targeted_cache_.erase(it);
                     }
                     else
                     {

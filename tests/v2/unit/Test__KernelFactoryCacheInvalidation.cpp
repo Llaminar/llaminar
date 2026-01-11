@@ -510,4 +510,274 @@ TEST_F(Test__KernelFactoryCacheInvalidation, BothCaches_CleanedUpTogether)
     // Note: We can't check tensor->cache_ anymore since tensor is destroyed,
     // but the destructor should have called clearCacheFor which cleans both
 }
+
+// ============================================================================
+// REGRESSION: Device-Targeted Cache Invalidation (GitHub Issue #XXX)
+// ============================================================================
+// These tests verify that device_targeted_cache_ is properly cleared when
+// a tensor is destroyed. This is a regression test for a bug where
+// device-targeted kernels (created via getOrCreateGemm(tensor, DeviceType))
+// were NOT being cleared, causing use-after-free when tensor memory was reused.
+
+TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_CUDA_AutoInvalidation)
+{
+    // This test verifies the bug fix: device_targeted_cache_ entries must be
+    // cleared when a tensor is destroyed.
+    //
+    // Bug scenario:
+    // 1. Create tensor A, create device-targeted CUDA kernel (cached by tensor ptr)
+    // 2. Destroy tensor A (cache entry SHOULD be removed)
+    // 3. Create tensor B at same memory address (memory reuse)
+    // 4. Query cache for tensor B -> WITHOUT FIX: returns stale kernel from A
+    //                                WITH FIX: cache miss, creates new kernel
+
+    const auto &dm = DeviceManager::instance();
+    const auto &devices = dm.devices();
+    bool has_cuda = false;
+
+    for (const auto &dev : devices)
+    {
+        if (dev.type == ComputeBackendType::GPU_CUDA)
+        {
+            has_cuda = true;
+            break;
+        }
+    }
+
+    if (!has_cuda)
+    {
+        GTEST_SKIP() << "No CUDA device available";
+    }
+
+    {
+        auto tensor = createTestTensor();
+
+        // Create device-targeted kernel (this uses device_targeted_cache_)
+        auto *kernel = KernelFactory::getOrCreateGemm(tensor.get(), DeviceType::CUDA);
+        ASSERT_NE(kernel, nullptr);
+
+        // Verify cache has an entry
+        auto [size_during, _] = KernelFactory::cacheStats();
+        EXPECT_GE(size_during, 1u) << "Cache should have at least one entry";
+
+        // tensor goes out of scope here -> destructor should clear cache entry
+    }
+
+    // After destruction, the device-targeted cache entry should be removed
+    // This is the key assertion for the bug fix
+    auto [size_after, _] = KernelFactory::cacheStats();
+    EXPECT_EQ(size_after, 0u)
+        << "REGRESSION: device_targeted_cache_ was not cleared on tensor destruction. "
+           "This causes use-after-free when memory is reused.";
+}
+
+TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_CPU_AutoInvalidation)
+{
+    // Same test but for CPU device-targeted kernels
+    {
+        auto tensor = createTestTensor();
+
+        // Create CPU device-targeted kernel
+        auto *kernel = KernelFactory::getOrCreateGemm(tensor.get(), DeviceType::CPU);
+        ASSERT_NE(kernel, nullptr);
+
+        auto [size_during, _] = KernelFactory::cacheStats();
+        EXPECT_GE(size_during, 1u);
+    }
+
+    auto [size_after, _] = KernelFactory::cacheStats();
+    EXPECT_EQ(size_after, 0u)
+        << "REGRESSION: device_targeted_cache_ (CPU) was not cleared on tensor destruction";
+}
+
+TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_MultipleDevices_IndependentInvalidation)
+{
+    // Test that clearing one tensor doesn't affect device-targeted kernels for other tensors
+
+    const auto &dm = DeviceManager::instance();
+    const auto &devices = dm.devices();
+    bool has_cuda = false;
+
+    for (const auto &dev : devices)
+    {
+        if (dev.type == ComputeBackendType::GPU_CUDA)
+        {
+            has_cuda = true;
+            break;
+        }
+    }
+
+    if (!has_cuda)
+    {
+        GTEST_SKIP() << "No CUDA device available";
+    }
+
+    auto tensor1 = createTestTensor();
+    auto tensor2 = createTestTensor();
+
+    // Create device-targeted kernels for both tensors
+    auto *kernel1 = KernelFactory::getOrCreateGemm(tensor1.get(), DeviceType::CUDA);
+    auto *kernel2 = KernelFactory::getOrCreateGemm(tensor2.get(), DeviceType::CUDA);
+
+    ASSERT_NE(kernel1, nullptr);
+    ASSERT_NE(kernel2, nullptr);
+
+    auto [size_both, _] = KernelFactory::cacheStats();
+    EXPECT_GE(size_both, 2u) << "Should have at least 2 cache entries";
+
+    // Destroy tensor1
+    tensor1.reset();
+
+    // tensor2's kernel should still be in cache
+    auto [size_one, __] = KernelFactory::cacheStats();
+    EXPECT_GE(size_one, 1u) << "tensor2's kernel should still be cached";
+
+    // Verify we can still get tensor2's kernel (cache hit)
+    auto *kernel2_again = KernelFactory::getOrCreateGemm(tensor2.get(), DeviceType::CUDA);
+    EXPECT_EQ(kernel2, kernel2_again) << "Should return same cached kernel for tensor2";
+
+    // Destroy tensor2
+    tensor2.reset();
+
+    // Now cache should be empty
+    auto [size_none, ___] = KernelFactory::cacheStats();
+    EXPECT_EQ(size_none, 0u) << "Cache should be empty after all tensors destroyed";
+}
+
+TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_SameTensorBothDevices)
+{
+    // Test tensor with kernels cached for BOTH CPU and CUDA device types
+    const auto &dm = DeviceManager::instance();
+    const auto &devices = dm.devices();
+    bool has_cuda = false;
+
+    for (const auto &dev : devices)
+    {
+        if (dev.type == ComputeBackendType::GPU_CUDA)
+        {
+            has_cuda = true;
+            break;
+        }
+    }
+
+    if (!has_cuda)
+    {
+        GTEST_SKIP() << "No CUDA device available";
+    }
+
+    {
+        auto tensor = createTestTensor();
+
+        // Create kernels for both device types
+        auto *cpu_kernel = KernelFactory::getOrCreateGemm(tensor.get(), DeviceType::CPU);
+        auto *cuda_kernel = KernelFactory::getOrCreateGemm(tensor.get(), DeviceType::CUDA);
+
+        ASSERT_NE(cpu_kernel, nullptr);
+        ASSERT_NE(cuda_kernel, nullptr);
+        EXPECT_NE(cpu_kernel, cuda_kernel) << "CPU and CUDA kernels should be different";
+
+        auto [size_during, _] = KernelFactory::cacheStats();
+        EXPECT_GE(size_during, 2u) << "Should have entries for both device types";
+
+        // tensor goes out of scope here
+    }
+
+    // Both entries should be cleared
+    auto [size_after, _] = KernelFactory::cacheStats();
+    EXPECT_EQ(size_after, 0u)
+        << "REGRESSION: Both CPU and CUDA device_targeted_cache_ entries should be cleared";
+}
+
+TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_ExplicitClearCacheFor)
+{
+    // Test that explicit clearCacheFor() clears device_targeted_cache_ entries
+
+    const auto &dm = DeviceManager::instance();
+    const auto &devices = dm.devices();
+    bool has_cuda = false;
+
+    for (const auto &dev : devices)
+    {
+        if (dev.type == ComputeBackendType::GPU_CUDA)
+        {
+            has_cuda = true;
+            break;
+        }
+    }
+
+    if (!has_cuda)
+    {
+        GTEST_SKIP() << "No CUDA device available";
+    }
+
+    auto tensor = createTestTensor();
+
+    // Create device-targeted kernel
+    auto *kernel = KernelFactory::getOrCreateGemm(tensor.get(), DeviceType::CUDA);
+    ASSERT_NE(kernel, nullptr);
+
+    auto [size_before, _] = KernelFactory::cacheStats();
+    EXPECT_GE(size_before, 1u);
+
+    // Explicitly clear cache for this tensor
+    KernelFactory::clearCacheFor(tensor.get());
+
+    // Entry should be removed
+    auto [size_after, __] = KernelFactory::cacheStats();
+    EXPECT_EQ(size_after, 0u)
+        << "clearCacheFor should remove device_targeted_cache_ entries";
+
+    // Creating a new kernel should result in a cache miss (new kernel)
+    auto *kernel_new = KernelFactory::getOrCreateGemm(tensor.get(), DeviceType::CUDA);
+    ASSERT_NE(kernel_new, nullptr);
+    // Note: kernel_new might equal kernel if the factory creates the same type,
+    // but the key point is the cache was cleared
+}
+
+TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_MemoryReuseSimulation)
+{
+    // This test simulates the exact scenario that caused the original bug:
+    // Memory reuse after tensor destruction leading to stale cache hits.
+    //
+    // We can't force memory reuse, but we can verify the cache is clean
+    // after destruction, which prevents the bug.
+
+    const auto &dm = DeviceManager::instance();
+    const auto &devices = dm.devices();
+    bool has_cuda = false;
+
+    for (const auto &dev : devices)
+    {
+        if (dev.type == ComputeBackendType::GPU_CUDA)
+        {
+            has_cuda = true;
+            break;
+        }
+    }
+
+    if (!has_cuda)
+    {
+        GTEST_SKIP() << "No CUDA device available";
+    }
+
+    // Simulate the bug scenario by rapidly creating/destroying tensors
+    // and checking that the cache stays clean
+
+    for (int i = 0; i < 10; ++i)
+    {
+        {
+            auto tensor = createTestTensor();
+            auto *kernel = KernelFactory::getOrCreateGemm(tensor.get(), DeviceType::CUDA);
+            ASSERT_NE(kernel, nullptr);
+            // tensor destroyed here
+        }
+
+        // After each destruction, cache should be empty
+        auto [size, _] = KernelFactory::cacheStats();
+        EXPECT_EQ(size, 0u)
+            << "REGRESSION: Iteration " << i << " - cache should be empty after tensor destruction. "
+                                                "Memory reuse could cause stale cache hits if not properly invalidated.";
+    }
+}
+
 #endif // HAVE_CUDA

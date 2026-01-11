@@ -82,27 +82,35 @@ namespace llaminar2
     public:
         virtual ~ICPUKVCache() = default;
 
-        // Metadata
+        // =====================================================================
+        // IKVCache Interface (public API)
+        // =====================================================================
+
+        // Metadata (IKVCache)
         virtual ActivationPrecision precision() const = 0;
         int n_layers() const override { return num_layers(); }
-        virtual int num_layers() const = 0;
-        virtual int batch_size() const = 0;
         virtual int max_seq_len() const = 0;
-
-        // Layout mode
-        virtual KVCacheLayoutMode layout_mode() const = 0;
         virtual TensorLayout kv_layout() const = 0;
 
-        // Sharding (Tensor Parallelism) info
-        virtual bool is_sharded() const = 0;      ///< True if using local KV heads
-        virtual int n_kv_heads() const = 0;       ///< Total KV heads (across all ranks)
-        virtual int local_n_kv_heads() const = 0; ///< Local KV heads (this rank)
-        virtual int kv_head_start() const = 0;    ///< Starting KV head index
-        virtual int local_kv_dim() const = 0;     ///< local_n_kv_heads * head_dim
-
-        // Per-sequence token tracking
+        // Per-sequence token tracking (IKVCache)
         virtual int get_cached_tokens(int layer, int seq_idx = 0) const = 0;
 
+        // Sharding (Tensor Parallelism) info (IKVCache)
+        virtual bool is_sharded() const = 0;      ///< True if using local KV heads
+        virtual int local_n_kv_heads() const = 0; ///< Local KV heads (this rank)
+        virtual int local_kv_dim() const = 0;     ///< local_n_kv_heads * head_dim
+        virtual int kv_head_start() const = 0;    ///< Starting KV head index
+
+        // =====================================================================
+        // CPU-Specific Methods (exposed for testing and internal use)
+        // =====================================================================
+
+        virtual int num_layers() const = 0;
+        virtual int batch_size() const = 0;
+        virtual KVCacheLayoutMode layout_mode() const = 0;
+        virtual int n_kv_heads() const = 0; ///< Total KV heads (across all ranks)
+
+    public:
         // =================================================================
         // Unified KV Access (preferred interface)
         // =================================================================
@@ -143,16 +151,60 @@ namespace llaminar2
         // =================================================================
 
         /// @deprecated Use get_kv() instead
-        virtual ITensor *get_k(int layer, int seq_idx = 0) = 0;
+        ITensor *get_k(int layer, int seq_idx = 0) override = 0;
         /// @deprecated Use get_kv() instead
-        virtual const ITensor *get_k(int layer, int seq_idx = 0) const = 0;
+        const ITensor *get_k(int layer, int seq_idx = 0) const override = 0;
         /// @deprecated Use get_kv() instead
-        virtual ITensor *get_v(int layer, int seq_idx = 0) = 0;
+        ITensor *get_v(int layer, int seq_idx = 0) override = 0;
         /// @deprecated Use get_kv() instead
-        virtual const ITensor *get_v(int layer, int seq_idx = 0) const = 0;
+        const ITensor *get_v(int layer, int seq_idx = 0) const override = 0;
+
+        // =================================================================
+        // IKVCache interface bridging
+        // =================================================================
+
+        // Bridge IKVCache::append(ITensor*) to ICPUKVCache::append_kv(TensorBase*)
+        // dynamic_cast required due to virtual inheritance in ITensor hierarchy
+        bool append(int layer, int seq_idx, const ITensor *K, const ITensor *V, int num_tokens) override
+        {
+            return append_kv(layer, seq_idx,
+                             dynamic_cast<const TensorBase *>(K),
+                             dynamic_cast<const TensorBase *>(V),
+                             num_tokens);
+        }
+
+        // Bring in IKVCache convenience overloads
+        using IKVCache::append;
+
+        // IKVCache::gather_kv_batched bridge (uses ITensor*, delegates to TensorBase* version)
+        int gather_kv_batched(
+            int layer,
+            int num_sequences,
+            ITensor *out_k,
+            ITensor *out_v,
+            std::vector<int> &out_kv_lens) override
+        {
+            // dynamic_cast required due to virtual inheritance in ITensor hierarchy
+            return gather_kv_batched(layer, num_sequences,
+                                     dynamic_cast<TensorBase *>(out_k),
+                                     dynamic_cast<TensorBase *>(out_v),
+                                     out_kv_lens);
+        }
+
+        // Cache management (IKVCache)
+        void clear() override = 0;
+        void clear_sequence(int layer, int seq_idx) override = 0;
+        void clear_layer(int layer) override = 0;
+
+        // Bring in IKVCache::clear_sequence(seq_idx) default implementation
+        using IKVCache::clear_sequence;
+
+        // =================================================================
+        // CPU-Specific Methods (for testing and internal use)
+        // =================================================================
 
         /**
-         * @brief Append K/V to cache for a sequence
+         * @brief Append K/V to cache for a sequence (TensorBase version)
          *
          * @param layer Layer index
          * @param seq_idx Sequence index (default 0 for single-sequence mode)
@@ -179,19 +231,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Gather K/V from multiple cache slots into batched output tensors
-         *
-         * This method copies K/V from cache slots [0..batch_size-1] into contiguous
-         * output tensors suitable for batched attention computation.
-         *
-         * For batched decode, each sequence may have different kv_len. This method
-         * handles variable lengths by:
-         * 1. Finding the maximum kv_len across all sequences
-         * 2. Copying each sequence's K/V to its slot (with implicit zero-padding)
-         * 3. Returning per-sequence kv_lens for masking
-         *
-         * Output tensor layout: [batch_size * max_kv_len, kv_dim]
-         * where each sequence's K/V occupies [seq_idx * max_kv_len, (seq_idx+1) * max_kv_len)
+         * @brief Gather K/V from multiple cache slots into batched output tensors (TensorBase version)
          *
          * @param layer Layer index
          * @param num_sequences Number of sequences to gather (typically batch_size)
@@ -207,47 +247,9 @@ namespace llaminar2
             TensorBase *out_v,
             std::vector<int> &out_kv_lens) = 0;
 
-        // IKVCache::gather_kv_batched bridge
-        int gather_kv_batched(
-            int layer,
-            int num_sequences,
-            ITensor *out_k,
-            ITensor *out_v,
-            std::vector<int> &out_kv_lens) override
-        {
-            // dynamic_cast required due to virtual inheritance in ITensor hierarchy
-            return gather_kv_batched(layer, num_sequences,
-                                     dynamic_cast<TensorBase *>(out_k),
-                                     dynamic_cast<TensorBase *>(out_v),
-                                     out_kv_lens);
-        }
-
-        // Cache management
-        void clear() override = 0;
-        void clear_sequence(int layer, int seq_idx) override = 0;
-        void clear_layer(int layer) override = 0;
+        // Eviction operations
         virtual void evict_oldest(int tokens_to_evict) = 0;
         virtual void evict_oldest_from_sequence(int seq_idx, int tokens_to_evict) = 0;
-
-        // Bring in IKVCache::clear_sequence(seq_idx) default implementation
-        using IKVCache::clear_sequence;
-
-        // =================================================================
-        // IKVCache interface bridging
-        // =================================================================
-
-        // Bridge IKVCache::append(ITensor*) to ICPUKVCache::append_kv(TensorBase*)
-        // dynamic_cast required due to virtual inheritance in ITensor hierarchy
-        bool append(int layer, int seq_idx, const ITensor *K, const ITensor *V, int num_tokens) override
-        {
-            return append_kv(layer, seq_idx,
-                             dynamic_cast<const TensorBase *>(K),
-                             dynamic_cast<const TensorBase *>(V),
-                             num_tokens);
-        }
-
-        // Bring in IKVCache convenience overloads
-        using IKVCache::append;
 
         // Device placement
         virtual DeviceId get_layer_device(int layer) const = 0;
@@ -403,12 +405,9 @@ namespace llaminar2
 
         // ICPUKVCache interface implementation
         ActivationPrecision precision() const override { return Precision; }
-        int num_layers() const override { return n_layers_; }
-        int batch_size() const override { return batch_size_; }
         int max_seq_len() const override { return max_seq_len_; }
 
         // Layout mode accessors
-        KVCacheLayoutMode layout_mode() const override { return layout_mode_; }
         TensorLayout kv_layout() const override
         {
             return (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
@@ -436,6 +435,31 @@ namespace llaminar2
         ITensor *get_v(int layer, int seq_idx = 0) override;
         const ITensor *get_v(int layer, int seq_idx = 0) const override;
 
+        void clear() override;
+        void clear_sequence(int layer, int seq_idx) override;
+        void clear_layer(int layer) override;
+
+        // Bring in IKVCache::clear_sequence(seq_idx) default implementation
+        using ICPUKVCache::clear_sequence;
+
+        // =====================================================================
+        // Sharding (Tensor Parallelism) Accessors (IKVCache interface)
+        // =====================================================================
+
+        bool is_sharded() const override { return is_sharded_; }
+        int local_n_kv_heads() const override { return local_n_kv_heads_; }
+        int kv_head_start() const override { return kv_head_start_; }
+        int local_kv_dim() const override { return kv_dim_; }
+
+        // =====================================================================
+        // CPU-Specific Methods (exposed for testing and internal use)
+        // =====================================================================
+
+        int num_layers() const override { return n_layers_; }
+        int batch_size() const override { return batch_size_; }
+        KVCacheLayoutMode layout_mode() const override { return layout_mode_; }
+        int n_kv_heads() const override { return n_kv_heads_; }
+
         bool append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v) override;
         bool append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v, int num_tokens) override;
 
@@ -445,65 +469,19 @@ namespace llaminar2
         int gather_kv_batched(int layer, int num_sequences, TensorBase *out_k, TensorBase *out_v,
                               std::vector<int> &out_kv_lens) override;
 
-        void clear() override;
-        void clear_sequence(int layer, int seq_idx) override;
-        void clear_layer(int layer) override;
         void evict_oldest(int tokens_to_evict) override;
         void evict_oldest_from_sequence(int seq_idx, int tokens_to_evict) override;
-
-        // Bring in IKVCache::clear_sequence(seq_idx) default implementation
-        using ICPUKVCache::clear_sequence;
 
         DeviceId get_layer_device(int layer) const override;
         int get_total_evicted() const override { return total_evicted_; }
         void reset_eviction_counter() override { total_evicted_ = 0; }
 
         // =====================================================================
-        // Sharding (Tensor Parallelism) Accessors
-        // =====================================================================
-
-        /**
-         * @brief Check if cache is sharded (local heads only)
-         */
-        bool is_sharded() const override { return is_sharded_; }
-
-        /**
-         * @brief Get total KV heads (across all ranks)
-         */
-        int n_kv_heads() const override { return n_kv_heads_; }
-
-        /**
-         * @brief Get local KV heads (this rank's heads, == n_kv_heads if not sharded)
-         */
-        int local_n_kv_heads() const override { return local_n_kv_heads_; }
-
-        /**
-         * @brief Get starting KV head index for this rank (0 if not sharded)
-         */
-        int kv_head_start() const override { return kv_head_start_; }
-
-        /**
-         * @brief Get local KV dimension (local_n_kv_heads * head_dim)
-         */
-        int local_kv_dim() const override { return kv_dim_; }
-
-        // =====================================================================
         // Typed accessors (for direct use when precision is known at compile time)
         // =====================================================================
 
-        /**
-         * @brief Get typed K cache for specific layer and sequence
-         */
         std::shared_ptr<TensorT> get_k_typed(int layer, int seq_idx = 0) const;
-
-        /**
-         * @brief Get typed V cache for specific layer and sequence
-         */
         std::shared_ptr<TensorT> get_v_typed(int layer, int seq_idx = 0) const;
-
-        /**
-         * @brief Append new K/V to cache (typed version - zero-copy for matching precision)
-         */
         bool append_kv_typed(int layer, int seq_idx, const TensorT *new_k, const TensorT *new_v);
         bool append_kv_typed(int layer, int seq_idx, const TensorT *new_k, const TensorT *new_v, int num_tokens);
 

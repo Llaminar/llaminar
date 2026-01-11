@@ -19,6 +19,7 @@
 namespace llaminar2
 {
     // Forward declarations
+    class ITensor; // Device-agnostic tensor interface
     class CPUTensorBase;
     using TensorBase = CPUTensorBase; // Backward compatibility alias
     struct Q8_1Block;                 // For apply_q8_1() interface
@@ -1756,12 +1757,16 @@ namespace llaminar2
          * The output tensor is indexed as output[seq, head, dim], so each rank writes
          * to output[:, head_start:head_start+local_n_heads, :]. After computation,
          * an AllGather is needed to combine results (handled by caller).
+         *
+         * Note: Uses ITensor* (not TensorBase*) to support both CPU tensors and GPU
+         * tensor wrappers (e.g., GpuTensorView from KV cache). Implementations extract
+         * GPU pointers via gpu_data_ptr() or CPU data via dynamic_cast to TensorBase.
          */
         virtual bool compute_tensor(
-            const TensorBase *Q,
-            const TensorBase *K,
-            const TensorBase *V,
-            TensorBase *output,
+            const ITensor *Q,
+            const ITensor *K,
+            const ITensor *V,
+            ITensor *output,
             int batch_size,
             int seq_len,
             int kv_len,
@@ -1770,8 +1775,8 @@ namespace llaminar2
             int head_dim,
             bool causal = false,
             int window_size = -1,
-            TensorBase *workspace_scores = nullptr,
-            TensorBase *workspace_mask = nullptr,
+            ITensor *workspace_scores = nullptr,
+            ITensor *workspace_mask = nullptr,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             int head_start = 0,        ///< First query head (TP slice start)

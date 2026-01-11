@@ -1386,12 +1386,15 @@ namespace llaminar2
          * For tensor parallelism across N ranks:
          *   Rank i: head_start = i * (n_heads/N), local_n_heads = n_heads/N
          * The caller is responsible for AllGather to combine output slices.
+         *
+         * Note: Accepts ITensor* for interface compatibility but requires TensorBase*
+         * underneath (CPU tensors only). GPU tensors will fail with an error.
          */
         bool compute_tensor(
-            const TensorBase *Q,
-            const TensorBase *K,
-            const TensorBase *V,
-            TensorBase *output,
+            const ITensor *Q,
+            const ITensor *K,
+            const ITensor *V,
+            ITensor *output,
             int batch_size,
             int seq_len,
             int kv_len,
@@ -1400,14 +1403,29 @@ namespace llaminar2
             int head_dim,
             bool causal = false,
             int window_size = -1,
-            TensorBase *workspace_scores = nullptr,
-            TensorBase *workspace_mask = nullptr,
+            ITensor *workspace_scores = nullptr,
+            ITensor *workspace_mask = nullptr,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             int head_start = 0,
             int local_n_heads = -1,
             int local_n_kv_heads = -1) override
         {
+            // Cast ITensor* to TensorBase* - CPU kernel requires CPU tensors
+            const TensorBase *Q_base = dynamic_cast<const TensorBase *>(Q);
+            const TensorBase *K_base = dynamic_cast<const TensorBase *>(K);
+            const TensorBase *V_base = dynamic_cast<const TensorBase *>(V);
+            TensorBase *output_base = dynamic_cast<TensorBase *>(output);
+            TensorBase *workspace_scores_base = dynamic_cast<TensorBase *>(workspace_scores);
+            TensorBase *workspace_mask_base = dynamic_cast<TensorBase *>(workspace_mask);
+
+            if ((Q && !Q_base) || (K && !K_base) || (V && !V_base) || (output && !output_base))
+            {
+                LOG_ERROR("[CPUAttentionKernelT::compute_tensor] GPU tensors not supported - "
+                          << "requires CPU TensorBase");
+                return false;
+            }
+
             // Resolve defaults: -1 means use all heads
             const int actual_local_n_heads = (local_n_heads < 0) ? n_heads : local_n_heads;
             const int actual_local_n_kv_heads = (local_n_kv_heads < 0) ? n_kv_heads : local_n_kv_heads;
@@ -1444,7 +1462,7 @@ namespace llaminar2
 
             // Suppress unused variable warnings for TP parameters until implemented
             (void)actual_local_n_kv_heads;
-            if (!Q || !K || !V || !output)
+            if (!Q_base || !K_base || !V_base || !output_base)
             {
                 LOG_ERROR("[CPUAttentionKernelT::compute_tensor] Null tensor provided");
                 return false;
@@ -1465,10 +1483,10 @@ namespace llaminar2
                     return TensorType::FP32; // Default
             }();
 
-            if (Q->native_type() != expected_type)
+            if (Q_base->native_type() != expected_type)
             {
                 LOG_ERROR("[CPUAttentionKernelT::compute_tensor] Q tensor type mismatch: expected "
-                          << static_cast<int>(expected_type) << ", got " << static_cast<int>(Q->native_type()));
+                          << static_cast<int>(expected_type) << ", got " << static_cast<int>(Q_base->native_type()));
                 return false;
             }
 
@@ -1481,10 +1499,10 @@ namespace llaminar2
             if constexpr (Precision == ActivationPrecision::Q8_1)
             {
                 // Q8_1 path: use block pointers cast to float* (kernel interprets internally)
-                auto Q_q8_1 = static_cast<const Q8_1Tensor *>(Q);
-                auto K_q8_1 = static_cast<const Q8_1Tensor *>(K);
-                auto V_q8_1 = static_cast<const Q8_1Tensor *>(V);
-                auto out_q8_1 = static_cast<Q8_1Tensor *>(output);
+                auto Q_q8_1 = static_cast<const Q8_1Tensor *>(Q_base);
+                auto K_q8_1 = static_cast<const Q8_1Tensor *>(K_base);
+                auto V_q8_1 = static_cast<const Q8_1Tensor *>(V_base);
+                auto out_q8_1 = static_cast<Q8_1Tensor *>(output_base);
 
                 Q_ptr = reinterpret_cast<const float *>(Q_q8_1->typed_data());
                 K_ptr = reinterpret_cast<const float *>(K_q8_1->typed_data());
@@ -1494,10 +1512,10 @@ namespace llaminar2
             else
             {
                 // FP32/BF16/FP16 path: use data() pointers
-                Q_ptr = Q->data();
-                K_ptr = K->data();
-                V_ptr = V->data();
-                output_ptr = output->mutable_data();
+                Q_ptr = Q_base->data();
+                K_ptr = K_base->data();
+                V_ptr = V_base->data();
+                output_ptr = output_base->mutable_data();
             }
 
             // Dispatch to batch or single-sequence compute
@@ -1507,7 +1525,7 @@ namespace llaminar2
                     Q_ptr, K_ptr, V_ptr, output_ptr,
                     batch_size, seq_len, n_heads, n_kv_heads, head_dim,
                     causal, window_size,
-                    workspace_scores, nullptr, nullptr, workspace_mask,
+                    workspace_scores_base, nullptr, nullptr, workspace_mask_base,
                     false, mpi_ctx, device_idx);
             }
             else
@@ -1519,7 +1537,7 @@ namespace llaminar2
                         Q_ptr, K_ptr, V_ptr, output_ptr,
                         seq_len, kv_len, n_heads, n_kv_heads, head_dim,
                         causal, window_size,
-                        workspace_scores, nullptr, nullptr, workspace_mask,
+                        workspace_scores_base, nullptr, nullptr, workspace_mask_base,
                         false, mpi_ctx, device_idx);
                 }
                 else
@@ -1528,7 +1546,7 @@ namespace llaminar2
                         Q_ptr, K_ptr, V_ptr, output_ptr,
                         seq_len, n_heads, n_kv_heads, head_dim,
                         causal, window_size,
-                        workspace_scores, nullptr, nullptr, workspace_mask,
+                        workspace_scores_base, nullptr, nullptr, workspace_mask_base,
                         false, mpi_ctx, device_idx);
                 }
             }

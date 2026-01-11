@@ -38,6 +38,7 @@
 #include <cuda_bf16.h>
 #include <vector>
 #include <memory>
+#include <array>
 
 namespace llaminar2
 {
@@ -61,53 +62,87 @@ namespace llaminar2
         virtual ~ICUDARingKVCache() = default;
 
         // =====================================================================
-        // Metadata
+        // IKVCache Interface (public API)
         // =====================================================================
 
         virtual ActivationPrecision precision() const = 0;
         int n_layers() const override { return num_layers(); }
+        int max_seq_len() const override = 0;
+
+        // Per-sequence token tracking (IKVCache)
+        int get_cached_tokens(int layer, int seq_idx = 0) const override = 0;
+
+        // Cache management (IKVCache)
+        virtual void clear() = 0;
+        virtual void clear_sequence(int layer, int seq_idx) = 0;
+        virtual void clear_layer(int layer) = 0;
+
+        // =====================================================================
+        // ITensor Access (IKVCache interface via get_k/get_v)
+        // =====================================================================
+
+        /**
+         * @brief Get K/V as ITensor pointers
+         *
+         * NOTE: For CUDA caches, this creates temporary GpuTensorView wrappers
+         * around device buffers. Prefer get_kv_for_attention() for performance.
+         */
+        bool get_kv(int layer, int seq_idx,
+                    ITensor **out_k, ITensor **out_v,
+                    int *out_kv_len = nullptr) override
+        {
+            (void)layer;
+            (void)seq_idx;
+            (void)out_k;
+            (void)out_v;
+            (void)out_kv_len;
+            return false; // Implemented by concrete class
+        }
+
+        bool get_kv(int layer, int seq_idx,
+                    const ITensor **out_k, const ITensor **out_v,
+                    int *out_kv_len = nullptr) const override
+        {
+            (void)layer;
+            (void)seq_idx;
+            (void)out_k;
+            (void)out_v;
+            (void)out_kv_len;
+            return false; // Implemented by concrete class
+        }
+
+        /**
+         * @brief Append K/V from ITensor pointers (IKVCache interface)
+         *
+         * Extracts device pointers from tensors and delegates to the
+         * void* append method.
+         */
+        bool append(int layer, int seq_idx,
+                    const ITensor *K, const ITensor *V,
+                    int num_tokens) override;
+
+        // Bring in convenience overloads from IKVCache
+        using IKVCache::append;
+        using IKVCache::clear_sequence;
+        using IKVCache::get_kv;
+
+        // =====================================================================
+        // CUDA-Specific Methods (device pointer APIs)
+        // These are exposed for CUDA attention kernels and testing.
+        // =====================================================================
+
         virtual int num_layers() const = 0;
         virtual int batch_size() const = 0;
-        int max_seq_len() const override = 0;
         virtual int n_kv_heads() const = 0;
         virtual int head_dim() const = 0;
         virtual int kv_dim() const = 0; ///< n_kv_heads * head_dim
 
-        // =====================================================================
-        // Per-Sequence State
-        // =====================================================================
-
-        /**
-         * @brief Get number of cached tokens for a sequence
-         */
-        int get_cached_tokens(int layer, int seq_idx = 0) const override = 0;
-
-        /**
-         * @brief Get head (write) position for a sequence
-         */
+        // Ring buffer state
         virtual int get_head_position(int layer, int seq_idx = 0) const = 0;
-
-        /**
-         * @brief Check if buffer is wrapped (tail > head)
-         *
-         * If not wrapped, attention can read directly without linearization.
-         */
         virtual bool is_wrapped(int layer, int seq_idx = 0) const = 0;
 
-        // =====================================================================
-        // Append Operations
-        // =====================================================================
-
         /**
-         * @brief Append K/V tokens to cache (type-erased)
-         *
-         * @param layer Layer index
-         * @param seq_idx Sequence index
-         * @param d_k Device pointer to K data [num_tokens, kv_dim]
-         * @param d_v Device pointer to V data [num_tokens, kv_dim]
-         * @param num_tokens Number of tokens to append
-         * @param stream CUDA stream (0 for default)
-         * @return true on success, false if would exceed capacity
+         * @brief Append K/V tokens to cache (device pointer version)
          */
         virtual bool append(int layer, int seq_idx,
                             const void *d_k, const void *d_v,
@@ -120,23 +155,8 @@ namespace llaminar2
             return append(layer, 0, d_k, d_v, num_tokens, stream);
         }
 
-        // =====================================================================
-        // Read Operations
-        // =====================================================================
-
         /**
          * @brief Get K/V pointers for attention computation
-         *
-         * If buffer is contiguous (not wrapped), returns direct pointers.
-         * If wrapped, returns pointers to linearized scratch buffers.
-         *
-         * @param layer Layer index
-         * @param seq_idx Sequence index
-         * @param d_k_out Output: pointer to K data
-         * @param d_v_out Output: pointer to V data
-         * @param kv_len Output: number of valid tokens
-         * @param stream CUDA stream for potential linearization
-         * @return true on success
          */
         virtual bool get_kv_for_attention(int layer, int seq_idx,
                                           const void **d_k_out, const void **d_v_out,
@@ -152,17 +172,6 @@ namespace llaminar2
 
         /**
          * @brief Force linearization to external buffer
-         *
-         * Always copies to provided buffer, regardless of wrap state.
-         * Use when attention kernel requires specific memory layout.
-         *
-         * @param layer Layer index
-         * @param seq_idx Sequence index
-         * @param d_k_out Output K buffer [kv_len, kv_dim]
-         * @param d_v_out Output V buffer [kv_len, kv_dim]
-         * @param kv_len Output: number of tokens copied
-         * @param stream CUDA stream
-         * @return true on success
          */
         virtual bool linearize_to(int layer, int seq_idx,
                                   void *d_k_out, void *d_v_out,
@@ -172,165 +181,35 @@ namespace llaminar2
         // Eviction (O(1) - pointer arithmetic only)
         // =====================================================================
 
-        /**
-         * @brief Evict oldest tokens from a sequence
-         *
-         * O(1) operation - only updates tail pointer (via count decrement).
-         * No memory copies or kernel launches.
-         *
-         * @param layer Layer index
-         * @param seq_idx Sequence index
-         * @param num_tokens Number of oldest tokens to evict
-         */
         virtual void evict_oldest(int layer, int seq_idx, int num_tokens) = 0;
 
-        // Convenience for single-sequence mode
         void evict_oldest(int layer, int num_tokens)
         {
             evict_oldest(layer, 0, num_tokens);
         }
 
-        /**
-         * @brief Evict oldest tokens from all sequences in a layer
-         */
         virtual void evict_oldest_layer(int layer, int num_tokens) = 0;
 
         // =====================================================================
         // Batched Operations
         // =====================================================================
 
-        /**
-         * @brief Gather K/V from multiple sequences for batched attention
-         *
-         * Copies K/V from sequences [0..num_seqs-1] into contiguous output
-         * tensors with padding to max_kv_len.
-         *
-         * Output layout: [num_seqs * max_kv_len, kv_dim]
-         *
-         * @param layer Layer index
-         * @param num_seqs Number of sequences to gather
-         * @param d_k_out Output K tensor
-         * @param d_v_out Output V tensor
-         * @param kv_lens Output: per-sequence kv_lens (size = num_seqs)
-         * @param max_kv_len Maximum kv_len (for padding)
-         * @param stream CUDA stream
-         * @return Actual max kv_len found, or -1 on error
-         */
         virtual int gather_kv_batched(int layer, int num_seqs,
                                       void *d_k_out, void *d_v_out,
                                       int *kv_lens, int max_kv_len,
                                       cudaStream_t stream = 0) = 0;
 
-        // =====================================================================
-        // Cache Management
-        // =====================================================================
-
-        /**
-         * @brief Clear all cached tokens
-         */
-        virtual void clear() = 0;
-
-        /**
-         * @brief Clear a specific sequence
-         */
-        virtual void clear_sequence(int layer, int seq_idx) = 0;
-
-        /**
-         * @brief Clear all sequences in a layer
-         */
-        virtual void clear_layer(int layer) = 0;
+        // Bring in IKVCache::gather_kv_batched(ITensor*) to avoid hiding
+        using IKVCache::gather_kv_batched;
 
         // =====================================================================
         // Statistics
         // =====================================================================
 
-        /**
-         * @brief Get total evicted token count (across all sequences)
-         */
         virtual int get_total_evicted() const = 0;
-
-        /**
-         * @brief Reset eviction counter
-         */
         virtual void reset_eviction_counter() = 0;
-
-        /**
-         * @brief Get number of linearizations performed (for profiling)
-         */
         virtual int get_linearization_count() const = 0;
-
-        /**
-         * @brief Reset linearization counter
-         */
         virtual void reset_linearization_counter() = 0;
-
-        // =====================================================================
-        // IKVCache Interface Implementation
-        // =====================================================================
-        // CUDA KV cache primarily uses device pointer APIs (get_kv_for_attention,
-        // append with void*). These IKVCache methods provide the ITensor-based
-        // interface for compatibility with GraphOrchestrator.
-
-        /**
-         * @brief Get K/V as ITensor pointers
-         *
-         * NOTE: For CUDA caches, this creates temporary CUDATensor wrappers
-         * around device buffers. Prefer get_kv_for_attention() for performance.
-         *
-         * @return false - not yet implemented, use get_kv_for_attention() directly
-         */
-        bool get_kv(int layer, int seq_idx,
-                    ITensor **out_k, ITensor **out_v,
-                    int *out_kv_len = nullptr) override
-        {
-            // TODO: Implement with CUDATensor wrappers if needed
-            // For now, CUDA attention kernels use get_kv_for_attention() directly
-            (void)layer;
-            (void)seq_idx;
-            (void)out_k;
-            (void)out_v;
-            (void)out_kv_len;
-            return false;
-        }
-
-        bool get_kv(int layer, int seq_idx,
-                    const ITensor **out_k, const ITensor **out_v,
-                    int *out_kv_len = nullptr) const override
-        {
-            // TODO: Implement with CUDATensor wrappers if needed
-            (void)layer;
-            (void)seq_idx;
-            (void)out_k;
-            (void)out_v;
-            (void)out_kv_len;
-            return false;
-        }
-
-        /**
-         * @brief Append K/V from ITensor pointers
-         *
-         * Extracts device pointers from tensors and delegates to the
-         * void* append method. Tensors must have GPU data available
-         * (call ensureOnDevice() before if needed).
-         *
-         * @param layer Layer index
-         * @param seq_idx Sequence index
-         * @param K Key tensor with GPU data
-         * @param V Value tensor with GPU data
-         * @param num_tokens Number of tokens to append
-         * @return true on success, false if tensors lack GPU data or append fails
-         *
-         * @note Implementation in CUDARingKVCacheTensorAdapter.cpp to avoid
-         *       including heavy tensor headers in CUDA code.
-         */
-        bool append(int layer, int seq_idx,
-                    const ITensor *K, const ITensor *V,
-                    int num_tokens) override;
-
-        // Bring in convenience overloads from IKVCache
-        using IKVCache::append;
-        using IKVCache::clear_sequence;
-        using IKVCache::get_kv;
     };
 
     // =========================================================================
@@ -453,18 +332,39 @@ namespace llaminar2
         CUDARingKVCache &operator=(CUDARingKVCache &&) = delete;
 
         // =====================================================================
-        // ICUDARingKVCache Interface Implementation
+        // IKVCache Interface (public API)
         // =====================================================================
 
         ActivationPrecision precision() const override { return Precision; }
+        int max_seq_len() const override { return max_seq_len_; }
+
+        int get_cached_tokens(int layer, int seq_idx = 0) const override;
+
+        void clear() override;
+        void clear_sequence(int layer, int seq_idx) override;
+        void clear_layer(int layer) override;
+
+        // ITensor Access (IKVCache interface via get_k/get_v)
+        ITensor *get_k(int layer, int seq_idx = 0) override;
+        const ITensor *get_k(int layer, int seq_idx = 0) const override;
+        ITensor *get_v(int layer, int seq_idx = 0) override;
+        const ITensor *get_v(int layer, int seq_idx = 0) const override;
+
+        // Bring in IKVCache overloads to avoid hiding
+        using ICUDARingKVCache::append;
+        using ICUDARingKVCache::clear_sequence;
+        using ICUDARingKVCache::gather_kv_batched;
+
+        // =====================================================================
+        // CUDA-Specific Methods (implementation)
+        // =====================================================================
+
         int num_layers() const override { return n_layers_; }
         int batch_size() const override { return batch_size_; }
-        int max_seq_len() const override { return max_seq_len_; }
         int n_kv_heads() const override { return n_kv_heads_; }
         int head_dim() const override { return head_dim_; }
         int kv_dim() const override { return kv_dim_; }
 
-        int get_cached_tokens(int layer, int seq_idx = 0) const override;
         int get_head_position(int layer, int seq_idx = 0) const override;
         bool is_wrapped(int layer, int seq_idx = 0) const override;
 
@@ -488,10 +388,6 @@ namespace llaminar2
                               int *kv_lens, int max_kv_len,
                               cudaStream_t stream = 0) override;
 
-        void clear() override;
-        void clear_sequence(int layer, int seq_idx) override;
-        void clear_layer(int layer) override;
-
         int get_total_evicted() const override { return total_evicted_; }
         void reset_eviction_counter() override { total_evicted_ = 0; }
         int get_linearization_count() const override { return linearization_count_; }
@@ -501,16 +397,10 @@ namespace llaminar2
         // Typed Accessors (for direct use when precision is known)
         // =====================================================================
 
-        /**
-         * @brief Get typed K/V pointers for attention
-         */
         bool get_kv_typed(int layer, int seq_idx,
                           const DataT **d_k_out, const DataT **d_v_out,
                           int *kv_len, cudaStream_t stream = 0);
 
-        /**
-         * @brief Append with typed pointers
-         */
         bool append_typed(int layer, int seq_idx,
                           const DataT *d_k, const DataT *d_v,
                           int num_tokens, cudaStream_t stream = 0);
@@ -526,6 +416,11 @@ namespace llaminar2
 
         // Entry storage: [n_layers][batch_size]
         std::vector<std::vector<EntryT>> entries_;
+
+        // GpuTensorView storage for get_k()/get_v(): [n_layers][batch_size][2]
+        // Index 0 = K view, Index 1 = V view
+        // Mutable because views are lazily created in const methods
+        mutable std::vector<std::vector<std::array<std::unique_ptr<ITensor>, 2>>> tensor_views_;
 
         // Statistics
         mutable int total_evicted_ = 0;

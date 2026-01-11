@@ -39,10 +39,11 @@ namespace llaminar2::test::parity::qwen2
      */
     struct BackendThresholds
     {
-        float cosine_threshold = 0.99f;  ///< Minimum cosine similarity for layer pass
-        int early_layers_count = 6;      ///< Number of early layers to check strictly
-        int min_early_layers_passed = 6; ///< Minimum early layers that must pass
-        float kl_threshold = 0.15f;      ///< Maximum KL divergence for LM_HEAD
+        float cosine_threshold = 0.99f;        ///< Minimum cosine similarity for layer pass
+        float decode_cosine_threshold = 0.99f; ///< Minimum avg cosine for decode steps
+        int early_layers_count = 6;            ///< Number of early layers to check strictly
+        int min_early_layers_passed = 6;       ///< Minimum early layers that must pass
+        float kl_threshold = 0.15f;            ///< Maximum KL divergence for LM_HEAD
     };
 
     /**
@@ -69,6 +70,7 @@ namespace llaminar2::test::parity::qwen2
             // Apply backend-specific thresholds
             auto thresholds = getBackendThresholds();
             config_.cosine_threshold = thresholds.cosine_threshold;
+            config_.decode_cosine_threshold = thresholds.decode_cosine_threshold;
             config_.use_avg_cosine = true; // Always use average for consistency
             config_.early_layers_count = thresholds.early_layers_count;
             config_.min_early_layers_passed = thresholds.min_early_layers_passed;
@@ -89,7 +91,8 @@ namespace llaminar2::test::parity::qwen2
  * @brief Macro to instantiate standard Qwen2 parity test cases
  *
  * Generates the common test cases for any Qwen2 parity test fixture:
- * - PrefillParity_LayerByLayer: Main parity test
+ * - PrefillParity_LayerByLayer: Main prefill parity test
+ * - DecodeParity_Incremental: Incremental decode parity test
  * - SnapshotInfrastructure: Verifies snapshot loading works
  *
  * Usage:
@@ -101,6 +104,12 @@ namespace llaminar2::test::parity::qwen2
     {                                                                                        \
         auto summary = runPrefillParity();                                                   \
         assertParity(summary);                                                               \
+    }                                                                                        \
+                                                                                             \
+    TEST_F(TestFixture, DecodeParity_Incremental)                                            \
+    {                                                                                        \
+        auto summary = runDecodeParity();                                                    \
+        assertDecodeParity(summary);                                                         \
     }                                                                                        \
                                                                                              \
     TEST_F(TestFixture, SnapshotInfrastructure)                                              \

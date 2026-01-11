@@ -311,10 +311,10 @@ namespace llaminar2
         }
 
         bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::compute_tensor(
-            const TensorBase *Q,
-            const TensorBase *K,
-            const TensorBase *V,
-            TensorBase *output,
+            const ITensor *Q,
+            const ITensor *K,
+            const ITensor *V,
+            ITensor *output,
             int batch_size,
             int seq_len,
             int kv_len,
@@ -323,8 +323,8 @@ namespace llaminar2
             int head_dim,
             bool causal,
             int window_size,
-            TensorBase *workspace_scores,
-            TensorBase *workspace_mask,
+            ITensor *workspace_scores,
+            ITensor *workspace_mask,
             const MPIContext *mpi_ctx,
             int device_idx,
             int head_start,
@@ -543,10 +543,10 @@ namespace llaminar2
         }
 
         bool CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::compute_tensor(
-            const TensorBase *Q,
-            const TensorBase *K,
-            const TensorBase *V,
-            TensorBase *output,
+            const ITensor *Q,
+            const ITensor *K,
+            const ITensor *V,
+            ITensor *output,
             int batch_size,
             int seq_len,
             int kv_len,
@@ -555,8 +555,8 @@ namespace llaminar2
             int head_dim,
             bool causal,
             int window_size,
-            TensorBase *workspace_scores,
-            TensorBase *workspace_mask,
+            ITensor *workspace_scores,
+            ITensor *workspace_mask,
             const MPIContext *mpi_ctx,
             int device_idx,
             int head_start,
@@ -722,10 +722,10 @@ namespace llaminar2
         }
 
         bool CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::compute_tensor(
-            const TensorBase *Q,
-            const TensorBase *K,
-            const TensorBase *V,
-            TensorBase *output,
+            const ITensor *Q,
+            const ITensor *K,
+            const ITensor *V,
+            ITensor *output,
             int batch_size,
             int seq_len,
             int kv_len,
@@ -734,8 +734,8 @@ namespace llaminar2
             int head_dim,
             bool causal,
             int window_size,
-            TensorBase *workspace_scores,
-            TensorBase *workspace_mask,
+            ITensor *workspace_scores,
+            ITensor *workspace_mask,
             const MPIContext *mpi_ctx,
             int device_idx,
             int head_start,

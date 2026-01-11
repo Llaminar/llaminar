@@ -278,6 +278,14 @@ namespace llaminar2
             }
         }
 
+        // Initialize tensor_views_ storage for get_k()/get_v() wrappers
+        tensor_views_.resize(n_layers_);
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            tensor_views_[layer].resize(batch_size_);
+            // Views are created lazily in get_k()/get_v()
+        }
+
         LOG_INFO("[CUDARingKVCache] Allocated "
                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
                  << " MB total (including scratch)");

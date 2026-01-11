@@ -213,6 +213,10 @@ namespace llaminar2
             }
 
             LOG_DEBUG("[packWeightsToCUDA] Packed " << N << "x" << K << " weights to INT8");
+            // Debug: verify scales are all positive (should be since scale = max_abs / 127.0f)
+            LOG_DEBUG("[packWeightsToCUDA] First 4 host scales: "
+                      << out.scales[0] << "," << (N > 1 ? out.scales[1] : 0.f) << ","
+                      << (N > 2 ? out.scales[2] : 0.f) << "," << (N > 3 ? out.scales[3] : 0.f));
             return true;
         }
 
@@ -346,6 +350,10 @@ namespace llaminar2
 
         void CUDAQuantisedGemmKernel::ensureWeightsConverted()
         {
+            LOG_DEBUG("[CUDAQuantisedGemmKernel::ensureWeightsConverted] Entry: N_=" << N_ << " K_=" << K_
+                                                                                     << " weights_converted_=" << weights_converted_
+                                                                                     << " d_scales_B=" << (impl_ ? (void *)impl_->d_scales_B : nullptr)
+                                                                                     << " d_weights_int8=" << (impl_ ? (void *)impl_->d_weights_int8 : nullptr));
             if (weights_converted_)
             {
                 return;
@@ -358,6 +366,12 @@ namespace llaminar2
                 if (packed_->uploaded && packed_->cuda_device_id == cuda_device_id_)
                 {
                     // Already uploaded - just reference the device pointers
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::ensureWeightsConverted] Reusing cached device pointers for K="
+                              << packed_->K << " N=" << packed_->N
+                              << ", d_scales=" << (void *)packed_->d_scales
+                              << ", host scales[0:4]: "
+                              << packed_->scales[0] << "," << (packed_->N > 1 ? packed_->scales[1] : 0.f) << ","
+                              << (packed_->N > 2 ? packed_->scales[2] : 0.f) << "," << (packed_->N > 3 ? packed_->scales[3] : 0.f));
                     impl_->d_weights_int8 = packed_->d_int8_data;
                     impl_->d_scales_B = packed_->d_scales;
                     weights_converted_ = true;
@@ -365,6 +379,9 @@ namespace llaminar2
                 }
 
                 // Upload to device and cache in packed_
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::ensureWeightsConverted] About to upload, host scales[0:4]: "
+                          << packed_->scales[0] << "," << (packed_->N > 1 ? packed_->scales[1] : 0.f) << ","
+                          << (packed_->N > 2 ? packed_->scales[2] : 0.f) << "," << (packed_->N > 3 ? packed_->scales[3] : 0.f));
                 if (!cudaQuantGemm_uploadWeights(
                         packed_->int8_data.data(),
                         packed_->scales.data(),

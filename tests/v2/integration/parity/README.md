@@ -9,6 +9,7 @@ This directory contains parity tests that compare Llaminar inference against PyT
 - [ParityTestBase Class](#paritytestbase-class)
 - [Configuration Options](#configuration-options)
 - [Metrics Computed](#metrics-computed)
+- [Test Coverage](#test-coverage)
 - [Writing a New Parity Test](#writing-a-new-parity-test)
 - [Running Tests](#running-tests)
 - [Adding Support for New Models](#adding-support-for-new-models)
@@ -235,6 +236,58 @@ float computeTopKOverlap(const float* actual, const float* expected,
 Checks if the Top-K predicted tokens overlap. Range: `[0, 1]`, where 1 = 100% overlap.
 
 **Why Top-K?** This is the "smoke test" - even if logits differ numerically, the model should predict similar tokens.
+
+---
+
+## Test Coverage
+
+Parity tests cover both **prefill** and **incremental decode** phases:
+
+### Prefill Parity (`PrefillParity_LayerByLayer`)
+
+Compares Llaminar's prefill output against PyTorch layer-by-layer:
+- Processes the full input prompt in a single batch
+- Compares activations at each transformer layer
+- Validates embedding, attention, FFN, and LM_HEAD stages
+- Pass criteria: average cosine similarity >= threshold per layer
+
+### Decode Parity (`DecodeParity_Incremental`)
+
+Compares incremental token generation (autoregressive decode):
+- First runs prefill to initialize KV cache
+- Generates tokens one at a time using the sampled token from PyTorch
+- Compares LM_HEAD logit distribution at each decode step
+- Pass criteria:
+  - Each step: cosine >= threshold OR KL < threshold
+  - Overall: min_decode_pass_rate (default 80%)
+  - Top-1 accuracy >= min_top1_accuracy (default 60%)
+
+**Example Decode Parity Output:**
+
+```
+╔════════════════════════════════════════════════════════════════════════════════════╗
+║                    CPU INCREMENTAL DECODE PARITY                                   ║
+║                    (Threshold: cosine >= 0.990 OR KL < 0.150)                      ║
+╠═════════╦═══════════════╦═══════════════╦═══════════════╦═══════════════╦══════════╣
+║  Step   ║    Cosine     ║      KL       ║   Llaminar    ║    PyTorch    ║  Status  ║
+╠═════════╬═══════════════╬═══════════════╬═══════════════╬═══════════════╬══════════╣
+║      0  ║     0.998922  ║     0.001664  ║       323 ✓   ║       323     ║    ✓     ║
+║      1  ║     0.999334  ║     0.005113  ║      1221 ✗   ║       279     ║    ✓     ║
+║      2  ║     0.999353  ║     0.008595  ║      5562 ✗   ║      3974     ║    ✓     ║
+║      3  ║     0.999493  ║     0.000528  ║     13876 ✓   ║     13876     ║    ✓     ║
+║      4  ║     0.999577  ║     0.000179  ║     38835 ✓   ║     38835     ║    ✓     ║
+╠═════════╩═══════════════╩═══════════════╩═══════════════╩═══════════════╩══════════╣
+║  SUMMARY:  Steps=5/5  AvgCosine=0.9993  Top1=60.0%  ✓ PASSED                       ║
+╚════════════════════════════════════════════════════════════════════════════════════╝
+```
+
+**Note:** Token mismatches (✗ in Llaminar column) are expected when quantization shifts probability mass slightly. The key metric is cosine similarity of the logit distributions.
+
+### Snapshot Infrastructure (`SnapshotInfrastructure`)
+
+Verifies the PyTorch snapshot generation and loading works correctly:
+- Checks that snapshots can be generated
+- Validates embedding snapshot loads successfully
 
 ---
 

@@ -104,7 +104,7 @@ namespace llaminar2
         // so it should attend to ALL kv_len positions. The kernel's "n > m" check would
         // only allow attending to position 0, which is wrong.
         std::unique_ptr<FP32Tensor> decode_mask;
-        TensorBase *mask_to_use = asTensorBase(params_.workspace_mask, "workspace_mask");
+        ITensor *mask_to_use = params_.workspace_mask;
 
         const bool is_decode_mode = (mode == AttentionMode::DECODE ||
                                      (params_.seq_len < effective_kv_len && params_.batch_size == 1));
@@ -147,32 +147,25 @@ namespace llaminar2
 
         // Device-agnostic unified path using compute_tensor()
         // The kernel factory creates the appropriate kernel (CPU or GPU) based on dev_type,
-        // and compute_tensor() handles type dispatch internally
+        // and compute_tensor() handles type dispatch internally.
+        // Since compute_tensor() now takes ITensor*, we can pass Q/K/V directly without casting.
+        // This allows GPU tensor wrappers (like GpuTensorView from CUDA KV cache) to work.
 
-        // Cast tensors to TensorBase* for compute_tensor()
-        auto *Q_base = asTensorBase(params_.Q, "Q");
-        auto *K_base = asTensorBase(params_.K, "K");
-        auto *V_base = asTensorBase(params_.V, "V");
-        auto *output_base = asTensorBase(params_.output, "output");
-
-        if (!Q_base || !K_base || !V_base || !output_base)
+        if (!params_.Q || !params_.K || !params_.V || !params_.output)
         {
-            LOG_ERROR("[AttentionComputeStage] Failed to get TensorBase pointers");
+            LOG_ERROR("[AttentionComputeStage] Null tensor pointer");
             return false;
         }
 
         // Device coherence is now handled automatically by GraphExecutor at stage boundaries
         // based on the stage's coherencePolicy() (FULL by default)
 
-        // Cast workspace_scores to TensorBase* (can be null)
-        auto *workspace_scores_base = asTensorBase(params_.workspace_scores, "workspace_scores");
-
         LOG_DEBUG("[AttentionComputeStage] Executing kernel: dev_type=" << llaminar::v2::kernels::to_string(dev_type)
-                                                                        << " Q_type=" << Q_base->dtype_name()
+                                                                        << " Q_type=" << params_.Q->dtype_name()
                                                                         << " device_idx=" << device_idx);
 
         bool success = kernel->compute_tensor(
-            Q_base, K_base, V_base, output_base,
+            params_.Q, params_.K, params_.V, params_.output,
             params_.batch_size,
             params_.seq_len,
             effective_kv_len,
@@ -181,7 +174,7 @@ namespace llaminar2
             params_.head_dim,
             kernel_causal, // Pass false for decode (we built the mask explicitly)
             params_.window_size,
-            workspace_scores_base,
+            params_.workspace_scores,
             mask_to_use, // Use our decode mask if we built one
             params_.mpi_ctx,
             device_idx);
