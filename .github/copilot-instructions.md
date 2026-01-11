@@ -18,7 +18,7 @@ This document provides practical guidelines for working with the **Llaminar V2**
 - [Debugging](#debugging)
 - [Stage Dump Framework](#stage-dump-framework)
 - [Stage Output Print Facility](#stage-output-print-facility)
-- [Snapshot Framework and E2E Testing](#snapshot-framework-and-e2e-testing)
+- [Parity Testing (PyTorch Reference)](#parity-testing-pytorch-reference)
 - [Kernel Development](#kernel-development)
 - [GPU Tensor Coherence](#gpu-tensor-coherence)
 - [Weight Sharding and Tensor Parallelism](#weight-sharding-and-tensor-parallelism)
@@ -65,10 +65,6 @@ cmake --build build_v2_release --parallel
 # Integration build (for "V2_Integration*" integration tests with snapshots + debug symbols)
 cmake -B build_v2_integration -S src/v2 -DCMAKE_BUILD_TYPE=Integration
 cmake --build build_v2_integration --parallel
-
-# E2E Release build (for "V2_E2E*" Llaminar vs Pytorch parity testing)
-cmake -B build_v2_e2e_release -S src/v2 -DCMAKE_BUILD_TYPE=E2ERelease
-cmake --build build_v2_e2e_release --parallel
 ```
 
 **Build Targets**:
@@ -80,15 +76,14 @@ cmake --build build_v2_e2e_release --parallel
 |------------|-------------|---------------|-----------|----------|
 | `Debug` | Off | Yes | Yes | Development, debugging |
 | `Release` | Full (-O3) | No | No | Production, benchmarks |
-| `Integration` | Full (-O3) | Yes | Yes | Integration tests with backtraces |
-| `E2ERelease` | Full (-O3) | No | Yes | E2E parity tests |
+| `Integration` | Full (-O3) | Yes | Yes | Integration tests, parity tests |
 
 **CMake Options**:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `HAVE_CUDA` | OFF | Enable CUDA backend |
 | `HAVE_ROCM` | OFF | Enable ROCm backend |
-| `ENABLE_SNAPSHOTS` | OFF | Enable tensor snapshot capture (auto-enabled for Debug/Integration/E2ERelease) |
+| `ENABLE_SNAPSHOTS` | OFF | Enable tensor snapshot capture (auto-enabled for Debug/Integration) |
 
 ---
 
@@ -191,7 +186,7 @@ LLAMINAR_PROFILE_KERNELS=1 ./build_v2_release/llaminar2 --benchmark -m model.ggu
 |----------|----------|---------|
 | Unit | `tests/v2/unit/` | Fast, isolated component tests (no model loading) |
 | Integration | `tests/v2/integration/` | Full pipeline tests with models |
-| E2E | `tests/v2/e2e/` | Ground truth parity vs PyTorch reference |
+| Integration/Parity | `tests/v2/integration/parity/` | PyTorch ground truth parity tests |
 | Performance | `tests/v2/performance/` | Benchmark tests |
 
 ### Test File Naming Convention
@@ -208,7 +203,7 @@ LLAMINAR_PROFILE_KERNELS=1 ./build_v2_release/llaminar2 --benchmark -m model.ggu
 |-----------|-----------------|--------------|
 | Unit tests (`V2_Unit_*`) | `build_v2` | `-R "^V2_Unit_"` |
 | Integration tests (`V2_Integration_*`) | `build_v2_integration` | `-R "^V2_Integration_"` |
-| E2E tests (`V2_E2E_*`) | `build_v2_e2e_release` | `-R "^V2_E2E_"` |
+| Parity tests (`V2_Integration_Parity_*`) | `build_v2_integration` | `-R "^V2_Integration_Parity_"` |
 | Performance tests (`V2_Perf_*`) | `build_v2_release` | `-R "^V2_Perf_"` |
 
 **CRITICAL: Never Limit Parallelism**
@@ -235,8 +230,8 @@ ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure --parallel
 # Integration tests (Integration build - has snapshots + debug symbols)
 ctest --test-dir build_v2_integration -R "^V2_Integration_" --output-on-failure
 
-# E2E parity tests that test Llaminar vs Pytorch
-ctest --test-dir build_v2_e2e_release -R "^V2_E2E_" --output-on-failure
+# Parity tests (Llaminar vs PyTorch reference)
+ctest --test-dir build_v2_integration -R "^V2_Integration_Parity_" --output-on-failure
 
 # Performance benchmarks
 ctest --test-dir build_v2_release -R "^V2_Perf_" --verbose
@@ -245,7 +240,7 @@ ctest --test-dir build_v2_release -R "^V2_Perf_" --verbose
 ### CTest Labels
 
 Tests use hierarchical labels for flexible filtering:
-- **Tier 1 (Type)**: `Unit`, `Integration`, `E2E`, `Performance`
+- **Tier 1 (Type)**: `Unit`, `Integration`, `Parity`, `Performance`
 - **Tier 2 (Architecture)**: `V2`
 - **Tier 3 (Component)**: `DeviceManagement`, `TensorOperations`, `Kernels`, `ModelLoading`
 - **Tier 4 (Feature)**: `Quantization`, `GEMM`, `Attention`, `IQ4_NL`
@@ -322,7 +317,7 @@ mpirun -np 2 valgrind --tool=memcheck --leak-check=full ./build_v2/tests/v2/v2_t
 | Problem | Solution |
 |---------|----------|
 | MPI hangs | Use `MPI_Barrier` before/after collective operations |
-| Numerical divergence | Run E2E parity tests, check layer-by-layer snapshots |
+| Numerical divergence | Run parity tests, check layer-by-layer snapshots |
 | Performance regression | Use `--benchmark` mode, verify Release build with `-march=native` |
 | Memory allocation failures | Enable NUMA verification, check first-touch allocation |
 | Race conditions | Use `OMP_WORKSHARE_REGION` macro, avoid shared mutable state |
@@ -568,105 +563,51 @@ This revealed that the GPU SwiGLU output was identical to its `up` input, indica
 
 ---
 
-## Snapshot Framework and E2E Testing
+## Parity Testing (PyTorch Reference)
 
 ### Overview
 
-
-The snapshot framework captures intermediate tensors during inference for comparison against PyTorch ground truth. This is essential for debugging numerical divergence.
+Parity tests validate that Llaminar's inference results match PyTorch ground truth within acceptable tolerances. Tests compare layer-by-layer activations and final logit distributions across different backends (CPU, CUDA, ROCm).
 
 **Key Concept**: Both Llaminar and PyTorch load the **same GGUF weights** (e.g., Q4_0). PyTorch dequantizes to FP32; Llaminar uses quantized GEMM. Minor divergence is expected; token predictions should match.
 
-### Build Configuration
+### Location and Documentation
 
+All parity tests are located in `tests/v2/integration/parity/` with a comprehensive README:
+
+> **📖 See `tests/v2/integration/parity/README.md` for full documentation** including:
+> - Declarative test architecture (three-tier inheritance)
+> - `BackendThresholds` configuration
+> - Writing new parity tests
+> - Metrics (cosine similarity, KL divergence, Top-K overlap)
+> - Troubleshooting guide
+
+### Quick Reference
+
+**Running Parity Tests**:
 ```bash
-# E2E builds require ENABLE_PIPELINE_SNAPSHOTS
-cmake -B build_v2_e2e_release -S src/v2 \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DENABLE_PIPELINE_SNAPSHOTS=ON
-cmake --build build_v2_e2e_release --parallel
+# Build integration tests (includes parity tests)
+cmake -B build_v2_integration -S src/v2 -DCMAKE_BUILD_TYPE=Integration
+cmake --build build_v2_integration --parallel
+
+# Run all parity tests
+ctest --test-dir build_v2_integration -R "^V2_Integration_Parity_" --output-on-failure
+
+# Run Qwen2 CUDA parity test
+ctest --test-dir build_v2_integration -R "V2_Integration_Parity_Qwen2_CUDA" -V
 ```
 
-### Snapshot Capture API
-
-```cpp
-// Enable snapshot capture before forward pass
-IInferenceRunner* runner = createInferenceRunner(model_ctx, mpi_ctx);
-runner->enableSnapshotCapture("/tmp/llaminar_snapshots");
-
-// Run inference
-runner->forward(token_ids.data(), seq_len);
-
-// Retrieve snapshots
-auto keys = runner->getSnapshotKeys();
-for (const auto& key : keys) {
-    size_t size;
-    const float* data = runner->getSnapshot(key, size);
-    // Compare with PyTorch reference...
-}
+**Test Output Example**:
 ```
-
-### Snapshot Keys (Qwen2)
-
-| Stage | Key Format |
-|-------|------------|
-| Embedding | `EMBEDDING` |
-| Attention norm | `layer{N}_ATTENTION_NORM` |
-| QKV projections | `layer{N}_Q_PROJECTION`, `layer{N}_K_PROJECTION`, `layer{N}_V_PROJECTION` |
-| RoPE | `layer{N}_Q_ROPE`, `layer{N}_K_ROPE` |
-| Attention output | `layer{N}_ATTENTION_CONTEXT`, `layer{N}_ATTENTION_OUTPUT` |
-| FFN stages | `layer{N}_FFN_NORM`, `layer{N}_FFN_GATE`, `layer{N}_FFN_UP`, `layer{N}_FFN_SWIGLU`, `layer{N}_FFN_DOWN` |
-| Residuals | `layer{N}_ATTENTION_RESIDUAL`, `layer{N}_FFN_RESIDUAL` |
-| Final | `FINAL_NORM`, `LM_HEAD` |
-
-### Tensor Dump for Debugging
-
-Dump raw tensor data to disk for analysis:
-
-```bash
-# Dump specific layers and stages
-LLAMINAR_SNAPSHOT_TENSOR_DUMP=1 \
-LLAMINAR_SNAPSHOT_DUMP_LAYERS=3,4,5 \
-LLAMINAR_SNAPSHOT_DUMP_STAGES=FFN_RESIDUAL,ATTENTION_RESIDUAL \
-LLAMINAR_SNAPSHOT_DUMP_DIR=/tmp/layer_debug \
-./build_v2_release/llaminar2 -m model.gguf -p "test prompt"
-```
-
-**Output Files**:
-- `<stage>_rank<N>_fp32.bin` - FP32 dequantized data
-- `<stage>_rank<N>_metadata.txt` - Shape and type info
-
-### Analyzing Dumps
-
-```python
-import numpy as np
-
-# Compare FP32 vs Q8_1 at specific element
-dump_dir = "/tmp/layer_debug"
-for layer in range(24):
-    fp32 = np.fromfile(f"{dump_dir}/layer{layer}_FFN_RESIDUAL_rank0_fp32.bin", dtype=np.float32)
-    q8_1 = np.fromfile(f"{dump_dir}/layer{layer}_FFN_RESIDUAL_rank0_q8_1.bin", dtype=np.float32)
-    diff = np.max(np.abs(fp32 - q8_1))
-    print(f"Layer {layer}: max diff = {diff:.6f}")
-```
-
-### PyTorch Reference Framework
-
-Generate ground truth snapshots from GGUF:
-
-```bash
-# Generate snapshots
-python python/reference/generate_qwen2_pipeline_snapshots.py \
-    --model models/qwen2.5-0.5b-instruct-q4_0.gguf \
-    --output pytorch_qwen2_snapshots \
-    --decode-steps 5
-
-# Run inference
-python python/reference/run_reference.py \
-    --model qwen \
-    --checkpoint models/qwen2.5-0.5b-instruct-q4_0.gguf \
-    --prompt "The quick brown fox" \
-    --max-tokens 20
+╔══════════════════════════════════════════════════════════════════════════════════════════╗
+║                    CUDA vs PyTorch LAYER-BY-LAYER PARITY                                 ║
+╠═══════════╦═══════════════╦═══════════════╦════════════════════════════════════════╦══════╣
+║   Layer   ║   Avg Cosine  ║   Min Cosine  ║            Worst Stage                 ║Status║
+╠═══════════╬═══════════════╬═══════════════╬════════════════════════════════════════╬══════╣
+║ EMBEDDING ║      0.999912 ║      0.999912 ║                      -                 ║  ✓  ║
+║   Layer 0 ║      0.998234 ║      0.995123 ║              FFN_RESIDUAL              ║  ✓  ║
+...
+╚═══════════╩═══════════════╩═══════════════╩════════════════════════════════════════╩══════╝
 ```
 
 ### Debugging Inference Issues
@@ -681,9 +622,9 @@ python python/reference/run_reference.py \
 LLAMINAR_LOG_LEVEL=TRACE ./build_v2_release/llaminar2 -m model.gguf -p "prompt" -n 1 -t 0 2>&1 | grep "Top-5"
 ```
 
-**Step 3**: Run E2E parity tests:
+**Step 3**: Run parity tests:
 ```bash
-ctest --test-dir build_v2_e2e_release -R Qwen2FP32Parity -V
+ctest --test-dir build_v2_integration -R "V2_Integration_Parity_Qwen2" -V
 ```
 
 **Step 4**: Enable stage tracing for full visibility:
@@ -1217,7 +1158,6 @@ Llaminar uses a systematic assertion framework that is **automatically enabled**
 | Debug | 1 | Auto-ON | Fail by default |
 | Integration | 1 | Auto-ON | Fail by default |
 | Release | 0 | Compiled out | Compiled out |
-| E2ERelease | 0 | Compiled out | Compiled out |
 
 **Available Assertion Macros** (see `utils/Assertions.h`):
 

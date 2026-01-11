@@ -89,7 +89,7 @@ public:
     virtual int vocab_size() const = 0;
     virtual const char* architecture() const = 0;
     
-    // Snapshot capture (for E2E testing)
+    // Snapshot capture (for parity testing)
     virtual void enableSnapshotCapture(const std::string& dir) = 0;
     virtual std::vector<std::string> getSnapshotKeys() const = 0;
     virtual const float* getSnapshot(const std::string& key, size_t& size) const = 0;
@@ -484,7 +484,6 @@ The verification system provides fail-fast validation at stage boundaries in Deb
 | Debug | 1 | Yes | Throws `VerificationFailure` |
 | Integration | 1 | Yes | Throws `VerificationFailure` |
 | Release | 0 | No | Compiled out (zero overhead) |
-| E2ERelease | 0 | No | Compiled out |
 
 **Verification Checks:**
 
@@ -959,7 +958,7 @@ struct StageDumpInfo {
 
 **Every stage must implement getDumpInfo()** - This is required for:
 1. **TensorVerification** - Entry/exit validation of inputs and outputs
-2. **Snapshot callbacks** - E2E parity testing against PyTorch
+2. **Snapshot callbacks** - parity testing against PyTorch
 3. **StageDumper** - Full binary dumps for debugging
 
 ### 8.2 StageDumper Utility
@@ -1000,16 +999,18 @@ LLAMINAR_STAGE_DUMP=1 LLAMINAR_STAGE_DUMP_LAYERS=0,1 ./build_v2/llaminar2 -m mod
 
 ### 8.3 Snapshot System (Subset of StageDumpInfo)
 
-The **snapshot system** uses `StageDumpInfo` outputs for E2E parity testing. It captures output tensors in-memory for comparison against PyTorch reference:
+> **📖 For parity test implementation details, see `tests/v2/integration/parity/README.md`**
+
+The **snapshot system** uses `StageDumpInfo` outputs for parity testing. It captures output tensors in-memory for comparison against PyTorch reference:
 
 **Architecture:**
 ```
 StageDumpInfo.outputs  ->  GraphExecutor.snapshot_callback_  ->  In-memory storage
                                      |
-                          IInferenceRunner.getSnapshot()  ->  E2E test comparison
+                          IInferenceRunner.getSnapshot()  ->  parity test comparison
 ```
 
-- **Compile-time conditional** - Only in Debug/E2ERelease builds (`ENABLE_PIPELINE_SNAPSHOTS`)
+- **Compile-time conditional** - Only in Debug/Integration builds (`ENABLE_PIPELINE_SNAPSHOTS`)
 - **In-memory storage** - `std::map<std::string, std::vector<float>>`
 - **Zero overhead in Release** - Compiles away to NOOPs
 
@@ -1114,11 +1115,11 @@ void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
 # Unit tests
 ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure --parallel
 
-# Integration tests
-ctest --test-dir build_v2_release -R "^V2_Integration_" --output-on-failure
+# Integration tests (includes parity tests)
+ctest --test-dir build_v2_integration -R "^V2_Integration_" --output-on-failure
 
-# E2E parity tests (requires E2ERelease build)
-ctest --test-dir build_v2_e2e_release -R "^V2_E2E_" --output-on-failure
+# Parity tests (subset of integration tests)
+ctest --test-dir build_v2_integration -R "^V2_Integration_Parity_" --output-on-failure
 ```
 
 ---
