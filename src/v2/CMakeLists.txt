@@ -388,6 +388,7 @@ if(HAVE_ROCM)
     set(ROCM_KERNEL_SOURCES
         kernels/rocm/HipBLASGemmKernel.cpp      # hipBLAS wrapper for FP32/FP16 dense GEMM
         kernels/rocm/ROCmQuantisedGemmKernel_CK.hip  # ComposableKernel INT8 GEMM implementation
+        kernels/rocm/ROCmQuantisedGemmKernel_FP16.hip  # FP16 GEMM path (alternative to INT8)
     )
     
     # ROCm enumeration and backend must be compiled with hipcc to use HIP runtime

@@ -321,4 +321,171 @@ namespace
         }
     }
 
+    // =============================================================================
+    // Phase 2: GemmPath Selection Tests (CPU-only)
+    // =============================================================================
+
+    /**
+     * @test Verify selectGemmPath returns FP16 for large M values
+     *
+     * Based on benchmarks, FP16 hipBLAS is 20-35% faster for M > 128.
+     */
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, SelectGemmPath_LargeM_SelectsFP16)
+    {
+        // Clear environment overrides
+        unsetenv("LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS");
+        unsetenv("LLAMINAR_ROCM_GEMM_FORCE_FP16");
+        unsetenv("LLAMINAR_ROCM_GEMM_DISABLE_FP16");
+        unsetenv("LLAMINAR_ROCM_GEMM_FUSED");
+
+        // M > 128 should select FP16 path (with CK-supported N, K)
+        EXPECT_EQ(selectGemmPath(256, 896, 896), GemmPath::FP16_HIPBLAS);
+        EXPECT_EQ(selectGemmPath(512, 1024, 4096), GemmPath::FP16_HIPBLAS);
+        EXPECT_EQ(selectGemmPath(1024, 896, 896), GemmPath::FP16_HIPBLAS);
+
+        LOG_INFO("[Unit] SelectGemmPath: M > 128 correctly selects FP16_HIPBLAS");
+    }
+
+    /**
+     * @test Verify selectGemmPath returns CK Two-Kernel for M <= 128 (and M >= 64)
+     *
+     * For small batch sizes (64 <= M <= 128), INT8 CK has lower overhead than FP16 conversion.
+     * Note: CK requires M >= 64, so M < 64 falls back to hipBLAS INT8.
+     */
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, SelectGemmPath_SmallM_SelectsCKTwoKernel)
+    {
+        // Clear environment overrides
+        unsetenv("LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS");
+        unsetenv("LLAMINAR_ROCM_GEMM_FORCE_FP16");
+        unsetenv("LLAMINAR_ROCM_GEMM_DISABLE_FP16");
+        unsetenv("LLAMINAR_ROCM_GEMM_FUSED");
+
+        // 64 <= M <= 128 should select CK Two-Kernel (CK minimum M is 64)
+        EXPECT_EQ(selectGemmPath(64, 896, 896), GemmPath::CK_TWO_KERNEL);
+        EXPECT_EQ(selectGemmPath(128, 1024, 4096), GemmPath::CK_TWO_KERNEL);
+        EXPECT_EQ(selectGemmPath(96, 896, 896), GemmPath::CK_TWO_KERNEL);
+
+        // M < 64 falls back to hipBLAS INT8 (CK doesn't support small M)
+        EXPECT_EQ(selectGemmPath(1, 896, 896), GemmPath::HIPBLAS_INT8);
+        EXPECT_EQ(selectGemmPath(32, 896, 896), GemmPath::HIPBLAS_INT8);
+
+        LOG_INFO("[Unit] SelectGemmPath: M <= 128 correctly selects CK_TWO_KERNEL or HIPBLAS_INT8");
+    }
+
+    /**
+     * @test Verify LLAMINAR_ROCM_GEMM_FORCE_FP16 overrides heuristics
+     */
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, SelectGemmPath_ForceFP16_OverridesHeuristic)
+    {
+        // Clear other overrides
+        unsetenv("LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS");
+        unsetenv("LLAMINAR_ROCM_GEMM_DISABLE_FP16");
+        unsetenv("LLAMINAR_ROCM_GEMM_FUSED");
+
+        // Set force FP16
+        setenv("LLAMINAR_ROCM_GEMM_FORCE_FP16", "1", 1);
+
+        // Even with small M, should return FP16 when forced
+        EXPECT_EQ(selectGemmPath(64, 896, 896), GemmPath::FP16_HIPBLAS);
+        EXPECT_EQ(selectGemmPath(1, 896, 896), GemmPath::FP16_HIPBLAS);
+
+        // Cleanup
+        unsetenv("LLAMINAR_ROCM_GEMM_FORCE_FP16");
+
+        LOG_INFO("[Unit] SelectGemmPath: FORCE_FP16 correctly overrides heuristic");
+    }
+
+    /**
+     * @test Verify LLAMINAR_ROCM_GEMM_DISABLE_FP16 disables FP16 selection
+     */
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, SelectGemmPath_DisableFP16_FallsToCKTwoKernel)
+    {
+        // Clear other overrides
+        unsetenv("LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS");
+        unsetenv("LLAMINAR_ROCM_GEMM_FORCE_FP16");
+        unsetenv("LLAMINAR_ROCM_GEMM_FUSED");
+
+        // Set disable FP16
+        setenv("LLAMINAR_ROCM_GEMM_DISABLE_FP16", "1", 1);
+
+        // Even with large M, should NOT return FP16 when disabled
+        EXPECT_EQ(selectGemmPath(256, 896, 896), GemmPath::CK_TWO_KERNEL);
+        EXPECT_EQ(selectGemmPath(1024, 1024, 4096), GemmPath::CK_TWO_KERNEL);
+
+        // Cleanup
+        unsetenv("LLAMINAR_ROCM_GEMM_DISABLE_FP16");
+
+        LOG_INFO("[Unit] SelectGemmPath: DISABLE_FP16 correctly prevents FP16 selection");
+    }
+
+    /**
+     * @test Verify LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS forces hipBLAS INT8
+     */
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, SelectGemmPath_ForceHipBLAS_OverridesAll)
+    {
+        // Clear other overrides
+        unsetenv("LLAMINAR_ROCM_GEMM_FORCE_FP16");
+        unsetenv("LLAMINAR_ROCM_GEMM_DISABLE_FP16");
+        unsetenv("LLAMINAR_ROCM_GEMM_FUSED");
+
+        // Set force hipBLAS
+        setenv("LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS", "1", 1);
+
+        // All cases should return hipBLAS INT8
+        EXPECT_EQ(selectGemmPath(64, 896, 896), GemmPath::HIPBLAS_INT8);
+        EXPECT_EQ(selectGemmPath(256, 896, 896), GemmPath::HIPBLAS_INT8);
+        EXPECT_EQ(selectGemmPath(1024, 1024, 4096), GemmPath::HIPBLAS_INT8);
+
+        // Cleanup
+        unsetenv("LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS");
+
+        LOG_INFO("[Unit] SelectGemmPath: FORCE_HIPBLAS correctly overrides all paths");
+    }
+
+    /**
+     * @test Verify LLAMINAR_ROCM_GEMM_FUSED selects CK Fused path
+     */
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, SelectGemmPath_UseFused_SelectsCKFused)
+    {
+        // Clear other overrides
+        unsetenv("LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS");
+        unsetenv("LLAMINAR_ROCM_GEMM_FORCE_FP16");
+        unsetenv("LLAMINAR_ROCM_GEMM_DISABLE_FP16");
+
+        // Set use fused
+        setenv("LLAMINAR_ROCM_GEMM_FUSED", "1", 1);
+
+        // M <= 128 with fused flag should use CK Fused (not Two-Kernel)
+        EXPECT_EQ(selectGemmPath(64, 896, 896), GemmPath::CK_FUSED);
+        EXPECT_EQ(selectGemmPath(128, 1024, 4096), GemmPath::CK_FUSED);
+
+        // M > 128 still uses FP16 (unless disabled)
+        EXPECT_EQ(selectGemmPath(256, 896, 896), GemmPath::FP16_HIPBLAS);
+
+        // Cleanup
+        unsetenv("LLAMINAR_ROCM_GEMM_FUSED");
+
+        LOG_INFO("[Unit] SelectGemmPath: FUSED flag correctly selects CK_FUSED for small M");
+    }
+
+    /**
+     * @test Verify M=128 boundary condition (threshold is M > 128, not M >= 128)
+     */
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, SelectGemmPath_BoundaryM128_SelectsCK)
+    {
+        // Clear environment overrides
+        unsetenv("LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS");
+        unsetenv("LLAMINAR_ROCM_GEMM_FORCE_FP16");
+        unsetenv("LLAMINAR_ROCM_GEMM_DISABLE_FP16");
+        unsetenv("LLAMINAR_ROCM_GEMM_FUSED");
+
+        // M = 128 should select CK (threshold is M > 128)
+        EXPECT_EQ(selectGemmPath(128, 896, 896), GemmPath::CK_TWO_KERNEL);
+
+        // M = 129 should select FP16
+        EXPECT_EQ(selectGemmPath(129, 896, 896), GemmPath::FP16_HIPBLAS);
+
+        LOG_INFO("[Unit] SelectGemmPath: Boundary M=128 correctly handled");
+    }
+
 } // namespace

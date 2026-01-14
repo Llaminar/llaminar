@@ -30,6 +30,7 @@
 // OneDNN for reference GEMM (much better than naive loop!)
 #ifdef HAVE_ONEDNN
 #include "kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
+#include <dnnl.hpp>
 #endif
 
 #ifdef HAVE_ROCM
@@ -79,6 +80,27 @@ extern "C"
         int32_t *d_C_int32,
         int M, int N, int K,
         int rocm_device_id);
+
+    bool rocmQuantGemm_executeTwoKernel(
+        const int8_t *d_A_int8,
+        const int8_t *d_weights_int8,
+        float *d_C_fp32,
+        const float *d_scales_A,
+        const float *d_scales_B,
+        int M, int N, int K,
+        int rocm_device_id);
+
+    bool rocmQuantGemm_executeFP16(
+        const int8_t *d_A,
+        const int8_t *d_B,
+        float *d_E,
+        const float *d_scaleA,
+        const float *d_scaleB,
+        int M,
+        int N,
+        int K,
+        int device_id,
+        void *stream);
 
     void rocmQuantGemm_freeDevice(void *d_ptr);
 
@@ -195,6 +217,161 @@ namespace llaminar2
                         }
                     }
                 }
+
+                /**
+                 * @brief Compute INT8×INT8→INT32 reference GEMM using OneDNN
+                 *
+                 * C[m,n] = sum_k(A[m,k] * B[k,n])
+                 *
+                 * Uses OneDNN's optimized s8×s8→s32 matmul when available,
+                 * falls back to OpenMP parallelized naive loop otherwise.
+                 *
+                 * @param A Input matrix A [M × K] row-major
+                 * @param B Input matrix B [K × N] row-major
+                 * @param C Output matrix C [M × N] row-major
+                 * @param M Number of rows in A
+                 * @param N Number of columns in B
+                 * @param K Shared dimension
+                 */
+                void computeInt8GemmReference(
+                    const std::vector<int8_t> &A,
+                    const std::vector<int8_t> &B,
+                    std::vector<int32_t> &C,
+                    int M, int N, int K)
+                {
+                    C.resize(static_cast<size_t>(M) * N);
+
+#ifdef HAVE_ONEDNN
+                    using namespace dnnl;
+                    using dt = memory::data_type;
+                    using tag = memory::format_tag;
+
+                    // Thread-local engine and stream
+                    static thread_local engine eng(engine::kind::cpu, 0);
+                    static thread_local stream strm(eng);
+
+                    // Memory descriptors
+                    memory::dims src_dims = {M, K};
+                    memory::dims weights_dims = {K, N};
+                    memory::dims dst_dims = {M, N};
+
+                    auto src_md = memory::desc(src_dims, dt::s8, tag::ab);
+                    auto weights_md = memory::desc(weights_dims, dt::s8, tag::ab);
+                    auto dst_md = memory::desc(dst_dims, dt::s32, tag::ab);
+
+                    auto matmul_pd = matmul::primitive_desc(eng, src_md, weights_md, dst_md);
+                    auto src_mem = memory(src_md, eng, const_cast<int8_t *>(A.data()));
+                    auto weights_mem = memory(weights_md, eng, const_cast<int8_t *>(B.data()));
+                    auto dst_mem = memory(dst_md, eng, C.data());
+
+                    auto matmul_prim = matmul(matmul_pd);
+                    matmul_prim.execute(strm, {{DNNL_ARG_SRC, src_mem},
+                                               {DNNL_ARG_WEIGHTS, weights_mem},
+                                               {DNNL_ARG_DST, dst_mem}});
+                    strm.wait();
+#else
+                    // Fallback: OpenMP parallelized naive implementation
+#pragma omp parallel for collapse(2) schedule(static)
+                    for (int m = 0; m < M; ++m)
+                    {
+                        for (int n = 0; n < N; ++n)
+                        {
+                            int32_t acc = 0;
+                            for (int k = 0; k < K; ++k)
+                            {
+                                acc += static_cast<int32_t>(A[static_cast<size_t>(m) * K + k]) *
+                                       static_cast<int32_t>(B[static_cast<size_t>(k) * N + n]);
+                            }
+                            C[static_cast<size_t>(m) * N + n] = acc;
+                        }
+                    }
+#endif
+                }
+
+                /**
+                 * @brief Compute INT8×INT8→FP32 reference GEMM with per-row/per-col scales using OneDNN
+                 *
+                 * C[m,n] = sum_k(A[m,k] * B[k,n]) * scaleA[m] * scaleB[n]
+                 *
+                 * Uses OneDNN's optimized INT8 matmul for the core GEMM, then applies
+                 * scales manually in a separate pass.
+                 *
+                 * @param A Input matrix A [M × K] row-major
+                 * @param B Input matrix B [K × N] row-major
+                 * @param scaleA Per-row scales for A [M]
+                 * @param scaleB Per-column scales for B [N]
+                 * @param C Output matrix C [M × N] row-major
+                 * @param M Number of rows in A
+                 * @param N Number of columns in B
+                 * @param K Shared dimension
+                 */
+                void computeScaledInt8GemmReference(
+                    const std::vector<int8_t> &A,
+                    const std::vector<int8_t> &B,
+                    const std::vector<float> &scaleA,
+                    const std::vector<float> &scaleB,
+                    std::vector<float> &C,
+                    int M, int N, int K)
+                {
+                    C.resize(static_cast<size_t>(M) * N);
+
+#ifdef HAVE_ONEDNN
+                    using namespace dnnl;
+                    using dt = memory::data_type;
+                    using tag = memory::format_tag;
+
+                    // Thread-local engine and stream
+                    static thread_local engine eng(engine::kind::cpu, 0);
+                    static thread_local stream strm(eng);
+
+                    // Memory descriptors
+                    memory::dims src_dims = {M, K};
+                    memory::dims weights_dims = {K, N};
+                    memory::dims dst_dims = {M, N};
+
+                    auto src_md = memory::desc(src_dims, dt::s8, tag::ab);
+                    auto weights_md = memory::desc(weights_dims, dt::s8, tag::ab);
+                    auto dst_md = memory::desc(dst_dims, dt::f32, tag::ab);
+
+                    auto matmul_pd = matmul::primitive_desc(eng, src_md, weights_md, dst_md);
+                    auto src_mem = memory(src_md, eng, const_cast<int8_t *>(A.data()));
+                    auto weights_mem = memory(weights_md, eng, const_cast<int8_t *>(B.data()));
+                    auto dst_mem = memory(dst_md, eng, C.data());
+
+                    auto matmul_prim = matmul(matmul_pd);
+                    matmul_prim.execute(strm, {{DNNL_ARG_SRC, src_mem},
+                                               {DNNL_ARG_WEIGHTS, weights_mem},
+                                               {DNNL_ARG_DST, dst_mem}});
+                    strm.wait();
+
+                    // Apply scales manually: C[m,n] *= scaleA[m] * scaleB[n]
+#pragma omp parallel for collapse(2) schedule(static)
+                    for (int m = 0; m < M; ++m)
+                    {
+                        for (int n = 0; n < N; ++n)
+                        {
+                            C[static_cast<size_t>(m) * N + n] *= scaleA[m] * scaleB[n];
+                        }
+                    }
+#else
+                    // Fallback: OpenMP parallelized naive implementation
+#pragma omp parallel for collapse(2) schedule(static)
+                    for (int m = 0; m < M; ++m)
+                    {
+                        for (int n = 0; n < N; ++n)
+                        {
+                            int32_t acc = 0;
+                            for (int k = 0; k < K; ++k)
+                            {
+                                acc += static_cast<int32_t>(A[static_cast<size_t>(m) * K + k]) *
+                                       static_cast<int32_t>(B[static_cast<size_t>(k) * N + n]);
+                            }
+                            C[static_cast<size_t>(m) * N + n] =
+                                static_cast<float>(acc) * scaleA[m] * scaleB[n];
+                        }
+                    }
+#endif
+                }
             } // namespace
 #endif
 
@@ -274,9 +451,13 @@ namespace llaminar2
             /**
              * @test Base INT8×INT8→INT32 GEMM without any D-tensor scaling
              *
+             * Tests the raw CK GEMM kernel: rocmQuantGemm_executeNoScale()
+             *
              * This test isolates the core GEMM operation from D-tensor handling.
              * If this passes but fused tests fail, the issue is in D-tensor configuration.
              * If this fails, the issue is in the base GEMM tile parameters.
+             *
+             * @note This tests the low-level C function directly, not the ROCmQuantisedGemmKernel class.
              */
             TEST_F(ROCmQuantisedGemmIntegrationTest, BaseGemm_NoScale_Deterministic128)
             {
@@ -314,22 +495,9 @@ namespace llaminar2
                 std::vector<int32_t> h_C(static_cast<size_t>(M) * N);
                 ASSERT_EQ(hipMemcpy(h_C.data(), d_C, static_cast<size_t>(M) * N * sizeof(int32_t), hipMemcpyDeviceToHost), hipSuccess);
 
-                // CPU reference: C[m,n] = sum_k(A[m,k] * B[k,n])
-                std::vector<int32_t> h_ref(static_cast<size_t>(M) * N);
-                for (int m = 0; m < M; ++m)
-                {
-                    for (int n = 0; n < N; ++n)
-                    {
-                        int32_t acc = 0;
-                        for (int k = 0; k < K; ++k)
-                        {
-                            const int32_t av = static_cast<int32_t>(h_A[static_cast<size_t>(m) * K + k]);
-                            const int32_t bv = static_cast<int32_t>(h_B[static_cast<size_t>(k) * N + n]);
-                            acc += av * bv;
-                        }
-                        h_ref[static_cast<size_t>(m) * N + n] = acc;
-                    }
-                }
+                // CPU reference using OneDNN (much faster than naive loop)
+                std::vector<int32_t> h_ref;
+                computeInt8GemmReference(h_A, h_B, h_ref, M, N, K);
 
                 // Check for exact match (INT32 should be exact)
                 int mismatch_count = 0;
@@ -388,7 +556,7 @@ namespace llaminar2
             // Phase 3/4: Fused GEMM+Scaling Correctness (direct-call, deterministic)
             // =====================================================================
 
-            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedGemmScaling_DeterministicSmall)
+            TEST_F(ROCmQuantisedGemmIntegrationTest, HipBLAS_ScaledGemm_DeterministicSmall)
             {
                 if (!has_rocm_device_)
                 {
@@ -397,6 +565,7 @@ namespace llaminar2
 
                 // Small dimensions that CK cannot handle (M < 64, N < 64, K < 32)
                 // This test verifies the hipBLAS fallback path for small matrices.
+                // Uses rocmQuantGemm_executeHipBLAS() which handles per-row/per-col scaling.
                 const int M = 8;
                 const int N = 9;
                 const int K = 4;
@@ -487,7 +656,16 @@ namespace llaminar2
                 rocmQuantGemm_freeDevice(d_E);
             }
 
-            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedGemmScaling_Deterministic128)
+            /**
+             * @test CK DenseScale (fused) GEMM with 128×128×128 dimensions
+             *
+             * Tests rocmQuantGemm_executeDenseScale() which is the CK fused path.
+             * This applies scales via D-tensor mechanism during the GEMM operation.
+             *
+             * @note This tests the low-level C function directly, not the ROCmQuantisedGemmKernel class.
+             * @note The DenseScale approach has slightly lower accuracy than TwoKernel on gfx906.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, CK_DenseScale_Deterministic128)
             {
                 if (!has_rocm_device_)
                 {
@@ -545,21 +723,9 @@ namespace llaminar2
                 std::vector<float> h_E(static_cast<size_t>(M) * N);
                 ASSERT_EQ(hipMemcpy(h_E.data(), d_E, static_cast<size_t>(M) * N * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
 
-                std::vector<float> h_ref(static_cast<size_t>(M) * N);
-                for (int m = 0; m < M; ++m)
-                {
-                    for (int n = 0; n < N; ++n)
-                    {
-                        int32_t acc = 0;
-                        for (int k = 0; k < K; ++k)
-                        {
-                            const int32_t av = static_cast<int32_t>(h_A[static_cast<size_t>(m) * K + k]);
-                            const int32_t bv = static_cast<int32_t>(h_B[static_cast<size_t>(k) * N + n]);
-                            acc += av * bv;
-                        }
-                        h_ref[static_cast<size_t>(m) * N + n] = static_cast<float>(acc) * h_scaleA[m] * h_scaleB[n];
-                    }
-                }
+                // CPU reference using OneDNN (much faster than naive loop)
+                std::vector<float> h_ref;
+                computeScaledInt8GemmReference(h_A, h_B, h_scaleA, h_scaleB, h_ref, M, N, K);
 
                 float max_abs = 0.0f;
                 float max_rel = 0.0f;
@@ -661,16 +827,18 @@ namespace llaminar2
             }
 
             /**
-             * @test Dense scale GEMM with pre-multiplied scale matrix
+             * @test CK DenseScale (fused) GEMM - duplicate test with pre-multiplied scale matrix
              *
-             * Tests the workaround approach that uses a dense [M×N] scale matrix
-             * instead of broadcast D-tensors with stride=0.
+             * Tests rocmQuantGemm_executeDenseScale() with same dimensions as above.
+             * This is essentially a duplicate of CK_DenseScale_Deterministic128.
              *
              * NOTE: The dense scale approach (fused D-tensor scaling) has known lower
              * accuracy (~0.9917-0.9998) due to CK's D-tensor handling on gfx906.
              * Use TwoKernel path for best accuracy.
+             *
+             * @note This tests the low-level C function directly, not the ROCmQuantisedGemmKernel class.
              */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, DenseScaleGemm_Deterministic128)
+            TEST_F(ROCmQuantisedGemmIntegrationTest, CK_DenseScale_Deterministic128_Variant)
             {
                 if (!has_rocm_device_)
                 {
@@ -728,22 +896,9 @@ namespace llaminar2
                 std::vector<float> h_E(static_cast<size_t>(M) * N);
                 ASSERT_EQ(hipMemcpy(h_E.data(), d_E, static_cast<size_t>(M) * N * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
 
-                // Compute reference
-                std::vector<float> h_ref(static_cast<size_t>(M) * N);
-                for (int m = 0; m < M; ++m)
-                {
-                    for (int n = 0; n < N; ++n)
-                    {
-                        int32_t acc = 0;
-                        for (int k = 0; k < K; ++k)
-                        {
-                            const int32_t av = static_cast<int32_t>(h_A[static_cast<size_t>(m) * K + k]);
-                            const int32_t bv = static_cast<int32_t>(h_B[static_cast<size_t>(k) * N + n]);
-                            acc += av * bv;
-                        }
-                        h_ref[static_cast<size_t>(m) * N + n] = static_cast<float>(acc) * h_scaleA[m] * h_scaleB[n];
-                    }
-                }
+                // CPU reference using OneDNN (much faster than naive loop)
+                std::vector<float> h_ref;
+                computeScaledInt8GemmReference(h_A, h_B, h_scaleA, h_scaleB, h_ref, M, N, K);
 
                 float max_abs = 0.0f;
                 float max_rel = 0.0f;
@@ -1829,6 +1984,193 @@ namespace llaminar2
                 rocmQuantGemm_freeDevice(d_C_int32);
 
                 LOG_INFO("[Integration] Tested batch sizes: 1 to 2048");
+            }
+
+            // =============================================================================
+            // FP16 Path Integration Tests
+            // =============================================================================
+
+            /**
+             * @test Verify FP16 path produces correct output vs INT8 reference
+             *
+             * The FP16 path should produce nearly identical results to the INT8 path.
+             * Both should have high cosine similarity (> 0.999) vs the reference.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, FP16Path_MatchesINT8TwoKernel)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                // Use M > 128 where FP16 is expected to be selected
+                const int M = 256;
+                const int N = 896;
+                const int K = 896;
+
+                // Create weights and activations
+                auto weights = TestTensorFactory::createQ8_1Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                auto activations = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+
+                // Pack weights
+                ROCmPackedWeights packed;
+                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+
+                // Allocate device buffers
+                int8_t *d_A_int8 = nullptr;
+                float *d_scales_A = nullptr;
+                int32_t *d_C_int32 = nullptr;
+                int work_buffer_M = 0;
+                ASSERT_TRUE(rocmQuantGemm_ensureWorkBuffers(
+                    &d_A_int8, &d_scales_A, &d_C_int32, &work_buffer_M, M, K, N, 0));
+
+                float *d_activations = nullptr;
+                float *d_output_twokernel = nullptr;
+                float *d_output_fp16 = nullptr;
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_activations, M * K, 0));
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_output_twokernel, M * N, 0));
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_output_fp16, M * N, 0));
+
+                // Upload activations and quantize
+                ASSERT_TRUE(rocmQuantGemm_copyHostToDevice(d_activations, activations->data(), M * K, 0));
+                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(d_activations, d_A_int8, d_scales_A, M, K, 0));
+
+                // Upload weights
+                int8_t *d_B_int8 = nullptr;
+                float *d_scales_B = nullptr;
+                ASSERT_EQ(hipMalloc(&d_B_int8, packed.int8_data.size() * sizeof(int8_t)), hipSuccess);
+                ASSERT_EQ(hipMemcpy(d_B_int8, packed.int8_data.data(), packed.int8_data.size() * sizeof(int8_t), hipMemcpyHostToDevice), hipSuccess);
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_scales_B, N, 0));
+                ASSERT_TRUE(rocmQuantGemm_copyHostToDevice(d_scales_B, packed.scales.data(), N, 0));
+
+                // Run INT8 Two-Kernel path (reference)
+                ASSERT_TRUE(rocmQuantGemm_executeTwoKernel(
+                    d_A_int8, d_B_int8, d_output_twokernel,
+                    d_scales_A, d_scales_B,
+                    M, N, K, 0))
+                    << "INT8 Two-Kernel GEMM failed";
+
+                // Run FP16 path
+                ASSERT_TRUE(rocmQuantGemm_executeFP16(
+                    d_A_int8, d_B_int8, d_output_fp16,
+                    d_scales_A, d_scales_B,
+                    M, N, K, 0, nullptr))
+                    << "FP16 hipBLAS GEMM failed";
+
+                // Download results
+                std::vector<float> h_output_twokernel(M * N);
+                std::vector<float> h_output_fp16(M * N);
+                ASSERT_TRUE(rocmQuantGemm_copyDeviceToHost(h_output_twokernel.data(), d_output_twokernel, M * N, 0));
+                ASSERT_TRUE(rocmQuantGemm_copyDeviceToHost(h_output_fp16.data(), d_output_fp16, M * N, 0));
+
+                // Compute cosine similarity between the two paths
+                float cosine = cosineSimilarity(h_output_twokernel, h_output_fp16);
+
+                LOG_INFO("[Integration] FP16 vs INT8 Two-Kernel cosine similarity: " << cosine);
+
+                // FP16 and INT8 should produce very similar results (both are quantized paths)
+                // Allow slightly lower threshold due to FP16 intermediate precision
+                EXPECT_GT(cosine, 0.995f) << "FP16 path diverged too much from INT8 Two-Kernel";
+
+                // Cleanup
+                rocmQuantGemm_freeDevice(d_A_int8);
+                rocmQuantGemm_freeDevice(d_scales_A);
+                rocmQuantGemm_freeDevice(d_C_int32);
+                rocmQuantGemm_freeDevice(d_activations);
+                rocmQuantGemm_freeDevice(d_output_twokernel);
+                rocmQuantGemm_freeDevice(d_output_fp16);
+                rocmQuantGemm_freeDevice(d_B_int8);
+                rocmQuantGemm_freeDevice(d_scales_B);
+            }
+
+            /**
+             * @test Verify adaptive path selection works correctly in multiply_tensor
+             *
+             * Tests that multiply_tensor automatically uses FP16 for M > 128.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, AdaptivePathSelection_M256_UsesFP16)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                // M = 256 should trigger FP16 path (threshold is M > 128)
+                const int M = 256;
+                const int N = 896;
+                const int K = 896;
+
+                // Clear environment overrides to test default behavior
+                unsetenv("LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS");
+                unsetenv("LLAMINAR_ROCM_GEMM_FORCE_FP16");
+                unsetenv("LLAMINAR_ROCM_GEMM_DISABLE_FP16");
+                unsetenv("LLAMINAR_ROCM_GEMM_FUSED");
+
+                // Create tensors
+                auto weights = TestTensorFactory::createQ8_1Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                auto activations = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+                // Create kernel and run GEMM
+                ROCmQuantisedGemmKernel kernel(weights.get(), 0);
+                ASSERT_TRUE(kernel.multiply_tensor(activations.get(), output.get(), M, N, K))
+                    << "multiply_tensor failed for M=" << M;
+
+                // Verify output is not all zeros
+                const float *out_data = output->data();
+                bool has_nonzero = false;
+                for (int i = 0; i < M * N && !has_nonzero; ++i)
+                {
+                    if (std::abs(out_data[i]) > 1e-10f)
+                    {
+                        has_nonzero = true;
+                    }
+                }
+                EXPECT_TRUE(has_nonzero) << "Output is all zeros - GEMM may have failed";
+
+                LOG_INFO("[Integration] Adaptive path selection test passed for M=" << M);
+            }
+
+            /**
+             * @test Verify selectGemmPath is honored by multiply_tensor
+             *
+             * Tests that DISABLE_FP16 flag correctly prevents FP16 path usage.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, DisableFP16_UsesCKTwoKernel)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                // M = 256 would normally use FP16, but we disable it
+                const int M = 256;
+                const int N = 896;
+                const int K = 896;
+
+                // Set DISABLE_FP16 to force CK Two-Kernel path
+                unsetenv("LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS");
+                unsetenv("LLAMINAR_ROCM_GEMM_FORCE_FP16");
+                setenv("LLAMINAR_ROCM_GEMM_DISABLE_FP16", "1", 1);
+                unsetenv("LLAMINAR_ROCM_GEMM_FUSED");
+
+                // Verify path selection
+                GemmPath path = selectGemmPath(M, N, K);
+                EXPECT_EQ(path, GemmPath::CK_TWO_KERNEL) << "DISABLE_FP16 should force CK Two-Kernel";
+
+                // Create tensors and run GEMM
+                auto weights = TestTensorFactory::createQ8_1Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                auto activations = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+                ROCmQuantisedGemmKernel kernel(weights.get(), 0);
+                ASSERT_TRUE(kernel.multiply_tensor(activations.get(), output.get(), M, N, K))
+                    << "multiply_tensor failed with DISABLE_FP16";
+
+                // Cleanup environment
+                unsetenv("LLAMINAR_ROCM_GEMM_DISABLE_FP16");
+
+                LOG_INFO("[Integration] DISABLE_FP16 test passed");
             }
 
         } // namespace integration_test

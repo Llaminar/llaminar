@@ -5431,4 +5431,21 @@ if(HAVE_ROCM)
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm Quantised GEMM kernel performance benchmarks")
+
+    # Performance Test: FP16 vs INT8 GEMM Comparison
+    # Tests hypothesis that FP16 hipBLAS may be faster than INT8 CK on gfx906
+    add_executable(v2_perf_rocm_fp16_vs_int8_gemm 
+        performance/kernels/rocm/Perf__ROCmFP16vsINT8Gemm.cpp
+    )
+    target_link_libraries(v2_perf_rocm_fp16_vs_int8_gemm 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_ROCmFP16vsINT8Gemm
+        COMMAND $<TARGET_FILE:v2_perf_rocm_fp16_vs_int8_gemm>
+        LABELS "V2;Performance;ROCm;GEMM;FP16;INT8;Comparison;gfx906;Benchmark"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm FP16 vs INT8 GEMM comparison benchmarks")
 endif()
