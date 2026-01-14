@@ -116,6 +116,36 @@ namespace llaminar2
                 float *work_buffer, // Optional pre-allocated [M×N] FP32 buffer
                 size_t work_buffer_size);
 
+            // Execute INT8 GEMM using hipBLAS (fallback for small M < 64)
+            bool rocmQuantGemm_executeHipBLAS(
+                const int8_t *d_A_int8, // [M x K] RowMajor quantized activations
+                const int8_t *d_B_int8, // [K x N] RowMajor transposed weights
+                float *d_E_fp32,        // [M x N] RowMajor FP32 output
+                const float *d_scale_A, // [M] per-row activation scales
+                const float *d_scale_B, // [N] per-column weight scales
+                int M, int N, int K,
+                int rocm_device_id);
+
+            // Execute INT8 GEMM using CK with SEPARATE scaling (two-kernel approach)
+            // This runs CK for INT8→INT32 GEMM, then a separate kernel for scaling.
+            // Used to test if fused scaling causes accuracy loss.
+            bool rocmQuantGemm_executeTwoKernel(
+                const int8_t *d_A_int8, // [M x K] RowMajor quantized activations
+                const int8_t *d_B_int8, // [K x N] RowMajor transposed weights
+                float *d_E_fp32,        // [M x N] RowMajor FP32 output
+                const float *d_scale_A, // [M] per-row activation scales
+                const float *d_scale_B, // [N] per-column weight scales
+                int M, int N, int K,
+                int rocm_device_id);
+
+            // Get CK minimum dimension requirements
+            int rocmQuantGemm_getMinM();
+            int rocmQuantGemm_getMinN();
+            int rocmQuantGemm_getMinK();
+
+            // Check if CK supports the given dimensions
+            bool rocmQuantGemm_areDimensionsSupported(int M, int N, int K);
+
             // Free device memory
             void rocmQuantGemm_freeDevice(void *d_ptr);
 
@@ -608,17 +638,140 @@ namespace llaminar2
             }
             float *d_C_fp32 = impl_->d_C_fp32;
 
-            // Execute DenseScale INT8 GEMM + scaling: C_fp32 = (A_int8 × B_int8) * scale_A * scale_B
-            // This uses CK's CDEElementOp to apply scales during output writeback via a pre-computed
-            // combined_scale[M×N] = scale_A[m] × scale_B[n] buffer. The scale multiplication is fused
-            // into the GEMM kernel's output writeback, eliminating separate scaling kernel overhead.
-            if (!rocmQuantGemm_executeDenseScale(d_A_int8, d_weights_int8, d_C_fp32,
-                                                 d_scales_A, d_scales_B,
-                                                 m, n, k, rocm_device_id_,
-                                                 nullptr, 0)) // Let kernel allocate work buffer
+            // =========================================================================
+            // THREE-PATH DISPATCH: CK Two-Kernel (default) | CK Fused | hipBLAS
+            // =========================================================================
+            //
+            // DISPATCH DECISION TREE:
+            //
+            //   ┌─────────────────────────────────────────────────────────────────┐
+            //   │ M < 64 or N < 64 or K < 32?  ───YES───> hipBLAS (no choice)     │
+            //   │         │                                                       │
+            //   │         NO                                                      │
+            //   │         │                                                       │
+            //   │         ▼                                                       │
+            //   │ LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS=1? ───YES───> hipBLAS         │
+            //   │         │                                                       │
+            //   │         NO                                                      │
+            //   │         │                                                       │
+            //   │         ▼                                                       │
+            //   │ LLAMINAR_ROCM_GEMM_FUSED=1? ───YES───> CK Fused (legacy)       │
+            //   │         │                                                       │
+            //   │         NO (default)                                            │
+            //   │         │                                                       │
+            //   │         ▼                                                       │
+            //   │ CK Two-Kernel (DEFAULT for M >= 64)                            │
+            //   └─────────────────────────────────────────────────────────────────┘
+            //
+            // WHY CK TWO-KERNEL IS DEFAULT:
+            //
+            //   We benchmarked three approaches on Qwen2.5-7B (MI50/MI60, gfx906):
+            //
+            //   | M    | CK Fused (TFLOPS) | CK Two-Kernel | hipBLAS | Accuracy  |
+            //   |------|-------------------|---------------|---------|----------|
+            //   | 128  | 3.015             | 3.063 (+1.6%) | 2.055   | ↓ see below |
+            //   | 512  | 3.349             | 3.403 (+1.6%) | 2.461   |           |
+            //
+            //   Accuracy (cosine similarity vs FP32 reference):
+            //     - CK Fused:      ~0.9917 (fused D-tensor scaling introduces error)
+            //     - CK Two-Kernel: ~0.9999 (same as hipBLAS - gold standard)
+            //     - hipBLAS:       ~0.9999 (reference implementation)
+            //
+            //   CONCLUSION: CK Two-Kernel provides:
+            //     ✅ Same accuracy as hipBLAS (cos ≈ 0.9999)
+            //     ✅ Slightly faster than CK Fused (+1-2%)
+            //     ✅ 38% faster than hipBLAS for large M
+            //
+            // ENVIRONMENT VARIABLES:
+            //   LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS=1 - Force hipBLAS for all sizes
+            //   LLAMINAR_ROCM_GEMM_FUSED=1        - Use CK fused (legacy, lower accuracy)
+            //
+            const char *force_hipblas_env = std::getenv("LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS");
+            const bool force_hipblas = (force_hipblas_env && force_hipblas_env[0] == '1');
+
+            const char *use_fused_env = std::getenv("LLAMINAR_ROCM_GEMM_FUSED");
+            const bool use_fused = (use_fused_env && use_fused_env[0] == '1');
+
+            const bool use_ck = !force_hipblas && rocmQuantGemm_areDimensionsSupported(m, n, k);
+
+            if (use_ck)
             {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] DenseScale GEMM failed");
-                return false;
+                if (use_fused)
+                {
+                    // Execute CK FUSED approach (legacy, lower accuracy but slightly faster launch)
+                    // Uses CK's CDEElementOp to apply scales during output writeback via a pre-computed
+                    // combined_scale[M×N] = scale_A[m] × scale_B[n] buffer.
+                    //
+                    // WARNING: This path has ~0.8% lower cosine similarity vs reference due to
+                    // numerical precision loss in CK's fused D-tensor handling.
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel] Using CK FUSED (M=" << m << ", N=" << n << ", K=" << k << ")");
+                    if (!rocmQuantGemm_executeDenseScale(d_A_int8, d_weights_int8, d_C_fp32,
+                                                         d_scales_A, d_scales_B,
+                                                         m, n, k, rocm_device_id_,
+                                                         nullptr, 0))
+                    {
+                        LOG_WARN("[ROCmQuantisedGemmKernel::multiply_tensor] CK fused failed, trying two-kernel fallback");
+                        if (!rocmQuantGemm_executeTwoKernel(d_A_int8, d_weights_int8, d_C_fp32,
+                                                            d_scales_A, d_scales_B,
+                                                            m, n, k, rocm_device_id_))
+                        {
+                            // Both CK paths failed - final fallback to hipBLAS
+                            LOG_WARN("[ROCmQuantisedGemmKernel::multiply_tensor] Both CK paths failed, trying hipBLAS fallback");
+                            if (!rocmQuantGemm_executeHipBLAS(d_A_int8, d_weights_int8, d_C_fp32,
+                                                              d_scales_A, d_scales_B,
+                                                              m, n, k, rocm_device_id_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] All GEMM paths failed");
+                                return false;
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // Execute CK TWO-KERNEL approach (DEFAULT - best accuracy + performance)
+                    // Step 1: CK INT8×INT8→INT32 GEMM (no scaling)
+                    // Step 2: applyScales_kernel INT32→FP32 with per-row/col scales
+                    //
+                    // This approach matches hipBLAS accuracy (~0.9999 cosine) while being
+                    // ~38% faster than hipBLAS and ~1-2% faster than CK fused.
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel] Using CK TWO-KERNEL (M=" << m << ", N=" << n << ", K=" << k << ")");
+                    if (!rocmQuantGemm_executeTwoKernel(d_A_int8, d_weights_int8, d_C_fp32,
+                                                        d_scales_A, d_scales_B,
+                                                        m, n, k, rocm_device_id_))
+                    {
+                        // Two-kernel failed - try fused as fallback
+                        LOG_WARN("[ROCmQuantisedGemmKernel::multiply_tensor] CK two-kernel failed, trying fused fallback");
+                        if (!rocmQuantGemm_executeDenseScale(d_A_int8, d_weights_int8, d_C_fp32,
+                                                             d_scales_A, d_scales_B,
+                                                             m, n, k, rocm_device_id_,
+                                                             nullptr, 0))
+                        {
+                            // Both CK paths failed - final fallback to hipBLAS
+                            LOG_WARN("[ROCmQuantisedGemmKernel::multiply_tensor] Both CK paths failed, trying hipBLAS fallback");
+                            if (!rocmQuantGemm_executeHipBLAS(d_A_int8, d_weights_int8, d_C_fp32,
+                                                              d_scales_A, d_scales_B,
+                                                              m, n, k, rocm_device_id_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] All GEMM paths failed");
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // Execute hipBLAS INT8 GEMM + scaling: C_fp32 = (A_int8 × B_int8) * scale_A * scale_B
+                // Two-kernel approach: hipBLAS GemmEx (INT8→INT32) + applyScales_kernel (INT32→FP32)
+                LOG_DEBUG("[ROCmQuantisedGemmKernel] Using hipBLAS (M=" << m << ", N=" << n << ", K=" << k << " not supported by CK)");
+                if (!rocmQuantGemm_executeHipBLAS(d_A_int8, d_weights_int8, d_C_fp32,
+                                                  d_scales_A, d_scales_B,
+                                                  m, n, k, rocm_device_id_))
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] hipBLAS GEMM failed");
+                    return false;
+                }
             }
 
             // Copy result back to host

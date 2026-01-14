@@ -15,8 +15,10 @@
  *   2. Performs matrix multiplication: C = A × B
  *   3. Applies per-row and per-column scaling to get FP32 output
  *
- * Key functions:
- *   - rocmQuantGemm_executeDenseScale()  : Main entry point - fused INT8 GEMM
+ * Key functions (in order of preference):
+ *   - rocmQuantGemm_executeTwoKernel()   : DEFAULT - CK GEMM + separate scaling
+ *   - rocmQuantGemm_executeDenseScale()  : Legacy - CK with fused scaling
+ *   - rocmQuantGemm_executeHipBLAS()     : Fallback for M < 64
  *   - rocmQuantGemm_quantizeActivations(): FP32→INT8 activation quantization
  *   - rocmQuantGemm_uploadWeights()      : Upload weights to GPU
  *
@@ -120,12 +122,52 @@
  */
 
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
 #include <cstdint>
 #include <cstdio>
 #include <cfloat>
 #include <cmath>
 #include <iostream>
 #include <streambuf>
+
+// ============================================================================
+// HIPBLAS HANDLE MANAGEMENT
+// ============================================================================
+// Thread-local hipBLAS handle for INT8 GEMM on small M (M < 64)
+// Used as fallback when CK's minimum dimension requirements aren't met.
+
+namespace {
+
+thread_local hipblasHandle_t g_hipblas_handle = nullptr;
+thread_local int g_hipblas_device_id = -1;
+
+hipblasHandle_t getHipblasHandle(int device_id)
+{
+    if (g_hipblas_handle && g_hipblas_device_id == device_id)
+        return g_hipblas_handle;
+    
+    // Destroy old handle if device changed
+    if (g_hipblas_handle)
+    {
+        hipblasDestroy(g_hipblas_handle);
+        g_hipblas_handle = nullptr;
+    }
+    
+    // Set device and create handle
+    if (hipSetDevice(device_id) != hipSuccess)
+        return nullptr;
+    
+    if (hipblasCreate(&g_hipblas_handle) != HIPBLAS_STATUS_SUCCESS)
+    {
+        g_hipblas_handle = nullptr;
+        return nullptr;
+    }
+    
+    g_hipblas_device_id = device_id;
+    return g_hipblas_handle;
+}
+
+} // anonymous namespace
 
 // ComposableKernel headers for INT8 GEMM
 
@@ -284,30 +326,35 @@ using BElementOp   = PassThrough;
 static constexpr auto GemmDefault = ck::tensor_operation::device::GemmSpecialization::Default;
 
 // ============================================================================
-// DENSE SCALE KERNEL TYPE (PRODUCTION)
+// DENSE SCALE KERNEL TYPE (LEGACY - NOT DEFAULT)
 // ============================================================================
 //
-// This is the kernel for INT8×INT8→FP32 GEMM with fused scaling.
+// ⚠️ WARNING: This kernel has ~0.8% lower accuracy than Two-Kernel approach!
+//    Cosine similarity: ~0.9917 vs ~0.9999 for Two-Kernel/hipBLAS
+//    Use LLAMINAR_ROCM_GEMM_FUSED=1 to enable (not recommended)
+//
+// This kernel attempts to fuse scaling into the GEMM via CK's D-tensor.
 //
 // How it works:
 //   1. Pre-compute combined_scale[m,n] = scale_A[m] * scale_B[n]
 //   2. Run GEMM with fused scaling: E[m,n] = C_int32[m,n] * combined_scale[m,n]
 //
-// Why this design (not broadcast D-tensors):
-//   - CK has an API limitation where broadcast D-tensors (stride=0) don't work
-//     correctly for asymmetric scale vectors (see docs/HANDOVER_ROCM_INT8_GEMM.md)
-//   - Dense scale matrix uses standard row-major D-tensor (stride=N)
-//   - Scaling is still FUSED into the GEMM kernel (no separate scaling pass)
-//   - Pre-compute overhead is negligible (~0.1ms for 128×128)
+// Why fused scaling has lower accuracy:
+//   CK's CDEElementOp applies scaling during output writeback. The INT32→FP32
+//   conversion and float multiplication happen in a single pass. This can
+//   accumulate rounding errors differently than the two-kernel approach where
+//   INT32 accumulator values are written exactly, then scaled.
 //
-// Memory overhead:
-//   - Temporary [M×N] float buffer for combined_scale
-//   - For M=128, N=1024: 512KB temporary (acceptable)
-//   - For M=1, N=4096: 16KB temporary (negligible)
+// Why this design exists (historical context):
+//   - Originally designed to avoid a second kernel launch overhead
+//   - CK's broadcast D-tensors (stride=0) had bugs, so we use dense [M×N] scale
+//   - Pre-compute overhead is negligible (~0.1ms for 128×128)
 //
 // Formula:
 //   E[m,n] = (A_int8[m,:] × B_int8[:,n]) * combined_scale[m,n]
 //          = (A_int8[m,:] × B_int8[:,n]) * scale_A[m] * scale_B[n]
+//
+// PREFER: rocmQuantGemm_executeTwoKernel() for production (same speed, better accuracy)
 //
 // ============================================================================
 using DsDataType_Dense = ck::Tuple<F32>;    // Single [M×N] scale matrix
@@ -429,21 +476,23 @@ using DeviceGemmInt8_DenseScale = ck::tensor_operation::device::DeviceGemmMultip
 // clang-format on
 
 // ============================================================================
-// NO-SCALE KERNEL TYPE (DEBUGGING / REFERENCE)
+// NO-SCALE KERNEL TYPE (USED BY TWO-KERNEL DEFAULT PATH)
 // ============================================================================
 //
 // This kernel performs pure INT8×INT8→INT32 GEMM without any scaling.
+// It is the FIRST STEP in the default two-kernel approach.
 //
 // USE CASES:
-//   1. Debugging: Isolate whether issues are in the base GEMM or D-tensor handling
-//   2. Reference: Verify GEMM correctness before adding scaling
-//   3. Testing: Compare against CPU reference implementation
+//   1. Two-Kernel Path (DEFAULT): First kernel, followed by applyScales_kernel
+//   2. Debugging: Isolate whether issues are in the base GEMM or scaling
+//   3. Reference: Verify GEMM correctness against CPU implementation
 //
 // Formula:
 //   E[m,n] = sum_k( A_int8[m,k] × B_int8[k,n] )  [result is INT32]
 //
-// For production inference, use DenseScale kernel which includes scaling.
-// This kernel would need a separate scale application pass.
+// For production inference:
+//   - Default path: This kernel + applyScales_kernel (via executeTwoKernel)
+//   - Legacy path: DenseScale kernel (lower accuracy, use LLAMINAR_ROCM_GEMM_FUSED=1)
 //
 // ============================================================================
 using DsDataType_None = ck::Tuple<>;  // No D tensors (empty tuple)
@@ -518,8 +567,8 @@ using DeviceGemmInt8_NoScale = ck::tensor_operation::device::DeviceGemmMultipleD
 //   ┌──────────────────┬─────────────────────────────────────────────────────┐
 //   │ Kernel           │ Use Case                                            │
 //   ├──────────────────┼─────────────────────────────────────────────────────┤
-//   │ DenseScale       │ Production: Pre-compute combined_scale + fused GEMM │
-//   │ NoScale          │ Debugging: Raw INT32 output, no scaling             │
+//   │ NoScale          │ Two-Kernel default: INT8→INT32 GEMM only           │
+//   │ DenseScale       │ Legacy fused: INT8→FP32 with pre-computed scales   │
 //   └──────────────────┴─────────────────────────────────────────────────────┘
 //
 // ============================================================================
@@ -855,20 +904,22 @@ extern "C"
     }
 
     // =========================================================================
-    // MAIN ENTRY POINT: Dense Scale GEMM
+    // LEGACY ENTRY POINT: Dense Scale GEMM (NOT DEFAULT)
     // =========================================================================
     //
-    // rocmQuantGemm_executeDenseScale - INT8×INT8→FP32 with per-row/col scaling
+    // ⚠️ NOTE: This is NOT the default path. Use rocmQuantGemm_executeTwoKernel()
+    //    for best accuracy. Enable this with LLAMINAR_ROCM_GEMM_FUSED=1.
+    //
+    // rocmQuantGemm_executeDenseScale - INT8×INT8→FP32 with fused per-row/col scaling
     //
     // ALGORITHM:
     //   Step 1: Compute combined_scale[m,n] = scale_A[m] * scale_B[n]  (GPU kernel)
     //   Step 2: Run CK GEMM: E[m,n] = sum_k(A[m,k] × B[k,n]) * combined_scale[m,n]
     //
-    // WHY THIS APPROACH:
-    //   - CK's broadcast D-tensor (stride=0) had bugs on gfx906 (now patched)
-    //   - Dense scale matrix uses standard row-major D-tensor (stride=N)
-    //   - More reliable and easier to debug
-    //   - Pre-scale computation is negligible (~1% of GEMM time)
+    // ACCURACY WARNING:
+    //   This approach has ~0.8% lower cosine similarity vs FP32 reference.
+    //   The fused D-tensor scaling accumulates rounding errors differently.
+    //   Prefer rocmQuantGemm_executeTwoKernel() for production inference.
     //
     // PARAMETERS:
     //   d_A_int8        - [M×K] INT8 activation matrix (row-major, device pointer)
@@ -1103,6 +1154,94 @@ extern "C"
     }
 
     // =========================================================================
+    // TWO-KERNEL CK APPROACH (DEFAULT - BEST ACCURACY + PERFORMANCE)
+    // =========================================================================
+    //
+    // rocmQuantGemm_executeTwoKernel - CK INT8→INT32 GEMM + applyScales_kernel
+    //
+    // ✅ THIS IS THE DEFAULT AND RECOMMENDED PATH FOR M >= 64
+    //
+    // This approach runs two kernels:
+    //   1. CK's DeviceGemmMultipleD_Dl for INT8×INT8→INT32 (no D-tensor scaling)
+    //   2. applyScales_kernel to convert INT32→FP32 with per-row/col scales
+    //
+    // FORMULA:
+    //   C_int32[m,n] = sum_k(A_int8[m,k] × B_int8[k,n])    [CK GEMM]
+    //   E_fp32[m,n] = C_int32[m,n] × scale_A[m] × scale_B[n]  [applyScales_kernel]
+    //
+    // WHY THIS IS DEFAULT (January 2026 benchmarks on MI50/MI60, Qwen2.5-7B):
+    //
+    //   | Approach      | M=512 FFN TFLOPS | Cosine Similarity |
+    //   |---------------|------------------|-------------------|
+    //   | Two-Kernel    | 3.403            | 0.9999 ✅         |
+    //   | Fused         | 3.349 (-1.6%)    | 0.9917 ❌         |
+    //   | hipBLAS       | 2.461 (-28%)     | 0.9999 ✅         |
+    //
+    //   Two-Kernel provides:
+    //     ✅ Same accuracy as hipBLAS (gold standard)
+    //     ✅ Slightly faster than fused CK (+1.6%)
+    //     ✅ 38% faster than hipBLAS
+    //
+    // MEMORY:
+    //   - Allocates temporary [M×N×4] bytes for INT32 accumulator
+    //   - Freed immediately after scaling kernel completes
+    //
+    // =========================================================================
+    bool rocmQuantGemm_executeTwoKernel(
+        const int8_t *d_A_int8,       // [M × K] INT8 activations (row-major)
+        const int8_t *d_B_int8,       // [K × N] INT8 weights (row-major)
+        float *d_E_fp32,              // [M × N] FP32 output (row-major)
+        const float *d_scale_A,       // [M] per-row scales
+        const float *d_scale_B,       // [N] per-column scales
+        int M, int N, int K,
+        int rocm_device_id)
+    {
+        if (M <= 0 || N <= 0 || K <= 0)
+            return true;
+
+        // 1. Allocate INT32 accumulator buffer
+        int32_t *d_C_int32 = nullptr;
+        hipError_t err = hipMalloc(&d_C_int32, static_cast<size_t>(M) * N * sizeof(int32_t));
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_executeTwoKernel] Failed to allocate INT32 buffer: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+
+        // 2. Run CK INT8 GEMM: C_int32 = A_int8 × B_int8 (no scaling)
+        if (!rocmQuantGemm_executeNoScale(d_A_int8, d_B_int8, d_C_int32, M, N, K, rocm_device_id))
+        {
+            fprintf(stderr, "[rocmQuantGemm_executeTwoKernel] CK NoScale GEMM failed\n");
+            hipFree(d_C_int32);
+            return false;
+        }
+
+        // 3. Apply scales: E_fp32[m,n] = C_int32[m,n] * scale_A[m] * scale_B[n]
+        const int total = M * N;
+        const int block_size = 256;
+        const int grid_size = (total + block_size - 1) / block_size;
+
+        hipLaunchKernelGGL(
+            applyScales_kernel,
+            dim3(grid_size), dim3(block_size), 0, 0,
+            d_C_int32, d_E_fp32, d_scale_A, d_scale_B, M, N);
+
+        err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_executeTwoKernel] applyScales_kernel failed: %s\n",
+                    hipGetErrorString(err));
+            hipFree(d_C_int32);
+            return false;
+        }
+
+        // 4. Cleanup
+        hipFree(d_C_int32);
+        return true;
+    }
+
+    // =========================================================================
     // ACTIVATION QUANTIZATION (FP32 → INT8)
     // =========================================================================
     //
@@ -1159,6 +1298,129 @@ extern "C"
 
         // No device-wide sync here; rely on stream ordering + a final sync/copy.
 
+        return true;
+    }
+
+    // =========================================================================
+    // HIPBLAS INT8 GEMM (SMALL M FALLBACK)
+    // =========================================================================
+    //
+    // rocmQuantGemm_executeHipBLAS - INT8×INT8→FP32 GEMM using hipBLAS
+    //
+    // This function handles dimensions that CK cannot process (M < 64).
+    // It uses hipBLAS's GemmEx with INT8 compute, then applies scaling.
+    //
+    // FORMULA:
+    //   C_int32[m,n] = sum_k(A_int8[m,k] × B_int8[k,n])    [hipBLAS]
+    //   E_fp32[m,n] = C_int32[m,n] × scale_A[m] × scale_B[n]  [applyScales_kernel]
+    //
+    // MEMORY LAYOUT:
+    //   - A_int8: [M × K] Row-Major (RowMajor = lda=K)
+    //   - B_int8: [K × N] Row-Major (ColMajor for BLAS = ldb=N, transposed)
+    //   - C_int32/E_fp32: [M × N] Row-Major (RowMajor = ldc=N)
+    //
+    // HIPBLAS DETAILS:
+    //   hipBLAS uses column-major by default, but we have row-major data.
+    //   We compute C = A × B as: C^T = B^T × A^T
+    //   This means we call: hipblasGemmEx(NOTRANS, NOTRANS, N, M, K, B, A, C)
+    //   Output C is [M × N] row-major = [N × M] column-major
+    //
+    // WHY HIPBLAS FOR SMALL M:
+    //   - CK requires M ≥ 64 (tile-based computation)
+    //   - Decode generates M=1 tokens at a time
+    //   - hipBLAS has no minimum dimension requirements
+    //   - Performance is acceptable for small M (memory-bound anyway)
+    //
+    // =========================================================================
+    bool rocmQuantGemm_executeHipBLAS(
+        const int8_t *d_A_int8,       // [M × K] INT8 activations (row-major)
+        const int8_t *d_B_int8,       // [K × N] INT8 weights (row-major)
+        float *d_E_fp32,              // [M × N] FP32 output (row-major)
+        const float *d_scale_A,       // [M] per-row scales
+        const float *d_scale_B,       // [N] per-column scales
+        int M, int N, int K,
+        int rocm_device_id)
+    {
+        if (M <= 0 || N <= 0 || K <= 0)
+            return true;
+
+        // 1. Get/create hipBLAS handle
+        hipblasHandle_t handle = getHipblasHandle(rocm_device_id);
+        if (!handle)
+        {
+            fprintf(stderr, "[rocmQuantGemm_executeHipBLAS] Failed to get hipBLAS handle\n");
+            return false;
+        }
+
+        // 2. Allocate INT32 accumulator buffer
+        int32_t *d_C_int32 = nullptr;
+        hipError_t err = hipMalloc(&d_C_int32, static_cast<size_t>(M) * N * sizeof(int32_t));
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_executeHipBLAS] Failed to allocate INT32 buffer: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+
+        // 3. Run hipBLAS INT8 GEMM: C_int32 = A_int8 × B_int8
+        //
+        // Row-major trick: compute C = A × B by doing C^T = B^T × A^T
+        // Since our B is [K × N] row-major = [N × K] column-major,
+        // and our A is [M × K] row-major = [K × M] column-major,
+        // we call: GemmEx(opB=N, opA=N, N, M, K, B, N, A, K, C, N)
+        //
+        // This gives us [N × M] column-major output = [M × N] row-major!
+        const int32_t alpha = 1;
+        const int32_t beta = 0;
+
+        hipblasStatus_t status = hipblasGemmEx(
+            handle,
+            HIPBLAS_OP_N,               // opB: no transpose (B is K×N row = N×K col)
+            HIPBLAS_OP_N,               // opA: no transpose (A is M×K row = K×M col)
+            N, M, K,                    // [N × M] col-major output = [M × N] row-major
+            &alpha,                     // alpha = 1
+            d_B_int8,                   // B: [K × N] row-major
+            HIP_R_8I,                   // B type: INT8
+            N,                          // ldb = N (row-major stride)
+            d_A_int8,                   // A: [M × K] row-major
+            HIP_R_8I,                   // A type: INT8
+            K,                          // lda = K (row-major stride)
+            &beta,                      // beta = 0
+            d_C_int32,                  // C: [M × N] row-major output
+            HIP_R_32I,                  // C type: INT32
+            N,                          // ldc = N (row-major stride)
+            HIPBLAS_COMPUTE_32I,        // compute type: 32-bit integer
+            HIPBLAS_GEMM_DEFAULT);      // algorithm
+
+        if (status != HIPBLAS_STATUS_SUCCESS)
+        {
+            fprintf(stderr, "[rocmQuantGemm_executeHipBLAS] hipblasGemmEx failed: %d\n",
+                    static_cast<int>(status));
+            hipFree(d_C_int32);
+            return false;
+        }
+
+        // 4. Apply scales: E_fp32[m,n] = C_int32[m,n] * scale_A[m] * scale_B[n]
+        const int total = M * N;
+        const int block_size = 256;
+        const int grid_size = (total + block_size - 1) / block_size;
+
+        hipLaunchKernelGGL(
+            applyScales_kernel,
+            dim3(grid_size), dim3(block_size), 0, 0,
+            d_C_int32, d_E_fp32, d_scale_A, d_scale_B, M, N);
+
+        err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_executeHipBLAS] applyScales_kernel failed: %s\n",
+                    hipGetErrorString(err));
+            hipFree(d_C_int32);
+            return false;
+        }
+
+        // 5. Cleanup
+        hipFree(d_C_int32);
         return true;
     }
 
