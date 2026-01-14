@@ -170,9 +170,10 @@ if(HAVE_ROCM)
     message(STATUS "V2: HIP Version: ${hip_VERSION}")
     message(STATUS "V2: hipcc: ${HIP_HIPCC_EXECUTABLE}")
     
-    # ROCm compile flags (support common AMD architectures)
-    # MI50 = gfx906
-    set(CMAKE_HIP_ARCHITECTURES "gfx900;gfx906;gfx908;gfx90a;gfx940;gfx1030;gfx1100")
+    # ROCm compile flags - only architectures supporting DL (Deep Learning) instructions
+    # CK requires specific arch macros: gfx906, gfx908, gfx90a (MI50/MI100/MI200)
+    # NOT supported: gfx900 (no DL), gfx940 (CK expects gfx942), gfx1030/gfx1100 (RDNA)
+    set(CMAKE_HIP_ARCHITECTURES "gfx906;gfx908;gfx90a")
 endif()
 
 # =============================================================================
@@ -315,11 +316,78 @@ if(HAVE_CUDA)
     message(STATUS "V2: CUDA backend library configured with ${CMAKE_CURRENT_LIST_LENGTH} kernel(s)")
 endif()
 
+# =============================================================================
+# ComposableKernel (CK) Auto-Clone for ROCm INT8 GEMM
+# =============================================================================
+# CK is AMD's template-based GPU kernel library. We use a fork that includes
+# a fix for DeviceGemmMultipleD_Dl when FloatAcc != FloatC (INT8 GEMM with FP32 output).
+# See: https://github.com/ROCm/composable_kernel/pull/3565
+if(HAVE_ROCM)
+    find_package(Git REQUIRED)
+
+    # Ensure CK exists in external/ and is on our fix branch
+    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+    set(CK_EXTERNAL_DIR "${REPO_ROOT}/external/composable_kernel")
+    set(CK_GIT_URL "https://github.com/dbsanfte/composable_kernel.git")
+    # Track our fork's fix branch for INT8 GEMM with FP32 output scaling
+    set(CK_GIT_REF "fix/multiple-d-floatc-output")
+
+    if(NOT EXISTS "${REPO_ROOT}/external")
+        file(MAKE_DIRECTORY ${REPO_ROOT}/external)
+    endif()
+
+    if(NOT EXISTS "${CK_EXTERNAL_DIR}")
+        message(STATUS "V2: ComposableKernel not found in external/, cloning ${CK_GIT_URL} (${CK_GIT_REF})...")
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} clone --depth 1 --branch ${CK_GIT_REF}
+                ${CK_GIT_URL}
+                composable_kernel
+            WORKING_DIRECTORY ${REPO_ROOT}/external
+            RESULT_VARIABLE GIT_CLONE_RESULT
+            OUTPUT_VARIABLE GIT_CLONE_OUTPUT
+            ERROR_VARIABLE GIT_CLONE_ERROR
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_STRIP_TRAILING_WHITESPACE
+        )
+
+        if(NOT GIT_CLONE_RESULT EQUAL 0)
+            message(FATAL_ERROR "V2: Failed to clone ComposableKernel: ${GIT_CLONE_ERROR}")
+        endif()
+
+        message(STATUS "V2: ComposableKernel ${CK_GIT_REF} cloned successfully")
+    else()
+        # Verify CK is on the expected branch (don't force-checkout, just warn if different)
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} rev-parse --abbrev-ref HEAD
+            WORKING_DIRECTORY ${CK_EXTERNAL_DIR}
+            RESULT_VARIABLE CK_BRANCH_RESULT
+            OUTPUT_VARIABLE CK_CURRENT_BRANCH
+            ERROR_VARIABLE CK_BRANCH_ERROR
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if(CK_BRANCH_RESULT EQUAL 0)
+            if(NOT CK_CURRENT_BRANCH STREQUAL CK_GIT_REF)
+                message(WARNING "V2: ComposableKernel is on branch '${CK_CURRENT_BRANCH}', expected '${CK_GIT_REF}'. "
+                                "INT8 GEMM may not work correctly without the fix branch.")
+            else()
+                message(STATUS "V2: ComposableKernel already present at ${CK_EXTERNAL_DIR} on branch ${CK_GIT_REF}")
+            endif()
+        else()
+            message(STATUS "V2: ComposableKernel already present at ${CK_EXTERNAL_DIR}; leaving existing checkout untouched")
+        endif()
+    endif()
+endif()
+
 # ROCm backend (separate .cpp compilation unit with HIP)
 if(HAVE_ROCM)
+    # Find ComposableKernel library (AMD's template-based GPU kernel library)
+    list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+    find_package(ComposableKernel QUIET)
+    
     # ROCm kernels compiled with hipcc
     set(ROCM_KERNEL_SOURCES
         kernels/rocm/HipBLASGemmKernel.cpp      # hipBLAS wrapper for FP32/FP16 dense GEMM
+        kernels/rocm/ROCmQuantisedGemmKernel_CK.hip  # ComposableKernel INT8 GEMM implementation
     )
     
     # ROCm enumeration and backend must be compiled with hipcc to use HIP runtime
@@ -330,6 +398,15 @@ if(HAVE_ROCM)
     )
     target_include_directories(rocm_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(rocm_backend PUBLIC hip::host roc::hipblas)
+    
+    # Link ComposableKernel if found
+    if(ComposableKernel_FOUND)
+        target_link_libraries(rocm_backend PUBLIC ComposableKernel::ComposableKernel)
+        target_compile_definitions(rocm_backend PUBLIC HAVE_COMPOSABLE_KERNEL)
+        message(STATUS "V2: ROCm backend using ComposableKernel for INT8 GEMM")
+    else()
+        message(WARNING "V2: ComposableKernel not found - ROCm INT8 GEMM will be disabled")
+    endif()
     
     # Set HIP compiler for ROCm source files
     set_source_files_properties(
@@ -894,6 +971,7 @@ if(HAVE_ROCM)
     # These implement ITensorGemm interface and can include MPI headers
     target_sources(llaminar2_core PRIVATE
         kernels/rocm/ROCmFloatingPointGemmKernel.cpp
+        kernels/rocm/ROCmQuantisedGemmKernel.cpp  # INT8 GEMM adapter (uses CK via extern "C")
     )
     
     message(STATUS "V2: Linked ROCm backend library with hipBLAS GEMM")

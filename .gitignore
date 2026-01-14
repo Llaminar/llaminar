@@ -39,6 +39,7 @@ compile_commands.json
 # Debug files
 *.dSYM/
 *.pdb
+**/gpucore*
 
 # System files
 .DS_Store

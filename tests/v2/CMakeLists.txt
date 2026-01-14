@@ -204,13 +204,39 @@ function(add_v2_test TEST_NAME)
         set(DEFAULT_LOG_LEVEL "INFO")
     endif()
     
-    # Set environment variables for optimal performance + logging
+    # Build base environment variables for optimal performance + logging
+    set(TEST_ENV 
+        "LLAMINAR_LOG_LEVEL=${DEFAULT_LOG_LEVEL}"
+        "HWLOC_COMPONENTS=-gl,-opencl"
+        "OMP_NUM_THREADS=${CORES_PER_SOCKET}"
+        "OMP_PLACES=sockets"
+        "OMP_PROC_BIND=close"
+        "OMP_NESTED=false"
+        "OMP_DYNAMIC=false"
+        "KMP_AFFINITY=granularity=fine,compact,1,0"
+        "KMP_BLOCKTIME=0"
+        "OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET}"
+        "GOTO_NUM_THREADS=${CORES_PER_SOCKET}"
+        "MKL_NUM_THREADS=${CORES_PER_SOCKET}"
+        "MKL_DYNAMIC=false"
+        "OMPI_MCA_mpi_leave_pinned=1"
+        "OMPI_MCA_btl_vader_single_copy_mechanism=none"
+        "OMPI_MCA_btl_openib_allow_ib=1"
+    )
+    
+    # Add ROCm environment variables for ROCm tests
+    # HSA_OVERRIDE_GFX_VERSION=9.0.6 enables gfx906 (MI50/MI60) codepaths on compatible GPUs
+    if("${ARG_LABELS}" MATCHES "ROCm")
+        list(APPEND TEST_ENV "HSA_OVERRIDE_GFX_VERSION=9.0.6")
+    endif()
+    
+    # Set environment variables
     # Working directory: project root (so model paths like "models/..." work)
     # CMAKE_SOURCE_DIR is /workspaces/llaminar/src/v2, so go up two levels to reach project root
     set_tests_properties(${TEST_NAME} PROPERTIES
         FIXTURES_REQUIRED V2_Models                    # Requires V2_Models fixture
         LABELS "${ARG_LABELS}"
-        ENVIRONMENT "LLAMINAR_LOG_LEVEL=${DEFAULT_LOG_LEVEL};HWLOC_COMPONENTS=-gl,-opencl;OMP_NUM_THREADS=${CORES_PER_SOCKET};OMP_PLACES=sockets;OMP_PROC_BIND=close;OMP_NESTED=false;OMP_DYNAMIC=false;KMP_AFFINITY=granularity=fine,compact,1,0;KMP_BLOCKTIME=0;OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET};GOTO_NUM_THREADS=${CORES_PER_SOCKET};MKL_NUM_THREADS=${CORES_PER_SOCKET};MKL_DYNAMIC=false;OMPI_MCA_mpi_leave_pinned=1;OMPI_MCA_btl_vader_single_copy_mechanism=none;OMPI_MCA_btl_openib_allow_ib=1"
+        ENVIRONMENT "${TEST_ENV}"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../.."
     )
 endfunction()
@@ -2464,6 +2490,18 @@ target_link_libraries(v2_test_q8_0_views
 add_v2_test(V2_Unit_Q8_0_Views 
     COMMAND $<TARGET_FILE:v2_test_q8_0_views>
     LABELS "V2;Unit;TensorOperations;Q8_0;Quantization;ViewSupport;RowSlice"
+)
+
+# Test: Q8_0 Tensor Partial Blocks (Regression test for Jan 2026 buffer overflow fix)
+add_executable(v2_test_q8_0_partial_blocks unit/tensors/Test__Q8_0Tensor_PartialBlocks.cpp)
+target_link_libraries(v2_test_q8_0_partial_blocks 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_0_PartialBlocks 
+    COMMAND $<TARGET_FILE:v2_test_q8_0_partial_blocks>
+    LABELS "V2;Unit;TensorOperations;Q8_0;Quantization;Regression;PartialBlocks;BufferOverflow"
 )
 
 # Test: Q4_0 Tensor Views
@@ -5338,3 +5376,59 @@ add_v2_test(V2_Unit_Q16FixedScaleQuantization
     LABELS "V2;Unit;Kernels;Q16_1;Quantization;VNNI;Safety"
     MPI_PROCS 1
 )
+
+# =============================================================================
+# ROCm Quantised GEMM Kernel Tests (ComposableKernel INT8)
+# =============================================================================
+if(HAVE_ROCM)
+    # Test: ROCm Quantised GEMM Kernel (INT8×INT8→INT32 via ComposableKernel)
+    # Tests weight packing, activation quantization, CK GEMM, and output scaling
+    add_executable(v2_unit_rocm_quantised_gemm_kernel 
+        unit/kernels/rocm/Test__ROCmQuantisedGemmKernel.cpp
+    )
+    target_link_libraries(v2_unit_rocm_quantised_gemm_kernel 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_ROCmQuantisedGemmKernel
+        COMMAND $<TARGET_FILE:v2_unit_rocm_quantised_gemm_kernel>
+        LABELS "V2;Unit;ROCm;GEMM;INT8;Quantized;ComposableKernel;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm Quantised GEMM kernel unit tests")
+
+    # Integration Test: ROCm Quantised GEMM Kernel Pipeline
+    # Tests full pipeline: weight packing + activation quantization + realistic model dims
+    add_executable(v2_integration_rocm_quantised_gemm_kernel 
+        integration/Test__ROCmQuantisedGemmKernel.cpp
+    )
+    target_link_libraries(v2_integration_rocm_quantised_gemm_kernel 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmQuantisedGemmKernel
+        COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_kernel>
+        LABELS "V2;Integration;ROCm;GEMM;INT8;Quantized;ComposableKernel;gfx906;Qwen2"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm Quantised GEMM kernel integration tests")
+
+    # Performance Test: ROCm Quantised GEMM Kernel Benchmarks
+    # Measures throughput and accuracy for Qwen model dimensions (0.5B, 7B, 14B, 32B)
+    add_executable(v2_perf_rocm_quantised_gemm_kernel 
+        performance/kernels/rocm/Perf__ROCmQuantisedGemmKernel.cpp
+    )
+    target_link_libraries(v2_perf_rocm_quantised_gemm_kernel 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_ROCmQuantisedGemmKernel
+        COMMAND $<TARGET_FILE:v2_perf_rocm_quantised_gemm_kernel>
+        LABELS "V2;Performance;ROCm;GEMM;INT8;Quantized;ComposableKernel;gfx906;Qwen2;Benchmark"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm Quantised GEMM kernel performance benchmarks")
+endif()

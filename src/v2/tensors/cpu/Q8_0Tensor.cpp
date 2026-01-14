@@ -147,7 +147,6 @@ namespace llaminar2
             new_shape, root_data_ptr, root_byte_offset, root_parent));
     }
 
-
     const float *Q8_0Tensor::data() const
     {
         assertValid("Q8_0Tensor::data");
@@ -168,15 +167,37 @@ namespace llaminar2
             // Decode all blocks (parallelized for large tensors)
             const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
             const Q8_0Block *blocks = reinterpret_cast<const Q8_0Block *>(data_ptr);
-            size_t blocks_per_row = (shape_[1] + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
+            size_t K = shape_[1];
+            size_t blocks_per_row = (K + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
 
-#pragma omp parallel for collapse(2) if (total_elements > 10000)
+#pragma omp parallel for if (total_elements > 10000)
             for (size_t r = 0; r < shape_[0]; ++r)
             {
                 for (size_t b = 0; b < blocks_per_row; ++b)
                 {
                     const Q8_0Block &block = blocks[r * blocks_per_row + b];
-                    decodeBlock(block, &dequant_cache_[r * shape_[1] + b * Q8_0Block::BLOCK_SIZE]);
+                    size_t elem_offset = b * Q8_0Block::BLOCK_SIZE;
+
+                    // Calculate how many elements to write for this block
+                    // The last block in each row may be partial (when K is not a multiple of 32)
+                    size_t elem_count = std::min(static_cast<size_t>(Q8_0Block::BLOCK_SIZE), K - elem_offset);
+
+                    float *output = &dequant_cache_[r * K + elem_offset];
+
+                    // Use scalar decode for partial blocks, SIMD for full blocks
+                    if (elem_count == Q8_0Block::BLOCK_SIZE)
+                    {
+                        decodeBlock(block, output);
+                    }
+                    else
+                    {
+                        // Partial block - only decode elem_count elements
+                        const float scale = fp16_to_fp32(block.d);
+                        for (size_t i = 0; i < elem_count; ++i)
+                        {
+                            output[i] = scale * static_cast<float>(block.qs[i]);
+                        }
+                    }
                 }
             }
         }
