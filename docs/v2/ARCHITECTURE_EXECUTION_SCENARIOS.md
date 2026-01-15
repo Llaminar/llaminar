@@ -5,6 +5,7 @@ This document provides detailed diagrams showing how Llaminar constructs and exe
 ## Table of Contents
 - [Architecture Layers](#architecture-layers)
 - [MPI Orchestration and Topology Discovery](#mpi-orchestration-and-topology-discovery)
+- [Memory Management and GPU Workspace Architecture](#memory-management-and-gpu-workspace-architecture)
 - [Scenario 1: Single Machine, 2 Ranks, Heterogeneous](#scenario-1-single-machine-2-ranks-heterogeneous)
 - [Scenario 2: Six Machines, 12 Ranks, Complex Topology](#scenario-2-six-machines-12-ranks-complex-topology)
 - [Collective Backend Selection](#collective-backend-selection)
@@ -20,6 +21,8 @@ This document provides detailed diagrams showing how Llaminar constructs and exe
 │                              APPLICATION LAYER                               │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
 │  │  llaminar2 CLI  →  InferenceRunnerFactory  →  IInferenceRunner      │    │
+│  │    ├── createInferenceRunner(model_ctx, mpi_ctx, device, config)    │    │
+│  │    └── createTestableInferenceRunner(IModelContext*, device, config)│    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
@@ -28,16 +31,19 @@ This document provides detailed diagrams showing how Llaminar constructs and exe
 │                            ORCHESTRATION LAYER                               │
 │                                                                              │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  GraphOrchestrator                                                    │   │
-│  │    ├── Qwen2Graph / LlamaGraph (model-specific graph builder)        │   │
-│  │    └── Uses: PlacementPlan, MPITopology, DeviceManager               │   │
+│  │  GraphOrchestrator (implements IInferenceRunner)                      │   │
+│  │    ├── InferenceState (hidden, logits, kv_cache, positions)          │   │
+│  │    ├── GraphExecutor (DAG execution engine)                          │   │
+│  │    ├── LayerGraphCache (decode-mode graph caching)                   │   │
+│  │    ├── Qwen2Graph (IGraphBuilder - declarative graph construction)   │   │
+│  │    └── CollectiveContext (MPI backend routing)                       │   │
 │  └──────────────────────────────────────────────────────────────────────┘   │
 │                                      │                                       │
 │         ┌────────────────────────────┼────────────────────────────┐          │
 │         ▼                            ▼                            ▼          │
 │  ┌──────────────────┐   ┌─────────────────────────┐   ┌──────────────────┐  │
 │  │   MPITopology    │   │   PlacementStrategy     │   │  DeviceManager   │  │
-│  │  (global coord)  │   │  (device→stage mapping) │   │ (device registry)│  │
+│  │ (IMPITopology)   │   │  (device→stage mapping) │   │ (device registry)│  │
 │  ├──────────────────┤   ├─────────────────────────┤   ├──────────────────┤  │
 │  │ • world_size     │   │ • CPUOnlyStrategy       │   │ • DeviceInventory│  │
 │  │ • rank           │   │ • GPUFirstStrategy      │   │ • DeviceId       │  │
@@ -45,8 +51,8 @@ This document provides detailed diagrams showing how Llaminar constructs and exe
 │  │ • local_rank     │──▶│                         │◀──│ • CUDA/ROCm query│  │
 │  │ • ranks_per_node │   │ Outputs: PlacementPlan  │   │ • memory/compute │  │
 │  │ • all_hostnames  │   │ • LayerPlacement[]      │   │   capabilities   │  │
-│  └────────┬─────────┘   │ • GlobalTensorPlacement │   └────────┬─────────┘  │
-│           │             │ • decode_devices[]      │            │            │
+│  │ • WorkRange APIs │   │ • GlobalTensorPlacement │   │                  │  │
+│  └────────┬─────────┘   │ • decode_devices[]      │   └────────┬─────────┘  │
 │           │             │ • weight_fractions[]    │            │            │
 │           │             └─────────────────────────┘            │            │
 │           │                         ▲                          │            │
@@ -67,7 +73,7 @@ This document provides detailed diagrams showing how Llaminar constructs and exe
 │  │   PlacementInput (provided to strategy):                           │    │
 │  │     • n_layers, n_heads, hidden_dim, vocab_size                    │    │
 │  │     • bytes_per_layer, total_model_bytes                           │    │
-│  │     • world_size, available_devices[], gpu_memory_bytes            │    │
+│  │     • world_size, cluster_inventory (ClusterInventory)             │    │
 │  │     • gpu_memory_bandwidth, cpu_memory_bandwidth                   │    │
 │  │     ────────────────────────────────────────────                   │    │
 │  │     • getPhaseDeviceWeights(phase) → {gpu_weight, cpu_weight}      │    │
@@ -92,9 +98,32 @@ This document provides detailed diagrams showing how Llaminar constructs and exe
 │                              GRAPH LAYER                                     │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
 │  │  ComputeGraph (DAG of ComputeNodes)                                  │    │
-│  │    ├── ComputeNode (stage + dependencies + device affinity)         │    │
-│  │    ├── BufferSpec (tensor allocation specifications)                │    │
-│  │    └── Stages: GEMM, Attention, Norm, AllreduceStage, AllGatherStage│    │
+│  │    ├── ComputeNode {name, stage, dependencies, device, completed}   │    │
+│  │    ├── addNode(), addDependency(), getExecutionOrder()              │    │
+│  │    ├── merge() - combine subgraphs with dependency linking          │    │
+│  │    └── getRootNodes(), getLeafNodes() for DAG traversal             │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  IGraphBuilder (model-specific graph construction)                   │    │
+│  │    ├── Qwen2Graph: buildAttentionGraph(), buildFFNGraph()           │    │
+│  │    ├── buildForwardGraph() → complete embedding→layers→LM head      │    │
+│  │    └── buildLayerGraph() → single transformer layer                 │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  GraphBufferManager (IGraphBufferManager)                            │    │
+│  │    ├── queryAvailableMemory(device) → total, free, usable          │    │
+│  │    ├── computeWorkspaceBudget(device, config) → budget bytes       │    │
+│  │    ├── allocateWithAliasing(graph) → LivenessAnalyzer optimization │    │
+│  │    └── getBuffer(node, buffer) → tensor ptr                        │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  LivenessAnalyzer (buffer aliasing optimization)                    │    │
+│  │    ├── analyze(graph) → BufferLiveness[] (first/last use per buffer)│    │
+│  │    ├── computeAliasingGroups() → non-overlapping SCRATCH buffers   │    │
+│  │    └── computeMemoryUsage() → (original_bytes, optimized_bytes)    │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
@@ -102,27 +131,92 @@ This document provides detailed diagrams showing how Llaminar constructs and exe
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                            EXECUTION LAYER                                   │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  GraphExecutor                                                       │    │
-│  │    ├── CollectiveContext (bridges stages ↔ backends)                │    │
-│  │    ├── StageCoherence (GPU↔CPU memory sync)                         │    │
-│  │    └── TensorVerification (debug builds)                            │    │
+│  │  GraphExecutor (IGraphExecutor)                                      │    │
+│  │    ├── execute(graph, ctx) → topological order execution            │    │
+│  │    ├── executeMultiDevice(graph, contexts) → multi-GPU support      │    │
+│  │    ├── setSnapshotCallback() for debugging/parity tests            │    │
+│  │    └── verifyStageEntry/Exit() - debug validation (ASSERTIONS)     │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  StageCoherence (GPU↔CPU memory synchronization)                    │    │
+│  │    ├── cohereInputs(buffers, device) → ensureOnDevice()            │    │
+│  │    ├── cohereOutputs(buffers, device) → allocate GPU buffers       │    │
+│  │    ├── markOutputsDirty(buffers) → mark device as authoritative    │    │
+│  │    └── CoherencePolicy: NONE, INPUT, OUTPUT, FULL                  │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  DeviceWorkspaceManager (per-device workspace allocation)           │    │
+│  │    ├── Single contiguous block allocation at startup                │    │
+│  │    ├── Named buffer suballocation at aligned offsets                │    │
+│  │    ├── getBuffer(name), getBufferSize(name)                        │    │
+│  │    └── Zero-allocation hot path during inference                    │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  TensorVerification (debug/integration builds only)                 │    │
+│  │    ├── NaN/Inf detection at stage boundaries                       │    │
+│  │    ├── Zero-tensor detection with configurable failure             │    │
+│  │    ├── Auto-dump on verification failure                           │    │
+│  │    └── VerificationFailure exception with full context             │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         COMPUTE STAGE LAYER                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  IComputeStage (base interface for all stages)                       │    │
+│  │    ├── execute(ctx) → run computation on device                     │    │
+│  │    ├── type() → ComputeStageType enum                               │    │
+│  │    ├── getDumpInfo() → StageDumpInfo (inputs/outputs/weights)       │    │
+│  │    ├── getBufferRequirements() → StageBufferRequirements            │    │
+│  │    └── coherencePolicy() → CoherencePolicy for auto-sync            │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                       │
+│  ┌───────────────┐ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐   │
+│  │   GEMM Stages │ │Attention Stage│ │  Norm Stages  │ │Collective Stg │   │
+│  ├───────────────┤ ├───────────────┤ ├───────────────┤ ├───────────────┤   │
+│  │ GEMMStage     │ │ FusedAttnWo   │ │ RMSNormStage  │ │ AllreduceStage│   │
+│  │ FusedQKVGEMM  │ │ AttnCompute   │ │ EmbeddingStage│ │ AllGatherStage│   │
+│  │ FusedGateUp   │ │ KVCacheAppend │ │ LMHeadStage   │ │               │   │
+│  │ LMHeadStage   │ │ KVCacheGather │ │               │ │               │   │
+│  └───────────────┘ └───────────────┘ └───────────────┘ └───────────────┘   │
+│                                                                              │
+│  ┌───────────────┐ ┌───────────────┐ ┌───────────────┐                      │
+│  │ Activation Stg│ │Transform Stg  │ │ Utility Stages│                      │
+│  ├───────────────┤ ├───────────────┤ ├───────────────┤                      │
+│  │ SwiGLUStage   │ │ RoPEStage     │ │ResidualAddStg │                      │
+│  │               │ │ QuantizeQ16_1 │ │               │                      │
+│  └───────────────┘ └───────────────┘ └───────────────┘                      │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           COLLECTIVE LAYER                                   │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  BackendRouter (IBackendRouter)                                      │    │
-│  │    ├── Route by DeviceGroup topology                                │    │
-│  │    └── Select: NCCLBackend, RCCLBackend, MPIBackend, HostBackend    │    │
+│  │  CollectiveContext (ICollectiveContext)                              │    │
+│  │    ├── executeAllreduce(buffer, count, device, op)                  │    │
+│  │    ├── executeAllgather(local, full, seq_len, device)               │    │
+│  │    ├── executeBroadcast(buffer, count, root, device)                │    │
+│  │    └── Bridges abstract stages → concrete backends                  │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  BackendRouter (IBackendRouter)                                      │    │
+│  │    ├── selectBackend(DeviceGroup) → BackendSelection               │    │
+│  │    ├── getBackend(group) → ICollectiveBackend*                      │    │
+│  │    └── executeHeterogeneousAllReduce() for mixed device groups     │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                       │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
 │  │  Backends (ICollectiveBackend)                                       │    │
 │  │    ├── NCCLBackend   - CUDA↔CUDA (NVLink/PCIe)                      │    │
 │  │    ├── RCCLBackend   - ROCm↔ROCm (xGMI/PCIe)                        │    │
 │  │    ├── MPIBackend    - Inter-node (Infiniband/Ethernet)             │    │
-│  │    └── HostBackend   - Heterogeneous fallback (CPU staging)         │    │
+│  │    ├── HostBackend   - Heterogeneous fallback (CPU staging)         │    │
+│  │    └── PCIeBARBackend- Direct CUDA↔ROCm via PCIe BAR mapping        │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
@@ -130,21 +224,112 @@ This document provides detailed diagrams showing how Llaminar constructs and exe
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                             KERNEL LAYER                                     │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  KernelFactory                                                       │    │
-│  │    ├── CPU: OpenBLAS GEMM, JIT Attention, SIMD primitives           │    │
-│  │    ├── CUDA: cuBLAS GEMM, Flash Attention                           │    │
-│  │    └── ROCm: rocBLAS GEMM, composable_kernel attention              │    │
+│  │  KernelFactory (centralized kernel dispatch)                         │    │
+│  │    ├── getDeviceType(DeviceId) → DeviceType                         │    │
+│  │    ├── isActivationWeightCompatible(act_type, wgt_type) → bool      │    │
+│  │    ├── createGemm<TensorType>(tensor, dev_type) → ITensorGemm       │    │
+│  │    ├── createKVCache(config) → IKVCache                             │    │
+│  │    └── CPU/CUDA/ROCm dispatch based on device type                  │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Kernel Interfaces                                                   │    │
+│  │    ├── ITensorGemm - GEMM between activations and/or weights        │    │
+│  │    ├── ITensorAttention - Full attention computation                │    │
+│  │    ├── ITensorRoPE - Rotary position embeddings                     │    │
+│  │    ├── ITensorSwiGLU - SwiGLU activation                            │    │
+│  │    ├── ITensorRMSNorm - RMS normalization                           │    │
+│  │    └── IWorkspaceConsumer - workspace buffer management interface   │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                       │
+│  ┌───────────────┐ ┌───────────────┐ ┌───────────────┐                      │
+│  │  CPU Kernels  │ │ CUDA Kernels  │ │ ROCm Kernels  │                      │
+│  ├───────────────┤ ├───────────────┤ ├───────────────┤                      │
+│  │ OpenBLAS GEMM │ │ cuBLAS GEMM   │ │ rocBLAS GEMM  │                      │
+│  │ MKL GEMM      │ │ FlashAttn     │ │ comp_kernel   │                      │
+│  │ JIT Attention │ │ TensorCore    │ │ MatrixCore    │                      │
+│  │ SIMD Prims    │ │ WMMA kernels  │ │ HIP kernels   │                      │
+│  │ Quantized GEMM│ │ CUDAQuantised │ │ ROCmQuantised │                      │
+│  └───────────────┘ └───────────────┘ └───────────────┘                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                             BACKEND LAYER                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  BackendManager (unified device memory interface)                    │    │
+│  │    ├── getBackendFor(DeviceId) → IBackend*                          │    │
+│  │    ├── getCPUBackend() → CPUBackend*                                │    │
+│  │    ├── getCUDABackend() → CUDABackend* (if available)               │    │
+│  │    └── getROCmBackend() → ROCmBackend* (if available)               │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  IBackend (per-device-type memory management)                        │    │
+│  │    ├── deviceToHost(), hostToDevice() - memory transfers            │    │
+│  │    ├── allocate(), free() - device memory allocation                │    │
+│  │    ├── deviceMemoryTotal(), deviceMemoryFree() - memory queries     │    │
+│  │    └── synchronize() - device synchronization                       │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                       │
+│  ┌───────────────┐ ┌───────────────┐ ┌───────────────┐                      │
+│  │  CPUBackend   │ │ CUDABackend   │ │ ROCmBackend   │                      │
+│  ├───────────────┤ ├───────────────┤ ├───────────────┤                      │
+│  │ Rank-local    │ │ cudaMalloc    │ │ hipMalloc     │                      │
+│  │ NUMA node     │ │ cudaMemcpy    │ │ hipMemcpy     │                      │
+│  │ /sys/node     │ │ cudaMemGetInfo│ │ hipMemGetInfo │                      │
+│  │ 64B align     │ │ 256B align    │ │ 256B align    │                      │
+│  └───────────────┘ └───────────────┘ └───────────────┘                      │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                             TENSOR LAYER                                     │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  TensorBase + TypedTensorBase<T>                                     │    │
-│  │    ├── Device affinity (CPU, CUDA:0, ROCm:1, etc.)                  │    │
-│  │    ├── Coherence state (host-dirty, device-dirty)                   │    │
-│  │    └── Quantization: FP32, FP16, BF16, Q8_0, Q8_1, Q4_0, IQ4_NL    │    │
+│  │  ITensor (runtime polymorphism interface)                            │    │
+│  │    ├── native_type(), dtype_name() - type introspection             │    │
+│  │    ├── shape(), rows(), cols(), numel(), size_bytes()               │    │
+│  │    ├── home_device() → DeviceId (CPU, CUDA:0, ROCm:1)               │    │
+│  │    └── typed_as<T>(), try_as<T>() - type-safe downcasting           │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  CPUTensorBase (TensorBase alias) - base with device coherence       │    │
+│  │    ├── ensureOnDevice(device) → upload to GPU if needed             │    │
+│  │    ├── mark_device_dirty() → mark GPU as authoritative              │    │
+│  │    ├── data() → host data (syncs from GPU if device-dirty)          │    │
+│  │    └── mutable_data() → host data (marks CPU as authoritative)      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  TypedTensorBase<Derived, DataType> (CRTP for zero-overhead access)  │    │
+│  │    ├── typed_data() → const DataType* (native storage access)       │    │
+│  │    └── mutable_typed_data() → DataType* (mutable native access)     │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                       │
+│  ┌───────────────┐ ┌───────────────┐ ┌───────────────────────────────────┐ │
+│  │ Activation    │ │ Quantized     │ │ Special Tensors                   │ │
+│  │ Tensors       │ │ Weight Tensors│ │                                   │ │
+│  ├───────────────┤ ├───────────────┤ ├───────────────────────────────────┤ │
+│  │ FP32Tensor    │ │ IQ4_NLTensor  │ │ Q8_1Tensor  (activation quant)    │ │
+│  │ FP16Tensor    │ │ Q4_0Tensor    │ │ Q16_1Tensor (KV cache quant)      │ │
+│  │ BF16Tensor    │ │ Q6_KTensor    │ │ INT8Tensor  (dequant weights)     │ │
+│  │ INT32Tensor   │ │ Q8_0Tensor    │ │ INT32Tensor (GEMM accumulator)    │ │
+│  │               │ │ Q4_K, Q5_K... │ │                                   │ │
+│  └───────────────┘ └───────────────┘ └───────────────────────────────────┘ │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  IActivationTensor (interface for mutable activations)               │    │
+│  │    ├── createRoPE(), createSwiGLU(), createSoftmax(), createRMSNorm()│    │
+│  │    ├── applyRMSNorm(), applyRoPE() - in-place transformations       │    │
+│  │    └── to_int8_activation_pack() - per-row quantization for INT8 GEMM│    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  ITensorGemmTileDataProvider (strategy pattern for quantized decode) │    │
+│  │    ├── decode_block_at(row, k_offset, output) - format-specific     │    │
+│  │    ├── block_size() → 32 elements for most formats                  │    │
+│  │    └── Enables single generic GEMM kernel for all quant formats     │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -379,6 +564,282 @@ public:
 //   - Local homogeneous GPUs → NCCL/RCCL
 //   - Cross-node GPUs → MPI + NCCL
 //   - Heterogeneous (CPU + GPU) → HostBackend (CPU staging)
+```
+
+---
+
+## Memory Management and GPU Workspace Architecture
+
+This section details the unified memory management system that enables efficient workspace buffer reuse across heterogeneous devices (CPU, CUDA, ROCm).
+
+### Component Hierarchy
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     MEMORY MANAGEMENT COMPONENT FLOW                         │
+│                                                                              │
+│   Model Load Complete (weights in VRAM/RAM)                                 │
+│          │                                                                   │
+│          ▼                                                                   │
+│   ┌──────────────────────────────────────────────────────────────────┐      │
+│   │                    GraphBufferManager                             │      │
+│   │  Central coordinator for buffer allocation and workspace budgets │      │
+│   │                                                                   │      │
+│   │  queryAvailableMemory(device):                                   │      │
+│   │    → Calls BackendManager::getBackendFor(device)                 │      │
+│   │    → Returns { total_bytes, free_bytes, usable_bytes }           │      │
+│   │                                                                   │      │
+│   │  computeWorkspaceBudget(device, config):                         │      │
+│   │    → usable = free_bytes - headroom                              │      │
+│   │    → budget = clamp(usable * fraction, min, max)                 │      │
+│   │                                                                   │      │
+│   │  allocateDeviceWorkspace(device, requirements):                     │      │
+│   │    → Creates DeviceWorkspaceManager for the device                  │      │
+│   │    → Pre-allocates contiguous block                              │      │
+│   └──────┬───────────────────────────────────────────────────────────┘      │
+│          │                                                                   │
+│          ├────────────────────────────┬──────────────────────────┐          │
+│          ▼                            ▼                          ▼          │
+│   ┌──────────────────┐    ┌──────────────────────┐    ┌──────────────────┐ │
+│   │ BackendManager   │    │ DeviceWorkspaceManager  │    │ WorkspaceBudget  │ │
+│   │                  │    │   (per device)       │    │    Config        │ │
+│   ├──────────────────┤    ├──────────────────────┤    ├──────────────────┤ │
+│   │ getBackendFor()  │    │ • device: DeviceId   │    │ • gpu_fraction   │ │
+│   │   → IBackend*    │    │ • budget_bytes       │    │   (default 0.8)  │ │
+│   │                  │    │ • block_ptr          │    │ • cpu_fraction   │ │
+│   │ getCPUBackend()  │    │ • named_buffers{}    │    │   (default 0.3)  │ │
+│   │ getCUDABackend() │    │                      │    │ • min_budget     │ │
+│   │ getROCmBackend() │    │ allocate(reqs)       │    │   (64 MB)        │ │
+│   │                  │    │ getBuffer(name)      │    │ • max_budget     │ │
+│   └────────┬─────────┘    │ release()            │    │   (4 GB)         │ │
+│            │              └──────────┬───────────┘    │ • headroom       │ │
+│            │                         │                │   (128 MB)       │ │
+│            ▼                         │                └──────────────────┘ │
+│   ┌──────────────────────────────────┴───────────────────────────────┐     │
+│   │                        IBackend Interface                         │     │
+│   │                                                                   │     │
+│   │  Methods (unified for CPU, CUDA, ROCm):                          │     │
+│   │    • deviceCount() → int                                         │     │
+│   │    • deviceMemoryTotal(device_id) → size_t                       │     │
+│   │    • deviceMemoryFree(device_id) → size_t                        │     │
+│   │    • allocate(device_id, size, alignment) → void*                │     │
+│   │    • free(device_id, ptr)                                        │     │
+│   └──────────────────────────────────────────────────────────────────┘     │
+│            │                                                                │
+│            ├─────────────────────────┬────────────────────────┐            │
+│            ▼                         ▼                        ▼            │
+│   ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐    │
+│   │   CPUBackend     │    │   CUDABackend    │    │   ROCmBackend    │    │
+│   │                  │    │                  │    │                  │    │
+│   │ Rank-local NUMA  │    │ cudaMalloc/Free  │    │ hipMalloc/Free   │    │
+│   │ /sys/node/nodeN  │    │ cudaMemGetInfo   │    │ hipMemGetInfo    │    │
+│   │ 64-byte align    │    │ 256-byte align   │    │ 256-byte align   │    │
+│   │ deviceCount()→1  │    │ deviceCount()→N  │    │ deviceCount()→M  │    │
+│   └──────────────────┘    └──────────────────┘    └──────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### GPU Workspace Lifecycle
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      WORKSPACE LIFECYCLE FLOW                                │
+│                                                                              │
+│   1. BUDGET COMPUTATION (after model load)                                  │
+│   ─────────────────────────────────────────                                 │
+│                                                                              │
+│   GraphBufferManager::computeWorkspaceBudget(CUDA:0, config)                │
+│          │                                                                   │
+│          ▼                                                                   │
+│   ┌─────────────────────────────────────────────────────────┐               │
+│   │  IBackend::deviceMemoryFree(0) → 18.5 GB (after weights)│               │
+│   │  usable = 18.5 GB - 128 MB headroom = 18.37 GB          │               │
+│   │  budget = clamp(18.37 GB * 0.8, 64 MB, 4 GB) = 4 GB     │               │
+│   └─────────────────────────────────────────────────────────┘               │
+│                                                                              │
+│   2. REQUIREMENTS AGGREGATION                                               │
+│   ───────────────────────────────                                           │
+│                                                                              │
+│   Kernels declare workspace needs via IWorkspaceConsumer:                │
+│                                                                              │
+│   ┌─────────────────────────┐    ┌─────────────────────────┐               │
+│   │  ROCmQuantisedGemmKernel│    │  CUDAQuantisedGemmKernel│               │
+│   │                         │    │                         │               │
+│   │  getWorkspaceRequirements():│  getWorkspaceRequirements():             │
+│   │  ┌───────────────────┐  │    │  ┌───────────────────┐  │               │
+│   │  │ "fp16_activations"│  │    │  │ "fp16_activations"│  │               │
+│   │  │   M×K×2 bytes     │  │    │  │   M×K×2 bytes     │  │               │
+│   │  │ "fp16_output"     │  │    │  │ "fp16_output"     │  │               │
+│   │  │   M×N×2 bytes     │  │    │  │   M×N×2 bytes     │  │               │
+│   │  └───────────────────┘  │    │  └───────────────────┘  │               │
+│   └─────────────────────────┘    └─────────────────────────┘               │
+│                                                                              │
+│   3. ALLOCATION (single contiguous block)                                   │
+│   ────────────────────────────────────────                                  │
+│                                                                              │
+│   DeviceWorkspaceManager::allocate(requirements):                              │
+│                                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                 CONTIGUOUS GPU MEMORY BLOCK                          │   │
+│   │                     (single allocation)                              │   │
+│   │                                                                      │   │
+│   │  ┌──────────────────┐ ┌──────────────────┐ ┌─────────────────────┐  │   │
+│   │  │ fp16_activations │ │ fp16_output      │ │ (unused headroom)   │  │   │
+│   │  │   offset: 0      │ │   offset: 17MB   │ │                     │  │   │
+│   │  │   size: 17MB     │ │   size: 17MB     │ │                     │  │   │
+│   │  │   align: 256     │ │   align: 256     │ │                     │  │   │
+│   │  └──────────────────┘ └──────────────────┘ └─────────────────────┘  │   │
+│   │  ◄────────────────── total_required: 34MB ─────────────────────────►│   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   4. BINDING (kernels receive workspace)                                    │
+│   ──────────────────────────────────────                                    │
+│                                                                              │
+│   kernel.bindWorkspace(&workspace_manager):                                 │
+│     → kernel.hasWorkspace() = true                                          │
+│     → kernel uses getBuffer("fp16_activations") instead of internal alloc   │
+│                                                                              │
+│   5. INFERENCE (zero-allocation hot path)                                   │
+│   ────────────────────────────────────────                                  │
+│                                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │   for each token:                                                    │   │
+│   │       kernel->multiply(input, output, M, N, K)                       │   │
+│   │       // Uses pre-allocated workspace buffers                        │   │
+│   │       // NO hipMalloc/cudaMalloc calls during inference              │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### CPUBackend Rank-Local Design
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CPUBackend RANK-LOCAL ARCHITECTURE                        │
+│                                                                              │
+│   2-socket machine with 2 MPI ranks (each bound to one socket):             │
+│                                                                              │
+│   ┌─────────────────────────────────┬─────────────────────────────────┐     │
+│   │        Socket 0 / NUMA Node 0   │        Socket 1 / NUMA Node 1   │     │
+│   │            (MPI Rank 0)         │            (MPI Rank 1)         │     │
+│   │                                 │                                 │     │
+│   │  ┌───────────────────────────┐  │  ┌───────────────────────────┐  │     │
+│   │  │  CPUBackend(numa_node=0)  │  │  │  CPUBackend(numa_node=1)  │  │     │
+│   │  │                           │  │  │                           │  │     │
+│   │  │  deviceCount() → 1        │  │  │  deviceCount() → 1        │  │     │
+│   │  │  backendName() → "CPU"    │  │  │  backendName() → "CPU"    │  │     │
+│   │  │  deviceName(0) →          │  │  │  deviceName(0) →          │  │     │
+│   │  │    "CPU:NUMA0"            │  │  │    "CPU:NUMA1"            │  │     │
+│   │  │                           │  │  │                           │  │     │
+│   │  │  Memory Queries:          │  │  │  Memory Queries:          │  │     │
+│   │  │  (reads /sys/node/node0)  │  │  │  (reads /sys/node/node1)  │  │     │
+│   │  │                           │  │  │                           │  │     │
+│   │  │  deviceMemoryTotal(0)     │  │  │  deviceMemoryTotal(0)     │  │     │
+│   │  │    → 64 GB (half of 128GB)│  │  │    → 64 GB (half of 128GB)│  │     │
+│   │  │  deviceMemoryFree(0)      │  │  │  deviceMemoryFree(0)      │  │     │
+│   │  │    → 58 GB                │  │  │    → 60 GB                │  │     │
+│   │  │                           │  │  │                           │  │     │
+│   │  │  allocate(0, size, align) │  │  │  allocate(0, size, align) │  │     │
+│   │  │    → numa_alloc_onnode()  │  │  │    → numa_alloc_onnode()  │  │     │
+│   │  │       or aligned_alloc()  │  │  │       or aligned_alloc()  │  │     │
+│   │  └───────────────────────────┘  │  └───────────────────────────┘  │     │
+│   │                                 │                                 │     │
+│   └─────────────────────────────────┴─────────────────────────────────┘     │
+│                                                                              │
+│   Why Rank-Local?                                                           │
+│   ────────────────                                                          │
+│   1. Consistent API: deviceCount()=1 like single-GPU systems               │
+│   2. NUMA-aware: Memory queries return local socket's memory               │
+│   3. Unified access: BackendManager::getBackendFor(CPU:0) works            │
+│   4. No cross-socket memory: Each rank only sees its local NUMA node       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Kernel Dual-Mode Operation
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    KERNEL WORKSPACE DUAL-MODE DESIGN                         │
+│                                                                              │
+│   Kernels implementing IWorkspaceConsumer support both modes:            │
+│                                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                    IWorkspaceConsumer Interface                   │   │
+│   │                                                                      │   │
+│   │  • getWorkspaceRequirements() → WorkspaceRequirements            │   │
+│   │  • bindWorkspace(DeviceWorkspaceManager*) → void                       │   │
+│   │  • hasWorkspace() → bool                                            │   │
+│   │  • getWorkspace() → DeviceWorkspaceManager*                            │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   ┌─────────────────────────────┐    ┌─────────────────────────────┐       │
+│   │     LEGACY MODE             │    │     MANAGED MODE            │       │
+│   │     (hasWorkspace()=false)  │    │     (hasWorkspace()=true)   │       │
+│   ├─────────────────────────────┤    ├─────────────────────────────┤       │
+│   │                             │    │                             │       │
+│   │  On each multiply() call:   │    │  On bindWorkspace() call:   │       │
+│   │                             │    │    workspace_ = mgr         │       │
+│   │  void* fp16_act;            │    │                             │       │
+│   │  hipMalloc(&fp16_act, ...)  │    │  On each multiply() call:   │       │
+│   │                             │    │                             │       │
+│   │  // ... compute ...         │    │  void* fp16_act =           │       │
+│   │                             │    │    workspace_->getBuffer(   │       │
+│   │  hipFree(fp16_act)          │    │      "fp16_activations")    │       │
+│   │                             │    │                             │       │
+│   │  Problem:                   │    │  // ... compute ...         │       │
+│   │  ~17MB alloc per call       │    │                             │       │
+│   │  Allocation overhead: ~1ms  │    │  // No free needed!         │       │
+│   │                             │    │                             │       │
+│   │                             │    │  Benefit:                   │       │
+│   │                             │    │  Zero allocation hot path   │       │
+│   │                             │    │  Allocation overhead: 0ms   │       │
+│   └─────────────────────────────┘    └─────────────────────────────┘       │
+│                                                                              │
+│   Usage in GraphExecutor:                                                   │
+│   ───────────────────────                                                   │
+│                                                                              │
+│   // At graph construction time (once)                                      │
+│   GraphBufferManager gbm;                                                   │
+│   auto budget = gbm.computeWorkspaceBudget(CUDA:0, config);                 │
+│   auto reqs = kernel->getWorkspaceRequirements();                           │
+│   auto mgr = gbm.allocateDeviceWorkspace(CUDA:0, reqs);                        │
+│   kernel->bindWorkspace(mgr.get());                                         │
+│                                                                              │
+│   // At inference time (hot path)                                           │
+│   for (token in sequence) {                                                 │
+│       kernel->multiply(input, output, M, N, K);  // Zero allocations!       │
+│   }                                                                         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Slab GEMM Configuration
+
+For large FP16 GEMM operations that exceed workspace budget, the slab GEMM approach chunks the computation:
+
+```cpp
+// SlabGemmConfig: Budget-based slab dimension calculation
+
+struct SlabGemmConfig {
+    size_t slab_M;        // Rows per slab chunk
+    size_t slab_N;        // Output columns (full)
+    size_t slab_K;        // Input columns (full)
+    size_t num_slabs;     // Total chunks needed
+    
+    // Factory methods
+    static SlabGemmConfig fromBudget(size_t M, size_t N, size_t K, size_t budget_bytes);
+    static SlabGemmConfig forDecode(size_t N, size_t K, size_t budget_bytes);   // M=1
+    static SlabGemmConfig forPrefill(size_t seq_len, size_t N, size_t K, size_t budget_bytes);
+};
+
+// Example: 7B model attention projection
+//   M=512 (sequence length), N=3584 (hidden), K=3584 (hidden)
+//   Full FP16: 512×3584×2 + 3584×3584×2 = ~29 MB activation + ~26 MB output = ~55 MB
+//   Budget: 32 MB
+//   Slab config: slab_M=256, num_slabs=2 → processes 256 rows at a time
 ```
 
 ---

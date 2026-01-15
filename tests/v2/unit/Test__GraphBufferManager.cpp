@@ -12,6 +12,7 @@
 #include "../../../src/v2/execution/GraphBufferManager.h"
 #include "../../../src/v2/execution/GraphExecutor.h"
 #include "../../../src/v2/execution/CollectiveContext.h"
+#include "../../../src/v2/backends/BackendManager.h"
 #include "execution/compute_stages/ComputeStages.h"
 #include "../../../src/v2/tensors/TensorFactory.h"
 #include "../../../src/v2/utils/MPIContext.h"
@@ -909,4 +910,190 @@ TEST_F(GraphBufferManagerTest, AllocateGraphWithCollectiveBuffers)
     EXPECT_TRUE(manager_->hasBuffer("test_stage", "regular_output"));
     EXPECT_TRUE(manager_->hasBuffer("test_stage", "collective_output"));
     EXPECT_TRUE(manager_->hasBuffer("test_stage", "workspace"));
+}
+
+// =============================================================================
+// GPU Workspace Management Tests (Phase 4: Memory Budget Enforcement)
+// =============================================================================
+
+TEST_F(GraphBufferManagerTest, QueryAvailableMemoryCPU)
+{
+    // CPU backend must be initialized first
+    initCPUBackend(0); // NUMA node 0
+
+    size_t available = manager_->queryAvailableMemory(DeviceId::cpu());
+
+    // Should return non-zero on any system with memory
+    EXPECT_GT(available, 0u);
+
+    // Should be at least 1GB on any reasonable system
+    EXPECT_GT(available, 1024ULL * 1024 * 1024);
+}
+
+TEST_F(GraphBufferManagerTest, ComputeWorkspaceBudgetWithDefaults)
+{
+    initCPUBackend(0);
+
+    size_t budget = manager_->computeWorkspaceBudget(DeviceId::cpu());
+
+    // Should return non-zero
+    EXPECT_GT(budget, 0u);
+
+    // Should be at least min_budget (64MB default)
+    EXPECT_GE(budget, 64ULL * 1024 * 1024);
+}
+
+TEST_F(GraphBufferManagerTest, ComputeWorkspaceBudgetWithCustomConfig)
+{
+    initCPUBackend(0);
+
+    WorkspaceBudgetConfig config;
+    config.cpu_fraction = 0.1f; // Very conservative 10%
+    config.min_budget = 1024;   // 1KB minimum
+
+    size_t budget = manager_->computeWorkspaceBudget(DeviceId::cpu(), config);
+
+    // Should return non-zero
+    EXPECT_GT(budget, 0u);
+}
+
+TEST_F(GraphBufferManagerTest, BudgetRespectsHeadroom)
+{
+    initCPUBackend(0);
+
+    WorkspaceBudgetConfig config;
+    config.headroom = 1024ULL * 1024 * 1024; // 1GB headroom
+    config.min_budget = 1024;                // Low minimum to not mask effect
+
+    size_t available = manager_->queryAvailableMemory(DeviceId::cpu());
+    size_t budget = manager_->computeWorkspaceBudget(DeviceId::cpu(), config);
+
+    // Budget should be less than available due to headroom
+    // (unless min_budget kicks in)
+    if (available * config.cpu_fraction > config.headroom)
+    {
+        EXPECT_LT(budget, available);
+    }
+}
+
+TEST_F(GraphBufferManagerTest, BudgetRespectsMinimum)
+{
+    initCPUBackend(0);
+
+    WorkspaceBudgetConfig config;
+    config.cpu_fraction = 0.0001f;                 // Tiny fraction
+    config.min_budget = 128 * 1024 * 1024;         // 128MB minimum
+    config.max_budget = 4ULL * 1024 * 1024 * 1024; // Large max
+
+    size_t budget = manager_->computeWorkspaceBudget(DeviceId::cpu(), config);
+
+    // Should be at least min_budget
+    EXPECT_GE(budget, config.min_budget);
+}
+
+TEST_F(GraphBufferManagerTest, BudgetRespectsMaximum)
+{
+    initCPUBackend(0);
+
+    WorkspaceBudgetConfig config;
+    config.cpu_fraction = 1.0f;            // 100% of available
+    config.max_budget = 256 * 1024 * 1024; // 256MB max
+    config.headroom = 0;
+    config.min_budget = 1024;
+
+    size_t budget = manager_->computeWorkspaceBudget(DeviceId::cpu(), config);
+
+    // Should not exceed max_budget
+    EXPECT_LE(budget, config.max_budget);
+}
+
+TEST_F(GraphBufferManagerTest, GetGpuWorkspaceReturnsNullBeforeAllocation)
+{
+    EXPECT_EQ(manager_->getDeviceWorkspace(DeviceId::cpu()), nullptr);
+    EXPECT_EQ(manager_->getDeviceWorkspace(DeviceId::cuda(0)), nullptr);
+    EXPECT_EQ(manager_->getDeviceWorkspace(DeviceId::rocm(0)), nullptr);
+}
+
+TEST_F(GraphBufferManagerTest, ReleaseGpuWorkspaceClearsAll)
+{
+    // Even if nothing allocated, release should work
+    manager_->releaseDeviceWorkspace();
+    EXPECT_EQ(manager_->totalDeviceWorkspaceAllocated(), 0u);
+}
+
+TEST_F(GraphBufferManagerTest, TotalGpuWorkspaceAllocatedStartsAtZero)
+{
+    EXPECT_EQ(manager_->totalDeviceWorkspaceAllocated(), 0u);
+}
+
+TEST_F(GraphBufferManagerTest, DeviceGpuWorkspaceAllocatedReturnsZeroForUnknownDevice)
+{
+    EXPECT_EQ(manager_->deviceWorkspaceAllocated(DeviceId::cuda(99)), 0u);
+    EXPECT_EQ(manager_->deviceWorkspaceAllocated(DeviceId::rocm(42)), 0u);
+}
+
+TEST_F(GraphBufferManagerTest, AllocateGpuWorkspaceWithNoStages)
+{
+    std::vector<IComputeStage *> stages; // Empty
+
+    // Should succeed with no consumers
+    EXPECT_TRUE(manager_->allocateDeviceWorkspace(stages));
+    EXPECT_EQ(manager_->totalDeviceWorkspaceAllocated(), 0u);
+}
+
+TEST_F(GraphBufferManagerTest, AllocateGpuWorkspaceWithNonConsumerStages)
+{
+    // Create stages that don't implement IWorkspaceConsumer
+    MockStageNoRequirements stage1(DeviceId::cpu());
+    MockStageNoRequirements stage2(DeviceId::cpu());
+
+    std::vector<IComputeStage *> stages = {&stage1, &stage2};
+
+    // Should succeed with no workspace consumers found
+    EXPECT_TRUE(manager_->allocateDeviceWorkspace(stages));
+    EXPECT_EQ(manager_->totalDeviceWorkspaceAllocated(), 0u);
+}
+
+TEST_F(GraphBufferManagerTest, WorkspaceBudgetConfigDefaults)
+{
+    WorkspaceBudgetConfig config;
+
+    // Verify defaults
+    EXPECT_FLOAT_EQ(config.gpu_fraction, 0.8f);
+    EXPECT_FLOAT_EQ(config.cpu_fraction, 0.3f);
+    EXPECT_EQ(config.min_budget, 64ULL * 1024 * 1024);
+    EXPECT_EQ(config.max_budget, 4ULL * 1024 * 1024 * 1024);
+    EXPECT_EQ(config.headroom, 128ULL * 1024 * 1024);
+}
+
+TEST_F(GraphBufferManagerTest, QueryAvailableMemoryForInvalidDevice)
+{
+    // Invalid device should return 0
+    DeviceId invalid = DeviceId::invalid();
+    size_t available = manager_->queryAvailableMemory(invalid);
+    EXPECT_EQ(available, 0u);
+}
+
+TEST_F(GraphBufferManagerTest, ComputeWorkspaceBudgetForUnavailableDevice)
+{
+    // Without GPU backend initialized, should return min_budget (clamped)
+    // or 0 if no backend at all
+    WorkspaceBudgetConfig config;
+    config.min_budget = 1024; // Small for test
+
+    // CUDA without backend should return 0 (no backend)
+    size_t budget = manager_->computeWorkspaceBudget(DeviceId::cuda(0), config);
+    // Result depends on whether CUDA backend is available
+    // At minimum, shouldn't crash
+    EXPECT_GE(budget, 0u);
+}
+
+TEST_F(GraphBufferManagerTest, MultipleReleaseGpuWorkspaceIsSafe)
+{
+    manager_->releaseDeviceWorkspace();
+    manager_->releaseDeviceWorkspace();
+    manager_->releaseDeviceWorkspace();
+
+    // Should not crash, total should remain 0
+    EXPECT_EQ(manager_->totalDeviceWorkspaceAllocated(), 0u);
 }

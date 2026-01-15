@@ -729,6 +729,7 @@ add_library(llaminar2_core STATIC
     interfaces/IMPIContext.cpp
     backends/ComputeBackend.cpp
     backends/BackendManager.cpp
+    backends/CPUBackend.cpp
     # Execution framework (hierarchical work distribution)
     execution/WorkDistributor.cpp
     execution/DeviceContext.cpp
@@ -763,6 +764,9 @@ add_library(llaminar2_core STATIC
     execution/HybridPrecisionConfig.cpp
     execution/InferenceMode.cpp
     execution/StageCoherence.cpp
+    execution/DeviceWorkspaceManager.cpp
+    # Slab GEMM configuration (for chunked FP16 GEMM workspace management)
+    kernels/SlabGemmConfig.cpp
     # Placement strategy (weight/compute distribution)
     execution/PlacementPlan.cpp
     execution/PlacementStrategy.cpp

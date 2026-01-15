@@ -1,13 +1,14 @@
 /**
  * @file BackendManager.cpp
- * @brief Global GPU backend accessor implementation (Phase 6: Heterogeneous Multi-GPU)
+ * @brief Global backend accessor implementation (Phase 6: Heterogeneous Multi-GPU + CPU)
  *
- * Supports BOTH CUDA and ROCm backends simultaneously for heterogeneous multi-GPU.
+ * Supports CPU, CUDA, and ROCm backends simultaneously for heterogeneous compute.
  *
  * @author David Sanftenberg
  */
 
 #include "BackendManager.h"
+#include "CPUBackend.h"
 #include "../utils/Logger.h"
 
 #ifdef HAVE_CUDA
@@ -19,17 +20,34 @@
 #endif
 
 #include <mutex>
+#include <atomic>
 
 namespace llaminar2
 {
 
     namespace
     {
-        // Phase 6: Support both CUDA and ROCm backends simultaneously
+        // Phase 6: Support CPU, CUDA, and ROCm backends simultaneously
+        IBackend *g_cpu_backend = nullptr;
         IBackend *g_cuda_backend = nullptr;
         IBackend *g_rocm_backend = nullptr;
+
+        std::once_flag g_cpu_init_flag;
         std::once_flag g_cuda_init_flag;
         std::once_flag g_rocm_init_flag;
+
+        // CPU backend requires explicit initialization with NUMA node
+        std::atomic<int> g_cpu_numa_node{-1};
+        std::atomic<bool> g_cpu_init_requested{false};
+
+        void initCPUBackendImpl()
+        {
+            int numa_node = g_cpu_numa_node.load();
+            g_cpu_backend = new CPUBackend(numa_node);
+            LOG_INFO("[BackendManager] Initialized CPU backend (NUMA node: "
+                     << numa_node << ", memory: "
+                     << (g_cpu_backend->deviceMemoryTotal(0) / (1024 * 1024)) << " MB)");
+        }
 
         void initCUDABackend()
         {
@@ -101,6 +119,52 @@ namespace llaminar2
     bool hasROCmBackend()
     {
         return getROCmBackend() != nullptr;
+    }
+
+    // ====================================================================
+    // CPU Backend
+    // ====================================================================
+
+    void initCPUBackend(int local_numa_node)
+    {
+        g_cpu_numa_node.store(local_numa_node);
+        g_cpu_init_requested.store(true);
+        std::call_once(g_cpu_init_flag, initCPUBackendImpl);
+    }
+
+    IBackend *getCPUBackend()
+    {
+        if (!g_cpu_init_requested.load())
+        {
+            // Auto-initialize with NUMA node -1 (system-wide) if not explicitly initialized
+            initCPUBackend(-1);
+        }
+        return g_cpu_backend;
+    }
+
+    bool hasCPUBackend()
+    {
+        return getCPUBackend() != nullptr;
+    }
+
+    // ====================================================================
+    // Unified Backend Accessor
+    // ====================================================================
+
+    IBackend *getBackendFor(DeviceId device)
+    {
+        switch (device.type)
+        {
+        case DeviceType::CPU:
+            return getCPUBackend();
+        case DeviceType::CUDA:
+            return getCUDABackend();
+        case DeviceType::ROCm:
+            return getROCmBackend();
+        default:
+            LOG_ERROR("[BackendManager] Unknown device type: " << device.toString());
+            return nullptr;
+        }
     }
 
 } // namespace llaminar2

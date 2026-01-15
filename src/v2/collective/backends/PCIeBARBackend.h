@@ -36,6 +36,9 @@
 namespace llaminar2
 {
 
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+    // Full implementation when both CUDA and ROCm are available
+
     /**
      * @brief Direct CUDA↔ROCm collective backend via PCIe BAR mapping
      *
@@ -309,5 +312,52 @@ namespace llaminar2
 
         size_t datatypeSize(CollectiveDataType dtype) const;
     };
+
+#else
+    // Stub implementation when CUDA and ROCm are not both available
+
+    /**
+     * @brief Stub PCIeBARBackend (requires both CUDA and ROCm)
+     *
+     * This stub is provided so code can compile without both GPU backends.
+     * All operations return failure/unavailable.
+     */
+    class PCIeBARBackend : public ICollectiveBackend
+    {
+    public:
+        explicit PCIeBARBackend(std::unique_ptr<DirectP2PEngine> = nullptr) {}
+        ~PCIeBARBackend() override = default;
+
+        CollectiveBackendType type() const override { return CollectiveBackendType::PCIE_BAR; }
+        std::string name() const override { return "PCIe_BAR (stub)"; }
+        bool supportsDevice(DeviceType) const override { return false; }
+        bool supportsDirectTransfer(DeviceId, DeviceId) const override { return false; }
+        bool isAvailable() const override { return false; }
+        bool initialize(const DeviceGroup &) override { return false; }
+        void shutdown() override {}
+        bool isInitialized() const override { return false; }
+
+        bool allreduce(void *, size_t, CollectiveDataType, CollectiveOp) override { return false; }
+        bool allgather(const void *, void *, size_t, CollectiveDataType) override { return false; }
+        bool reduceScatter(const void *, void *, size_t, CollectiveDataType, CollectiveOp) override { return false; }
+        bool broadcast(void *, size_t, CollectiveDataType, int) override { return false; }
+        bool synchronize() override { return false; }
+
+        double getMeasuredBandwidthGBps() const { return 0.0; }
+        bool isPCIeBarActive() const { return false; }
+
+        std::optional<std::pair<void *, size_t>> allocateInBarRegion(size_t) { return std::nullopt; }
+        void freeBarBuffer(void *) {}
+        size_t getBarAllocOffset() const { return 0; }
+        size_t getBarTotalMappedSize() const { return 0; }
+
+        bool registerBuffer(const std::string &, DeviceId, void *, size_t) override { return false; }
+        void unregisterBuffer(const std::string &, DeviceId) override {}
+        std::optional<RegisteredBuffer> getBuffer(const std::string &, DeviceId) const override { return std::nullopt; }
+        bool requiresBufferRegistration() const override { return false; }
+        bool allreduceRegistered(const std::string &, size_t, CollectiveDataType, CollectiveOp) override { return false; }
+    };
+
+#endif // HAVE_CUDA && HAVE_ROCM
 
 } // namespace llaminar2

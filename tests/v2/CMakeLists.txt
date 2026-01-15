@@ -439,6 +439,46 @@ add_v2_test(V2_Unit_HostBackend
     MPI_PROCS 1
 )
 
+# Test: CPUBackend - CPU/NUMA backend implementing IBackend interface
+add_executable(v2_unit_cpu_backend unit/Test__CPUBackend.cpp)
+target_link_libraries(v2_unit_cpu_backend 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+    GTest::gmock
+)
+add_v2_test(V2_Unit_CPUBackend 
+    COMMAND $<TARGET_FILE:v2_unit_cpu_backend>
+    LABELS "V2;Unit;Backend;CPUBackend;NUMA;Memory"
+    MPI_PROCS 1
+)
+
+# Test: DeviceWorkspaceManager - Per-device GPU workspace buffer management
+add_executable(v2_unit_device_workspace_manager unit/Test__DeviceWorkspaceManager.cpp)
+target_link_libraries(v2_unit_device_workspace_manager 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_DeviceWorkspaceManager 
+    COMMAND $<TARGET_FILE:v2_unit_device_workspace_manager>
+    LABELS "V2;Unit;Execution;DeviceWorkspaceManager;Memory;Allocation"
+    MPI_PROCS 1
+)
+
+# Test: ROCmQuantisedGemmKernel_Workspace - IWorkspaceConsumer interface integration
+add_executable(v2_unit_rocm_gemm_workspace unit/Test__ROCmQuantisedGemmKernel_Workspace.cpp)
+target_link_libraries(v2_unit_rocm_gemm_workspace 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ROCmQuantisedGemmKernel_Workspace 
+    COMMAND $<TARGET_FILE:v2_unit_rocm_gemm_workspace>
+    LABELS "V2;Unit;Kernels;ROCm;GEMM;Workspace;IWorkspaceConsumer"
+    MPI_PROCS 1
+)
+
 # Test: MPIBackend - MPI-based collective backend for inter-node communication
 add_executable(v2_unit_mpi_backend unit/Test__MPIBackend.cpp)
 target_link_libraries(v2_unit_mpi_backend 
@@ -3034,6 +3074,7 @@ add_v2_test(V2_Perf_CUDAFlashAttention
 
 # Test: CUDA Ring Buffer KV Cache Parity
 # Tests ring buffer KV cache with O(1) eviction, wrap-around, batched gather, FP32/FP16/BF16
+if(HAVE_CUDA)
 add_executable(v2_integration_cuda_ring_kv_cache_parity integration/Test__CUDARingKVCacheParity.cpp)
 target_link_libraries(v2_integration_cuda_ring_kv_cache_parity llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_CUDARingKVCacheParity
@@ -3041,6 +3082,7 @@ add_v2_test(V2_Integration_CUDARingKVCacheParity
     LABELS "V2;Integration;CUDA;Parity;KVCache;RingBuffer;Eviction;SlidingWindow;FP32;FP16;BF16"
     MPI_PROCS 1  # Tests GPU KV cache locally, no MPI needed
 )
+endif()
 
 # Test: CUDA Full Model Inference
 # End-to-end GPU inference: model loading, forward pass, token prediction
@@ -5449,3 +5491,24 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm FP16 vs INT8 GEMM comparison benchmarks")
 endif()
+
+# =============================================================================
+# Slab FP16 GEMM Workspace Integration Tests (Phase 3)
+# =============================================================================
+# Tests SlabGemmConfig integration with DeviceWorkspaceManager
+# Can run on CPU (no ROCm required) to validate buffer allocation and configuration
+
+add_executable(v2_integration_slab_fp16_workspace
+    integration/Test__SlabFP16GemmWorkspace.cpp
+)
+target_link_libraries(v2_integration_slab_fp16_workspace 
+    llaminar2_core 
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_SlabFP16GemmWorkspace
+    COMMAND $<TARGET_FILE:v2_integration_slab_fp16_workspace>
+    LABELS "V2;Integration;Kernels;GEMM;Workspace;FP16;SlabGEMM"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added Slab FP16 GEMM workspace integration tests")

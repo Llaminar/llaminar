@@ -67,6 +67,9 @@
 namespace llaminar2
 {
 
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
+    // Full implementation when at least one GPU backend is available
+
     /**
      * @brief Information about a discovered PCIe BAR
      */
@@ -457,5 +460,75 @@ namespace llaminar2
         bool direct_p2p_active_ = false;
         bool pcie_bar_active_ = false;
     };
+
+#else
+    // Stub implementations when no GPU backends are available
+
+    struct PCIeBarInfo
+    {
+    };
+
+    struct DirectP2PCapability
+    {
+        bool canDoDirectP2P() const { return false; }
+        bool canDoPCIeBarP2P() const { return false; }
+        std::string describe() const { return "No GPU backends available"; }
+    };
+
+    struct DirectP2PResult
+    {
+        double throughput_gbps = 0.0;
+        double transfer_time_ms = 0.0;
+        size_t bytes_transferred = 0;
+        bool success = false;
+        std::string error_message = "No GPU backends available";
+        std::string transfer_path;
+    };
+
+    struct DirectP2PBuffer
+    {
+        void *device_ptr = nullptr;
+        int dmabuf_fd = -1;
+        size_t size = 0;
+        DeviceId owner_device;
+        bool is_exported = false;
+    };
+
+    class DirectP2PEngine
+    {
+    public:
+        enum class Direction
+        {
+            ToNVIDIA,
+            ToAMD
+        };
+
+        DirectP2PEngine() = default;
+        ~DirectP2PEngine() = default;
+
+        static DirectP2PCapability probeCapabilities() { return {}; }
+        static std::vector<PCIeBarInfo> discoverBars() { return {}; }
+
+        bool initializePCIeBar(DeviceId, DeviceId, size_t = 0) { return false; }
+        bool initializePCIeBarMultiGPU(DeviceId, const std::vector<DeviceId> &, size_t = 0) { return false; }
+        bool isPCIeBarActive() const { return false; }
+        std::vector<size_t> getMappedBarSizes() const { return {}; }
+        size_t getMappedBarSize(int = 0) const { return 0; }
+        DirectP2PResult transferPCIeBar(Direction, const void *, void *, size_t, int = 0) { return {}; }
+        DirectP2PResult transferPCIeBarAsync(Direction, const void *, void *, size_t, int = 0) { return {}; }
+        DirectP2PResult broadcastToAMD(const void *, size_t) { return {}; }
+        DirectP2PResult gatherFromAMDSequential(void *, size_t) { return {}; }
+        DirectP2PResult gatherFromAMDOverlapped(void *, size_t) { return {}; }
+        DirectP2PResult transferOverlapped(void *, size_t, size_t, const void *, size_t, size_t) { return {}; }
+        DirectP2PResult benchmarkAllModes(size_t, int = 5) { return {}; }
+        bool initialize(DeviceId, DeviceId) { return false; }
+        bool isDirectP2PActive() const { return false; }
+        std::unique_ptr<DirectP2PBuffer> allocateExportable(DeviceId, size_t) { return nullptr; }
+        void *importBuffer(const DirectP2PBuffer &, DeviceId) { return nullptr; }
+        DirectP2PResult transfer(DeviceId, const void *, DeviceId, void *, size_t) { return {}; }
+        DirectP2PResult benchmark(size_t, int = 5) { return {}; }
+    };
+
+#endif // HAVE_CUDA || HAVE_ROCM
 
 } // namespace llaminar2

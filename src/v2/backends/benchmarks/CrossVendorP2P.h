@@ -61,12 +61,12 @@ namespace llaminar2
      */
     struct CrossVendorP2PConfig
     {
-        size_t buffer_size = 64 * 1024 * 1024;  // 64 MB per buffer (2 buffers = 128 MB staging)
-        size_t chunk_size = 4 * 1024 * 1024;    // 4 MB transfer chunks (optimal for pipelining)
-        int num_buffers = 2;                     // Double buffering for D2H/H2D overlap
-        bool enable_pipelining = true;           // Overlap D2H and H2D on different buffers
-        bool auto_tune = false;                  // Run calibration during initialize()
-        bool allow_same_vendor = false;          // Allow same-vendor transfers (e.g., ROCm↔ROCm)
+        size_t buffer_size = 64 * 1024 * 1024; // 64 MB per buffer (2 buffers = 128 MB staging)
+        size_t chunk_size = 4 * 1024 * 1024;   // 4 MB transfer chunks (optimal for pipelining)
+        int num_buffers = 2;                   // Double buffering for D2H/H2D overlap
+        bool enable_pipelining = true;         // Overlap D2H and H2D on different buffers
+        bool auto_tune = false;                // Run calibration during initialize()
+        bool allow_same_vendor = false;        // Allow same-vendor transfers (e.g., ROCm↔ROCm)
     };
 
     /**
@@ -74,14 +74,17 @@ namespace llaminar2
      */
     struct CrossVendorP2PResult
     {
-        double throughput_gbps = 0.0;       // Effective throughput
-        double d2h_time_ms = 0.0;           // Total D2H time
-        double h2d_time_ms = 0.0;           // Total H2D time
-        double overlap_efficiency = 0.0;    // How much D2H/H2D overlapped (0-1)
+        double throughput_gbps = 0.0;    // Effective throughput
+        double d2h_time_ms = 0.0;        // Total D2H time
+        double h2d_time_ms = 0.0;        // Total H2D time
+        double overlap_efficiency = 0.0; // How much D2H/H2D overlapped (0-1)
         size_t bytes_transferred = 0;
-        size_t optimal_chunk_size = 0;      // If auto_tune was used, the optimal chunk size
+        size_t optimal_chunk_size = 0; // If auto_tune was used, the optimal chunk size
         bool success = false;
     };
+
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
+    // Full implementation when at least one GPU backend is available
 
     /**
      * @brief Cross-vendor P2P transfer engine
@@ -224,5 +227,45 @@ namespace llaminar2
         static CrossVendorP2PResult quickBenchmark(DeviceId src, DeviceId dst,
                                                    size_t num_bytes = 64 * 1024 * 1024);
     };
+
+#else
+    // Stub implementations when no GPU backends are available
+
+    /**
+     * @brief Stub CrossVendorP2PEngine (no GPU backends available)
+     */
+    class CrossVendorP2PEngine
+    {
+    public:
+        explicit CrossVendorP2PEngine(const CrossVendorP2PConfig & = {}) {}
+        ~CrossVendorP2PEngine() = default;
+
+        CrossVendorP2PEngine(const CrossVendorP2PEngine &) = delete;
+        CrossVendorP2PEngine &operator=(const CrossVendorP2PEngine &) = delete;
+        CrossVendorP2PEngine(CrossVendorP2PEngine &&) noexcept = default;
+        CrossVendorP2PEngine &operator=(CrossVendorP2PEngine &&) noexcept = default;
+
+        bool initialize(DeviceId, DeviceId) { return false; }
+        bool isInitialized() const { return false; }
+        CrossVendorP2PResult transfer(const void *, void *, size_t) { return {}; }
+        CrossVendorP2PResult benchmark(size_t, int = 5) { return {}; }
+        double theoreticalMaxGbps() const { return 0.0; }
+        size_t chunkSize() const { return 0; }
+        void setChunkSize(size_t) {}
+    };
+
+    /**
+     * @brief Stub CrossVendorP2PHelper (no GPU backends available)
+     */
+    class CrossVendorP2PHelper
+    {
+    public:
+        static bool canTransfer(DeviceId, DeviceId) { return false; }
+        static bool canTransfer(DeviceId, DeviceId, bool) { return false; }
+        static double estimateTransferTimeMs(DeviceId, DeviceId, size_t, bool = true) { return 0.0; }
+        static CrossVendorP2PResult quickBenchmark(DeviceId, DeviceId, size_t = 64 * 1024 * 1024) { return {}; }
+    };
+
+#endif // HAVE_CUDA || HAVE_ROCM
 
 } // namespace llaminar2

@@ -65,6 +65,24 @@
  * kernel->multiply_tensor(activations, output, m, n, k);
  * ```
  *
+ * ## Workspace Management (Phase 2)
+ *
+ * This kernel implements IWorkspaceConsumer for centralized workspace buffer
+ * management. When a DeviceWorkspaceManager is bound, the kernel uses pre-allocated
+ * buffers instead of its internal allocations, enabling:
+ *
+ * - **Zero hot-path allocations**: No hipMalloc during GEMM execution
+ * - **Memory budget control**: Workspace fits within overall VRAM budget
+ * - **Buffer sharing**: Same workspace can be reused across kernel calls
+ *
+ * ```cpp
+ * // Managed mode (Phase 2):
+ * auto reqs = kernel->getWorkspaceRequirements(max_m, n, k);
+ * workspaceManager->allocate(reqs);
+ * kernel->bindWorkspace(workspaceManager);
+ * kernel->multiply_tensor(A, C, m, n, k);  // Uses pre-allocated buffers
+ * ```
+ *
  * @author David Sanftenberg
  * @date January 2026
  */
@@ -73,6 +91,7 @@
 
 #include "../../tensors/TensorKernels.h"
 #include "../../tensors/BlockStructures.h"
+#include "../../interfaces/IWorkspaceConsumer.h"
 #include <memory>
 #include <cstdint>
 #include <vector>
@@ -250,7 +269,7 @@ namespace llaminar2
          * The DL (Data-Level) kernels use 4-way INT8 dot product instructions.
          * Future: DeviceGemmXdl for gfx908+ (MFMA instructions).
          */
-        class ROCmQuantisedGemmKernel : public ITensorGemm
+        class ROCmQuantisedGemmKernel : public ITensorGemm, public IWorkspaceConsumer
         {
         public:
             /**
@@ -428,6 +447,49 @@ namespace llaminar2
             KernelSnapshotInfo getKernelSnapshotInfo() const override;
 
             // =========================================================================
+            // IWorkspaceConsumer Interface (Phase 2)
+            // =========================================================================
+
+            /**
+             * @brief Get workspace requirements for GEMM at given dimensions
+             *
+             * Returns buffers needed based on the selected GEMM path:
+             * - **INT8 path** (M ≤ 128): quant_a [M×K], scales_a [M], acc_int32 [M×N],
+             *                            temp_a_fp32 [M×K], temp_c_fp32 [M×N]
+             * - **FP16 path** (M > 128): full_a_fp16 [M×K], full_b_fp16 [K×N], full_c_fp16 [M×N]
+             *
+             * @param m Maximum sequence length (batch size)
+             * @param n Number of output features (0 = use internal N_)
+             * @param k Number of input features (0 = use internal K_)
+             * @return WorkspaceRequirements describing all needed buffers
+             *
+             * @note Call with maximum expected M to allocate once and reuse.
+             */
+            WorkspaceRequirements getWorkspaceRequirements(
+                int m, int n = 0, int k = 0) const override;
+
+            /**
+             * @brief Bind workspace manager for managed mode
+             *
+             * After binding, the kernel uses pre-allocated buffers from the
+             * workspace manager instead of internal allocations.
+             *
+             * @param workspace Pointer to workspace manager (NOT owned, must outlive kernel)
+             *                  Pass nullptr to return to legacy mode.
+             */
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+
+            /**
+             * @brief Check if a workspace is currently bound
+             */
+            bool hasWorkspace() const override;
+
+            /**
+             * @brief Get the currently bound workspace manager
+             */
+            DeviceWorkspaceManager *getWorkspace() const override;
+
+            // =========================================================================
             // Accessors
             // =========================================================================
 
@@ -522,6 +584,9 @@ namespace llaminar2
             float *d_scales_A_ = nullptr;  // [M] per-row scales
             int32_t *d_C_int32_ = nullptr; // [M × N] INT32 accumulator
             int work_buffer_M_ = 0;        // Current work buffer capacity
+
+            // IWorkspaceConsumer state (Phase 2)
+            DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned)
 
             // PIMPL for CK implementation (avoids CK headers in this header)
             struct Impl;

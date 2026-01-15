@@ -53,11 +53,16 @@
  */
 
 #include "ROCmQuantisedGemmKernel.h"
+#include "ROCmQuantisedGemmKernel_SlabFP16.h"
 #include "backends/ComputeBackend.h" // DeviceManager
 #include "backends/DeviceId.h"       // DeviceId
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.
 #include "tensors/BlockStructures.h" // Q8_1Block
 #include "tensors/KernelSnapshotInfo.h"
+#include "execution/DeviceWorkspaceManager.h"
+#include "execution/WorkspaceDescriptor.h"
+#include "interfaces/IWorkspaceConsumer.h"
+#include "kernels/SlabGemmConfig.h"
 #include "utils/Logger.h"
 
 #include <stdexcept>
@@ -780,6 +785,106 @@ namespace llaminar2
                 // Optimal for M > 128 on gfx906 due to better FP16 MFMA utilization
                 LOG_DEBUG("[ROCmQuantisedGemmKernel] Using FP16 hipBLAS (M=" << m << ", N=" << n << ", K=" << k << ")");
 
+                // =====================================================================
+                // Phase 3: Check if we should use slab mode with workspace buffers
+                // =====================================================================
+
+                // Determine workspace budget:
+                //   - If workspace bound: use workspace budget
+                //   - Otherwise: use default 64MB budget for decision
+                const size_t workspace_budget = hasWorkspace() ? workspace_->budget() : (64 * 1024 * 1024);
+
+                // Check if slab mode should be used (large matrices that exceed budget)
+                if (rocmQuantGemm_shouldUseSlabFP16(m, n, k, workspace_budget))
+                {
+                    // Get optimal slab configuration for this GEMM
+                    SlabGemmConfig slab_config;
+                    rocmQuantGemm_getSlabConfig(m, n, k, workspace_budget, &slab_config);
+
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel] Using slab FP16 GEMM: " << slab_config.describe()
+                                                                                 << ", iterations=" << slab_config.estimateIterations(m, n, k));
+
+                    // Try to get workspace slab buffers (Phase 3 integration)
+                    void *slab_a = nullptr;
+                    void *slab_b = nullptr;
+                    void *slab_c = nullptr;
+                    bool owns_slabs = false;
+
+                    if (hasWorkspace())
+                    {
+                        // Use pre-allocated workspace buffers (zero hot-path allocations)
+                        slab_a = workspace_->getBuffer(GemmWorkspaceBuffers::SLAB_A_FP16);
+                        slab_b = workspace_->getBuffer(GemmWorkspaceBuffers::SLAB_B_FP16);
+                        slab_c = workspace_->getBuffer(GemmWorkspaceBuffers::SLAB_C_FP16);
+
+                        if (slab_a && slab_b && slab_c)
+                        {
+                            LOG_DEBUG("[ROCmQuantisedGemmKernel] Using managed workspace for slab FP16 GEMM");
+                        }
+                        else
+                        {
+                            LOG_WARN("[ROCmQuantisedGemmKernel] Workspace bound but slab buffers not found, "
+                                     "falling back to internal allocation");
+                            slab_a = slab_b = slab_c = nullptr;
+                        }
+                    }
+
+                    // Fall back to internal allocation if workspace not available (legacy mode)
+                    if (!slab_a || !slab_b || !slab_c)
+                    {
+                        LOG_DEBUG("[ROCmQuantisedGemmKernel] Allocating internal slab buffers (legacy mode)");
+
+                        const size_t slab_a_bytes = slab_config.slabABytes(SlabDataType::FP16);
+                        const size_t slab_b_bytes = slab_config.slabBBytes(SlabDataType::FP16);
+                        const size_t slab_c_bytes = slab_config.slabCBytes(SlabDataType::FP16);
+
+                        if (!rocmQuantGemm_allocFP16(&slab_a, slab_a_bytes / sizeof(uint16_t), rocm_device_id_) ||
+                            !rocmQuantGemm_allocFP16(&slab_b, slab_b_bytes / sizeof(uint16_t), rocm_device_id_) ||
+                            !rocmQuantGemm_allocFP16(&slab_c, slab_c_bytes / sizeof(uint16_t), rocm_device_id_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate internal slab buffers");
+                            if (slab_a)
+                                rocmQuantGemm_freeDevice(slab_a);
+                            if (slab_b)
+                                rocmQuantGemm_freeDevice(slab_b);
+                            if (slab_c)
+                                rocmQuantGemm_freeDevice(slab_c);
+                            return false;
+                        }
+                        owns_slabs = true;
+                    }
+
+                    // Execute slab FP16 GEMM
+                    success = rocmQuantGemm_executeSlabFP16(
+                        d_A_int8, d_weights_int8, d_C_fp32,
+                        d_scales_A, d_scales_B,
+                        m, n, k,
+                        slab_a, slab_b, slab_c,
+                        &slab_config,
+                        rocm_device_id_, nullptr);
+
+                    // Clean up internal allocations if we own them
+                    if (owns_slabs)
+                    {
+                        rocmQuantGemm_freeDevice(slab_a);
+                        rocmQuantGemm_freeDevice(slab_b);
+                        rocmQuantGemm_freeDevice(slab_c);
+                    }
+
+                    if (!success)
+                    {
+                        LOG_WARN("[ROCmQuantisedGemmKernel] Slab FP16 failed, trying CK Two-Kernel fallback");
+                        success = rocmQuantGemm_executeTwoKernel(d_A_int8, d_weights_int8, d_C_fp32,
+                                                                 d_scales_A, d_scales_B,
+                                                                 m, n, k, rocm_device_id_);
+                    }
+                    break;
+                }
+
+                // =====================================================================
+                // Full FP16 path (fits in memory without slab chunking)
+                // =====================================================================
+
                 // Ensure FP16 workspace buffers are large enough (cached for reuse)
                 const size_t a_fp16_size = static_cast<size_t>(m) * k;
                 const size_t b_fp16_size = static_cast<size_t>(k) * n;
@@ -987,6 +1092,133 @@ namespace llaminar2
                 .withScalar("K", "input features", KernelBufferDtype::INT32)
                 .withScalar("rocm_device_id", "ROCm device ID", KernelBufferDtype::INT32)
                 .withScalar("weights_converted", "whether weights are converted to INT8", KernelBufferDtype::INT32);
+        }
+
+        // =====================================================================
+        // IWorkspaceConsumer Interface Implementation (Phase 2 + Phase 3)
+        // =====================================================================
+
+        WorkspaceRequirements ROCmQuantisedGemmKernel::getWorkspaceRequirements(
+            int m, int n, int k) const
+        {
+            WorkspaceRequirements reqs;
+
+            // Use internal dimensions if not specified
+            if (n == 0)
+                n = static_cast<int>(N_);
+            if (k == 0)
+                k = static_cast<int>(K_);
+
+            // Select path to determine which buffers are needed
+            // selectGemmPath is a free function in rocm namespace
+            GemmPath path = selectGemmPath(m, n, k);
+
+            if (path == GemmPath::FP16_HIPBLAS)
+            {
+                // =====================================================================
+                // Phase 3: Check if slab mode should be used
+                //
+                // Slab mode is used when full FP16 conversion would exceed 80% of budget.
+                // Default budget is 64MB; actual budget comes from workspace when bound.
+                // =====================================================================
+                constexpr size_t DEFAULT_WORKSPACE_BUDGET = 64 * 1024 * 1024;
+
+                // Check if slab mode should be used (large matrices that exceed budget)
+                if (rocmQuantGemm_shouldUseSlabFP16(m, n, k, DEFAULT_WORKSPACE_BUDGET))
+                {
+                    // Get optimal slab configuration
+                    SlabGemmConfig slab_config = SlabGemmConfig::fromBudget(
+                        DEFAULT_WORKSPACE_BUDGET, m, n, k, SlabDataType::FP16);
+
+                    // Request slab buffers via SlabGemmConfig::workspaceRequirements
+                    auto slab_reqs = slab_config.workspaceRequirements(SlabDataType::FP16);
+
+                    // Copy slab buffer requirements to our reqs, using standard GEMM buffer names
+                    for (const auto &buf : slab_reqs.buffers)
+                    {
+                        std::string name;
+                        if (buf.name.find("slab_a") != std::string::npos)
+                            name = GemmWorkspaceBuffers::SLAB_A_FP16;
+                        else if (buf.name.find("slab_b") != std::string::npos)
+                            name = GemmWorkspaceBuffers::SLAB_B_FP16;
+                        else if (buf.name.find("slab_c") != std::string::npos)
+                            name = GemmWorkspaceBuffers::SLAB_C_FP16;
+                        else
+                            name = buf.name;
+
+                        reqs.buffers.push_back({name, buf.size_bytes, buf.alignment, buf.required});
+                    }
+
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::getWorkspaceRequirements] FP16 SLAB path: "
+                              << slab_config.describe()
+                              << ", total=" << (slab_config.totalWorkspaceBytes(SlabDataType::FP16) / 1024) << "KB"
+                              << ", iterations=" << slab_config.estimateIterations(m, n, k));
+
+                    return reqs;
+                }
+
+                // Full FP16 path (fits in memory)
+                size_t a_fp16_bytes = static_cast<size_t>(m) * k * sizeof(uint16_t);
+                size_t b_fp16_bytes = static_cast<size_t>(k) * n * sizeof(uint16_t);
+                size_t c_fp16_bytes = static_cast<size_t>(m) * n * sizeof(uint16_t);
+
+                reqs.buffers.push_back({GemmWorkspaceBuffers::FULL_A_FP16, a_fp16_bytes, 256, true});
+                reqs.buffers.push_back({GemmWorkspaceBuffers::FULL_B_FP16, b_fp16_bytes, 256, true});
+                reqs.buffers.push_back({GemmWorkspaceBuffers::FULL_C_FP16, c_fp16_bytes, 256, true});
+
+                LOG_DEBUG("[ROCmQuantisedGemmKernel::getWorkspaceRequirements] FP16 FULL path: "
+                          << "A=" << (a_fp16_bytes / 1024) << "KB, "
+                          << "B=" << (b_fp16_bytes / (1024 * 1024)) << "MB, "
+                          << "C=" << (c_fp16_bytes / 1024) << "KB");
+            }
+            else
+            {
+                // INT8 path needs quantization + accumulator buffers
+                size_t quant_a_bytes = static_cast<size_t>(m) * k * sizeof(int8_t);
+                size_t scales_a_bytes = static_cast<size_t>(m) * sizeof(float);
+                size_t acc_int32_bytes = static_cast<size_t>(m) * n * sizeof(int32_t);
+
+                // Also need FP32 temp buffers for host→device transfer
+                size_t temp_a_fp32_bytes = static_cast<size_t>(m) * k * sizeof(float);
+                size_t temp_c_fp32_bytes = static_cast<size_t>(m) * n * sizeof(float);
+
+                reqs.buffers.push_back({GemmWorkspaceBuffers::QUANT_A, quant_a_bytes, 256, true});
+                reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A, scales_a_bytes, 256, true});
+                reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32, acc_int32_bytes, 256, true});
+                reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_A_FP32, temp_a_fp32_bytes, 256, true});
+                reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
+
+                LOG_DEBUG("[ROCmQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
+                          << "quant_a=" << (quant_a_bytes / 1024) << "KB, "
+                          << "scales_a=" << (scales_a_bytes) << "B, "
+                          << "acc=" << (acc_int32_bytes / 1024) << "KB");
+            }
+
+            return reqs;
+        }
+
+        void ROCmQuantisedGemmKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
+        {
+            workspace_ = workspace;
+            if (workspace)
+            {
+                LOG_DEBUG("[ROCmQuantisedGemmKernel] Bound workspace manager at " << (void *)workspace
+                                                                                  << ", entering managed mode");
+            }
+            else
+            {
+                LOG_DEBUG("[ROCmQuantisedGemmKernel] Unbound workspace, returning to legacy mode");
+            }
+        }
+
+        bool ROCmQuantisedGemmKernel::hasWorkspace() const
+        {
+            return workspace_ != nullptr;
+        }
+
+        DeviceWorkspaceManager *ROCmQuantisedGemmKernel::getWorkspace() const
+        {
+            return workspace_;
         }
 
         // =====================================================================

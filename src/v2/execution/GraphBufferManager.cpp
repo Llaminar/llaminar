@@ -9,7 +9,11 @@
 #include "GraphExecutor.h"
 #include "LivenessAnalyzer.h"
 #include "CollectiveContext.h"
+#include "DeviceWorkspaceManager.h"
 #include "../collective/backends/PCIeBARBackend.h"
+#include "../backends/BackendManager.h"
+#include "../interfaces/IWorkspaceConsumer.h"
+#include "../execution/compute_stages/IComputeStage.h"
 #include "../utils/Logger.h"
 
 namespace llaminar2
@@ -696,6 +700,205 @@ namespace llaminar2
             stats_.weight_bytes += allocated_bytes;
             break;
         }
+    }
+
+    // =========================================================================
+    // GPU Workspace Management (Phase 4: Memory Budget Enforcement)
+    // =========================================================================
+
+    size_t GraphBufferManager::queryAvailableMemory(DeviceId device)
+    {
+        // Handle invalid device early
+        if (!device.is_valid())
+        {
+            LOG_WARN("[GraphBufferManager] Cannot query memory for invalid device");
+            return 0;
+        }
+
+        IBackend *backend = getBackendFor(device);
+        if (!backend)
+        {
+            LOG_WARN("[GraphBufferManager] No backend available for " << device.toString());
+            return 0;
+        }
+
+        // For GPU: use gpu_ordinal, for CPU: always device 0 (rank-local view)
+        int device_idx = device.is_cpu() ? 0 : device.gpu_ordinal();
+        return backend->deviceMemoryFree(device_idx);
+    }
+
+    size_t GraphBufferManager::computeWorkspaceBudget(DeviceId device,
+                                                      const WorkspaceBudgetConfig &config)
+    {
+        size_t available = queryAvailableMemory(device);
+        if (available == 0)
+        {
+            LOG_DEBUG("[GraphBufferManager] No memory available for " << device.toString());
+            return 0;
+        }
+
+        // Apply fraction based on device type
+        float fraction = device.is_cpu() ? config.cpu_fraction : config.gpu_fraction;
+        size_t budget = static_cast<size_t>(static_cast<double>(available) * fraction);
+
+        // Apply headroom
+        if (budget > config.headroom)
+        {
+            budget -= config.headroom;
+        }
+        else
+        {
+            budget = 0;
+        }
+
+        // Clamp to min/max
+        budget = std::max(budget, config.min_budget);
+        budget = std::min(budget, config.max_budget);
+
+        LOG_INFO("[GraphBufferManager] " << device.toString()
+                                         << " available=" << (available / (1024 * 1024)) << "MB"
+                                         << ", budget=" << (budget / (1024 * 1024)) << "MB"
+                                         << " (fraction=" << fraction << ", headroom=" << (config.headroom / (1024 * 1024)) << "MB)");
+
+        return budget;
+    }
+
+    DeviceWorkspaceManager *GraphBufferManager::getDeviceWorkspace(DeviceId device)
+    {
+        auto it = device_workspaces_.find(device);
+        return (it != device_workspaces_.end()) ? it->second.get() : nullptr;
+    }
+
+    bool GraphBufferManager::allocateDeviceWorkspace(
+        const std::vector<IComputeStage *> &stages,
+        const WorkspaceBudgetConfig &config)
+    {
+        // Step 1: Collect all unique devices from stages that are workspace consumers
+        std::unordered_map<DeviceId, std::vector<IWorkspaceConsumer *>> device_consumers;
+
+        for (auto *stage : stages)
+        {
+            if (!stage)
+            {
+                continue;
+            }
+
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(stage);
+            if (consumer)
+            {
+                DeviceId device = stage->device();
+                device_consumers[device].push_back(consumer);
+            }
+        }
+
+        if (device_consumers.empty())
+        {
+            LOG_DEBUG("[GraphBufferManager] No workspace consumers found in " << stages.size() << " stages");
+            return true;
+        }
+
+        LOG_DEBUG("[GraphBufferManager] Found " << device_consumers.size()
+                                                << " devices with workspace consumers");
+
+        // Step 2: For each device, allocate workspace and bind to consumers
+        for (const auto &[device, consumers] : device_consumers)
+        {
+            // Skip invalid devices
+            if (!device.is_valid())
+            {
+                LOG_WARN("[GraphBufferManager] Skipping invalid device from stage");
+                continue;
+            }
+
+            // Compute budget for this device
+            size_t budget = computeWorkspaceBudget(device, config);
+            if (budget == 0)
+            {
+                LOG_WARN("[GraphBufferManager] Zero budget for " << device.toString()
+                                                                 << ", skipping workspace allocation");
+                continue;
+            }
+
+            // Collect requirements from all consumers on this device
+            // Use reasonable default dimensions (consumers can request larger)
+            WorkspaceRequirements combined;
+            for (auto *consumer : consumers)
+            {
+                // Get requirements for maximum expected dimensions
+                // Default to 4096 for max_m if not specified
+                auto reqs = consumer->getWorkspaceRequirements(/*max_m=*/4096);
+                combined.merge(reqs);
+            }
+
+            // If no requirements after merging, skip this device
+            if (combined.buffers.empty())
+            {
+                LOG_DEBUG("[GraphBufferManager] No workspace requirements for device "
+                          << device.toString());
+                continue;
+            }
+
+            LOG_DEBUG("[GraphBufferManager] Device " << device.toString()
+                                                     << ": " << consumers.size() << " consumers, "
+                                                     << combined.buffers.size() << " buffers, "
+                                                     << combined.total_bytes_with_alignment() << " bytes needed");
+
+            // Create manager and allocate
+            auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
+            if (!manager->allocate(combined))
+            {
+                LOG_ERROR("[GraphBufferManager] Failed to allocate workspace on "
+                          << device.toString()
+                          << " (needed=" << combined.total_bytes_with_alignment()
+                          << ", budget=" << budget << ")");
+                return false;
+            }
+
+            // Bind workspace to all consumers on this device
+            for (auto *consumer : consumers)
+            {
+                consumer->bindWorkspace(manager.get());
+            }
+
+            LOG_INFO("[GraphBufferManager] Allocated " << (manager->used() / (1024 * 1024))
+                                                       << "MB workspace on " << device.toString()
+                                                       << " (" << manager->bufferCount() << " buffers)");
+
+            // Store the manager and budget
+            device_workspace_budgets_[device] = budget;
+            device_workspaces_[device] = std::move(manager);
+        }
+
+        return true;
+    }
+
+    void GraphBufferManager::releaseDeviceWorkspace()
+    {
+        if (!device_workspaces_.empty())
+        {
+            LOG_DEBUG("[GraphBufferManager] Releasing " << device_workspaces_.size()
+                                                        << " GPU workspace managers");
+        }
+
+        // Clear all workspace managers (destructors release memory)
+        device_workspaces_.clear();
+        device_workspace_budgets_.clear();
+    }
+
+    size_t GraphBufferManager::totalDeviceWorkspaceAllocated() const
+    {
+        size_t total = 0;
+        for (const auto &[device, mgr] : device_workspaces_)
+        {
+            total += mgr->used();
+        }
+        return total;
+    }
+
+    size_t GraphBufferManager::deviceWorkspaceAllocated(DeviceId device) const
+    {
+        auto it = device_workspaces_.find(device);
+        return (it != device_workspaces_.end()) ? it->second->used() : 0;
     }
 
 } // namespace llaminar2

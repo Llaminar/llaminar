@@ -1,64 +1,190 @@
-# Llaminar V2 Architecture
+# Llaminar V2 Architecture Reference
 
-This document is a high-level but concrete map of the Llaminar V2 stack: tensors, kernels, devices, inference execution, MPI orchestration, and attention. It is intended as a **quick-start reference for future agents** so they can safely modify V2 without re-deriving the architecture from scratch.
+This document provides an architecture-level reference for agents working with **Llaminar V2**, the operator-free, kernel-centric LLM inference engine. It's designed to give context when navigating the codebase and understanding how components connect.
+
+> **For development guidelines**, build commands, testing procedures, and debugging instructions, see `.github/copilot-instructions.md`.
+> 
+> **For execution scenario diagrams** including Memory Management Flow, Workspace Lifecycle, and multi-rank scenarios, see `docs/v2/ARCHITECTURE_EXECUTION_SCENARIOS.md`.
 
 ---
 
-## 1. Design Goals
+## 1. Design Goals and Mental Model
+
+### 1.1 Design Goals
 
 V2 is a **kernel-centric, operator-free** architecture:
 
-- **Per-tensor device affinity** – each tensor knows which device it lives on.
-- **Declarative graph execution** – `GraphOrchestrator` executes DAGs of compute stages.
-- **Heterogeneous execution** – CPU / CUDA / ROCm / (future) backends can be mixed in one run.
-- **Quantization-aware kernels** – unified GEMM/attention interfaces that work with FP32/BF16 and quantized formats.
-- **MPI-aware orchestration** – multi-rank inference (tensor parallelism) lives in orchestrators, not kernels.
-- **Centralized kernel dispatch** – `KernelFactory` provides unified kernel creation with caching.
-- **Weight sharding** – automatic tensor parallelism distributes weight matrices across MPI ranks.
-- **Graph caching** – `Qwen2Graph` builds DAGs that are cached and reused during decode for performance.
+1. **Per-tensor device affinity** – each tensor knows which device it lives on (CPU, CUDA:0, ROCm:1)
+2. **Declarative graph execution** – `GraphOrchestrator` executes DAGs of compute stages
+3. **Heterogeneous execution** – CPU / CUDA / ROCm backends can be mixed in one inference run
+4. **Quantization-aware kernels** – unified GEMM/attention interfaces for FP32/BF16 and quantized formats
+5. **MPI-aware orchestration** – multi-rank tensor parallelism lives in orchestrators, not kernels
+6. **Centralized kernel dispatch** – `KernelFactory` provides unified kernel creation with caching
+7. **Automatic weight sharding** – Megatron-style tensor parallelism distributes weights across MPI ranks
+8. **Graph caching** – `LayerGraphCache` builds DAGs that are cached and reused during decode
+9. **Zero-allocation hot path** – all buffers pre-allocated via `GraphBufferManager` + `DeviceWorkspaceManager`
+10. **Automatic coherence** – GPU↔CPU memory sync handled by `StageCoherence` at stage boundaries
 
-The mental model:
+### 1.2 Mental Model
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                          INFERENCE LAYER                                     │
+│                          APPLICATION LAYER                                   │
 │                                                                              │
-│   createInferenceRunner()  ──→  IInferenceRunner (GraphOrchestrator)        │
-│                                      │                                       │
-│                                      ▼                                       │
-│                        ┌─────────────────────────┐                          │
-│                        │   GraphOrchestrator     │                          │
-│                        │  (Declarative graphs)   │                          │
-│                        └─────────────────────────┘                          │
-│                                      │                                       │
-│                                      │ DAG stages                            │
-│                                      ▼                                       │
-│                        ┌─────────────────────────┐                          │
-│                        │   ComputeGraph DAG      │                          │
-│                        │  + GraphExecutor        │                          │
-│                        └─────────────────────────┘                          │
+│   llaminar2 CLI  ──→  InferenceRunnerFactory::createInferenceRunner()       │
+│                              │                                               │
+│                              ▼                                               │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  IInferenceRunner (GraphOrchestrator implements)                    │   │
+│   │    • forward(tokens, seq_len) → logits                             │   │
+│   │    • enableSnapshotCapture() → parity testing                      │   │
+│   │    • getSnapshot(key) → per-stage tensor data                      │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        ORCHESTRATION LAYER                                   │
 │                                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  GraphOrchestrator                                                  │   │
+│   │    • InferenceState (hidden, logits, kv_cache, activations)        │   │
+│   │    • LayerGraphCache (decode-mode graph reuse)                     │   │
+│   │    • Qwen2Graph (IGraphBuilder - declarative graph construction)   │   │
+│   │    • CollectiveContext (ICollectiveContext - MPI backend routing)  │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                      │                                       │
+│         ┌────────────────────────────┼────────────────────────────┐          │
+│         ▼                            ▼                            ▼          │
+│   ┌──────────────────┐   ┌─────────────────────────┐   ┌──────────────────┐ │
+│   │   MPITopology    │   │   PlacementStrategy     │   │   BackendRouter  │ │
+│   │ (IMPITopology)   │   │ (device→stage mapping)  │   │ (NCCL/RCCL/MPI)  │ │
+│   └──────────────────┘   └─────────────────────────┘   └──────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                             GRAPH LAYER                                      │
+│                                                                              │
+│   ┌───────────────────────┐        ┌────────────────────────────────────┐   │
+│   │  ComputeGraph (DAG)   │        │  GraphBufferManager                │   │
+│   │    • ComputeNode      │        │    • LivenessAnalyzer (aliasing)   │   │
+│   │    • dependencies     │        │    • DeviceWorkspaceManager        │   │
+│   │    • getExecutionOrder│        │    • WorkspaceBudgetConfig         │   │
+│   └───────────────────────┘        └────────────────────────────────────┘   │
+│                                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  GraphExecutor (IGraphExecutor)                                     │   │
+│   │    • execute(graph, ctx) → topological order                        │   │
+│   │    • StageCoherence (GPU↔CPU sync at boundaries)                   │   │
+│   │    • TensorVerification (debug builds: NaN/zero detection)         │   │
+│   │    • setSnapshotCallback() → parity test hooks                     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         COMPUTE STAGE LAYER                                  │
+│                                                                              │
+│   IComputeStage Interface:                                                   │
+│     • execute(ctx) → run computation                                         │
+│     • type() → ComputeStageType enum                                        │
+│     • getDumpInfo() → StageDumpInfo (inputs/outputs/weights for debugging)  │
+│     • coherencePolicy() → FULL/INPUT/OUTPUT/NONE                            │
+│                                                                              │
+│   ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌───────────┐│
+│   │GEMM Stages │ │Attn Stages │ │Norm Stages │ │Activ Stages│ │MPI Stages ││
+│   ├────────────┤ ├────────────┤ ├────────────┤ ├────────────┤ ├───────────┤│
+│   │GEMMStage   │ │FusedAttnWo │ │RMSNormStage│ │SwiGLUStage │ │Allreduce  ││
+│   │FusedQKV    │ │AttnCompute │ │EmbedStage  │ │QuantQ16_1  │ │AllGather  ││
+│   │FusedGateUp │ │KVCacheOps  │ │LMHeadStage │ │RoPEStage   │ │           ││
+│   └────────────┘ └────────────┘ └────────────┘ └────────────┘ └───────────┘│
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           KERNEL LAYER                                       │
 │                                                                              │
-│   KernelFactory  ──→  ITensorGemm, ITensorAttention, IRMSNorm, etc.         │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  KernelFactory (centralized dispatch with caching)                  │   │
+│   │    • getDeviceType(DeviceId) → DeviceType (CPU/CUDA/ROCm)          │   │
+│   │    • getOrCreateGemm(tensor) → ITensorGemm* (cached)               │   │
+│   │    • createKVCache(config) → IKVCache                              │   │
+│   │    • createAttention(config) → ITensorAttention                    │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                              │
-│   ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────────────┐ │
-│   │  CPU Kernels    │  │  CUDA Kernels   │  │  Quantized Kernels         │ │
-│   │  (OpenBLAS/MKL) │  │  (future)       │  │  (IQ4_NL, Q8_0, Q6_K...)   │ │
-│   └─────────────────┘  └─────────────────┘  └─────────────────────────────┘ │
+│   Kernel Interfaces:                                                         │
+│   ┌──────────────┐ ┌──────────────────┐ ┌──────────────┐ ┌───────────────┐  │
+│   │ ITensorGemm  │ │ ITensorAttention │ │ ITensorRoPE  │ │IWorkspaceCons │  │
+│   │ multiply()   │ │ compute()        │ │ apply()      │ │BindWorkspace()│  │
+│   └──────────────┘ └──────────────────┘ └──────────────┘ └───────────────┘  │
 │                                                                              │
+│   Backend Implementations:                                                   │
+│   ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐            │
+│   │   CPU Kernels    │ │   CUDA Kernels   │ │   ROCm Kernels   │            │
+│   │ OpenBLAS/MKL GEMM│ │ cuBLAS GEMM      │ │ rocBLAS GEMM     │            │
+│   │ JIT Attention    │ │ FlashAttention   │ │ comp_kernel      │            │
+│   │ AVX-512 VNNI     │ │ TensorCore WMMA  │ │ MatrixCore       │            │
+│   │ QuantizedGEMM    │ │ CUDAQuantGEMM    │ │ ROCmQuantGEMM    │            │
+│   └──────────────────┘ └──────────────────┘ └──────────────────┘            │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           BACKEND LAYER                                      │
+│                                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  BackendManager (unified device memory interface)                   │   │
+│   │    • getBackendFor(DeviceId) → IBackend*                           │   │
+│   │    • getCPUBackend(), getCUDABackend(), getROCmBackend()           │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   IBackend Interface:                                                        │
+│     • allocate(size) → void*, free(ptr)                                     │
+│     • deviceToHost(dst, src, size), hostToDevice(dst, src, size)            │
+│     • deviceMemoryTotal(), deviceMemoryFree()                               │
+│     • synchronize()                                                          │
+│                                                                              │
+│   ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐               │
+│   │   CPUBackend    │ │  CUDABackend    │ │  ROCmBackend    │               │
+│   │ Rank-local NUMA │ │ cudaMalloc      │ │ hipMalloc       │               │
+│   │ 64B alignment   │ │ cudaMemcpy      │ │ hipMemcpy       │               │
+│   └─────────────────┘ └─────────────────┘ └─────────────────┘               │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           TENSOR LAYER                                       │
 │                                                                              │
-│   TensorBase  ──→  FP32Tensor, BF16Tensor, IQ4_NLTensor, Q8_0Tensor, etc.   │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  ITensor (runtime polymorphism interface)                           │   │
+│   │    • native_type(), dtype_name()                                   │   │
+│   │    • shape(), rows(), cols(), numel(), size_bytes()               │   │
+│   │    • home_device() → DeviceId                                      │   │
+│   │    • typed_as<T>(), try_as<T>()                                   │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  CPUTensorBase (device coherence + host storage)                    │   │
+│   │    • ensureOnDevice(device) → upload to GPU                         │   │
+│   │    • mark_device_dirty() → mark GPU as authoritative                │   │
+│   │    • data() → host data (syncs from GPU if device-dirty)           │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  TypedTensorBase<Derived, DataType> (CRTP zero-overhead access)     │   │
+│   │    • typed_data() → const DataType*                                │   │
+│   │    • mutable_typed_data() → DataType*                              │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   Concrete Types:                                                            │
+│   ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌───────────────────┐  │
+│   │ Activations  │ │Quant Weights │ │ KV Cache     │ │ Special Purpose   │  │
+│   ├──────────────┤ ├──────────────┤ ├──────────────┤ ├───────────────────┤  │
+│   │ FP32Tensor   │ │ IQ4_NLTensor │ │ Q16_1Tensor  │ │ INT32Tensor (acc) │  │
+│   │ FP16Tensor   │ │ Q4_0Tensor   │ │ Q8_1Tensor   │ │ INT8Tensor        │  │
+│   │ BF16Tensor   │ │ Q6_KTensor   │ │              │ │                   │  │
+│   └──────────────┘ └──────────────┘ └──────────────┘ └───────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -96,26 +222,64 @@ public:
 };
 ```
 
-### 2.2 Factory Function
+### 2.2 Factory Functions
 
-Location: `src/v2/inference/InferenceRunner.h`
+Location: `src/v2/execution/InferenceRunnerFactory.h`
 
 ```cpp
-// Factory creates a GraphOrchestrator-based runner
+// Standard factory - creates GraphOrchestrator with full model context
 std::unique_ptr<IInferenceRunner> createInferenceRunner(
-    std::shared_ptr<ModelContext> model_ctx,
+    std::shared_ptr<IModelContext> model_ctx,
     std::shared_ptr<MPIContext> mpi_ctx,
-    int device_idx,
+    DeviceId device,                               // DeviceId (not int)
+    const InferenceRunnerConfig& config = {});
+
+// Testable factory - allows injecting mock IModelContext for unit tests
+std::unique_ptr<IInferenceRunner> createTestableInferenceRunner(
+    IModelContext* model_ctx,                      // Non-owning pointer for DI
+    DeviceId device,
     const InferenceRunnerConfig& config = {});
 ```
 
-The factory creates a `GraphOrchestrator` for the model architecture (e.g., Qwen2).
+**InferenceRunnerConfig:**
+```cpp
+struct InferenceRunnerConfig {
+    bool enable_benchmarking = false;              // Enable timing instrumentation
+    bool enable_tensor_parallelism = true;         // MPI sharding (auto if world_size > 1)
+    size_t max_context_length = 4096;              // Maximum sequence length
+    std::string cache_dir = "";                    // Optional: snapshot/cache directory
+};
+```
 
-### 2.3 Usage Pattern
+### 2.3 IModelContext Interface
+
+Location: `src/v2/interfaces/IModelContext.h`
+
+The `IModelContext` abstracts model metadata for testing:
+
+```cpp
+class IModelContext {
+public:
+    virtual int n_vocab() const = 0;
+    virtual int n_embd() const = 0;
+    virtual int n_head() const = 0;
+    virtual int n_kv_head() const = 0;
+    virtual int n_layer() const = 0;
+    virtual int n_ff() const = 0;
+    virtual int n_ctx() const = 0;
+    virtual float rope_freq_base() const = 0;
+    virtual const char* arch() const = 0;
+    
+    // Weight access (returns nullptr for mock contexts)
+    virtual ITensor* get_weight(const std::string& name) const = 0;
+};
+```
+
+### 2.4 Usage Pattern
 
 ```cpp
 // Create runner
-auto runner = createInferenceRunner(model_ctx, mpi_ctx, device_idx);
+auto runner = createInferenceRunner(model_ctx, mpi_ctx, DeviceId::cpu());
 
 // Inference
 runner->forward(tokens.data(), seq_len);
@@ -143,63 +307,213 @@ runner->clear_cache();
 The **GraphOrchestrator** is the graph-based execution system for transformer inference. It orchestrates declarative compute graphs for high-performance execution with:
 
 - **Declarative graph construction** – Build computation as a DAG of stages
-- **Automatic dependency tracking** – Stages execute in correct order
-- **Graph caching** – Pre-built graphs reused across decode steps
-- **MPI-aware execution** – `AllreduceStage` handles tensor-parallel synchronization
+- **Automatic dependency tracking** – Stages execute in topological order
+- **Graph caching** – Pre-built graphs reused across decode steps (`LayerGraphCache`)
+- **MPI-aware execution** – `AllreduceStage` / `AllGatherStage` handle tensor-parallel sync
 - **State management** – Owns KV cache, position tracking, and activation buffers
+- **Collective context** – Routes MPI operations to appropriate backends (NCCL/RCCL/MPI/Host)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                        GraphOrchestrator                                     │
 │                                                                              │
-│   ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────────────┐  │
-│   │  InferenceState │   │  GraphExecutor  │   │   LayerGraphCache       │  │
-│   │  - hidden       │   │  - execute()    │   │   - attention_decode    │  │
-│   │  - logits       │   │  - topo sort    │   │   - ffn_decode          │  │
-│   │  - kv_cache     │   │                 │   │   - per-layer caching   │  │
-│   │  - positions    │   │                 │   │                         │  │
-│   └─────────────────┘   └─────────────────┘   └─────────────────────────┘  │
+│   ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────────────┐   │
+│   │  InferenceState │   │  GraphExecutor  │   │   LayerGraphCache       │   │
+│   │  - hidden       │   │  - execute()    │   │   - attention_decode    │   │
+│   │  - logits       │   │  - topo sort    │   │   - ffn_decode          │   │
+│   │  - kv_cache     │   │  - coherence    │   │   - layer_prefetch_fn   │   │
+│   │  - positions[]  │   │  - verification │   │   - per-layer graphs    │   │
+│   │  - activations  │   │                 │   │                         │   │
+│   └─────────────────┘   └─────────────────┘   └─────────────────────────┘   │
+│                                                                              │
+│   ┌───────────────────────────────────────┐   ┌─────────────────────────┐   │
+│   │  CollectiveContext                    │   │  PlacementPlan          │   │
+│   │  - executeAllreduce()                 │   │  - layers[]             │   │
+│   │  - executeAllgather()                 │   │  - decode_devices[]     │   │
+│   │  - BackendRouter (NCCL/RCCL/MPI/Host) │   │  - weight_fractions[]   │   │
+│   └───────────────────────────────────────┘   └─────────────────────────┘   │
 │                                                                              │
 │   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  Qwen2Graph (IGraphBuilder)                                         │   │
-│   │  - buildAttentionGraph() → ComputeGraph                             │   │
-│   │  - buildFFNGraph() → ComputeGraph                                   │   │
-│   │  - Declarative stage definition                                      │   │
+│   │  Qwen2Graph (IGraphBuilder)                                          │   │
+│   │    • buildAttentionGraph(params) → ComputeGraph                      │   │
+│   │    • buildFFNGraph(params) → ComputeGraph                            │   │
+│   │    • buildLayerGraph(layer_idx) → ComputeGraph                       │   │
+│   │    • buildForwardGraph() → complete embedding→layers→LM head         │   │
 │   └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 ComputeGraph and Stages
+### 3.2 InferenceState
 
-Location: `src/v2/execution/ComputeGraph.h`, `src/v2/execution/ComputeStage.h`
+Location: `src/v2/execution/GraphOrchestrator.h`
 
-A **ComputeGraph** is a DAG of `IComputeStage` nodes:
+The **InferenceState** struct holds all buffers for inference:
 
 ```cpp
-class ComputeGraph {
-public:
-    void addNode(const std::string& name, std::unique_ptr<IComputeStage> stage, int device_idx);
-    void addDependency(const std::string& dependent, const std::string& dependency);
-    std::vector<std::string> getExecutionOrder() const;  // Topological sort
-    void reset();  // Reset all stages for reuse
+struct InferenceState {
+    // Core buffers
+    std::unique_ptr<FP32Tensor> hidden;           // Current hidden state
+    std::unique_ptr<FP32Tensor> logits;           // Full logits (allgathered)
+    std::unique_ptr<FP32Tensor> logits_local;     // Local shard (column-parallel LM head)
+    
+    // KV cache
+    std::unique_ptr<IKVCache> kv_cache;
+    
+    // Position tracking
+    std::vector<int> positions;                   // Per-sequence positions
+    std::vector<int> sequence_lengths;            // For batched inference
+    
+    // Activation buffers (reused across layers)
+    std::unique_ptr<FP32Tensor> normalized;       // After RMS norm
+    std::unique_ptr<FP32Tensor> residual;         // For residual connections
+    std::unique_ptr<FP32Tensor> Q, K, V;          // Attention projections
+    std::unique_ptr<FP32Tensor> attn_output;      // Attention context
+    std::unique_ptr<FP32Tensor> attn_proj;        // After Wo projection
+    std::unique_ptr<FP32Tensor> gate, up;         // FFN activations
+    std::unique_ptr<FP32Tensor> ffn_output;       // After down projection
+    
+    // HybridQ16 mode buffers (optional)
+    std::unique_ptr<Q16_1Tensor> Q_rope, K_rope;  // Quantized Q/K after RoPE
+    std::unique_ptr<FP32Tensor> V_dequant;        // Dequantized V for attention
+    
+    // Workspace buffers
+    std::unique_ptr<FP32Tensor> workspace_scores; // Attention scores
+    std::unique_ptr<FP32Tensor> workspace_context;// Attention context scratch
+    std::unique_ptr<INT32Tensor> workspace_mask;  // Causal mask
 };
 ```
 
-**Available Stage Types:**
+### 3.3 ComputeGraph and ComputeNode
 
-| Stage Class | Purpose | MPI Sync? |
-|-------------|---------|-----------|
-| `RMSNormStage` | RMS normalization | No |
-| `GEMMStage` | Matrix multiplication | No |
-| `SwiGLUStage` | SwiGLU activation | No |
-| `RoPEStage` | Rotary position embeddings | No |
-| `ResidualAddStage` | Residual connections | No |
-| `AttentionComputeStage` | Full attention computation | No |
-| `KVCacheAppendStage` | KV cache management | No |
-| `AllreduceStage` | **MPI synchronization** | **Yes** |
+Location: `src/v2/execution/GraphExecutor.h`
 
-### 3.3 Execution Flow
+A **ComputeGraph** is a DAG of `ComputeNode` structures:
+
+```cpp
+struct ComputeNode {
+    std::string name;                              // Unique node identifier
+    std::shared_ptr<IComputeStage> stage;          // The compute stage
+    std::vector<std::string> dependencies;         // Input node names
+    DeviceId device;                               // Target device
+    bool completed = false;                        // Execution status
+};
+
+class ComputeGraph {
+public:
+    void addNode(const std::string& name, std::shared_ptr<IComputeStage> stage, 
+                 DeviceId device = DeviceId::cpu());
+    void addDependency(const std::string& dependent, const std::string& dependency);
+    std::vector<const ComputeNode*> getExecutionOrder() const;  // Topological sort
+    void merge(const ComputeGraph& other);                       // Combine subgraphs
+    std::vector<const ComputeNode*> getRootNodes() const;        // Entry points
+    std::vector<const ComputeNode*> getLeafNodes() const;        // Output nodes
+    void reset();                                                 // Reset for reuse
+};
+```
+
+### 3.4 IComputeStage Interface
+
+Location: `src/v2/execution/compute_stages/IComputeStage.h`
+
+```cpp
+class IComputeStage {
+public:
+    virtual ~IComputeStage() = default;
+    
+    // Core execution
+    virtual bool execute(void* ctx = nullptr) = 0;
+    
+    // Metadata
+    virtual ComputeStageType type() const = 0;
+    virtual const char* name() const = 0;
+    
+    // Debugging/parity (REQUIRED for all stages)
+    virtual StageDumpInfo getDumpInfo() const = 0;
+    
+    // Buffer requirements for GraphBufferManager
+    virtual StageBufferRequirements getBufferRequirements() const { return {}; }
+    
+    // Coherence policy for automatic GPU↔CPU sync
+    virtual CoherencePolicy coherencePolicy() const { return CoherencePolicy::FULL; }
+};
+```
+
+### 3.5 ComputeStageType Enum
+
+```cpp
+enum class ComputeStageType {
+    // Matrix operations
+    GEMM,                  // General GEMM
+    GEMM_BIAS,             // GEMM with bias add
+    GEMM_FUSED_QKV,        // Fused Q/K/V projection
+    GEMM_FUSED_GATE_UP,    // Fused gate/up projection
+    
+    // Normalization
+    RMS_NORM,              // RMS normalization
+    LAYER_NORM,            // Layer normalization
+    
+    // Activations
+    SWIGLU,                // SwiGLU activation
+    GELU,                  // GELU activation
+    SILU,                  // SiLU activation
+    
+    // Attention
+    ROPE,                  // Rotary position embeddings
+    ATTENTION,             // Full attention (deprecated)
+    FUSED_ATTENTION_WO,    // Attention + Wo projection
+    ATTENTION_COMPUTE,     // Pure attention computation
+    
+    // Element-wise
+    ADD_RESIDUAL,          // Residual connections
+    SCALE,                 // Scalar multiplication
+    
+    // MoE (future)
+    MOE_ROUTER,            // MoE routing
+    MOE_EXPERT_FFN,        // MoE expert computation
+    MOE_COMBINE,           // MoE output combination
+    
+    // MPI collective
+    ALLREDUCE,             // MPI_Allreduce(SUM)
+    ALLGATHER,             // MPI_Allgather
+    
+    // Model-level
+    EMBEDDING,             // Token embedding lookup
+    LM_HEAD,               // Language model head
+    FINAL_NORM,            // Final layer norm
+    
+    // KV cache
+    KV_CACHE_APPEND,       // Append to KV cache
+    KV_CACHE_GATHER,       // Gather from KV cache
+    
+    // Quantization
+    QUANTIZE_Q8_1,         // Quantize to Q8_1
+    QUANTIZE_Q16_1,        // Quantize to Q16_1
+    DEQUANTIZE,            // Dequantize to FP32
+};
+```
+
+### 3.6 Available Compute Stages
+
+| Stage Class | Type | Purpose | MPI Sync? |
+|-------------|------|---------|-----------|
+| `RMSNormStage` | RMS_NORM | RMS normalization | No |
+| `GEMMStage` | GEMM | Matrix multiplication | No |
+| `FusedQKVGEMMStage` | GEMM_FUSED_QKV | Q/K/V projection | No |
+| `FusedGateUpGEMMStage` | GEMM_FUSED_GATE_UP | Gate/Up projection | No |
+| `SwiGLUStage` | SWIGLU | SwiGLU activation | No |
+| `RoPEStage` | ROPE | Rotary position embeddings | No |
+| `ResidualAddStage` | ADD_RESIDUAL | Residual connections | No |
+| `FusedAttentionWoStage` | FUSED_ATTENTION_WO | Attention + Wo | No |
+| `AttentionComputeStage` | ATTENTION_COMPUTE | Pure attention | No |
+| `KVCacheAppendStage` | KV_CACHE_APPEND | KV cache management | No |
+| `EmbeddingStage` | EMBEDDING | Token embedding | No |
+| `LMHeadStage` | LM_HEAD | Final projection | No |
+| `QuantizeQ16_1Stage` | QUANTIZE_Q16_1 | Activation quantization | No |
+| `AllreduceStage` | ALLREDUCE | **MPI sync** | **Yes** |
+| `AllGatherStage` | ALLGATHER | **MPI sync** | **Yes** |
+
+### 3.7 Execution Flow
 
 ```
 forward(tokens, seq_len)
@@ -293,9 +607,9 @@ The GraphOrchestrator implements **Megatron-style tensor parallelism** where wei
 - Each rank has its own `GraphOrchestrator` instance
 - Graphs are structurally identical across ranks
 - Weight tensors point to different shards
-- `AllreduceStage` synchronizes partial results after Wo and Down projections
+- `AllreduceStage` / `AllGatherStage` synchronize partial results
 
-### 3.5 Graph Caching (Decode Optimization)
+### 3.9 Graph Caching (Decode Optimization)
 
 For decode mode (seq_len=1), graphs are cached and reused:
 
@@ -328,39 +642,179 @@ bool GraphOrchestrator::executeAttention(...) {
 - Position offset updated via `updateDynamicParams()` without rebuilding
 - ~10-20% decode speedup for long sequences
 
-### 3.6 InferenceState
+---
 
-The `GraphOrchestrator` owns all mutable inference state:
+## 4. Collective Layer and MPI
+
+### 4.1 CollectiveContext
+
+Location: `src/v2/execution/CollectiveContext.h`
+
+The **CollectiveContext** bridges compute stages to MPI backends:
 
 ```cpp
-struct InferenceState {
-    // Core buffers
-    std::shared_ptr<TensorBase> hidden;    // [batch * seq, d_model]
-    std::shared_ptr<TensorBase> logits;    // [batch * seq, vocab_size]
+class CollectiveContext : public ICollectiveContext {
+public:
+    struct Config {
+        std::shared_ptr<MPIContext> mpi_ctx;
+        std::shared_ptr<IMPITopology> topology;
+        CollectiveBackendType preferred_backend = CollectiveBackendType::AUTO;
+    };
     
-    // KV Cache
-    std::unique_ptr<IUnifiedKVCache> kv_cache;
+    // Execute collective operations
+    bool executeAllreduce(TensorBase* buffer, CollectiveOp op, DeviceId device);
+    bool executeAllgather(TensorBase* local, TensorBase* full, int seq_len, DeviceId device);
+    bool executeBroadcast(TensorBase* buffer, int root, DeviceId device);
     
-    // Position tracking
-    std::vector<int> positions;           // Per-sequence position offset
-    std::vector<int> sequence_lengths;    // For variable-length batches
+    // Backend selection
+    ICollectiveBackend* getBackend(const DeviceGroup& group);
+};
+```
+
+### 4.2 BackendRouter
+
+Location: `src/v2/collective/BackendRouter.h`
+
+Routes collective operations to appropriate backends:
+
+```cpp
+class BackendRouter : public IBackendRouter {
+public:
+    BackendSelection selectBackend(const DeviceGroup& group);
+    ICollectiveBackend* getBackend(const DeviceGroup& group);
     
-    // Activation buffers
-    std::shared_ptr<TensorBase> normalized, residual;
-    std::shared_ptr<TensorBase> Q, K, V;
-    std::shared_ptr<TensorBase> attn_output, attn_proj;
-    std::shared_ptr<TensorBase> gate, up, ffn_output;
+    // Special case: heterogeneous device groups (CPU+GPU)
+    bool executeHeterogeneousAllReduce(
+        const std::vector<DeviceId>& devices,
+        TensorBase* buffer,
+        CollectiveOp op);
+};
+
+struct BackendSelection {
+    CollectiveBackendType type;
+    ICollectiveBackend* backend;
+    std::string reason;  // For debugging
+};
+```
+
+### 4.3 CollectiveBackendType
+
+```cpp
+enum class CollectiveBackendType {
+    AUTO,       // Auto-select based on DeviceGroup topology
+    MPI,        // MPI (fallback, inter-node)
+    NCCL,       // NVIDIA Collective Communication Library
+    RCCL,       // ROCm Collective Communication Library
+    PCIE_BAR,   // Direct PCIe BAR mapping (CUDA↔ROCm)
+    HOST,       // Host-staged fallback (heterogeneous)
+};
+```
+
+### 4.4 Backend Selection Logic
+
+| Device Group | Selected Backend | Reason |
+|--------------|------------------|--------|
+| All CUDA | NCCL | NVLink/PCIe fast path |
+| All ROCm | RCCL | xGMI/PCIe fast path |
+| Mixed CUDA+ROCm | PCIE_BAR or HOST | Direct BAR or staged |
+| Cross-node | MPI | Infiniband/Ethernet |
+| CPU only | MPI | Standard MPI |
+
+---
+
+## 5. Buffer Management
+
+### 5.1 GraphBufferManager
+
+Location: `src/v2/execution/GraphBufferManager.h`
+
+Manages memory allocation with buffer aliasing for reduced footprint:
+
+```cpp
+class GraphBufferManager : public IGraphBufferManager {
+public:
+    struct MemoryInfo {
+        size_t total_bytes;
+        size_t free_bytes;
+        size_t usable_bytes;  // Accounting for fragmentation
+    };
     
-    // Attention workspace
-    std::shared_ptr<TensorBase> workspace_scores, workspace_context, workspace_mask;
+    MemoryInfo queryAvailableMemory(DeviceId device);
+    size_t computeWorkspaceBudget(DeviceId device, const WorkspaceBudgetConfig& config);
+    void allocateWithAliasing(const ComputeGraph& graph);
+    TensorBase* getBuffer(const std::string& node, const std::string& buffer);
+};
+```
+
+### 5.2 LivenessAnalyzer
+
+Location: `src/v2/execution/LivenessAnalyzer.h`
+
+Analyzes buffer lifetimes to enable SCRATCH buffer aliasing:
+
+```cpp
+class LivenessAnalyzer {
+public:
+    struct BufferLiveness {
+        std::string buffer_name;
+        int first_use_stage;   // Stage index where buffer is first written
+        int last_use_stage;    // Stage index where buffer is last read
+        size_t size_bytes;
+    };
+    
+    std::vector<BufferLiveness> analyze(const ComputeGraph& graph);
+    std::vector<AliasingGroup> computeAliasingGroups();
+    std::pair<size_t, size_t> computeMemoryUsage();  // (original, optimized)
+};
+```
+
+**Example Aliasing:**
+```
+Stage 0: Q = GEMM(hidden)           Q live [0, 2]
+Stage 1: K = GEMM(hidden)           K live [1, 2]
+Stage 2: attn = Attention(Q, K, V)  Q, K dead after stage 2
+Stage 3: gate = GEMM(hidden)        gate live [3, 4] ← can reuse Q's memory!
+```
+
+### 5.3 DeviceWorkspaceManager
+
+Location: `src/v2/execution/DeviceWorkspaceManager.h`
+
+Per-device workspace allocation with zero-allocation hot path:
+
+```cpp
+class DeviceWorkspaceManager {
+public:
+    DeviceWorkspaceManager(DeviceId device, size_t total_bytes);
+    
+    // Single contiguous allocation at startup
+    void* allocateContiguous(size_t bytes, size_t alignment = 64);
+    
+    // Named sub-buffer allocation
+    void* getBuffer(const std::string& name);
+    size_t getBufferSize(const std::string& name);
+    
+    // Zero-allocation during inference - all buffers pre-allocated
+    bool isFullyAllocated() const;
+};
+```
+
+### 5.4 WorkspaceBudgetConfig
+
+```cpp
+struct WorkspaceBudgetConfig {
+    float gpu_workspace_fraction = 0.1f;  // 10% of free GPU memory
+    float cpu_workspace_fraction = 0.2f;  // 20% of available RAM
+    size_t min_workspace_bytes = 64 * 1024 * 1024;  // 64 MB minimum
+    size_t max_workspace_bytes = 2ULL * 1024 * 1024 * 1024;  // 2 GB max
 };
 ```
 
 ---
 
-## 4. Tensors and Tensor Interfaces
+## 6. Tensors and Tensor Interfaces
 
-### 4.1 Core Tensor Types
+### 6.1 Core Tensor Types
 
 Location: `src/v2/tensors/`
 
@@ -376,7 +830,7 @@ std::unique_ptr<ITensorGemm> createGemm() const;
 std::unique_ptr<ITensorAttention> createAttention() const;
 ```
 
-### 4.1.1 TypedTensorBase and `typed_data()` Pattern
+### 6.1.1 TypedTensorBase and `typed_data()` Pattern
 
 All 27 tensor classes inherit from `TypedTensorBase<Derived, DataType>`, a CRTP base that provides
 **zero-overhead typed access** to native storage:
@@ -428,7 +882,7 @@ if (c_type == TensorType::Q8_1) {
 - `bf16_data()` / `mutable_bf16_data()` → Use `typed_data()` instead
 - `fp16_data()` / `mutable_fp16_data()` → Use `typed_data()` instead
 
-### 4.2 Tensor Kernel Interfaces
+### 6.2 Tensor Kernel Interfaces
 
 Location: `src/v2/tensors/TensorKernels.h`
 
@@ -1076,18 +1530,49 @@ void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
 
 | Component | Location |
 |-----------|----------|
-| Inference interface | `src/v2/inference/IInferenceRunner.h` |
-| Inference factory | `src/v2/inference/InferenceRunner.{h,cpp}` |
-| GraphOrchestrator | `src/v2/pipelines/qwen/GraphOrchestrator.{h,cpp}` |
-| Graph builder | `src/v2/pipelines/qwen/Qwen2Graph.{h,cpp}` |
-| Buffer allocation | `src/v2/pipelines/qwen/Qwen2BufferSpec.{h,cpp}` |
-| ComputeGraph/Stages | `src/v2/execution/` |
-| KernelFactory | `src/v2/kernels/KernelFactory.{h,cpp}` |
-| Tensors | `src/v2/tensors/` |
+| **Application Layer** | |
+| Inference interface | `src/v2/execution/IInferenceRunner.h` |
+| Inference factory | `src/v2/execution/InferenceRunnerFactory.h` |
+| Model context interface | `src/v2/interfaces/IModelContext.h` |
+| **Orchestration Layer** | |
+| GraphOrchestrator | `src/v2/execution/GraphOrchestrator.h` |
+| Graph builder interface | `src/v2/execution/IGraphBuilder.h` |
+| Qwen2 graph builder | `src/v2/models/qwen/Qwen2Graph.h` |
+| **Graph Layer** | |
+| Graph executor | `src/v2/execution/GraphExecutor.h` |
+| Compute stages | `src/v2/execution/compute_stages/` |
+| Stage base interface | `src/v2/execution/compute_stages/IComputeStage.h` |
+| **Buffer Management** | |
+| Graph buffer manager | `src/v2/execution/GraphBufferManager.h` |
+| Liveness analyzer | `src/v2/execution/LivenessAnalyzer.h` |
+| Workspace manager | `src/v2/execution/DeviceWorkspaceManager.h` |
+| **Collective Layer** | |
+| Collective context | `src/v2/execution/CollectiveContext.h` |
+| Backend router | `src/v2/collective/BackendRouter.h` |
+| Backend interface | `src/v2/collective/ICollectiveBackend.h` |
+| NCCL/RCCL/MPI backends | `src/v2/collective/backends/` |
+| **Coherence** | |
+| Stage coherence | `src/v2/execution/StageCoherence.h` |
+| GPU coherence utilities | `src/v2/execution/GpuCoherence.h` |
+| **Kernel Layer** | |
+| KernelFactory | `src/v2/kernels/KernelFactory.h` |
 | CPU kernels | `src/v2/kernels/cpu/` |
-| MPI utilities | `src/v2/utils/MPIContext.h`, `src/v2/utils/MPITopology.h` |
-| Weight sharding | `src/v2/loaders/WeightManager.{h,cpp}` |
+| CUDA kernels | `src/v2/kernels/cuda/` |
+| ROCm kernels | `src/v2/kernels/rocm/` |
+| **Backend Layer** | |
+| Backend manager | `src/v2/backends/BackendManager.h` |
+| Backend interface | `src/v2/backends/IBackend.h` |
+| DeviceId | `src/v2/backends/DeviceId.h` |
+| **Tensor Layer** | |
+| ITensor interface | `src/v2/tensors/ITensor.h` |
+| CPU tensors | `src/v2/tensors/cpu/CPUTensors.h` |
+| Tensor factory | `src/v2/tensors/TensorFactory.h` |
+| **MPI Layer** | |
+| MPI context | `src/v2/utils/MPIContext.h` |
+| MPI topology | `src/v2/utils/MPITopology.h` |
+| NUMA topology | `src/v2/utils/NUMATopology.h` |
 | Placement strategy | `src/v2/execution/PlacementStrategy.h` |
+| Weight sharding | `src/v2/loaders/WeightManager.h` |
 
 ### 9.2 Key Design Rules
 
@@ -1096,35 +1581,45 @@ void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
 3. **Use KernelFactory** – Prefer `getOrCreateGemm()` for cached kernel access
 4. **Declarative graphs** – Build computation as DAGs of `ComputeStage` nodes
 5. **Graph caching** – Reuse cached graphs in decode mode for performance
+6. **Use StageCoherence** – Let GraphExecutor handle GPU↔CPU sync automatically
+7. **Implement getDumpInfo()** – All stages must support introspection
+8. **DeviceId not int** – Use typed `DeviceId` for device identification
+9. **Collective via BackendRouter** – Let the router select optimal MPI backend
 
 ### 9.3 Environment Variables
 
 | Variable | Effect |
 |----------|--------|
-| `LLAMINAR_PROFILE_KERNELS=1` | Enable per-kernel timing in benchmark mode |
 | `LLAMINAR_LOG_LEVEL=DEBUG` | Set logging verbosity |
-| `LLAMINAR_SNAPSHOT_TENSOR_DUMP=1` | Enable raw tensor dumps for debugging |
+| `LLAMINAR_PROFILE_KERNELS=1` | Enable per-kernel timing in benchmark mode |
+| `LLAMINAR_EXECUTOR_PROFILING=1` | Enable per-stage profiling in GraphExecutor |
 | `LLAMINAR_VALIDATE_BUFFERS=1` | Enable buffer validation at stage boundaries |
+| `LLAMINAR_VALIDATE_INPUTS=1` | Enable input validation before stage execution |
 | `LLAMINAR_FAIL_ON_NAN=1` | Throw exception on NaN/Inf detection (default in Debug) |
 | `LLAMINAR_FAIL_ON_ZERO=1` | Throw exception on all-zero output tensors |
 | `LLAMINAR_DUMP_ON_FAILURE=1` | Dump buffers to disk when verification fails |
+| `LLAMINAR_STAGE_DUMP_ENABLED=1` | Enable full stage dumping |
+| `LLAMINAR_STAGE_DUMP_DIR` | Output directory for stage dumps |
+| `LLAMINAR_STAGE_DUMP_TYPES` | Comma-separated stage types to dump |
+| `LLAMINAR_STAGE_DUMP_LAYERS` | Comma-separated layer indices to dump |
+| `LLAMINAR_STAGE_OUTPUT_PRINT=1` | Print stage outputs to log |
+| `LLAMINAR_MPI_LOG_COLLECTIVES=1` | Log MPI collective operations |
 
 ### 9.4 Running Tests
 
 ```bash
-# Unit tests
+# Unit tests (Debug build)
 ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure --parallel
 
-# Integration tests (includes parity tests)
+# Integration tests (Integration build - has snapshots + debug symbols)
 ctest --test-dir build_v2_integration -R "^V2_Integration_" --output-on-failure
 
-# Parity tests (subset of integration tests)
+# Parity tests (Llaminar vs PyTorch reference)
 ctest --test-dir build_v2_integration -R "^V2_Integration_Parity_" --output-on-failure
+
+# Performance benchmarks (Release build)
+ctest --test-dir build_v2_release -R "^V2_Perf_" --verbose
 ```
-
----
-
-This architecture is intentionally modular: small, focused abstractions connected by narrow interfaces. The `IInferenceRunner` interface ensures that callers (Main.cpp, ChatUI, tests) remain decoupled from implementation details of the `GraphOrchestrator`.
 
 ---
 
@@ -1157,7 +1652,15 @@ Location: `src/v2/utils/MPITopology.h`
 Manages work distribution across ranks:
 
 ```cpp
-class MPITopology {
+class MPITopology : public IMPITopology {
+    // Identification
+    int rank() const;
+    int world_size() const;
+    int node_rank() const;
+    int local_rank() const;
+    int ranks_per_node() const;
+    const std::vector<std::string>& all_hostnames() const;
+    
     // Work range calculations
     WorkRange get_head_range(int total_heads) const;     // For attention
     WorkRange get_column_range(int total_cols) const;    // For column-parallel
@@ -1165,5 +1668,57 @@ class MPITopology {
     
     // Device capabilities
     const std::vector<RankPlacement>& all_placements() const;
+    const ClusterInventory& cluster_inventory() const;
+};
+
+struct WorkRange {
+    int start;
+    int end;        // Exclusive
+    int count() const { return end - start; }
+};
+
+struct RankPlacement {
+    int rank;
+    std::string hostname;
+    int numa_node;
+    DeviceId primary_device;
+    DeviceCapability capability;
 };
 ```
+
+### 10.4 PlacementStrategy
+
+Location: `src/v2/execution/PlacementStrategy.h`
+
+Determines device-to-layer mapping for heterogeneous systems:
+
+```cpp
+class PlacementStrategy {
+public:
+    virtual PlacementPlan createPlan(const PlacementInput& input) = 0;
+};
+
+// Available strategies
+class CPUOnlyStrategy : public PlacementStrategy;
+class GPUFirstStrategy : public PlacementStrategy;
+class HybridOptimalStrategy : public PlacementStrategy;  // Bandwidth-proportional
+
+struct PlacementInput {
+    int n_layers, n_heads, hidden_dim, vocab_size;
+    size_t bytes_per_layer, total_model_bytes;
+    int world_size;
+    const ClusterInventory* cluster_inventory;
+    float gpu_memory_bandwidth, cpu_memory_bandwidth;
+    
+    // Phase-aware methods
+    PhaseDeviceWeights getPhaseDeviceWeights(InferencePhase phase) const;
+    bool cpuShouldParticipate(InferencePhase phase) const;  // True if CPU has ≥5% bandwidth
+    float getTotalDecodeBandwidth() const;
+};
+
+enum class InferencePhase { PREFILL, DECODE };
+```
+
+---
+
+This architecture is intentionally modular: small, focused abstractions connected by narrow interfaces. The `IInferenceRunner` interface ensures that callers (Main.cpp, ChatUI, tests) remain decoupled from implementation details of the `GraphOrchestrator`.

@@ -56,7 +56,9 @@
 #include "BufferRole.h"
 #include "LivenessAnalyzer.h"
 #include "CollectiveContext.h"
+#include "DeviceWorkspaceManager.h"
 #include "../interfaces/IGraphBufferManager.h"
+#include "../backends/DeviceId.h"
 #include "../tensors/TensorFactory.h"
 #include "../utils/MPIContext.h"
 #include <memory>
@@ -71,7 +73,32 @@ namespace llaminar2
     class ComputeGraph;
     class CPUTensorBase;
     class PCIeBARBackend;
+    class IComputeStage;
+    class IWorkspaceConsumer;
+    class IBackend;
     using TensorBase = CPUTensorBase; // Backward compatibility alias
+
+    // =========================================================================
+    // Workspace Budget Configuration (Phase 4: Memory Budget Enforcement)
+    // =========================================================================
+
+    /**
+     * @brief Configuration for workspace memory budget calculation
+     *
+     * Controls how GraphBufferManager computes workspace budgets for GPU and CPU
+     * devices. The budget is calculated as:
+     *   budget = min(max(available * fraction - headroom, min_budget), max_budget)
+     *
+     * @see GraphBufferManager::computeWorkspaceBudget()
+     */
+    struct WorkspaceBudgetConfig
+    {
+        float gpu_fraction = 0.8f;                     ///< Fraction of free GPU memory to use (0.0-1.0)
+        float cpu_fraction = 0.3f;                     ///< Fraction of free CPU memory to use (conservative)
+        size_t min_budget = 64 * 1024 * 1024;          ///< Minimum budget (64MB)
+        size_t max_budget = 4ULL * 1024 * 1024 * 1024; ///< Maximum budget (4GB)
+        size_t headroom = 128 * 1024 * 1024;           ///< Reserved headroom (128MB)
+    };
 
     // =========================================================================
     // Buffer Allocation Statistics
@@ -316,6 +343,86 @@ namespace llaminar2
                         TensorBase **target_ptr) override;
 
         // =====================================================================
+        // GPU Workspace Management (Phase 4: Memory Budget Enforcement)
+        // =====================================================================
+
+        /**
+         * @brief Query available memory for a device
+         *
+         * Uses the appropriate backend (CPU, CUDA, or ROCm) to query the
+         * device's free memory. For CPU, this queries the local NUMA node.
+         *
+         * @param device Target device (CPU, CUDA, ROCm)
+         * @return Available bytes (after weights loaded, before workspace)
+         */
+        size_t queryAvailableMemory(DeviceId device);
+
+        /**
+         * @brief Compute workspace budget for a device
+         *
+         * Applies the budget configuration to compute an appropriate workspace
+         * allocation size. The budget calculation considers:
+         * - Device-specific fraction (GPU vs CPU)
+         * - Headroom reservation
+         * - Min/max clamps
+         *
+         * @param device Target device
+         * @param config Budget configuration (defaults to reasonable values)
+         * @return Computed budget in bytes
+         */
+        size_t computeWorkspaceBudget(DeviceId device,
+                                      const WorkspaceBudgetConfig &config = WorkspaceBudgetConfig{});
+
+        /**
+         * @brief Get workspace manager for a device
+         *
+         * Returns the workspace manager allocated via allocateDeviceWorkspace().
+         *
+         * @param device Target device
+         * @return Workspace manager (nullptr if not allocated)
+         */
+        DeviceWorkspaceManager *getDeviceWorkspace(DeviceId device);
+
+        /**
+         * @brief Allocate GPU workspace for all devices used by stages
+         *
+         * Workflow:
+         * 1. Enumerate unique devices from stages that implement IWorkspaceConsumer
+         * 2. Query available memory per device
+         * 3. Compute budget per device using config
+         * 4. Collect workspace requirements from all consumers on each device
+         * 5. Allocate workspace per device
+         * 6. Bind workspace to consuming stages
+         *
+         * @param stages Stages that may need workspace (filtered for IWorkspaceConsumer)
+         * @param config Budget configuration
+         * @return true if all allocations succeeded
+         */
+        bool allocateDeviceWorkspace(const std::vector<IComputeStage *> &stages,
+                                     const WorkspaceBudgetConfig &config = WorkspaceBudgetConfig{});
+
+        /**
+         * @brief Release all GPU workspace
+         *
+         * Releases all workspace managers and clears budget tracking.
+         * Workspace consumers are NOT unbound (they will fall back to legacy mode).
+         */
+        void releaseDeviceWorkspace();
+
+        /**
+         * @brief Get total GPU workspace allocated across all devices
+         * @return Sum of used bytes from all workspace managers
+         */
+        size_t totalDeviceWorkspaceAllocated() const;
+
+        /**
+         * @brief Get GPU workspace allocated for a specific device
+         * @param device Target device
+         * @return Used bytes for that device (0 if not allocated)
+         */
+        size_t deviceWorkspaceAllocated(DeviceId device) const;
+
+        // =====================================================================
         // Statistics
         // =====================================================================
 
@@ -388,6 +495,12 @@ namespace llaminar2
 
         /// Collective context for BAR-aware allocation (Phase 3)
         std::shared_ptr<CollectiveContext> collective_ctx_;
+
+        /// GPU workspace managers per device (Phase 4: Memory Budget Enforcement)
+        std::unordered_map<DeviceId, std::unique_ptr<DeviceWorkspaceManager>> device_workspaces_;
+
+        /// GPU workspace budgets per device (for metrics)
+        std::unordered_map<DeviceId, size_t> device_workspace_budgets_;
 
         // Internal helpers
         std::unique_ptr<TensorBase> createTensorFromDescriptor(const BufferDescriptor &desc);

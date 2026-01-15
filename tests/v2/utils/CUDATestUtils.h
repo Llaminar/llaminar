@@ -210,8 +210,8 @@ namespace llaminar2::test::cuda
                 std::cerr << "[CUDATestBase::TearDown] Test left CUDA error: "
                           << cudaGetErrorString(err) << std::endl;
             }
-#endif
             backend_.reset();
+#endif
         }
 
         int gpu_idx_ = -1;                      ///< Legacy DeviceManager index (for backward compat)
