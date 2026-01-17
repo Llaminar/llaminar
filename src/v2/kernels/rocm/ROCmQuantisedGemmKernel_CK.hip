@@ -194,9 +194,9 @@ struct ScopedCoutSilence final
 // ## Configuration Source
 //
 // Tile parameters copied from CK's official instance file for Row,Col,Row layout:
-//   https://github.com/ROCm/composable_kernel/blob/develop/library/src/tensor_operation_instance/gpu/gemm_universal/device_gemm_dl_i8_i8_i8_mk_nk_mn_instance.cpp
+//   https://github.com/ROCm/composable_kernel/blob/develop/library/src/tensor_operation_instance/gpu/gemm/device_gemm_dl_i8_i8_i8_mk_nk_mn_instance.cpp
 //
-// The "mk_nk_mn" suffix indicates: A[M,K]=Row, B[K,N]=Col, C[M,N]=Row
+// The "mk_nk_mn" suffix indicates: A[M,K]=Row, B[K,N]=Col (same as [N,K] Row), C[M,N]=Row
 //
 // ============================================================================
 
@@ -421,6 +421,7 @@ using DeviceGemmInt8_NoScale = ck::tensor_operation::device::DeviceGemmMultipleD
 //
 // This kernel uses GemmMNPadding to handle irregular M dimensions natively.
 // Tile parameters from device_gemm_dl_i8_i8_i8_mk_nk_mn_irregular_instance.cpp
+//   https://github.com/ROCm/composable_kernel/blob/develop/library/src/tensor_operation_instance/gpu/gemm/device_gemm_dl_i8_i8_i8_mk_nk_mn_irregular_instance.cpp
 //
 // clang-format off
 using DeviceGemmInt8_NoScale_32x32 = ck::tensor_operation::device::DeviceGemmMultipleD_Dl<
@@ -478,6 +479,7 @@ using DeviceGemmInt8_NoScale_32x32 = ck::tensor_operation::device::DeviceGemmMul
 //
 // This kernel uses GemmMNPadding to handle irregular M dimensions natively.
 // Tile parameters from device_gemm_dl_i8_i8_i8_mk_nk_mn_irregular_instance.cpp
+//   https://github.com/ROCm/composable_kernel/blob/develop/library/src/tensor_operation_instance/gpu/gemm/device_gemm_dl_i8_i8_i8_mk_nk_mn_irregular_instance.cpp
 //
 // clang-format off
 using DeviceGemmInt8_NoScale_64x64 = ck::tensor_operation::device::DeviceGemmMultipleD_Dl<
