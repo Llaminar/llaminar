@@ -1,3 +1,6 @@
+#ifndef LLAMINAR2_KERNELS_ROCM_ROCMQUANTISEDGEMMKERNEL_H
+#define LLAMINAR2_KERNELS_ROCM_ROCMQUANTISEDGEMMKERNEL_H
+
 /**
  * @file ROCmQuantisedGemmKernel.h
  * @brief ROCm INT8 GEMM kernel for quantized tensors using AMD ComposableKernel (CK)
@@ -67,8 +70,8 @@
  *
  * ## Workspace Management (Phase 2)
  *
- * This kernel implements IWorkspaceConsumer for centralized workspace buffer
- * management. When a DeviceWorkspaceManager is bound, the kernel uses pre-allocated
+ * This kernel implements IGpuWorkspaceConsumer for centralized workspace buffer
+ * management. When a GpuWorkspaceManager is bound, the kernel uses pre-allocated
  * buffers instead of its internal allocations, enabling:
  *
  * - **Zero hot-path allocations**: No hipMalloc during GEMM execution
@@ -168,49 +171,6 @@ namespace llaminar2
          * @return true on success
          */
         bool packWeightsToROCm(const TensorBase *tensor, ROCmPackedWeights &out);
-
-        // =====================================================================
-        // GEMM Path Selection - Adaptive FP16/INT8 dispatch
-        // =====================================================================
-
-        /**
-         * @brief GEMM execution path selection
-         *
-         * Based on benchmarks on gfx906 (MI50/MI60), the optimal path depends on M:
-         *
-         * | M        | Optimal Path    | Reasoning                                    |
-         * |----------|-----------------|---------------------------------------------|
-         * | M < 64   | hipBLAS INT8    | CK has minimum dimension requirements        |
-         * | 64-128   | CK Two-Kernel   | INT8 CK is faster for smaller batches        |
-         * | M > 128  | FP16 hipBLAS    | 20-35% faster due to well-tuned FP16 kernels |
-         *
-         * The FP16 path converts INT8→FP16 with scales fused, uses hipBLAS hgemm,
-         * then converts FP16→FP32 output. Despite the conversion overhead, the
-         * faster FP16 MFMA kernels on gfx906 make it worthwhile for larger M.
-         */
-        enum class GemmPath
-        {
-            HIPBLAS_INT8,  ///< hipBLAS INT8 GEMM (fallback for unsupported dimensions)
-            CK_TWO_KERNEL, ///< CK INT8→INT32 GEMM + separate scale kernel (default for M ≤ 128)
-            CK_FUSED,      ///< CK fused scaling (legacy, lower accuracy)
-            FP16_HIPBLAS   ///< INT8→FP16 + hipBLAS hgemm (best for M > 128 on gfx906)
-        };
-
-        /**
-         * @brief Select optimal GEMM path based on dimensions and environment
-         *
-         * Environment Variables:
-         *   LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS=1 - Force hipBLAS INT8 for all sizes
-         *   LLAMINAR_ROCM_GEMM_FORCE_FP16=1   - Force FP16 hipBLAS for all sizes
-         *   LLAMINAR_ROCM_GEMM_DISABLE_FP16=1 - Disable FP16 path (use INT8 always)
-         *   LLAMINAR_ROCM_GEMM_FUSED=1        - Use CK fused (legacy, lower accuracy)
-         *
-         * @param M Number of rows (batch size / sequence length)
-         * @param N Number of output features
-         * @param K Number of input features
-         * @return Optimal GemmPath for the given configuration
-         */
-        GemmPath selectGemmPath(int M, int N, int K);
 
         /**
          * @brief ROCm GEMM kernel for quantized weight tensors using ComposableKernel INT8
@@ -447,16 +407,18 @@ namespace llaminar2
             KernelSnapshotInfo getKernelSnapshotInfo() const override;
 
             // =========================================================================
-            // IWorkspaceConsumer Interface (Phase 2)
+            // IWorkspaceConsumer Interface
             // =========================================================================
 
             /**
              * @brief Get workspace requirements for GEMM at given dimensions
              *
-             * Returns buffers needed based on the selected GEMM path:
-             * - **INT8 path** (M ≤ 128): quant_a [M×K], scales_a [M], acc_int32 [M×N],
-             *                            temp_a_fp32 [M×K], temp_c_fp32 [M×N]
-             * - **FP16 path** (M > 128): full_a_fp16 [M×K], full_b_fp16 [K×N], full_c_fp16 [M×N]
+             * Returns buffers needed for INT8 GEMM:
+             * - quant_a [M×K]: INT8 quantized activations
+             * - scales_a [M]: per-row activation scales
+             * - acc_int32 [M×N]: INT32 GEMM accumulator
+             * - temp_a_fp32 [M×K]: FP32 activation input buffer
+             * - temp_c_fp32 [M×N]: FP32 output buffer
              *
              * @param m Maximum sequence length (batch size)
              * @param n Number of output features (0 = use internal N_)
@@ -488,6 +450,34 @@ namespace llaminar2
              * @brief Get the currently bound workspace manager
              */
             DeviceWorkspaceManager *getWorkspace() const override;
+
+            // =========================================================================
+            // Benchmarking Support
+            // =========================================================================
+
+            /**
+             * @brief Execute GEMM with kernel-only timing (excludes PCIe transfers)
+             *
+             * This method performs the full GEMM operation but returns the GPU kernel
+             * execution time measured via HIP events, excluding:
+             *   - Host-to-device activation transfer
+             *   - Device-to-host output transfer
+             *   - CPU-side quantization overhead
+             *
+             * Use this for accurate kernel performance measurement.
+             *
+             * @param A FP32 activations [m, k]
+             * @param C FP32 output [m, n]
+             * @param m Batch/sequence dimension
+             * @param n Output features
+             * @param k Input features
+             * @param kernel_time_ms OUTPUT: GPU kernel time in milliseconds
+             * @return true on success
+             */
+            bool multiply_tensor_timed(
+                const TensorBase *A, TensorBase *C,
+                int m, int n, int k,
+                float *kernel_time_ms);
 
             // =========================================================================
             // Accessors
@@ -585,7 +575,7 @@ namespace llaminar2
             int32_t *d_C_int32_ = nullptr; // [M × N] INT32 accumulator
             int work_buffer_M_ = 0;        // Current work buffer capacity
 
-            // IWorkspaceConsumer state (Phase 2)
+            // IWorkspaceConsumer state
             DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned)
 
             // PIMPL for CK implementation (avoids CK headers in this header)
@@ -622,6 +612,22 @@ extern "C"
         int rocm_device_id);
 
     /**
+     * @brief Execute Two-Kernel INT8 GEMM with HIP event timing (for benchmarking)
+     *
+     * Same as executeTwoKernel_cached but uses HIP events to measure ONLY
+     * the GPU kernel execution time, excluding PCIe transfers.
+     *
+     * @param kernel_time_ms OUTPUT: Kernel execution time in milliseconds
+     */
+    bool rocmQuantGemm_executeTwoKernel_timed(
+        const int8_t *d_A, const int8_t *d_B, float *d_E,
+        const float *d_scaleA, const float *d_scaleB,
+        int32_t *d_C_int32,
+        int M, int N, int K,
+        int rocm_device_id,
+        float *kernel_time_ms);
+
+    /**
      * @brief Execute hipBLAS INT8 GEMM fallback
      *
      * Uses hipBLAS INT8 GEMM with FP32 accumulation. Useful as fallback
@@ -632,43 +638,7 @@ extern "C"
         const float *d_scaleA, const float *d_scaleB,
         int M, int N, int K,
         int rocm_device_id);
-
-    // =====================================================================
-    // FP16 GEMM Path (Alternative to INT8 CK path)
-    // =====================================================================
-    //
-    // These functions implement an alternative approach that converts INT8 data
-    // to FP16 and uses hipBLAS hgemm. On gfx906, this may be faster than INT8
-    // paths through ComposableKernel due to better-tuned FP16 MFMA kernels.
-    //
-    // See ROCmQuantisedGemmKernel_FP16.hip for implementation details.
-    // =====================================================================
-
-    /**
-     * @brief Execute INT8→FP16→GEMM→FP32 pipeline
-     *
-     * Converts INT8 A and B to FP16 with sqrt(scale) fused, then uses
-     * hipBLAS hgemm for FP16 GEMM, and converts output to FP32.
-     *
-     * @param d_A        INT8 activations [M × K] on device
-     * @param d_B        INT8 weights [K × N] on device (transposed)
-     * @param d_E        FP32 output [M × N] on device
-     * @param d_scaleA   Per-row scale factors [M] on device
-     * @param d_scaleB   Per-column scale factors [N] on device
-     * @param M, N, K    Dimensions
-     * @param device_id  ROCm device ID
-     * @param stream     HIP stream (nullptr for default)
-     * @return true on success
-     */
-    bool rocmQuantGemm_executeFP16(
-        const int8_t *d_A,
-        const int8_t *d_B,
-        float *d_E,
-        const float *d_scaleA,
-        const float *d_scaleB,
-        int M,
-        int N,
-        int K,
-        int device_id,
-        void *stream = nullptr); // Use void* to avoid HIP headers in this header
 }
+
+#endif // LLAMINAR2_KERNELS_ROCM_ROCMQUANTISEDGEMMKERNEL_H
+

@@ -1,10 +1,9 @@
 /**
  * @file DirectP2P.cpp
- * @brief EXPERIMENTAL: Direct cross-vendor P2P implementation
+ * @brief Direct cross-vendor P2P via PCIe BAR mapping
  *
  * Implements PCIe BAR-based direct P2P between CUDA and ROCm devices.
- * Also includes experimental DMA-BUF support (often fails).
- * Falls back to pipelined host-staged transfer if direct P2P fails.
+ * This is true peer-to-peer - data flows directly over PCIe with no host memory bounce.
  *
  * ## PCIe BAR Implementation
  *
@@ -21,7 +20,6 @@
  */
 
 #include "DirectP2P.h"
-#include "CrossVendorP2P.h" // Fallback
 #include "utils/Logger.h"
 
 #include <chrono>
@@ -37,64 +35,17 @@
 #include <fstream>
 
 #ifdef HAVE_CUDA
-#include "DirectP2P_CUDA.h"
 #include <cuda.h>
 #endif
 
 #ifdef HAVE_ROCM
-#include "DirectP2P_ROCm.h"
+#include <hip/hip_runtime.h>
 #endif
 
 namespace llaminar2
 {
 
-    //--------------------------------------------------------------------------
-    // DirectP2PBuffer Implementation
-    //--------------------------------------------------------------------------
-
-    DirectP2PBuffer::~DirectP2PBuffer()
-    {
-        if (device_ptr && dmabuf_fd >= 0)
-        {
-#ifdef HAVE_CUDA
-            if (owner_device.type == DeviceType::CUDA)
-            {
-                cuda_direct_p2p::freeExportable(owner_device.ordinal, device_ptr, dmabuf_fd);
-            }
-#endif
-#ifdef HAVE_ROCM
-            if (owner_device.type == DeviceType::ROCm)
-            {
-                rocm_direct_p2p::freeExportable(owner_device.ordinal, device_ptr, dmabuf_fd);
-            }
-#endif
-        }
-    }
-
-    DirectP2PBuffer::DirectP2PBuffer(DirectP2PBuffer &&other) noexcept
-        : device_ptr(other.device_ptr), dmabuf_fd(other.dmabuf_fd),
-          size(other.size), owner_device(other.owner_device),
-          is_exported(other.is_exported)
-    {
-        other.device_ptr = nullptr;
-        other.dmabuf_fd = -1;
-    }
-
-    DirectP2PBuffer &DirectP2PBuffer::operator=(DirectP2PBuffer &&other) noexcept
-    {
-        if (this != &other)
-        {
-            device_ptr = other.device_ptr;
-            dmabuf_fd = other.dmabuf_fd;
-            size = other.size;
-            owner_device = other.owner_device;
-            is_exported = other.is_exported;
-
-            other.device_ptr = nullptr;
-            other.dmabuf_fd = -1;
-        }
-        return *this;
-    }
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 
     //--------------------------------------------------------------------------
     // PCIe BAR Discovery Functions
@@ -204,7 +155,6 @@ namespace llaminar2
             return false;
         }
 
-#ifdef HAVE_CUDA
         /**
          * @brief Check if CUDA supports IOMEMORY registration
          */
@@ -219,7 +169,36 @@ namespace llaminar2
             }
             return false;
         }
-#endif
+
+        /**
+         * @brief Get CUDA driver version string
+         */
+        std::string getCudaDriverVersion()
+        {
+            int driver_version = 0;
+            cuDriverGetVersion(&driver_version);
+            std::ostringstream ss;
+            ss << driver_version / 1000 << "." << (driver_version % 1000) / 10;
+            return ss.str();
+        }
+
+        /**
+         * @brief Get ROCm driver version string
+         */
+        std::string getRocmDriverVersion()
+        {
+            int runtime_version = 0;
+            hipRuntimeGetVersion(&runtime_version);
+
+            // HIP version format: MAJOR * 10000000 + MINOR * 100000 + PATCH
+            int major = runtime_version / 10000000;
+            int minor = (runtime_version % 10000000) / 100000;
+            int patch = (runtime_version % 100000);
+
+            std::ostringstream ss;
+            ss << major << "." << minor << "." << patch;
+            return ss.str();
+        }
     } // anonymous namespace
 
     //--------------------------------------------------------------------------
@@ -229,11 +208,11 @@ namespace llaminar2
     std::string DirectP2PCapability::describe() const
     {
         std::ostringstream ss;
-        ss << "Direct P2P Capabilities:\n";
+        ss << "Direct P2P Capabilities (PCIe BAR only):\n";
         ss << "  Kernel: " << kernel_version << "\n";
         ss << "  CUDA Driver: " << cuda_driver_version << "\n";
         ss << "  ROCm Driver: " << rocm_driver_version << "\n";
-        ss << "\n  === PCIe BAR (Recommended Path) ===\n";
+        ss << "\n  === PCIe BAR ===\n";
         ss << "  PCIe BAR Access: " << (pcie_bar_accessible ? "YES" : "NO (need root?)") << "\n";
         ss << "  CUDA IOMEMORY Support: " << (pcie_bar_iomemory_supported ? "YES" : "NO") << "\n";
         ss << "  AMD BARs Found: " << discovered_bars.size() << "\n";
@@ -242,17 +221,8 @@ namespace llaminar2
             ss << "    - " << bar.pci_address << ": "
                << (bar.bar_size / (1024 * 1024 * 1024)) << " GB\n";
         }
-        ss << "\n  === DMA-BUF (Experimental) ===\n";
-        ss << "  CUDA DMA-BUF Export: " << (dmabuf_export_cuda ? "YES" : "NO") << "\n";
-        ss << "  CUDA DMA-BUF Import: " << (dmabuf_import_cuda ? "YES" : "NO") << "\n";
-        ss << "  ROCm DMA-BUF Export: " << (dmabuf_export_rocm ? "YES" : "NO") << "\n";
-        ss << "  ROCm DMA-BUF Import: " << (dmabuf_import_rocm ? "YES" : "NO") << "\n";
-        ss << "\n  IOMMU: " << (iommu_enabled ? "ENABLED (may affect DMA-BUF)" : "disabled") << "\n";
+        ss << "\n  IOMMU: " << (iommu_enabled ? "ENABLED (may affect DMA)" : "disabled") << "\n";
         ss << "  Direct P2P Possible: " << (canDoDirectP2P() ? "YES" : "NO") << "\n";
-        if (canDoPCIeBarP2P())
-        {
-            ss << "  >>> PCIe BAR P2P is AVAILABLE <<<\n";
-        }
         return ss.str();
     }
 
@@ -263,10 +233,8 @@ namespace llaminar2
     struct DirectP2PEngine::Impl
     {
         // Streams for async operations (multiple for concurrent transfers)
-        void *cuda_stream = nullptr;
         void *cuda_stream_read = nullptr;  // For overlapped reads
         void *cuda_stream_write = nullptr; // For overlapped writes
-        void *rocm_stream = nullptr;
         int cuda_device = -1;
         int rocm_device = -1;
 
@@ -283,9 +251,6 @@ namespace llaminar2
         CUcontext cuda_ctx = nullptr;
         CUdevice cu_device = 0;
 
-        // Fallback engine
-        std::unique_ptr<CrossVendorP2PEngine> fallback_engine;
-
         ~Impl()
         {
             cleanup();
@@ -293,12 +258,10 @@ namespace llaminar2
 
         void cleanup()
         {
-            // Cleanup PCIe BAR
+            // Cleanup single BAR
             if (bar_mapped && bar_info.mapped_ptr)
             {
-#ifdef HAVE_CUDA
                 cuMemHostUnregister(bar_info.mapped_ptr);
-#endif
                 munmap(bar_info.mapped_ptr, bar_info.mapped_size);
                 bar_info.mapped_ptr = nullptr;
                 bar_info.mapped_size = 0;
@@ -312,21 +275,42 @@ namespace llaminar2
                 bar_info.bar_fd = -1;
             }
 
-#ifdef HAVE_CUDA
-            if (cuda_stream)
+            // Cleanup multi-GPU BARs
+            for (auto &bar : mapped_bars)
             {
-                cuda_direct_p2p::destroyStream(cuda_stream);
-                cuda_stream = nullptr;
+                if (bar.mapped_ptr)
+                {
+                    cuMemHostUnregister(bar.mapped_ptr);
+                    munmap(bar.mapped_ptr, bar.mapped_size);
+                    bar.mapped_ptr = nullptr;
+                }
+                if (bar.bar_fd >= 0)
+                {
+                    close(bar.bar_fd);
+                    bar.bar_fd = -1;
+                }
             }
-#endif
-#ifdef HAVE_ROCM
-            if (rocm_stream)
+            mapped_bars.clear();
+            rocm_ordinal_to_bar_idx.clear();
+
+            // Cleanup streams
+            if (cuda_stream_read)
             {
-                rocm_direct_p2p::destroyStream(rocm_stream);
-                rocm_stream = nullptr;
+                cuStreamDestroy(reinterpret_cast<CUstream>(cuda_stream_read));
+                cuda_stream_read = nullptr;
             }
-#endif
-            fallback_engine.reset();
+            if (cuda_stream_write)
+            {
+                cuStreamDestroy(reinterpret_cast<CUstream>(cuda_stream_write));
+                cuda_stream_write = nullptr;
+            }
+
+            // Release CUDA context
+            if (cuda_ctx && cu_device >= 0)
+            {
+                cuDevicePrimaryCtxRelease(cu_device);
+                cuda_ctx = nullptr;
+            }
         }
     };
 
@@ -369,111 +353,20 @@ namespace llaminar2
             }
         }
 
-#ifdef HAVE_CUDA
-        caps.cuda_driver_version = cuda_direct_p2p::getDriverVersion();
-        caps.dmabuf_export_cuda = cuda_direct_p2p::supportsDmaBufExport();
-        caps.dmabuf_import_cuda = cuda_direct_p2p::supportsDmaBufImport();
+        caps.cuda_driver_version = getCudaDriverVersion();
+        caps.rocm_driver_version = getRocmDriverVersion();
         caps.pcie_bar_iomemory_supported = checkCudaIomemorySupport();
-#endif
-
-#ifdef HAVE_ROCM
-        caps.rocm_driver_version = rocm_direct_p2p::getDriverVersion();
-        caps.dmabuf_export_rocm = rocm_direct_p2p::supportsDmaBufExport();
-        caps.dmabuf_import_rocm = rocm_direct_p2p::supportsDmaBufImport();
-#endif
 
         return caps;
     }
 
-    bool DirectP2PEngine::initialize(DeviceId device_a, DeviceId device_b)
-    {
-#if !defined(HAVE_CUDA) || !defined(HAVE_ROCM)
-        LOG_ERROR("DirectP2PEngine requires both HAVE_CUDA and HAVE_ROCM");
-        return false;
-#else
-        if (device_a.type == device_b.type)
-        {
-            LOG_ERROR("DirectP2PEngine: devices must be different vendors");
-            return false;
-        }
-
-        impl_->cleanup();
-
-        device_a_ = device_a;
-        device_b_ = device_b;
-
-        // Identify CUDA and ROCm devices
-        if (device_a.type == DeviceType::CUDA)
-        {
-            impl_->cuda_device = device_a.ordinal;
-            impl_->rocm_device = device_b.ordinal;
-        }
-        else
-        {
-            impl_->cuda_device = device_b.ordinal;
-            impl_->rocm_device = device_a.ordinal;
-        }
-
-        LOG_INFO("Creating streams - CUDA device: " << impl_->cuda_device << ", ROCm device: " << impl_->rocm_device);
-
-        // Create streams
-        impl_->cuda_stream = cuda_direct_p2p::createStream(impl_->cuda_device);
-        LOG_INFO("CUDA stream: " << (impl_->cuda_stream ? "OK" : "FAILED"));
-
-        impl_->rocm_stream = rocm_direct_p2p::createStream(impl_->rocm_device);
-        LOG_INFO("ROCm stream: " << (impl_->rocm_stream ? "OK" : "FAILED"));
-
-        if (!impl_->cuda_stream || !impl_->rocm_stream)
-        {
-            LOG_ERROR("Failed to create GPU streams - CUDA: " << (impl_->cuda_stream ? "OK" : "NULL")
-                                                              << ", ROCm: " << (impl_->rocm_stream ? "OK" : "NULL"));
-            impl_->cleanup();
-            return false;
-        }
-
-        // Check if direct P2P is possible
-        auto caps = probeCapabilities();
-        LOG_INFO(caps.describe());
-
-        if (caps.canDoDirectP2P())
-        {
-            LOG_INFO("Direct P2P via DMA-BUF appears supported - will try direct path");
-            direct_p2p_active_ = true;
-        }
-        else
-        {
-            LOG_WARN("Direct P2P not fully supported - will use fallback with direct attempt");
-            direct_p2p_active_ = false;
-        }
-
-        // Always set up fallback engine
-        CrossVendorP2PConfig fallback_config;
-        fallback_config.buffer_size = 64 * 1024 * 1024;
-        fallback_config.chunk_size = 16 * 1024 * 1024;
-        fallback_config.num_buffers = 2;
-        fallback_config.enable_pipelining = true;
-
-        impl_->fallback_engine = std::make_unique<CrossVendorP2PEngine>(fallback_config);
-        if (!impl_->fallback_engine->initialize(device_a, device_b))
-        {
-            LOG_WARN("Fallback engine initialization failed");
-        }
-
-        return true;
-#endif
-    }
-
     //--------------------------------------------------------------------------
-    // PCIe BAR Direct P2P Implementation
+    // Single-GPU PCIe BAR P2P Implementation
     //--------------------------------------------------------------------------
 
     bool DirectP2PEngine::initializePCIeBar(DeviceId cuda_device, DeviceId rocm_device,
                                             size_t bar_offset, size_t map_size)
     {
-#ifndef HAVE_CUDA
-        LOG_ERROR("PCIe BAR P2P requires CUDA support");
-        return false;
-#else
         if (cuda_device.type != DeviceType::CUDA)
         {
             LOG_ERROR("First device must be CUDA for PCIe BAR P2P");
@@ -580,6 +473,7 @@ namespace llaminar2
             impl_->bar_info.bar_fd = -1;
             return false;
         }
+        impl_->cu_device = cu_device;
 
         // Use primary context instead of creating a new one
         CUcontext cu_ctx;
@@ -592,6 +486,7 @@ namespace llaminar2
             impl_->bar_info.bar_fd = -1;
             return false;
         }
+        impl_->cuda_ctx = cu_ctx;
 
         err = cuCtxSetCurrent(cu_ctx);
         if (err != CUDA_SUCCESS)
@@ -620,9 +515,8 @@ namespace llaminar2
                 LOG_ERROR("Options:");
                 LOG_ERROR("  1. Run with sudo");
                 LOG_ERROR("  2. Run as root user");
-                LOG_ERROR("  3. Use host-staged transfer (CrossVendorP2PEngine) instead");
             }
-            cuCtxDestroy(cu_ctx);
+            cuDevicePrimaryCtxRelease(cu_device);
             munmap(mapped, actual_map_size);
             close(impl_->bar_info.bar_fd);
             impl_->bar_info.bar_fd = -1;
@@ -635,7 +529,7 @@ namespace llaminar2
         {
             LOG_ERROR("cuMemHostGetDevicePointer failed: " << err);
             cuMemHostUnregister(mapped);
-            cuCtxDestroy(cu_ctx);
+            cuDevicePrimaryCtxRelease(cu_device);
             munmap(mapped, actual_map_size);
             close(impl_->bar_info.bar_fd);
             impl_->bar_info.bar_fd = -1;
@@ -650,16 +544,11 @@ namespace llaminar2
         LOG_INFO("  Mapped size: " << (actual_map_size / (1024 * 1024)) << " MB");
 
         return true;
-#endif
     }
 
     void *DirectP2PEngine::getCudaBarPointer() const
     {
-#ifdef HAVE_CUDA
         return reinterpret_cast<void *>(impl_->cuda_bar_ptr);
-#else
-        return nullptr;
-#endif
     }
 
     size_t DirectP2PEngine::getBarMappedSize() const
@@ -674,9 +563,7 @@ namespace llaminar2
 
     size_t DirectP2PEngine::getBarOffset() const
     {
-        // The bar_offset was always 0 in our implementation since we map from the start
-        // If we need to track this explicitly, we'd need to add a member variable
-        return 0;
+        return 0; // We always map from offset 0 in this implementation
     }
 
     DirectP2PResult DirectP2PEngine::transferViaPCIeBar(void *cuda_ptr, size_t bar_offset,
@@ -685,10 +572,6 @@ namespace llaminar2
         DirectP2PResult result;
         result.bytes_transferred = num_bytes;
 
-#ifndef HAVE_CUDA
-        result.error_message = "Requires CUDA";
-        return result;
-#else
         if (!pcie_bar_active_)
         {
             result.error_message = "PCIe BAR not initialized - call initializePCIeBar() first";
@@ -733,10 +616,8 @@ namespace llaminar2
         result.transfer_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
         result.throughput_gbps = (num_bytes / (1024.0 * 1024.0 * 1024.0)) / (result.transfer_time_ms / 1000.0);
         result.success = true;
-        result.used_pcie_bar = true;
 
         return result;
-#endif
     }
 
     DirectP2PResult DirectP2PEngine::benchmarkPCIeBar(size_t num_bytes, int iterations)
@@ -744,10 +625,6 @@ namespace llaminar2
         DirectP2PResult result;
         result.bytes_transferred = num_bytes;
 
-#ifndef HAVE_CUDA
-        result.error_message = "Requires CUDA";
-        return result;
-#else
         if (!pcie_bar_active_)
         {
             result.error_message = "PCIe BAR not initialized";
@@ -813,7 +690,6 @@ namespace llaminar2
         result.throughput_gbps = (result.read_gbps + result.write_gbps) / 2.0;
         result.transfer_time_ms = (avg_read_ms + avg_write_ms) / 2.0;
         result.success = true;
-        result.used_pcie_bar = true;
         result.transfer_path = "PCIe BAR Direct P2P";
 
         LOG_INFO("\n╔══════════════════════════════════════════════════════════════╗");
@@ -827,225 +703,16 @@ namespace llaminar2
 
         cuMemFree(cuda_buf);
         return result;
-#endif
-    }
-
-    std::unique_ptr<DirectP2PBuffer> DirectP2PEngine::allocateExportable(DeviceId device, size_t size)
-    {
-        auto buffer = std::make_unique<DirectP2PBuffer>();
-        buffer->size = size;
-        buffer->owner_device = device;
-
-#ifdef HAVE_CUDA
-        if (device.type == DeviceType::CUDA)
-        {
-            int fd = -1;
-            buffer->device_ptr = cuda_direct_p2p::allocateExportable(device.ordinal, size, &fd);
-            buffer->dmabuf_fd = fd;
-            buffer->is_exported = (fd >= 0);
-
-            if (buffer->device_ptr)
-            {
-                LOG_INFO("Allocated exportable CUDA buffer: " << size << " bytes, fd=" << fd);
-            }
-        }
-#endif
-
-#ifdef HAVE_ROCM
-        if (device.type == DeviceType::ROCm)
-        {
-            int fd = -1;
-            buffer->device_ptr = rocm_direct_p2p::allocateExportable(device.ordinal, size, &fd);
-            buffer->dmabuf_fd = fd;
-            buffer->is_exported = (fd >= 0);
-
-            if (buffer->device_ptr)
-            {
-                LOG_INFO("Allocated exportable ROCm buffer: " << size << " bytes, fd=" << fd);
-            }
-        }
-#endif
-
-        if (!buffer->device_ptr)
-        {
-            return nullptr;
-        }
-
-        return buffer;
-    }
-
-    void *DirectP2PEngine::importBuffer(const DirectP2PBuffer &buffer, DeviceId target_device)
-    {
-        if (buffer.dmabuf_fd < 0)
-        {
-            LOG_ERROR("Buffer not exported (no DMA-BUF fd)");
-            return nullptr;
-        }
-
-        if (buffer.owner_device.type == target_device.type)
-        {
-            LOG_ERROR("Cannot import to same vendor");
-            return nullptr;
-        }
-
-#ifdef HAVE_CUDA
-        if (target_device.type == DeviceType::CUDA)
-        {
-            return cuda_direct_p2p::importDmaBuf(target_device.ordinal,
-                                                 buffer.dmabuf_fd, buffer.size);
-        }
-#endif
-
-#ifdef HAVE_ROCM
-        if (target_device.type == DeviceType::ROCm)
-        {
-            return rocm_direct_p2p::importDmaBuf(target_device.ordinal,
-                                                 buffer.dmabuf_fd, buffer.size);
-        }
-#endif
-
-        return nullptr;
-    }
-
-    DirectP2PResult DirectP2PEngine::transfer(DeviceId src_device, const void *src_ptr,
-                                              DeviceId dst_device, void *dst_ptr,
-                                              size_t num_bytes)
-    {
-        DirectP2PResult result;
-        result.bytes_transferred = num_bytes;
-
-#if !defined(HAVE_CUDA) || !defined(HAVE_ROCM)
-        result.error_message = "Requires both CUDA and ROCm";
-        return result;
-#else
-        auto start = std::chrono::high_resolution_clock::now();
-
-        // Try direct copy first (this would work if DMA-BUF import succeeded
-        // and gives us a valid cross-vendor pointer)
-        bool direct_success = false;
-
-        // For now, we can't do truly direct copy without explicit DMA-BUF setup
-        // The memory regions aren't mapped across vendors by default
-
-        // Fall back to pipelined transfer
-        if (!direct_success && impl_->fallback_engine)
-        {
-            auto fallback_result = impl_->fallback_engine->transfer(src_ptr, dst_ptr, num_bytes);
-            if (fallback_result.success)
-            {
-                result.throughput_gbps = fallback_result.throughput_gbps;
-                result.success = true;
-                result.fell_back_to_staged = true;
-            }
-            else
-            {
-                result.error_message = "Fallback transfer also failed";
-            }
-        }
-
-        auto end = std::chrono::high_resolution_clock::now();
-        result.transfer_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-
-        if (result.success)
-        {
-            result.throughput_gbps = (num_bytes / (1024.0 * 1024.0 * 1024.0)) /
-                                     (result.transfer_time_ms / 1000.0);
-        }
-
-        return result;
-#endif
-    }
-
-    DirectP2PResult DirectP2PEngine::benchmark(size_t num_bytes, int iterations)
-    {
-        DirectP2PResult result;
-        result.bytes_transferred = num_bytes;
-
-#if !defined(HAVE_CUDA) || !defined(HAVE_ROCM)
-        result.error_message = "Requires both CUDA and ROCm";
-        return result;
-#else
-        LOG_INFO("=== DirectP2PEngine Benchmark ===");
-        LOG_INFO("Testing " << (num_bytes / (1024 * 1024)) << " MB transfer, "
-                            << iterations << " iterations");
-
-        // Probe capabilities
-        auto caps = probeCapabilities();
-        LOG_INFO(caps.describe());
-
-        // Try allocating exportable buffer on CUDA side
-        DeviceId cuda_dev = DeviceId::cuda(impl_->cuda_device);
-        DeviceId rocm_dev = DeviceId::rocm(impl_->rocm_device);
-
-        LOG_INFO("\n--- Testing DMA-BUF Export/Import ---");
-
-        auto cuda_buffer = allocateExportable(cuda_dev, num_bytes);
-        if (cuda_buffer && cuda_buffer->is_exported)
-        {
-            LOG_INFO("CUDA buffer exported with fd=" << cuda_buffer->dmabuf_fd);
-
-            // Try to import into ROCm
-            void *rocm_imported = importBuffer(*cuda_buffer, rocm_dev);
-            if (rocm_imported)
-            {
-                LOG_INFO("Successfully imported into ROCm as ptr=" << rocm_imported);
-                result.used_dmabuf = true;
-
-                // Try direct copy!
-                LOG_INFO("\n--- Attempting Direct Cross-Vendor Copy ---");
-
-                // Initialize source buffer
-                // (would need to do this via CUDA, but for benchmark we'll skip)
-
-                // The actual copy would be:
-                // rocm_direct_p2p::asyncCopy(impl_->rocm_device,
-                //                            rocm_imported,      // dst (ROCm view of CUDA memory)
-                //                            cuda_buffer->device_ptr, // src (native CUDA ptr)
-                //                            num_bytes,
-                //                            impl_->rocm_stream);
-
-                LOG_INFO("Direct copy would go here - but needs same physical memory!");
-                rocm_direct_p2p::releaseImported(impl_->rocm_device, rocm_imported);
-            }
-            else
-            {
-                LOG_WARN("Failed to import CUDA buffer into ROCm");
-            }
-        }
-        else
-        {
-            LOG_WARN("CUDA exportable buffer allocation failed or not exported");
-        }
-
-        // Fall back to pipelined benchmark
-        LOG_INFO("\n--- Fallback: Pipelined Host-Staged Transfer ---");
-
-        if (impl_->fallback_engine)
-        {
-            auto fallback_result = impl_->fallback_engine->benchmark(num_bytes, iterations);
-            result.throughput_gbps = fallback_result.throughput_gbps;
-            result.success = fallback_result.success;
-            result.fell_back_to_staged = true;
-
-            LOG_INFO("Pipelined transfer: " << result.throughput_gbps << " GB/s");
-        }
-
-        return result;
-#endif
     }
 
     //--------------------------------------------------------------------------
-    // Multi-GPU and Concurrent Transfer Implementation
+    // Multi-GPU PCIe BAR P2P Implementation
     //--------------------------------------------------------------------------
 
     bool DirectP2PEngine::initializePCIeBarMultiGPU(DeviceId cuda_device,
                                                     const std::vector<DeviceId> &rocm_devices,
                                                     size_t map_size)
     {
-#ifndef HAVE_CUDA
-        LOG_ERROR("PCIe BAR P2P requires CUDA support");
-        return false;
-#else
         if (cuda_device.type != DeviceType::CUDA)
         {
             LOG_ERROR("First device must be CUDA for PCIe BAR P2P");
@@ -1132,14 +799,13 @@ namespace llaminar2
         {
             // Find matching BAR by device ordinal
             // Note: This is heuristic - BAR order may not match device ordinal
-            // For now, use ordinal as index into discovered BARs
             if (bar_idx >= discovered_bars.size())
             {
                 LOG_WARN("Not enough AMD GPU BARs for all requested devices");
                 break;
             }
 
-            PCIeBarInfo &bar = discovered_bars[bar_idx];
+            PCIeBarInfo bar = discovered_bars[bar_idx];
             LOG_INFO("Mapping BAR for ROCm device " << rocm_dev.ordinal
                                                     << " from " << bar.pci_address);
 
@@ -1149,6 +815,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Cannot open BAR at " << bar.sysfs_path << " (errno=" << errno << ")");
                 LOG_ERROR("Run: sudo chmod 666 " << bar.sysfs_path);
+                bar_idx++;
                 continue;
             }
 
@@ -1161,6 +828,7 @@ namespace llaminar2
                 LOG_ERROR("Failed to mmap BAR for " << bar.pci_address);
                 close(bar.bar_fd);
                 bar.bar_fd = -1;
+                bar_idx++;
                 continue;
             }
 
@@ -1178,6 +846,7 @@ namespace llaminar2
                 close(bar.bar_fd);
                 bar.bar_fd = -1;
                 bar.mapped_ptr = nullptr;
+                bar_idx++;
                 continue;
             }
 
@@ -1192,6 +861,7 @@ namespace llaminar2
                 close(bar.bar_fd);
                 bar.bar_fd = -1;
                 bar.mapped_ptr = nullptr;
+                bar_idx++;
                 continue;
             }
 
@@ -1217,7 +887,6 @@ namespace llaminar2
         LOG_INFO("PCIe BAR Multi-GPU initialized: " << impl_->mapped_bars.size() << " BARs mapped");
 
         return true;
-#endif
     }
 
     size_t DirectP2PEngine::getNumMappedBars() const
@@ -1241,10 +910,6 @@ namespace llaminar2
         DirectP2PResult result;
         result.bytes_transferred = num_bytes * impl_->mapped_bars.size();
 
-#ifndef HAVE_CUDA
-        result.error_message = "Requires CUDA";
-        return result;
-#else
         if (!pcie_bar_active_ || impl_->mapped_bars.empty())
         {
             result.error_message = "PCIe BAR not initialized";
@@ -1257,7 +922,6 @@ namespace llaminar2
         auto start = std::chrono::high_resolution_clock::now();
 
         // Write to all AMD BARs (uses fast posted writes ~2.65 GB/s per target)
-        // All writes share PCIe bandwidth but simplify programming
         for (auto &bar : impl_->mapped_bars)
         {
             if (num_bytes > bar.mapped_size)
@@ -1288,11 +952,9 @@ namespace llaminar2
         result.write_gbps = result.throughput_gbps;
         result.dual_write_gbps = result.throughput_gbps;
         result.success = true;
-        result.used_pcie_bar = true;
         result.transfer_path = "NVIDIA -> " + std::to_string(impl_->mapped_bars.size()) + "x AMD (broadcast)";
 
         return result;
-#endif
     }
 
     DirectP2PResult DirectP2PEngine::gatherFromAMDOverlapped(void *cuda_dst, size_t num_bytes,
@@ -1301,10 +963,6 @@ namespace llaminar2
         DirectP2PResult result;
         result.bytes_transferred = num_bytes * impl_->mapped_bars.size();
 
-#ifndef HAVE_CUDA
-        result.error_message = "Requires CUDA";
-        return result;
-#else
         if (!pcie_bar_active_ || impl_->mapped_bars.empty())
         {
             result.error_message = "PCIe BAR not initialized";
@@ -1318,7 +976,6 @@ namespace llaminar2
         auto start = std::chrono::high_resolution_clock::now();
 
         // Launch reads from all AMD BARs using different streams for overlap
-        // This achieves ~1.22 GB/s total from 2 BARs (vs ~0.79 GB/s sequential)
         size_t offset = 0;
         for (size_t i = 0; i < impl_->mapped_bars.size(); ++i)
         {
@@ -1360,12 +1017,10 @@ namespace llaminar2
         result.read_gbps = result.throughput_gbps;
         result.dual_read_gbps = result.throughput_gbps;
         result.success = true;
-        result.used_pcie_bar = true;
         result.used_overlap = true;
         result.transfer_path = std::to_string(impl_->mapped_bars.size()) + "x AMD -> NVIDIA (overlapped gather)";
 
         return result;
-#endif
     }
 
     DirectP2PResult DirectP2PEngine::transferOverlapped(void *cuda_read_dst, size_t read_bar_offset,
@@ -1376,10 +1031,6 @@ namespace llaminar2
         DirectP2PResult result;
         result.bytes_transferred = read_bytes + write_bytes;
 
-#ifndef HAVE_CUDA
-        result.error_message = "Requires CUDA";
-        return result;
-#else
         if (!pcie_bar_active_ || impl_->mapped_bars.size() < 2)
         {
             result.error_message = "Need at least 2 AMD BARs for overlapped transfer";
@@ -1400,7 +1051,6 @@ namespace llaminar2
         // Simultaneously:
         // - Read from BAR 0 (AMD->NVIDIA) on read_stream
         // - Write to BAR 1 (NVIDIA->AMD) on write_stream
-        // This achieves ~1.58 GB/s effective (30% faster than sequential)
 
         if (cuda_read_dst && read_bytes > 0)
         {
@@ -1435,12 +1085,10 @@ namespace llaminar2
                                  (result.transfer_time_ms / 1000.0);
         result.concurrent_gbps = result.throughput_gbps;
         result.success = true;
-        result.used_pcie_bar = true;
         result.used_overlap = true;
         result.transfer_path = "Overlapped: AMD->NVIDIA + NVIDIA->AMD";
 
         return result;
-#endif
     }
 
     DirectP2PResult DirectP2PEngine::benchmarkAllModes(size_t num_bytes, int iterations)
@@ -1448,10 +1096,6 @@ namespace llaminar2
         DirectP2PResult result;
         result.bytes_transferred = num_bytes;
 
-#ifndef HAVE_CUDA
-        result.error_message = "Requires CUDA";
-        return result;
-#else
         if (!pcie_bar_active_ || impl_->mapped_bars.empty())
         {
             result.error_message = "PCIe BAR not initialized";
@@ -1597,12 +1241,12 @@ namespace llaminar2
         LOG_INFO("================================================================");
 
         result.success = true;
-        result.used_pcie_bar = true;
         result.throughput_gbps = (result.read_gbps + result.write_gbps) / 2.0;
 
         cuMemFree(cuda_buf);
         return result;
-#endif
     }
+
+#endif // HAVE_CUDA && HAVE_ROCM
 
 } // namespace llaminar2

@@ -5,10 +5,11 @@
  * Tests the full pipeline of ROCm INT8 quantized GEMM:
  * - Activation quantization (FP32 → INT8) on device
  * - Work buffer allocation and growth
- * - INT8×INT8→INT32 GEMM via ComposableKernel (CK)
- * - Full pipeline integration tests
+ * - CK 3-way dispatch: 32×32, 64×64, 128×128 tile kernels
+ * - Correctness across M sizes (1, 8, 32, 64, 128, 256)
+ * - Full pipeline integration with realistic model dimensions
  *
- * CPU-only tests (weight packing, constructor) are in:
+ * CPU-only tests (weight packing, dimension validation) are in:
  *   tests/v2/unit/kernels/rocm/Test__ROCmQuantisedGemmKernel.cpp
  *
  * @note Requires ROCm device to run. Tests are skipped if no GPU available.
@@ -36,9 +37,10 @@
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
 
-// Forward declarations for HIP functions
+// Forward declarations for HIP functions used in integration tests
 extern "C"
 {
+    // Activation quantization kernel
     bool rocmQuantGemm_quantizeActivations(
         const float *d_A_fp32,
         int8_t *d_A_int8,
@@ -46,6 +48,7 @@ extern "C"
         int M, int K,
         int rocm_device_id);
 
+    // Work buffer management
     bool rocmQuantGemm_ensureWorkBuffers(
         int8_t **d_A_int8,
         float **d_scales_A,
@@ -54,26 +57,7 @@ extern "C"
         int M, int K, int N,
         int rocm_device_id);
 
-    bool rocmQuantGemm_executeDenseScale(
-        const int8_t *d_A_int8,
-        const int8_t *d_weights_int8,
-        float *d_C_fp32,
-        const float *d_scales_A,
-        const float *d_scales_B,
-        int M, int N, int K,
-        int rocm_device_id,
-        float *d_work_buffer,
-        size_t work_buffer_size);
-
-    bool rocmQuantGemm_executeHipBLAS(
-        const int8_t *d_A_int8,
-        const int8_t *d_B_int8,
-        float *d_E_fp32,
-        const float *d_scale_A,
-        const float *d_scale_B,
-        int M, int N, int K,
-        int rocm_device_id);
-
+    // Base INT8×INT8→INT32 GEMM (no scaling) - 3-way dispatch entry point
     bool rocmQuantGemm_executeNoScale(
         const int8_t *d_A_int8,
         const int8_t *d_weights_int8,
@@ -81,6 +65,7 @@ extern "C"
         int M, int N, int K,
         int rocm_device_id);
 
+    // Two-kernel path: INT8×INT8→INT32 GEMM + separate scale application
     bool rocmQuantGemm_executeTwoKernel(
         const int8_t *d_A_int8,
         const int8_t *d_weights_int8,
@@ -90,20 +75,8 @@ extern "C"
         int M, int N, int K,
         int rocm_device_id);
 
-    bool rocmQuantGemm_executeFP16(
-        const int8_t *d_A,
-        const int8_t *d_B,
-        float *d_E,
-        const float *d_scaleA,
-        const float *d_scaleB,
-        int M,
-        int N,
-        int K,
-        int device_id,
-        void *stream);
-
+    // Memory management
     void rocmQuantGemm_freeDevice(void *d_ptr);
-
     bool rocmQuantGemm_copyHostToDevice(float *d_dst, const float *h_src, size_t count, int rocm_device_id);
     bool rocmQuantGemm_copyDeviceToHost(float *h_dst, const float *d_src, size_t count, int rocm_device_id);
     bool rocmQuantGemm_allocFloat(float **d_ptr, size_t count, int rocm_device_id);
@@ -553,22 +526,28 @@ namespace llaminar2
             }
 
             // =====================================================================
-            // Phase 3/4: Fused GEMM+Scaling Correctness (direct-call, deterministic)
+            // Two-Kernel Path Tests (INT8×INT8→INT32 + scale application)
             // =====================================================================
 
-            TEST_F(ROCmQuantisedGemmIntegrationTest, HipBLAS_ScaledGemm_DeterministicSmall)
+            /**
+             * @test Two-Kernel path correctness with 128×128×128 dimensions
+             *
+             * Tests rocmQuantGemm_executeTwoKernel() which separates GEMM and scaling:
+             * 1. INT8×INT8→INT32 via CK GEMM
+             * 2. Separate scale application kernel
+             *
+             * This is the production path for M ≤ 128.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, TwoKernel_Deterministic128)
             {
                 if (!has_rocm_device_)
                 {
                     GTEST_SKIP() << "No ROCm device available";
                 }
 
-                // Small dimensions that CK cannot handle (M < 64, N < 64, K < 32)
-                // This test verifies the hipBLAS fallback path for small matrices.
-                // Uses rocmQuantGemm_executeHipBLAS() which handles per-row/per-col scaling.
-                const int M = 8;
-                const int N = 9;
-                const int K = 4;
+                const int M = 128;
+                const int N = 128;
+                const int K = 128;
 
                 ASSERT_EQ(hipSetDevice(0), hipSuccess);
 
@@ -581,14 +560,13 @@ namespace llaminar2
                 std::vector<float> h_scaleB(N);
                 for (int m = 0; m < M; ++m)
                 {
-                    h_scaleA[m] = 0.01f * static_cast<float>(m + 1);
+                    h_scaleA[m] = 0.001f * static_cast<float>(m + 1);
                 }
                 for (int n = 0; n < N; ++n)
                 {
-                    h_scaleB[n] = 0.02f * static_cast<float>(n + 1);
+                    h_scaleB[n] = 0.002f * static_cast<float>(n + 1);
                 }
 
-                // Device buffers
                 int8_t *d_A = nullptr;
                 int8_t *d_B = nullptr;
                 float *d_scaleA = nullptr;
@@ -606,8 +584,8 @@ namespace llaminar2
                 ASSERT_EQ(hipMemcpy(d_scaleA, h_scaleA.data(), static_cast<size_t>(M) * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
                 ASSERT_EQ(hipMemcpy(d_scaleB, h_scaleB.data(), static_cast<size_t>(N) * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
 
-                // Use hipBLAS path for small dimensions (CK doesn't support M=8, N=9, K=4)
-                ASSERT_TRUE(rocmQuantGemm_executeHipBLAS(
+                // Use Two-Kernel path (production path for M ≤ 128)
+                ASSERT_TRUE(rocmQuantGemm_executeTwoKernel(
                     d_A, d_B, d_E,
                     d_scaleA, d_scaleB,
                     M, N, K,
@@ -616,357 +594,15 @@ namespace llaminar2
                 std::vector<float> h_E(static_cast<size_t>(M) * N);
                 ASSERT_EQ(hipMemcpy(h_E.data(), d_E, static_cast<size_t>(M) * N * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
 
-                // CPU reference: E[m,n] = sum_k(A[m,k] * B[k,n]) * scaleA[m] * scaleB[n]
-                std::vector<float> h_ref(static_cast<size_t>(M) * N);
-                for (int m = 0; m < M; ++m)
-                {
-                    for (int n = 0; n < N; ++n)
-                    {
-                        int32_t acc = 0;
-                        for (int k = 0; k < K; ++k)
-                        {
-                            const int32_t av = static_cast<int32_t>(h_A[static_cast<size_t>(m) * K + k]);
-                            const int32_t bv = static_cast<int32_t>(h_B[static_cast<size_t>(k) * N + n]);
-                            acc += av * bv;
-                        }
-                        h_ref[static_cast<size_t>(m) * N + n] = static_cast<float>(acc) * h_scaleA[m] * h_scaleB[n];
-                    }
-                }
-
-                float max_abs = 0.0f;
-                float max_rel = 0.0f;
-                for (size_t i = 0; i < h_E.size(); ++i)
-                {
-                    const float diff = std::fabs(h_E[i] - h_ref[i]);
-                    max_abs = std::max(max_abs, diff);
-                    const float denom = std::max(1e-6f, std::fabs(h_ref[i]));
-                    max_rel = std::max(max_rel, diff / denom);
-                }
-
-                const float cos = cosineSimilarity(h_E, h_ref);
-                LOG_INFO("[DeterministicSmall] cos=" << cos << " max_abs=" << max_abs << " max_rel=" << max_rel);
-
-                EXPECT_GT(cos, 0.9999f);
-                EXPECT_LT(max_rel, 1e-3f);
-
-                rocmQuantGemm_freeDevice(d_A);
-                rocmQuantGemm_freeDevice(d_B);
-                rocmQuantGemm_freeDevice(d_scaleA);
-                rocmQuantGemm_freeDevice(d_scaleB);
-                rocmQuantGemm_freeDevice(d_E);
-            }
-
-            /**
-             * @test CK DenseScale (fused) GEMM with 128×128×128 dimensions
-             *
-             * Tests rocmQuantGemm_executeDenseScale() which is the CK fused path.
-             * This applies scales via D-tensor mechanism during the GEMM operation.
-             *
-             * @note This tests the low-level C function directly, not the ROCmQuantisedGemmKernel class.
-             * @note The DenseScale approach has slightly lower accuracy than TwoKernel on gfx906.
-             */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, CK_DenseScale_Deterministic128)
-            {
-                if (!has_rocm_device_)
-                {
-                    GTEST_SKIP() << "No ROCm device available";
-                }
-
-                // This is the shape that previously regressed badly.
-                const int M = 128;
-                const int N = 128;
-                const int K = 128;
-
-                ASSERT_EQ(hipSetDevice(0), hipSuccess);
-
-                std::vector<int8_t> h_A;
-                std::vector<int8_t> h_B;
-                fillDeterministicInt8Pattern(h_A, M, K);
-                fillDeterministicInt8PatternTransposed(h_B, K, N);
-
-                std::vector<float> h_scaleA(M);
-                std::vector<float> h_scaleB(N);
-                for (int m = 0; m < M; ++m)
-                {
-                    h_scaleA[m] = 0.001f * static_cast<float>(m + 1);
-                }
-                for (int n = 0; n < N; ++n)
-                {
-                    h_scaleB[n] = 0.002f * static_cast<float>(n + 1);
-                }
-
-                int8_t *d_A = nullptr;
-                int8_t *d_B = nullptr;
-                float *d_scaleA = nullptr;
-                float *d_scaleB = nullptr;
-                float *d_E = nullptr;
-
-                ASSERT_EQ(hipMalloc(&d_A, static_cast<size_t>(M) * K * sizeof(int8_t)), hipSuccess);
-                ASSERT_EQ(hipMalloc(&d_B, static_cast<size_t>(K) * N * sizeof(int8_t)), hipSuccess);
-                ASSERT_EQ(hipMalloc(&d_scaleA, static_cast<size_t>(M) * sizeof(float)), hipSuccess);
-                ASSERT_EQ(hipMalloc(&d_scaleB, static_cast<size_t>(N) * sizeof(float)), hipSuccess);
-                ASSERT_EQ(hipMalloc(&d_E, static_cast<size_t>(M) * N * sizeof(float)), hipSuccess);
-
-                ASSERT_EQ(hipMemcpy(d_A, h_A.data(), static_cast<size_t>(M) * K * sizeof(int8_t), hipMemcpyHostToDevice), hipSuccess);
-                ASSERT_EQ(hipMemcpy(d_B, h_B.data(), static_cast<size_t>(K) * N * sizeof(int8_t), hipMemcpyHostToDevice), hipSuccess);
-                ASSERT_EQ(hipMemcpy(d_scaleA, h_scaleA.data(), static_cast<size_t>(M) * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
-                ASSERT_EQ(hipMemcpy(d_scaleB, h_scaleB.data(), static_cast<size_t>(N) * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
-
-                ASSERT_TRUE(rocmQuantGemm_executeDenseScale(
-                    d_A, d_B, d_E,
-                    d_scaleA, d_scaleB,
-                    M, N, K,
-                    /*rocm_device_id=*/0,
-                    /*work_buffer=*/nullptr,
-                    /*work_buffer_size=*/0));
-
-                std::vector<float> h_E(static_cast<size_t>(M) * N);
-                ASSERT_EQ(hipMemcpy(h_E.data(), d_E, static_cast<size_t>(M) * N * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
-
-                // CPU reference using OneDNN (much faster than naive loop)
+                // CPU reference using OneDNN
                 std::vector<float> h_ref;
                 computeScaledInt8GemmReference(h_A, h_B, h_scaleA, h_scaleB, h_ref, M, N, K);
 
-                float max_abs = 0.0f;
-                float max_rel = 0.0f;
-                int worst_m = 0, worst_n = 0;
-                for (int m = 0; m < M; ++m)
-                {
-                    for (int n = 0; n < N; ++n)
-                    {
-                        const size_t idx = static_cast<size_t>(m) * N + n;
-                        const float diff = std::fabs(h_E[idx] - h_ref[idx]);
-                        if (diff > max_abs)
-                        {
-                            max_abs = diff;
-                            worst_m = m;
-                            worst_n = n;
-                        }
-                        const float denom = std::max(1e-6f, std::fabs(h_ref[idx]));
-                        const float rel = diff / denom;
-                        if (rel > max_rel)
-                        {
-                            max_rel = rel;
-                        }
-                    }
-                }
-
                 const float cos = cosineSimilarity(h_E, h_ref);
-                LOG_INFO("[Deterministic128] cos=" << cos << " max_abs=" << max_abs << " max_rel=" << max_rel);
-                LOG_INFO("[Deterministic128] Worst position: (" << worst_m << "," << worst_n << ")");
+                LOG_INFO("[TwoKernel_Deterministic128] cos=" << cos);
 
-                // Print detailed comparison for worst element and nearby elements
-                LOG_INFO("[Deterministic128] Detailed comparison around worst element:");
-                for (int dm = -2; dm <= 2; ++dm)
-                {
-                    int m = worst_m + dm;
-                    if (m < 0 || m >= M)
-                        continue;
-                    for (int dn = -2; dn <= 2; ++dn)
-                    {
-                        int n = worst_n + dn;
-                        if (n < 0 || n >= N)
-                            continue;
-                        const size_t idx = static_cast<size_t>(m) * N + n;
-                        LOG_INFO("  E[" << m << "," << n << "] = " << h_E[idx]
-                                        << " (ref=" << h_ref[idx]
-                                        << ", scA=" << h_scaleA[m]
-                                        << ", scB=" << h_scaleB[n] << ")");
-                    }
-                }
-
-                // Also print samples from different quadrants of the matrix
-                LOG_INFO("[Deterministic128] Quadrant samples:");
-                int sample_positions[][2] = {{0, 0}, {0, N - 1}, {M - 1, 0}, {M - 1, N - 1}, {M / 2, N / 2}, {M / 4, N / 4}, {3 * M / 4, 3 * N / 4}};
-                for (auto &pos : sample_positions)
-                {
-                    int m = pos[0], n = pos[1];
-                    const size_t idx = static_cast<size_t>(m) * N + n;
-                    float diff = std::fabs(h_E[idx] - h_ref[idx]);
-                    LOG_INFO("  E[" << m << "," << n << "] = " << h_E[idx]
-                                    << " (ref=" << h_ref[idx] << ", diff=" << diff << ")");
-                }
-
-                // Print all incorrect zero positions (where ref is significantly non-zero)
-                LOG_INFO("[Deterministic128] All incorrect zeros (E=0 but |ref|>0.1):");
-                int zero_count = 0;
-                for (int m = 0; m < M && zero_count < 50; ++m)
-                {
-                    for (int n = 0; n < N && zero_count < 50; ++n)
-                    {
-                        const size_t idx = static_cast<size_t>(m) * N + n;
-                        if (h_E[idx] == 0.0f && std::fabs(h_ref[idx]) > 0.1f)
-                        {
-                            // Compute which block and local coords
-                            int blk_m = m / 64, blk_n = n / 64;
-                            int loc_m = m % 64, loc_n = n % 64;
-                            int m10 = loc_m / 32, m11 = loc_m % 32;
-                            int n10 = loc_n / 32, n11 = loc_n % 32;
-                            LOG_INFO("  ZERO@(" << m << "," << n << "): blk(" << blk_m << "," << blk_n
-                                                << ") loc(" << loc_m << "," << loc_n
-                                                << ") m10/11=" << m10 << "/" << m11
-                                                << " n10/11=" << n10 << "/" << n11
-                                                << " ref=" << h_ref[idx]);
-                            ++zero_count;
-                        }
-                    }
-                }
-
-                // NOTE: The fused D-tensor scaling path has known lower accuracy (~0.9917-0.9998)
-                // due to CK's D-tensor handling on gfx906. This test verifies the function works,
-                // not that it achieves maximum accuracy. Use TwoKernel path for best accuracy.
-                EXPECT_GT(cos, 0.99f) << "Fused path cosine similarity too low (known limitation)";
-                // Relaxed threshold for fused path - some zeros are expected
-                EXPECT_LT(max_rel, 2.0f) << "Fused path relative error too high";
-
-                rocmQuantGemm_freeDevice(d_A);
-                rocmQuantGemm_freeDevice(d_B);
-                rocmQuantGemm_freeDevice(d_scaleA);
-                rocmQuantGemm_freeDevice(d_scaleB);
-                rocmQuantGemm_freeDevice(d_E);
-            }
-
-            /**
-             * @test CK DenseScale (fused) GEMM - duplicate test with pre-multiplied scale matrix
-             *
-             * Tests rocmQuantGemm_executeDenseScale() with same dimensions as above.
-             * This is essentially a duplicate of CK_DenseScale_Deterministic128.
-             *
-             * NOTE: The dense scale approach (fused D-tensor scaling) has known lower
-             * accuracy (~0.9917-0.9998) due to CK's D-tensor handling on gfx906.
-             * Use TwoKernel path for best accuracy.
-             *
-             * @note This tests the low-level C function directly, not the ROCmQuantisedGemmKernel class.
-             */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, CK_DenseScale_Deterministic128_Variant)
-            {
-                if (!has_rocm_device_)
-                {
-                    GTEST_SKIP() << "No ROCm device available";
-                }
-
-                const int M = 128;
-                const int N = 128;
-                const int K = 128;
-
-                ASSERT_EQ(hipSetDevice(0), hipSuccess);
-
-                std::vector<int8_t> h_A;
-                std::vector<int8_t> h_B;
-                fillDeterministicInt8Pattern(h_A, M, K);
-                fillDeterministicInt8PatternTransposed(h_B, K, N);
-
-                std::vector<float> h_scaleA(M);
-                std::vector<float> h_scaleB(N);
-                for (int m = 0; m < M; ++m)
-                {
-                    h_scaleA[m] = 0.001f * static_cast<float>(m + 1);
-                }
-                for (int n = 0; n < N; ++n)
-                {
-                    h_scaleB[n] = 0.002f * static_cast<float>(n + 1);
-                }
-
-                int8_t *d_A = nullptr;
-                int8_t *d_B = nullptr;
-                float *d_scaleA = nullptr;
-                float *d_scaleB = nullptr;
-                float *d_E = nullptr;
-
-                ASSERT_EQ(hipMalloc(&d_A, static_cast<size_t>(M) * K * sizeof(int8_t)), hipSuccess);
-                ASSERT_EQ(hipMalloc(&d_B, static_cast<size_t>(K) * N * sizeof(int8_t)), hipSuccess);
-                ASSERT_EQ(hipMalloc(&d_scaleA, static_cast<size_t>(M) * sizeof(float)), hipSuccess);
-                ASSERT_EQ(hipMalloc(&d_scaleB, static_cast<size_t>(N) * sizeof(float)), hipSuccess);
-                ASSERT_EQ(hipMalloc(&d_E, static_cast<size_t>(M) * N * sizeof(float)), hipSuccess);
-
-                ASSERT_EQ(hipMemcpy(d_A, h_A.data(), static_cast<size_t>(M) * K * sizeof(int8_t), hipMemcpyHostToDevice), hipSuccess);
-                ASSERT_EQ(hipMemcpy(d_B, h_B.data(), static_cast<size_t>(K) * N * sizeof(int8_t), hipMemcpyHostToDevice), hipSuccess);
-                ASSERT_EQ(hipMemcpy(d_scaleA, h_scaleA.data(), static_cast<size_t>(M) * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
-                ASSERT_EQ(hipMemcpy(d_scaleB, h_scaleB.data(), static_cast<size_t>(N) * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
-
-                // Use dense scale approach (allocates internal combined scale buffer)
-                ASSERT_TRUE(rocmQuantGemm_executeDenseScale(
-                    d_A, d_B, d_E,
-                    d_scaleA, d_scaleB,
-                    M, N, K,
-                    /*rocm_device_id=*/0,
-                    /*d_work_buffer=*/nullptr,
-                    /*work_buffer_size=*/0));
-
-                std::vector<float> h_E(static_cast<size_t>(M) * N);
-                ASSERT_EQ(hipMemcpy(h_E.data(), d_E, static_cast<size_t>(M) * N * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
-
-                // CPU reference using OneDNN (much faster than naive loop)
-                std::vector<float> h_ref;
-                computeScaledInt8GemmReference(h_A, h_B, h_scaleA, h_scaleB, h_ref, M, N, K);
-
-                float max_abs = 0.0f;
-                float max_rel = 0.0f;
-                int worst_m = 0, worst_n = 0;
-                for (int m = 0; m < M; ++m)
-                {
-                    for (int n = 0; n < N; ++n)
-                    {
-                        const size_t idx = static_cast<size_t>(m) * N + n;
-                        const float diff = std::fabs(h_E[idx] - h_ref[idx]);
-                        if (diff > max_abs)
-                        {
-                            max_abs = diff;
-                            worst_m = m;
-                            worst_n = n;
-                        }
-                        const float denom = std::max(1e-6f, std::fabs(h_ref[idx]));
-                        const float rel = diff / denom;
-                        if (rel > max_rel)
-                        {
-                            max_rel = rel;
-                        }
-                    }
-                }
-
-                const float cos = cosineSimilarity(h_E, h_ref);
-                LOG_INFO("[DenseScale128] cos=" << cos << " max_abs=" << max_abs << " max_rel=" << max_rel);
-                LOG_INFO("[DenseScale128] Worst position: (" << worst_m << "," << worst_n << ")");
-
-                // Check for any zeros where ref is non-zero
-                int zero_count = 0;
-                std::vector<int> zero_n_positions;
-                for (int m = 0; m < M; ++m)
-                {
-                    for (int n = 0; n < N; ++n)
-                    {
-                        const size_t idx = static_cast<size_t>(m) * N + n;
-                        if (h_E[idx] == 0.0f && std::fabs(h_ref[idx]) > 0.1f)
-                        {
-                            if (zero_count < 10)
-                            {
-                                LOG_INFO("  ZERO@(" << m << "," << n << "): ref=" << h_ref[idx]);
-                            }
-                            ++zero_count;
-                            if (m == 0)
-                            {
-                                zero_n_positions.push_back(n);
-                            }
-                        }
-                    }
-                }
-                LOG_INFO("[DenseScale128] Total zeros: " << zero_count);
-                std::stringstream ss;
-                ss << "[DenseScale128] Zero N positions (m=0): ";
-                for (size_t i = 0; i < std::min(zero_n_positions.size(), size_t(64)); ++i)
-                {
-                    if (i > 0)
-                        ss << ",";
-                    ss << zero_n_positions[i];
-                }
-                LOG_INFO(ss.str());
-
-                // NOTE: The dense scale approach (fused D-tensor scaling) has known lower
-                // accuracy (~0.9917-0.9998) due to CK's D-tensor handling on gfx906.
-                // Use TwoKernel path for best accuracy.
-                EXPECT_GT(cos, 0.99f) << "Fused path cosine similarity too low (known limitation)";
-                // Relaxed threshold for fused path - some zeros are expected
-                EXPECT_LT(max_rel, 2.0f) << "Fused path relative error too high";
+                // Two-Kernel path should have very high accuracy (>0.9999)
+                EXPECT_GT(cos, 0.9999f) << "Two-Kernel path cosine similarity too low";
 
                 rocmQuantGemm_freeDevice(d_A);
                 rocmQuantGemm_freeDevice(d_B);
@@ -1986,191 +1622,287 @@ namespace llaminar2
                 LOG_INFO("[Integration] Tested batch sizes: 1 to 2048");
             }
 
-            // =============================================================================
-            // FP16 Path Integration Tests
-            // =============================================================================
+            // =====================================================================
+            // M-Scaling Correctness Tests: 3-Way Dispatch Verification
+            // =====================================================================
+            //
+            // These tests verify GEMM correctness across different M sizes to exercise
+            // all three CK kernel tiles in the 3-way dispatch:
+            //   - M ≤ 32:       32×32 tile (GemmMNPadding)
+            //   - 32 < M < 128: 64×64 tile (GemmMNPadding)
+            //   - M ≥ 128:      128×128 tile
+            //
+            // Tests are run with Qwen2.5-0.5B and Qwen2.5-7B model dimensions.
 
             /**
-             * @test Verify FP16 path produces correct output vs INT8 reference
-             *
-             * The FP16 path should produce nearly identical results to the INT8 path.
-             * Both should have high cosine similarity (> 0.999) vs the reference.
+             * @brief Helper struct for model dimensions
              */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, FP16Path_MatchesINT8TwoKernel)
+            struct QwenModelDims
+            {
+                const char *name;
+                int hidden_size;       // K for most projections
+                int intermediate_size; // N for FFN up/gate
+                int attention_output;  // N for Wo (usually = hidden_size)
+            };
+
+            /**
+             * @test M-scaling correctness for Qwen2.5-0.5B attention output (Wo)
+             *
+             * Tests: M=1, 8, 32, 64, 128, 256 with N=896, K=896
+             * This exercises the attention output projection (context → hidden).
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, MScaling_Qwen05B_AttentionOutput)
             {
                 if (!has_rocm_device_)
                 {
                     GTEST_SKIP() << "No ROCm device available";
                 }
 
-                // Use M > 128 where FP16 is expected to be selected
-                const int M = 256;
-                const int N = 896;
-                const int K = 896;
+                const int N = 896; // hidden_size
+                const int K = 896; // hidden_size (attention output is square)
 
-                // Create weights and activations
-                auto weights = TestTensorFactory::createQ8_1Random({static_cast<size_t>(N), static_cast<size_t>(K)});
-                auto activations = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                std::vector<int> m_values = {1, 8, 32, 64, 128, 256};
 
-                // Pack weights
-                ROCmPackedWeights packed;
-                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+                LOG_INFO("\n╔══════════════════════════════════════════════════════════════════════════╗");
+                LOG_INFO("║  Qwen2.5-0.5B Attention Output (Wo): N=" << N << " K=" << K
+                                                                     << std::setw(25) << " ║");
+                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
+                LOG_INFO("║  M      │ Tile Used │ Cosine Similarity │ Status                        ║");
+                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
 
-                // Allocate device buffers
-                int8_t *d_A_int8 = nullptr;
-                float *d_scales_A = nullptr;
-                int32_t *d_C_int32 = nullptr;
-                int work_buffer_M = 0;
-                ASSERT_TRUE(rocmQuantGemm_ensureWorkBuffers(
-                    &d_A_int8, &d_scales_A, &d_C_int32, &work_buffer_M, M, K, N, 0));
+                for (int M : m_values)
+                {
+                    double cos = runGemmAndComputeCosineSimilarity(M, N, K);
 
-                float *d_activations = nullptr;
-                float *d_output_twokernel = nullptr;
-                float *d_output_fp16 = nullptr;
-                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_activations, M * K, 0));
-                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_output_twokernel, M * N, 0));
-                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_output_fp16, M * N, 0));
+                    // Determine which tile is used
+                    const char *tile = (M <= 32) ? "32×32" : (M < 128) ? "64×64"
+                                                                       : "128×128";
 
-                // Upload activations and quantize
-                ASSERT_TRUE(rocmQuantGemm_copyHostToDevice(d_activations, activations->data(), M * K, 0));
-                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(d_activations, d_A_int8, d_scales_A, M, K, 0));
+                    const char *status = (cos > 0.99) ? "✓ PASS" : "✗ FAIL";
 
-                // Upload weights
-                int8_t *d_B_int8 = nullptr;
-                float *d_scales_B = nullptr;
-                ASSERT_EQ(hipMalloc(&d_B_int8, packed.int8_data.size() * sizeof(int8_t)), hipSuccess);
-                ASSERT_EQ(hipMemcpy(d_B_int8, packed.int8_data.data(), packed.int8_data.size() * sizeof(int8_t), hipMemcpyHostToDevice), hipSuccess);
-                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_scales_B, N, 0));
-                ASSERT_TRUE(rocmQuantGemm_copyHostToDevice(d_scales_B, packed.scales.data(), N, 0));
+                    LOG_INFO("║  " << std::setw(5) << M << "  │  " << tile << "  │     "
+                                   << std::fixed << std::setprecision(6) << cos
+                                   << "     │ " << status << std::setw(24) << " ║");
 
-                // Run INT8 Two-Kernel path (reference)
-                ASSERT_TRUE(rocmQuantGemm_executeTwoKernel(
-                    d_A_int8, d_B_int8, d_output_twokernel,
-                    d_scales_A, d_scales_B,
-                    M, N, K, 0))
-                    << "INT8 Two-Kernel GEMM failed";
+                    EXPECT_GT(cos, 0.99) << "M=" << M << " (tile " << tile << ") cosine too low";
+                }
 
-                // Run FP16 path
-                ASSERT_TRUE(rocmQuantGemm_executeFP16(
-                    d_A_int8, d_B_int8, d_output_fp16,
-                    d_scales_A, d_scales_B,
-                    M, N, K, 0, nullptr))
-                    << "FP16 hipBLAS GEMM failed";
-
-                // Download results
-                std::vector<float> h_output_twokernel(M * N);
-                std::vector<float> h_output_fp16(M * N);
-                ASSERT_TRUE(rocmQuantGemm_copyDeviceToHost(h_output_twokernel.data(), d_output_twokernel, M * N, 0));
-                ASSERT_TRUE(rocmQuantGemm_copyDeviceToHost(h_output_fp16.data(), d_output_fp16, M * N, 0));
-
-                // Compute cosine similarity between the two paths
-                float cosine = cosineSimilarity(h_output_twokernel, h_output_fp16);
-
-                LOG_INFO("[Integration] FP16 vs INT8 Two-Kernel cosine similarity: " << cosine);
-
-                // FP16 and INT8 should produce very similar results (both are quantized paths)
-                // Allow slightly lower threshold due to FP16 intermediate precision
-                EXPECT_GT(cosine, 0.995f) << "FP16 path diverged too much from INT8 Two-Kernel";
-
-                // Cleanup
-                rocmQuantGemm_freeDevice(d_A_int8);
-                rocmQuantGemm_freeDevice(d_scales_A);
-                rocmQuantGemm_freeDevice(d_C_int32);
-                rocmQuantGemm_freeDevice(d_activations);
-                rocmQuantGemm_freeDevice(d_output_twokernel);
-                rocmQuantGemm_freeDevice(d_output_fp16);
-                rocmQuantGemm_freeDevice(d_B_int8);
-                rocmQuantGemm_freeDevice(d_scales_B);
+                LOG_INFO("╚══════════════════════════════════════════════════════════════════════════╝\n");
             }
 
             /**
-             * @test Verify adaptive path selection works correctly in multiply_tensor
+             * @test M-scaling correctness for Qwen2.5-0.5B FFN up projection
              *
-             * Tests that multiply_tensor automatically uses FP16 for M > 128.
+             * Tests: M=1, 8, 32, 64, 128, 256 with N=4864, K=896
+             * This exercises the FFN up/gate projection (hidden → intermediate).
              */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, AdaptivePathSelection_M256_UsesFP16)
+            TEST_F(ROCmQuantisedGemmIntegrationTest, MScaling_Qwen05B_FFNUp)
             {
                 if (!has_rocm_device_)
                 {
                     GTEST_SKIP() << "No ROCm device available";
                 }
 
-                // M = 256 should trigger FP16 path (threshold is M > 128)
-                const int M = 256;
-                const int N = 896;
-                const int K = 896;
+                const int N = 4864; // intermediate_size
+                const int K = 896;  // hidden_size
 
-                // Clear environment overrides to test default behavior
-                unsetenv("LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS");
-                unsetenv("LLAMINAR_ROCM_GEMM_FORCE_FP16");
-                unsetenv("LLAMINAR_ROCM_GEMM_DISABLE_FP16");
-                unsetenv("LLAMINAR_ROCM_GEMM_FUSED");
+                std::vector<int> m_values = {1, 8, 32, 64, 128, 256};
 
-                // Create tensors
-                auto weights = TestTensorFactory::createQ8_1Random({static_cast<size_t>(N), static_cast<size_t>(K)});
-                auto activations = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
-                auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                LOG_INFO("\n╔══════════════════════════════════════════════════════════════════════════╗");
+                LOG_INFO("║  Qwen2.5-0.5B FFN Up: N=" << N << " K=" << K
+                                                      << std::setw(31) << " ║");
+                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
+                LOG_INFO("║  M      │ Tile Used │ Cosine Similarity │ Status                        ║");
+                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
 
-                // Create kernel and run GEMM
-                ROCmQuantisedGemmKernel kernel(weights.get(), 0);
-                ASSERT_TRUE(kernel.multiply_tensor(activations.get(), output.get(), M, N, K))
-                    << "multiply_tensor failed for M=" << M;
-
-                // Verify output is not all zeros
-                const float *out_data = output->data();
-                bool has_nonzero = false;
-                for (int i = 0; i < M * N && !has_nonzero; ++i)
+                for (int M : m_values)
                 {
-                    if (std::abs(out_data[i]) > 1e-10f)
-                    {
-                        has_nonzero = true;
-                    }
-                }
-                EXPECT_TRUE(has_nonzero) << "Output is all zeros - GEMM may have failed";
+                    double cos = runGemmAndComputeCosineSimilarity(M, N, K);
 
-                LOG_INFO("[Integration] Adaptive path selection test passed for M=" << M);
+                    const char *tile = (M <= 32) ? "32×32" : (M < 128) ? "64×64"
+                                                                       : "128×128";
+                    const char *status = (cos > 0.99) ? "✓ PASS" : "✗ FAIL";
+
+                    LOG_INFO("║  " << std::setw(5) << M << "  │  " << tile << "  │     "
+                                   << std::fixed << std::setprecision(6) << cos
+                                   << "     │ " << status << std::setw(24) << " ║");
+
+                    EXPECT_GT(cos, 0.99) << "M=" << M << " (tile " << tile << ") cosine too low";
+                }
+
+                LOG_INFO("╚══════════════════════════════════════════════════════════════════════════╝\n");
             }
 
             /**
-             * @test Verify selectGemmPath is honored by multiply_tensor
+             * @test M-scaling correctness for Qwen2.5-0.5B FFN down projection
              *
-             * Tests that DISABLE_FP16 flag correctly prevents FP16 path usage.
+             * Tests: M=1, 8, 32, 64, 128, 256 with N=896, K=4864
+             * This exercises the FFN down projection (intermediate → hidden).
              */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, DisableFP16_UsesCKTwoKernel)
+            TEST_F(ROCmQuantisedGemmIntegrationTest, MScaling_Qwen05B_FFNDown)
             {
                 if (!has_rocm_device_)
                 {
                     GTEST_SKIP() << "No ROCm device available";
                 }
 
-                // M = 256 would normally use FP16, but we disable it
-                const int M = 256;
-                const int N = 896;
-                const int K = 896;
+                const int N = 896;  // hidden_size
+                const int K = 4864; // intermediate_size
 
-                // Set DISABLE_FP16 to force CK Two-Kernel path
-                unsetenv("LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS");
-                unsetenv("LLAMINAR_ROCM_GEMM_FORCE_FP16");
-                setenv("LLAMINAR_ROCM_GEMM_DISABLE_FP16", "1", 1);
-                unsetenv("LLAMINAR_ROCM_GEMM_FUSED");
+                std::vector<int> m_values = {1, 8, 32, 64, 128, 256};
 
-                // Verify path selection
-                GemmPath path = selectGemmPath(M, N, K);
-                EXPECT_EQ(path, GemmPath::CK_TWO_KERNEL) << "DISABLE_FP16 should force CK Two-Kernel";
+                LOG_INFO("\n╔══════════════════════════════════════════════════════════════════════════╗");
+                LOG_INFO("║  Qwen2.5-0.5B FFN Down: N=" << N << " K=" << K
+                                                        << std::setw(29) << " ║");
+                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
+                LOG_INFO("║  M      │ Tile Used │ Cosine Similarity │ Status                        ║");
+                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
 
-                // Create tensors and run GEMM
-                auto weights = TestTensorFactory::createQ8_1Random({static_cast<size_t>(N), static_cast<size_t>(K)});
-                auto activations = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
-                auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                for (int M : m_values)
+                {
+                    double cos = runGemmAndComputeCosineSimilarity(M, N, K);
 
-                ROCmQuantisedGemmKernel kernel(weights.get(), 0);
-                ASSERT_TRUE(kernel.multiply_tensor(activations.get(), output.get(), M, N, K))
-                    << "multiply_tensor failed with DISABLE_FP16";
+                    const char *tile = (M <= 32) ? "32×32" : (M < 128) ? "64×64"
+                                                                       : "128×128";
+                    const char *status = (cos > 0.99) ? "✓ PASS" : "✗ FAIL";
 
-                // Cleanup environment
-                unsetenv("LLAMINAR_ROCM_GEMM_DISABLE_FP16");
+                    LOG_INFO("║  " << std::setw(5) << M << "  │  " << tile << "  │     "
+                                   << std::fixed << std::setprecision(6) << cos
+                                   << "     │ " << status << std::setw(24) << " ║");
 
-                LOG_INFO("[Integration] DISABLE_FP16 test passed");
+                    EXPECT_GT(cos, 0.99) << "M=" << M << " (tile " << tile << ") cosine too low";
+                }
+
+                LOG_INFO("╚══════════════════════════════════════════════════════════════════════════╝\n");
+            }
+
+            /**
+             * @test M-scaling correctness for Qwen2.5-7B attention output (Wo)
+             *
+             * Tests: M=1, 8, 32, 64, 128, 256 with N=3584, K=3584
+             * This exercises larger dimensions typical of 7B models.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, MScaling_Qwen7B_AttentionOutput)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                const int N = 3584; // hidden_size
+                const int K = 3584; // hidden_size
+
+                std::vector<int> m_values = {1, 8, 32, 64, 128, 256};
+
+                LOG_INFO("\n╔══════════════════════════════════════════════════════════════════════════╗");
+                LOG_INFO("║  Qwen2.5-7B Attention Output (Wo): N=" << N << " K=" << K
+                                                                   << std::setw(19) << " ║");
+                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
+                LOG_INFO("║  M      │ Tile Used │ Cosine Similarity │ Status                        ║");
+                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
+
+                for (int M : m_values)
+                {
+                    double cos = runGemmAndComputeCosineSimilarity(M, N, K);
+
+                    const char *tile = (M <= 32) ? "32×32" : (M < 128) ? "64×64"
+                                                                       : "128×128";
+                    const char *status = (cos > 0.99) ? "✓ PASS" : "✗ FAIL";
+
+                    LOG_INFO("║  " << std::setw(5) << M << "  │  " << tile << "  │     "
+                                   << std::fixed << std::setprecision(6) << cos
+                                   << "     │ " << status << std::setw(24) << " ║");
+
+                    EXPECT_GT(cos, 0.99) << "M=" << M << " (tile " << tile << ") cosine too low";
+                }
+
+                LOG_INFO("╚══════════════════════════════════════════════════════════════════════════╝\n");
+            }
+
+            /**
+             * @test M-scaling correctness for Qwen2.5-7B FFN up projection
+             *
+             * Tests: M=1, 8, 32, 64, 128, 256 with N=18944, K=3584
+             * This exercises the large FFN dimensions of 7B models.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, MScaling_Qwen7B_FFNUp)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                const int N = 18944; // intermediate_size
+                const int K = 3584;  // hidden_size
+
+                std::vector<int> m_values = {1, 8, 32, 64, 128, 256};
+
+                LOG_INFO("\n╔══════════════════════════════════════════════════════════════════════════╗");
+                LOG_INFO("║  Qwen2.5-7B FFN Up: N=" << N << " K=" << K
+                                                    << std::setw(27) << " ║");
+                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
+                LOG_INFO("║  M      │ Tile Used │ Cosine Similarity │ Status                        ║");
+                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
+
+                for (int M : m_values)
+                {
+                    double cos = runGemmAndComputeCosineSimilarity(M, N, K);
+
+                    const char *tile = (M <= 32) ? "32×32" : (M < 128) ? "64×64"
+                                                                       : "128×128";
+                    const char *status = (cos > 0.99) ? "✓ PASS" : "✗ FAIL";
+
+                    LOG_INFO("║  " << std::setw(5) << M << "  │  " << tile << "  │     "
+                                   << std::fixed << std::setprecision(6) << cos
+                                   << "     │ " << status << std::setw(24) << " ║");
+
+                    EXPECT_GT(cos, 0.99) << "M=" << M << " (tile " << tile << ") cosine too low";
+                }
+
+                LOG_INFO("╚══════════════════════════════════════════════════════════════════════════╝\n");
+            }
+
+            /**
+             * @test M-scaling correctness for Qwen2.5-7B FFN down projection
+             *
+             * Tests: M=1, 8, 32, 64, 128, 256 with N=3584, K=18944
+             * This exercises the large K dimension typical of FFN down projections.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, MScaling_Qwen7B_FFNDown)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                const int N = 3584;  // hidden_size
+                const int K = 18944; // intermediate_size
+
+                std::vector<int> m_values = {1, 8, 32, 64, 128, 256};
+
+                LOG_INFO("\n╔══════════════════════════════════════════════════════════════════════════╗");
+                LOG_INFO("║  Qwen2.5-7B FFN Down: N=" << N << " K=" << K
+                                                      << std::setw(25) << " ║");
+                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
+                LOG_INFO("║  M      │ Tile Used │ Cosine Similarity │ Status                        ║");
+                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
+
+                for (int M : m_values)
+                {
+                    double cos = runGemmAndComputeCosineSimilarity(M, N, K);
+
+                    const char *tile = (M <= 32) ? "32×32" : (M < 128) ? "64×64"
+                                                                       : "128×128";
+                    const char *status = (cos > 0.99) ? "✓ PASS" : "✗ FAIL";
+
+                    LOG_INFO("║  " << std::setw(5) << M << "  │  " << tile << "  │     "
+                                   << std::fixed << std::setprecision(6) << cos
+                                   << "     │ " << status << std::setw(24) << " ║");
+
+                    EXPECT_GT(cos, 0.99) << "M=" << M << " (tile " << tile << ") cosine too low";
+                }
+
+                LOG_INFO("╚══════════════════════════════════════════════════════════════════════════╝\n");
             }
 
         } // namespace integration_test

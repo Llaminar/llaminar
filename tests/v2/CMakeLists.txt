@@ -335,8 +335,8 @@ add_v2_test(V2_Unit_DeviceBenchmark
     MPI_PROCS 1
 )
 
-# Test: DirectP2P - EXPERIMENTAL direct cross-vendor P2P via Linux DMA-BUF
-# Requires both CUDA and ROCm - tests zero-copy memory sharing between vendors
+# Test: DirectP2P - Cross-vendor P2P via PCIe BAR mapping
+# Requires both CUDA and ROCm - tests true zero-copy P2P between GPU vendors
 if(HAVE_CUDA AND HAVE_ROCM)
     add_executable(v2_integration_direct_p2p integration/Test__DirectP2P.cpp)
     target_link_libraries(v2_integration_direct_p2p 
@@ -347,7 +347,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
     )
     add_v2_test(V2_Integration_DirectP2P 
         COMMAND $<TARGET_FILE:v2_integration_direct_p2p>
-        LABELS "V2;Integration;DeviceManagement;P2P;DMA-BUF;CUDA;ROCm;CrossVendor"
+        LABELS "V2;Integration;DeviceManagement;P2P;PCIeBAR;CUDA;ROCm;CrossVendor"
         MPI_PROCS 1
     )
 
@@ -5474,41 +5474,29 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm Quantised GEMM kernel performance benchmarks")
 
-    # Performance Test: FP16 vs INT8 GEMM Comparison
-    # Tests hypothesis that FP16 hipBLAS may be faster than INT8 CK on gfx906
-    add_executable(v2_perf_rocm_fp16_vs_int8_gemm 
-        performance/kernels/rocm/Perf__ROCmFP16vsINT8Gemm.cpp
+    # NOTE: FP16 vs INT8 benchmark removed (January 2026) - INT8 proven faster for all sizes.
+    # Results documented in changelog/2026-01-10-rocm-int8-gemm-optimization.md
+
+    # Performance Test: hipBLAS INT8 GEMM Roofline
+    # Measures raw hipBLAS INT8 GEMM throughput to establish roofline on MI50
+    set_source_files_properties(
+        performance/rocm/Perf__HipblasInt8Roofline.hip
+        PROPERTIES LANGUAGE HIP
     )
-    target_link_libraries(v2_perf_rocm_fp16_vs_int8_gemm 
-        llaminar2_core 
+    add_executable(v2_perf_hipblas_int8_roofline 
+        performance/rocm/Perf__HipblasInt8Roofline.hip
+    )
+    target_link_libraries(v2_perf_hipblas_int8_roofline 
+        hip::host
+        hip::device
+        hipblas
         GTest::gtest 
         GTest::gtest_main
     )
-    add_v2_test(V2_Perf_ROCmFP16vsINT8Gemm
-        COMMAND $<TARGET_FILE:v2_perf_rocm_fp16_vs_int8_gemm>
-        LABELS "V2;Performance;ROCm;GEMM;FP16;INT8;Comparison;gfx906;Benchmark"
+    add_v2_test(V2_Perf_HipblasInt8Roofline
+        COMMAND $<TARGET_FILE:v2_perf_hipblas_int8_roofline>
+        LABELS "V2;Performance;ROCm;GEMM;INT8;hipBLAS;Roofline;gfx906;Benchmark"
         MPI_PROCS 1
     )
-    message(STATUS "V2 Tests: Added ROCm FP16 vs INT8 GEMM comparison benchmarks")
+    message(STATUS "V2 Tests: Added hipBLAS INT8 GEMM roofline benchmarks")
 endif()
-
-# =============================================================================
-# Slab FP16 GEMM Workspace Integration Tests (Phase 3)
-# =============================================================================
-# Tests SlabGemmConfig integration with DeviceWorkspaceManager
-# Can run on CPU (no ROCm required) to validate buffer allocation and configuration
-
-add_executable(v2_integration_slab_fp16_workspace
-    integration/Test__SlabFP16GemmWorkspace.cpp
-)
-target_link_libraries(v2_integration_slab_fp16_workspace 
-    llaminar2_core 
-    GTest::gtest 
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_SlabFP16GemmWorkspace
-    COMMAND $<TARGET_FILE:v2_integration_slab_fp16_workspace>
-    LABELS "V2;Integration;Kernels;GEMM;Workspace;FP16;SlabGEMM"
-    MPI_PROCS 1
-)
-message(STATUS "V2 Tests: Added Slab FP16 GEMM workspace integration tests")

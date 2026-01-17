@@ -15,35 +15,54 @@
  *       ▼
  * ROCmQuantisedGemmKernel_CK.hip (compiled with hipcc)
  *       │
- *       │ CK template instantiation
+ *       │ CK template instantiation (3-way dispatch)
  *       ▼
- * ComposableKernel DeviceGemmMultipleD_Dl
+ * ComposableKernel DeviceGemmMultipleD_Dl (mk_nk_mn layout)
+ *   - 32×32 kernel  for M ≤ 32  (decode: M=1 handled natively)
+ *   - 64×64 kernel  for 32 < M < 128
+ *   - 128×128 kernel for M ≥ 128 (prefill: peak throughput)
  * ```
  *
- * ## Weight Conversion Pipeline
+ * ## Weight Conversion Pipeline (packWeightsToROCm) - ONE-TIME AT LOAD
  *
  * Model weights are stored in various quantized formats (IQ4_NL, Q8_0, Q4_K, etc.).
- * This kernel requires symmetric INT8 quantization with per-column scales:
+ * This kernel requires symmetric INT8 quantization with per-output-feature scales.
  *
- * 1. **Dequantize**: Original quantized weights → FP32 via fp32_data()
- * 2. **Per-column quantization**: Find max_abs per output feature (column)
- * 3. **Transpose + Quantize**: Store as [K×N] row-major INT8
- * 4. **Upload**: Copy INT8 weights + scales to GPU memory
+ * Weight conversion happens ONCE at model load time, entirely on CPU:
  *
- * ## Memory Layout Convention
+ * 1. **Dequantize (CPU)**: Original quantized weights → FP32 via fp32_data()
+ * 2. **Requantize (CPU)**: FP32 → INT8 with per-row scales (symmetric, [-127,127])
+ * 3. **Upload (H2D)**: Copy INT8 weights + scales to GPU memory
  *
- * All matrices use row-major layout:
+ * After loading, GPU only sees INT8 data - no format-specific decode on device.
+ * This keeps VRAM usage minimal and avoids needing GPU kernels for each quant format.
  *
- * | Matrix      | Original Shape | Packed Shape | Element Access          |
- * |-------------|---------------|--------------|------------------------|
- * | Model Weights | [N × K]       | [K × N]      | B[k,n] = data[k*N + n] |
- * | Activations | [M × K]       | [M × K]      | A[m,k] = data[m*K + k] |
- * | Output      | [M × N]       | [M × N]      | C[m,n] = data[m*N + n] |
+ * ## Memory Layout Convention (mk_nk_mn - optimized for 128x128 tiles)
  *
- * Note: Model weights are transposed during packing because GEMM computes:
- * ```
- * output[m,n] = sum_k(A[m,k] * B[k,n]) = sum_k(A[m,k] * W_transposed[k,n])
- * ```
+ * | Matrix        | Shape    | Memory Layout | Element Access          | CK View         |
+ * |---------------|----------|---------------|-------------------------|-----------------|
+ * | Model Weights | [N × K]  | Row-Major     | W[n,k] = data[n*K + k]  | ColMajor [K×N]  |
+ * | Activations   | [M × K]  | Row-Major     | A[m,k] = data[m*K + k]  | RowMajor [M×K]  |
+ * | Output        | [M × N]  | Row-Major     | C[m,n] = data[m*N + n]  | RowMajor [M×N]  |
+ *
+ * Key insight: Model weights [N×K] Row-Major == Column-Major [K×N]!
+ * No transpose needed - we just reinterpret the layout for CK's mk_nk_mn convention.
+ * This enables 128×128 tile sizes (4x larger than mk_kn_mn) for ~2-4x speedup.
+ *
+ * ## Two-Kernel Execution Path (PER-INFERENCE)
+ *
+ * Production path uses rocmQuantGemm_executeTwoKernel_cached():
+ *   1. Upload FP32 activations to GPU (H2D)
+ *   2. Quantize activations FP32→INT8 on GPU (rocmQuantGemm_quantizeActivations)
+ *   3. CK INT8×INT8→INT32 GEMM (no scaling in kernel)
+ *   4. Separate applyScales_kernel: E[m,n] = C_int32[m,n] * scale_A[m] * scale_B[n]
+ *   5. Download FP32 output to host (D2H)
+ *
+ * Activation quantization happens ON GPU every inference call - this is the
+ * per-row symmetric quantization that produces INT8 activations + scales.
+ *
+ * The two-kernel GEMM approach is required because CK's fused D-tensor scaling
+ * doesn't support the per-row × per-column broadcast pattern we need.
  *
  * @see ROCmQuantisedGemmKernel_CK.hip for HIP kernel implementation
  * @see ROCmQuantisedGemmKernel.h for class documentation
@@ -53,7 +72,6 @@
  */
 
 #include "ROCmQuantisedGemmKernel.h"
-#include "ROCmQuantisedGemmKernel_SlabFP16.h"
 #include "backends/ComputeBackend.h" // DeviceManager
 #include "backends/DeviceId.h"       // DeviceId
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.
@@ -109,31 +127,8 @@ namespace llaminar2
                 int M, int K,
                 int rocm_device_id);
 
-            // Execute INT8 GEMM with DenseScale (pre-computed combined scale buffer)
-            bool rocmQuantGemm_executeDenseScale(
-                const int8_t *d_A_int8,       // [M x K] RowMajor quantized activations
-                const int8_t *d_weights_int8, // [K x N] RowMajor transposed weights
-                float *d_C_fp32,              // [M x N] RowMajor FP32 output
-                const float *d_scales_A,      // [M] per-row activation scales
-                const float *d_scales_B,      // [N] per-column weight scales
-                int M, int N, int K,
-                int rocm_device_id,
-                float *work_buffer, // Optional pre-allocated [M×N] FP32 buffer
-                size_t work_buffer_size);
-
-            // Execute INT8 GEMM using hipBLAS (fallback for small M < 64)
-            bool rocmQuantGemm_executeHipBLAS(
-                const int8_t *d_A_int8, // [M x K] RowMajor quantized activations
-                const int8_t *d_B_int8, // [K x N] RowMajor transposed weights
-                float *d_E_fp32,        // [M x N] RowMajor FP32 output
-                const float *d_scale_A, // [M] per-row activation scales
-                const float *d_scale_B, // [N] per-column weight scales
-                int M, int N, int K,
-                int rocm_device_id);
-
             // Execute INT8 GEMM using CK with SEPARATE scaling (two-kernel approach)
             // This runs CK for INT8→INT32 GEMM, then a separate kernel for scaling.
-            // Used to test if fused scaling causes accuracy loss.
             bool rocmQuantGemm_executeTwoKernel(
                 const int8_t *d_A_int8, // [M x K] RowMajor quantized activations
                 const int8_t *d_B_int8, // [K x N] RowMajor transposed weights
@@ -143,50 +138,44 @@ namespace llaminar2
                 int M, int N, int K,
                 int rocm_device_id);
 
-            // Execute FP16 hipBLAS GEMM (INT8→FP16 conversion + hgemm + FP32 output)
-            // On gfx906, this is ~20-35% faster than INT8 paths for M > 128.
-            // See ROCmQuantisedGemmKernel_FP16.hip for implementation.
-            bool rocmQuantGemm_executeFP16(
-                const int8_t *d_A,     // [M x K] RowMajor quantized activations
-                const int8_t *d_B,     // [K x N] RowMajor transposed weights
-                float *d_E,            // [M x N] RowMajor FP32 output
-                const float *d_scaleA, // [M] per-row activation scales
-                const float *d_scaleB, // [N] per-column weight scales
-                int M, int N, int K,
-                int device_id,
-                void *stream); // HIP stream (nullptr for default)
-
-            // Execute FP16 GEMM with pre-allocated workspace buffers (allocation-free)
+            // Execute INT8 GEMM using CK two-kernel with PRE-ALLOCATED buffer (allocation-free)
             // This is the preferred variant for hot-path execution.
-            bool rocmQuantGemm_executeFP16_cached(
-                const int8_t *d_A,     // [M x K] RowMajor quantized activations
-                const int8_t *d_B,     // [K x N] RowMajor transposed weights
-                float *d_E,            // [M x N] RowMajor FP32 output
-                const float *d_scaleA, // [M] per-row activation scales
-                const float *d_scaleB, // [N] per-column weight scales
-                void *d_A_fp16,        // Pre-allocated [M x K] FP16 buffer
-                void *d_B_fp16,        // Pre-allocated [K x N] FP16 buffer
-                void *d_C_fp16,        // Pre-allocated [M x N] FP16 buffer
+            bool rocmQuantGemm_executeTwoKernel_cached(
+                const int8_t *d_A_int8, // [M x K] RowMajor quantized activations
+                const int8_t *d_B_int8, // [K x N] RowMajor transposed weights
+                float *d_E_fp32,        // [M x N] RowMajor FP32 output
+                const float *d_scale_A, // [M] per-row activation scales
+                const float *d_scale_B, // [N] per-column weight scales
+                int32_t *d_C_int32,     // [M x N] Pre-allocated INT32 accumulator
                 int M, int N, int K,
-                int device_id,
-                void *stream); // HIP stream (nullptr for default)
+                int rocm_device_id);
 
-            // Allocate FP16 buffer on device (helper for workspace allocation)
-            bool rocmQuantGemm_allocFP16(void **d_ptr, size_t count, int rocm_device_id);
+            // Execute INT8 GEMM using CK two-kernel with M-PADDING for decode (M < 8)
+            // Pads activations to padded_m, runs CK, extracts first M rows of output.
+            // Note: With the 32×32 kernel, only M < 8 needs explicit padding.
+            bool rocmQuantGemm_executeTwoKernel_padded(
+                const int8_t *d_A_int8, // [M x K] RowMajor quantized activations
+                const int8_t *d_B_int8, // [N x K] RowMajor weights (viewed as [K x N] col-major)
+                float *d_E_fp32,        // [M x N] RowMajor FP32 output (only first M rows written)
+                const float *d_scale_A, // [M] per-row activation scales
+                const float *d_scale_B, // [N] per-column weight scales
+                int32_t *d_C_int32,     // [padded_m x N] Pre-allocated INT32 accumulator
+                int M,                  // Actual M (output rows needed)
+                int padded_m,           // Padded M for CK
+                int N, int K,
+                int rocm_device_id);
 
             // Get CK minimum dimension requirements
             int rocmQuantGemm_getMinM();
             int rocmQuantGemm_getMinN();
             int rocmQuantGemm_getMinK();
 
-            // Check if CK supports the given dimensions
-            bool rocmQuantGemm_areDimensionsSupported(int M, int N, int K);
-
             // Free device memory
             void rocmQuantGemm_freeDevice(void *d_ptr);
 
             // Memory management helpers
             bool rocmQuantGemm_allocFloat(float **d_ptr, size_t count, int rocm_device_id);
+            bool rocmQuantGemm_allocInt32(int32_t **d_ptr, size_t count, int rocm_device_id);
             bool rocmQuantGemm_copyHostToDevice(float *d_dst, const float *h_src, size_t count, int rocm_device_id);
             bool rocmQuantGemm_copyDeviceToHost(float *h_dst, const float *d_src, size_t count, int rocm_device_id);
             bool rocmQuantGemm_copyInt32DeviceToHost(int32_t *h_dst, const int32_t *d_src, size_t count, int rocm_device_id);
@@ -194,61 +183,49 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // GemmPath selection - heuristics based on benchmarks
+        // 3-Way Dispatch - Optimized kernel selection based on M
+        // =====================================================================
+        //
+        // The .hip file implements 3-way dispatch using GemmMNPadding-enabled kernels:
+        //
+        //   ┌─────────────────────────────────────────────────────────────────┐
+        //   │ M ≤ 32?      ───YES───> 32×32 kernel (handles M=1 natively!)   │
+        //   │         │                                                       │
+        //   │         NO                                                      │
+        //   │         │                                                       │
+        //   │ 32 < M < 128? ─YES───> 64×64 kernel (good for small batches)   │
+        //   │         │                                                       │
+        //   │         NO                                                      │
+        //   │         │                                                       │
+        //   │ M >= 128  ───────────> 128×128 kernel (peak throughput)        │
+        //   └─────────────────────────────────────────────────────────────────┘
+        //
+        // Performance (FFN Up: K=3584, N=18944, MI50 gfx906):
+        //   M=1:   0.46ms, ~2.4 TFLOPS  (32×32 kernel, 2.6x faster than 128-pad)
+        //   M=32:  0.53ms, ~8.2 TFLOPS  (32×32 kernel)
+        //   M=64:  0.51ms, ~17 TFLOPS   (64×64 kernel, 1.3x faster than 128-pad)
+        //   M=128: 0.82ms, ~21 TFLOPS   (128×128 kernel)
+        //
         // =====================================================================
 
-        GemmPath selectGemmPath(int M, int N, int K)
+        // Minimum M that the 32×32 kernel can handle without explicit padding
+        // With GemmMNPadding, any M >= 1 works, but we keep 8 as the threshold
+        // for explicit padding to match the old code path (for safety)
+        constexpr int CK_MIN_M_FOR_EXPLICIT_PADDING = 8;
+        constexpr int CK_MIN_N = 32; // All kernels: minimum N
+        constexpr int CK_MIN_K = 32; // All kernels: minimum K
+
+        // Returns the padded M value needed (only for M < 8)
+        // The 32×32 kernel with GemmMNPadding handles most M values natively
+        inline int getPaddedM(int M)
         {
-            // Environment variable overrides
-            const char *force_hipblas_env = std::getenv("LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS");
-            const bool force_hipblas = (force_hipblas_env && force_hipblas_env[0] == '1');
+            return (M < CK_MIN_M_FOR_EXPLICIT_PADDING) ? CK_MIN_M_FOR_EXPLICIT_PADDING : M;
+        }
 
-            const char *force_fp16_env = std::getenv("LLAMINAR_ROCM_GEMM_FORCE_FP16");
-            const bool force_fp16 = (force_fp16_env && force_fp16_env[0] == '1');
-
-            const char *disable_fp16_env = std::getenv("LLAMINAR_ROCM_GEMM_DISABLE_FP16");
-            const bool disable_fp16 = (disable_fp16_env && disable_fp16_env[0] == '1');
-
-            const char *use_fused_env = std::getenv("LLAMINAR_ROCM_GEMM_FUSED");
-            const bool use_fused = (use_fused_env && use_fused_env[0] == '1');
-
-            // Force overrides
-            if (force_hipblas)
-            {
-                return GemmPath::HIPBLAS_INT8;
-            }
-            if (force_fp16 && !disable_fp16)
-            {
-                return GemmPath::FP16_HIPBLAS;
-            }
-
-            // Check if CK supports these dimensions
-            const bool ck_supported = rocmQuantGemm_areDimensionsSupported(M, N, K);
-
-            if (!ck_supported)
-            {
-                // CK doesn't support these dimensions, fall back to hipBLAS INT8
-                return GemmPath::HIPBLAS_INT8;
-            }
-
-            // Heuristic selection based on M (batch size)
-            // Threshold determined by benchmarks on gfx906:
-            //   - M ≤ 128: INT8 Two-Kernel is faster (lower conversion overhead)
-            //   - M > 128: FP16 hipBLAS is 20-35% faster (better FP16 MFMA utilization)
-            constexpr int FP16_THRESHOLD_M = 128;
-
-            if (!disable_fp16 && M > FP16_THRESHOLD_M)
-            {
-                return GemmPath::FP16_HIPBLAS;
-            }
-
-            // For M ≤ 128, use CK INT8 paths
-            if (use_fused)
-            {
-                return GemmPath::CK_FUSED;
-            }
-
-            return GemmPath::CK_TWO_KERNEL;
+        // Check if M needs explicit padding (rare - only M < 8)
+        inline bool needsMPadding(int M)
+        {
+            return M < CK_MIN_M_FOR_EXPLICIT_PADDING;
         }
 
         // =====================================================================
@@ -267,20 +244,15 @@ namespace llaminar2
             int32_t *d_C_int32 = nullptr; // [M x N]
             int work_buffer_M = 0;
 
+            // Cached INT32 accumulator for CK two-kernel path (avoids hot-path allocations)
+            int32_t *d_CK_int32 = nullptr;  // [M x N] accumulator for CK NoScale + applyScales
+            size_t d_CK_int32_capacity = 0; // Current allocation size (elements)
+
             // Cached temporary buffers (to avoid hipMalloc/hipFree per call)
             float *d_A_fp32 = nullptr;    // [M x K] input activations FP32
             float *d_C_fp32 = nullptr;    // [M x N] output FP32
             size_t d_A_fp32_capacity = 0; // Current allocation size (elements)
             size_t d_C_fp32_capacity = 0; // Current allocation size (elements)
-
-            // FP16 workspace buffers for FP16 GEMM path (cached to avoid hot-path allocations)
-            // These are half-precision buffers for INT8→FP16→GEMM→FP32 pipeline
-            void *d_A_fp16 = nullptr;     // [M x K] FP16 activations (__half)
-            void *d_B_fp16 = nullptr;     // [K x N] FP16 weights (__half)
-            void *d_C_fp16 = nullptr;     // [M x N] FP16 GEMM output (__half)
-            size_t d_A_fp16_capacity = 0; // Current allocation size (elements, not bytes)
-            size_t d_B_fp16_capacity = 0; // Current allocation size (elements, not bytes)
-            size_t d_C_fp16_capacity = 0; // Current allocation size (elements, not bytes)
 
             // Flag to track if we own weight memory
             bool owns_weight_memory = false;
@@ -302,18 +274,14 @@ namespace llaminar2
                     rocmQuantGemm_freeDevice(d_scales_A);
                 if (d_C_int32)
                     rocmQuantGemm_freeDevice(d_C_int32);
+                // Free cached CK INT32 buffer
+                if (d_CK_int32)
+                    rocmQuantGemm_freeDevice(d_CK_int32);
                 // Free cached temporary buffers
                 if (d_A_fp32)
                     rocmQuantGemm_freeDevice(d_A_fp32);
                 if (d_C_fp32)
                     rocmQuantGemm_freeDevice(d_C_fp32);
-                // Free FP16 workspace buffers
-                if (d_A_fp16)
-                    rocmQuantGemm_freeDevice(d_A_fp16);
-                if (d_B_fp16)
-                    rocmQuantGemm_freeDevice(d_B_fp16);
-                if (d_C_fp16)
-                    rocmQuantGemm_freeDevice(d_C_fp16);
             }
         };
 
@@ -333,7 +301,7 @@ namespace llaminar2
         // packWeightsToROCm: Convert any quantized tensor to INT8 + scales
         // =====================================================================
         //
-        // This function performs the critical layout transformation for CK GEMM.
+        // This function quantizes weights for CK GEMM using mk_nk_mn layout.
         //
         // ## Input Layout (Model Weights)
         //
@@ -342,24 +310,23 @@ namespace llaminar2
         //   - K = input_features (columns)
         //   - Element W[n,k] at offset: n * K + k
         //
-        // ## Output Layout (CK GEMM Weights)
+        // ## Output Layout (CK GEMM Weights - mk_nk_mn convention)
         //
-        // CK expects B as [K × N] row-major (matching mk_kn_mn convention):
-        //   - K = rows (contraction dimension)
-        //   - N = columns (output dimension)
-        //   - Element B[k,n] at offset: k * N + n
+        // CK's mk_nk_mn layout expects B as [N × K] stored as Column-Major [K × N]:
+        //   - When viewed as B[k,n], element at offset: k + n * K
+        //   - This is EXACTLY the same memory layout as [N × K] Row-Major!
+        //   - W[n,k] at n*K + k == B[k,n] at k + n*K (same offset!)
         //
-        // ## Transpose Relationship
+        // ## Key Insight: NO TRANSPOSE NEEDED!
         //
-        // The conversion performs an implicit transpose:
-        //   B[k,n] = W[n,k]
-        //   int8_data[k * N + n] = quantize(h_weights_fp32[n * K + k])
+        // Model weights [N×K] Row-Major can be directly reinterpreted as
+        // Column-Major [K×N] for CK's mk_nk_mn layout. We just quantize in place.
         //
         // ## Quantization
         //
-        // Per-column (per-output-feature) symmetric quantization:
-        //   scale[n] = max(|W[:, n]|) / 127.0
-        //   int8[k,n] = round(W[n,k] / scale[n])
+        // Per-output-feature (per-row of model weights) symmetric quantization:
+        //   scale[n] = max(|W[n,:]|) / 127.0
+        //   int8[n,k] = round(W[n,k] / scale[n])
         //
         // This allows efficient output scaling: output = int32_result * scale_A * scale_B
         //
@@ -385,27 +352,27 @@ namespace llaminar2
             }
 
             // Allocate output vectors:
-            //   int8_data: [K × N] row-major (transposed from model [N × K])
-            //   scales: [N] per-column (per-output-feature) scales
-            out.int8_data.resize(static_cast<size_t>(K) * N);
+            //   int8_data: [N × K] row-major (same layout as model weights!)
+            //             This is Column-Major [K × N] for CK's mk_nk_mn convention
+            //   scales: [N] per-output-feature scales
+            out.int8_data.resize(static_cast<size_t>(N) * K);
             out.scales.resize(N);
             out.K = K;
             out.N = N;
 
-            // Per-column symmetric quantization with transpose
+            // Per-row (per-output-feature) symmetric quantization
+            // NO transpose - keep same layout as model weights
             //
             // Input (h_weights_fp32):  [N × K] row-major, W[n,k] at n*K + k
-            // Output (out.int8_data):  [K × N] row-major, B[k,n] at k*N + n
-            //
-            // Relationship: B[k,n] = quantize(W[n,k])  (transpose during copy)
+            // Output (out.int8_data):  [N × K] row-major, same layout!
+            //                          (viewed as Column-Major [K×N] for CK)
             for (int n = 0; n < N; ++n)
             {
-                // Find max_abs for this output feature (column n of original weights)
-                // We iterate over all K values for this output feature
+                // Find max_abs for this output feature (row n of model weights)
                 float max_abs = 0.0f;
                 for (int k = 0; k < K; ++k)
                 {
-                    // W[n,k] = h_weights_fp32[n * K + k]  (row n, column k of model weights)
+                    // W[n,k] = h_weights_fp32[n * K + k]
                     float val = h_weights_fp32[n * K + k];
                     max_abs = std::max(max_abs, std::abs(val));
                 }
@@ -413,21 +380,20 @@ namespace llaminar2
                 // Symmetric quantization: scale = max_abs / 127
                 float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
                 float inv_scale = 1.0f / scale;
-                out.scales[n] = scale; // One scale per output feature (column of packed weights)
+                out.scales[n] = scale; // One scale per output feature
 
-                // Quantize and store with transpose:
-                //   Source:      W[n,k]  at offset n*K + k  (model weights [N×K])
-                //   Destination: B[k,n]  at offset k*N + n  (packed weights [K×N])
+                // Quantize in place - NO transpose!
+                // Both source and destination use offset n*K + k
                 for (int k = 0; k < K; ++k)
                 {
                     float val = h_weights_fp32[n * K + k]; // Read W[n,k]
                     int8_t quantized = static_cast<int8_t>(
                         std::round(std::clamp(val * inv_scale, -127.0f, 127.0f)));
-                    out.int8_data[k * N + n] = quantized; // Write B[k,n] (transpose!)
+                    out.int8_data[n * K + k] = quantized; // Write at same offset!
                 }
             }
 
-            LOG_DEBUG("[packWeightsToROCm] Packed " << N << "x" << K << " weights to INT8");
+            LOG_DEBUG("[packWeightsToROCm] Packed " << N << "x" << K << " weights to INT8 (mk_nk_mn layout)");
             return true;
         }
 
@@ -749,251 +715,62 @@ namespace llaminar2
             float *d_C_fp32 = impl_->d_C_fp32;
 
             // =========================================================================
-            // FOUR-PATH DISPATCH using selectGemmPath()
+            // CK TWO-KERNEL DISPATCH (with M-padding for decode)
             // =========================================================================
             //
-            // DISPATCH DECISION (based on benchmarks on gfx906 MI50/MI60):
+            // CK INT8 Two-Kernel is the ONLY path. For small M (decode), we pad
+            // activations to CK_MIN_M (128), run CK, then extract first M rows.
             //
-            //   ┌─────────────────────────────────────────────────────────────────┐
-            //   │ M < 64 or N < 64 or K < 32?  ───YES───> hipBLAS INT8            │
-            //   │         │                                                       │
-            //   │         NO                                                      │
-            //   │         │                                                       │
-            //   │         ▼                                                       │
-            //   │ M > 128?  ───YES───> FP16 hipBLAS (20-35% faster)              │
-            //   │         │                                                       │
-            //   │         NO                                                      │
-            //   │         │                                                       │
-            //   │         ▼                                                       │
-            //   │ CK Two-Kernel (default for 64 ≤ M ≤ 128)                       │
-            //   └─────────────────────────────────────────────────────────────────┘
+            // NOTE: hipBLAS INT8 on gfx906 has N <= K limitation, breaking FFN.
+            //       M-padding for CK is more efficient and universally supported.
             //
-            // ENVIRONMENT VARIABLES:
-            //   LLAMINAR_ROCM_GEMM_FORCE_HIPBLAS=1 - Force hipBLAS INT8 for all sizes
-            //   LLAMINAR_ROCM_GEMM_FORCE_FP16=1   - Force FP16 hipBLAS for all sizes
-            //   LLAMINAR_ROCM_GEMM_DISABLE_FP16=1 - Disable FP16 path (use INT8 always)
-            //   LLAMINAR_ROCM_GEMM_FUSED=1        - Use CK fused (legacy, lower accuracy)
-            //
-            const GemmPath path = selectGemmPath(m, n, k);
+            const int padded_m = getPaddedM(m);
+            const bool needs_padding = needsMPadding(m);
             bool success = false;
 
-            switch (path)
+            if (needs_padding)
             {
-            case GemmPath::FP16_HIPBLAS:
+                LOG_DEBUG("[ROCmQuantisedGemmKernel] Using CK TWO-KERNEL with M-padding (M=" << m << " -> " << padded_m << ", N=" << n << ", K=" << k << ")");
+            }
+            else
             {
-                // FP16 hipBLAS: INT8→FP16 + hgemm + FP16→FP32
-                // Optimal for M > 128 on gfx906 due to better FP16 MFMA utilization
-                LOG_DEBUG("[ROCmQuantisedGemmKernel] Using FP16 hipBLAS (M=" << m << ", N=" << n << ", K=" << k << ")");
-
-                // =====================================================================
-                // Phase 3: Check if we should use slab mode with workspace buffers
-                // =====================================================================
-
-                // Determine workspace budget:
-                //   - If workspace bound: use workspace budget
-                //   - Otherwise: use default 64MB budget for decision
-                const size_t workspace_budget = hasWorkspace() ? workspace_->budget() : (64 * 1024 * 1024);
-
-                // Check if slab mode should be used (large matrices that exceed budget)
-                if (rocmQuantGemm_shouldUseSlabFP16(m, n, k, workspace_budget))
-                {
-                    // Get optimal slab configuration for this GEMM
-                    SlabGemmConfig slab_config;
-                    rocmQuantGemm_getSlabConfig(m, n, k, workspace_budget, &slab_config);
-
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel] Using slab FP16 GEMM: " << slab_config.describe()
-                                                                                 << ", iterations=" << slab_config.estimateIterations(m, n, k));
-
-                    // Try to get workspace slab buffers (Phase 3 integration)
-                    void *slab_a = nullptr;
-                    void *slab_b = nullptr;
-                    void *slab_c = nullptr;
-                    bool owns_slabs = false;
-
-                    if (hasWorkspace())
-                    {
-                        // Use pre-allocated workspace buffers (zero hot-path allocations)
-                        slab_a = workspace_->getBuffer(GemmWorkspaceBuffers::SLAB_A_FP16);
-                        slab_b = workspace_->getBuffer(GemmWorkspaceBuffers::SLAB_B_FP16);
-                        slab_c = workspace_->getBuffer(GemmWorkspaceBuffers::SLAB_C_FP16);
-
-                        if (slab_a && slab_b && slab_c)
-                        {
-                            LOG_DEBUG("[ROCmQuantisedGemmKernel] Using managed workspace for slab FP16 GEMM");
-                        }
-                        else
-                        {
-                            LOG_WARN("[ROCmQuantisedGemmKernel] Workspace bound but slab buffers not found, "
-                                     "falling back to internal allocation");
-                            slab_a = slab_b = slab_c = nullptr;
-                        }
-                    }
-
-                    // Fall back to internal allocation if workspace not available (legacy mode)
-                    if (!slab_a || !slab_b || !slab_c)
-                    {
-                        LOG_DEBUG("[ROCmQuantisedGemmKernel] Allocating internal slab buffers (legacy mode)");
-
-                        const size_t slab_a_bytes = slab_config.slabABytes(SlabDataType::FP16);
-                        const size_t slab_b_bytes = slab_config.slabBBytes(SlabDataType::FP16);
-                        const size_t slab_c_bytes = slab_config.slabCBytes(SlabDataType::FP16);
-
-                        if (!rocmQuantGemm_allocFP16(&slab_a, slab_a_bytes / sizeof(uint16_t), rocm_device_id_) ||
-                            !rocmQuantGemm_allocFP16(&slab_b, slab_b_bytes / sizeof(uint16_t), rocm_device_id_) ||
-                            !rocmQuantGemm_allocFP16(&slab_c, slab_c_bytes / sizeof(uint16_t), rocm_device_id_))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate internal slab buffers");
-                            if (slab_a)
-                                rocmQuantGemm_freeDevice(slab_a);
-                            if (slab_b)
-                                rocmQuantGemm_freeDevice(slab_b);
-                            if (slab_c)
-                                rocmQuantGemm_freeDevice(slab_c);
-                            return false;
-                        }
-                        owns_slabs = true;
-                    }
-
-                    // Execute slab FP16 GEMM
-                    success = rocmQuantGemm_executeSlabFP16(
-                        d_A_int8, d_weights_int8, d_C_fp32,
-                        d_scales_A, d_scales_B,
-                        m, n, k,
-                        slab_a, slab_b, slab_c,
-                        &slab_config,
-                        rocm_device_id_, nullptr);
-
-                    // Clean up internal allocations if we own them
-                    if (owns_slabs)
-                    {
-                        rocmQuantGemm_freeDevice(slab_a);
-                        rocmQuantGemm_freeDevice(slab_b);
-                        rocmQuantGemm_freeDevice(slab_c);
-                    }
-
-                    if (!success)
-                    {
-                        LOG_WARN("[ROCmQuantisedGemmKernel] Slab FP16 failed, trying CK Two-Kernel fallback");
-                        success = rocmQuantGemm_executeTwoKernel(d_A_int8, d_weights_int8, d_C_fp32,
-                                                                 d_scales_A, d_scales_B,
-                                                                 m, n, k, rocm_device_id_);
-                    }
-                    break;
-                }
-
-                // =====================================================================
-                // Full FP16 path (fits in memory without slab chunking)
-                // =====================================================================
-
-                // Ensure FP16 workspace buffers are large enough (cached for reuse)
-                const size_t a_fp16_size = static_cast<size_t>(m) * k;
-                const size_t b_fp16_size = static_cast<size_t>(k) * n;
-                const size_t c_fp16_size = static_cast<size_t>(m) * n;
-
-                if (a_fp16_size > impl_->d_A_fp16_capacity)
-                {
-                    if (impl_->d_A_fp16)
-                        rocmQuantGemm_freeDevice(impl_->d_A_fp16);
-                    impl_->d_A_fp16 = nullptr;
-                    impl_->d_A_fp16_capacity = 0;
-
-                    if (!rocmQuantGemm_allocFP16(&impl_->d_A_fp16, a_fp16_size, rocm_device_id_))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate FP16 A buffer");
-                        return false;
-                    }
-                    impl_->d_A_fp16_capacity = a_fp16_size;
-                }
-
-                if (b_fp16_size > impl_->d_B_fp16_capacity)
-                {
-                    if (impl_->d_B_fp16)
-                        rocmQuantGemm_freeDevice(impl_->d_B_fp16);
-                    impl_->d_B_fp16 = nullptr;
-                    impl_->d_B_fp16_capacity = 0;
-
-                    if (!rocmQuantGemm_allocFP16(&impl_->d_B_fp16, b_fp16_size, rocm_device_id_))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate FP16 B buffer");
-                        return false;
-                    }
-                    impl_->d_B_fp16_capacity = b_fp16_size;
-                }
-
-                if (c_fp16_size > impl_->d_C_fp16_capacity)
-                {
-                    if (impl_->d_C_fp16)
-                        rocmQuantGemm_freeDevice(impl_->d_C_fp16);
-                    impl_->d_C_fp16 = nullptr;
-                    impl_->d_C_fp16_capacity = 0;
-
-                    if (!rocmQuantGemm_allocFP16(&impl_->d_C_fp16, c_fp16_size, rocm_device_id_))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate FP16 C buffer");
-                        return false;
-                    }
-                    impl_->d_C_fp16_capacity = c_fp16_size;
-                }
-
-                // Execute with cached buffers (no allocations in hot path)
-                success = rocmQuantGemm_executeFP16_cached(
-                    d_A_int8, d_weights_int8, d_C_fp32,
-                    d_scales_A, d_scales_B,
-                    impl_->d_A_fp16, impl_->d_B_fp16, impl_->d_C_fp16,
-                    m, n, k, rocm_device_id_, nullptr);
-
-                if (!success)
-                {
-                    // Fallback to CK Two-Kernel if FP16 fails
-                    LOG_WARN("[ROCmQuantisedGemmKernel] FP16 cached failed, trying CK Two-Kernel fallback");
-                    success = rocmQuantGemm_executeTwoKernel(d_A_int8, d_weights_int8, d_C_fp32,
-                                                             d_scales_A, d_scales_B,
-                                                             m, n, k, rocm_device_id_);
-                }
-                break;
+                LOG_DEBUG("[ROCmQuantisedGemmKernel] Using CK TWO-KERNEL (M=" << m << ", N=" << n << ", K=" << k << ")");
             }
 
-            case GemmPath::CK_TWO_KERNEL:
-                // CK Two-Kernel: INT8→INT32 GEMM + separate scale kernel
-                // Default for 64 ≤ M ≤ 128, best accuracy + good performance
-                LOG_DEBUG("[ROCmQuantisedGemmKernel] Using CK TWO-KERNEL (M=" << m << ", N=" << n << ", K=" << k << ")");
-                success = rocmQuantGemm_executeTwoKernel(d_A_int8, d_weights_int8, d_C_fp32,
-                                                         d_scales_A, d_scales_B,
-                                                         m, n, k, rocm_device_id_);
-                if (!success)
-                {
-                    LOG_WARN("[ROCmQuantisedGemmKernel] CK Two-Kernel failed, trying hipBLAS fallback");
-                    success = rocmQuantGemm_executeHipBLAS(d_A_int8, d_weights_int8, d_C_fp32,
-                                                           d_scales_A, d_scales_B,
-                                                           m, n, k, rocm_device_id_);
-                }
-                break;
+            // Ensure cached INT32 accumulator buffer is large enough (use padded size)
+            const size_t ck_int32_size = static_cast<size_t>(padded_m) * n;
+            if (ck_int32_size > impl_->d_CK_int32_capacity)
+            {
+                if (impl_->d_CK_int32)
+                    rocmQuantGemm_freeDevice(impl_->d_CK_int32);
+                impl_->d_CK_int32 = nullptr;
+                impl_->d_CK_int32_capacity = 0;
 
-            case GemmPath::CK_FUSED:
-                // CK Fused: INT8→INT32 with fused scale application (legacy)
-                // Slightly lower accuracy (~0.9917 vs 0.9999 cosine)
-                LOG_DEBUG("[ROCmQuantisedGemmKernel] Using CK FUSED (M=" << m << ", N=" << n << ", K=" << k << ")");
-                success = rocmQuantGemm_executeDenseScale(d_A_int8, d_weights_int8, d_C_fp32,
-                                                          d_scales_A, d_scales_B,
-                                                          m, n, k, rocm_device_id_,
-                                                          nullptr, 0);
-                if (!success)
+                if (!rocmQuantGemm_allocInt32(&impl_->d_CK_int32, ck_int32_size, rocm_device_id_))
                 {
-                    LOG_WARN("[ROCmQuantisedGemmKernel] CK Fused failed, trying Two-Kernel fallback");
-                    success = rocmQuantGemm_executeTwoKernel(d_A_int8, d_weights_int8, d_C_fp32,
-                                                             d_scales_A, d_scales_B,
-                                                             m, n, k, rocm_device_id_);
+                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate CK INT32 buffer");
+                    return false;
                 }
-                break;
+                impl_->d_CK_int32_capacity = ck_int32_size;
+            }
 
-            case GemmPath::HIPBLAS_INT8:
-            default:
-                // hipBLAS INT8: Fallback for unsupported dimensions
-                LOG_DEBUG("[ROCmQuantisedGemmKernel] Using hipBLAS INT8 (M=" << m << ", N=" << n << ", K=" << k << ")");
-                success = rocmQuantGemm_executeHipBLAS(d_A_int8, d_weights_int8, d_C_fp32,
-                                                       d_scales_A, d_scales_B,
-                                                       m, n, k, rocm_device_id_);
-                break;
+            if (needs_padding)
+            {
+                // Padded execution: allocate padded buffers, run CK, extract first M rows
+                success = rocmQuantGemm_executeTwoKernel_padded(
+                    d_A_int8, d_weights_int8, d_C_fp32,
+                    d_scales_A, d_scales_B,
+                    impl_->d_CK_int32,
+                    m, padded_m, n, k, rocm_device_id_);
+            }
+            else
+            {
+                // Direct execution: no padding needed
+                success = rocmQuantGemm_executeTwoKernel_cached(
+                    d_A_int8, d_weights_int8, d_C_fp32,
+                    d_scales_A, d_scales_B,
+                    impl_->d_CK_int32,
+                    m, n, k, rocm_device_id_);
             }
 
             if (!success)
@@ -1010,6 +787,151 @@ namespace llaminar2
             }
 
             LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Completed " << m << "x" << n << "x" << k);
+            return true;
+        }
+
+        bool ROCmQuantisedGemmKernel::multiply_tensor_timed(
+            const TensorBase *A, TensorBase *C,
+            int m, int n, int k,
+            float *kernel_time_ms)
+        {
+            if (kernel_time_ms)
+                *kernel_time_ms = 0.0f;
+
+            if (!A || !C)
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Null tensor");
+                return false;
+            }
+
+            auto *A_fp32 = dynamic_cast<const FP32Tensor *>(A);
+            auto *C_fp32 = dynamic_cast<FP32Tensor *>(C);
+            if (!A_fp32)
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] A must be FP32Tensor");
+                return false;
+            }
+            if (!C_fp32)
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] C must be FP32Tensor");
+                return false;
+            }
+
+            // Get weight device pointers
+            int8_t *d_weights_int8 = impl_->d_weights_int8;
+            float *d_scales_B = impl_->d_scales_B;
+            if (!d_weights_int8 || !d_scales_B)
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Weights not uploaded");
+                return false;
+            }
+
+            // Ensure work buffers
+            ensureWorkBuffers(m);
+
+            int8_t *d_A_int8 = impl_->d_A_int8;
+            float *d_scales_A = impl_->d_scales_A;
+            int32_t *d_C_int32 = impl_->d_C_int32;
+
+            // Ensure FP32 activation buffer
+            const size_t a_fp32_size = static_cast<size_t>(m) * k;
+            if (a_fp32_size > impl_->d_A_fp32_capacity)
+            {
+                if (impl_->d_A_fp32)
+                    rocmQuantGemm_freeDevice(impl_->d_A_fp32);
+                if (!rocmQuantGemm_allocFloat(&impl_->d_A_fp32, a_fp32_size, rocm_device_id_))
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Failed to allocate A buffer");
+                    return false;
+                }
+                impl_->d_A_fp32_capacity = a_fp32_size;
+            }
+            float *d_A_fp32 = impl_->d_A_fp32;
+
+            // Copy activations H2D and quantize (OUTSIDE timing)
+            if (!rocmQuantGemm_copyHostToDevice(d_A_fp32, A_fp32->data(), a_fp32_size, rocm_device_id_))
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Failed to copy A");
+                return false;
+            }
+            if (!rocmQuantGemm_quantizeActivations(d_A_fp32, d_A_int8, d_scales_A, m, k, rocm_device_id_))
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Failed to quantize A");
+                return false;
+            }
+
+            // Ensure output buffer
+            const size_t c_fp32_size = static_cast<size_t>(m) * n;
+            if (c_fp32_size > impl_->d_C_fp32_capacity)
+            {
+                if (impl_->d_C_fp32)
+                    rocmQuantGemm_freeDevice(impl_->d_C_fp32);
+                if (!rocmQuantGemm_allocFloat(&impl_->d_C_fp32, c_fp32_size, rocm_device_id_))
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Failed to allocate C buffer");
+                    return false;
+                }
+                impl_->d_C_fp32_capacity = c_fp32_size;
+            }
+            float *d_C_fp32 = impl_->d_C_fp32;
+
+            // Calculate padding
+            int padded_m = getPaddedM(m);
+            bool needs_padding = (padded_m > m);
+
+            // Ensure INT32 accumulator buffer
+            const size_t ck_int32_size = static_cast<size_t>(padded_m) * n;
+            if (ck_int32_size > impl_->d_CK_int32_capacity)
+            {
+                if (impl_->d_CK_int32)
+                    rocmQuantGemm_freeDevice(impl_->d_CK_int32);
+                impl_->d_CK_int32 = nullptr;
+                if (!rocmQuantGemm_allocInt32(&impl_->d_CK_int32, ck_int32_size, rocm_device_id_))
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Failed to allocate INT32 buffer");
+                    return false;
+                }
+                impl_->d_CK_int32_capacity = ck_int32_size;
+            }
+
+            // Execute GEMM with HIP event timing (ONLY this is timed)
+            bool success = false;
+            if (needs_padding)
+            {
+                // Padded path doesn't have timed version yet, fall back to cached
+                success = rocmQuantGemm_executeTwoKernel_padded(
+                    d_A_int8, d_weights_int8, d_C_fp32,
+                    d_scales_A, d_scales_B,
+                    impl_->d_CK_int32,
+                    m, padded_m, n, k, rocm_device_id_);
+                // Can't get accurate timing for padded path without modifying it
+                if (kernel_time_ms)
+                    *kernel_time_ms = -1.0f; // Indicate timing not available
+            }
+            else
+            {
+                // Direct execution with timing
+                success = rocmQuantGemm_executeTwoKernel_timed(
+                    d_A_int8, d_weights_int8, d_C_fp32,
+                    d_scales_A, d_scales_B,
+                    impl_->d_CK_int32,
+                    m, n, k, rocm_device_id_,
+                    kernel_time_ms);
+            }
+
+            if (!success)
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] GEMM failed");
+                return false;
+            }
+
+            // Copy result D2H (OUTSIDE timing)
+            if (!rocmQuantGemm_copyDeviceToHost(C_fp32->mutable_data(), d_C_fp32, c_fp32_size, rocm_device_id_))
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Failed to copy C");
+                return false;
+            }
+
             return true;
         }
 
@@ -1095,7 +1017,7 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // IWorkspaceConsumer Interface Implementation (Phase 2 + Phase 3)
+        // IWorkspaceConsumer Interface Implementation
         // =====================================================================
 
         WorkspaceRequirements ROCmQuantisedGemmKernel::getWorkspaceRequirements(
@@ -1109,90 +1031,25 @@ namespace llaminar2
             if (k == 0)
                 k = static_cast<int>(K_);
 
-            // Select path to determine which buffers are needed
-            // selectGemmPath is a free function in rocm namespace
-            GemmPath path = selectGemmPath(m, n, k);
+            // INT8 path needs quantization + accumulator buffers
+            size_t quant_a_bytes = static_cast<size_t>(m) * k * sizeof(int8_t);
+            size_t scales_a_bytes = static_cast<size_t>(m) * sizeof(float);
+            size_t acc_int32_bytes = static_cast<size_t>(m) * n * sizeof(int32_t);
 
-            if (path == GemmPath::FP16_HIPBLAS)
-            {
-                // =====================================================================
-                // Phase 3: Check if slab mode should be used
-                //
-                // Slab mode is used when full FP16 conversion would exceed 80% of budget.
-                // Default budget is 64MB; actual budget comes from workspace when bound.
-                // =====================================================================
-                constexpr size_t DEFAULT_WORKSPACE_BUDGET = 64 * 1024 * 1024;
+            // Also need FP32 temp buffers for host→device transfer
+            size_t temp_a_fp32_bytes = static_cast<size_t>(m) * k * sizeof(float);
+            size_t temp_c_fp32_bytes = static_cast<size_t>(m) * n * sizeof(float);
 
-                // Check if slab mode should be used (large matrices that exceed budget)
-                if (rocmQuantGemm_shouldUseSlabFP16(m, n, k, DEFAULT_WORKSPACE_BUDGET))
-                {
-                    // Get optimal slab configuration
-                    SlabGemmConfig slab_config = SlabGemmConfig::fromBudget(
-                        DEFAULT_WORKSPACE_BUDGET, m, n, k, SlabDataType::FP16);
+            reqs.buffers.push_back({GemmWorkspaceBuffers::QUANT_A, quant_a_bytes, 256, true});
+            reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A, scales_a_bytes, 256, true});
+            reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32, acc_int32_bytes, 256, true});
+            reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_A_FP32, temp_a_fp32_bytes, 256, true});
+            reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
 
-                    // Request slab buffers via SlabGemmConfig::workspaceRequirements
-                    auto slab_reqs = slab_config.workspaceRequirements(SlabDataType::FP16);
-
-                    // Copy slab buffer requirements to our reqs, using standard GEMM buffer names
-                    for (const auto &buf : slab_reqs.buffers)
-                    {
-                        std::string name;
-                        if (buf.name.find("slab_a") != std::string::npos)
-                            name = GemmWorkspaceBuffers::SLAB_A_FP16;
-                        else if (buf.name.find("slab_b") != std::string::npos)
-                            name = GemmWorkspaceBuffers::SLAB_B_FP16;
-                        else if (buf.name.find("slab_c") != std::string::npos)
-                            name = GemmWorkspaceBuffers::SLAB_C_FP16;
-                        else
-                            name = buf.name;
-
-                        reqs.buffers.push_back({name, buf.size_bytes, buf.alignment, buf.required});
-                    }
-
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::getWorkspaceRequirements] FP16 SLAB path: "
-                              << slab_config.describe()
-                              << ", total=" << (slab_config.totalWorkspaceBytes(SlabDataType::FP16) / 1024) << "KB"
-                              << ", iterations=" << slab_config.estimateIterations(m, n, k));
-
-                    return reqs;
-                }
-
-                // Full FP16 path (fits in memory)
-                size_t a_fp16_bytes = static_cast<size_t>(m) * k * sizeof(uint16_t);
-                size_t b_fp16_bytes = static_cast<size_t>(k) * n * sizeof(uint16_t);
-                size_t c_fp16_bytes = static_cast<size_t>(m) * n * sizeof(uint16_t);
-
-                reqs.buffers.push_back({GemmWorkspaceBuffers::FULL_A_FP16, a_fp16_bytes, 256, true});
-                reqs.buffers.push_back({GemmWorkspaceBuffers::FULL_B_FP16, b_fp16_bytes, 256, true});
-                reqs.buffers.push_back({GemmWorkspaceBuffers::FULL_C_FP16, c_fp16_bytes, 256, true});
-
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::getWorkspaceRequirements] FP16 FULL path: "
-                          << "A=" << (a_fp16_bytes / 1024) << "KB, "
-                          << "B=" << (b_fp16_bytes / (1024 * 1024)) << "MB, "
-                          << "C=" << (c_fp16_bytes / 1024) << "KB");
-            }
-            else
-            {
-                // INT8 path needs quantization + accumulator buffers
-                size_t quant_a_bytes = static_cast<size_t>(m) * k * sizeof(int8_t);
-                size_t scales_a_bytes = static_cast<size_t>(m) * sizeof(float);
-                size_t acc_int32_bytes = static_cast<size_t>(m) * n * sizeof(int32_t);
-
-                // Also need FP32 temp buffers for host→device transfer
-                size_t temp_a_fp32_bytes = static_cast<size_t>(m) * k * sizeof(float);
-                size_t temp_c_fp32_bytes = static_cast<size_t>(m) * n * sizeof(float);
-
-                reqs.buffers.push_back({GemmWorkspaceBuffers::QUANT_A, quant_a_bytes, 256, true});
-                reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A, scales_a_bytes, 256, true});
-                reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32, acc_int32_bytes, 256, true});
-                reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_A_FP32, temp_a_fp32_bytes, 256, true});
-                reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
-
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
-                          << "quant_a=" << (quant_a_bytes / 1024) << "KB, "
-                          << "scales_a=" << (scales_a_bytes) << "B, "
-                          << "acc=" << (acc_int32_bytes / 1024) << "KB");
-            }
+            LOG_DEBUG("[ROCmQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
+                      << "quant_a=" << (quant_a_bytes / 1024) << "KB, "
+                      << "scales_a=" << (scales_a_bytes) << "B, "
+                      << "acc=" << (acc_int32_bytes / 1024) << "KB");
 
             return reqs;
         }

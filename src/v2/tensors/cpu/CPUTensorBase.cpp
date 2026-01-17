@@ -665,7 +665,7 @@ namespace llaminar2
         // If host is already valid, nothing to do
         if (host_valid_)
         {
-            LOG_DEBUG("[CPUTensorBase::ensureOnHost] Host already valid, skipping sync");
+            LOG_TRACE("[CPUTensorBase::ensureOnHost] Host already valid, skipping sync");
             return true;
         }
 

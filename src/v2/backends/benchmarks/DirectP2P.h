@@ -7,35 +7,31 @@
  *
  * ## Benchmarked Performance (RTX 3090 + MI50, PCIe 3.0)
  *
- * ### With Resizable BAR Enabled (RECOMMENDED)
+ * | Direction         | Method              | Speed     | Notes                        |
+ * |-------------------|---------------------|-----------|------------------------------|
+ * | NVIDIA → AMD      | CUDA writes to BAR  | 2.65 GB/s | PCIe posted writes           |
+ * | AMD → NVIDIA      | CUDA reads from BAR | 2.67 GB/s | SYMMETRIC with rBAR enabled  |
+ * | Mixed read+write  | Overlapped streams  | ~5.3 GB/s | Full bidirectional PCIe      |
+ *
+ * ### Without Resizable BAR (legacy 256MB BAR)
  *
  * | Direction         | Method              | Speed     | Notes                        |
  * |-------------------|---------------------|-----------|------------------------------|
- * | NVIDIA → AMD      | CUDA writes to BAR  | 2.85 GB/s | PCIe posted writes           |
- * | AMD → NVIDIA      | CUDA reads from BAR | 2.86 GB/s | SYMMETRIC with rBAR!         |
- * | NVIDIA → 2x AMD   | Concurrent writes   | 2.85 GB/s | Shared PCIe bandwidth        |
- * | 2x AMD → NVIDIA   | Concurrent reads    | 2.86 GB/s | Also symmetric               |
- * | Mixed read+write  | Overlapped streams  | 5.62 GB/s | Full bidirectional PCIe!     |
+ * | NVIDIA → AMD      | CUDA writes to BAR  | ~2.6 GB/s | PCIe posted writes (fast)    |
+ * | AMD → NVIDIA      | CUDA reads from BAR | ~0.8 GB/s | PCIe read completion (slow)  |
  *
- * ### Without Resizable BAR (legacy 256MB BAR1)
+ * **Note**: With Resizable BAR enabled, reads become symmetric with writes.
  *
- * | Direction         | Method              | Speed     | Notes                        |
- * |-------------------|---------------------|-----------|------------------------------|
- * | NVIDIA → AMD      | CUDA writes to BAR  | 2.65 GB/s | PCIe posted writes (fast)    |
- * | AMD → NVIDIA      | CUDA reads from BAR | 0.79 GB/s | PCIe read completion (slow)  |
- * | Mixed read+write  | Overlapped streams  | 1.58 GB/s | 30% improvement from overlap |
+ * ## Key Insight: Resizable BAR Eliminates Read/Write Asymmetry
  *
- * ## Key Insight: Resizable BAR Eliminates Asymmetry
+ * Without rBAR, PCIe has significant asymmetry between writes and reads:
+ * - **Posted writes**: Fire-and-forget, no response needed (~2.6 GB/s)
+ * - **Non-posted reads**: Requires completion packet (~0.8 GB/s)
  *
- * Without rBAR, PCIe has a fundamental 3.4x asymmetry between writes and reads:
- * - **Posted writes**: Fire-and-forget, no response needed (~2.65 GB/s)
- * - **Non-posted reads**: Requires completion packet (~0.79 GB/s)
+ * With Resizable BAR enabled, reads become nearly as fast as writes (~2.67 vs 2.65 GB/s).
  *
- * With rBAR enabled on NVIDIA (32GB BAR1), reads become as fast as writes!
- * This enables symmetric bidirectional transfers at full PCIe bandwidth.
- *
- * **Optimal Strategy**: Enable Resizable BAR in BIOS for both GPUs. NVIDIA must
- * initiate all transfers (HIP cannot register NVIDIA BAR as IoMemory).
+ * **Important**: Only NVIDIA can initiate transfers because HIP/ROCm cannot register
+ * NVIDIA's BAR as IoMemory. All cuMemcpy operations originate from CUDA.
  *
  * ## Implementation
  *
@@ -67,8 +63,8 @@
 namespace llaminar2
 {
 
-#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
-    // Full implementation when at least one GPU backend is available
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+    // Full implementation requires both CUDA and ROCm backends
 
     /**
      * @brief Information about a discovered PCIe BAR
@@ -92,13 +88,7 @@ namespace llaminar2
      */
     struct DirectP2PCapability
     {
-        // DMA-BUF capabilities (often fail in practice)
-        bool dmabuf_export_cuda = false; // CUDA can export DMA-BUF handles
-        bool dmabuf_export_rocm = false; // ROCm can export DMA-BUF handles
-        bool dmabuf_import_cuda = false; // CUDA can import external DMA-BUF
-        bool dmabuf_import_rocm = false; // ROCm can import external DMA-BUF
-
-        // PCIe BAR capabilities (the working path!)
+        // PCIe BAR capabilities
         bool pcie_bar_accessible = false;         // Can access GPU BAR directly (need root)
         bool pcie_bar_iomemory_supported = false; // CUDA supports IOMEMORY registration
         std::vector<PCIeBarInfo> discovered_bars; // Found AMD GPU BARs
@@ -111,24 +101,17 @@ namespace llaminar2
 
         bool canDoDirectP2P() const
         {
-            // PCIe BAR is the reliable path
-            if (pcie_bar_accessible && pcie_bar_iomemory_supported && !discovered_bars.empty())
-                return true;
-            // DMA-BUF is experimental fallback
-            return (dmabuf_export_cuda && dmabuf_import_rocm) ||
-                   (dmabuf_export_rocm && dmabuf_import_cuda);
-        }
-
-        bool canDoPCIeBarP2P() const
-        {
             return pcie_bar_accessible && pcie_bar_iomemory_supported && !discovered_bars.empty();
         }
+
+        // Alias for backward compatibility with code that used the more specific name
+        bool canDoPCIeBarP2P() const { return canDoDirectP2P(); }
 
         std::string describe() const;
     };
 
     /**
-     * @brief Result of a direct P2P transfer attempt
+     * @brief Result of a direct P2P transfer
      */
     struct DirectP2PResult
     {
@@ -136,15 +119,12 @@ namespace llaminar2
         double transfer_time_ms = 0.0;
         size_t bytes_transferred = 0;
         bool success = false;
-        bool used_dmabuf = false;         // True if DMA-BUF path succeeded
-        bool used_pcie_bar = false;       // True if PCIe BAR mapping path succeeded
-        bool fell_back_to_staged = false; // True if had to use host staging
-        bool used_overlap = false;        // True if overlapped read+write for speedup
+        bool used_overlap = false; // True if overlapped read+write for speedup
 
         // Direction-specific metrics for PCIe BAR
-        double read_gbps = 0.0;       // AMD→NVIDIA (read from BAR) ~0.79 GB/s
-        double write_gbps = 0.0;      // NVIDIA→AMD (write to BAR) ~2.65 GB/s
-        double concurrent_gbps = 0.0; // Overlapped operations ~1.58 GB/s effective
+        double read_gbps = 0.0;       // AMD→NVIDIA (read from BAR)
+        double write_gbps = 0.0;      // NVIDIA→AMD (write to BAR)
+        double concurrent_gbps = 0.0; // Overlapped operations
 
         // Multi-GPU metrics
         double dual_write_gbps = 0.0; // Writing to 2 AMD GPUs simultaneously
@@ -155,52 +135,35 @@ namespace llaminar2
     };
 
     /**
-     * @brief Shared buffer handle for cross-vendor access
-     */
-    struct DirectP2PBuffer
-    {
-        void *device_ptr = nullptr; // Native device pointer
-        int dmabuf_fd = -1;         // Linux DMA-BUF file descriptor
-        size_t size = 0;
-        DeviceId owner_device;
-        bool is_exported = false;
-
-        ~DirectP2PBuffer();
-
-        // Non-copyable
-        DirectP2PBuffer() = default;
-        DirectP2PBuffer(const DirectP2PBuffer &) = delete;
-        DirectP2PBuffer &operator=(const DirectP2PBuffer &) = delete;
-        DirectP2PBuffer(DirectP2PBuffer &&) noexcept;
-        DirectP2PBuffer &operator=(DirectP2PBuffer &&) noexcept;
-    };
-
-    /**
-     * @brief EXPERIMENTAL: Direct cross-vendor P2P engine
+     * @brief Direct cross-vendor P2P engine via PCIe BAR mapping
      *
-     * Attempts to establish true zero-copy P2P between CUDA and ROCm GPUs
-     * using PCIe BAR mapping (preferred) or Linux DMA-BUF (experimental).
+     * Establishes true zero-copy P2P between CUDA and ROCm GPUs
+     * using PCIe BAR mapping. No host memory staging - data flows
+     * directly over the PCIe bus between GPUs.
      *
-     * ## Usage (PCIe BAR - Recommended)
+     * ## Usage
      *
      * ```cpp
      * DirectP2PEngine engine;
      * // Initialize with all AMD GPUs for maximum parallelism
      * if (engine.initializePCIeBarMultiGPU(cuda_device, {rocm_device0, rocm_device1})) {
      *     // Tensor parallel: broadcast weights to all AMD GPUs
-     *     engine.broadcastToAMD(cuda_weights, size);  // ~2.65 GB/s
+     *     engine.broadcastToAMD(cuda_weights, size);  // ~2.85 GB/s with rBAR
      *
      *     // Gather activations from AMD GPUs with overlap
-     *     engine.gatherFromAMDOverlapped(cuda_activations, size);  // ~1.58 GB/s
+     *     engine.gatherFromAMDOverlapped(cuda_activations, size);
+     * } else {
+     *     // PCIe BAR P2P not available - handle error
      * }
      * ```
      *
-     * ## Direction Asymmetry (Measured)
+     * ## Transfer Performance
      *
-     * PCIe BAR transfers have 3.4x asymmetric performance:
-     * - **NVIDIA→AMD (write to BAR)**: 2.65 GB/s - PCIe posted writes
-     * - **AMD→NVIDIA (read from BAR)**: 0.79 GB/s - PCIe read latency
-     * - **Concurrent read+write**: 1.58 GB/s - 30% speedup from overlap
+     * Typical PCIe 3.0 x16 performance with Resizable BAR:
+     * - **NVIDIA→AMD (write to BAR)**: ~2.65 GB/s - PCIe posted writes
+     * - **AMD→NVIDIA (read from BAR)**: ~2.67 GB/s - Symmetric with rBAR
+     *
+     * Without rBAR, reads are ~3x slower than writes due to PCIe protocol.
      */
     class DirectP2PEngine
     {
@@ -226,7 +189,7 @@ namespace llaminar2
         static DirectP2PCapability probeCapabilities();
 
         //----------------------------------------------------------------------
-        // PCIe BAR Direct P2P (RECOMMENDED - Actually works!)
+        // Single-GPU PCIe BAR P2P
         //----------------------------------------------------------------------
 
         /**
@@ -238,7 +201,7 @@ namespace llaminar2
          * @param cuda_device NVIDIA GPU device
          * @param rocm_device AMD GPU device
          * @param bar_offset Offset into the BAR to map (usually 0)
-         * @param map_size Size to map (0 = auto-detect from BAR)
+         * @param map_size Size to map (0 = default 64MB)
          * @return true if PCIe BAR P2P was established
          */
         bool initializePCIeBar(DeviceId cuda_device, DeviceId rocm_device,
@@ -266,7 +229,7 @@ namespace llaminar2
          * @brief Get the host-mapped pointer to the BAR region
          *
          * This pointer is directly accessible by ROCm since it maps
-         * to AMD GPU memory. Used for BAR region allocation.
+         * to AMD GPU memory.
          *
          * @return Host pointer to mmap'd BAR region, or nullptr if not initialized
          */
@@ -310,14 +273,13 @@ namespace llaminar2
         /**
          * @brief Initialize PCIe BAR P2P with multiple AMD GPUs
          *
-         * Enables optimal tensor parallel strategies:
-         * - Broadcast from NVIDIA to all AMD GPUs (~2.65 GB/s per target)
-         * - Gather from all AMD GPUs with overlap (~1.58 GB/s effective)
+         * Enables tensor parallel weight distribution and activation gathering
+         * across multiple AMD GPUs. With rBAR, achieves ~2.65 GB/s per target.
          *
          * @param cuda_device NVIDIA GPU device
          * @param rocm_devices List of AMD GPU devices
          * @param map_size Size to map per BAR (0 = default 64MB)
-         * @return true if all BARs were successfully mapped
+         * @return true if at least one BAR was successfully mapped
          */
         bool initializePCIeBarMultiGPU(DeviceId cuda_device,
                                        const std::vector<DeviceId> &rocm_devices,
@@ -353,8 +315,11 @@ namespace llaminar2
         /**
          * @brief Gather data from all AMD GPUs to NVIDIA with overlap
          *
-         * Uses read operations (~0.79 GB/s per BAR) but overlaps them for
-         * ~30% improvement. For tensor parallel activation gathering.
+         * Uses read operations from AMD BARs. Performance depends on rBAR:
+         * - With rBAR: ~2.67 GB/s (symmetric with writes)
+         * - Without rBAR: ~0.8 GB/s (PCIe read latency)
+         *
+         * For tensor parallel activation gathering.
          *
          * @param cuda_dst Destination pointer in NVIDIA GPU memory
          * @param num_bytes Number of bytes to gather per GPU
@@ -371,7 +336,8 @@ namespace llaminar2
          * - Read from one AMD BAR (AMD→NVIDIA)
          * - Write to another AMD BAR (NVIDIA→AMD)
          *
-         * Achieves ~1.58 GB/s effective (30% faster than sequential).
+         * With rBAR enabled, achieves ~5.3 GB/s aggregate bidirectional bandwidth.
+         * Without rBAR, reads are slower so benefit from overlap is more modest.
          *
          * @param cuda_read_dst Destination for read (nullptr to skip)
          * @param read_bar_offset BAR offset to read from
@@ -394,75 +360,15 @@ namespace llaminar2
          */
         DirectP2PResult benchmarkAllModes(size_t num_bytes, int iterations = 5);
 
-        //----------------------------------------------------------------------
-        // DMA-BUF Direct P2P (Experimental - Often Fails)
-        //----------------------------------------------------------------------
-
-        /**
-         * @brief Initialize DMA-BUF-based direct P2P (experimental)
-         *
-         * @param device_a First device (CUDA or ROCm)
-         * @param device_b Second device (different vendor)
-         * @return true if direct P2P was established
-         */
-        bool initialize(DeviceId device_a, DeviceId device_b);
-
-        /**
-         * @brief Check if DMA-BUF direct P2P is active
-         */
-        bool isDirectP2PActive() const { return direct_p2p_active_; }
-
-        /**
-         * @brief Allocate a buffer exportable for cross-vendor access
-         *
-         * @param device Device to allocate on
-         * @param size Buffer size in bytes
-         * @return Shared buffer handle (empty on failure)
-         */
-        std::unique_ptr<DirectP2PBuffer> allocateExportable(DeviceId device, size_t size);
-
-        /**
-         * @brief Import a buffer from another vendor's device
-         *
-         * @param buffer Source buffer (must be exported)
-         * @param target_device Device to import to (different vendor)
-         * @return Device pointer on target device (nullptr on failure)
-         */
-        void *importBuffer(const DirectP2PBuffer &buffer, DeviceId target_device);
-
-        /**
-         * @brief Attempt direct P2P copy between devices
-         *
-         * Tries PCIe BAR first, then DMA-BUF, then host staging fallback.
-         *
-         * @param src_device Source device
-         * @param src_ptr Source pointer (on src_device)
-         * @param dst_device Destination device
-         * @param dst_ptr Destination pointer (on dst_device)
-         * @param num_bytes Bytes to copy
-         * @return Transfer result
-         */
-        DirectP2PResult transfer(DeviceId src_device, const void *src_ptr,
-                                 DeviceId dst_device, void *dst_ptr,
-                                 size_t num_bytes);
-
-        /**
-         * @brief Benchmark direct P2P between initialized devices
-         */
-        DirectP2PResult benchmark(size_t num_bytes, int iterations = 5);
-
     private:
         struct Impl;
         std::unique_ptr<Impl> impl_;
 
-        DeviceId device_a_;
-        DeviceId device_b_;
-        bool direct_p2p_active_ = false;
         bool pcie_bar_active_ = false;
     };
 
 #else
-    // Stub implementations when no GPU backends are available
+    // Stub implementations when both GPU backends are not available
 
     struct PCIeBarInfo
     {
@@ -471,8 +377,7 @@ namespace llaminar2
     struct DirectP2PCapability
     {
         bool canDoDirectP2P() const { return false; }
-        bool canDoPCIeBarP2P() const { return false; }
-        std::string describe() const { return "No GPU backends available"; }
+        std::string describe() const { return "DirectP2P requires both CUDA and ROCm backends"; }
     };
 
     struct DirectP2PResult
@@ -481,17 +386,8 @@ namespace llaminar2
         double transfer_time_ms = 0.0;
         size_t bytes_transferred = 0;
         bool success = false;
-        std::string error_message = "No GPU backends available";
+        std::string error_message = "DirectP2P requires both CUDA and ROCm backends";
         std::string transfer_path;
-    };
-
-    struct DirectP2PBuffer
-    {
-        void *device_ptr = nullptr;
-        int dmabuf_fd = -1;
-        size_t size = 0;
-        DeviceId owner_device;
-        bool is_exported = false;
     };
 
     class DirectP2PEngine
@@ -507,28 +403,24 @@ namespace llaminar2
         ~DirectP2PEngine() = default;
 
         static DirectP2PCapability probeCapabilities() { return {}; }
-        static std::vector<PCIeBarInfo> discoverBars() { return {}; }
 
-        bool initializePCIeBar(DeviceId, DeviceId, size_t = 0) { return false; }
+        bool initializePCIeBar(DeviceId, DeviceId, size_t = 0, size_t = 0) { return false; }
         bool initializePCIeBarMultiGPU(DeviceId, const std::vector<DeviceId> &, size_t = 0) { return false; }
         bool isPCIeBarActive() const { return false; }
-        std::vector<size_t> getMappedBarSizes() const { return {}; }
-        size_t getMappedBarSize(int = 0) const { return 0; }
-        DirectP2PResult transferPCIeBar(Direction, const void *, void *, size_t, int = 0) { return {}; }
-        DirectP2PResult transferPCIeBarAsync(Direction, const void *, void *, size_t, int = 0) { return {}; }
-        DirectP2PResult broadcastToAMD(const void *, size_t) { return {}; }
-        DirectP2PResult gatherFromAMDSequential(void *, size_t) { return {}; }
-        DirectP2PResult gatherFromAMDOverlapped(void *, size_t) { return {}; }
+        void *getCudaBarPointer() const { return nullptr; }
+        size_t getBarMappedSize() const { return 0; }
+        void *getBarHostPtr() const { return nullptr; }
+        size_t getBarOffset() const { return 0; }
+        size_t getNumMappedBars() const { return 0; }
+        void *getCudaBarPointerForDevice(int) const { return nullptr; }
+        DirectP2PResult transferViaPCIeBar(void *, size_t, size_t, Direction) { return {}; }
+        DirectP2PResult benchmarkPCIeBar(size_t, int = 5) { return {}; }
+        DirectP2PResult broadcastToAMD(const void *, size_t, void * = nullptr) { return {}; }
+        DirectP2PResult gatherFromAMDOverlapped(void *, size_t, void * = nullptr) { return {}; }
         DirectP2PResult transferOverlapped(void *, size_t, size_t, const void *, size_t, size_t) { return {}; }
         DirectP2PResult benchmarkAllModes(size_t, int = 5) { return {}; }
-        bool initialize(DeviceId, DeviceId) { return false; }
-        bool isDirectP2PActive() const { return false; }
-        std::unique_ptr<DirectP2PBuffer> allocateExportable(DeviceId, size_t) { return nullptr; }
-        void *importBuffer(const DirectP2PBuffer &, DeviceId) { return nullptr; }
-        DirectP2PResult transfer(DeviceId, const void *, DeviceId, void *, size_t) { return {}; }
-        DirectP2PResult benchmark(size_t, int = 5) { return {}; }
     };
 
-#endif // HAVE_CUDA || HAVE_ROCM
+#endif // HAVE_CUDA && HAVE_ROCM
 
 } // namespace llaminar2

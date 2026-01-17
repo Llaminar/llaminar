@@ -320,8 +320,8 @@ endif()
 # ComposableKernel (CK) Auto-Clone for ROCm INT8 GEMM
 # =============================================================================
 # CK is AMD's template-based GPU kernel library. We use a fork that includes
-# a fix for DeviceGemmMultipleD_Dl when FloatAcc != FloatC (INT8 GEMM with FP32 output).
-# See: https://github.com/ROCm/composable_kernel/pull/3565
+# fixes for gfx906 (MI50/MI60) GPUs which don't have MFMA instructions.
+# See: https://github.com/ROCm/composable_kernel/pull/3593
 if(HAVE_ROCM)
     find_package(Git REQUIRED)
 
@@ -329,8 +329,8 @@ if(HAVE_ROCM)
     get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(CK_EXTERNAL_DIR "${REPO_ROOT}/external/composable_kernel")
     set(CK_GIT_URL "https://github.com/dbsanfte/composable_kernel.git")
-    # Track our fork's fix branch for INT8 GEMM with FP32 output scaling
-    set(CK_GIT_REF "fix/multiple-d-floatc-output")
+    # Track our fork's fix branch for gfx906 issues (OOB buffer loads, etc.)
+    set(CK_GIT_REF "gfx-906-issues")
 
     if(NOT EXISTS "${REPO_ROOT}/external")
         file(MAKE_DIRECTORY ${REPO_ROOT}/external)
@@ -388,8 +388,6 @@ if(HAVE_ROCM)
     set(ROCM_KERNEL_SOURCES
         kernels/rocm/HipBLASGemmKernel.cpp      # hipBLAS wrapper for FP32/FP16 dense GEMM
         kernels/rocm/ROCmQuantisedGemmKernel_CK.hip  # ComposableKernel INT8 GEMM implementation
-        kernels/rocm/ROCmQuantisedGemmKernel_FP16.hip  # FP16 GEMM path (alternative to INT8)
-        kernels/rocm/ROCmQuantisedGemmKernel_SlabFP16.hip  # Slab-based FP16 workspace GEMM
     )
     
     # ROCm enumeration and backend must be compiled with hipcc to use HIP runtime
@@ -461,10 +459,8 @@ if(HAVE_CUDA AND HAVE_ROCM)
         backends/benchmarks/CrossVendorP2P.cpp
         backends/benchmarks/CrossVendorP2P_CUDA.cu
         backends/benchmarks/CrossVendorP2P_ROCm.cpp
-        # EXPERIMENTAL: Direct P2P via Linux DMA-BUF
+        # Direct P2P via PCIe BAR mapping (no DMA-BUF, no fallback)
         backends/benchmarks/DirectP2P.cpp
-        backends/benchmarks/DirectP2P_CUDA.cu
-        backends/benchmarks/DirectP2P_ROCm.cpp
         # HostBackend runtime-specific helpers (must be in separate compilation units)
         collective/backends/HostBackendCUDA.cu
         collective/backends/HostBackendROCm.cpp
