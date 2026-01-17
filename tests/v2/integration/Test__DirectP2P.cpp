@@ -8,7 +8,7 @@
 
 #include <gtest/gtest.h>
 
-#include "backends/benchmarks/DirectP2P.h"
+#include "backends/p2p/DirectP2P.h"
 #include "utils/Logger.h"
 
 #ifdef HAVE_CUDA
@@ -232,7 +232,7 @@ namespace llaminar2
 
             auto start_time = std::chrono::steady_clock::now();
             auto end_time = start_time + std::chrono::seconds(60);
-            
+
             size_t total_bytes = 0;
             int iterations = 0;
 
@@ -243,17 +243,18 @@ namespace llaminar2
                 iterations++;
 
                 auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::steady_clock::now() - start_time).count();
-                
-                LOG_INFO("[" << elapsed << "s] Iteration " << iterations 
-                         << ": R=" << result.read_gbps << " GB/s, W=" << result.write_gbps << " GB/s");
+                                   std::chrono::steady_clock::now() - start_time)
+                                   .count();
+
+                LOG_INFO("[" << elapsed << "s] Iteration " << iterations
+                             << ": R=" << result.read_gbps << " GB/s, W=" << result.write_gbps << " GB/s");
             }
 
             double total_gb = total_bytes / (1024.0 * 1024.0 * 1024.0);
             LOG_INFO("\n=== 60-Second Stress Test Complete ===");
             LOG_INFO("  Total data transferred: " << total_gb << " GB");
             LOG_INFO("  Iterations completed: " << iterations);
-            
+
             EXPECT_GT(iterations, 0);
         }
 

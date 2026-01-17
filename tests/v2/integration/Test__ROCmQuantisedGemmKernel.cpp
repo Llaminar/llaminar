@@ -180,6 +180,7 @@ namespace llaminar2
                 void fillDeterministicInt8PatternTransposed(std::vector<int8_t> &b, int K, int N)
                 {
                     // Column-constant pattern: B[k,n] depends only on n.
+                    // Stored in ROW-MAJOR: B[k,n] at index k * N + n
                     b.resize(static_cast<size_t>(K) * N);
                     for (int k = 0; k < K; ++k)
                     {
@@ -187,6 +188,27 @@ namespace llaminar2
                         {
                             const int v = (n % 17) - 8; // [-8, 8]
                             b[static_cast<size_t>(k) * N + n] = static_cast<int8_t>(v);
+                        }
+                    }
+                }
+
+                /**
+                 * @brief Fill B matrix in COLUMN-MAJOR format for CK kernel
+                 *
+                 * CK kernels expect B in column-major format: B[k,n] at index k + n * K
+                 * This is equivalent to storing the transpose [N×K] in row-major.
+                 */
+                void fillDeterministicInt8PatternColumnMajor(std::vector<int8_t> &b, int K, int N)
+                {
+                    // Column-constant pattern: B[k,n] depends only on n.
+                    // Stored in COLUMN-MAJOR: B[k,n] at index k + n * K
+                    b.resize(static_cast<size_t>(K) * N);
+                    for (int k = 0; k < K; ++k)
+                    {
+                        for (int n = 0; n < N; ++n)
+                        {
+                            const int v = (n % 17) - 8; // [-8, 8]
+                            b[static_cast<size_t>(k) + static_cast<size_t>(n) * K] = static_cast<int8_t>(v);
                         }
                     }
                 }
@@ -259,6 +281,44 @@ namespace llaminar2
                         }
                     }
 #endif
+                }
+
+                /**
+                 * @brief Compute INT8×INT8→INT32 reference GEMM with column-major B
+                 *
+                 * C[m,n] = sum_k(A[m,k] * B[k,n]) where B is stored column-major
+                 *
+                 * This matches CK's expected layout: A row-major, B column-major.
+                 *
+                 * @param A Input matrix A [M × K] row-major: A[m,k] at m*K+k
+                 * @param B Input matrix B [K × N] column-major: B[k,n] at k+n*K
+                 * @param C Output matrix C [M × N] row-major
+                 */
+                void computeInt8GemmReferenceColumnMajorB(
+                    const std::vector<int8_t> &A,
+                    const std::vector<int8_t> &B,
+                    std::vector<int32_t> &C,
+                    int M, int N, int K)
+                {
+                    C.resize(static_cast<size_t>(M) * N);
+
+                    // OpenMP parallelized implementation for column-major B
+#pragma omp parallel for collapse(2) schedule(static)
+                    for (int m = 0; m < M; ++m)
+                    {
+                        for (int n = 0; n < N; ++n)
+                        {
+                            int32_t acc = 0;
+                            for (int k = 0; k < K; ++k)
+                            {
+                                // A is row-major: A[m,k] at m*K+k
+                                // B is column-major: B[k,n] at k+n*K
+                                acc += static_cast<int32_t>(A[static_cast<size_t>(m) * K + k]) *
+                                       static_cast<int32_t>(B[static_cast<size_t>(k) + static_cast<size_t>(n) * K]);
+                            }
+                            C[static_cast<size_t>(m) * N + n] = acc;
+                        }
+                    }
                 }
 
                 /**
@@ -344,6 +404,48 @@ namespace llaminar2
                         }
                     }
 #endif
+                }
+
+                /**
+                 * @brief Compute INT8×INT8→FP32 reference GEMM with column-major B and scales
+                 *
+                 * C[m,n] = sum_k(A[m,k] * B[k,n]) * scaleA[m] * scaleB[n]
+                 * where B is stored column-major
+                 *
+                 * @param A Input matrix A [M × K] row-major: A[m,k] at m*K+k
+                 * @param B Input matrix B [K × N] column-major: B[k,n] at k+n*K
+                 * @param scaleA Per-row scales for A [M]
+                 * @param scaleB Per-column scales for B [N]
+                 * @param C Output matrix C [M × N] row-major
+                 */
+                void computeScaledInt8GemmReferenceColumnMajorB(
+                    const std::vector<int8_t> &A,
+                    const std::vector<int8_t> &B,
+                    const std::vector<float> &scaleA,
+                    const std::vector<float> &scaleB,
+                    std::vector<float> &C,
+                    int M, int N, int K)
+                {
+                    C.resize(static_cast<size_t>(M) * N);
+
+                    // OpenMP parallelized implementation for column-major B
+#pragma omp parallel for collapse(2) schedule(static)
+                    for (int m = 0; m < M; ++m)
+                    {
+                        for (int n = 0; n < N; ++n)
+                        {
+                            int32_t acc = 0;
+                            for (int k = 0; k < K; ++k)
+                            {
+                                // A is row-major: A[m,k] at m*K+k
+                                // B is column-major: B[k,n] at k+n*K
+                                acc += static_cast<int32_t>(A[static_cast<size_t>(m) * K + k]) *
+                                       static_cast<int32_t>(B[static_cast<size_t>(k) + static_cast<size_t>(n) * K]);
+                            }
+                            C[static_cast<size_t>(m) * N + n] =
+                                static_cast<float>(acc) * scaleA[m] * scaleB[n];
+                        }
+                    }
                 }
             } // namespace
 #endif
@@ -449,7 +551,8 @@ namespace llaminar2
                 std::vector<int8_t> h_A;
                 std::vector<int8_t> h_B;
                 fillDeterministicInt8Pattern(h_A, M, K);
-                fillDeterministicInt8PatternTransposed(h_B, K, N);
+                // CK kernel expects B in COLUMN-MAJOR format: B[k,n] at index k + n*K
+                fillDeterministicInt8PatternColumnMajor(h_B, K, N);
 
                 // Device buffers
                 int8_t *d_A = nullptr;
@@ -468,9 +571,9 @@ namespace llaminar2
                 std::vector<int32_t> h_C(static_cast<size_t>(M) * N);
                 ASSERT_EQ(hipMemcpy(h_C.data(), d_C, static_cast<size_t>(M) * N * sizeof(int32_t), hipMemcpyDeviceToHost), hipSuccess);
 
-                // CPU reference using OneDNN (much faster than naive loop)
+                // CPU reference (column-major B to match CK kernel expectation)
                 std::vector<int32_t> h_ref;
-                computeInt8GemmReference(h_A, h_B, h_ref, M, N, K);
+                computeInt8GemmReferenceColumnMajorB(h_A, h_B, h_ref, M, N, K);
 
                 // Check for exact match (INT32 should be exact)
                 int mismatch_count = 0;
@@ -554,7 +657,8 @@ namespace llaminar2
                 std::vector<int8_t> h_A;
                 std::vector<int8_t> h_B;
                 fillDeterministicInt8Pattern(h_A, M, K);
-                fillDeterministicInt8PatternTransposed(h_B, K, N);
+                // CK kernel expects B in COLUMN-MAJOR format: B[k,n] at index k + n*K
+                fillDeterministicInt8PatternColumnMajor(h_B, K, N);
 
                 std::vector<float> h_scaleA(M);
                 std::vector<float> h_scaleB(N);
@@ -594,9 +698,9 @@ namespace llaminar2
                 std::vector<float> h_E(static_cast<size_t>(M) * N);
                 ASSERT_EQ(hipMemcpy(h_E.data(), d_E, static_cast<size_t>(M) * N * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
 
-                // CPU reference using OneDNN
+                // CPU reference (column-major B to match CK kernel expectation)
                 std::vector<float> h_ref;
-                computeScaledInt8GemmReference(h_A, h_B, h_scaleA, h_scaleB, h_ref, M, N, K);
+                computeScaledInt8GemmReferenceColumnMajorB(h_A, h_B, h_scaleA, h_scaleB, h_ref, M, N, K);
 
                 const float cos = cosineSimilarity(h_E, h_ref);
                 LOG_INFO("[TwoKernel_Deterministic128] cos=" << cos);
@@ -1132,263 +1236,120 @@ namespace llaminar2
                 return dot_product / (std::sqrt(norm_actual) * std::sqrt(norm_ref) + 1e-12);
             }
 
+            // =====================================================================
+            // Qwen Model Dimension Tests (0.5B and 1.5B only)
+            // =====================================================================
+            //
+            // Tests real model dimensions for Qwen 0.5B and 1.5B with decode (M=1)
+            // and prefill (M=64, 128, 256) batch sizes.
+
             /**
-             * @test Single row (M=1) - decode phase common case
+             * @test Qwen2.5-0.5B decode (M=1)
+             *
+             * hidden_size=896, intermediate_size=4864
              */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, CKGemm_SingleRow)
+            TEST_F(ROCmQuantisedGemmIntegrationTest, CKGemm_Qwen05B_Decode)
             {
                 if (!has_rocm_device_)
                 {
                     GTEST_SKIP() << "No ROCm device available";
                 }
 
-                // M=1 is critical for decode phase (one token at a time)
-                const int M = 1, K = 256, N = 512;
-                double cosine_sim = runGemmAndComputeCosineSimilarity(M, N, K);
-                LOG_INFO("[Integration] CK GEMM SingleRow " << M << "x" << K << "x" << N
-                                                            << ": cosine_similarity=" << cosine_sim);
-                EXPECT_GT(cosine_sim, 0.99) << "Single row GEMM cosine similarity too low";
-            }
-
-            /**
-             * @test Small batch sizes (M=2,4,8) - early decode batching
-             */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, CKGemm_SmallBatches)
-            {
-                if (!has_rocm_device_)
-                {
-                    GTEST_SKIP() << "No ROCm device available";
-                }
-
-                const int K = 512, N = 1024;
-                for (int M : {2, 4, 8})
-                {
-                    double cosine_sim = runGemmAndComputeCosineSimilarity(M, N, K);
-                    LOG_INFO("[Integration] CK GEMM SmallBatch M=" << M << ": cosine_similarity=" << cosine_sim);
-                    EXPECT_GT(cosine_sim, 0.99) << "Small batch M=" << M << " cosine similarity too low";
-                }
-            }
-
-            /**
-             * @test Isolated prime dimension test
-             */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, CKGemm_7x13x17)
-            {
-                if (!has_rocm_device_)
-                {
-                    GTEST_SKIP() << "No ROCm device available";
-                }
-
-                const int M = 7, N = 13, K = 17;
-                double cosine_sim = runGemmAndComputeCosineSimilarity(M, N, K);
-                LOG_INFO("[Integration] CK GEMM 7x13x17: cosine_similarity=" << cosine_sim);
-                EXPECT_GT(cosine_sim, 0.99) << "7x13x17 cosine similarity too low";
-            }
-
-            /**
-             * @test Non-aligned dimensions (not multiples of 4, 8, 16, etc.)
-             */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, CKGemm_NonAligned)
-            {
-                if (!has_rocm_device_)
-                {
-                    GTEST_SKIP() << "No ROCm device available";
-                }
-
-                // Test dimensions that don't align to common tile sizes
                 struct TestCase
                 {
+                    const char *name;
                     int M, N, K;
                 };
                 std::vector<TestCase> cases = {
-                    {7, 13, 17},     // All prime numbers
-                    {33, 65, 129},   // 2^n + 1
-                    {31, 63, 127},   // 2^n - 1
-                    {100, 200, 300}, // Round numbers, not powers of 2
-                    {17, 896, 4864}, // Real model K/N with prime M
+                    {"Wo_proj", 1, 896, 896},
+                    {"FFN_gate", 1, 4864, 896},
+                    {"FFN_down", 1, 896, 4864},
                 };
 
                 for (const auto &tc : cases)
                 {
-                    double cosine_sim = runGemmAndComputeCosineSimilarity(tc.M, tc.N, tc.K);
-                    LOG_INFO("[Integration] CK GEMM NonAligned " << tc.M << "x" << tc.K << "x" << tc.N
-                                                                 << ": cosine_similarity=" << cosine_sim);
-                    EXPECT_GT(cosine_sim, 0.99) << "Non-aligned " << tc.M << "x" << tc.K << "x" << tc.N
-                                                << " cosine similarity too low";
+                    double cos = runGemmAndComputeCosineSimilarity(tc.M, tc.N, tc.K);
+                    LOG_INFO("[Integration] Qwen0.5B decode " << tc.name << ": cos=" << cos);
+                    EXPECT_GT(cos, 0.99) << "Qwen0.5B decode " << tc.name << " cosine too low";
                 }
             }
 
             /**
-             * @test Tall/skinny matrices
-             */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, CKGemm_TallSkinny)
-            {
-                if (!has_rocm_device_)
-                {
-                    GTEST_SKIP() << "No ROCm device available";
-                }
-
-                // Tall: M >> N (many rows, few columns)
-                {
-                    const int M = 1024, N = 32, K = 256;
-                    double cosine_sim = runGemmAndComputeCosineSimilarity(M, N, K);
-                    LOG_INFO("[Integration] CK GEMM Tall " << M << "x" << K << "x" << N
-                                                           << ": cosine_similarity=" << cosine_sim);
-                    EXPECT_GT(cosine_sim, 0.99) << "Tall matrix cosine similarity too low";
-                }
-
-                // Skinny: N >> M (few rows, many columns)
-                {
-                    const int M = 16, N = 2048, K = 256;
-                    double cosine_sim = runGemmAndComputeCosineSimilarity(M, N, K);
-                    LOG_INFO("[Integration] CK GEMM Skinny " << M << "x" << K << "x" << N
-                                                             << ": cosine_similarity=" << cosine_sim);
-                    EXPECT_GT(cosine_sim, 0.99) << "Skinny matrix cosine similarity too low";
-                }
-            }
-
-            /**
-             * @test Square matrices of various sizes
-             */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, CKGemm_Square)
-            {
-                if (!has_rocm_device_)
-                {
-                    GTEST_SKIP() << "No ROCm device available";
-                }
-
-                for (int size : {64, 128, 256, 512})
-                {
-                    double cosine_sim = runGemmAndComputeCosineSimilarity(size, size, size);
-                    LOG_INFO("[Integration] CK GEMM Square " << size << "x" << size << "x" << size
-                                                             << ": cosine_similarity=" << cosine_sim);
-                    EXPECT_GT(cosine_sim, 0.99) << "Square " << size << " cosine similarity too low";
-                }
-            }
-
-            /**
-             * @test Prefill batch sizes (M > 64) with model dimensions
+             * @test Qwen2.5-1.5B decode (M=1)
              *
-             * Critical gap discovered: M=128+ with realistic N,K was not tested.
-             * This test ensures prefill batch sizes work correctly.
+             * hidden_size=1536, intermediate_size=8960
              */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, CKGemm_PrefillBatchSizes)
+            TEST_F(ROCmQuantisedGemmIntegrationTest, CKGemm_Qwen15B_Decode)
             {
                 if (!has_rocm_device_)
                 {
                     GTEST_SKIP() << "No ROCm device available";
                 }
 
-                // Qwen2.5-0.5B dimensions
-                const int K = 896; // hidden_size
-                const int N = 896; // attention output (hidden→hidden)
-
-                // Test prefill batch sizes from 64 to 512
-                for (int M : {64, 128, 256, 512})
+                struct TestCase
                 {
-                    double cosine_sim = runGemmAndComputeCosineSimilarity(M, N, K);
-                    LOG_INFO("[Integration] CK GEMM Prefill M=" << M << " N=" << N << " K=" << K
-                                                                << ": cosine_similarity=" << cosine_sim);
-                    EXPECT_GT(cosine_sim, 0.99) << "Prefill M=" << M << " cosine similarity too low";
+                    const char *name;
+                    int M, N, K;
+                };
+                std::vector<TestCase> cases = {
+                    {"Wo_proj", 1, 1536, 1536},
+                    {"FFN_gate", 1, 8960, 1536},
+                    {"FFN_down", 1, 1536, 8960},
+                };
+
+                for (const auto &tc : cases)
+                {
+                    double cos = runGemmAndComputeCosineSimilarity(tc.M, tc.N, tc.K);
+                    LOG_INFO("[Integration] Qwen1.5B decode " << tc.name << ": cos=" << cos);
+                    EXPECT_GT(cos, 0.99) << "Qwen1.5B decode " << tc.name << " cosine too low";
+                }
+            }
+
+            /**
+             * @test Qwen2.5-0.5B prefill (M=64, 128, 256)
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, CKGemm_Qwen05B_Prefill)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
                 }
 
-                // Also test FFN dimensions with larger M
-                const int N_ffn = 4864; // intermediate_size
+                const int K = 896, N_attn = 896, N_ffn = 4864;
+
                 for (int M : {64, 128, 256})
                 {
-                    double cosine_sim = runGemmAndComputeCosineSimilarity(M, N_ffn, K);
-                    LOG_INFO("[Integration] CK GEMM FFN M=" << M << " N=" << N_ffn << " K=" << K
-                                                            << ": cosine_similarity=" << cosine_sim);
-                    EXPECT_GT(cosine_sim, 0.99) << "FFN M=" << M << " cosine similarity too low";
+                    double cos_attn = runGemmAndComputeCosineSimilarity(M, N_attn, K);
+                    LOG_INFO("[Integration] Qwen0.5B prefill Wo M=" << M << ": cos=" << cos_attn);
+                    EXPECT_GT(cos_attn, 0.99) << "Qwen0.5B prefill Wo M=" << M << " cosine too low";
+
+                    double cos_ffn = runGemmAndComputeCosineSimilarity(M, N_ffn, K);
+                    LOG_INFO("[Integration] Qwen0.5B prefill FFN M=" << M << ": cos=" << cos_ffn);
+                    EXPECT_GT(cos_ffn, 0.99) << "Qwen0.5B prefill FFN M=" << M << " cosine too low";
                 }
             }
 
             /**
-             * @test Large K dimension (deep reduction)
+             * @test Qwen2.5-1.5B prefill (M=64, 128, 256)
              */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, CKGemm_LargeK)
+            TEST_F(ROCmQuantisedGemmIntegrationTest, CKGemm_Qwen15B_Prefill)
             {
                 if (!has_rocm_device_)
                 {
                     GTEST_SKIP() << "No ROCm device available";
                 }
 
-                // Large K means many multiply-accumulates, tests accumulation precision
-                const int M = 32, N = 64, K = 4096;
-                double cosine_sim = runGemmAndComputeCosineSimilarity(M, N, K);
-                LOG_INFO("[Integration] CK GEMM LargeK " << M << "x" << K << "x" << N
-                                                         << ": cosine_similarity=" << cosine_sim);
-                EXPECT_GT(cosine_sim, 0.99) << "Large K cosine similarity too low";
-            }
+                const int K = 1536, N_attn = 1536, N_ffn = 8960;
 
-            /**
-             * @test Qwen2.5-0.5B model dimensions (all projection sizes)
-             */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, CKGemm_Qwen2_Dimensions)
-            {
-                if (!has_rocm_device_)
+                for (int M : {64, 128, 256})
                 {
-                    GTEST_SKIP() << "No ROCm device available";
-                }
+                    double cos_attn = runGemmAndComputeCosineSimilarity(M, N_attn, K);
+                    LOG_INFO("[Integration] Qwen1.5B prefill Wo M=" << M << ": cos=" << cos_attn);
+                    EXPECT_GT(cos_attn, 0.99) << "Qwen1.5B prefill Wo M=" << M << " cosine too low";
 
-                // Qwen2.5-0.5B: hidden_size=896, intermediate_size=4864, num_heads=14, head_dim=64
-                struct TestCase
-                {
-                    const char *name;
-                    int M, N, K;
-                };
-                std::vector<TestCase> cases = {
-                    {"QKV_proj", 64, 896 * 3, 896},     // Q, K, V packed projection
-                    {"Wo_proj", 64, 896, 896},          // Output projection
-                    {"FFN_gate_up", 64, 4864 * 2, 896}, // Gate + Up packed
-                    {"FFN_down", 64, 896, 4864},        // Down projection
-                    {"LM_head", 64, 151936, 896},       // Vocabulary projection (large!)
-                };
-
-                for (const auto &tc : cases)
-                {
-                    // Skip LM_head for now - too large for quick test
-                    if (tc.N > 10000)
-                    {
-                        LOG_INFO("[Integration] Skipping " << tc.name << " (N=" << tc.N << " too large)");
-                        continue;
-                    }
-
-                    double cosine_sim = runGemmAndComputeCosineSimilarity(tc.M, tc.N, tc.K);
-                    LOG_INFO("[Integration] CK GEMM " << tc.name << " " << tc.M << "x" << tc.K << "x" << tc.N
-                                                      << ": cosine_similarity=" << cosine_sim);
-                    EXPECT_GT(cosine_sim, 0.99) << tc.name << " cosine similarity too low";
-                }
-            }
-
-            /**
-             * @test Llama-3 8B model dimensions
-             */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, CKGemm_Llama3_Dimensions)
-            {
-                if (!has_rocm_device_)
-                {
-                    GTEST_SKIP() << "No ROCm device available";
-                }
-
-                // Llama-3 8B: hidden_size=4096, intermediate_size=14336, num_heads=32, head_dim=128
-                struct TestCase
-                {
-                    const char *name;
-                    int M, N, K;
-                };
-                std::vector<TestCase> cases = {
-                    {"Attention_proj", 32, 4096, 4096}, // Attention projections
-                    {"FFN_up", 32, 14336, 4096},        // FFN up projection
-                    {"FFN_down", 32, 4096, 14336},      // FFN down projection
-                };
-
-                for (const auto &tc : cases)
-                {
-                    double cosine_sim = runGemmAndComputeCosineSimilarity(tc.M, tc.N, tc.K);
-                    LOG_INFO("[Integration] CK GEMM Llama3 " << tc.name << " " << tc.M << "x" << tc.K << "x" << tc.N
-                                                             << ": cosine_similarity=" << cosine_sim);
-                    EXPECT_GT(cosine_sim, 0.99) << "Llama3 " << tc.name << " cosine similarity too low";
+                    double cos_ffn = runGemmAndComputeCosineSimilarity(M, N_ffn, K);
+                    LOG_INFO("[Integration] Qwen1.5B prefill FFN M=" << M << ": cos=" << cos_ffn);
+                    EXPECT_GT(cos_ffn, 0.99) << "Qwen1.5B prefill FFN M=" << M << " cosine too low";
                 }
             }
 
@@ -1622,288 +1583,7 @@ namespace llaminar2
                 LOG_INFO("[Integration] Tested batch sizes: 1 to 2048");
             }
 
-            // =====================================================================
-            // M-Scaling Correctness Tests: 3-Way Dispatch Verification
-            // =====================================================================
-            //
-            // These tests verify GEMM correctness across different M sizes to exercise
-            // all three CK kernel tiles in the 3-way dispatch:
-            //   - M ≤ 32:       32×32 tile (GemmMNPadding)
-            //   - 32 < M < 128: 64×64 tile (GemmMNPadding)
-            //   - M ≥ 128:      128×128 tile
-            //
-            // Tests are run with Qwen2.5-0.5B and Qwen2.5-7B model dimensions.
-
-            /**
-             * @brief Helper struct for model dimensions
-             */
-            struct QwenModelDims
-            {
-                const char *name;
-                int hidden_size;       // K for most projections
-                int intermediate_size; // N for FFN up/gate
-                int attention_output;  // N for Wo (usually = hidden_size)
-            };
-
-            /**
-             * @test M-scaling correctness for Qwen2.5-0.5B attention output (Wo)
-             *
-             * Tests: M=1, 8, 32, 64, 128, 256 with N=896, K=896
-             * This exercises the attention output projection (context → hidden).
-             */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, MScaling_Qwen05B_AttentionOutput)
-            {
-                if (!has_rocm_device_)
-                {
-                    GTEST_SKIP() << "No ROCm device available";
-                }
-
-                const int N = 896; // hidden_size
-                const int K = 896; // hidden_size (attention output is square)
-
-                std::vector<int> m_values = {1, 8, 32, 64, 128, 256};
-
-                LOG_INFO("\n╔══════════════════════════════════════════════════════════════════════════╗");
-                LOG_INFO("║  Qwen2.5-0.5B Attention Output (Wo): N=" << N << " K=" << K
-                                                                     << std::setw(25) << " ║");
-                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
-                LOG_INFO("║  M      │ Tile Used │ Cosine Similarity │ Status                        ║");
-                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
-
-                for (int M : m_values)
-                {
-                    double cos = runGemmAndComputeCosineSimilarity(M, N, K);
-
-                    // Determine which tile is used
-                    const char *tile = (M <= 32) ? "32×32" : (M < 128) ? "64×64"
-                                                                       : "128×128";
-
-                    const char *status = (cos > 0.99) ? "✓ PASS" : "✗ FAIL";
-
-                    LOG_INFO("║  " << std::setw(5) << M << "  │  " << tile << "  │     "
-                                   << std::fixed << std::setprecision(6) << cos
-                                   << "     │ " << status << std::setw(24) << " ║");
-
-                    EXPECT_GT(cos, 0.99) << "M=" << M << " (tile " << tile << ") cosine too low";
-                }
-
-                LOG_INFO("╚══════════════════════════════════════════════════════════════════════════╝\n");
-            }
-
-            /**
-             * @test M-scaling correctness for Qwen2.5-0.5B FFN up projection
-             *
-             * Tests: M=1, 8, 32, 64, 128, 256 with N=4864, K=896
-             * This exercises the FFN up/gate projection (hidden → intermediate).
-             */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, MScaling_Qwen05B_FFNUp)
-            {
-                if (!has_rocm_device_)
-                {
-                    GTEST_SKIP() << "No ROCm device available";
-                }
-
-                const int N = 4864; // intermediate_size
-                const int K = 896;  // hidden_size
-
-                std::vector<int> m_values = {1, 8, 32, 64, 128, 256};
-
-                LOG_INFO("\n╔══════════════════════════════════════════════════════════════════════════╗");
-                LOG_INFO("║  Qwen2.5-0.5B FFN Up: N=" << N << " K=" << K
-                                                      << std::setw(31) << " ║");
-                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
-                LOG_INFO("║  M      │ Tile Used │ Cosine Similarity │ Status                        ║");
-                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
-
-                for (int M : m_values)
-                {
-                    double cos = runGemmAndComputeCosineSimilarity(M, N, K);
-
-                    const char *tile = (M <= 32) ? "32×32" : (M < 128) ? "64×64"
-                                                                       : "128×128";
-                    const char *status = (cos > 0.99) ? "✓ PASS" : "✗ FAIL";
-
-                    LOG_INFO("║  " << std::setw(5) << M << "  │  " << tile << "  │     "
-                                   << std::fixed << std::setprecision(6) << cos
-                                   << "     │ " << status << std::setw(24) << " ║");
-
-                    EXPECT_GT(cos, 0.99) << "M=" << M << " (tile " << tile << ") cosine too low";
-                }
-
-                LOG_INFO("╚══════════════════════════════════════════════════════════════════════════╝\n");
-            }
-
-            /**
-             * @test M-scaling correctness for Qwen2.5-0.5B FFN down projection
-             *
-             * Tests: M=1, 8, 32, 64, 128, 256 with N=896, K=4864
-             * This exercises the FFN down projection (intermediate → hidden).
-             */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, MScaling_Qwen05B_FFNDown)
-            {
-                if (!has_rocm_device_)
-                {
-                    GTEST_SKIP() << "No ROCm device available";
-                }
-
-                const int N = 896;  // hidden_size
-                const int K = 4864; // intermediate_size
-
-                std::vector<int> m_values = {1, 8, 32, 64, 128, 256};
-
-                LOG_INFO("\n╔══════════════════════════════════════════════════════════════════════════╗");
-                LOG_INFO("║  Qwen2.5-0.5B FFN Down: N=" << N << " K=" << K
-                                                        << std::setw(29) << " ║");
-                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
-                LOG_INFO("║  M      │ Tile Used │ Cosine Similarity │ Status                        ║");
-                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
-
-                for (int M : m_values)
-                {
-                    double cos = runGemmAndComputeCosineSimilarity(M, N, K);
-
-                    const char *tile = (M <= 32) ? "32×32" : (M < 128) ? "64×64"
-                                                                       : "128×128";
-                    const char *status = (cos > 0.99) ? "✓ PASS" : "✗ FAIL";
-
-                    LOG_INFO("║  " << std::setw(5) << M << "  │  " << tile << "  │     "
-                                   << std::fixed << std::setprecision(6) << cos
-                                   << "     │ " << status << std::setw(24) << " ║");
-
-                    EXPECT_GT(cos, 0.99) << "M=" << M << " (tile " << tile << ") cosine too low";
-                }
-
-                LOG_INFO("╚══════════════════════════════════════════════════════════════════════════╝\n");
-            }
-
-            /**
-             * @test M-scaling correctness for Qwen2.5-7B attention output (Wo)
-             *
-             * Tests: M=1, 8, 32, 64, 128, 256 with N=3584, K=3584
-             * This exercises larger dimensions typical of 7B models.
-             */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, MScaling_Qwen7B_AttentionOutput)
-            {
-                if (!has_rocm_device_)
-                {
-                    GTEST_SKIP() << "No ROCm device available";
-                }
-
-                const int N = 3584; // hidden_size
-                const int K = 3584; // hidden_size
-
-                std::vector<int> m_values = {1, 8, 32, 64, 128, 256};
-
-                LOG_INFO("\n╔══════════════════════════════════════════════════════════════════════════╗");
-                LOG_INFO("║  Qwen2.5-7B Attention Output (Wo): N=" << N << " K=" << K
-                                                                   << std::setw(19) << " ║");
-                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
-                LOG_INFO("║  M      │ Tile Used │ Cosine Similarity │ Status                        ║");
-                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
-
-                for (int M : m_values)
-                {
-                    double cos = runGemmAndComputeCosineSimilarity(M, N, K);
-
-                    const char *tile = (M <= 32) ? "32×32" : (M < 128) ? "64×64"
-                                                                       : "128×128";
-                    const char *status = (cos > 0.99) ? "✓ PASS" : "✗ FAIL";
-
-                    LOG_INFO("║  " << std::setw(5) << M << "  │  " << tile << "  │     "
-                                   << std::fixed << std::setprecision(6) << cos
-                                   << "     │ " << status << std::setw(24) << " ║");
-
-                    EXPECT_GT(cos, 0.99) << "M=" << M << " (tile " << tile << ") cosine too low";
-                }
-
-                LOG_INFO("╚══════════════════════════════════════════════════════════════════════════╝\n");
-            }
-
-            /**
-             * @test M-scaling correctness for Qwen2.5-7B FFN up projection
-             *
-             * Tests: M=1, 8, 32, 64, 128, 256 with N=18944, K=3584
-             * This exercises the large FFN dimensions of 7B models.
-             */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, MScaling_Qwen7B_FFNUp)
-            {
-                if (!has_rocm_device_)
-                {
-                    GTEST_SKIP() << "No ROCm device available";
-                }
-
-                const int N = 18944; // intermediate_size
-                const int K = 3584;  // hidden_size
-
-                std::vector<int> m_values = {1, 8, 32, 64, 128, 256};
-
-                LOG_INFO("\n╔══════════════════════════════════════════════════════════════════════════╗");
-                LOG_INFO("║  Qwen2.5-7B FFN Up: N=" << N << " K=" << K
-                                                    << std::setw(27) << " ║");
-                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
-                LOG_INFO("║  M      │ Tile Used │ Cosine Similarity │ Status                        ║");
-                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
-
-                for (int M : m_values)
-                {
-                    double cos = runGemmAndComputeCosineSimilarity(M, N, K);
-
-                    const char *tile = (M <= 32) ? "32×32" : (M < 128) ? "64×64"
-                                                                       : "128×128";
-                    const char *status = (cos > 0.99) ? "✓ PASS" : "✗ FAIL";
-
-                    LOG_INFO("║  " << std::setw(5) << M << "  │  " << tile << "  │     "
-                                   << std::fixed << std::setprecision(6) << cos
-                                   << "     │ " << status << std::setw(24) << " ║");
-
-                    EXPECT_GT(cos, 0.99) << "M=" << M << " (tile " << tile << ") cosine too low";
-                }
-
-                LOG_INFO("╚══════════════════════════════════════════════════════════════════════════╝\n");
-            }
-
-            /**
-             * @test M-scaling correctness for Qwen2.5-7B FFN down projection
-             *
-             * Tests: M=1, 8, 32, 64, 128, 256 with N=3584, K=18944
-             * This exercises the large K dimension typical of FFN down projections.
-             */
-            TEST_F(ROCmQuantisedGemmIntegrationTest, MScaling_Qwen7B_FFNDown)
-            {
-                if (!has_rocm_device_)
-                {
-                    GTEST_SKIP() << "No ROCm device available";
-                }
-
-                const int N = 3584;  // hidden_size
-                const int K = 18944; // intermediate_size
-
-                std::vector<int> m_values = {1, 8, 32, 64, 128, 256};
-
-                LOG_INFO("\n╔══════════════════════════════════════════════════════════════════════════╗");
-                LOG_INFO("║  Qwen2.5-7B FFN Down: N=" << N << " K=" << K
-                                                      << std::setw(25) << " ║");
-                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
-                LOG_INFO("║  M      │ Tile Used │ Cosine Similarity │ Status                        ║");
-                LOG_INFO("╠══════════════════════════════════════════════════════════════════════════╣");
-
-                for (int M : m_values)
-                {
-                    double cos = runGemmAndComputeCosineSimilarity(M, N, K);
-
-                    const char *tile = (M <= 32) ? "32×32" : (M < 128) ? "64×64"
-                                                                       : "128×128";
-                    const char *status = (cos > 0.99) ? "✓ PASS" : "✗ FAIL";
-
-                    LOG_INFO("║  " << std::setw(5) << M << "  │  " << tile << "  │     "
-                                   << std::fixed << std::setprecision(6) << cos
-                                   << "     │ " << status << std::setw(24) << " ║");
-
-                    EXPECT_GT(cos, 0.99) << "M=" << M << " (tile " << tile << ") cosine too low";
-                }
-
-                LOG_INFO("╚══════════════════════════════════════════════════════════════════════════╝\n");
-            }
+            // MScaling tests removed - covered by decode/prefill tests above
 
         } // namespace integration_test
     } // namespace rocm

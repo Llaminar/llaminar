@@ -220,6 +220,15 @@ namespace llaminar
                 {
                     return device.is_cuda();
                 }
+
+                /**
+                 * @brief Check if this config targets a ROCm device
+                 * @return true if device is an AMD GPU
+                 */
+                bool is_rocm() const
+                {
+                    return device.is_rocm();
+                }
             };
 
             /**
@@ -886,6 +895,23 @@ namespace llaminar
                  * @throws std::runtime_error if precision is not supported
                  */
                 static std::unique_ptr<llaminar2::ICUDARingKVCache> createCUDAKVCache(const KVCacheConfig &config);
+#endif
+
+#ifdef HAVE_ROCM
+                /**
+                 * @brief Create a ROCm ring buffer KV cache
+                 *
+                 * Creates a ROCmRingKVCache with O(1) append and eviction.
+                 *
+                 * Limitations:
+                 * - Only FP32, BF16, FP16 precisions supported (no Q8_1/Q16_1)
+                 * - Sharded ROCm KV cache supported for tensor parallelism
+                 *
+                 * @param config KVCacheConfig with ROCm device
+                 * @return Unique pointer to IKVCache implementation (underlying is ROCmRingKVCache)
+                 * @throws std::runtime_error if precision is not supported
+                 */
+                static std::unique_ptr<llaminar2::IKVCache> createROCmKVCache(const KVCacheConfig &config);
 #endif
 
                 // ==========================================================================

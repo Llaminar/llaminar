@@ -32,7 +32,7 @@
 
 #include <gtest/gtest.h>
 
-#include "backends/benchmarks/DirectP2P.h"
+#include "backends/p2p/DirectP2P.h"
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
 #include "tensors/Tensors.h"
@@ -121,14 +121,17 @@ namespace llaminar2
 
             /**
              * @brief Skip test if P2P not available
+             * Uses macro to properly return from calling test function
              */
-            void requireP2P()
-            {
-                if (!p2p_available_)
-                {
-                    GTEST_SKIP() << "PCIe BAR P2P not available (need root + AMD GPU)";
-                }
-            }
+#define REQUIRE_P2P()                                                           \
+    do                                                                          \
+    {                                                                           \
+        if (!p2p_available_)                                                    \
+        {                                                                       \
+            GTEST_SKIP() << "PCIe BAR P2P not available (need root + AMD GPU)"; \
+            return;                                                             \
+        }                                                                       \
+    } while (0)
 
             /**
              * @brief Compute MSE between two float buffers
@@ -209,7 +212,7 @@ namespace llaminar2
 
         TEST_F(Test__CrossVendorTensorParallel, FP32Tensor_RoundTrip)
         {
-            requireP2P();
+            REQUIRE_P2P();
 
             LOG_INFO("\n=== FP32 Tensor Round-Trip Test ===");
 
@@ -267,7 +270,7 @@ namespace llaminar2
 
         TEST_F(Test__CrossVendorTensorParallel, FP32Tensor_LargeTransfer)
         {
-            requireP2P();
+            REQUIRE_P2P();
 
             LOG_INFO("\n=== Large FP32 Tensor Transfer ===");
 
@@ -310,7 +313,7 @@ namespace llaminar2
 
         TEST_F(Test__CrossVendorTensorParallel, Q8_1Tensor_RoundTrip)
         {
-            requireP2P();
+            REQUIRE_P2P();
 
             LOG_INFO("\n=== Q8_1 Tensor Round-Trip Test ===");
 
@@ -377,7 +380,7 @@ namespace llaminar2
 
         TEST_F(Test__CrossVendorTensorParallel, ColumnParallelGEMM_TwoGPU)
         {
-            requireP2P();
+            REQUIRE_P2P();
 
 #ifndef HAVE_ROCM
             GTEST_SKIP() << "ROCm required for cross-vendor GPU GEMM test";
@@ -583,7 +586,7 @@ namespace llaminar2
 
         TEST_F(Test__CrossVendorTensorParallel, RowParallelGEMM_AllReduce)
         {
-            requireP2P();
+            REQUIRE_P2P();
 
 #ifndef HAVE_ROCM
             GTEST_SKIP() << "ROCm required for cross-vendor GPU GEMM test";
@@ -793,7 +796,7 @@ namespace llaminar2
 
         TEST_F(Test__CrossVendorTensorParallel, ConcurrentBidirectionalTransfer)
         {
-            requireP2P();
+            REQUIRE_P2P();
 
             LOG_INFO("\n=== Concurrent Bidirectional Transfer Test ===");
 
@@ -869,7 +872,7 @@ namespace llaminar2
 
         TEST_F(Test__CrossVendorTensorParallel, MultiLayerPipeline_TensorParallel)
         {
-            requireP2P();
+            REQUIRE_P2P();
 
             LOG_INFO("\n=== Multi-Layer Tensor Parallel Pipeline ===");
 
@@ -962,7 +965,7 @@ namespace llaminar2
 
         TEST_F(Test__CrossVendorTensorParallel, StressTest_RepeatedTransfers)
         {
-            requireP2P();
+            REQUIRE_P2P();
 
             LOG_INFO("\n=== Stress Test: 1000 Repeated Transfers ===");
 
@@ -1017,7 +1020,7 @@ namespace llaminar2
 
         TEST_F(Test__CrossVendorTensorParallel, DataIntegrity_PatternVerification)
         {
-            requireP2P();
+            REQUIRE_P2P();
 
             LOG_INFO("\n=== Data Integrity: Pattern Verification ===");
 
@@ -1087,7 +1090,7 @@ namespace llaminar2
 
         TEST_F(Test__CrossVendorTensorParallel, Benchmark_AllSizes)
         {
-            requireP2P();
+            REQUIRE_P2P();
 
             LOG_INFO("\n=== P2P Bandwidth Benchmark (All Sizes) ===");
             LOG_INFO("Size (MB) | Write (GB/s) | Read (GB/s) | Symmetric Ratio");

@@ -26,7 +26,7 @@
 #include "v2/backends/DeviceId.h"
 #include "v2/backends/BackendManager.h"
 #include "v2/backends/IBackend.h"
-#include "v2/backends/benchmarks/DirectP2P.h"
+#include "v2/backends/p2p/DirectP2P.h"
 #include "v2/utils/Logger.h"
 
 // Only CUDA headers - avoid HIP headers to prevent conflicts
@@ -119,13 +119,19 @@ namespace llaminar2::test
             }
         }
 
-        void requireHardware()
-        {
-            if (!hardware_available_)
-            {
-                GTEST_SKIP() << "PCIe BAR P2P hardware not available";
-            }
-        }
+        /**
+         * @brief Skip test if P2P hardware not available
+         * Uses macro to properly return from calling test function
+         */
+#define REQUIRE_HARDWARE()                                         \
+    do                                                             \
+    {                                                              \
+        if (!hardware_available_)                                  \
+        {                                                          \
+            GTEST_SKIP() << "PCIe BAR P2P hardware not available"; \
+            return;                                                \
+        }                                                          \
+    } while (0)
 
         // Helper to allocate CUDA memory with initialization
         void *allocateCUDA(size_t bytes, float init_value = 0.0f)
@@ -231,7 +237,7 @@ namespace llaminar2::test
 
     TEST_F(Test__PCIeBARBackendIntegration, BroadcastFromCUDAThenRead)
     {
-        requireHardware();
+        REQUIRE_HARDWARE();
 
         // Test basic broadcast: write data from CUDA to ROCm via BAR
         const size_t count = 1024;
@@ -291,7 +297,7 @@ namespace llaminar2::test
 
     TEST_F(Test__PCIeBARBackendIntegration, AllReduceSmallBuffer)
     {
-        requireHardware();
+        REQUIRE_HARDWARE();
 
         // Test small buffer allreduce (typical for attention output)
         const size_t count = BATCH_SIZE * D_MODEL;
@@ -352,7 +358,7 @@ namespace llaminar2::test
 
     TEST_F(Test__PCIeBARBackendIntegration, AllReduceLargeBuffer)
     {
-        requireHardware();
+        REQUIRE_HARDWARE();
 
         // Test larger buffer (FFN dimension)
         const size_t count = BATCH_SIZE * FFN_DIM;
@@ -431,7 +437,7 @@ namespace llaminar2::test
         // This test documents the expected behavior when MAX is implemented
         GTEST_SKIP() << "MAX reduction requires additional CUDA kernel implementation - tracking issue #TBD";
 
-        requireHardware();
+        REQUIRE_HARDWARE();
 
         const size_t count = 1024;
         const size_t bytes = count * sizeof(float);
@@ -489,7 +495,7 @@ namespace llaminar2::test
 
     TEST_F(Test__PCIeBARBackendIntegration, BroadcastFromCUDA)
     {
-        requireHardware();
+        REQUIRE_HARDWARE();
 
         const size_t count = D_MODEL * 4; // Typical embedding size
         const size_t bytes = count * sizeof(float);
@@ -534,7 +540,7 @@ namespace llaminar2::test
 
     TEST_F(Test__PCIeBARBackendIntegration, AllReducePerformance)
     {
-        requireHardware();
+        REQUIRE_HARDWARE();
 
         // Test various sizes typical of tensor parallel inference
         const std::vector<size_t> sizes = {
@@ -622,7 +628,7 @@ namespace llaminar2::test
      */
     TEST_F(Test__PCIeBARBackendIntegration, TensorParallelGEMMAllReduce)
     {
-        requireHardware();
+        REQUIRE_HARDWARE();
 
         // Dimensions for test
         const int M = BATCH_SIZE;          // 32 - batch/seq
@@ -741,7 +747,7 @@ namespace llaminar2::test
      */
     TEST_F(Test__PCIeBARBackendIntegration, AllReduceWithBufferRegistration_Correctness)
     {
-        requireHardware();
+        REQUIRE_HARDWARE();
 
         // Small buffer with known values for exact verification
         const size_t count = 4;
@@ -810,7 +816,7 @@ namespace llaminar2::test
      */
     TEST_F(Test__PCIeBARBackendIntegration, AllReduceRegistered_Bandwidth)
     {
-        requireHardware();
+        REQUIRE_HARDWARE();
 
         // Large buffer for meaningful bandwidth measurement
         const size_t count = 4 * 1024 * 1024; // 16 MB (4M floats)
@@ -903,7 +909,7 @@ namespace llaminar2::test
 
     TEST_F(Test__PCIeBARBackendIntegration, BackendRouterSelectsPCIeBAR)
     {
-        requireHardware();
+        REQUIRE_HARDWARE();
 
         // Create BackendRouter with default factory
         ClusterInventory cluster;

@@ -194,21 +194,8 @@ if(HAVE_CUDA)
     # - Unlimited dynamic configs (vs 37,380 fixed)
     # - GPU-adaptive (auto-compiles for target architecture)
     
-    # CUDA kernels (JIT-based compilation)
+    # CUDA kernels
     set(CUDA_KERNEL_SOURCES
-        kernels/cuda/IQ4_NL_BlockDecoder.cu
-        kernels/cuda/CudaGemmVariantsBaseline.cu      # Template definitions + JIT launcher
-        kernels/cuda/CudaGemmVariantsMemoryOpt.cu     # Memory-optimized kernels (Phase 1)
-        # kernels/cuda/CudaGemmVariantsTensorCore.cu  # OBSOLETE: Unused CuTe-based Tensor Core kernels (replaced by JIT)
-        kernels/cuda/CudaGemmJIT.cu                   # JIT compiler implementation (NVRTC)
-        kernels/cuda/CudaGemmAutoTuner.cu
-        kernels/cuda/CudaGemmCuTeWrapper.cu           # CuTe Tensor Core wrapper (Phase 1)
-        kernels/cuda/CudaGemmKernelPhase3.cu          # Phase 3 Part 1: Large tiles (128×128×64)
-        kernels/cuda/CudaGemmKernelPhase3Pipelined.cu # Phase 3 Part 2: Pipelined (900-1,000 GFLOPS target)
-        kernels/cuda/CudaGemmKernelPhase4QuickWins.cu # Phase 4: Swizzled + cp.async (7.6 TFLOPS target)
-        kernels/cuda/CudaGemmKernelPhase5ASimple.cu   # Phase 5A: Streaming dequant (10.0 TFLOPS target)
-        kernels/cuda/CudaGemmJITPhase5.cu             # Phase 5 JIT: Auto-tuning infrastructure
-        kernels/cuda/CudaGemmKernelPhase7_CUTLASS.cu  # Phase 7: CUTLASS int8 GEMM (50-100+ TFLOPS target)
         kernels/cuda/CuBLASGemmKernel.cu              # cuBLAS wrapper for FP32/FP16/BF16 dense GEMM
         kernels/cuda/CUDAQuantisedGemmKernel_CUTLASS.cu  # CUTLASS INT8 GEMM implementation
         # Ops kernels (split from monolithic CUDAOpsKernels.cu)
@@ -219,18 +206,12 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDAEmbeddingKernels.cu      # Embedding lookup kernel
         kernels/cuda/ops/CUDAVectorAddKernels.cu      # Vector add kernels (for collective reductions)
         kernels/cuda/attention/CUDAFlashAttentionKernels.cu  # Flash Attention 2 and Flash Decoding kernels
-        kernels/cuda/CUDARingKVCache.cu               # Ring buffer KV cache with O(1) eviction
+        kernels/cuda/kvcache/CUDARingKVCache.cu       # Ring buffer KV cache with O(1) eviction
     )
     
     # NOTE: CUDA kernel ITensorGemm adapters (CUDAFloatingPointGemmKernel.cpp, CUDAQuantisedGemmKernel.cpp)
     # are added to llaminar2_core with target_sources() below, compiled with regular C++ compiler (NOT nvcc)
     # because they include MPI headers which nvcc cannot process
-    
-    # Add neural network if ONNX Runtime enabled
-    if(USE_ONNX_HEURISTIC AND ONNXRUNTIME_INCLUDE_DIR)
-        list(APPEND CUDA_KERNEL_SOURCES kernels/cuda/CudaGemmNeuralNetwork.cu)
-        message(STATUS "V2: Neural network source added to CUDA backend")
-    endif()
     
     # CUDA backend library includes backend + kernels + enumeration
     add_library(cuda_backend STATIC 
@@ -388,6 +369,8 @@ if(HAVE_ROCM)
     set(ROCM_KERNEL_SOURCES
         kernels/rocm/HipBLASGemmKernel.cpp      # hipBLAS wrapper for FP32/FP16 dense GEMM
         kernels/rocm/ROCmQuantisedGemmKernel_CK.hip  # ComposableKernel INT8 GEMM implementation
+        kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
+        kernels/rocm/kvcache/ROCmRingKVCacheKernels.hip       # Ring buffer KV cache kernels
     )
     
     # ROCm enumeration and backend must be compiled with hipcc to use HIP runtime
@@ -456,11 +439,10 @@ endif()
 # Add cross-vendor P2P if both CUDA and ROCm enabled
 if(HAVE_CUDA AND HAVE_ROCM)
     list(APPEND BENCHMARK_SOURCES
-        backends/benchmarks/CrossVendorP2P.cpp
-        backends/benchmarks/CrossVendorP2P_CUDA.cu
-        backends/benchmarks/CrossVendorP2P_ROCm.cpp
         # Direct P2P via PCIe BAR mapping (no DMA-BUF, no fallback)
-        backends/benchmarks/DirectP2P.cpp
+        backends/p2p/DirectP2P.cpp
+        backends/p2p/DirectP2P_CUDA.cu
+        backends/p2p/DirectP2P_ROCm.cpp
         # HostBackend runtime-specific helpers (must be in separate compilation units)
         collective/backends/HostBackendCUDA.cu
         collective/backends/HostBackendROCm.cpp
@@ -488,8 +470,7 @@ if(HAVE_ROCM)
     )
     if(HAVE_CUDA)
         set_source_files_properties(
-            backends/benchmarks/CrossVendorP2P_ROCm.cpp
-            backends/benchmarks/DirectP2P_ROCm.cpp
+            backends/p2p/DirectP2P_ROCm.cpp
             collective/backends/HostBackendROCm.cpp
             PROPERTIES LANGUAGE HIP
         )
@@ -958,7 +939,7 @@ if(HAVE_CUDA)
     target_sources(llaminar2_core PRIVATE
         kernels/cuda/CUDAFloatingPointGemmKernel.cpp
         kernels/cuda/CUDAQuantisedGemmKernel.cpp
-        kernels/cuda/CUDARingKVCacheTensorAdapter.cpp # ICUDARingKVCache::append(TensorBase*) impl
+        kernels/cuda/kvcache/CUDARingKVCacheTensorAdapter.cpp # ICUDARingKVCache::append(TensorBase*) impl
         kernels/cuda/ops/CUDAOpsKernels.cpp           # RMSNorm, SwiGLU, RoPE, Embedding ITensor implementations
         kernels/cuda/attention/CUDAFlashAttentionKernelT.cpp  # Flash Attention ITensor implementation
     )
@@ -974,6 +955,9 @@ if(HAVE_ROCM)
     target_sources(llaminar2_core PRIVATE
         kernels/rocm/ROCmFloatingPointGemmKernel.cpp
         kernels/rocm/ROCmQuantisedGemmKernel.cpp  # INT8 GEMM adapter (uses CK via extern "C")
+        kernels/rocm/attention/ROCmFlashAttentionKernelT.cpp  # Flash Attention ITensor implementation
+        kernels/rocm/kvcache/ROCmRingKVCache.cpp              # Ring buffer KV cache implementation
+        kernels/rocm/kvcache/ROCmRingKVCacheFactory.cpp       # Factory for creating ROCm KV cache instances
     )
     
     message(STATUS "V2: Linked ROCm backend library with hipBLAS GEMM")

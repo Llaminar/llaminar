@@ -1,0 +1,918 @@
+/**
+ * @file ROCmRingKVCache.cpp
+ * @brief ROCm Ring Buffer KV Cache implementation (C++ adapter)
+ * @author Llaminar Team
+ * @date January 2026
+ *
+ * This file is compiled by the regular C++ compiler (not hipcc) so it can
+ * include heavy headers like CPUTensors.h.
+ *
+ * The HIP kernels are defined in ROCmRingKVCacheKernels.hip and linked
+ * via extern "C" declarations.
+ *
+ * Target Hardware: AMD MI50 (gfx906 / Vega 20)
+ */
+
+#include "ROCmRingKVCache.h"
+#include "../../../utils/Logger.h"
+#include "../../../tensors/GpuTensorView.h"
+
+#include <algorithm>
+
+namespace llaminar2
+{
+
+    // =========================================================================
+    // External HIP Kernel Declarations
+    // =========================================================================
+
+    // FP32 kernel wrappers
+    extern "C" void hip_ring_append_fp32(
+        float *d_K_cache, float *d_V_cache,
+        const float *d_K_new, const float *d_V_new,
+        int head, int max_seq_len, int kv_dim, int num_tokens,
+        hipStream_t stream);
+
+    extern "C" void hip_ring_linearize_fp32(
+        float *d_out,
+        const float *d_cache,
+        int tail, int count, int max_seq_len, int kv_dim,
+        hipStream_t stream);
+
+    extern "C" void hip_ring_gather_batched_fp32(
+        float *d_K_out, float *d_V_out,
+        const float *const *d_K_caches, const float *const *d_V_caches,
+        const int *tails, const int *counts,
+        int num_seqs, int max_kv_len, int max_seq_len, int kv_dim,
+        hipStream_t stream);
+
+    // FP16 kernel wrappers
+    extern "C" void hip_ring_append_fp16(
+        _Float16 *d_K_cache, _Float16 *d_V_cache,
+        const _Float16 *d_K_new, const _Float16 *d_V_new,
+        int head, int max_seq_len, int kv_dim, int num_tokens,
+        hipStream_t stream);
+
+    extern "C" void hip_ring_linearize_fp16(
+        _Float16 *d_out,
+        const _Float16 *d_cache,
+        int tail, int count, int max_seq_len, int kv_dim,
+        hipStream_t stream);
+
+    extern "C" void hip_ring_gather_batched_fp16(
+        _Float16 *d_K_out, _Float16 *d_V_out,
+        const _Float16 *const *d_K_caches, const _Float16 *const *d_V_caches,
+        const int *tails, const int *counts,
+        int num_seqs, int max_kv_len, int max_seq_len, int kv_dim,
+        hipStream_t stream);
+
+    // BF16 kernel wrappers
+    extern "C" void hip_ring_append_bf16(
+        hip_bfloat16 *d_K_cache, hip_bfloat16 *d_V_cache,
+        const hip_bfloat16 *d_K_new, const hip_bfloat16 *d_V_new,
+        int head, int max_seq_len, int kv_dim, int num_tokens,
+        hipStream_t stream);
+
+    extern "C" void hip_ring_linearize_bf16(
+        hip_bfloat16 *d_out,
+        const hip_bfloat16 *d_cache,
+        int tail, int count, int max_seq_len, int kv_dim,
+        hipStream_t stream);
+
+    extern "C" void hip_ring_gather_batched_bf16(
+        hip_bfloat16 *d_K_out, hip_bfloat16 *d_V_out,
+        const hip_bfloat16 *const *d_K_caches, const hip_bfloat16 *const *d_V_caches,
+        const int *tails, const int *counts,
+        int num_seqs, int max_kv_len, int max_seq_len, int kv_dim,
+        hipStream_t stream);
+
+    // =========================================================================
+    // IROCmRingKVCache::append(ITensor*) implementation
+    // =========================================================================
+
+    bool IROCmRingKVCache::append(int layer, int seq_idx,
+                                  const ITensor *K, const ITensor *V,
+                                  int num_tokens)
+    {
+        if (!K || !V)
+        {
+            LOG_DEBUG("[IROCmRingKVCache::append(ITensor)] Null K or V tensor");
+            return false;
+        }
+
+        // Get GPU data pointers from tensors via ITensor interface
+        const void *d_k = K->gpu_data_ptr();
+        const void *d_v = V->gpu_data_ptr();
+
+        if (!d_k || !d_v)
+        {
+            // Tensors don't have GPU data - caller should have called ensureOnDevice()
+            LOG_ERROR("[IROCmRingKVCache::append(ITensor)] K or V tensor lacks GPU data. "
+                      << "Call ensureOnDevice() before append.");
+            return false;
+        }
+
+        // Delegate to the device pointer version (with default stream 0)
+        return append(layer, seq_idx, d_k, d_v, num_tokens, 0);
+    }
+
+    // =========================================================================
+    // ROCmRingKVCache Implementation
+    // =========================================================================
+
+    template <ActivationPrecision Precision>
+    ROCmRingKVCache<Precision>::ROCmRingKVCache(
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int head_dim, int device_id)
+        : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
+          n_kv_heads_(n_kv_heads), local_n_kv_heads_(n_kv_heads), kv_head_start_(0),
+          head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim), device_id_(device_id),
+          is_sharded_(false)
+    {
+        LOG_INFO("[ROCmRingKVCache] Creating cache: "
+                 << n_layers << " layers, batch=" << batch_size
+                 << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
+                 << ", precision=" << static_cast<int>(Precision));
+
+        hipSetDevice(device_id_);
+
+        // Allocate entries
+        entries_.resize(n_layers_);
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            entries_[layer].resize(batch_size_);
+            for (int seq = 0; seq < batch_size_; ++seq)
+            {
+                allocate_entry(entries_[layer][seq]);
+            }
+        }
+
+        // Initialize tensor_views_ storage for get_k()/get_v() wrappers
+        tensor_views_.resize(n_layers_);
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            tensor_views_[layer].resize(batch_size_);
+            // Views are created lazily in get_k()/get_v()
+        }
+
+        LOG_INFO("[ROCmRingKVCache] Allocated "
+                 << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                 << " MB total (including scratch)");
+    }
+
+    template <ActivationPrecision Precision>
+    ROCmRingKVCache<Precision>::ROCmRingKVCache(
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+        int head_dim, int device_id)
+        : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
+          n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads), kv_head_start_(kv_head_start),
+          head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim), device_id_(device_id),
+          is_sharded_(local_n_kv_heads != n_kv_heads)
+    {
+        LOG_INFO("[ROCmRingKVCache] Creating sharded cache: "
+                 << n_layers << " layers, batch=" << batch_size
+                 << ", max_seq=" << max_seq_len << ", total_kv_heads=" << n_kv_heads
+                 << ", local_kv_heads=" << local_n_kv_heads << ", kv_head_start=" << kv_head_start
+                 << ", local_kv_dim=" << kv_dim_
+                 << ", precision=" << static_cast<int>(Precision));
+
+        hipSetDevice(device_id_);
+
+        // Allocate entries
+        entries_.resize(n_layers_);
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            entries_[layer].resize(batch_size_);
+            for (int seq = 0; seq < batch_size_; ++seq)
+            {
+                allocate_entry(entries_[layer][seq]);
+            }
+        }
+
+        // Initialize tensor_views_ storage for get_k()/get_v() wrappers
+        tensor_views_.resize(n_layers_);
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            tensor_views_[layer].resize(batch_size_);
+            // Views are created lazily in get_k()/get_v()
+        }
+
+        LOG_INFO("[ROCmRingKVCache] Allocated "
+                 << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                 << " MB total (including scratch)");
+    }
+
+    template <ActivationPrecision Precision>
+    ROCmRingKVCache<Precision>::~ROCmRingKVCache()
+    {
+        hipSetDevice(device_id_);
+
+        for (auto &layer_entries : entries_)
+        {
+            for (auto &entry : layer_entries)
+            {
+                free_entry(entry);
+            }
+        }
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::allocate_entry(EntryT &entry)
+    {
+        size_t buffer_size = max_seq_len_ * kv_dim_ * sizeof(DataT);
+
+        // Main K/V buffers
+        hipMalloc(&entry.d_K, buffer_size);
+        hipMalloc(&entry.d_V, buffer_size);
+
+        // Per-sequence scratch buffers for linearization
+        hipMalloc(&entry.d_K_scratch, buffer_size);
+        hipMalloc(&entry.d_V_scratch, buffer_size);
+
+        // Initialize state
+        entry.head = 0;
+        entry.count = 0;
+        entry.scratch_valid = false;
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::free_entry(EntryT &entry)
+    {
+        if (entry.d_K)
+            hipFree(entry.d_K);
+        if (entry.d_V)
+            hipFree(entry.d_V);
+        if (entry.d_K_scratch)
+            hipFree(entry.d_K_scratch);
+        if (entry.d_V_scratch)
+            hipFree(entry.d_V_scratch);
+
+        entry.d_K = nullptr;
+        entry.d_V = nullptr;
+        entry.d_K_scratch = nullptr;
+        entry.d_V_scratch = nullptr;
+    }
+
+    template <ActivationPrecision Precision>
+    int ROCmRingKVCache<Precision>::get_cached_tokens(int layer, int seq_idx) const
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        {
+            return 0;
+        }
+        return entries_[layer][seq_idx].count;
+    }
+
+    template <ActivationPrecision Precision>
+    int ROCmRingKVCache<Precision>::get_head_position(int layer, int seq_idx) const
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        {
+            return 0;
+        }
+        return entries_[layer][seq_idx].head;
+    }
+
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::is_wrapped(int layer, int seq_idx) const
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        {
+            return false;
+        }
+        return entries_[layer][seq_idx].is_wrapped(max_seq_len_);
+    }
+
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::append(
+        int layer, int seq_idx,
+        const void *d_k, const void *d_v,
+        int num_tokens, hipStream_t stream)
+    {
+        return append_typed(layer, seq_idx,
+                            static_cast<const DataT *>(d_k),
+                            static_cast<const DataT *>(d_v),
+                            num_tokens, stream);
+    }
+
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::append_typed(
+        int layer, int seq_idx,
+        const DataT *d_k, const DataT *d_v,
+        int num_tokens, hipStream_t stream)
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        {
+            LOG_ERROR("[ROCmRingKVCache::append] Invalid layer=" << layer << " or seq_idx=" << seq_idx);
+            return false;
+        }
+
+        EntryT &entry = entries_[layer][seq_idx];
+
+        // Track how many tokens to skip from input (earliest tokens that would be overwritten)
+        int tokens_to_skip = 0;
+        int tokens_to_write = num_tokens;
+
+        // Check if we would exceed capacity (ring buffer overwrites oldest)
+        if (entry.count + num_tokens > max_seq_len_)
+        {
+            // Calculate how many existing tokens to evict
+            int to_evict = entry.count + num_tokens - max_seq_len_;
+
+            // If eviction would be more than current count, we're also skipping input tokens
+            if (to_evict > entry.count)
+            {
+                // Skip input tokens that would be immediately overwritten
+                tokens_to_skip = to_evict - entry.count;
+                tokens_to_write = num_tokens - tokens_to_skip;
+                // Count both existing cache tokens AND skipped input tokens as evicted
+                total_evicted_ += entry.count + tokens_to_skip;
+                entry.count = 0;
+                LOG_DEBUG("[ROCmRingKVCache::append] Skipping " << tokens_to_skip
+                                                                << " input tokens, writing " << tokens_to_write);
+            }
+            else
+            {
+                entry.count -= to_evict;
+                total_evicted_ += to_evict;
+                LOG_DEBUG("[ROCmRingKVCache::append] Auto-evicted " << to_evict << " tokens");
+            }
+        }
+
+        // Launch append kernel with adjusted pointers (skip earliest tokens)
+        if (tokens_to_write > 0)
+        {
+            const DataT *d_k_adjusted = d_k + tokens_to_skip * kv_dim_;
+            const DataT *d_v_adjusted = d_v + tokens_to_skip * kv_dim_;
+            launch_append_kernel(entry, d_k_adjusted, d_v_adjusted, tokens_to_write, stream);
+        }
+
+        // Update ring buffer state based on actual tokens written
+        entry.head = (entry.head + tokens_to_write) % max_seq_len_;
+        entry.count += tokens_to_write;
+        entry.scratch_valid = false; // Scratch is stale after append
+
+        return true;
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::launch_append_kernel(
+        EntryT &entry, const DataT *d_k, const DataT *d_v,
+        int num_tokens, hipStream_t stream)
+    {
+        if constexpr (Precision == ActivationPrecision::FP32)
+        {
+            hip_ring_append_fp32(
+                entry.d_K, entry.d_V, d_k, d_v,
+                entry.head, max_seq_len_, kv_dim_, num_tokens, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::FP16)
+        {
+            hip_ring_append_fp16(
+                entry.d_K, entry.d_V, d_k, d_v,
+                entry.head, max_seq_len_, kv_dim_, num_tokens, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::BF16)
+        {
+            hip_ring_append_bf16(
+                entry.d_K, entry.d_V, d_k, d_v,
+                entry.head, max_seq_len_, kv_dim_, num_tokens, stream);
+        }
+    }
+
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::get_kv_for_attention(
+        int layer, int seq_idx,
+        const void **d_k_out, const void **d_v_out,
+        int *kv_len, hipStream_t stream)
+    {
+        const DataT *k_typed;
+        const DataT *v_typed;
+        bool result = get_kv_typed(layer, seq_idx, &k_typed, &v_typed, kv_len, stream);
+        *d_k_out = k_typed;
+        *d_v_out = v_typed;
+        return result;
+    }
+
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::get_kv_typed(
+        int layer, int seq_idx,
+        const DataT **d_k_out, const DataT **d_v_out,
+        int *kv_len, hipStream_t stream)
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        {
+            LOG_ERROR("[ROCmRingKVCache::get_kv] Invalid layer=" << layer << " or seq_idx=" << seq_idx);
+            return false;
+        }
+
+        EntryT &entry = entries_[layer][seq_idx];
+        *kv_len = entry.count;
+
+        if (entry.count == 0)
+        {
+            *d_k_out = nullptr;
+            *d_v_out = nullptr;
+            return true;
+        }
+
+        // Optimization: if not wrapped, return direct pointers
+        if (!entry.is_wrapped(max_seq_len_))
+        {
+            int tail = entry.tail(max_seq_len_);
+            *d_k_out = entry.d_K + tail * kv_dim_;
+            *d_v_out = entry.d_V + tail * kv_dim_;
+            return true;
+        }
+
+        // Buffer is wrapped - need to linearize
+        if (!entry.scratch_valid)
+        {
+            linearize_entry(entry, stream);
+            entry.scratch_valid = true;
+            ++linearization_count_;
+        }
+
+        *d_k_out = entry.d_K_scratch;
+        *d_v_out = entry.d_V_scratch;
+        return true;
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::linearize_entry(EntryT &entry, hipStream_t stream)
+    {
+        launch_linearize_kernel(entry, entry.d_K_scratch, entry.d_V_scratch, stream);
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::launch_linearize_kernel(
+        const EntryT &entry, DataT *d_k_out, DataT *d_v_out,
+        hipStream_t stream)
+    {
+        int tail = entry.tail(max_seq_len_);
+
+        if constexpr (Precision == ActivationPrecision::FP32)
+        {
+            // Linearize K
+            hip_ring_linearize_fp32(
+                d_k_out, entry.d_K,
+                tail, entry.count, max_seq_len_, kv_dim_, stream);
+            // Linearize V
+            hip_ring_linearize_fp32(
+                d_v_out, entry.d_V,
+                tail, entry.count, max_seq_len_, kv_dim_, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::FP16)
+        {
+            hip_ring_linearize_fp16(
+                d_k_out, entry.d_K,
+                tail, entry.count, max_seq_len_, kv_dim_, stream);
+            hip_ring_linearize_fp16(
+                d_v_out, entry.d_V,
+                tail, entry.count, max_seq_len_, kv_dim_, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::BF16)
+        {
+            hip_ring_linearize_bf16(
+                d_k_out, entry.d_K,
+                tail, entry.count, max_seq_len_, kv_dim_, stream);
+            hip_ring_linearize_bf16(
+                d_v_out, entry.d_V,
+                tail, entry.count, max_seq_len_, kv_dim_, stream);
+        }
+    }
+
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::linearize_to(
+        int layer, int seq_idx,
+        void *d_k_out, void *d_v_out,
+        int *kv_len, hipStream_t stream)
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        {
+            LOG_ERROR("[ROCmRingKVCache::linearize_to] Invalid layer=" << layer << " or seq_idx=" << seq_idx);
+            return false;
+        }
+
+        const EntryT &entry = entries_[layer][seq_idx];
+        *kv_len = entry.count;
+
+        if (entry.count == 0)
+        {
+            return true;
+        }
+
+        launch_linearize_kernel(entry,
+                                static_cast<DataT *>(d_k_out),
+                                static_cast<DataT *>(d_v_out),
+                                stream);
+        return true;
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::evict_oldest(int layer, int seq_idx, int num_tokens)
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        {
+            return;
+        }
+
+        EntryT &entry = entries_[layer][seq_idx];
+        int to_evict = std::min(num_tokens, entry.count);
+
+        // O(1) eviction - just update count (tail moves implicitly)
+        entry.count -= to_evict;
+        entry.scratch_valid = false;
+        total_evicted_ += to_evict;
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::evict_oldest_layer(int layer, int num_tokens)
+    {
+        if (layer < 0 || layer >= n_layers_)
+        {
+            return;
+        }
+
+        for (int seq = 0; seq < batch_size_; ++seq)
+        {
+            evict_oldest(layer, seq, num_tokens);
+        }
+    }
+
+    template <ActivationPrecision Precision>
+    int ROCmRingKVCache<Precision>::gather_kv_batched(
+        int layer, int num_seqs,
+        void *d_k_out, void *d_v_out,
+        int *kv_lens, int max_kv_len,
+        hipStream_t stream)
+    {
+        if (layer < 0 || layer >= n_layers_ || num_seqs > batch_size_)
+        {
+            LOG_ERROR("[ROCmRingKVCache::gather_kv_batched] Invalid layer=" << layer);
+            return -1;
+        }
+
+        // Collect entry pointers and metadata
+        std::vector<EntryT *> entry_ptrs(num_seqs);
+        int actual_max_kv_len = 0;
+
+        for (int seq = 0; seq < num_seqs; ++seq)
+        {
+            entry_ptrs[seq] = &entries_[layer][seq];
+            kv_lens[seq] = entry_ptrs[seq]->count;
+            actual_max_kv_len = std::max(actual_max_kv_len, kv_lens[seq]);
+        }
+
+        if (actual_max_kv_len == 0)
+        {
+            return 0;
+        }
+
+        // Use provided max_kv_len or actual
+        int out_max_kv_len = (max_kv_len > 0) ? max_kv_len : actual_max_kv_len;
+
+        launch_gather_kernel(entry_ptrs,
+                             static_cast<DataT *>(d_k_out),
+                             static_cast<DataT *>(d_v_out),
+                             kv_lens, out_max_kv_len,
+                             num_seqs, stream);
+
+        return actual_max_kv_len;
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::launch_gather_kernel(
+        const std::vector<EntryT *> &entries,
+        DataT *d_k_out, DataT *d_v_out,
+        int *kv_lens, int max_kv_len,
+        int num_seqs, hipStream_t stream)
+    {
+        // Allocate device arrays for kernel
+        DataT **d_k_caches;
+        DataT **d_v_caches;
+        int *d_tails;
+        int *d_counts;
+
+        hipMalloc(&d_k_caches, num_seqs * sizeof(DataT *));
+        hipMalloc(&d_v_caches, num_seqs * sizeof(DataT *));
+        hipMalloc(&d_tails, num_seqs * sizeof(int));
+        hipMalloc(&d_counts, num_seqs * sizeof(int));
+
+        // Prepare host arrays
+        std::vector<DataT *> h_k_caches(num_seqs);
+        std::vector<DataT *> h_v_caches(num_seqs);
+        std::vector<int> h_tails(num_seqs);
+        std::vector<int> h_counts(num_seqs);
+
+        for (int i = 0; i < num_seqs; ++i)
+        {
+            h_k_caches[i] = entries[i]->d_K;
+            h_v_caches[i] = entries[i]->d_V;
+            h_tails[i] = entries[i]->tail(max_seq_len_);
+            h_counts[i] = entries[i]->count;
+        }
+
+        // Copy to device
+        hipMemcpyAsync(d_k_caches, h_k_caches.data(), num_seqs * sizeof(DataT *),
+                       hipMemcpyHostToDevice, stream);
+        hipMemcpyAsync(d_v_caches, h_v_caches.data(), num_seqs * sizeof(DataT *),
+                       hipMemcpyHostToDevice, stream);
+        hipMemcpyAsync(d_tails, h_tails.data(), num_seqs * sizeof(int),
+                       hipMemcpyHostToDevice, stream);
+        hipMemcpyAsync(d_counts, h_counts.data(), num_seqs * sizeof(int),
+                       hipMemcpyHostToDevice, stream);
+
+        // Launch kernel (via extern "C" wrapper)
+        if constexpr (Precision == ActivationPrecision::FP32)
+        {
+            hip_ring_gather_batched_fp32(
+                d_k_out, d_v_out,
+                const_cast<const float *const *>(d_k_caches),
+                const_cast<const float *const *>(d_v_caches),
+                d_tails, d_counts,
+                num_seqs, max_kv_len, max_seq_len_, kv_dim_, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::FP16)
+        {
+            hip_ring_gather_batched_fp16(
+                d_k_out, d_v_out,
+                const_cast<const _Float16 *const *>(d_k_caches),
+                const_cast<const _Float16 *const *>(d_v_caches),
+                d_tails, d_counts,
+                num_seqs, max_kv_len, max_seq_len_, kv_dim_, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::BF16)
+        {
+            hip_ring_gather_batched_bf16(
+                d_k_out, d_v_out,
+                const_cast<const hip_bfloat16 *const *>(d_k_caches),
+                const_cast<const hip_bfloat16 *const *>(d_v_caches),
+                d_tails, d_counts,
+                num_seqs, max_kv_len, max_seq_len_, kv_dim_, stream);
+        }
+
+        // Synchronize and free temporary device arrays
+        hipStreamSynchronize(stream);
+        hipFree(d_k_caches);
+        hipFree(d_v_caches);
+        hipFree(d_tails);
+        hipFree(d_counts);
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::clear()
+    {
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            clear_layer(layer);
+        }
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::clear_sequence(int layer, int seq_idx)
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        {
+            return;
+        }
+
+        EntryT &entry = entries_[layer][seq_idx];
+        entry.head = 0;
+        entry.count = 0;
+        entry.scratch_valid = false;
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::clear_layer(int layer)
+    {
+        if (layer < 0 || layer >= n_layers_)
+        {
+            return;
+        }
+
+        for (int seq = 0; seq < batch_size_; ++seq)
+        {
+            clear_sequence(layer, seq);
+        }
+    }
+
+    // =========================================================================
+    // get_k() / get_v() implementations
+    // =========================================================================
+
+    template <ActivationPrecision Precision>
+    ITensor *ROCmRingKVCache<Precision>::get_k(int layer, int seq_idx)
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        {
+            LOG_WARN("[ROCmRingKVCache::get_k] Invalid layer=" << layer
+                                                               << " seq_idx=" << seq_idx);
+            return nullptr;
+        }
+
+        // Get device pointers via get_kv_for_attention
+        const void *d_k = nullptr;
+        const void *d_v = nullptr;
+        int kv_len = 0;
+
+        if (!get_kv_for_attention(layer, seq_idx, &d_k, &d_v, &kv_len, 0))
+        {
+            LOG_WARN("[ROCmRingKVCache::get_k] get_kv_for_attention failed for layer="
+                     << layer << " seq_idx=" << seq_idx);
+            return nullptr;
+        }
+
+        if (!d_k || kv_len == 0)
+        {
+            // Empty cache - valid state, return nullptr
+            return nullptr;
+        }
+
+        // Convert ActivationPrecision to TensorType at compile time
+        constexpr TensorType tensor_type = []() constexpr
+        {
+            if constexpr (Precision == ActivationPrecision::FP16)
+                return TensorType::FP16;
+            else if constexpr (Precision == ActivationPrecision::BF16)
+                return TensorType::BF16;
+            else
+                return TensorType::FP32;
+        }();
+
+        // Create or update the view
+        auto &view = tensor_views_[layer][seq_idx][0]; // Index 0 = K
+
+        // Check if view needs to be created or updated (pointer or size changed)
+        if (!view ||
+            view->gpu_data_ptr() != d_k ||
+            view->rows() != static_cast<size_t>(kv_len))
+        {
+            // Create new view wrapping the device buffer
+            view = std::make_unique<GpuTensorView>(
+                const_cast<void *>(d_k), // GpuTensorView needs non-const for interface
+                static_cast<size_t>(kv_len),
+                static_cast<size_t>(kv_dim_),
+                tensor_type,
+                device_id_);
+
+            LOG_TRACE("[ROCmRingKVCache::get_k] Created view for layer=" << layer
+                                                                         << " seq=" << seq_idx << " kv_len=" << kv_len);
+        }
+
+        return view.get();
+    }
+
+    template <ActivationPrecision Precision>
+    const ITensor *ROCmRingKVCache<Precision>::get_k(int layer, int seq_idx) const
+    {
+        // Delegate to non-const version (tensor_views_ is mutable)
+        return const_cast<ROCmRingKVCache<Precision> *>(this)->get_k(layer, seq_idx);
+    }
+
+    template <ActivationPrecision Precision>
+    ITensor *ROCmRingKVCache<Precision>::get_v(int layer, int seq_idx)
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        {
+            LOG_WARN("[ROCmRingKVCache::get_v] Invalid layer=" << layer
+                                                               << " seq_idx=" << seq_idx);
+            return nullptr;
+        }
+
+        // Get device pointers via get_kv_for_attention
+        const void *d_k = nullptr;
+        const void *d_v = nullptr;
+        int kv_len = 0;
+
+        if (!get_kv_for_attention(layer, seq_idx, &d_k, &d_v, &kv_len, 0))
+        {
+            LOG_WARN("[ROCmRingKVCache::get_v] get_kv_for_attention failed for layer="
+                     << layer << " seq_idx=" << seq_idx);
+            return nullptr;
+        }
+
+        if (!d_v || kv_len == 0)
+        {
+            // Empty cache - valid state, return nullptr
+            return nullptr;
+        }
+
+        // Convert ActivationPrecision to TensorType at compile time
+        constexpr TensorType tensor_type = []() constexpr
+        {
+            if constexpr (Precision == ActivationPrecision::FP16)
+                return TensorType::FP16;
+            else if constexpr (Precision == ActivationPrecision::BF16)
+                return TensorType::BF16;
+            else
+                return TensorType::FP32;
+        }();
+
+        // Create or update the view
+        auto &view = tensor_views_[layer][seq_idx][1]; // Index 1 = V
+
+        // Check if view needs to be created or updated (pointer or size changed)
+        if (!view ||
+            view->gpu_data_ptr() != d_v ||
+            view->rows() != static_cast<size_t>(kv_len))
+        {
+            // Create new view wrapping the device buffer
+            view = std::make_unique<GpuTensorView>(
+                const_cast<void *>(d_v), // GpuTensorView needs non-const for interface
+                static_cast<size_t>(kv_len),
+                static_cast<size_t>(kv_dim_),
+                tensor_type,
+                device_id_);
+
+            LOG_TRACE("[ROCmRingKVCache::get_v] Created view for layer=" << layer
+                                                                         << " seq=" << seq_idx << " kv_len=" << kv_len);
+        }
+
+        return view.get();
+    }
+
+    template <ActivationPrecision Precision>
+    const ITensor *ROCmRingKVCache<Precision>::get_v(int layer, int seq_idx) const
+    {
+        // Delegate to non-const version (tensor_views_ is mutable)
+        return const_cast<ROCmRingKVCache<Precision> *>(this)->get_v(layer, seq_idx);
+    }
+
+    // =========================================================================
+    // Explicit Template Instantiations
+    // =========================================================================
+
+    template class ROCmRingKVCache<ActivationPrecision::FP32>;
+    template class ROCmRingKVCache<ActivationPrecision::FP16>;
+    template class ROCmRingKVCache<ActivationPrecision::BF16>;
+
+    // =========================================================================
+    // Factory Function
+    // =========================================================================
+
+    std::unique_ptr<IROCmRingKVCache> createROCmRingKVCache(
+        ActivationPrecision precision,
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int head_dim, int device_id)
+    {
+        switch (precision)
+        {
+        case ActivationPrecision::FP32:
+            return std::make_unique<ROCmRingKVCacheFP32>(
+                n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_id);
+
+        case ActivationPrecision::FP16:
+            return std::make_unique<ROCmRingKVCacheFP16>(
+                n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_id);
+
+        case ActivationPrecision::BF16:
+            return std::make_unique<ROCmRingKVCacheBF16>(
+                n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_id);
+
+        default:
+            LOG_ERROR("[createROCmRingKVCache] Unsupported precision: "
+                      << static_cast<int>(precision));
+            return nullptr;
+        }
+    }
+
+    // =========================================================================
+    // Sharded Factory Function (for Tensor Parallelism)
+    // =========================================================================
+
+    std::unique_ptr<IROCmRingKVCache> createShardedROCmRingKVCache(
+        ActivationPrecision precision,
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+        int head_dim, int device_id)
+    {
+        switch (precision)
+        {
+        case ActivationPrecision::FP32:
+            return std::make_unique<ROCmRingKVCacheFP32>(
+                n_layers, batch_size, max_seq_len,
+                n_kv_heads, local_n_kv_heads, kv_head_start,
+                head_dim, device_id);
+
+        case ActivationPrecision::FP16:
+            return std::make_unique<ROCmRingKVCacheFP16>(
+                n_layers, batch_size, max_seq_len,
+                n_kv_heads, local_n_kv_heads, kv_head_start,
+                head_dim, device_id);
+
+        case ActivationPrecision::BF16:
+            return std::make_unique<ROCmRingKVCacheBF16>(
+                n_layers, batch_size, max_seq_len,
+                n_kv_heads, local_n_kv_heads, kv_head_start,
+                head_dim, device_id);
+
+        default:
+            LOG_ERROR("[createShardedROCmRingKVCache] Unsupported precision: "
+                      << static_cast<int>(precision));
+            return nullptr;
+        }
+    }
+
+} // namespace llaminar2

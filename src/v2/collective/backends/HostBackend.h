@@ -19,7 +19,6 @@
 
 #include "../ICollectiveBackend.h"
 #include "../DeviceGroup.h"
-#include "../../backends/benchmarks/CrossVendorP2P.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -99,7 +98,7 @@ namespace llaminar2
          * @param group Device group that will participate in collectives
          * @return true on success
          */
-        bool initialize(const DeviceGroup& group) override;
+        bool initialize(const DeviceGroup &group) override;
 
         /**
          * @brief Check if backend is initialized
@@ -129,7 +128,7 @@ namespace llaminar2
          * @return true on success
          */
         bool allreduce(
-            void* buffer,
+            void *buffer,
             size_t count,
             CollectiveDataType dtype,
             CollectiveOp op) override;
@@ -147,8 +146,8 @@ namespace llaminar2
          * @return true on success
          */
         bool allgather(
-            const void* send_buf,
-            void* recv_buf,
+            const void *send_buf,
+            void *recv_buf,
             size_t send_count,
             CollectiveDataType dtype) override;
 
@@ -166,8 +165,8 @@ namespace llaminar2
          * @return true on success
          */
         bool reduceScatter(
-            const void* send_buf,
-            void* recv_buf,
+            const void *send_buf,
+            void *recv_buf,
             size_t recv_count,
             CollectiveDataType dtype,
             CollectiveOp op) override;
@@ -185,7 +184,7 @@ namespace llaminar2
          * @return true on success
          */
         bool broadcast(
-            void* buffer,
+            void *buffer,
             size_t count,
             CollectiveDataType dtype,
             int root_rank) override;
@@ -215,11 +214,8 @@ namespace llaminar2
         /// Last error message
         std::string last_error_;
 
-        /// Cross-vendor P2P engine for CUDA↔ROCm transfers
-        std::unique_ptr<CrossVendorP2PEngine> cross_vendor_engine_;
-
         /// Host staging buffer for reductions (dual-registered with both runtimes)
-        void* staging_buffer_ = nullptr;
+        void *staging_buffer_ = nullptr;
         size_t staging_buffer_size_ = 0;
 
         /// Track CUDA and ROCm device presence in group
@@ -243,7 +239,7 @@ namespace llaminar2
          * @param bytes Number of bytes to copy
          * @return true on success
          */
-        bool copyToHost(void* host_dst, const void* device_src, DeviceId device, size_t bytes);
+        bool copyToHost(void *host_dst, const void *device_src, DeviceId device, size_t bytes);
 
         /**
          * @brief Copy data from host staging buffer to GPU device
@@ -253,7 +249,7 @@ namespace llaminar2
          * @param bytes Number of bytes to copy
          * @return true on success
          */
-        bool copyFromHost(void* device_dst, const void* host_src, DeviceId device, size_t bytes);
+        bool copyFromHost(void *device_dst, const void *host_src, DeviceId device, size_t bytes);
 
         /**
          * @brief Perform reduction on host buffers
@@ -263,7 +259,7 @@ namespace llaminar2
          * @param dtype Data type
          * @param op Reduction operation
          */
-        void reduceOnHost(void* dst, const void* src, size_t count, 
+        void reduceOnHost(void *dst, const void *src, size_t count,
                           CollectiveDataType dtype, CollectiveOp op);
 
         /**
@@ -272,12 +268,6 @@ namespace llaminar2
          * @return true if buffer is ready
          */
         bool ensureStagingBuffer(size_t required_bytes);
-
-        /**
-         * @brief Initialize cross-vendor engine if we have mixed CUDA/ROCm
-         * @return true on success
-         */
-        bool initializeCrossVendorEngine();
     };
 
 } // namespace llaminar2

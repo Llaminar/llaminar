@@ -20,7 +20,7 @@
 // KVCache includes
 #include "cpu/CPUKVCache.h"
 #ifdef HAVE_CUDA
-#include "cuda/CUDARingKVCache.h"
+#include "cuda/kvcache/CUDARingKVCache.h"
 #endif
 
 #include "../tensors/Tensors.h"
@@ -43,7 +43,8 @@
 
 // ROCm kernel classes
 #ifdef HAVE_ROCM
-#include "rocm/ROCmFloatingPointGemmKernel.h" // FP32/FP16/BF16 via hipBLAS
+#include "rocm/ROCmFloatingPointGemmKernel.h"    // FP32/FP16/BF16 via hipBLAS
+#include "rocm/kvcache/ROCmRingKVCacheFactory.h" // ROCm Ring Buffer KV Cache factory
 #endif
 
 namespace llaminar
@@ -3476,8 +3477,12 @@ namespace llaminar
                 }
                 else if (config.device.is_rocm())
                 {
-                    LOG_ERROR("[KernelFactory] ROCm KVCache not yet implemented");
-                    throw std::runtime_error("KernelFactory::createKVCache: ROCm backend not yet supported");
+#ifdef HAVE_ROCM
+                    return createROCmKVCache(config);
+#else
+                    LOG_ERROR("[KernelFactory] ROCm KVCache requested but HAVE_ROCM not defined");
+                    throw std::runtime_error("KernelFactory::createKVCache: ROCm support not compiled in");
+#endif
                 }
                 else
                 {
@@ -3647,6 +3652,87 @@ namespace llaminar
                 }
             }
 #endif // HAVE_CUDA
+
+#ifdef HAVE_ROCM
+            std::unique_ptr<llaminar2::IKVCache> KernelFactory::createROCmKVCache(const KVCacheConfig &config)
+            {
+                // Validate precision - ROCm ring cache only supports FP32/BF16/FP16
+                switch (config.precision)
+                {
+                case llaminar2::ActivationPrecision::FP32:
+                case llaminar2::ActivationPrecision::BF16:
+                case llaminar2::ActivationPrecision::FP16:
+                    break; // Supported
+
+                case llaminar2::ActivationPrecision::Q8_1:
+                case llaminar2::ActivationPrecision::Q16_1:
+                case llaminar2::ActivationPrecision::Hybrid:
+                case llaminar2::ActivationPrecision::HybridQ16:
+                    LOG_ERROR("[KernelFactory] ROCm KVCache does not support precision: "
+                              << llaminar2::activationPrecisionToString(config.precision)
+                              << ". Use FP32, BF16, or FP16.");
+                    throw std::runtime_error("KernelFactory::createROCmKVCache: Unsupported precision");
+
+                default:
+                    LOG_ERROR("[KernelFactory] Unknown precision for ROCm KVCache: "
+                              << static_cast<int>(config.precision));
+                    throw std::runtime_error("KernelFactory::createROCmKVCache: Unknown precision");
+                }
+
+                // Validate basic parameters
+                if (config.num_layers <= 0 || config.n_kv_heads <= 0 || config.head_dim <= 0)
+                {
+                    LOG_ERROR("[KernelFactory] createROCmKVCache: invalid parameters");
+                    throw std::runtime_error("KernelFactory::createROCmKVCache: invalid parameters");
+                }
+
+                int rocm_device = config.device.rocm_ordinal();
+
+                // Handle sharding - ROCm supports it via factory function
+                if (config.is_sharded())
+                {
+                    LOG_DEBUG("[KernelFactory] Creating sharded ROCm Ring KVCache: "
+                              << "precision=" << llaminar2::activationPrecisionToString(config.precision)
+                              << ", device=ROCm:" << rocm_device
+                              << ", layers=" << config.num_layers
+                              << ", n_kv_heads=" << config.n_kv_heads
+                              << ", local_n_kv_heads=" << config.local_n_kv_heads
+                              << ", kv_head_start=" << config.kv_head_start
+                              << ", head_dim=" << config.head_dim
+                              << ", max_seq_len=" << config.max_seq_len);
+
+                    return llaminar2::createShardedROCmRingKVCache(
+                        config.precision,
+                        config.num_layers,
+                        config.batch_size,
+                        config.max_seq_len,
+                        config.n_kv_heads,
+                        config.local_n_kv_heads,
+                        config.kv_head_start,
+                        config.head_dim,
+                        rocm_device);
+                }
+                else
+                {
+                    LOG_DEBUG("[KernelFactory] Creating ROCm Ring KVCache: "
+                              << "precision=" << llaminar2::activationPrecisionToString(config.precision)
+                              << ", device=ROCm:" << rocm_device
+                              << ", layers=" << config.num_layers
+                              << ", n_kv_heads=" << config.n_kv_heads
+                              << ", head_dim=" << config.head_dim
+                              << ", max_seq_len=" << config.max_seq_len);
+
+                    return llaminar2::createROCmRingKVCache(
+                        config.precision,
+                        config.num_layers,
+                        config.batch_size,
+                        config.max_seq_len,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        rocm_device);
+                }
+            }
+#endif // HAVE_ROCM
 
             // ==========================================================================
             // Activation/Weight Type Compatibility

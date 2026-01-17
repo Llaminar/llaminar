@@ -3,12 +3,7 @@
  * @brief CPU-based fallback collective backend implementation
  *
  * This backend provides heterogeneous GPU collective operations by
- * staging data through host memory. For mixed CUDA/ROCm device groups,
- * it uses CrossVendorP2PEngine for efficient pipelined transfers.
- *
- * NOTE: We cannot include both <cuda_runtime.h> and <hip/hip_runtime.h> in
- * the same compilation unit due to conflicting type definitions. Instead,
- * we use the CrossVendorP2PEngine which handles the runtime isolation.
+ * staging data through host memory.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -128,16 +123,6 @@ namespace llaminar2
                                                         << " (CUDA: " << (has_cuda_ ? "yes" : "no")
                                                         << ", ROCm: " << (has_rocm_ ? "yes" : "no") << ")");
 
-        // If we have both CUDA and ROCm, set up cross-vendor engine
-        if (has_cuda_ && has_rocm_)
-        {
-            if (!initializeCrossVendorEngine())
-            {
-                LOG_WARN("HostBackend: Failed to initialize cross-vendor engine, "
-                         "falling back to serial transfers");
-            }
-        }
-
         initialized_ = true;
         return true;
     }
@@ -152,9 +137,6 @@ namespace llaminar2
         if (initialized_)
         {
             LOG_DEBUG("HostBackend: Shutting down");
-
-            // Shutdown cross-vendor engine
-            cross_vendor_engine_.reset();
 
             initialized_ = false;
             group_ = DeviceGroup{};
@@ -585,35 +567,6 @@ namespace llaminar2
 
         LOG_DEBUG("HostBackend: Allocated staging buffer of " << alloc_size << " bytes");
         return true;
-    }
-
-    bool HostBackend::initializeCrossVendorEngine()
-    {
-#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-        // Configure for optimal pipelined transfers
-        CrossVendorP2PConfig config;
-        config.buffer_size = 64 * 1024 * 1024; // 64 MB
-        config.chunk_size = 4 * 1024 * 1024;   // 4 MB (optimal from testing)
-        config.num_buffers = 2;
-        config.enable_pipelining = true;
-        config.auto_tune = false; // Use pre-tuned defaults
-
-        cross_vendor_engine_ = std::make_unique<CrossVendorP2PEngine>(config);
-
-        // Initialize for CUDA -> ROCm direction
-        if (!cross_vendor_engine_->initialize(cuda_device_, rocm_device_))
-        {
-            LOG_WARN("HostBackend: CrossVendorP2PEngine initialization failed");
-            cross_vendor_engine_.reset();
-            return false;
-        }
-
-        LOG_INFO("HostBackend: CrossVendorP2PEngine initialized for "
-                 << cuda_device_ << " <-> " << rocm_device_);
-        return true;
-#else
-        return false;
-#endif
     }
 
     bool HostBackend::copyToHost(void *host_dst, const void *device_src,

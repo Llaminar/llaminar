@@ -87,7 +87,7 @@ function(add_v2_test TEST_NAME)
         ARG                             # Prefix for parsed args
         ""                              # Options (boolean flags)
         "MPI_PROCS"                     # One-value keywords
-        "COMMAND;LABELS"                # Multi-value keywords
+        "COMMAND;LABELS;RESOURCE_LOCK"  # Multi-value keywords
         ${ARGN}                         # Arguments to parse
     )
     
@@ -239,6 +239,13 @@ function(add_v2_test TEST_NAME)
         ENVIRONMENT "${TEST_ENV}"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../.."
     )
+    
+    # Add RESOURCE_LOCK if specified (prevents parallel execution of tests needing same resource)
+    if(ARG_RESOURCE_LOCK)
+        set_tests_properties(${TEST_NAME} PROPERTIES
+            RESOURCE_LOCK "${ARG_RESOURCE_LOCK}"
+        )
+    endif()
 endfunction()
 
 # =============================================================================
@@ -367,6 +374,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
         COMMAND $<TARGET_FILE:v2_integration_cross_vendor_tp>
         LABELS "V2;Integration;TensorParallel;P2P;CUDA;ROCm;CrossVendor;GEMM;AllReduce"
         MPI_PROCS 1
+        RESOURCE_LOCK "PCIeBAR_P2P"
     )
 
     # Test: PCIeBARBackend Integration - End-to-end collective operations via PCIe BAR P2P
@@ -384,6 +392,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
         COMMAND $<TARGET_FILE:v2_integration_pcie_bar_backend>
         LABELS "V2;Integration;Collective;PCIeBARBackend;P2P;CUDA;ROCm;CrossVendor;TensorParallel;AllReduce"
         MPI_PROCS 1
+        RESOURCE_LOCK "PCIeBAR_P2P"
     )
 
     # Test: CUDA Vector Add Kernels - Accuracy tests for FP32/FP16/BF16/INT8/INT32 reduction kernels
@@ -2995,17 +3004,6 @@ add_v2_test(V2_Unit_HipBLASGemm
     MPI_PROCS 1  # Tests GPU GEMM locally, no MPI needed
 )
 
-# Test: ROCm Intra-Vendor P2P Transfer (MI50↔MI50 via host staging)
-# Tests CrossVendorP2PEngine's same_vendor_allowed mode for ROCm-to-ROCm transfers
-# across PCIe bus using double-buffered pipelining through pinned host memory
-add_executable(v2_test_rocm_intra_vendor_p2p unit/backends/benchmarks/Test__ROCmIntraVendorP2P.cpp)
-target_link_libraries(v2_test_rocm_intra_vendor_p2p llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_ROCmIntraVendorP2P
-    COMMAND $<TARGET_FILE:v2_test_rocm_intra_vendor_p2p>
-    LABELS "V2;Unit;ROCm;P2P;Benchmark;MultiGPU;MI50;PCIe;HostStaging;TensorParallel"
-    MPI_PROCS 1  # Tests multi-GPU P2P locally, no MPI needed
-)
-
 # Test: CUDA Basic Pipeline (Phase 1 - end-to-end KernelFactory + tensor transfer)
 # Tests KernelFactory dispatch to cuBLAS, tensor upload/download in GEMM context
 add_executable(v2_integration_cuda_basic_pipeline integration/Test__CUDABasicPipeline.cpp)
@@ -5499,4 +5497,64 @@ if(HAVE_ROCM)
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added hipBLAS INT8 GEMM roofline benchmarks")
+
+    # =============================================================================
+    # ROCm Ring Buffer KV Cache Tests
+    # =============================================================================
+
+    # Unit Test: ROCm Ring Buffer KV Cache
+    # Tests append, wrap-around, eviction, linearization, FP32/FP16 precision
+    add_executable(v2_unit_rocm_ring_kv_cache 
+        unit/Test__ROCmRingKVCache.cpp
+    )
+    target_link_libraries(v2_unit_rocm_ring_kv_cache 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_ROCmRingKVCache
+        COMMAND $<TARGET_FILE:v2_unit_rocm_ring_kv_cache>
+        LABELS "V2;Unit;ROCm;KVCache;RingBuffer;Eviction;SlidingWindow;FP32;FP16;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm Ring KV Cache unit tests")
+
+    # Unit Test: ROCm Ring Buffer KV Cache Sharding
+    # Tests sharded KV cache for tensor parallelism (stub tests until sharding implemented)
+    add_executable(v2_unit_rocm_ring_kv_cache_sharding 
+        unit/Test__ROCmRingKVCache_Sharding.cpp
+    )
+    target_link_libraries(v2_unit_rocm_ring_kv_cache_sharding 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_ROCmRingKVCache_Sharding
+        COMMAND $<TARGET_FILE:v2_unit_rocm_ring_kv_cache_sharding>
+        LABELS "V2;Unit;ROCm;KVCache;RingBuffer;Sharding;TensorParallel;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm Ring KV Cache sharding unit tests")
+
+    # =============================================================================
+    # ROCm Flash Attention Parity Tests
+    # =============================================================================
+
+    # Integration Test: ROCm Flash Attention Parity
+    # Tests Flash Attention 2 (prefill) and Flash Decoding (decode) ROCm kernels
+    # against CPU attention reference with cosine similarity metrics
+    add_executable(v2_integration_rocm_flash_attention_parity 
+        integration/Test__ROCmFlashAttentionParity.cpp
+    )
+    target_link_libraries(v2_integration_rocm_flash_attention_parity 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmFlashAttentionParity
+        COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
+        LABELS "V2;Integration;ROCm;Parity;Attention;FlashAttention;FlashDecode;GQA;FP32;CosineSimilarity;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm Flash Attention parity tests")
 endif()

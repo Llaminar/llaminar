@@ -27,7 +27,7 @@
 #pragma once
 
 #include "../ICollectiveBackend.h"
-#include "../../backends/benchmarks/DirectP2P.h"
+#include "../../backends/p2p/DirectP2P.h"
 #include <memory>
 #include <optional>
 #include <unordered_map>

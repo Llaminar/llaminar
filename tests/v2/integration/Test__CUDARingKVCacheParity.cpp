@@ -18,7 +18,7 @@
 #include <vector>
 #include <random>
 #include <cmath>
-#include "kernels/cuda/CUDARingKVCache.h"
+#include "kernels/cuda/kvcache/CUDARingKVCache.h"
 #include "utils/Logger.h"
 
 using namespace llaminar2;

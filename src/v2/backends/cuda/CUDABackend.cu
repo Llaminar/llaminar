@@ -10,9 +10,6 @@
 
 #include "CUDABackend.h"
 #include "../../utils/Logger.h"
-#include "../../kernels/cuda/IQ4_NL_BlockDecoder.h"
-#include "../../kernels/cuda/CudaGemmVariantsBaseline.h"
-#include "../../kernels/cuda/CudaGemmAutoTuner.h"
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <sstream>
@@ -337,60 +334,17 @@ namespace llaminar2
     // ====================================================================
 
     bool CUDABackend::gemmIQ4NL(
-        const void *A_device,
-        const void *B_device,
-        void *C_device,
-        int m,
-        int n,
-        int k,
-        int device_id)
+        const void * /*A_device*/,
+        const void * /*B_device*/,
+        void * /*C_device*/,
+        int /*m*/,
+        int /*n*/,
+        int /*k*/,
+        int /*device_id*/)
     {
-        // Validate device ID
-        if (device_id >= device_count_ || device_id < 0)
-        {
-            LOG_ERROR("CUDABackend::gemmIQ4NL - Invalid device ID: " << device_id);
-            return false;
-        }
-
-        // Set device
-        cudaError_t err_set = cudaSetDevice(device_id);
-        if (err_set != cudaSuccess)
-        {
-            LOG_ERROR("CUDABackend::gemmIQ4NL - Failed to set device " << device_id
-                                                                       << ": " << cudaGetErrorString(err_set));
-            return false;
-        }
-
-        // Cast to typed pointers
-        const float *A = static_cast<const float *>(A_device);
-        const cuda::IQ4_NLBlock *B = static_cast<const cuda::IQ4_NLBlock *>(B_device);
-        float *C = static_cast<float *>(C_device);
-
-        // Get optimal tile configuration from auto-tuner
-        auto &autotuner = cuda::CudaGemmAutoTuner::instance();
-        auto config = autotuner.getOptimalConfig(m, n, k);
-
-        // Launch optimized variant kernel (uses default CUDA stream)
-        cudaError_t err = cuda::launchIQ4NLGemmVariant(
-            A, B, C, m, n, k, config, 0);
-
-        if (err != cudaSuccess)
-        {
-            LOG_ERROR("CUDABackend::gemmIQ4NL - Kernel launch failed: "
-                      << cudaGetErrorString(err));
-            return false;
-        }
-
-        // Synchronize to catch kernel execution errors
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess)
-        {
-            LOG_ERROR("CUDABackend::gemmIQ4NL - Kernel execution failed: "
-                      << cudaGetErrorString(err));
-            return false;
-        }
-
-        return true;
+        // IQ4_NL GEMM via backend is deprecated - use kernel interface directly
+        LOG_ERROR("CUDABackend::gemmIQ4NL is deprecated and no longer implemented");
+        return false;
     }
 
 } // namespace llaminar2
