@@ -50,8 +50,9 @@
  *   | 32 < M < 128| 64×64    | 64×64×32  | Good balance for small batches   |
  *   | M ≥ 128   | 128×128   | 128×128×64| Peak throughput for prefill      |
  *
- * All kernels use GemmSpecialization::MNPadding to handle irregular M natively.
- * N and K requirements: N ≥ 32, K ≥ 32 (satisfied by all LLM dimensions).
+ * The 32×32 and 64×64 kernels use GemmSpecialization::MNPadding for irregular M.
+ * The 128×128 kernel uses GemmSpecialization::Default (requires M ≥ 128).
+ * N and K requirements: N ≥ 64, K ≥ 64 (satisfied by all LLM dimensions).
  *
  * For decode (M=1), the 32×32 kernel handles it directly - no explicit padding!
  *
@@ -59,19 +60,18 @@
  * MEMORY LAYOUT CONVENTION (CRITICAL!)
  * ============================================================================
  *
- * This implementation uses **Row-Major layout for ALL matrices**. This follows
- * CK's `mk_kn_mn` naming convention:
+ * This implementation uses **Row-Major for A and C, Column-Major for B**.
+ * This follows CK's `mk_nk_mn` naming convention (A=Row, B=Col, C=Row):
  *
  * Matrix A (activations): [M × K] Row-Major
  *   - Element A[m,k] is at memory offset: m * K + k
  *   - Stride = K (number of columns)
  *   - Example: A[2,3] with K=5 is at offset 2*5 + 3 = 13
  *
- * Matrix B (weights): [K × N] Row-Major
- *   - Element B[k,n] is at memory offset: k * N + n
- *   - Stride = N (number of columns)
- *   - NOTE: This is the TRANSPOSE of original model weights [N×K]
- *   - We transpose during weight packing in ROCmQuantisedGemmKernel.cpp
+ * Matrix B (weights): [K × N] Column-Major (stored as [N×K] Row-Major)
+ *   - Original model weights [N×K] are stored Row-Major: W[n,k] = data[n*K + k]
+ *   - CK interprets this as Column-Major [K×N]: B[k,n] = data[n*K + k]
+ *   - No transpose needed - reinterpret layout for CK's mk_nk_mn convention
  *
  * Matrix C (output): [M × N] Row-Major
  *   - Element C[m,n] is at memory offset: m * N + n
@@ -193,10 +193,10 @@ struct ScopedCoutSilence final
 //
 // ## Configuration Source
 //
-// Tile parameters copied from CK's official instance file for Row,Row,Row layout:
-//   https://github.com/ROCm/composable_kernel/blob/develop/library/src/tensor_operation_instance/gpu/gemm_universal/device_gemm_dl_i8_i8_i8_mk_kn_mn_instance.cpp
+// Tile parameters copied from CK's official instance file for Row,Col,Row layout:
+//   https://github.com/ROCm/composable_kernel/blob/develop/library/src/tensor_operation_instance/gpu/gemm_universal/device_gemm_dl_i8_i8_i8_mk_nk_mn_instance.cpp
 //
-// The "mk_kn_mn" suffix indicates: A[M,K]=Row, B[K,N]=Row, C[M,N]=Row
+// The "mk_nk_mn" suffix indicates: A[M,K]=Row, B[K,N]=Col, C[M,N]=Row
 //
 // ============================================================================
 
@@ -220,31 +220,45 @@ using PassThrough = ck::tensor_operation::element_wise::PassThrough;
 // DeviceGemmMultipleD_Dl uses tile-based computation with fixed block sizes.
 // Dimensions below these minimums will fail IsSupportedArgument().
 //
-// We use TWO kernel configurations:
+// We use THREE kernel configurations (3-way dispatch):
 //
-// LARGE KERNEL (128×128 tiles) - for prefill (M >= 64):
+// SMALL KERNEL (32×32 tiles) - for decode (M ≤ 32):
+//   - MPerBlock = 32, NPerBlock = 32, K0×K1 = 8×4 = 32
+//   - Uses GemmMNPadding to handle M=1 natively (no explicit padding needed!)
+//   - Optimal for decode where M is typically 1
+//
+// MEDIUM KERNEL (64×64 tiles) - for small batches (32 < M < 128):
+//   - MPerBlock = 64, NPerBlock = 64, K0×K1 = 8×4 = 32
+//   - Uses GemmMNPadding for irregular M dimensions
+//   - Good balance between occupancy and efficiency
+//
+// LARGE KERNEL (128×128 tiles) - for prefill (M ≥ 128):
 //   - MPerBlock = 128, NPerBlock = 128, K0×K1 = 16×4 = 64
-//   - High throughput for large batch sizes
-//
-// SMALL KERNEL (8×64 tiles) - for decode (M < 64):
-//   - MPerBlock = 8, NPerBlock = 64, K0×K1 = 32×2 = 64
-//   - Efficient for skinny-M problems (decode with M=1)
-//   - Only need to pad M to 8 for M < 8 (16× less waste than padding to 128!)
+//   - Uses GemmDefault (requires M ≥ 128)
+//   - Peak throughput for large batch sizes
 //
 // DISPATCH STRATEGY:
-//   M >= 64:  Use large kernel (128×128), pad M to 128 if needed (64 ≤ M < 128)
-//   M < 64:   Use small kernel (8×64), pad M to 8 if needed (1 ≤ M < 8)
+//   M ≤ 32:      Use 32×32 kernel (GemmMNPadding handles irregular M)
+//   32 < M < 128: Use 64×64 kernel (GemmMNPadding handles irregular M)  
+//   M ≥ 128:     Use 128×128 kernel (GemmDefault, peak throughput)
 //
-constexpr int CK_LARGE_MIN_M = 128;  // Large kernel MPerBlock
-constexpr int CK_LARGE_MIN_N = 128;  // Large kernel NPerBlock
-constexpr int CK_LARGE_MIN_K = 64;   // Large kernel K0×K1
+// Dimension requirements for each kernel (used by ck_dimensions_supported())
+// Note: The 32×32 and 64×64 kernels use GemmMNPadding, so they can handle
+// M values below their tile size. These are the MINIMUM dimensions after
+// the C++ caller's explicit padding (M < 8 gets padded to 8).
 
-constexpr int CK_SMALL_MIN_M = 8;    // Small kernel MPerBlock (decode-optimized!)
-constexpr int CK_SMALL_MIN_N = 64;   // Small kernel NPerBlock
-constexpr int CK_SMALL_MIN_K = 64;   // Small kernel K0×K1
+constexpr int CK_LARGE_MIN_M = 128;  // 128×128 kernel requires M ≥ 128
+constexpr int CK_LARGE_MIN_N = 128;  // 128×128 kernel requires N ≥ 128
+constexpr int CK_LARGE_MIN_K = 64;   // 128×128 kernel requires K ≥ 64
 
-// Threshold: use small kernel for M below this
-constexpr int CK_SMALL_KERNEL_THRESHOLD = 128;  // M < 128 uses small kernel (8×64 tiles)
+// Minimum dimensions supported after C++ caller padding (M < 8 → 8)
+// The 32×32 kernel with GemmMNPadding handles M=8 to M=32 natively
+constexpr int CK_SMALL_MIN_M = 8;    // After C++ padding, minimum M is 8
+constexpr int CK_SMALL_MIN_N = 64;   // Minimum N for 32×32/64×64 kernels  
+constexpr int CK_SMALL_MIN_K = 64;   // Minimum K for all kernels
+
+// Threshold for 3-way dispatch (handled in rocmQuantGemm_executeNoScale)
+constexpr int CK_SMALL_KERNEL_THRESHOLD = 128;  // M < 128 uses 32×32 or 64×64 kernel
 
 // Helper function to check if dimensions meet large kernel requirements
 inline bool ck_large_dimensions_supported(int M, int N, int K)
@@ -261,7 +275,9 @@ inline bool ck_small_dimensions_supported(int M, int N, int K)
 // Legacy: check if ANY CK kernel can handle these dimensions (after padding)
 inline bool ck_dimensions_supported(int M, int N, int K)
 {
-    // Small kernel can handle M >= 8, N >= 64, K >= 64
+    // After C++ caller padding (M < 8 → 8), minimum supported dimensions are:
+    // M >= 8, N >= 64, K >= 64
+    // The 32×32 kernel with GemmMNPadding handles these natively.
     return M >= CK_SMALL_MIN_M && N >= CK_SMALL_MIN_N && K >= CK_SMALL_MIN_K;
 }
 
@@ -696,8 +712,9 @@ extern "C"
     // CK's DeviceGemmMultipleD_Dl uses fixed tile sizes which impose minimum
     // dimension requirements. Use these functions to check before invoking.
     // 
-    // With the small-M kernel (8×64 tiles), minimums are now:
-    //   M >= 8, N >= 64, K >= 64
+    // With the 3-way dispatch and GemmMNPadding on 32×32/64×64 kernels:
+    //   M >= 8 (after C++ caller padding), N >= 64, K >= 64
+    // The 32×32 kernel handles M=8 to M=32 natively without explicit padding.
 
     int rocmQuantGemm_getMinM() { return CK_SMALL_MIN_M; }
     int rocmQuantGemm_getMinN() { return CK_SMALL_MIN_N; }
@@ -869,7 +886,7 @@ extern "C"
     //   - 32 < M < 128: 64×64 kernel with GemmMNPadding
     //   - M ≥ 128:    128×128 kernel (peak throughput)
     //
-    // Minimum requirements: N ≥ 32, K ≥ 32 (always satisfied by LLM dims)
+    // Minimum requirements: N ≥ 64, K ≥ 64 (always satisfied by LLM dims)
     //
     // NOTE: In practice, this always returns true for valid LLM dimensions.
     //       Qwen2.5-0.5B smallest: M=1 (decode), K=896, N=896
@@ -896,9 +913,9 @@ extern "C"
     //   - 32 < M < 128: Use 64×64 kernel (~17 TFLOPS, 1.3x faster than 128-pad)
     //   - M >= 128:    Use 128×128 kernel (~26 TFLOPS, optimal for large M)
     //
-    // All kernels use GemmSpecialization::MNPadding to handle irregular M
-    // without explicit buffer padding. This is much more efficient than
-    // allocating padded buffers and copying data.
+    // The 32×32 and 64×64 kernels use GemmSpecialization::MNPadding to handle
+    // irregular M dimensions. The 128×128 kernel uses GemmSpecialization::Default
+    // and requires M ≥ 128.
     //
     // Benchmark Results (K=3584, N=18944, MI50 gfx906):
     //   M=1:   32×32: 0.46ms / 128-pad: 1.2ms = 2.6x faster
@@ -929,8 +946,8 @@ extern "C"
         // =====================================================================
         // 3-WAY DISPATCH BASED ON M
         // =====================================================================
-        // All kernels use GemmMNPadding so no explicit padding needed!
-        // The kernel automatically handles irregular M dimensions.
+        // The 32×32 and 64×64 kernels use GemmMNPadding to handle irregular M.
+        // The 128×128 kernel uses GemmDefault and requires M ≥ 128.
         // =====================================================================
 
         ScopedCoutSilence silence;
