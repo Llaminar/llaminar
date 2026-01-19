@@ -9,6 +9,8 @@
 #include "compute_stages/IComputeStage.h"
 #include "../tensors/cpu/CPUTensors.h"
 #include "../utils/Logger.h"
+#include "../utils/DebugEnv.h"
+#include <chrono>
 
 namespace llaminar2
 {
@@ -24,6 +26,7 @@ namespace llaminar2
             return true;
         }
 
+        const bool trace_coherence = debugEnv().rocm.trace_coherence;
         LOG_DEBUG("[StageCoherence] Cohering " << inputs.size() << " inputs to " << target_device.to_string());
 
         for (const auto &buf : inputs)
@@ -47,8 +50,11 @@ namespace llaminar2
             // Check if tensor is already on device
             if (tensor_base->is_on_device(target_device))
             {
-                LOG_DEBUG("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
-                                                     << "' already on " << target_device.to_string());
+                if (trace_coherence)
+                {
+                    LOG_INFO("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
+                                                        << "' already on " << target_device.to_string());
+                }
                 continue;
             }
 
@@ -69,9 +75,20 @@ namespace llaminar2
             }
             else
             {
-                LOG_DEBUG("[StageCoherence] Uploading input '" << (buf.name ? buf.name : "unknown")
-                                                               << "' to " << target_device.to_string());
-                if (!tensor_base->ensureOnDevice(target_device))
+                auto start = std::chrono::high_resolution_clock::now();
+                bool success = tensor_base->ensureOnDevice(target_device);
+                auto end = std::chrono::high_resolution_clock::now();
+                auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+                if (trace_coherence)
+                {
+                    LOG_INFO("[StageCoherence] ensureOnDevice('" << (buf.name ? buf.name : "unknown")
+                                                                 << "') to " << target_device.to_string()
+                                                                 << " took " << elapsed_us << " us"
+                                                                 << " (numel=" << tensor_base->numel() << ")");
+                }
+
+                if (!success)
                 {
                     LOG_ERROR("[StageCoherence] Failed to upload input '"
                               << (buf.name ? buf.name : "unknown")
@@ -97,6 +114,7 @@ namespace llaminar2
             return true;
         }
 
+        const bool trace_coherence = debugEnv().rocm.trace_coherence;
         LOG_DEBUG("[StageCoherence] Allocating GPU buffers for " << outputs.size() << " outputs on " << target_device.to_string());
 
         for (const auto &buf : outputs)
@@ -120,17 +138,31 @@ namespace llaminar2
             // Check if tensor is already on device
             if (tensor_base->is_on_device(target_device))
             {
-                LOG_DEBUG("[StageCoherence] Output '" << (buf.name ? buf.name : "unknown")
-                                                      << "' already on " << target_device.to_string());
+                if (trace_coherence)
+                {
+                    LOG_INFO("[StageCoherence] Output '" << (buf.name ? buf.name : "unknown")
+                                                         << "' already on " << target_device.to_string());
+                }
                 continue;
             }
 
             // Ensure output buffer is allocated on device
             // This allocates GPU memory but doesn't necessarily upload host data
             // (the kernel will write to the GPU buffer)
-            LOG_DEBUG("[StageCoherence] Allocating output buffer '" << (buf.name ? buf.name : "unknown")
-                                                                    << "' on " << target_device.to_string());
-            if (!tensor_base->ensureOnDevice(target_device))
+            auto start = std::chrono::high_resolution_clock::now();
+            bool success = tensor_base->ensureOnDevice(target_device);
+            auto end = std::chrono::high_resolution_clock::now();
+            auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+            if (trace_coherence)
+            {
+                LOG_INFO("[StageCoherence] ensureOnDevice OUTPUT('" << (buf.name ? buf.name : "unknown")
+                                                                    << "') to " << target_device.to_string()
+                                                                    << " took " << elapsed_us << " us"
+                                                                    << " (numel=" << tensor_base->numel() << ")");
+            }
+
+            if (!success)
             {
                 LOG_ERROR("[StageCoherence] Failed to allocate output buffer '"
                           << (buf.name ? buf.name : "unknown")
@@ -149,7 +181,7 @@ namespace llaminar2
             return;
         }
 
-        LOG_DEBUG("[StageCoherence] Marking " << outputs.size() << " outputs as device-dirty");
+        LOG_DEBUG("[StageCoherence] Marking " << outputs.size() << " outputs as device-dirty (with events)");
 
         for (const auto &buf : outputs)
         {
@@ -169,10 +201,12 @@ namespace llaminar2
                 continue;
             }
 
-            // Mark as device-dirty (GPU has authoritative copy)
+            // Mark as device-dirty WITH EVENT for fine-grained synchronization
+            // This records a completion event so ensureOnHost() can wait on just
+            // this kernel rather than doing a full device sync
             LOG_DEBUG("[StageCoherence] Marking output '" << (buf.name ? buf.name : "unknown")
-                                                          << "' as device-dirty");
-            tensor_base->mark_device_dirty();
+                                                          << "' as device-dirty (with event)");
+            tensor_base->mark_device_dirty_with_event();
         }
     }
 

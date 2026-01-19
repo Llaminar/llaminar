@@ -199,6 +199,10 @@ namespace llaminar2
         size_t stages_with_requirements = 0;
         size_t total_requirements = 0;
 
+        // Collect all stages for workspace allocation
+        std::vector<IComputeStage *> all_stages;
+        all_stages.reserve(execution_order.size());
+
         for (const auto &node_name : execution_order)
         {
             auto *node = graph.getNode(node_name);
@@ -207,6 +211,9 @@ namespace llaminar2
                 LOG_WARN("GraphBufferManager: Node '" << node_name << "' has no stage, skipping");
                 continue;
             }
+
+            // Collect stage for potential workspace allocation
+            all_stages.push_back(node->stage.get());
 
             // Get requirements from stage
             auto reqs = node->stage->getBufferRequirements();
@@ -245,6 +252,17 @@ namespace llaminar2
                                                    << stages_with_requirements << " stages ("
                                                    << total_requirements << " requirements total)");
         LOG_DEBUG("GraphBufferManager: Total allocated: " << (stats_.total_bytes / 1024.0 / 1024.0) << " MB");
+
+        // Allocate GPU workspace for stages that need it (IWorkspaceConsumer implementations)
+        if (!all_stages.empty())
+        {
+            WorkspaceBudgetConfig workspace_config;
+            if (!allocateDeviceWorkspace(all_stages, workspace_config))
+            {
+                LOG_WARN("GraphBufferManager: GPU workspace allocation failed, kernels will use fallback path");
+                // Note: This is a warning, not an error - some kernels may fall back to host-path allocation
+            }
+        }
 
         return true;
     }

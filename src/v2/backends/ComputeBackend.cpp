@@ -599,6 +599,32 @@ namespace llaminar2
         return false;
     }
 
+    int DeviceManager::cuda_device_count() const
+    {
+        int count = 0;
+        for (const auto &dev : devices_)
+        {
+            if (dev.type == ComputeBackendType::GPU_CUDA)
+            {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    int DeviceManager::rocm_device_count() const
+    {
+        int count = 0;
+        for (const auto &dev : devices_)
+        {
+            if (dev.type == ComputeBackendType::GPU_ROCM)
+            {
+                count++;
+            }
+        }
+        return count;
+    }
+
     std::vector<size_t> DeviceManager::get_devices_by_type(ComputeBackendType type) const
     {
         std::vector<size_t> result;

@@ -19,8 +19,7 @@ namespace llaminar2
     // =============================================================================
 
     FusedGateUpGEMMStage::FusedGateUpGEMMStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
     }
 
@@ -73,9 +72,14 @@ namespace llaminar2
         // Get the target device type from device_id
         DeviceType target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
 
+        LOG_INFO("[FusedGateUpGEMMStage] Looking up kernel for gate=" << (void *)w_gate_base
+                                                                      << " up=" << (void *)w_up_base << " device=" << static_cast<int>(target_dev_type));
+
         // Get fused Gate/Up kernel from KernelFactory
         auto *fused_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
             w_gate_base, w_up_base, target_dev_type);
+
+        LOG_INFO("[FusedGateUpGEMMStage] Got fused_kernel=" << (void *)fused_kernel);
 
         if (!fused_kernel)
         {
@@ -227,6 +231,47 @@ namespace llaminar2
         }
 
         return reqs;
+    }
+
+    // =============================================================================
+    // IWorkspaceConsumerStage Implementation
+    // =============================================================================
+
+    IWorkspaceConsumer *FusedGateUpGEMMStage::getKernelAsWorkspaceConsumer()
+    {
+        // Check if we have valid weight tensors
+        if (!params_.w_gate || !params_.w_up)
+        {
+            LOG_WARN("[FusedGateUpGEMMStage::getKernelAsWorkspaceConsumer] Weight tensors not set");
+            return nullptr;
+        }
+
+        // Cast to TensorBase for KernelFactory
+        auto *w_gate_base = dynamic_cast<const TensorBase *>(params_.w_gate);
+        auto *w_up_base = dynamic_cast<const TensorBase *>(params_.w_up);
+        if (!w_gate_base || !w_up_base)
+        {
+            LOG_WARN("[FusedGateUpGEMMStage::getKernelAsWorkspaceConsumer] "
+                     "Weight tensors are not TensorBase");
+            return nullptr;
+        }
+
+        // Get the target device type
+        DeviceType target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+
+        // Get the fused kernel (cached by KernelFactory)
+        cached_kernel_ = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
+            w_gate_base, w_up_base, target_dev_type);
+
+        if (!cached_kernel_)
+        {
+            LOG_WARN("[FusedGateUpGEMMStage::getKernelAsWorkspaceConsumer] "
+                     "Failed to get fused kernel");
+            return nullptr;
+        }
+
+        // The FusedGateUpGemmAdapter now implements IWorkspaceConsumer
+        return dynamic_cast<IWorkspaceConsumer *>(cached_kernel_);
     }
 
 } // namespace llaminar2

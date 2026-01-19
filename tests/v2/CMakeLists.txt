@@ -475,6 +475,19 @@ add_v2_test(V2_Unit_DeviceWorkspaceManager
     MPI_PROCS 1
 )
 
+# Test: IWorkspaceConsumerStage - Mixin for stages that delegate workspace to kernels
+add_executable(v2_unit_workspace_consumer_stage unit/Test__IWorkspaceConsumerStage.cpp)
+target_link_libraries(v2_unit_workspace_consumer_stage 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IWorkspaceConsumerStage 
+    COMMAND $<TARGET_FILE:v2_unit_workspace_consumer_stage>
+    LABELS "V2;Unit;Execution;ComputeStages;Workspace;IWorkspaceConsumer;Mixin"
+    MPI_PROCS 1
+)
+
 # Test: ROCmQuantisedGemmKernel_Workspace - IWorkspaceConsumer interface integration
 add_executable(v2_unit_rocm_gemm_workspace unit/Test__ROCmQuantisedGemmKernel_Workspace.cpp)
 target_link_libraries(v2_unit_rocm_gemm_workspace 
@@ -3102,7 +3115,7 @@ add_v2_test(V2_Integration_CUDAFullModelInference
 # Test Organization:
 #   - Test__CUDA_vs_PyTorch.cpp - CUDA pipeline vs PyTorch FP32 reference
 #   - Test__CPU_vs_PyTorch.cpp  - CPU pipeline vs PyTorch FP32 reference
-#   - (future) Test__ROCm_vs_PyTorch.cpp - ROCm pipeline vs PyTorch FP32 reference
+#   - Test__ROCm_vs_PyTorch.cpp - ROCm pipeline vs PyTorch FP32 reference
 #
 # Requirements:
 #   - ZLIB (for cnpy .npy file loading)
@@ -3156,7 +3169,27 @@ if(ZLIB_FOUND)
         MPI_PROCS 1
     )
 
-    message(STATUS "V2: Qwen2 parity tests enabled (CUDA, CPU vs PyTorch)")
+    # Qwen2 ROCm vs PyTorch Parity Test
+    add_executable(v2_integration_parity_qwen2_rocm_vs_pytorch 
+        integration/parity/qwen2/Test__Qwen2_ROCm_vs_PyTorch.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen2_rocm_vs_pytorch 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+        ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen2_rocm_vs_pytorch PRIVATE 
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+    )
+    add_v2_test(V2_Integration_Parity_Qwen2_ROCm_vs_PyTorch
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_rocm_vs_pytorch>
+        LABELS "V2;Integration;Parity;Qwen2;ROCm;PyTorch;GoldenReference;FullModel;Pipeline"
+        MPI_PROCS 1
+    )
+
+    message(STATUS "V2: Qwen2 parity tests enabled (CUDA, CPU, ROCm vs PyTorch)")
 else()
     message(STATUS "V2: Parity tests disabled (ZLIB not found)")
 endif()
@@ -3169,6 +3202,16 @@ add_v2_test(V2_Unit_ComputeStage
     COMMAND $<TARGET_FILE:v2_test_compute_stage>
     LABELS "V2;Unit;Execution;ComputeStage;RMSNorm;RoPE;Attention;SwiGLU;MoE;KernelDispatch"
     MPI_PROCS 1  # Tests CPU stages locally, no MPI needed
+)
+
+# Test: GEMMStage (GEMM compute stage with workspace support)
+# Tests construction, IWorkspaceConsumerStage delegation, params validation, metrics
+add_executable(v2_test_gemm_stage unit/Test__GEMMStage.cpp)
+target_link_libraries(v2_test_gemm_stage llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GEMMStage
+    COMMAND $<TARGET_FILE:v2_test_gemm_stage>
+    LABELS "V2;Unit;Execution;ComputeStage;GEMM;Workspace;Validation"
+    MPI_PROCS 1  # Tests stage construction and params, no MPI needed
 )
 
 # Test: ExecutionPolicy (declarative operation control)
@@ -5537,6 +5580,90 @@ if(HAVE_ROCM)
     message(STATUS "V2 Tests: Added ROCm Ring KV Cache sharding unit tests")
 
     # =============================================================================
+    # ROCm SwiGLU Parity Tests
+    # =============================================================================
+
+    # Integration Test: ROCm SwiGLU Parity
+    # Tests ROCm SwiGLU kernels (FP32, BF16, FP16) against CPU reference
+    # with cosine similarity and L2 error metrics
+    add_executable(v2_integration_rocm_swiglu_parity 
+        integration/Test__ROCmSwiGLUParity.cpp
+    )
+    target_link_libraries(v2_integration_rocm_swiglu_parity 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmSwiGLUParity
+        COMMAND $<TARGET_FILE:v2_integration_rocm_swiglu_parity>
+        LABELS "V2;Integration;ROCm;Parity;SwiGLU;FP32;BF16;FP16;CosineSimilarity;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm SwiGLU parity tests")
+
+    # ROCm RoPE Parity Tests
+    # =============================================================================
+
+    # Integration Test: ROCm RoPE Parity
+    # Tests ROCm RoPE kernels (FP32, BF16, FP16) against CPU reference
+    # with cosine similarity and L2 error metrics
+    add_executable(v2_integration_rocm_rope_parity 
+        integration/Test__ROCmRoPEParity.cpp
+    )
+    target_link_libraries(v2_integration_rocm_rope_parity 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmRoPEParity
+        COMMAND $<TARGET_FILE:v2_integration_rocm_rope_parity>
+        LABELS "V2;Integration;ROCm;Parity;RoPE;FP32;BF16;FP16;CosineSimilarity;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm RoPE parity tests")
+
+    # ROCm RMSNorm Parity Tests
+    # =============================================================================
+
+    # Integration Test: ROCm RMSNorm Parity
+    # Tests ROCm RMSNorm kernels (FP32, BF16, FP16) against CPU reference
+    # with cosine similarity and L2 error metrics
+    add_executable(v2_integration_rocm_rmsnorm_parity 
+        integration/Test__ROCmRMSNormParity.cpp
+    )
+    target_link_libraries(v2_integration_rocm_rmsnorm_parity 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmRMSNormParity
+        COMMAND $<TARGET_FILE:v2_integration_rocm_rmsnorm_parity>
+        LABELS "V2;Integration;ROCm;Parity;RMSNorm;FP32;BF16;FP16;CosineSimilarity;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm RMSNorm parity tests")
+
+    # ROCm Embedding Parity Tests
+    # =============================================================================
+
+    # Integration Test: ROCm Embedding Parity
+    # Tests ROCm Embedding kernels (FP32, BF16, FP16, Q8_1) against CPU reference
+    # with cosine similarity and L2 error metrics
+    add_executable(v2_integration_rocm_embedding_parity 
+        integration/Test__ROCmEmbeddingParity.cpp
+    )
+    target_link_libraries(v2_integration_rocm_embedding_parity 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmEmbeddingParity
+        COMMAND $<TARGET_FILE:v2_integration_rocm_embedding_parity>
+        LABELS "V2;Integration;ROCm;Parity;Embedding;FP32;BF16;FP16;Q8_1;CosineSimilarity;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm Embedding parity tests")
+
     # ROCm Flash Attention Parity Tests
     # =============================================================================
 
@@ -5557,4 +5684,25 @@ if(HAVE_ROCM)
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm Flash Attention parity tests")
+
+    # ROCm ResidualAdd Parity Tests
+    # =============================================================================
+
+    # Integration Test: ROCm ResidualAdd Parity
+    # Tests ROCm ResidualAdd kernels (FP32, BF16, FP16) against CPU reference
+    # with cosine similarity and L2 error metrics
+    add_executable(v2_integration_rocm_residual_add_parity 
+        integration/Test__ROCmResidualAddParity.cpp
+    )
+    target_link_libraries(v2_integration_rocm_residual_add_parity 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmResidualAddParity
+        COMMAND $<TARGET_FILE:v2_integration_rocm_residual_add_parity>
+        LABELS "V2;Integration;ROCm;Parity;ResidualAdd;FP32;BF16;FP16;CosineSimilarity;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm ResidualAdd parity tests")
 endif()

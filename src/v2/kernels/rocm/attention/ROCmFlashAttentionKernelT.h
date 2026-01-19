@@ -33,14 +33,37 @@
 #pragma once
 
 #include "../../../execution/RuntimeConfig.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/MPIContext.h"
 
 namespace llaminar2
 {
+    // Forward declarations for IWorkspaceConsumer
+    class DeviceWorkspaceManager;
+    struct WorkspaceRequirements;
+
     namespace rocm
     {
+        // =============================================================================
+        // Attention Workspace Buffer Names
+        // =============================================================================
+
+        /**
+         * Standard buffer names for Flash Attention workspace.
+         * Flash Decoding requires partial output buffers for split-K reduction.
+         */
+        namespace AttentionWorkspaceBuffers
+        {
+            /// Partial attention output [batch × n_heads × num_splits × head_dim] FP32
+            constexpr const char *PARTIAL_OUTPUT = "attn_partial_output";
+            /// Max scores per split [batch × n_heads × num_splits] FP32
+            constexpr const char *PARTIAL_M = "attn_partial_m";
+            /// Logsumexp per split [batch × n_heads × num_splits] FP32
+            constexpr const char *PARTIAL_L = "attn_partial_l";
+        }
+
         // Forward declaration of precision element type mapping
         namespace detail
         {
@@ -193,13 +216,15 @@ namespace llaminar2
              * @param head_dim Dimension per head
              * @param causal Apply causal masking
              * @param position_offset Starting position (for causal mask)
+             * @param device_idx Target device index (-1 uses default)
              * @return true on success
              */
             bool compute_decode(
                 const float *Q, const float *K, const float *V, float *output,
                 int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
                 bool causal = true,
-                int position_offset = 0);
+                int position_offset = 0,
+                int device_idx = -1);
 
             /**
              * @brief Internal typed implementation
@@ -264,7 +289,7 @@ namespace llaminar2
          * @brief FP32 Flash Attention kernel specialization
          */
         template <>
-        class ROCmFlashAttentionKernelT<ActivationPrecision::FP32> : public ITensorAttention
+        class ROCmFlashAttentionKernelT<ActivationPrecision::FP32> : public ITensorAttention, public IWorkspaceConsumer
         {
         public:
             using ElementType = float;
@@ -309,7 +334,8 @@ namespace llaminar2
                 const float *Q, const float *K, const float *V, float *output,
                 int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
                 bool causal = true,
-                int position_offset = 0);
+                int position_offset = 0,
+                int device_idx = -1);
 
             bool apply_typed(
                 const float *Q, const float *K, const float *V, float *output,
@@ -339,6 +365,46 @@ namespace llaminar2
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1) override;
 
+            // =========================================================================
+            // IWorkspaceConsumer Interface
+            // =========================================================================
+
+            /**
+             * @brief Get workspace requirements for Flash Decoding
+             *
+             * Flash Decoding requires partial output buffers for split-K reduction:
+             * - partial_output [batch × n_heads × num_splits × head_dim] FP32
+             * - partial_m [batch × n_heads × num_splits] FP32 (max scores)
+             * - partial_l [batch × n_heads × num_splits] FP32 (logsumexp)
+             *
+             * @param m Batch size (typically 1 for decode)
+             * @param n Number of heads (n_heads)
+             * @param k Head dimension (head_dim)
+             * @return WorkspaceRequirements with buffer specifications
+             */
+            WorkspaceRequirements getWorkspaceRequirements(
+                int m = 1, int n = 0, int k = 0) const override;
+
+            /**
+             * @brief Bind workspace manager for managed mode
+             *
+             * When bound, Flash Decoding uses pre-allocated buffers instead of
+             * internal hipMalloc allocations (which are extremely slow on ROCm).
+             *
+             * @param workspace Pointer to workspace manager (NOT owned, must outlive kernel)
+             */
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+
+            /**
+             * @brief Check if workspace is currently bound
+             */
+            bool hasWorkspace() const override;
+
+            /**
+             * @brief Get the currently bound workspace manager
+             */
+            DeviceWorkspaceManager *getWorkspace() const override;
+
         private:
             int device_idx_;
             void *stream_ = nullptr;
@@ -348,6 +414,9 @@ namespace llaminar2
             size_t workspace_size_ = 0;
             int max_splits_ = 0;
 
+            // IWorkspaceConsumer state
+            DeviceWorkspaceManager *workspace_ = nullptr;
+
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();
         };
@@ -356,7 +425,7 @@ namespace llaminar2
          * @brief FP16 Flash Attention kernel specialization
          */
         template <>
-        class ROCmFlashAttentionKernelT<ActivationPrecision::FP16> : public ITensorAttention
+        class ROCmFlashAttentionKernelT<ActivationPrecision::FP16> : public ITensorAttention, public IWorkspaceConsumer
         {
         public:
             using ElementType = uint16_t;
@@ -401,7 +470,8 @@ namespace llaminar2
                 const float *Q, const float *K, const float *V, float *output,
                 int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
                 bool causal = true,
-                int position_offset = 0);
+                int position_offset = 0,
+                int device_idx = -1);
 
             bool apply_typed(
                 const uint16_t *Q, const uint16_t *K, const uint16_t *V, uint16_t *output,
@@ -431,6 +501,16 @@ namespace llaminar2
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1) override;
 
+            // =========================================================================
+            // IWorkspaceConsumer Interface
+            // =========================================================================
+
+            WorkspaceRequirements getWorkspaceRequirements(
+                int m = 1, int n = 0, int k = 0) const override;
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+            bool hasWorkspace() const override;
+            DeviceWorkspaceManager *getWorkspace() const override;
+
         private:
             int device_idx_;
             void *stream_ = nullptr;
@@ -439,6 +519,9 @@ namespace llaminar2
             void *partial_l_buf_ = nullptr;
             size_t workspace_size_ = 0;
             int max_splits_ = 0;
+
+            // IWorkspaceConsumer state
+            DeviceWorkspaceManager *workspace_ = nullptr;
 
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();
@@ -451,7 +534,7 @@ namespace llaminar2
          * may need to fall back to FP16 or FP32 accumulation paths.
          */
         template <>
-        class ROCmFlashAttentionKernelT<ActivationPrecision::BF16> : public ITensorAttention
+        class ROCmFlashAttentionKernelT<ActivationPrecision::BF16> : public ITensorAttention, public IWorkspaceConsumer
         {
         public:
             using ElementType = uint16_t;
@@ -496,7 +579,8 @@ namespace llaminar2
                 const float *Q, const float *K, const float *V, float *output,
                 int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
                 bool causal = true,
-                int position_offset = 0);
+                int position_offset = 0,
+                int device_idx = -1);
 
             bool apply_typed(
                 const uint16_t *Q, const uint16_t *K, const uint16_t *V, uint16_t *output,
@@ -526,6 +610,16 @@ namespace llaminar2
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1) override;
 
+            // =========================================================================
+            // IWorkspaceConsumer Interface
+            // =========================================================================
+
+            WorkspaceRequirements getWorkspaceRequirements(
+                int m = 1, int n = 0, int k = 0) const override;
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+            bool hasWorkspace() const override;
+            DeviceWorkspaceManager *getWorkspace() const override;
+
         private:
             int device_idx_;
             void *stream_ = nullptr;
@@ -534,6 +628,9 @@ namespace llaminar2
             void *partial_l_buf_ = nullptr;
             size_t workspace_size_ = 0;
             int max_splits_ = 0;
+
+            // IWorkspaceConsumer state
+            DeviceWorkspaceManager *workspace_ = nullptr;
 
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();

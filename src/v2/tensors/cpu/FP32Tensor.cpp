@@ -95,18 +95,53 @@ namespace llaminar2
         // They borrow from the parent via parent_data_ptr_
     }
 
+    std::unique_ptr<FP32Tensor> FP32Tensor::createMapped(
+        const std::vector<size_t> &shape,
+        DeviceId target_device)
+    {
+        // Calculate tensor size
+        size_t count = 1;
+        for (auto dim : shape)
+        {
+            count *= dim;
+        }
+        size_t bytes = count * sizeof(float);
+
+        // Create tensor with regular constructor first (no host allocation for mapped)
+        auto tensor = std::make_unique<FP32Tensor>(shape, target_device);
+
+        // Try to initialize as mapped tensor via base class
+        if (!tensor->initMappedMemory(bytes, target_device))
+        {
+            LOG_WARN("[FP32Tensor::createMapped] Failed to allocate mapped memory ("
+                     << bytes << " bytes), using regular allocation");
+            // tensor already has regular host allocation, just return it
+        }
+
+        return tensor;
+    }
+
     FP32Tensor::~FP32Tensor()
     {
-        // Base class CPUTensorBase handles gpu_data_ptr_ cleanup via releaseDeviceMemory
+        // Mapped memory cleanup is handled by CPUTensorBase destructor
+        // Nothing tensor-specific to clean up here
     }
 
     const float *FP32Tensor::data() const
     {
         assertValid("FP32Tensor::data");
 
-        LOG_TRACE("[FP32Tensor::data] Called for tensor, host_valid_=" << host_valid_ << " device_valid_=" << device_valid_ << " gpu_data_ptr_=" << (gpu_data_ptr_ ? "set" : "null"));
+        LOG_TRACE("[FP32Tensor::data] Called for tensor, host_valid_=" << host_valid_ << " device_valid_=" << device_valid_ << " gpu_data_ptr_=" << (gpu_data_ptr_ ? "set" : "null") << " is_mapped_=" << is_mapped_);
+
         // Use base class to ensure host has current data
+        // For mapped tensors, ensureOnHost() is a no-op (data is always available)
         const_cast<FP32Tensor *>(this)->ensureOnHost();
+
+        // Mapped tensors use mapped_host_ptr_ from base class
+        if (is_mapped_ && mapped_host_ptr_)
+        {
+            return static_cast<const float *>(mapped_host_ptr_);
+        }
 
         if (is_view_)
         {
@@ -120,11 +155,21 @@ namespace llaminar2
         assertValid("FP32Tensor::mutable_data");
 
         // Ensure host has current data before modification
+        // For mapped tensors, ensureOnHost() is a no-op
         ensureOnHost();
 
-        // CRITICAL: Invalidate GPU copy since host will be modified
-        // This forces re-upload on next ensureOnDevice() call
-        invalidateGpuData();
+        // For non-mapped tensors: Invalidate GPU copy since host will be modified
+        // For mapped tensors: Both host and device share memory, no invalidation needed
+        if (!is_mapped_)
+        {
+            invalidateGpuData();
+        }
+
+        // Mapped tensors use mapped_host_ptr_ from base class
+        if (is_mapped_ && mapped_host_ptr_)
+        {
+            return static_cast<float *>(mapped_host_ptr_);
+        }
 
         if (is_view_)
         {
@@ -189,6 +234,11 @@ namespace llaminar2
 
     void *FP32Tensor::raw_host_data_ptr()
     {
+        // Mapped tensors use mapped_host_ptr_ from base class
+        if (is_mapped_ && mapped_host_ptr_)
+        {
+            return mapped_host_ptr_;
+        }
         if (is_view_)
         {
             return parent_data_ptr_->data() + view_offset_;
@@ -198,6 +248,11 @@ namespace llaminar2
 
     const void *FP32Tensor::raw_host_data_ptr() const
     {
+        // Mapped tensors use mapped_host_ptr_ from base class
+        if (is_mapped_ && mapped_host_ptr_)
+        {
+            return mapped_host_ptr_;
+        }
         if (is_view_)
         {
             return parent_data_ptr_->data() + view_offset_;

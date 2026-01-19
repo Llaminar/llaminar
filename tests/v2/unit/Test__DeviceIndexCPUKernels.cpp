@@ -319,3 +319,75 @@ TEST_F(Test__DeviceIndexCPUKernels, MPIStager_UnspecifiedDeviceNoStaging)
 
 // Note: Cannot test GPU staging without actual GPU backend, but the logic is:
 // device_idx > 0 should require staging (GPU devices)
+
+// ============================================================================
+// DeviceId Tests - Regression tests for device ordinal propagation bug
+// ============================================================================
+
+/**
+ * @brief Test that DeviceId::cuda() stores ordinal correctly
+ */
+TEST_F(Test__DeviceIndexCPUKernels, DeviceId_CUDAOrdinalStorage)
+{
+    DeviceId dev0 = DeviceId::cuda(0);
+    DeviceId dev1 = DeviceId::cuda(1);
+
+    EXPECT_TRUE(dev0.is_cuda());
+    EXPECT_TRUE(dev1.is_cuda());
+
+    EXPECT_EQ(dev0.ordinal, 0);
+    EXPECT_EQ(dev1.ordinal, 1);
+}
+
+/**
+ * @brief Test DeviceId validity checks
+ */
+TEST_F(Test__DeviceIndexCPUKernels, DeviceId_ValidityChecks)
+{
+    DeviceId valid_rocm = DeviceId::rocm(0);
+    DeviceId valid_cpu = DeviceId::cpu();
+
+    // Valid DeviceIds should report as valid
+    EXPECT_TRUE(valid_rocm.is_valid());
+    EXPECT_TRUE(valid_cpu.is_valid());
+
+    // Factory methods should produce valid DeviceIds
+    EXPECT_TRUE(DeviceId::rocm(1).is_valid());
+    EXPECT_TRUE(DeviceId::cuda(0).is_valid());
+}
+
+/**
+ * @brief Test DeviceId ordinal edge values
+ */
+TEST_F(Test__DeviceIndexCPUKernels, DeviceId_OrdinalEdgeValues)
+{
+    // Test ordinal 0 (most common)
+    DeviceId d0 = DeviceId::rocm(0);
+    EXPECT_EQ(d0.ordinal, 0);
+
+    // Test high ordinal (8-GPU system)
+    DeviceId d7 = DeviceId::rocm(7);
+    EXPECT_EQ(d7.ordinal, 7);
+
+    // Test CPU ordinal (0 - CPU uses ordinal 0 by convention)
+    DeviceId cpu = DeviceId::cpu();
+    EXPECT_EQ(cpu.ordinal, 0);
+}
+
+/**
+ * @brief Test that DeviceId can be constructed from DeviceType + ordinal
+ *
+ * This tests the pattern used when upgrading from DeviceType to DeviceId.
+ */
+TEST_F(Test__DeviceIndexCPUKernels, DeviceId_ConstructFromTypeAndOrdinal)
+{
+    // Simulate the pattern: DeviceType -> DeviceId conversion
+    DeviceType type = DeviceType::ROCm;
+    int ordinal = 1;
+
+    DeviceId device = (type == DeviceType::CPU) ? DeviceId::cpu() : (type == DeviceType::CUDA) ? DeviceId::cuda(ordinal)
+                                                                                               : DeviceId::rocm(ordinal);
+
+    EXPECT_TRUE(device.is_rocm());
+    EXPECT_EQ(device.ordinal, 1);
+}

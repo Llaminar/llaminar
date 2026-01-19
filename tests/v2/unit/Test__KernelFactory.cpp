@@ -485,7 +485,7 @@ TEST_F(Test__KernelFactory, CreateGemm_IQ4_NL_CUDA_Throws)
 #endif
 }
 
-TEST_F(Test__KernelFactory, CreateGemm_Q4_0_ROCm_Throws)
+TEST_F(Test__KernelFactory, CreateGemm_Q4_0_ROCm)
 {
     const size_t rows = 32;
     const size_t cols = 32;
@@ -496,10 +496,9 @@ TEST_F(Test__KernelFactory, CreateGemm_Q4_0_ROCm_Throws)
 
     Q4_0Tensor tensor({rows, cols}, raw_data);
 
-    // ROCm is not implemented yet
-    EXPECT_THROW(
-        KernelFactory::createGemm(&tensor, DeviceType::ROCm),
-        std::runtime_error);
+    // ROCm GEMM is now supported via ROCmQuantisedGemmKernel
+    auto kernel = KernelFactory::createGemm(&tensor, DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
 }
 
 TEST_F(Test__KernelFactory, CreateGemm_FP32_Vulkan_Throws)

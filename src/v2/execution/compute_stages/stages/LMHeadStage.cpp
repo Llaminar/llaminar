@@ -19,8 +19,7 @@ namespace llaminar2
     // =============================================================================
 
     LMHeadStage::LMHeadStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
     }
 
@@ -53,35 +52,15 @@ namespace llaminar2
             return false;
         }
 
-        // Debug: show GPU pointers before any fp32_data() call that might trigger sync
-        LOG_DEBUG("[LMHeadStage] hidden_states gpu_data_ptr=" << hidden_states->gpu_data_ptr());
-
-        // Debug: dump hidden states input at last position
-        {
-            const float *hidden = hidden_states->fp32_data();
-            if (hidden && params_.seq_len > 0)
-            {
-                size_t last_row_offset = (params_.seq_len - 1) * params_.d_model;
-                LOG_DEBUG("[LMHeadStage] Hidden states input (last row, first 8): "
-                          << hidden[last_row_offset + 0] << ","
-                          << hidden[last_row_offset + 1] << ","
-                          << hidden[last_row_offset + 2] << ","
-                          << hidden[last_row_offset + 3] << ","
-                          << hidden[last_row_offset + 4] << ","
-                          << hidden[last_row_offset + 5] << ","
-                          << hidden[last_row_offset + 6] << ","
-                          << hidden[last_row_offset + 7]);
-            }
-        }
-
         // Get or create GEMM kernel for LM head weight
-        // Use device-targeted kernel creation to ensure GPU kernel when needed
-        auto target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-        LOG_DEBUG("[LMHeadStage] Requesting kernel with target_dev_type=" << static_cast<int>(target_dev_type)
-                                                                          << " device_id=" << params_.device_id.toKernelDeviceIndex()
-                                                                          << " lm_head_weight=" << (void *)lm_head_weight
-                                                                          << " shape=" << lm_head_weight->shape()[0] << "x" << lm_head_weight->shape()[1]);
-        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(lm_head_weight, target_dev_type);
+        // CRITICAL: Use DeviceId overload (not DeviceType) to ensure correct GPU ordinal
+        // Using DeviceType alone would default to ROCm:0 even when running on ROCm:1
+        LOG_DEBUG("[LMHeadStage] Requesting kernel with device_id=" << params_.device_id.toKernelDeviceIndex()
+                                                                    << " (is_rocm=" << params_.device_id.is_rocm()
+                                                                    << ", rocm_ordinal=" << (params_.device_id.is_rocm() ? params_.device_id.rocm_ordinal() : -1) << ")"
+                                                                    << " lm_head_weight=" << (void *)lm_head_weight
+                                                                    << " shape=" << lm_head_weight->shape()[0] << "x" << lm_head_weight->shape()[1]);
+        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(lm_head_weight, params_.device_id);
         LOG_DEBUG("[LMHeadStage] Got kernel=" << (void *)lm_gemm);
         if (!lm_gemm)
         {
@@ -227,4 +206,35 @@ namespace llaminar2
 
         return reqs;
     }
+
+    // =============================================================================
+    // IWorkspaceConsumerStage Implementation
+    // =============================================================================
+
+    IWorkspaceConsumer *LMHeadStage::getKernelAsWorkspaceConsumer()
+    {
+        // Get the GEMM kernel and return it as workspace consumer
+        // The kernel needs workspace for its ACC_INT32 accumulator buffer
+        // (vocab_size × M × sizeof(int32_t) can be large, but GraphOrchestrator
+        // now dynamically sizes the budget based on max_seq_len × vocab_size)
+        auto *lm_head_weight = requireTensorBase(params_.lm_head_weight, "lm_head_weight");
+        if (!lm_head_weight)
+        {
+            LOG_DEBUG("[LMHeadStage::getKernelAsWorkspaceConsumer] No weight tensor available");
+            return nullptr;
+        }
+
+        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(lm_head_weight, params_.device_id);
+        if (!lm_gemm)
+        {
+            LOG_DEBUG("[LMHeadStage::getKernelAsWorkspaceConsumer] No GEMM kernel available");
+            return nullptr;
+        }
+
+        auto *consumer = dynamic_cast<IWorkspaceConsumer *>(lm_gemm);
+        LOG_DEBUG("[LMHeadStage::getKernelAsWorkspaceConsumer] Returning kernel=" << (void *)lm_gemm
+                                                                                  << " as consumer=" << (void *)consumer);
+        return consumer;
+    }
+
 } // namespace llaminar2

@@ -4,6 +4,15 @@
 
 set -e
 
+# Log to file for debugging container startup issues
+LOGFILE="/tmp/onstart.log"
+exec > >(tee -a "$LOGFILE") 2>&1
+echo ""
+echo "========================================"
+echo "[onstart] $(date '+%Y-%m-%d %H:%M:%S') - Starting onstart.sh"
+echo "[onstart] Running as user: $(whoami) ($(id))"
+echo "========================================"
+
 echo "[onstart] Configuring system limits and permissions..."
 
 # Set unlimited locked memory for GPU P2P transfers and DMA operations
@@ -43,14 +52,34 @@ CURRENT_MEMLOCK=$(ulimit -l 2>/dev/null || echo "unknown")
 echo "[onstart] Current memlock limit: $CURRENT_MEMLOCK"
 
 # Fix render device permissions (host may assign different GIDs)
+# The host's render group GID may not match the container's render group,
+# so we use chmod 666 to give everyone access. We also try chgrp as backup.
 if [ -d /dev/dri ]; then
-    sudo chmod 666 /dev/dri/render* 2>/dev/null || true
-    echo "[onstart] Fixed /dev/dri/render* permissions"
+    # Log current state for debugging
+    echo "[onstart] Current /dev/dri permissions:"
+    ls -la /dev/dri/ 2>/dev/null || true
+    
+    # Wait briefly for devices to be fully available (race condition mitigation)
+    sleep 1
+    
+    # Fix render device permissions - try multiple approaches
+    for dev in /dev/dri/render*; do
+        if [ -e "$dev" ]; then
+            sudo chmod 666 "$dev" 2>/dev/null || true
+            # Also try to change group to render (may fail if render group doesn't exist)
+            sudo chgrp render "$dev" 2>/dev/null || true
+        fi
+    done
+    
+    # Verify fix was applied
+    echo "[onstart] Fixed /dev/dri permissions:"
+    ls -la /dev/dri/ 2>/dev/null || true
 fi
 
 # Ensure kfd device is accessible
 if [ -e /dev/kfd ]; then
     sudo chmod 666 /dev/kfd 2>/dev/null || true
+    sudo chgrp video /dev/kfd 2>/dev/null || true
     echo "[onstart] Fixed /dev/kfd permissions"
 fi
 

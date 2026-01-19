@@ -389,25 +389,27 @@ namespace llaminar2
         // =====================================================================
         // Preload weights for target device BEFORE accessing them
         // =====================================================================
-        // WeightPreloader creates device-targeted GEMM kernels (CPU or CUDA) and
+        // WeightPreloader creates device-targeted GEMM kernels (CPU, CUDA, or ROCm) and
         // optionally releases raw tensor data to save memory.
         // This MUST happen before weights are retrieved, as GEMM kernel creation
         // requires the raw tensor data to still be available for packing.
         // =====================================================================
-        DeviceType target_device = device.is_gpu() ? DeviceType::CUDA : DeviceType::CPU;
-        WeightPreloader preloader(weight_mgr);
-        if (!preloader.preloadForDevice(target_device))
+        DeviceType target_device = DeviceType::CPU;
+        if (device.is_gpu())
         {
-            LOG_WARN("[InferenceRunner] Weight preloading failed for device "
-                     << (target_device == DeviceType::CUDA ? "CUDA" : "CPU")
-                     << ", will use lazy kernel creation");
-            // Not fatal - kernels will be created lazily on first use
+            // Determine if it's CUDA or ROCm based on the device
+            if (device.is_rocm())
+            {
+                target_device = DeviceType::ROCm;
+            }
+            else
+            {
+                target_device = DeviceType::CUDA;
+            }
         }
-        else
-        {
-            LOG_INFO("[InferenceRunner] Preloaded weights for "
-                     << (target_device == DeviceType::CUDA ? "CUDA" : "CPU"));
-        }
+
+        const char *device_name = (target_device == DeviceType::CPU) ? "CPU" : (target_device == DeviceType::CUDA) ? "CUDA"
+                                                                                                                   : "ROCm";
 
         // Build Qwen2ModelWeights
         Qwen2ModelWeights weights;
@@ -427,7 +429,50 @@ namespace llaminar2
         weights.final_norm = final_norm.get();
         weights.lm_head = lm_head.get();
 
+        // =====================================================================
+        // Eager load ALL layer weights into cache BEFORE preloading
+        // =====================================================================
+        // This ensures weights are in cache for WeightPreloader to iterate
+        int n_layers = model_ctx->blockCount();
+        LOG_INFO("[InferenceRunner] Eagerly loading " << n_layers << " layers of weights...");
+        for (int layer_idx = 0; layer_idx < n_layers; ++layer_idx)
+        {
+            std::string prefix = "blk." + std::to_string(layer_idx) + ".";
+            // Load all layer weights into cache
+            weight_mgr->getWeight(prefix + "attn_q.weight");
+            weight_mgr->getWeight(prefix + "attn_k.weight");
+            weight_mgr->getWeight(prefix + "attn_v.weight");
+            weight_mgr->getWeight(prefix + "attn_output.weight");
+            weight_mgr->getWeight(prefix + "attn_norm.weight");
+            weight_mgr->getWeight(prefix + "ffn_gate.weight");
+            weight_mgr->getWeight(prefix + "ffn_up.weight");
+            weight_mgr->getWeight(prefix + "ffn_down.weight");
+            weight_mgr->getWeight(prefix + "ffn_norm.weight");
+            // Biases (may not exist)
+            weight_mgr->getWeight(prefix + "attn_q.bias");
+            weight_mgr->getWeight(prefix + "attn_k.bias");
+            weight_mgr->getWeight(prefix + "attn_v.bias");
+        }
+        LOG_INFO("[InferenceRunner] All layer weights loaded into cache");
+
+        // =====================================================================
+        // NOW preload weights for target device (GPU packing/upload)
+        // =====================================================================
+        // Use full DeviceId to preserve ordinal for multi-GPU setups
+        WeightPreloader preloader(weight_mgr);
+        if (!preloader.preloadForDevice(device))
+        {
+            LOG_WARN("[InferenceRunner] Weight preloading failed for device "
+                     << device_name << ", will use lazy kernel creation");
+            // Not fatal - kernels will be created lazily on first use
+        }
+        else
+        {
+            LOG_INFO("[InferenceRunner] Preloaded weights for " << device_name);
+        }
+
         // Layer weight accessor - capture weight_mgr by value (shared_ptr copy)
+        // Weights are now in cache, so these calls will be fast
         weights.get_layer_weights = [weight_mgr](int layer_idx) -> Qwen2LayerWeights
         {
             Qwen2LayerWeights layer;

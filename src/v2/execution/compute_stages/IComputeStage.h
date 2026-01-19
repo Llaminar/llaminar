@@ -240,6 +240,15 @@ namespace llaminar2
             scalars.push_back({name, value ? 1.0 : 0.0, "bool"});
             return *this;
         }
+
+        /**
+         * @brief Ensure all output tensors are synced from GPU to host
+         *
+         * Call this BEFORE reading output.data for verification/dumping.
+         * This is a deferred sync - outputs are NOT synced in addOutput().
+         * This allows GPU kernels to run async without blocking.
+         */
+        void ensureOutputsOnHost();
     };
 
     /**

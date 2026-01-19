@@ -26,6 +26,7 @@
 
 #include "WeightManager.h"
 #include "WeightPlacementMap.h"
+#include "../backends/DeviceId.h"
 #include "../backends/DeviceType.h"
 #include <memory>
 #include <string>
@@ -115,6 +116,22 @@ namespace llaminar2
             bool release_raw_data = true);
 
         /**
+         * @brief Preload all weights for a specific device (with ordinal)
+         *
+         * Packs all weights that are targeted for the given device.
+         * This overload preserves the device ordinal for multi-GPU setups.
+         *
+         * @param target_device DeviceId to preload for (includes type and ordinal)
+         * @param progress_callback Optional callback for progress reporting
+         * @param release_raw_data If true, release raw GGUF data after packing
+         * @return true if all matching weights were packed successfully
+         */
+        bool preloadForDevice(
+            DeviceId target_device,
+            PreloadProgressCallback progress_callback = nullptr,
+            bool release_raw_data = true);
+
+        /**
          * @brief Get statistics about preloaded weights
          *
          * @return Pair of (num_cpu_packed, num_gpu_packed)
@@ -123,25 +140,42 @@ namespace llaminar2
 
     private:
         /**
-         * @brief Get target device type for a weight
+         * @brief Get target device for a weight
          *
          * @param weight_name Name of the weight
-         * @return DeviceType for the weight (CPU if no placement map)
+         * @return DeviceId for the weight (CPU if no placement map)
          */
-        DeviceType getTargetDevice(const std::string &weight_name) const;
+        DeviceId getTargetDevice(const std::string &weight_name) const;
 
         /**
          * @brief Pack a single weight tensor
          *
          * @param tensor Weight tensor to pack
-         * @param target_device Target device type
+         * @param target_device Target device (type + ordinal for multi-GPU)
          * @param release_raw_data If true, release raw data after packing
          * @return true if packing succeeded
          */
         bool packWeight(
             TensorBase *tensor,
-            DeviceType target_device,
+            DeviceId target_device,
             bool release_raw_data);
+
+        /**
+         * @brief Preload weights with explicit device override
+         *
+         * Used when no placement map exists - forces all weights to specific device.
+         *
+         * @param weight_names Names of weights to preload
+         * @param override_device Force all weights to this device (with ordinal)
+         * @param progress_callback Optional callback for progress reporting
+         * @param release_raw_data If true, release raw GGUF data after packing
+         * @return true if all specified weights were packed successfully
+         */
+        bool preloadWithOverrideDevice(
+            const std::vector<std::string> &weight_names,
+            DeviceId override_device,
+            PreloadProgressCallback progress_callback = nullptr,
+            bool release_raw_data = true);
 
         std::shared_ptr<WeightManager> weight_manager_;
         std::shared_ptr<WeightPlacementMap> placement_map_;

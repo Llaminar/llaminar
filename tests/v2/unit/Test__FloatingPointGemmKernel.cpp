@@ -26,6 +26,8 @@
 #include "kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
 #include "tensors/Tensors.h"
 #include "tensors/FP16Utils.h"
+#include "execution/DeviceWorkspaceManager.h"
+#include "backends/DeviceId.h"
 #include "utils/Logger.h"
 
 namespace llaminar2
@@ -512,6 +514,134 @@ namespace llaminar2
         EXPECT_NO_THROW({
             gemm_v4::FloatingPointGemmKernel kernel(fp32_weights.get());
         });
+    }
+
+    // =============================================================================
+    // Workspace Parameter Tests
+    // =============================================================================
+
+    TEST_F(Test__FloatingPointGemmKernel, Multiply_WithNullWorkspace_Succeeds)
+    {
+        // Create FP32 weight tensor [N, K]
+        std::vector<float> weights_data(n_ * k_);
+        fill_random_fp32(weights_data.data(), weights_data.size(), 1.0f, 123);
+
+        auto weights = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(n_), static_cast<size_t>(k_)});
+        std::memcpy(weights->mutable_data(), weights_data.data(), weights_data.size() * sizeof(float));
+
+        gemm_v4::FloatingPointGemmKernel kernel(weights.get());
+
+        std::vector<float> A(m_ * k_);
+        std::vector<float> C(m_ * n_, 0.0f);
+        fill_random_fp32(A.data(), A.size(), 1.0f, 456);
+
+        // Call multiply with explicit workspace=nullptr
+        ASSERT_TRUE(kernel.multiply(A.data(), C.data(), m_, n_, k_, true, 1.0f, 0.0f, nullptr, -1, nullptr));
+
+        // Verify output is non-zero
+        float sum = 0.0f;
+        for (size_t i = 0; i < C.size(); ++i)
+            sum += std::abs(C[i]);
+        EXPECT_GT(sum, 0.0f) << "Output should contain non-zero values";
+    }
+
+    TEST_F(Test__FloatingPointGemmKernel, Multiply_WithWorkspace_Succeeds)
+    {
+        // Create FP32 weight tensor [N, K]
+        std::vector<float> weights_data(n_ * k_);
+        fill_random_fp32(weights_data.data(), weights_data.size(), 1.0f, 123);
+
+        auto weights = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(n_), static_cast<size_t>(k_)});
+        std::memcpy(weights->mutable_data(), weights_data.data(), weights_data.size() * sizeof(float));
+
+        gemm_v4::FloatingPointGemmKernel kernel(weights.get());
+
+        std::vector<float> A(m_ * k_);
+        std::vector<float> C(m_ * n_, 0.0f);
+        fill_random_fp32(A.data(), A.size(), 1.0f, 456);
+
+        // Create a workspace manager for CPU
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::cpu(), 1024 * 1024);
+        ASSERT_NE(workspace, nullptr);
+
+        // Call multiply with non-null workspace (CPU kernel should accept but ignore it)
+        ASSERT_TRUE(kernel.multiply(A.data(), C.data(), m_, n_, k_, true, 1.0f, 0.0f, nullptr, -1, workspace.get()));
+
+        // Verify output is non-zero
+        float sum = 0.0f;
+        for (size_t i = 0; i < C.size(); ++i)
+            sum += std::abs(C[i]);
+        EXPECT_GT(sum, 0.0f) << "Output should contain non-zero values";
+    }
+
+    TEST_F(Test__FloatingPointGemmKernel, MultiplyTensor_WithNullWorkspace_Succeeds)
+    {
+        // Create FP32 weight tensor [N, K]
+        std::vector<float> weights_data(n_ * k_);
+        fill_random_fp32(weights_data.data(), weights_data.size(), 1.0f, 123);
+
+        auto weights = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(n_), static_cast<size_t>(k_)});
+        std::memcpy(weights->mutable_data(), weights_data.data(), weights_data.size() * sizeof(float));
+
+        gemm_v4::FloatingPointGemmKernel kernel(weights.get());
+
+        // Create FP32 input tensor
+        auto A_tensor = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(k_)});
+        fill_random_fp32(A_tensor->mutable_data(), m_ * k_, 1.0f, 456);
+
+        // Create output tensor
+        auto C_tensor = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(n_)});
+
+        // Call multiply_tensor with explicit workspace=nullptr
+        ASSERT_TRUE(kernel.multiply_tensor(A_tensor.get(), C_tensor.get(), true, 1.0f, 0.0f, nullptr, -1, nullptr));
+
+        // Verify output is non-zero
+        const float *C_data = C_tensor->data();
+        float sum = 0.0f;
+        for (int i = 0; i < m_ * n_; ++i)
+            sum += std::abs(C_data[i]);
+        EXPECT_GT(sum, 0.0f) << "Output should contain non-zero values";
+    }
+
+    TEST_F(Test__FloatingPointGemmKernel, MultiplyTensor_WithWorkspace_Succeeds)
+    {
+        // Create FP32 weight tensor [N, K]
+        std::vector<float> weights_data(n_ * k_);
+        fill_random_fp32(weights_data.data(), weights_data.size(), 1.0f, 123);
+
+        auto weights = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(n_), static_cast<size_t>(k_)});
+        std::memcpy(weights->mutable_data(), weights_data.data(), weights_data.size() * sizeof(float));
+
+        gemm_v4::FloatingPointGemmKernel kernel(weights.get());
+
+        // Create FP32 input tensor
+        auto A_tensor = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(k_)});
+        fill_random_fp32(A_tensor->mutable_data(), m_ * k_, 1.0f, 456);
+
+        // Create output tensor
+        auto C_tensor = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(n_)});
+
+        // Create a workspace manager for CPU
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::cpu(), 1024 * 1024);
+        ASSERT_NE(workspace, nullptr);
+
+        // Call multiply_tensor with non-null workspace (CPU kernel should accept but ignore it)
+        ASSERT_TRUE(kernel.multiply_tensor(A_tensor.get(), C_tensor.get(), true, 1.0f, 0.0f, nullptr, -1, workspace.get()));
+
+        // Verify output is non-zero
+        const float *C_data = C_tensor->data();
+        float sum = 0.0f;
+        for (int i = 0; i < m_ * n_; ++i)
+            sum += std::abs(C_data[i]);
+        EXPECT_GT(sum, 0.0f) << "Output should contain non-zero values";
     }
 
 } // namespace llaminar2

@@ -153,7 +153,7 @@ namespace llaminar2
 #endif
 #ifdef HAVE_ROCM
         case ComputeBackendType::GPU_ROCM:
-            return false; // ROCm RMSNorm not yet implemented
+            return true; // ROCmRMSNormKernelT is available via KernelFactory
 #endif
         default:
             return false;

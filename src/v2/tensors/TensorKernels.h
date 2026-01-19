@@ -11,6 +11,7 @@
 #pragma once
 
 #include "../utils/MPIContext.h"
+#include "../interfaces/IWorkspaceConsumer.h"
 #include "BlockStructures.h"
 #include "KernelSnapshotInfo.h"
 #include <memory>
@@ -321,6 +322,9 @@ namespace llaminar2
      * - CUDAGemmKernel: cuBLAS + fused dequant for IQ4_NL
      * - ROCmGemmKernel: hipBLAS + fused dequant
      */
+    // Forward declaration for workspace
+    class DeviceWorkspaceManager;
+
     class ITensorGemm : public ITensorKernel
     {
     public:
@@ -337,6 +341,7 @@ namespace llaminar2
          * @param beta Scale factor for existing C (for fused add)
          * @param mpi_ctx MPI context for distributed execution (nullptr = single node)
          * @param device_idx Device index for execution (-1 = host/CPU, ≥0 = GPU device)
+         * @param workspace Optional pre-allocated workspace (nullptr = kernel allocates)
          *
          * @return true on success, false on error
          *
@@ -354,7 +359,8 @@ namespace llaminar2
             bool transpose_B = true,
             float alpha = 1.0f, float beta = 0.0f,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) = 0;
+            int device_idx = -1,
+            DeviceWorkspaceManager *workspace = nullptr) = 0;
 
         /**
          * @brief Tensor-based matrix multiplication: C = alpha * A @ B + beta * C
@@ -377,6 +383,7 @@ namespace llaminar2
          * @param beta Scale factor for existing C (for fused add)
          * @param mpi_ctx MPI context for distributed execution
          * @param device_idx Device index for execution
+         * @param workspace Optional pre-allocated workspace (nullptr = kernel allocates)
          *
          * @return true on success, false if format combination not supported
          *
@@ -388,7 +395,8 @@ namespace llaminar2
             bool transpose_B = true,
             float alpha = 1.0f, float beta = 0.0f,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
+            int device_idx = -1,
+            DeviceWorkspaceManager *workspace = nullptr)
         {
             // Default: not supported (TensorBase is only forward-declared here)
             // Subclasses that include Tensors.h can override with real implementation
@@ -399,6 +407,7 @@ namespace llaminar2
             (void)beta;
             (void)mpi_ctx;
             (void)device_idx;
+            (void)workspace;
             return false;
         }
 
@@ -420,6 +429,7 @@ namespace llaminar2
          * @param beta Scale factor for existing C (for fused add)
          * @param mpi_ctx MPI context for distributed execution
          * @param device_idx Device index for execution
+         * @param workspace Optional pre-allocated workspace (nullptr = kernel allocates)
          *
          * @return true on success, false if format combination not supported
          */
@@ -429,7 +439,8 @@ namespace llaminar2
             bool transpose_B = true,
             float alpha = 1.0f, float beta = 0.0f,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
+            int device_idx = -1,
+            DeviceWorkspaceManager *workspace = nullptr)
         {
             // Default: not supported
             (void)A;
@@ -442,6 +453,7 @@ namespace llaminar2
             (void)beta;
             (void)mpi_ctx;
             (void)device_idx;
+            (void)workspace;
             return false;
         }
 
@@ -458,6 +470,7 @@ namespace llaminar2
          * @param k Input features
          * @param mpi_ctx MPI context for distributed execution
          * @param device_idx Device index for execution
+         * @param workspace Optional pre-allocated workspace (nullptr = kernel allocates)
          *
          * @return true on success, false if not supported
          *
@@ -469,7 +482,8 @@ namespace llaminar2
             void *C_q8_1,
             int m, int n, int k,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
+            int device_idx = -1,
+            DeviceWorkspaceManager *workspace = nullptr)
         {
             // Default: not supported
             (void)A;
@@ -479,6 +493,7 @@ namespace llaminar2
             (void)k;
             (void)mpi_ctx;
             (void)device_idx;
+            (void)workspace;
             return false;
         }
 
@@ -521,6 +536,7 @@ namespace llaminar2
          * @param k Input dimension (must match all kernels' K dimension)
          * @param mpi_ctx MPI context for distributed execution
          * @param device_idx Device index for execution
+         * @param workspace Optional pre-allocated workspace (nullptr = kernel allocates)
          *
          * @return true on success, false on error
          */
@@ -529,7 +545,8 @@ namespace llaminar2
             const std::vector<FusedProjectionDesc> &projections,
             int m, int k,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
+            int device_idx = -1,
+            DeviceWorkspaceManager *workspace = nullptr)
         {
             // Default implementation: run each projection separately
             // Subclasses (e.g., QuantisedGemmKernel) can override for optimized fusion
@@ -547,7 +564,8 @@ namespace llaminar2
                     1.0f, // alpha
                     0.0f, // beta
                     mpi_ctx,
-                    device_idx);
+                    device_idx,
+                    workspace);
                 if (!success)
                 {
                     return false;
@@ -622,6 +640,7 @@ namespace llaminar2
          * @param m Number of rows (batch_size * seq_len)
          * @param k Input dimension (must match all kernels' K dimension)
          * @param mpi_ctx MPI context for distributed execution
+         * @param workspace Optional pre-allocated workspace (nullptr = kernel allocates)
          *
          * @return true on success, false on error
          */
@@ -629,7 +648,8 @@ namespace llaminar2
             const TensorBase *input,
             const std::vector<TensorProjectionDesc> &projections,
             int m, int k,
-            const MPIContext *mpi_ctx = nullptr)
+            const MPIContext *mpi_ctx = nullptr,
+            DeviceWorkspaceManager *workspace = nullptr)
         {
             // Default implementation: call multiply_tensor() for each projection
             for (const auto &proj : projections)
@@ -641,14 +661,16 @@ namespace llaminar2
 
                 // Use tensor-aware multiply - kernel handles device placement
                 // Note: Must pass transpose_B explicitly before alpha/beta to match signature:
-                //   multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx)
+                //   multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx, workspace)
                 bool success = proj.kernel->multiply_tensor(
                     input, proj.output,
                     m, proj.n, k,
                     true, // transpose_B (weights are [K,N] stored as [N,K] transposed)
                     1.0f, // alpha
                     0.0f, // beta
-                    mpi_ctx);
+                    mpi_ctx,
+                    -1, // device_idx (use default)
+                    workspace);
 
                 if (!success)
                 {
@@ -676,6 +698,7 @@ namespace llaminar2
          * @param accumulate Unused (Q8_1 output doesn't support accumulation)
          * @param mpi_ctx MPI context for distributed execution
          * @param device_idx Device index for execution
+         * @param workspace Optional pre-allocated workspace (nullptr = kernel allocates)
          *
          * @return true on success, false if not supported
          */
@@ -686,7 +709,8 @@ namespace llaminar2
             const TensorBase *bias = nullptr,
             bool accumulate = false,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
+            int device_idx = -1,
+            DeviceWorkspaceManager *workspace = nullptr)
         {
             // Default: not supported
             (void)q8_1_activations;
@@ -698,6 +722,7 @@ namespace llaminar2
             (void)accumulate;
             (void)mpi_ctx;
             (void)device_idx;
+            (void)workspace;
             return false;
         }
 
@@ -720,6 +745,7 @@ namespace llaminar2
          * @param bias Optional bias vector [n] to add before requantization (nullptr if none)
          * @param mpi_ctx MPI context
          * @param device_idx Device index
+         * @param workspace Optional pre-allocated workspace (nullptr = kernel allocates)
          *
          * @return true on success
          */
@@ -730,7 +756,8 @@ namespace llaminar2
             int q16_block_size = 64,
             const TensorBase *bias = nullptr,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
+            int device_idx = -1,
+            DeviceWorkspaceManager *workspace = nullptr)
         {
             // Default: not supported
             (void)q8_1_activations;
@@ -742,6 +769,7 @@ namespace llaminar2
             (void)bias;
             (void)mpi_ctx;
             (void)device_idx;
+            (void)workspace;
             return false;
         }
 
@@ -1316,6 +1344,7 @@ namespace llaminar2
          * @param beta Scale factor for existing C (only used if accumulate=true)
          * @param mpi_ctx MPI context for distributed execution
          * @param device_idx Device index (-1 = CPU)
+         * @param workspace Optional pre-allocated workspace (nullptr = kernel allocates)
          *
          * @return true on success, false if not supported
          *
@@ -1331,12 +1360,13 @@ namespace llaminar2
             bool accumulate = false,
             float alpha = 1.0f, float beta = 0.0f,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
+            int device_idx = -1,
+            DeviceWorkspaceManager *workspace = nullptr)
         {
             // Delegate to fused version with no fusion
             return multiply_with_precomputed_q8_1(
                 q8_1_activations, C, m, n, k, bias, accumulate, alpha, beta,
-                mpi_ctx, device_idx, GemmFusedOps::none());
+                mpi_ctx, device_idx, GemmFusedOps::none(), workspace);
         }
 
         /**
@@ -1358,6 +1388,7 @@ namespace llaminar2
          * @param mpi_ctx MPI context for distributed execution
          * @param device_idx Device index (-1 = CPU)
          * @param fused_ops Fused operation configuration (SwiGLU, Softmax, etc.)
+         * @param workspace Optional pre-allocated workspace (nullptr = kernel allocates)
          *
          * @return true on success, false if not supported
          *
@@ -1381,7 +1412,8 @@ namespace llaminar2
             float alpha, float beta,
             const MPIContext *mpi_ctx,
             int device_idx,
-            const GemmFusedOps &fused_ops)
+            const GemmFusedOps &fused_ops,
+            DeviceWorkspaceManager *workspace = nullptr)
         {
             (void)q8_1_activations;
             (void)C;
@@ -1395,6 +1427,7 @@ namespace llaminar2
             (void)mpi_ctx;
             (void)device_idx;
             (void)fused_ops;
+            (void)workspace;
             return false; // Not implemented for non-quantized kernels
         }
 
@@ -2232,8 +2265,12 @@ namespace llaminar2
      *
      * This interface wraps two ITensorGemm kernels internally, providing
      * a unified interface for the FusedGateUpGEMMStage.
+     *
+     * Workspace Support:
+     * This interface also inherits IWorkspaceConsumer to forward workspace
+     * binding to the underlying GEMM kernels (required for ROCm kernels).
      */
-    class ITensorFusedGateUpGemm : public ITensorKernel
+    class ITensorFusedGateUpGemm : public ITensorKernel, public IWorkspaceConsumer
     {
     public:
         /**

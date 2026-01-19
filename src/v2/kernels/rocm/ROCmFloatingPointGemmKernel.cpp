@@ -8,7 +8,7 @@
  *
  * **Design**: The adapter:
  * 1. Implements ITensorGemm (includes MPIContext, etc.)
- * 2. Holds a HipBLASGemmKernel* that does the actual HIP work
+ * 2. Uses shared HipBLASGemmKernel* from DeviceKernelCache (avoids JIT overhead)
  * 3. Handles tensor type introspection in multiply_tensor()
  *
  * @author David Sanftenberg
@@ -17,8 +17,10 @@
 
 #include "ROCmFloatingPointGemmKernel.h"
 #include "HipBLASGemmKernel.h"
-#include "backends/ComputeBackend.h" // DeviceManager
-#include "tensors/Tensors.h"         // FP32Tensor, BF16Tensor, FP16Tensor
+#include "backends/ComputeBackend.h"   // DeviceManager
+#include "backends/DeviceId.h"         // DeviceId for cache lookup
+#include "kernels/DeviceKernelCache.h" // Universal kernel cache
+#include "tensors/Tensors.h"           // FP32Tensor, BF16Tensor, FP16Tensor
 #include "tensors/KernelSnapshotInfo.h"
 #include "utils/Logger.h"
 
@@ -67,7 +69,7 @@ namespace llaminar2
                          << static_cast<int>(precision) << " but tensor is "
                          << static_cast<int>(wt));
             }
-            
+
             // Warn about BF16 emulation on MI50
             if (precision == Precision::BF16 || wt == TensorType::BF16)
             {
@@ -87,28 +89,13 @@ namespace llaminar2
                     "[ROCmFloatingPointGemmKernel] Weight tensor must be on GPU (call ensureOnDevice() first)");
             }
 
-            // Create underlying hipBLAS kernel
-            HipBLASGemmKernel::Precision hipblas_precision;
-            switch (precision)
-            {
-            case Precision::FP32:
-                hipblas_precision = HipBLASGemmKernel::Precision::FP32;
-                break;
-            case Precision::FP16:
-                hipblas_precision = HipBLASGemmKernel::Precision::FP16;
-                break;
-            case Precision::BF16:
-                // BF16 is emulated via FP32 on MI50
-                hipblas_precision = HipBLASGemmKernel::Precision::BF16;
-                break;
-            default:
-                hipblas_precision = HipBLASGemmKernel::Precision::FP32;
-            }
-
-            hipblas_kernel_ = std::make_unique<HipBLASGemmKernel>(rocm_device_id_, hipblas_precision);
+            // Get shared hipBLAS kernel from DeviceKernelCache (avoids per-tensor JIT overhead)
+            DeviceId device = DeviceId::rocm(rocm_device_id_);
+            hipblas_kernel_ = DeviceKernelCache::getKernel<HipBLASGemmKernel>(device, KernelType::BLAS_GEMM);
 
             LOG_DEBUG("[ROCmFloatingPointGemmKernel] Created for " << N_ << "x" << K_
-                                                                   << " weights on ROCm device " << rocm_device_id_);
+                                                                   << " weights on ROCm device " << rocm_device_id_
+                                                                   << " (using cached hipBLAS kernel)");
         }
 
         ROCmFloatingPointGemmKernel::~ROCmFloatingPointGemmKernel() = default;
@@ -120,10 +107,11 @@ namespace llaminar2
               precision_(other.precision_),
               N_(other.N_),
               K_(other.K_),
-              hipblas_kernel_(std::move(other.hipblas_kernel_))
+              hipblas_kernel_(other.hipblas_kernel_) // Just copy the shared pointer
         {
             other.weights_ = nullptr;
             other.d_weights_ = nullptr;
+            // Note: don't null other.hipblas_kernel_ - it's shared, not owned
         }
 
         ROCmFloatingPointGemmKernel &ROCmFloatingPointGemmKernel::operator=(ROCmFloatingPointGemmKernel &&other) noexcept
@@ -136,10 +124,11 @@ namespace llaminar2
                 precision_ = other.precision_;
                 N_ = other.N_;
                 K_ = other.K_;
-                hipblas_kernel_ = std::move(other.hipblas_kernel_);
+                hipblas_kernel_ = other.hipblas_kernel_; // Just copy the shared pointer
 
                 other.weights_ = nullptr;
                 other.d_weights_ = nullptr;
+                // Note: don't null other.hipblas_kernel_ - it's shared, not owned
             }
             return *this;
         }
@@ -153,7 +142,8 @@ namespace llaminar2
             bool transpose_B,
             float alpha, float beta,
             const MPIContext * /*mpi_ctx*/,
-            int /*device_idx*/)
+            int /*device_idx*/,
+            DeviceWorkspaceManager *workspace)
         {
             if (!A || !C)
             {
@@ -166,7 +156,7 @@ namespace llaminar2
             int n = static_cast<int>(N_);
             int k = static_cast<int>(K_);
 
-            return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, nullptr, -1);
+            return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, nullptr, -1, workspace);
         }
 
         bool ROCmFloatingPointGemmKernel::multiply_tensor(
@@ -175,8 +165,10 @@ namespace llaminar2
             bool transpose_B,
             float alpha, float beta,
             const MPIContext * /*mpi_ctx*/,
-            int /*device_idx*/)
+            int /*device_idx*/,
+            DeviceWorkspaceManager *workspace)
         {
+            (void)workspace; // TODO: Use workspace for intermediate allocations
             if (!A || !C)
             {
                 LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Null input or output tensor");
@@ -209,7 +201,7 @@ namespace llaminar2
                 return false;
             }
 
-            bool success = multiply(d_A, d_C, m, n, k, transpose_B, alpha, beta, nullptr, -1);
+            bool success = multiply(d_A, d_C, m, n, k, transpose_B, alpha, beta, nullptr, -1, workspace);
             return success;
         }
 
@@ -223,8 +215,10 @@ namespace llaminar2
             bool transpose_B,
             float alpha, float beta,
             const MPIContext * /*mpi_ctx*/,
-            int /*device_idx*/)
+            int /*device_idx*/,
+            DeviceWorkspaceManager *workspace)
         {
+            (void)workspace; // TODO: Use workspace for intermediate allocations
             if (!hipblas_kernel_)
             {
                 LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply] hipBLAS kernel not initialized");

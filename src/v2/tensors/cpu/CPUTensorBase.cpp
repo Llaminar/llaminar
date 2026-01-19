@@ -10,6 +10,7 @@
 #include "../SIMDHelpers.h"
 #include "../../utils/CPUFeatures.h"
 #include "../../utils/Logger.h"
+#include "../../utils/DebugEnv.h"
 #include "../../backends/BackendManager.h"
 #include "../../backends/ComputeBackend.h"
 #include "../../backends/DeviceId.h"
@@ -19,7 +20,25 @@
 #include <algorithm>
 #include <cstring>
 #include <vector>
+#include <chrono>
 #include <omp.h>
+
+// Forward declare pinned memory registration functions from HostBackend implementations
+// These are defined in HostBackendROCm.cpp and HostBackendCUDA.cu
+namespace llaminar2
+{
+    namespace host_backend_detail
+    {
+#ifdef HAVE_CUDA
+        bool cudaHostRegisterBuffer(void *ptr, size_t size);
+        void cudaHostUnregisterBuffer(void *ptr);
+#endif
+#ifdef HAVE_ROCM
+        bool hipHostRegisterBuffer(void *ptr, size_t size);
+        void hipHostUnregisterBuffer(void *ptr);
+#endif
+    } // namespace host_backend_detail
+} // namespace llaminar2
 
 namespace llaminar2
 {
@@ -104,9 +123,90 @@ namespace llaminar2
     // ===== TensorBase destructor =====
     // Clears the kernel cache entry for this tensor to prevent use-after-free
     // when a new tensor is allocated at the same memory address.
+    // Also frees mapped memory if this tensor used zero-copy allocation.
     CPUTensorBase::~CPUTensorBase()
     {
+        // Free mapped memory if allocated
+        freeMappedMemory();
+
+        // Clear kernel cache
         llaminar::v2::kernels::KernelFactory::clearCacheFor(this);
+    }
+
+    // ===== Zero-Copy Mapped Memory Implementation =====
+
+    bool CPUTensorBase::initMappedMemory(size_t bytes, DeviceId target_device)
+    {
+        // Validate target device - must be a GPU
+        if (!target_device.is_gpu())
+        {
+            LOG_ERROR("[CPUTensorBase::initMappedMemory] Target device must be GPU, got: " << target_device.toString());
+            return false;
+        }
+
+        // Get backend for target device
+        IBackend *backend = getBackendForDevice(target_device);
+        if (!backend)
+        {
+            LOG_ERROR("[CPUTensorBase::initMappedMemory] No backend available for device " << target_device.toString());
+            return false;
+        }
+
+        // Allocate mapped memory
+        int backend_device_id = target_device.gpu_ordinal();
+        void *device_ptr = nullptr;
+        void *host_ptr = backend->allocateMapped(bytes, backend_device_id, &device_ptr);
+
+        if (!host_ptr || !device_ptr)
+        {
+            LOG_WARN("[CPUTensorBase::initMappedMemory] Failed to allocate mapped memory ("
+                     << bytes << " bytes on device " << target_device.toString() << ")");
+            return false;
+        }
+
+        // Zero-initialize the mapped memory
+        std::memset(host_ptr, 0, bytes);
+
+        // Set up mapped memory state
+        is_mapped_ = true;
+        mapped_host_ptr_ = host_ptr;
+        mapped_device_ptr_ = device_ptr;
+        gpu_data_ptr_ = device_ptr; // GPU pointer is the device-visible mapped pointer
+        gpu_device_ = target_device;
+
+        // Both host and device are always valid for mapped memory
+        host_valid_ = true;
+        device_valid_ = true;
+
+        LOG_DEBUG("[CPUTensorBase::initMappedMemory] Allocated " << bytes << " bytes mapped memory"
+                                                                 << " host_ptr=" << host_ptr << " device_ptr=" << device_ptr
+                                                                 << " on device " << target_device.toString());
+
+        return true;
+    }
+
+    void CPUTensorBase::freeMappedMemory()
+    {
+        if (!is_mapped_ || !mapped_host_ptr_)
+        {
+            return; // Not mapped or already freed
+        }
+
+        if (gpu_device_.has_value())
+        {
+            IBackend *backend = getBackendForDevice(*gpu_device_);
+            if (backend)
+            {
+                int backend_device_id = gpu_device_->gpu_ordinal();
+                backend->freeMapped(mapped_host_ptr_, backend_device_id);
+                LOG_DEBUG("[CPUTensorBase::freeMappedMemory] Freed mapped memory");
+            }
+        }
+
+        mapped_host_ptr_ = nullptr;
+        gpu_data_ptr_ = nullptr; // gpu_data_ptr_ was pointing to mapped_device_ptr_
+        mapped_device_ptr_ = nullptr;
+        is_mapped_ = false;
     }
 
     void CPUTensorBase::to_fp32_via_blocks(float *dst) const
@@ -526,6 +626,111 @@ namespace llaminar2
     template void CPUTensorBase::to<int32_t>(int32_t *dst, TensorType format) const;
 
     // =========================================================================
+    // Pinned Memory Registration for Fast GPU Transfers
+    // =========================================================================
+
+    bool CPUTensorBase::ensureHostPinned()
+    {
+        // Already pinned?
+        if (host_pinned_)
+        {
+            return true;
+        }
+
+        // Get host data pointer and size
+        void *host_ptr = raw_host_data_ptr();
+        if (!host_ptr)
+        {
+            LOG_WARN("[CPUTensorBase::ensureHostPinned] No host data to pin");
+            return false;
+        }
+
+        size_t bytes = byte_size();
+        if (bytes == 0)
+        {
+            return true; // Nothing to pin
+        }
+
+        // Try to register with the appropriate runtime
+        bool success = false;
+
+#ifdef HAVE_ROCM
+        if (!success && gpu_device_.has_value() && gpu_device_->is_rocm())
+        {
+            success = host_backend_detail::hipHostRegisterBuffer(host_ptr, bytes);
+            if (success)
+            {
+                LOG_DEBUG("[CPUTensorBase::ensureHostPinned] Pinned " << bytes
+                                                                      << " bytes of host memory for ROCm DMA transfers");
+            }
+        }
+#endif
+
+#ifdef HAVE_CUDA
+        if (!success && gpu_device_.has_value() && gpu_device_->is_cuda())
+        {
+            success = host_backend_detail::cudaHostRegisterBuffer(host_ptr, bytes);
+            if (success)
+            {
+                LOG_DEBUG("[CPUTensorBase::ensureHostPinned] Pinned " << bytes
+                                                                      << " bytes of host memory for CUDA DMA transfers");
+            }
+        }
+#endif
+
+        if (success)
+        {
+            host_pinned_ = true;
+            pinned_bytes_ = bytes;
+        }
+        else
+        {
+            // Not an error - pinning is optional optimization
+            LOG_TRACE("[CPUTensorBase::ensureHostPinned] Could not pin host memory - "
+                      "using pageable memory (slower GPU transfers)");
+        }
+
+        return success;
+    }
+
+    void CPUTensorBase::unpinHostMemory()
+    {
+        if (!host_pinned_)
+        {
+            return; // Not pinned
+        }
+
+        void *host_ptr = raw_host_data_ptr();
+        if (!host_ptr)
+        {
+            host_pinned_ = false;
+            pinned_bytes_ = 0;
+            return;
+        }
+
+#ifdef HAVE_ROCM
+        if (gpu_device_.has_value() && gpu_device_->is_rocm())
+        {
+            host_backend_detail::hipHostUnregisterBuffer(host_ptr);
+            LOG_DEBUG("[CPUTensorBase::unpinHostMemory] Unpinned " << pinned_bytes_
+                                                                   << " bytes of ROCm host memory");
+        }
+#endif
+
+#ifdef HAVE_CUDA
+        if (gpu_device_.has_value() && gpu_device_->is_cuda())
+        {
+            host_backend_detail::cudaHostUnregisterBuffer(host_ptr);
+            LOG_DEBUG("[CPUTensorBase::unpinHostMemory] Unpinned " << pinned_bytes_
+                                                                   << " bytes of CUDA host memory");
+        }
+#endif
+
+        host_pinned_ = false;
+        pinned_bytes_ = 0;
+    }
+
+    // =========================================================================
     // Lazy Transfer Implementation (Phase 1 GPU Device-Aware Slicing)
     // =========================================================================
 
@@ -571,6 +776,36 @@ namespace llaminar2
             return false;
         }
 
+        const bool trace = debugEnv().rocm.trace_coherence;
+        auto overall_start = std::chrono::high_resolution_clock::now();
+
+        // ===== ZERO-COPY MAPPED MEMORY FAST PATH =====
+        // If tensor uses mapped memory, GPU can access host memory directly.
+        // No memcpy needed - just return the device-visible pointer.
+        if (is_mapped_ && mapped_device_ptr_ != nullptr)
+        {
+            // For mapped tensors, both host and device pointers are always valid
+            // Just ensure we're tracking the target device
+            if (!gpu_device_.has_value() || *gpu_device_ != target_device)
+            {
+                gpu_device_ = target_device;
+            }
+            // gpu_data_ptr_ points to mapped_device_ptr_ for mapped tensors
+            if (gpu_data_ptr_ != mapped_device_ptr_)
+            {
+                gpu_data_ptr_ = mapped_device_ptr_;
+            }
+            // Both host and device are always valid for mapped memory
+            host_valid_ = true;
+            device_valid_ = true;
+
+            if (trace)
+            {
+                LOG_INFO("[CPUTensorBase::ensureOnDevice] ZERO-COPY: Tensor is mapped, no memcpy needed");
+            }
+            return true;
+        }
+
         // Check if already on target device with valid data
         if (gpu_data_ptr_ && gpu_device_.has_value() && *gpu_device_ == target_device && device_valid_)
         {
@@ -608,7 +843,16 @@ namespace llaminar2
         size_t bytes = byte_size();
         if (!gpu_data_ptr_)
         {
+            auto alloc_start = std::chrono::high_resolution_clock::now();
             gpu_data_ptr_ = target_backend->allocate(bytes, backend_device_id);
+            auto alloc_end = std::chrono::high_resolution_clock::now();
+            auto alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(alloc_end - alloc_start).count();
+
+            if (trace)
+            {
+                LOG_INFO("[CPUTensorBase::ensureOnDevice] backend->allocate(" << bytes << " bytes) took " << alloc_us << " us");
+            }
+
             if (!gpu_data_ptr_)
             {
                 LOG_ERROR("[CPUTensorBase::ensureOnDevice] Failed to allocate " << bytes
@@ -618,6 +862,17 @@ namespace llaminar2
             }
             gpu_device_ = target_device; // Store the actual DeviceId
             device_valid_ = false;       // Newly allocated - not yet populated
+
+            // Pin host memory for fast DMA transfers (optional - continues if pinning fails)
+            auto pin_start = std::chrono::high_resolution_clock::now();
+            ensureHostPinned();
+            auto pin_end = std::chrono::high_resolution_clock::now();
+            auto pin_us = std::chrono::duration_cast<std::chrono::microseconds>(pin_end - pin_start).count();
+
+            if (trace && pin_us > 100)
+            {
+                LOG_INFO("[CPUTensorBase::ensureOnDevice] ensureHostPinned() took " << pin_us << " us");
+            }
         }
 
         // Upload data from host if device data is stale
@@ -640,7 +895,19 @@ namespace llaminar2
                 return false;
             }
 
-            if (!target_backend->hostToDevice(gpu_data_ptr_, src, bytes, backend_device_id))
+            auto h2d_start = std::chrono::high_resolution_clock::now();
+            bool h2d_ok = target_backend->hostToDevice(gpu_data_ptr_, src, bytes, backend_device_id);
+            auto h2d_end = std::chrono::high_resolution_clock::now();
+            auto h2d_us = std::chrono::duration_cast<std::chrono::microseconds>(h2d_end - h2d_start).count();
+            double bandwidth_gbps = (bytes / 1e9) / (h2d_us / 1e6);
+
+            if (trace)
+            {
+                LOG_INFO("[CPUTensorBase::ensureOnDevice] hostToDevice(" << bytes << " bytes) took "
+                                                                         << h2d_us << " us (" << bandwidth_gbps << " GB/s)");
+            }
+
+            if (!h2d_ok)
             {
                 LOG_ERROR("[CPUTensorBase::ensureOnDevice] hostToDevice failed");
                 target_backend->free(gpu_data_ptr_, backend_device_id);
@@ -657,11 +924,30 @@ namespace llaminar2
                                                                   << " (backend device ID: " << backend_device_id << ")");
         }
 
+        auto overall_end = std::chrono::high_resolution_clock::now();
+        auto overall_us = std::chrono::duration_cast<std::chrono::microseconds>(overall_end - overall_start).count();
+        if (trace && overall_us > 1000)
+        {
+            LOG_INFO("[CPUTensorBase::ensureOnDevice] TOTAL took " << overall_us << " us for " << bytes << " bytes");
+        }
+
         return true;
     }
 
     bool CPUTensorBase::ensureOnHost()
     {
+        // ===== ZERO-COPY MAPPED MEMORY FAST PATH =====
+        // If tensor uses mapped memory, host and device share the same memory.
+        // No memcpy needed - data is already visible to host.
+        if (is_mapped_)
+        {
+            // Both host and device are always valid for mapped memory
+            host_valid_ = true;
+            device_valid_ = true;
+            LOG_TRACE("[CPUTensorBase::ensureOnHost] ZERO-COPY: Tensor is mapped, no memcpy needed");
+            return true;
+        }
+
         // If host is already valid, nothing to do
         if (host_valid_)
         {
@@ -696,6 +982,18 @@ namespace llaminar2
                 return false;
             }
 
+            // Fine-grained sync: wait only for this tensor's completion event
+            // instead of a full device synchronization
+            if (device_completion_event_)
+            {
+                LOG_TRACE("[CPUTensorBase::ensureOnHost] Using event-based sync (waiting for specific kernel)");
+                if (!backend->waitForEvent(device_completion_event_, backend_device_id))
+                {
+                    LOG_WARN("[CPUTensorBase::ensureOnHost] Event wait failed, falling back to full sync");
+                    // Fall through to deviceToHost which does implicit full sync
+                }
+            }
+
             if (!backend->deviceToHost(dst, gpu_data_ptr_, bytes, backend_device_id))
             {
                 LOG_ERROR("[CPUTensorBase::ensureOnHost] deviceToHost failed");
@@ -713,6 +1011,62 @@ namespace llaminar2
         return true;
     }
 
+    void CPUTensorBase::mark_device_dirty_with_event()
+    {
+        // Mark as device dirty (standard behavior)
+        // For mapped memory, both host and device stay valid
+        device_valid_ = true;
+        host_valid_ = is_mapped_; // Mapped memory: host is also valid
+
+        // If we have a device, record an event for fine-grained sync
+        if (gpu_device_.has_value())
+        {
+            IBackend *backend = getBackendForDevice(*gpu_device_);
+            if (backend)
+            {
+                int backend_device_id = gpu_device_->gpu_ordinal();
+
+                // Create event if we don't have one
+                if (!device_completion_event_)
+                {
+                    device_completion_event_ = backend->createEvent(backend_device_id);
+                    if (device_completion_event_)
+                    {
+                        LOG_DEBUG("[CPUTensorBase::mark_device_dirty_with_event] Created completion event for tensor on device "
+                                  << gpu_device_->toString());
+                    }
+                    else
+                    {
+                        LOG_WARN("[CPUTensorBase::mark_device_dirty_with_event] Failed to create event on device "
+                                 << gpu_device_->toString());
+                    }
+                }
+
+                // Record the event (marks this point in the stream)
+                if (device_completion_event_)
+                {
+                    if (!backend->recordEvent(device_completion_event_, backend_device_id))
+                    {
+                        LOG_WARN("[CPUTensorBase::mark_device_dirty_with_event] Failed to record event");
+                    }
+                    else
+                    {
+                        LOG_TRACE("[CPUTensorBase::mark_device_dirty_with_event] Recorded completion event");
+                    }
+                }
+            }
+            else
+            {
+                LOG_TRACE("[CPUTensorBase::mark_device_dirty_with_event] No backend available for device "
+                          << gpu_device_->toString());
+            }
+        }
+        else
+        {
+            LOG_TRACE("[CPUTensorBase::mark_device_dirty_with_event] Tensor not on GPU (no gpu_device_)");
+        }
+    }
+
     bool CPUTensorBase::releaseDeviceMemory()
     {
         // Ensure host has current data
@@ -728,12 +1082,24 @@ namespace llaminar2
             if (backend)
             {
                 int backend_device_id = gpu_device_->gpu_ordinal();
+
+                // Destroy completion event if it exists
+                if (device_completion_event_)
+                {
+                    backend->destroyEvent(device_completion_event_, backend_device_id);
+                    device_completion_event_ = nullptr;
+                }
+
                 backend->free(gpu_data_ptr_, backend_device_id);
             }
             LOG_DEBUG("[CPUTensorBase::releaseDeviceMemory] Released device memory on device "
                       << gpu_device_->toString());
             gpu_data_ptr_ = nullptr;
             device_valid_ = false;
+
+            // Unpin host memory since we no longer need fast GPU transfers
+            unpinHostMemory();
+
             gpu_device_.reset();
         }
 

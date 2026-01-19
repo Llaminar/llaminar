@@ -6,10 +6,14 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
+#include <memory>
 
 namespace llaminar2
 {
+    // Forward declaration
+    class ITensorAttention;
 
     /**
      * @brief Pure attention compute stage (no KV cache management)
@@ -20,8 +24,13 @@ namespace llaminar2
      *
      * For KV cache management, use KVCacheAppendStage separately in the DAG.
      * For integrated cache+attention, use AttentionWithKVCacheStage.
+     *
+     * **Workspace Management (ROCm GPU)**:
+     * Implements IWorkspaceConsumerStage to delegate workspace requirements to the
+     * underlying attention kernel. This enables zero-allocation GPU execution by
+     * pre-binding workspace buffers during graph setup.
      */
-    class AttentionComputeStage : public IComputeStage
+    class AttentionComputeStage : public IComputeStage, public IWorkspaceConsumerStage
     {
     public:
         struct Params
@@ -75,7 +84,6 @@ namespace llaminar2
 
         /// Target device for coherence management
 
-
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
             params_.position_offset = pos_offset;
@@ -84,8 +92,31 @@ namespace llaminar2
 
         const Params &getParams() const { return params_; }
 
+        // =================================================================
+        // IWorkspaceConsumerStage Implementation
+        // =================================================================
+
+        /**
+         * @brief Get the attention kernel as IWorkspaceConsumer for delegation
+         *
+         * Returns cached kernel (creates on first call). The same kernel is
+         * returned on every call for this stage, enabling workspace binding.
+         *
+         * @return Kernel implementing IWorkspaceConsumer, or nullptr if not available
+         */
+        IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
+
     private:
         Params params_;
+
+        /// Cached attention kernel for workspace binding
+        std::unique_ptr<ITensorAttention> cached_kernel_;
+
+        /**
+         * @brief Get or create the attention kernel
+         * @return Pointer to cached kernel, or nullptr on failure
+         */
+        ITensorAttention *getOrCreateKernel();
     };
 
 } // namespace llaminar2

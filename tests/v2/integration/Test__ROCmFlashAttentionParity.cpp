@@ -26,6 +26,7 @@
 
 #include "tensors/Tensors.h"
 #include "execution/RuntimeConfig.h"
+#include "execution/DeviceWorkspaceManager.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
 
@@ -172,6 +173,9 @@ protected:
     std::uniform_real_distribution<float> dist_{-0.5f, 0.5f};
     MPIContext mpi_ctx_{0, 1, MPI_COMM_WORLD};
 
+    // Workspace manager for FlashDecode tests (owned by fixture)
+    std::unique_ptr<DeviceWorkspaceManager> workspace_;
+
     std::vector<float> randomFP32(size_t count)
     {
         std::vector<float> data(count);
@@ -194,6 +198,41 @@ protected:
                   << ", count=" << count
                   << std::endl;
     }
+
+#ifdef HAVE_ROCM
+    /**
+     * @brief Set up workspace for FlashDecode kernel
+     *
+     * FlashDecode requires workspace buffers for multi-block reduction:
+     * - PARTIAL_OUTPUT: [batch × n_heads × num_splits × head_dim]
+     * - PARTIAL_M: [batch × n_heads × num_splits]
+     * - PARTIAL_L: [batch × n_heads × num_splits]
+     */
+    bool setupWorkspace(
+        llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> &kernel,
+        int batch_size, int n_heads, int head_dim)
+    {
+        auto reqs = kernel.getWorkspaceRequirements(batch_size, n_heads, head_dim);
+        workspace_ = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
+        if (!workspace_->allocate(reqs))
+        {
+            LOG_ERROR("Failed to allocate workspace for FlashDecode");
+            return false;
+        }
+        kernel.bindWorkspace(workspace_.get());
+        return true;
+    }
+
+    void cleanupWorkspace(
+        llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> &kernel)
+    {
+        if (workspace_)
+        {
+            kernel.unbindWorkspace();
+            workspace_.reset();
+        }
+    }
+#endif
 };
 
 #ifdef HAVE_ROCM
@@ -639,6 +678,9 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_SmallKVLen)
     // ROCm kernel (decode path)
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
 
+    // Setup workspace for FlashDecode (required for multi-block reduction)
+    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
+
     float *d_Q, *d_K, *d_V, *d_output;
     hipMalloc(&d_Q, q_size * sizeof(float));
     hipMalloc(&d_K, kv_size * sizeof(float));
@@ -661,6 +703,9 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_SmallKVLen)
     ASSERT_TRUE(rocm_success) << "ROCm decode attention failed";
 
     hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+
+    // Cleanup workspace before freeing GPU memory
+    cleanupWorkspace(rocm_kernel);
 
     hipFree(d_Q);
     hipFree(d_K);
@@ -716,6 +761,9 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_LargeKVLen_GQA)
     // ROCm kernel
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
 
+    // Setup workspace for FlashDecode (required for multi-block reduction)
+    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
+
     float *d_Q, *d_K, *d_V, *d_output;
     hipMalloc(&d_Q, q_size * sizeof(float));
     hipMalloc(&d_K, kv_size * sizeof(float));
@@ -737,6 +785,9 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_LargeKVLen_GQA)
     ASSERT_TRUE(rocm_success);
 
     hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+
+    // Cleanup workspace before freeing GPU memory
+    cleanupWorkspace(rocm_kernel);
 
     hipFree(d_Q);
     hipFree(d_K);
@@ -946,6 +997,9 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_VeryLong_Parity)
     // ROCm decode
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
 
+    // Setup workspace for FlashDecode (required for multi-block reduction)
+    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
+
     float *d_Q, *d_K, *d_V, *d_output;
     hipMalloc(&d_Q, q_size * sizeof(float));
     hipMalloc(&d_K, kv_size * sizeof(float));
@@ -967,6 +1021,9 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_VeryLong_Parity)
     ASSERT_TRUE(rocm_success);
 
     hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+
+    // Cleanup workspace before freeing GPU memory
+    cleanupWorkspace(rocm_kernel);
 
     hipFree(d_Q);
     hipFree(d_K);
@@ -1019,6 +1076,8 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_MHA_Parity)
 
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
 
+    // Setup workspace for FlashDecode (required for multi-block reduction)
+    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
     float *d_Q, *d_K, *d_V, *d_output;
     hipMalloc(&d_Q, q_size * sizeof(float));
     hipMalloc(&d_K, kv_size * sizeof(float));
@@ -1041,6 +1100,8 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_MHA_Parity)
 
     hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
+    // Cleanup workspace before freeing GPU memory
+    cleanupWorkspace(rocm_kernel);
     hipFree(d_Q);
     hipFree(d_K);
     hipFree(d_V);
@@ -1092,6 +1153,8 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_HeadDim128_Parity)
 
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
 
+    // Setup workspace for FlashDecode (required for multi-block reduction)
+    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
     float *d_Q, *d_K, *d_V, *d_output;
     hipMalloc(&d_Q, q_size * sizeof(float));
     hipMalloc(&d_K, kv_size * sizeof(float));
@@ -1114,6 +1177,8 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_HeadDim128_Parity)
 
     hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
+    // Cleanup workspace before freeing GPU memory
+    cleanupWorkspace(rocm_kernel);
     hipFree(d_Q);
     hipFree(d_K);
     hipFree(d_V);
@@ -1165,6 +1230,8 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_NonCausal_Parity)
 
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
 
+    // Setup workspace for FlashDecode (required for multi-block reduction)
+    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
     float *d_Q, *d_K, *d_V, *d_output;
     hipMalloc(&d_Q, q_size * sizeof(float));
     hipMalloc(&d_K, kv_size * sizeof(float));
@@ -1187,6 +1254,8 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_NonCausal_Parity)
 
     hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
+    // Cleanup workspace before freeing GPU memory
+    cleanupWorkspace(rocm_kernel);
     hipFree(d_Q);
     hipFree(d_K);
     hipFree(d_V);
@@ -1235,6 +1304,10 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_BatchDecoding)
 
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
 
+    // Setup workspace for FlashDecode (required for multi-block reduction)
+    // Use batch_size=1 since we process one batch element at a time
+    ASSERT_TRUE(setupWorkspace(rocm_kernel, 1, n_heads, head_dim));
+
     // Allocate device memory for largest batch element
     float *d_Q, *d_K, *d_V, *d_output;
     hipMalloc(&d_Q, q_per_batch * sizeof(float));
@@ -1275,6 +1348,9 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_BatchDecoding)
         hipMemcpy(rocm_output.data() + b * out_per_batch, d_output,
                   out_per_batch * sizeof(float), hipMemcpyDeviceToHost);
     }
+
+    // Cleanup workspace before freeing GPU memory
+    cleanupWorkspace(rocm_kernel);
 
     hipFree(d_Q);
     hipFree(d_K);

@@ -7,6 +7,7 @@
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../tensors/TensorKernels.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
@@ -20,9 +21,56 @@ namespace llaminar2
     // =============================================================================
 
     AttentionComputeStage::AttentionComputeStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    // =============================================================================
+    // Kernel Caching (for Workspace Binding)
+    // =============================================================================
+
+    ITensorAttention *AttentionComputeStage::getOrCreateKernel()
+    {
+        // Return cached kernel if available
+        if (cached_kernel_)
+        {
+            return cached_kernel_.get();
+        }
+
+        // Need Q tensor to determine kernel type
+        if (!params_.Q)
+        {
+            LOG_ERROR("[AttentionComputeStage::getOrCreateKernel] Q tensor not set");
+            return nullptr;
+        }
+
+        // Determine device type from params_.device_id
+        using DeviceType = llaminar::v2::kernels::DeviceType;
+        DeviceType dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+
+        // Create and cache kernel
+        cached_kernel_ = llaminar::v2::kernels::KernelFactory::createAttention(params_.Q, dev_type);
+        if (!cached_kernel_)
+        {
+            LOG_ERROR("[AttentionComputeStage::getOrCreateKernel] Failed to create attention kernel for "
+                      << params_.Q->dtype_name());
+            return nullptr;
+        }
+
+        LOG_DEBUG("[AttentionComputeStage::getOrCreateKernel] Created and cached attention kernel for "
+                  << params_.Q->dtype_name() << " on " << params_.device_id.to_string());
+
+        return cached_kernel_.get();
+    }
+
+    IWorkspaceConsumer *AttentionComputeStage::getKernelAsWorkspaceConsumer()
+    {
+        auto *kernel = getOrCreateKernel();
+        if (!kernel)
+        {
+            return nullptr;
+        }
+        return dynamic_cast<IWorkspaceConsumer *>(kernel);
     }
 
     bool AttentionComputeStage::execute(IDeviceContext *ctx)
@@ -82,16 +130,11 @@ namespace llaminar2
             return false;
         }
 
-        // Determine device type from params_.device_id (device-agnostic)
-        using DeviceType = llaminar::v2::kernels::DeviceType;
-        DeviceType dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-
-        // Create attention kernel via KernelFactory using ITensor* overload (supports both CPU and GPU)
-        auto kernel = llaminar::v2::kernels::KernelFactory::createAttention(params_.Q, dev_type);
+        // Use cached kernel (enables workspace binding for GPU kernels)
+        auto *kernel = getOrCreateKernel();
         if (!kernel)
         {
-            LOG_ERROR("[AttentionComputeStage] Failed to create attention kernel for tensor type "
-                      << params_.Q->dtype_name());
+            LOG_ERROR("[AttentionComputeStage] Failed to get attention kernel");
             return false;
         }
 
@@ -163,9 +206,9 @@ namespace llaminar2
         // Device coherence is now handled automatically by GraphExecutor at stage boundaries
         // based on the stage's coherencePolicy() (FULL by default)
 
-        LOG_DEBUG("[AttentionComputeStage] Executing kernel: dev_type=" << llaminar::v2::kernels::to_string(dev_type)
-                                                                        << " Q_type=" << params_.Q->dtype_name()
-                                                                        << " device_idx=" << device_idx);
+        LOG_DEBUG("[AttentionComputeStage] Executing kernel: Q_type=" << params_.Q->dtype_name()
+                                                                      << " device=" << params_.device_id.to_string()
+                                                                      << " device_idx=" << device_idx);
 
         bool success = kernel->compute_tensor(
             params_.Q, params_.K, params_.V, params_.output,

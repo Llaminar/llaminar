@@ -148,7 +148,8 @@ namespace llaminar2
             bool transpose_B,
             float alpha, float beta,
             const MPIContext * /*mpi_ctx*/,
-            int /*device_idx*/)
+            int /*device_idx*/,
+            DeviceWorkspaceManager *workspace)
         {
             if (!A || !C)
             {
@@ -161,7 +162,7 @@ namespace llaminar2
             int n = static_cast<int>(N_);
             int k = static_cast<int>(K_);
 
-            return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, nullptr, -1);
+            return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, nullptr, -1, workspace);
         }
 
         bool CUDAFloatingPointGemmKernel::multiply_tensor(
@@ -170,8 +171,10 @@ namespace llaminar2
             bool transpose_B,
             float alpha, float beta,
             const MPIContext * /*mpi_ctx*/,
-            int /*device_idx*/)
+            int /*device_idx*/,
+            DeviceWorkspaceManager *workspace)
         {
+            (void)workspace; // TODO: Use workspace for intermediate allocations
             if (!A || !C)
             {
                 LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_tensor] Null input or output tensor");
@@ -204,7 +207,7 @@ namespace llaminar2
                 return false;
             }
 
-            bool success = multiply(d_A, d_C, m, n, k, transpose_B, alpha, beta, nullptr, -1);
+            bool success = multiply(d_A, d_C, m, n, k, transpose_B, alpha, beta, nullptr, -1, workspace);
             return success;
         }
 
@@ -218,8 +221,10 @@ namespace llaminar2
             bool transpose_B,
             float alpha, float beta,
             const MPIContext * /*mpi_ctx*/,
-            int /*device_idx*/)
+            int /*device_idx*/,
+            DeviceWorkspaceManager *workspace)
         {
+            (void)workspace; // TODO: Use workspace for intermediate allocations
             if (!cublas_kernel_)
             {
                 LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply] cuBLAS kernel not initialized");

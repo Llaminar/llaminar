@@ -11,6 +11,8 @@
  */
 
 #include "ROCmFlashAttentionKernelT.h"
+#include "../../../execution/DeviceWorkspaceManager.h"
+#include "../../../execution/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
 #include <cstring>
 
@@ -113,42 +115,34 @@ namespace llaminar2
         void ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::allocateWorkspace(
             int n_heads, int head_dim, int num_splits)
         {
-            if (num_splits <= max_splits_ && partial_output_buf_ != nullptr)
+            // Workspace is now REQUIRED - no legacy allocation path
+            if (!hasWorkspace())
             {
-                return; // Already have enough workspace
-            }
-
-            freeWorkspace();
-
-            // Allocate for batch_size=1 (resize if needed)
-            int batch_size = 1;
-            if (hipFlashAttn_allocWorkspace(
-                    &partial_output_buf_, &partial_m_buf_, &partial_l_buf_,
-                    batch_size, n_heads, head_dim, num_splits) != 0)
-            {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Failed to allocate workspace");
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Workspace not bound - hot-path allocation disabled. "
+                          "Call bindWorkspace() before allocateWorkspace()");
                 partial_output_buf_ = nullptr;
                 partial_m_buf_ = nullptr;
                 partial_l_buf_ = nullptr;
                 return;
             }
 
+            // Use pre-allocated buffers from workspace manager
+            partial_output_buf_ = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_OUTPUT);
+            partial_m_buf_ = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_M);
+            partial_l_buf_ = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_L);
             max_splits_ = num_splits;
-            workspace_size_ = static_cast<size_t>(batch_size) * n_heads * num_splits * head_dim * sizeof(float);
-            LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>] Allocated workspace: " << workspace_size_ << " bytes");
+
+            LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>] Using managed workspace buffers");
         }
 
         void ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::freeWorkspace()
         {
-            if (partial_output_buf_ || partial_m_buf_ || partial_l_buf_)
-            {
-                hipFlashAttn_freeWorkspace(partial_output_buf_, partial_m_buf_, partial_l_buf_);
-                partial_output_buf_ = nullptr;
-                partial_m_buf_ = nullptr;
-                partial_l_buf_ = nullptr;
-                workspace_size_ = 0;
-                max_splits_ = 0;
-            }
+            // Workspace buffers are managed externally, just clear pointers
+            partial_output_buf_ = nullptr;
+            partial_m_buf_ = nullptr;
+            partial_l_buf_ = nullptr;
+            workspace_size_ = 0;
+            max_splits_ = 0;
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::compute(
@@ -206,12 +200,13 @@ namespace llaminar2
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::compute_decode(
             const float *Q, const float *K, const float *V, float *output,
             int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
-            bool causal, int position_offset)
+            bool causal, int position_offset, int device_idx)
         {
+            int dev = (device_idx >= 0) ? device_idx : device_idx_;
             return apply_typed(Q, K, V, output,
                                1, seq_len, kv_len,
                                n_heads, n_kv_heads, head_dim,
-                               causal, -1, position_offset, device_idx_);
+                               causal, -1, position_offset, dev);
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::apply_typed(
@@ -383,14 +378,15 @@ namespace llaminar2
             LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] batch=" << batch_size
                                                                                  << " seq_len=" << seq_len << " kv_len=" << kv_len
                                                                                  << " n_heads=" << n_heads << " n_kv_heads=" << n_kv_heads
-                                                                                 << " head_dim=" << head_dim << " causal=" << causal);
+                                                                                 << " head_dim=" << head_dim << " causal=" << causal
+                                                                                 << " device_idx=" << dev);
 
             // Determine if this is decode (seq_len=1) or prefill
             if (seq_len == 1 && kv_len > 1)
             {
                 return compute_decode(Q_ptr, K_ptr, V_ptr, O_ptr,
                                       seq_len, kv_len, n_heads, n_kv_heads, head_dim,
-                                      causal, 0);
+                                      causal, 0, dev);
             }
             else
             {
@@ -399,6 +395,69 @@ namespace llaminar2
                                    n_heads, n_kv_heads, head_dim,
                                    causal, window_size, 0, dev);
             }
+        }
+
+        // =====================================================================
+        // FP32 IWorkspaceConsumer Interface Implementation
+        // =====================================================================
+
+        WorkspaceRequirements ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::getWorkspaceRequirements(
+            int m, int n, int k) const
+        {
+            WorkspaceRequirements reqs;
+
+            // Default parameters for Flash Decoding workspace sizing
+            // Conservative estimates for maximum expected configuration
+            const int batch_size = (m > 0) ? m : 1;
+            const int n_heads = (n > 0) ? n : 128;     // Max expected heads
+            const int head_dim = (k > 0) ? k : 128;    // Max expected head dim
+            const int num_splits = DEFAULT_NUM_SPLITS; // 8 splits
+
+            // partial_output: [batch × n_heads × num_splits × head_dim] FP32
+            size_t partial_output_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * head_dim * sizeof(float);
+
+            // partial_m: [batch × n_heads × num_splits] FP32 (max scores per split)
+            size_t partial_m_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
+
+            // partial_l: [batch × n_heads × num_splits] FP32 (logsumexp per split)
+            size_t partial_l_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
+
+            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_OUTPUT, partial_output_bytes, 256, true});
+            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_M, partial_m_bytes, 256, true});
+            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_L, partial_l_bytes, 256, true});
+
+            LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>::getWorkspaceRequirements] "
+                      << "batch=" << batch_size << " n_heads=" << n_heads << " head_dim=" << head_dim
+                      << " num_splits=" << num_splits
+                      << " => partial_output=" << (partial_output_bytes / 1024) << "KB"
+                      << ", partial_m=" << partial_m_bytes << "B"
+                      << ", partial_l=" << partial_l_bytes << "B");
+
+            return reqs;
+        }
+
+        void ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::bindWorkspace(
+            DeviceWorkspaceManager *workspace)
+        {
+            workspace_ = workspace;
+            if (workspace)
+            {
+                LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>] Bound workspace manager, entering managed mode");
+            }
+            else
+            {
+                LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>] Unbound workspace, returning to legacy mode");
+            }
+        }
+
+        bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::hasWorkspace() const
+        {
+            return workspace_ != nullptr;
+        }
+
+        DeviceWorkspaceManager *ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::getWorkspace() const
+        {
+            return workspace_;
         }
 
         // =====================================================================
@@ -463,36 +522,32 @@ namespace llaminar2
         void ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::allocateWorkspace(
             int n_heads, int head_dim, int num_splits)
         {
-            // FP16 uses FP32 workspace for numerical stability in reductions
-            if (num_splits <= max_splits_ && partial_output_buf_ != nullptr)
-                return;
-
-            freeWorkspace();
-
-            int batch_size = 1;
-            if (hipFlashAttn_allocWorkspace(
-                    &partial_output_buf_, &partial_m_buf_, &partial_l_buf_,
-                    batch_size, n_heads, head_dim, num_splits) != 0)
+            // Workspace is now REQUIRED - no legacy allocation path
+            if (!hasWorkspace())
             {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP16>] Failed to allocate workspace");
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP16>] Workspace not bound - hot-path allocation disabled. "
+                          "Call bindWorkspace() before allocateWorkspace()");
+                partial_output_buf_ = nullptr;
+                partial_m_buf_ = nullptr;
+                partial_l_buf_ = nullptr;
                 return;
             }
 
+            partial_output_buf_ = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_OUTPUT);
+            partial_m_buf_ = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_M);
+            partial_l_buf_ = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_L);
             max_splits_ = num_splits;
-            workspace_size_ = static_cast<size_t>(batch_size) * n_heads * num_splits * head_dim * sizeof(float);
+            LOG_DEBUG("[ROCmFlashAttentionKernelT<FP16>] Using managed workspace buffers");
         }
 
         void ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::freeWorkspace()
         {
-            if (partial_output_buf_ || partial_m_buf_ || partial_l_buf_)
-            {
-                hipFlashAttn_freeWorkspace(partial_output_buf_, partial_m_buf_, partial_l_buf_);
-                partial_output_buf_ = nullptr;
-                partial_m_buf_ = nullptr;
-                partial_l_buf_ = nullptr;
-                workspace_size_ = 0;
-                max_splits_ = 0;
-            }
+            // Workspace buffers are managed externally, just clear pointers
+            partial_output_buf_ = nullptr;
+            partial_m_buf_ = nullptr;
+            partial_l_buf_ = nullptr;
+            workspace_size_ = 0;
+            max_splits_ = 0;
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::compute(
@@ -561,10 +616,17 @@ namespace llaminar2
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::compute_decode(
             const float *Q, const float *K, const float *V, float *output,
             int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
-            bool causal, int position_offset)
+            bool causal, int position_offset, int device_idx)
         {
             (void)causal;
             (void)position_offset;
+
+            int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            if (hipFlashAttn_setDevice(dev) != 0)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP16>::compute_decode] Failed to set device " << dev);
+                return false;
+            }
 
             int num_splits = DEFAULT_NUM_SPLITS;
             if (kv_len <= 64)
@@ -585,7 +647,6 @@ namespace llaminar2
                        n_heads, n_kv_heads, head_dim,
                        num_splits, stream_) == 0;
         }
-
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::apply_typed(
             const uint16_t *Q, const uint16_t *K, const uint16_t *V, uint16_t *output,
             int batch_size, int seq_len, int kv_len,
@@ -659,6 +720,59 @@ namespace llaminar2
         }
 
         // =====================================================================
+        // FP16 IWorkspaceConsumer Interface Implementation
+        // =====================================================================
+
+        WorkspaceRequirements ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::getWorkspaceRequirements(
+            int m, int n, int k) const
+        {
+            WorkspaceRequirements reqs;
+
+            const int batch_size = (m > 0) ? m : 1;
+            const int n_heads = (n > 0) ? n : 128;
+            const int head_dim = (k > 0) ? k : 128;
+            const int num_splits = DEFAULT_NUM_SPLITS;
+
+            // FP16 uses FP32 workspace for numerical stability
+            size_t partial_output_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * head_dim * sizeof(float);
+            size_t partial_m_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
+            size_t partial_l_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
+
+            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_OUTPUT, partial_output_bytes, 256, true});
+            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_M, partial_m_bytes, 256, true});
+            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_L, partial_l_bytes, 256, true});
+
+            LOG_DEBUG("[ROCmFlashAttentionKernelT<FP16>::getWorkspaceRequirements] "
+                      << "partial_output=" << (partial_output_bytes / 1024) << "KB");
+
+            return reqs;
+        }
+
+        void ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::bindWorkspace(
+            DeviceWorkspaceManager *workspace)
+        {
+            workspace_ = workspace;
+            if (workspace)
+            {
+                LOG_DEBUG("[ROCmFlashAttentionKernelT<FP16>] Bound workspace manager, entering managed mode");
+            }
+            else
+            {
+                LOG_DEBUG("[ROCmFlashAttentionKernelT<FP16>] Unbound workspace, returning to legacy mode");
+            }
+        }
+
+        bool ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::hasWorkspace() const
+        {
+            return workspace_ != nullptr;
+        }
+
+        DeviceWorkspaceManager *ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::getWorkspace() const
+        {
+            return workspace_;
+        }
+
+        // =====================================================================
         // BF16 Specialization Implementation
         // =====================================================================
 
@@ -722,35 +836,32 @@ namespace llaminar2
         void ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::allocateWorkspace(
             int n_heads, int head_dim, int num_splits)
         {
-            if (num_splits <= max_splits_ && partial_output_buf_ != nullptr)
-                return;
-
-            freeWorkspace();
-
-            int batch_size = 1;
-            if (hipFlashAttn_allocWorkspace(
-                    &partial_output_buf_, &partial_m_buf_, &partial_l_buf_,
-                    batch_size, n_heads, head_dim, num_splits) != 0)
+            // Workspace is now REQUIRED - no legacy allocation path
+            if (!hasWorkspace())
             {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<BF16>] Failed to allocate workspace");
+                LOG_ERROR("[ROCmFlashAttentionKernelT<BF16>] Workspace not bound - hot-path allocation disabled. "
+                          "Call bindWorkspace() before allocateWorkspace()");
+                partial_output_buf_ = nullptr;
+                partial_m_buf_ = nullptr;
+                partial_l_buf_ = nullptr;
                 return;
             }
 
+            partial_output_buf_ = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_OUTPUT);
+            partial_m_buf_ = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_M);
+            partial_l_buf_ = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_L);
             max_splits_ = num_splits;
-            workspace_size_ = static_cast<size_t>(batch_size) * n_heads * num_splits * head_dim * sizeof(float);
+            LOG_DEBUG("[ROCmFlashAttentionKernelT<BF16>] Using managed workspace buffers");
         }
 
         void ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::freeWorkspace()
         {
-            if (partial_output_buf_ || partial_m_buf_ || partial_l_buf_)
-            {
-                hipFlashAttn_freeWorkspace(partial_output_buf_, partial_m_buf_, partial_l_buf_);
-                partial_output_buf_ = nullptr;
-                partial_m_buf_ = nullptr;
-                partial_l_buf_ = nullptr;
-                workspace_size_ = 0;
-                max_splits_ = 0;
-            }
+            // Workspace buffers are managed externally, just clear pointers
+            partial_output_buf_ = nullptr;
+            partial_m_buf_ = nullptr;
+            partial_l_buf_ = nullptr;
+            workspace_size_ = 0;
+            max_splits_ = 0;
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::compute(
@@ -814,10 +925,17 @@ namespace llaminar2
         bool ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::compute_decode(
             const float *Q, const float *K, const float *V, float *output,
             int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
-            bool causal, int position_offset)
+            bool causal, int position_offset, int device_idx)
         {
             (void)causal;
             (void)position_offset;
+
+            int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            if (hipFlashAttn_setDevice(dev) != 0)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<BF16>::compute_decode] Failed to set device " << dev);
+                return false;
+            }
 
             int num_splits = DEFAULT_NUM_SPLITS;
             if (kv_len <= 64)
@@ -906,6 +1024,59 @@ namespace llaminar2
             (void)local_n_heads;
             (void)local_n_kv_heads;
             return false;
+        }
+
+        // =====================================================================
+        // BF16 IWorkspaceConsumer Interface Implementation
+        // =====================================================================
+
+        WorkspaceRequirements ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::getWorkspaceRequirements(
+            int m, int n, int k) const
+        {
+            WorkspaceRequirements reqs;
+
+            const int batch_size = (m > 0) ? m : 1;
+            const int n_heads = (n > 0) ? n : 128;
+            const int head_dim = (k > 0) ? k : 128;
+            const int num_splits = DEFAULT_NUM_SPLITS;
+
+            // BF16 on MI50 falls back to FP32, so workspace is FP32
+            size_t partial_output_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * head_dim * sizeof(float);
+            size_t partial_m_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
+            size_t partial_l_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
+
+            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_OUTPUT, partial_output_bytes, 256, true});
+            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_M, partial_m_bytes, 256, true});
+            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_L, partial_l_bytes, 256, true});
+
+            LOG_DEBUG("[ROCmFlashAttentionKernelT<BF16>::getWorkspaceRequirements] "
+                      << "partial_output=" << (partial_output_bytes / 1024) << "KB");
+
+            return reqs;
+        }
+
+        void ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::bindWorkspace(
+            DeviceWorkspaceManager *workspace)
+        {
+            workspace_ = workspace;
+            if (workspace)
+            {
+                LOG_DEBUG("[ROCmFlashAttentionKernelT<BF16>] Bound workspace manager, entering managed mode");
+            }
+            else
+            {
+                LOG_DEBUG("[ROCmFlashAttentionKernelT<BF16>] Unbound workspace, returning to legacy mode");
+            }
+        }
+
+        bool ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::hasWorkspace() const
+        {
+            return workspace_ != nullptr;
+        }
+
+        DeviceWorkspaceManager *ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::getWorkspace() const
+        {
+            return workspace_;
         }
 
     } // namespace rocm

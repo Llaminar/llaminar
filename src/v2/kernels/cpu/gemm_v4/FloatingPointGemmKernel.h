@@ -869,10 +869,12 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override
             {
                 (void)mpi_ctx;
                 (void)device_idx;
+                (void)workspace; // CPU kernel doesn't need external workspace
 
                 if (!weight_tensor_)
                 {
@@ -908,10 +910,12 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override
             {
                 (void)mpi_ctx;
                 (void)device_idx;
+                (void)workspace; // CPU kernel doesn't need external workspace
 
                 if (!weight_tensor_ || !A || !C)
                 {
@@ -1006,10 +1010,12 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override
             {
                 (void)mpi_ctx;
                 (void)device_idx;
+                (void)workspace; // CPU kernel doesn't need external workspace
 
                 if (!weight_tensor_ || !A || !C)
                 {

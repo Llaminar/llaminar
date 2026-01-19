@@ -354,6 +354,28 @@ The Stage Dump framework captures raw input/output tensors from pipeline stages 
 | `LLAMINAR_STAGE_DUMP_INPUTS` | Dump input tensors (0/1) | 1 |
 | `LLAMINAR_STAGE_DUMP_OUTPUTS` | Dump output tensors (0/1) | 1 |
 | `LLAMINAR_STAGE_DUMP_WEIGHTS` | Dump weight tensors (0/1) | 1 |
+| `LLAMINAR_STAGE_DUMP_ASYNC` | Use async I/O for dumps (0/1) | 1 (enabled) |
+| `LLAMINAR_STAGE_DUMP_ASYNC_THREADS` | Number of async I/O threads (1-16) | 2 |
+
+### Async Stage Dumping
+
+By default, stage dumps use **asynchronous I/O** with a background thread pool. This significantly reduces the performance impact of dumping:
+
+- **Sync mode (ASYNC=0)**: ~60-70ms overhead per iteration for layer 0 dumps
+- **Async mode (ASYNC=1)**: ~2-5ms overhead per iteration (data copied to queue, I/O happens in background)
+
+The async system copies tensor data to an internal queue and immediately returns. Background threads handle the actual file I/O, allowing execution to continue without blocking.
+
+```bash
+# Default: async mode with 2 I/O threads
+LLAMINAR_STAGE_DUMP_ENABLED=1 ./llaminar2 -m model.gguf -p "test"
+
+# Disable async for debugging or when memory is constrained
+LLAMINAR_STAGE_DUMP_ENABLED=1 LLAMINAR_STAGE_DUMP_ASYNC=0 ./llaminar2 -m model.gguf -p "test"
+
+# Increase I/O threads for faster writes on fast storage
+LLAMINAR_STAGE_DUMP_ENABLED=1 LLAMINAR_STAGE_DUMP_ASYNC_THREADS=4 ./llaminar2 -m model.gguf -p "test"
+```
 
 ### Substring Matching for Stage Names
 
@@ -1322,6 +1344,12 @@ TEST(Test__MyNewKernel, BasicFunctionality) {
 | `LLAMINAR_STAGE_DUMP_LAYERS` | Comma-separated layer indices to dump | `all` |
 | `LLAMINAR_STAGE_DUMP_ITERATION` | Decode iterations to dump | `all` |
 | `LLAMINAR_STAGE_DUMP_RANK` | MPI rank to dump (-1 for all) | 0 |
+| `LLAMINAR_STAGE_DUMP_MAX` | Max dumps per stage type | 100 |
+| `LLAMINAR_STAGE_DUMP_INPUTS` | Dump input tensors (0/1) | 1 |
+| `LLAMINAR_STAGE_DUMP_OUTPUTS` | Dump output tensors (0/1) | 1 |
+| `LLAMINAR_STAGE_DUMP_WEIGHTS` | Dump weight tensors (0/1) | 1 |
+| `LLAMINAR_STAGE_DUMP_ASYNC` | Use async I/O for dumps (0/1) | 1 (enabled) |
+| `LLAMINAR_STAGE_DUMP_ASYNC_THREADS` | Number of async I/O threads (1-16) | 2 |
 | `LLAMINAR_STAGE_OUTPUT_PRINT` | Print stage outputs to log (0/1) | Disabled |
 | `LLAMINAR_STAGE_OUTPUT_PRINT_N` | Elements per row in stage output print | 8 |
 | `LLAMINAR_STAGE_OUTPUT_PRINT_ROWS` | Rows to print (first and last) | 2 |

@@ -123,6 +123,22 @@ namespace llaminar2
          */
         bool memset(void *ptr, int value, size_t bytes, int device_id) override;
 
+        /**
+         * @brief Allocate "mapped" memory (on CPU, just regular allocation)
+         * @param bytes Number of bytes to allocate
+         * @param device_id Must be 0
+         * @param device_ptr Set to same value as returned host pointer (no GPU)
+         * @return Pointer to allocated memory, or nullptr on failure
+         */
+        void *allocateMapped(size_t bytes, int device_id, void **device_ptr) override;
+
+        /**
+         * @brief Free mapped memory (on CPU, just regular free)
+         * @param host_ptr Pointer to free (may be nullptr)
+         * @param device_id Must be 0
+         */
+        void freeMapped(void *host_ptr, int device_id) override;
+
         // ====================================================================
         // Transfer Operations (memcpy for CPU)
         // ====================================================================
@@ -160,6 +176,40 @@ namespace llaminar2
          * @return true if device_id == 0, false otherwise
          */
         bool setDevice(int device_id) override;
+
+        // ====================================================================
+        // Event Operations (no-op for CPU - always synchronous)
+        // ====================================================================
+
+        /**
+         * @brief Create event (returns dummy pointer for CPU)
+         * @param device_id Must be 0
+         * @return Non-null dummy pointer (CPU is always synchronous)
+         */
+        void *createEvent(int device_id) override;
+
+        /**
+         * @brief Destroy event (no-op for CPU)
+         * @param event Event handle (ignored)
+         * @param device_id Must be 0
+         */
+        void destroyEvent(void *event, int device_id) override;
+
+        /**
+         * @brief Record event (no-op for CPU - always synchronous)
+         * @param event Event handle
+         * @param device_id Must be 0
+         * @return true
+         */
+        bool recordEvent(void *event, int device_id) override;
+
+        /**
+         * @brief Wait for event (no-op for CPU - always synchronous)
+         * @param event Event handle
+         * @param device_id Must be 0
+         * @return true
+         */
+        bool waitForEvent(void *event, int device_id) override;
 
         // ====================================================================
         // Capability Queries

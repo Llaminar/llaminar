@@ -112,7 +112,8 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
              * @brief Tensor-based GEMM with explicit dimensions
@@ -123,7 +124,8 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
              * @brief Raw FP32 pointer GEMM
@@ -136,7 +138,8 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
              * @brief Activation-activation GEMM (not supported for FP CUDA kernel)

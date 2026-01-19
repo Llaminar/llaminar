@@ -106,12 +106,42 @@ DeviceId parse_device(const std::string &device_str, DeviceManager &dm)
     if (device_str.substr(0, 5) == "cuda:")
     {
         int device_id = std::stoi(device_str.substr(5));
+
+        // Validate CUDA device exists
+        int cuda_count = dm.cuda_device_count();
+        if (cuda_count == 0)
+        {
+            LOG_ERROR("Error: No CUDA devices found. Cannot use --device " << device_str);
+            LOG_ERROR("Available backends: " << dm.device_count() << " total (use --list-devices to see)");
+            return DeviceId(); // Invalid
+        }
+        if (device_id >= cuda_count)
+        {
+            LOG_ERROR("Error: CUDA device " << device_id << " does not exist. Found " << cuda_count << " CUDA device(s).");
+            return DeviceId(); // Invalid
+        }
         return DeviceId::cuda(device_id);
     }
 
     if (device_str.substr(0, 5) == "rocm:")
     {
         int device_id = std::stoi(device_str.substr(5));
+
+        // Validate ROCm device exists
+        int rocm_count = dm.rocm_device_count();
+        if (rocm_count == 0)
+        {
+            LOG_ERROR("Error: No ROCm devices found. Cannot use --device " << device_str);
+            LOG_ERROR("Hint: Check that ROCm is installed and devices are accessible (try 'rocm-smi')");
+            LOG_ERROR("Hint: You may need to be in the 'video' or 'render' group for device access");
+            LOG_ERROR("Available backends: " << dm.device_count() << " total (use --list-devices to see)");
+            return DeviceId(); // Invalid
+        }
+        if (device_id >= rocm_count)
+        {
+            LOG_ERROR("Error: ROCm device " << device_id << " does not exist. Found " << rocm_count << " ROCm device(s).");
+            return DeviceId(); // Invalid
+        }
         return DeviceId::rocm(device_id);
     }
 
@@ -963,7 +993,7 @@ int main(int argc, char *argv[])
     // Run prefill inference
     if (mpi_ctx->rank() == 0)
     {
-        LOG_DEBUG("Running prefill (" << tokens.size() << " tokens)...");
+        LOG_INFO("Running prefill (" << tokens.size() << " tokens)...");
     }
 
     if (!runner->forward(tokens.data(), tokens.size()))

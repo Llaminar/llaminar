@@ -566,6 +566,10 @@ namespace llaminar2
         // Separate from cache_ to allow both CPU and CUDA paths to coexist
         mutable std::any cuda_cache_;
 
+        // Generic cache for ROCm kernel state (e.g. packed INT8 weights for CK)
+        // Separate from cache_ and cuda_cache_ to allow CPU, CUDA, and ROCm paths to coexist
+        mutable std::any rocm_cache_;
+
         // Shape and type - each concrete tensor class has its own shape_ member
         // and overrides shape() to return it.
         virtual TensorType native_type() const = 0;
@@ -777,13 +781,30 @@ namespace llaminar2
          *
          * After calling this:
          *   - device_valid_ = true (device just got written to)
-         *   - host_valid_ = false (host is now stale)
+         *   - host_valid_ = false (host is now stale) -- UNLESS tensor is mapped
+         *
+         * For mapped tensors, both host and device stay valid since they share memory.
          */
         virtual void mark_device_dirty()
         {
             device_valid_ = true; // Device just got written to
-            host_valid_ = false;  // Host is now stale
+            // For mapped memory, host is ALSO valid since they share the same memory
+            // For non-mapped memory, host is now stale
+            host_valid_ = is_mapped_;
         }
+
+        /**
+         * @brief Mark tensor as modified on device and record a completion event
+         *
+         * This is the preferred method when fine-grained synchronization is desired.
+         * Records an event after kernel execution so ensureOnHost() can wait on
+         * just this kernel rather than doing a full device synchronization.
+         *
+         * @note Call this after GPU kernels write to the tensor via gpu_data_ptr()
+         * @note The event is recorded on the default stream (stream 0)
+         * @note If event recording fails, falls back to eventless behavior
+         */
+        virtual void mark_device_dirty_with_event();
 
         /**
          * @brief Check if tensor data is currently resident on host (CPU)
@@ -796,6 +817,18 @@ namespace llaminar2
          * @return true if GPU buffer is allocated AND contains valid data
          */
         bool isDeviceValid() const { return device_valid_ && gpu_data_ptr_ != nullptr; }
+
+        /**
+         * @brief Check if tensor uses zero-copy mapped memory
+         * @return true if tensor was allocated with mapped memory (shared host/device)
+         *
+         * When a tensor is mapped:
+         * - ensureOnDevice() and ensureOnHost() are no-ops
+         * - GPU reads/writes directly to host memory via PCIe
+         * - Both host_valid_ and device_valid_ are always true
+         * - Eliminates sync memcpy bottleneck
+         */
+        bool isMapped() const { return is_mapped_; }
 
         /**
          * @brief Release GPU memory, keeping only host copy
@@ -1292,10 +1325,73 @@ namespace llaminar2
         //
         // See docs/v2/TENSOR_MEMORY_COHERENCE_DESIGN.md for full design.
 
-        void *gpu_data_ptr_ = nullptr;       // GPU buffer pointer (nullptr = not on GPU)
-        bool host_valid_ = true;             // Host data is current (starts true - data created on host)
-        bool device_valid_ = false;          // Device data is current (starts false - no GPU alloc)
-        std::optional<DeviceId> gpu_device_; // Which GPU device (nullopt = not on GPU)
+        void *gpu_data_ptr_ = nullptr;            // GPU buffer pointer (nullptr = not on GPU)
+        bool host_valid_ = true;                  // Host data is current (starts true - data created on host)
+        bool device_valid_ = false;               // Device data is current (starts false - no GPU alloc)
+        std::optional<DeviceId> gpu_device_;      // Which GPU device (nullopt = not on GPU)
+        void *device_completion_event_ = nullptr; // Event marking last kernel write (for fine-grained sync)
+
+        // ===== Zero-Copy Mapped Memory =====
+        // When a tensor uses mapped memory (hipHostMallocMapped/cudaHostAllocMapped):
+        // - Host and device share the SAME physical memory via PCIe BAR
+        // - GPU can read/write directly without memcpy
+        // - ensureOnDevice()/ensureOnHost() become no-ops
+        // - Eliminates sync memcpy bottleneck (1.5-1.7x speedup in benchmarks)
+        //
+        // Use for ACTIVATION tensors (read once, written once per stage).
+        // Do NOT use for weight tensors (need GPU cache locality).
+        //
+        // Derived classes should check is_mapped_ in raw_host_data_ptr() and return
+        // mapped_host_ptr_ when true.
+        bool is_mapped_ = false;            // True if using mapped memory
+        void *mapped_device_ptr_ = nullptr; // Device-visible pointer for mapped host memory
+        void *mapped_host_ptr_ = nullptr;   // Host-visible pointer for mapped memory
+
+        /**
+         * @brief Initialize mapped memory for this tensor (protected helper)
+         *
+         * Allocates GPU-visible host memory via backend->allocateMapped().
+         * Sets up is_mapped_, mapped_host_ptr_, mapped_device_ptr_, and gpu_data_ptr_.
+         *
+         * @param bytes Size in bytes to allocate
+         * @param target_device GPU device to map for
+         * @return true on success, false if allocation failed
+         *
+         * @note Called by derived class factories (e.g., FP32Tensor::createMapped)
+         */
+        bool initMappedMemory(size_t bytes, DeviceId target_device);
+
+        /**
+         * @brief Free mapped memory if allocated (called by destructor)
+         */
+        void freeMappedMemory();
+
+        // ===== Pinned Memory for Fast GPU Transfers =====
+        // When host buffer is pinned (page-locked), hipMemcpy/cudaMemcpy can:
+        // - Use DMA transfers instead of staging through internal buffers
+        // - Run truly asynchronously without blocking on device sync
+        // Host memory is pinned lazily on first GPU transfer attempt.
+        bool host_pinned_ = false; // True if host buffer is registered as pinned
+        size_t pinned_bytes_ = 0;  // Size of pinned region (for unregister)
+
+        /**
+         * @brief Register host buffer as pinned memory for fast GPU transfers
+         *
+         * Called automatically by ensureOnDevice() on first GPU transfer.
+         * Uses hipHostRegister/cudaHostRegister to pin existing pageable memory.
+         *
+         * @return true if pinning succeeded (or already pinned), false on error
+         * @note Safe to call multiple times - will return true if already pinned
+         */
+        bool ensureHostPinned();
+
+        /**
+         * @brief Unregister host buffer from pinned memory
+         *
+         * Called automatically by destructor or when releasing GPU resources.
+         * Safe to call even if not pinned (no-op).
+         */
+        void unpinHostMemory();
 
         // ===== Abstract Accessors for Lazy Transfer =====
         // Each tensor type can override these for GPU support.
@@ -1421,14 +1517,47 @@ namespace llaminar2
 
         // ===== CRTP Implementation for TypedTensorBase =====
         /// Called by TypedTensorBase::typed_data()
-        const float *data_impl() const { return host_data_.data(); }
+        const float *data_impl() const
+        {
+            if (is_mapped_ && mapped_host_ptr_)
+                return static_cast<const float *>(mapped_host_ptr_);
+            return host_data_.data();
+        }
         /// Called by TypedTensorBase::mutable_typed_data()
-        float *mutable_data_impl() { return host_data_.data(); }
+        float *mutable_data_impl()
+        {
+            if (is_mapped_ && mapped_host_ptr_)
+                return static_cast<float *>(mapped_host_ptr_);
+            return host_data_.data();
+        }
 
         /// @brief Construct FP32Tensor on specified device
         /// @param shape Tensor dimensions
         /// @param device Device placement (default: CPU)
         explicit FP32Tensor(const std::vector<size_t> &shape, DeviceId device = DeviceId::cpu());
+
+        /**
+         * @brief Create a zero-copy mapped FP32Tensor for GPU execution
+         *
+         * Allocates tensor data in mapped host memory that is directly accessible
+         * by the GPU via PCIe. This eliminates memcpy overhead:
+         * - ensureOnDevice() becomes a no-op (GPU reads directly from host memory)
+         * - ensureOnHost() becomes a no-op (host reads directly, no D2H copy)
+         * - 1.5x-1.7x faster than traditional H2D/D2H memcpy pattern
+         *
+         * **Use for**: Activation tensors (read once, written once per stage)
+         * **Don't use for**: Weight tensors (need GPU cache locality for repeated reads)
+         *
+         * @param shape Tensor dimensions
+         * @param target_device GPU device for mapped memory (must be CUDA or ROCm)
+         * @return unique_ptr<FP32Tensor> with mapped memory, or nullptr on failure
+         *
+         * @note Falls back to regular allocation if mapped memory unavailable
+         * @note Currently supported: ROCm (hipHostMallocMapped)
+         */
+        static std::unique_ptr<FP32Tensor> createMapped(
+            const std::vector<size_t> &shape,
+            DeviceId target_device);
 
         ~FP32Tensor() override;
 
@@ -1578,17 +1707,20 @@ namespace llaminar2
                    AlignedVector<float> *parent_data,
                    size_t data_offset,
                    std::shared_ptr<FP32Tensor> parent);
+
         std::vector<size_t> shape_;
         DeviceId device_; // Type-safe device identification
 
         // Ownership model:
-        // - If is_view_ == false: owns host_data_ (64-byte aligned for SIMD)
+        // - If is_view_ == false && !is_mapped_: owns host_data_ (64-byte aligned for SIMD)
         // - If is_view_ == true: parent_data_ptr_ points to parent's host_data_
+        // - If is_mapped_ == true: uses mapped_host_data_ (allocated by backend)
         bool is_view_;
-        AlignedVector<float> host_data_;        // Owned data (64-byte aligned, only used when !is_view_)
+        AlignedVector<float> host_data_;        // Owned data (64-byte aligned, only used when !is_view_ && !is_mapped_)
         AlignedVector<float> *parent_data_ptr_; // Borrowed data pointer (only used when is_view_)
         size_t view_offset_;                    // Offset into parent data (only used when is_view_)
         std::shared_ptr<FP32Tensor> parent_;    // Keep parent alive (only used when is_view_)
+        // Note: mapped memory uses CPUTensorBase::mapped_host_ptr_ (cast to float* in raw_host_data_ptr)
     };
 
     // Implementation: FP16Tensor.cpp

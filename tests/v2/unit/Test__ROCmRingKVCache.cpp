@@ -24,6 +24,8 @@
 #include <hip/hip_bfloat16.h>
 #include "kernels/rocm/kvcache/ROCmRingKVCache.h"
 #include "kernels/rocm/kvcache/ROCmRingKVCacheFactory.h"
+#include "execution/DeviceWorkspaceManager.h"
+#include "backends/DeviceId.h"
 #include "utils/Logger.h"
 
 using namespace llaminar2;
@@ -807,6 +809,12 @@ TEST(Test__ROCmRingKVCache, BatchedGather)
         EXPECT_EQ(cache->get_cached_tokens(0, seq), seq_lens[seq]);
     }
 
+    // Set up workspace for gather operation (REQUIRED - no fallback allocations)
+    auto reqs = cache->getWorkspaceRequirements(batch_size, 0, 0);
+    DeviceWorkspaceManager workspace(DeviceId::rocm(0), 1024 * 1024); // 1MB budget
+    ASSERT_TRUE(workspace.allocate(reqs));
+    cache->bindWorkspace(&workspace);
+
     // Gather all sequences
     int max_kv_len = 25; // Max sequence length
     float *d_K_gathered, *d_V_gathered;
@@ -842,6 +850,9 @@ TEST(Test__ROCmRingKVCache, BatchedGather)
                 << "Seq0 K mismatch at token " << t;
         }
     }
+
+    // Unbind workspace before cleanup
+    cache->unbindWorkspace();
 
     hipFree(d_K);
     hipFree(d_V);

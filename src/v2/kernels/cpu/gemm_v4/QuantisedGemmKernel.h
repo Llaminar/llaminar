@@ -815,10 +815,12 @@ namespace llaminar2
                 const std::vector<FusedProjectionDesc> &projections,
                 int m, int k,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override
             {
                 (void)mpi_ctx;
                 (void)device_idx;
+                (void)workspace; // CPU kernel doesn't need external workspace
 
                 // Convert ITensorGemm::FusedProjectionDesc to internal FusedProjection format
                 std::vector<FusedProjection> internal_projections;
@@ -856,11 +858,12 @@ namespace llaminar2
              *
              * @return true on success, false on dimension mismatch
              */
-            bool multiply(const float *A, float *C, int m, int n, int k, bool transpose_B, float alpha, float beta, const MPIContext *ctx, int device_idx) override
+            bool multiply(const float *A, float *C, int m, int n, int k, bool transpose_B, float alpha, float beta, const MPIContext *ctx, int device_idx, DeviceWorkspaceManager *workspace = nullptr) override
             {
                 // Note: transpose_B is ignored - quantized weights are always pre-transposed during packing
                 // Accumulate is determined by beta: beta > 0 means add to existing C
                 (void)transpose_B;
+                (void)workspace; // CPU kernel doesn't need external workspace
                 bool accumulate = (beta != 0.0f);
                 return multiply_fused(A, C, m, n, k, nullptr, nullptr, false, nullptr, nullptr, accumulate, alpha, beta, ctx, device_idx);
             }
@@ -1607,10 +1610,12 @@ namespace llaminar2
                 float alpha, float beta,
                 const MPIContext *mpi_ctx,
                 int device_idx,
-                const GemmFusedOps &fused_ops) override
+                const GemmFusedOps &fused_ops,
+                DeviceWorkspaceManager *workspace = nullptr) override
             {
                 (void)device_idx;
-                (void)alpha; // Currently assumed 1.0
+                (void)alpha;     // Currently assumed 1.0
+                (void)workspace; // CPU kernel doesn't need external workspace
 
                 if (!q8_1_activations || !C)
                     return false;
@@ -2001,11 +2006,13 @@ namespace llaminar2
                 const TensorBase *bias = nullptr,
                 bool accumulate = false,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override
             {
                 (void)device_idx;
                 (void)accumulate; // Q8_1 output doesn't support accumulate (would need dequant+add+requant)
                 (void)mpi_ctx;
+                (void)workspace; // CPU kernel doesn't need external workspace
 
                 if (!q8_1_activations || !C_q8_1)
                     return false;
@@ -2230,10 +2237,12 @@ namespace llaminar2
                 int q16_block_size = 64,
                 const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override
             {
                 (void)device_idx;
                 (void)mpi_ctx;
+                (void)workspace; // CPU kernel doesn't need external workspace
 
                 if (!q8_1_activations || !C_q16_1)
                     return false;
@@ -2433,8 +2442,10 @@ namespace llaminar2
                 void *C_q8_1,
                 int m, int n, int k,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override
             {
+                (void)workspace; // CPU kernel doesn't need external workspace
                 // Quantize activations first
                 int k_blocks = (k + 31) / 32;
                 std::vector<uint8_t> q8_1_buffer(m * k_blocks * sizeof(Q8_1Block) + 64);
@@ -2478,9 +2489,11 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override
             {
                 (void)transpose_B; // Weights are pre-packed
+                (void)workspace;   // CPU kernel doesn't need external workspace
 
                 const auto &a_shape = A->shape();
                 const auto &c_shape = C->shape();
@@ -2590,9 +2603,11 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override
             {
                 (void)transpose_B; // Weights are pre-packed
+                (void)workspace;   // CPU kernel doesn't need external workspace
 
                 // Determine input/output types
                 const TensorType a_type = A->native_type();

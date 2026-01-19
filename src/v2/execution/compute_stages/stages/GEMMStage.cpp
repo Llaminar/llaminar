@@ -10,6 +10,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 
 namespace llaminar2
 {
@@ -95,8 +96,7 @@ namespace llaminar2
     // =============================================================================
 
     GEMMStage::GEMMStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
     }
 
@@ -165,15 +165,13 @@ namespace llaminar2
         // Cast weights to TensorBase for KernelFactory
         auto *B_base = requireTensorBase(params_.B, "weight B");
 
-        // Get kernel - either full or sliced
-        // Use device-targeted kernel creation if params specifies GPU device
-        llaminar2::ITensorGemm *gemm = nullptr;
+        // Get kernel from KernelFactory (which caches by tensor + device)
         auto target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+        llaminar2::ITensorGemm *gemm = nullptr;
 
         if (is_sliced)
         {
             // Use sliced kernel for tensor parallelism
-            // TODO: Add device-targeted version of getOrCreateGemmSliced if needed
             gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmSliced(
                 B_base, params_.output_range.start, params_.output_range.end);
             LOG_DEBUG("[GEMMStage] Using sliced kernel for rows [" << params_.output_range.start
@@ -239,7 +237,8 @@ namespace llaminar2
                     params_.m, effective_n, params_.k,
                     params_.transpose_B,
                     params_.alpha, params_.beta,
-                    params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
+                    params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),
+                    getWorkspace()); // Pass workspace from IWorkspaceConsumerStage
 
                 // === Stage Tracing (Task 3) ===
                 if (success)
@@ -274,7 +273,7 @@ namespace llaminar2
                 params_.alpha, params_.beta,
                 params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),
                 gate_fp32,
-                params_.do_swiglu);
+                params_.do_swiglu); // CPU multiply_fused doesn't have workspace param
 
             // === Stage Tracing (Task 3) ===
             if (success)
@@ -290,7 +289,8 @@ namespace llaminar2
         // Use multiply_tensor if available for type-aware dispatch
         if (gemm->multiply_tensor(A_base_fallback, C_base_fallback, params_.m, effective_n, params_.k,
                                   params_.transpose_B, params_.alpha, params_.beta,
-                                  params_.mpi_ctx, params_.device_id.toKernelDeviceIndex()))
+                                  params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),
+                                  getWorkspace())) // Pass workspace from IWorkspaceConsumerStage
         {
             // === Stage Tracing (Task 3) ===
             traceOutput("C", params_.C);
@@ -311,7 +311,10 @@ namespace llaminar2
             input_fp32,
             output_fp32,
             params_.m, effective_n, params_.k,
-            params_.alpha, params_.beta);
+            params_.transpose_B,
+            params_.alpha, params_.beta,
+            params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),
+            getWorkspace()); // Pass workspace from IWorkspaceConsumerStage
 
         // === Stage Tracing (Task 3) ===
         if (success)
@@ -445,6 +448,44 @@ namespace llaminar2
         }
 
         return reqs;
+    }
+
+    // =============================================================================
+    // IWorkspaceConsumerStage Implementation
+    // =============================================================================
+
+    IWorkspaceConsumer *GEMMStage::getKernelAsWorkspaceConsumer()
+    {
+        // Get kernel from KernelFactory (which caches by tensor + device)
+        if (!params_.B)
+        {
+            LOG_WARN("[GEMMStage::getKernelAsWorkspaceConsumer] Weight tensor B not set");
+            return nullptr;
+        }
+
+        auto *B_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.B));
+        if (!B_base)
+        {
+            LOG_WARN("[GEMMStage::getKernelAsWorkspaceConsumer] Weight tensor B is not TensorBase");
+            return nullptr;
+        }
+
+        auto target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+        ITensorGemm *gemm = nullptr;
+
+        if (!params_.output_range.empty())
+        {
+            // Sliced kernel for tensor parallelism
+            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmSliced(
+                B_base, params_.output_range.start, params_.output_range.end);
+        }
+        else
+        {
+            // Standard GEMM kernel
+            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(B_base, target_dev_type);
+        }
+
+        return dynamic_cast<IWorkspaceConsumer *>(gemm);
     }
 
 } // namespace llaminar2

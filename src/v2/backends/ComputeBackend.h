@@ -333,6 +333,21 @@ public:
         bool has_gpu() const;
 
         /**
+         * @brief Get total number of enumerated devices
+         */
+        size_t device_count() const { return devices_.size(); }
+
+        /**
+         * @brief Get count of CUDA devices
+         */
+        int cuda_device_count() const;
+
+        /**
+         * @brief Get count of ROCm devices
+         */
+        int rocm_device_count() const;
+
+        /**
          * @brief Get all devices of specific type
          *
          * @param type Backend type

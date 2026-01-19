@@ -16,6 +16,7 @@
 #include "ROCmRingKVCache.h"
 #include "../../../utils/Logger.h"
 #include "../../../tensors/GpuTensorView.h"
+#include "../../../execution/DeviceWorkspaceManager.h"
 
 #include <algorithm>
 
@@ -589,16 +590,33 @@ namespace llaminar2
         int *kv_lens, int max_kv_len,
         int num_seqs, hipStream_t stream)
     {
-        // Allocate device arrays for kernel
-        DataT **d_k_caches;
-        DataT **d_v_caches;
-        int *d_tails;
-        int *d_counts;
+        // Device arrays for kernel
+        DataT **d_k_caches = nullptr;
+        DataT **d_v_caches = nullptr;
+        int *d_tails = nullptr;
+        int *d_counts = nullptr;
 
-        hipMalloc(&d_k_caches, num_seqs * sizeof(DataT *));
-        hipMalloc(&d_v_caches, num_seqs * sizeof(DataT *));
-        hipMalloc(&d_tails, num_seqs * sizeof(int));
-        hipMalloc(&d_counts, num_seqs * sizeof(int));
+        // Track whether we used workspace (to know if we need to free)
+        const bool use_workspace = hasWorkspace();
+
+        if (!use_workspace)
+        {
+            LOG_ERROR("[ROCmRingKVCache] Workspace not bound - hot-path allocation disabled. "
+                      "Call bindWorkspace() before launch_gather_kernel()");
+            return;
+        }
+
+        // Use pre-allocated workspace buffers (fast path - workspace is required)
+        d_k_caches = reinterpret_cast<DataT **>(
+            workspace_->getBuffer(KVCacheWorkspaceBuffers::K_CACHE_PTRS));
+        d_v_caches = reinterpret_cast<DataT **>(
+            workspace_->getBuffer(KVCacheWorkspaceBuffers::V_CACHE_PTRS));
+        d_tails = reinterpret_cast<int *>(
+            workspace_->getBuffer(KVCacheWorkspaceBuffers::TAILS));
+        d_counts = reinterpret_cast<int *>(
+            workspace_->getBuffer(KVCacheWorkspaceBuffers::COUNTS));
+
+        LOG_TRACE("[ROCmRingKVCache] Using workspace buffers for gather, num_seqs=" << num_seqs);
 
         // Prepare host arrays
         std::vector<DataT *> h_k_caches(num_seqs);
@@ -653,12 +671,10 @@ namespace llaminar2
                 num_seqs, max_kv_len, max_seq_len_, kv_dim_, stream);
         }
 
-        // Synchronize and free temporary device arrays
+        // Synchronize before returning
         hipStreamSynchronize(stream);
-        hipFree(d_k_caches);
-        hipFree(d_v_caches);
-        hipFree(d_tails);
-        hipFree(d_counts);
+
+        // Workspace buffers are caller-owned, no cleanup needed
     }
 
     template <ActivationPrecision Precision>
@@ -838,6 +854,74 @@ namespace llaminar2
     {
         // Delegate to non-const version (tensor_views_ is mutable)
         return const_cast<ROCmRingKVCache<Precision> *>(this)->get_v(layer, seq_idx);
+    }
+
+    // =========================================================================
+    // IWorkspaceConsumer Implementation
+    // =========================================================================
+
+    template <ActivationPrecision Precision>
+    WorkspaceRequirements ROCmRingKVCache<Precision>::getWorkspaceRequirements(
+        int m, int n, int k) const
+    {
+        // m = batch size (number of sequences in gather operation)
+        // n, k unused for KV cache
+        // Default to batch_size_ if m is 0
+        const int actual_batch_size = (m > 0) ? m : batch_size_;
+
+        WorkspaceRequirements reqs;
+
+        // Buffer for K cache pointers: DataT* per sequence
+        reqs.buffers.push_back({
+            KVCacheWorkspaceBuffers::K_CACHE_PTRS,
+            static_cast<size_t>(actual_batch_size) * sizeof(DataT *),
+            sizeof(void *) // Pointer alignment
+        });
+
+        // Buffer for V cache pointers: DataT* per sequence
+        reqs.buffers.push_back({
+            KVCacheWorkspaceBuffers::V_CACHE_PTRS,
+            static_cast<size_t>(actual_batch_size) * sizeof(DataT *),
+            sizeof(void *) // Pointer alignment
+        });
+
+        // Buffer for tail indices: int per sequence
+        reqs.buffers.push_back({KVCacheWorkspaceBuffers::TAILS,
+                                static_cast<size_t>(actual_batch_size) * sizeof(int),
+                                sizeof(int)});
+
+        // Buffer for count values: int per sequence
+        reqs.buffers.push_back({KVCacheWorkspaceBuffers::COUNTS,
+                                static_cast<size_t>(actual_batch_size) * sizeof(int),
+                                sizeof(int)});
+
+        LOG_DEBUG("[ROCmRingKVCache] Workspace requirements: batch_size="
+                  << actual_batch_size
+                  << " K_CACHE_PTRS=" << actual_batch_size * sizeof(DataT *)
+                  << " V_CACHE_PTRS=" << actual_batch_size * sizeof(DataT *)
+                  << " TAILS=" << actual_batch_size * sizeof(int)
+                  << " COUNTS=" << actual_batch_size * sizeof(int));
+
+        return reqs;
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        workspace_ = workspace;
+        LOG_DEBUG("[ROCmRingKVCache] Workspace bound: " << (workspace ? "yes" : "no"));
+    }
+
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::hasWorkspace() const
+    {
+        return workspace_ != nullptr;
+    }
+
+    template <ActivationPrecision Precision>
+    DeviceWorkspaceManager *ROCmRingKVCache<Precision>::getWorkspace() const
+    {
+        return workspace_;
     }
 
     // =========================================================================

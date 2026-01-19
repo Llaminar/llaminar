@@ -24,6 +24,7 @@
 #include <numeric>
 
 #include "kernels/rocm/ROCmQuantisedGemmKernel.h"
+#include "execution/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
 #include "../utils/TestTensorFactory.h"
 #include "utils/Logger.h"
@@ -80,6 +81,19 @@ extern "C"
     bool rocmQuantGemm_copyHostToDevice(float *d_dst, const float *h_src, size_t count, int rocm_device_id);
     bool rocmQuantGemm_copyDeviceToHost(float *h_dst, const float *d_src, size_t count, int rocm_device_id);
     bool rocmQuantGemm_allocFloat(float **d_ptr, size_t count, int rocm_device_id);
+    bool rocmQuantGemm_allocInt32(int32_t **d_ptr, size_t count, int rocm_device_id);
+
+    // Apply scaling with full epilogue (alpha, beta, bias)
+    bool rocmQuantGemm_applyScaling(
+        const int32_t *d_C_int32, // [M×N] INT32 GEMM output
+        float *d_C_fp32,          // [M×N] FP32 output
+        const float *d_scales_A,  // [M] per-row scales
+        const float *d_scales_B,  // [N] per-column scales
+        int M, int N,
+        float alpha, float beta,
+        const float *d_C_existing, // For beta != 0 (nullable)
+        const float *d_bias,       // [N] optional bias (nullable)
+        int rocm_device_id);
 }
 #endif
 
@@ -135,6 +149,41 @@ namespace llaminar2
                 }
 
                 bool has_rocm_device_ = false;
+
+#ifdef HAVE_ROCM
+                // Workspace manager for GEMM kernel tests
+                std::unique_ptr<DeviceWorkspaceManager> workspace_;
+
+                /**
+                 * @brief Set up workspace for GEMM kernel
+                 *
+                 * The ROCmQuantisedGemmKernel needs workspace buffers for:
+                 * - Quantized activations (INT8)
+                 * - Per-row scales
+                 * - INT32 intermediate output
+                 */
+                bool setupWorkspace(ROCmQuantisedGemmKernel &kernel, int M, int N, int K)
+                {
+                    auto reqs = kernel.getWorkspaceRequirements(M, N, K);
+                    workspace_ = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 64 * 1024 * 1024); // 64MB
+                    if (!workspace_->allocate(reqs))
+                    {
+                        LOG_ERROR("Failed to allocate workspace for GEMM kernel");
+                        return false;
+                    }
+                    kernel.bindWorkspace(workspace_.get());
+                    return true;
+                }
+
+                void cleanupWorkspace(ROCmQuantisedGemmKernel &kernel)
+                {
+                    if (workspace_)
+                    {
+                        kernel.unbindWorkspace();
+                        workspace_.reset();
+                    }
+                }
+#endif
             };
 
 #ifdef HAVE_ROCM
@@ -1027,6 +1076,9 @@ namespace llaminar2
                 // Create kernel
                 ROCmQuantisedGemmKernel kernel(&packed, 0);
 
+                // Setup workspace for GEMM kernel (required for work buffers)
+                ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
                 // Create input and output tensors
                 auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
                 auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
@@ -1111,6 +1163,9 @@ namespace llaminar2
                 // Create kernel
                 ROCmQuantisedGemmKernel kernel(&packed, 0);
 
+                // Setup workspace for GEMM kernel (required for work buffers)
+                ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
                 // Create input and output tensors
                 auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
                 auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
@@ -1186,6 +1241,15 @@ namespace llaminar2
                 // Create kernel
                 ROCmQuantisedGemmKernel kernel(&packed, 0);
 
+                // Setup workspace for GEMM kernel (required for work buffers)
+                auto reqs = kernel.getWorkspaceRequirements(M, N, K);
+                DeviceWorkspaceManager workspace(DeviceId::rocm(0), 64 * 1024 * 1024);
+                if (!workspace.allocate(reqs))
+                {
+                    return -1.0;
+                }
+                kernel.bindWorkspace(&workspace);
+
                 // Create input and output tensors
                 auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
                 auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
@@ -1233,6 +1297,10 @@ namespace llaminar2
                     norm_actual += static_cast<double>(actual) * actual;
                     norm_ref += static_cast<double>(ref) * ref;
                 }
+
+                // Unbind workspace before returning (workspace will be destroyed at scope exit)
+                kernel.unbindWorkspace();
+
                 return dot_product / (std::sqrt(norm_actual) * std::sqrt(norm_ref) + 1e-12);
             }
 
@@ -1581,6 +1649,159 @@ namespace llaminar2
                 rocmQuantGemm_freeDevice(d_C_int32);
 
                 LOG_INFO("[Integration] Tested batch sizes: 1 to 2048");
+            }
+
+            // =============================================================================
+            // Full Pipeline Tests - Scaling with Bias
+            // =============================================================================
+
+            /**
+             * @test rocmQuantGemm_applyScaling - Full epilogue with alpha, beta, bias
+             *
+             * Tests the scaling epilogue kernel that converts INT32 GEMM output to FP32
+             * with optional alpha/beta and bias.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, ApplyScaling_WithBias)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                const int M = 32;
+                const int N = 64;
+
+                // Allocate device buffers
+                int32_t *d_C_int32 = nullptr;
+                float *d_C_fp32_no_bias = nullptr;
+                float *d_C_fp32_with_bias = nullptr;
+                float *d_scales_A = nullptr;
+                float *d_scales_B = nullptr;
+                float *d_bias = nullptr;
+
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(reinterpret_cast<float **>(&d_C_int32), (M * N * sizeof(int32_t)) / sizeof(float), 0));
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_C_fp32_no_bias, M * N, 0));
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_C_fp32_with_bias, M * N, 0));
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_scales_A, M, 0));
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_scales_B, N, 0));
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_bias, N, 0));
+
+                // Create host data
+                std::vector<int32_t> h_C_int32(M * N);
+                std::vector<float> h_scales_A(M, 1.0f); // Unit scales for simplicity
+                std::vector<float> h_scales_B(N, 1.0f);
+                std::vector<float> h_bias(N, 0.5f); // Constant bias for verification
+
+                // Fill INT32 with deterministic values
+                for (int i = 0; i < M * N; ++i)
+                {
+                    h_C_int32[i] = (i % 100) - 50; // [-50, 49]
+                }
+
+                // Upload to device
+                hipMemcpy(d_C_int32, h_C_int32.data(), M * N * sizeof(int32_t), hipMemcpyHostToDevice);
+                hipMemcpy(d_scales_A, h_scales_A.data(), M * sizeof(float), hipMemcpyHostToDevice);
+                hipMemcpy(d_scales_B, h_scales_B.data(), N * sizeof(float), hipMemcpyHostToDevice);
+                hipMemcpy(d_bias, h_bias.data(), N * sizeof(float), hipMemcpyHostToDevice);
+
+                // Apply scaling without bias
+                ASSERT_TRUE(rocmQuantGemm_applyScaling(
+                    d_C_int32, d_C_fp32_no_bias, d_scales_A, d_scales_B,
+                    M, N, 1.0f, 0.0f, nullptr, nullptr, 0));
+
+                // Apply scaling with bias
+                ASSERT_TRUE(rocmQuantGemm_applyScaling(
+                    d_C_int32, d_C_fp32_with_bias, d_scales_A, d_scales_B,
+                    M, N, 1.0f, 0.0f, nullptr, d_bias, 0));
+
+                // Download results
+                std::vector<float> h_C_fp32_no_bias(M * N);
+                std::vector<float> h_C_fp32_with_bias(M * N);
+                hipMemcpy(h_C_fp32_no_bias.data(), d_C_fp32_no_bias, M * N * sizeof(float), hipMemcpyDeviceToHost);
+                hipMemcpy(h_C_fp32_with_bias.data(), d_C_fp32_with_bias, M * N * sizeof(float), hipMemcpyDeviceToHost);
+
+                // Verify: with_bias should be no_bias + bias[col]
+                int matches = 0;
+                for (int m = 0; m < M; ++m)
+                {
+                    for (int n = 0; n < N; ++n)
+                    {
+                        int idx = m * N + n;
+                        float expected = h_C_fp32_no_bias[idx] + h_bias[n];
+                        float actual = h_C_fp32_with_bias[idx];
+                        if (std::abs(expected - actual) < 1e-4f)
+                            matches++;
+                    }
+                }
+
+                float match_rate = static_cast<float>(matches) / static_cast<float>(M * N);
+                EXPECT_GT(match_rate, 0.99f) << "Bias addition mismatch";
+
+                LOG_INFO("[Integration] Bias scaling match rate: " << (match_rate * 100.0f) << "%");
+
+                // Cleanup
+                rocmQuantGemm_freeDevice(d_C_int32);
+                rocmQuantGemm_freeDevice(d_C_fp32_no_bias);
+                rocmQuantGemm_freeDevice(d_C_fp32_with_bias);
+                rocmQuantGemm_freeDevice(d_scales_A);
+                rocmQuantGemm_freeDevice(d_scales_B);
+                rocmQuantGemm_freeDevice(d_bias);
+            }
+
+            /**
+             * @test rocmQuantGemm_applyScaling with alpha != 1.0
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, ApplyScaling_WithAlpha)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                const int M = 16;
+                const int N = 32;
+                const float alpha = 2.0f;
+
+                int32_t *d_C_int32 = nullptr;
+                float *d_C_fp32 = nullptr;
+                float *d_scales_A = nullptr;
+                float *d_scales_B = nullptr;
+
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(reinterpret_cast<float **>(&d_C_int32), (M * N * sizeof(int32_t)) / sizeof(float), 0));
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_C_fp32, M * N, 0));
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_scales_A, M, 0));
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_scales_B, N, 0));
+
+                // Simple test: C_int32 = 1, scales = 1, alpha = 2 -> result should be 2.0
+                std::vector<int32_t> h_C_int32(M * N, 1);
+                std::vector<float> h_scales_A(M, 1.0f);
+                std::vector<float> h_scales_B(N, 1.0f);
+
+                hipMemcpy(d_C_int32, h_C_int32.data(), M * N * sizeof(int32_t), hipMemcpyHostToDevice);
+                hipMemcpy(d_scales_A, h_scales_A.data(), M * sizeof(float), hipMemcpyHostToDevice);
+                hipMemcpy(d_scales_B, h_scales_B.data(), N * sizeof(float), hipMemcpyHostToDevice);
+
+                ASSERT_TRUE(rocmQuantGemm_applyScaling(
+                    d_C_int32, d_C_fp32, d_scales_A, d_scales_B,
+                    M, N, alpha, 0.0f, nullptr, nullptr, 0));
+
+                std::vector<float> h_C_fp32(M * N);
+                hipMemcpy(h_C_fp32.data(), d_C_fp32, M * N * sizeof(float), hipMemcpyDeviceToHost);
+
+                // All values should be 2.0 (1 * 1.0 * 1.0 * 2.0)
+                int matches = 0;
+                for (float v : h_C_fp32)
+                {
+                    if (std::abs(v - 2.0f) < 1e-5f)
+                        matches++;
+                }
+
+                EXPECT_EQ(matches, M * N) << "Alpha scaling incorrect";
+
+                rocmQuantGemm_freeDevice(d_C_int32);
+                rocmQuantGemm_freeDevice(d_C_fp32);
+                rocmQuantGemm_freeDevice(d_scales_A);
+                rocmQuantGemm_freeDevice(d_scales_B);
             }
 
             // MScaling tests removed - covered by decode/prefill tests above

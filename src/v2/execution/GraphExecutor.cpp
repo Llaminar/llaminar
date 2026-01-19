@@ -7,8 +7,11 @@
 
 #include "GraphExecutor.h"
 #include "StageDumper.h"
+#include "AsyncStageDumper.h"
 #include "StageCoherence.h"
 #include "../tensors/TensorVerification.h"
+#include "../tensors/TensorValidation.h"
+#include "../tensors/cpu/CPUTensors.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include <algorithm>
@@ -374,6 +377,9 @@ namespace llaminar2
 
         auto total_start = std::chrono::high_resolution_clock::now();
 
+        int stage_idx = 0;
+        auto prev_time = total_start;
+
         for (const auto &name : order)
         {
             auto *node = graph.getNode(name);
@@ -383,17 +389,39 @@ namespace llaminar2
                 return false;
             }
 
+            auto stage_start = std::chrono::high_resolution_clock::now();
+
             if (!executeNode(*node, ctx))
             {
                 LOG_ERROR("[GraphExecutor] Stage failed: " << name);
                 return false;
             }
 
+            auto stage_end = std::chrono::high_resolution_clock::now();
+            double stage_ms = std::chrono::duration<double, std::milli>(stage_end - stage_start).count();
+
+            // Log every stage for ROCm debugging
+            LOG_INFO("[GraphExecutor] Stage " << stage_idx << "/" << order.size() << ": " << name << " took " << stage_ms << "ms");
+            stage_idx++;
+
             graph.markCompleted(name);
         }
 
         auto total_end = std::chrono::high_resolution_clock::now();
         double total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
+
+        // Wait for any pending async dumps to complete
+        if (AsyncStageDumper::isInitialized())
+        {
+            size_t pending = AsyncStageDumper::pendingTasks();
+            if (pending > 0)
+            {
+                LOG_INFO("[GraphExecutor] Waiting for " << pending << " pending async dumps...");
+                AsyncStageDumper::waitForCompletion();
+            }
+        }
+
+        LOG_INFO("[GraphExecutor] Total execution: " << total_ms << "ms for " << order.size() << " stages (" << (total_ms / order.size()) << "ms/stage avg)");
 
         stats_.total_time_ms += total_ms;
         stats_.total_stages_executed += order.size();
@@ -592,6 +620,16 @@ namespace llaminar2
         // Extract layer index from config
         const int layer_idx = config_.current_layer_idx;
 
+        // Timing variables for phase breakdown
+        auto phase_start = std::chrono::high_resolution_clock::now();
+        auto phase_end = phase_start;
+        double input_cohere_ms = 0.0;
+        double weight_cohere_ms = 0.0;
+        double output_alloc_ms = 0.0;
+        double dump_input_ms = 0.0;
+        double execute_ms = 0.0;
+        double mark_dirty_ms = 0.0;
+
         // =========================================================================
         // Stage Coherence: Ensure inputs are on target device BEFORE execution
         // =========================================================================
@@ -599,30 +637,40 @@ namespace llaminar2
             auto policy = node.stage->coherencePolicy();
             DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
 
+            LOG_DEBUG("[GraphExecutor] Stage '" << node.name << "' coherencePolicy=" << toString(policy)
+                                                << " target_device=" << target_device.to_string());
+
             if (policy == CoherencePolicy::INPUT || policy == CoherencePolicy::FULL)
             {
                 auto dump_info = node.stage->getDumpInfo();
 
                 // Cohere inputs
+                phase_start = std::chrono::high_resolution_clock::now();
                 auto inputs = extractInputBuffers(dump_info);
                 if (!cohereInputs(inputs, target_device))
                 {
                     LOG_ERROR("[GraphExecutor] Failed to cohere inputs for stage '" << node.name << "'");
                     return false;
                 }
+                phase_end = std::chrono::high_resolution_clock::now();
+                input_cohere_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
 
                 // Cohere weights (needed for GPU execution - biases, etc.)
+                phase_start = std::chrono::high_resolution_clock::now();
                 auto weights = extractWeightBuffers(dump_info);
                 if (!cohereInputs(weights, target_device)) // Weights are read-only like inputs
                 {
                     LOG_ERROR("[GraphExecutor] Failed to cohere weights for stage '" << node.name << "'");
                     return false;
                 }
+                phase_end = std::chrono::high_resolution_clock::now();
+                weight_cohere_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
             }
 
             // For GPU targets, outputs also need GPU buffers allocated before kernel runs
             if (policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL)
             {
+                phase_start = std::chrono::high_resolution_clock::now();
                 auto dump_info = node.stage->getDumpInfo();
                 auto outputs = extractOutputBuffers(dump_info);
 
@@ -631,6 +679,8 @@ namespace llaminar2
                     LOG_ERROR("[GraphExecutor] Failed to allocate output buffers for stage '" << node.name << "'");
                     return false;
                 }
+                phase_end = std::chrono::high_resolution_clock::now();
+                output_alloc_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
             }
         }
 
@@ -644,6 +694,7 @@ namespace llaminar2
 
         // Check if stage dumping is enabled for this stage
         StageDumpContext dump_ctx;
+        const auto &dump_cfg = debugEnv().stage_dump;
         const bool should_dump = StageDumper::shouldDump(
             node.stage.get(),
             node.name, // Pass node name for LLAMINAR_STAGE_DUMP_NAMES filtering
@@ -653,13 +704,33 @@ namespace llaminar2
 
         if (should_dump)
         {
+            phase_start = std::chrono::high_resolution_clock::now();
             dump_ctx = StageDumper::beginDump(
                 node.stage.get(),
                 node.name, // Pass node name for directory naming
                 config_.current_layer_idx,
                 config_.current_iteration,
                 config_.mpi_rank);
-            StageDumper::dumpInputs(dump_ctx, node.stage.get());
+
+            // Use async dumping if enabled (default: true)
+            if (dump_cfg.async_dump)
+            {
+                // Lazy initialization of async dumper
+                if (!AsyncStageDumper::isInitialized())
+                {
+                    AsyncStageDumper::initialize(dump_cfg.async_threads);
+                }
+                // Enqueue inputs for async writing (fast memcpy only)
+                auto dump_info = node.stage->getDumpInfo();
+                AsyncStageDumper::enqueueInputs(dump_ctx, dump_info);
+            }
+            else
+            {
+                // Synchronous dump (legacy path)
+                StageDumper::dumpInputs(dump_ctx, node.stage.get());
+            }
+            phase_end = std::chrono::high_resolution_clock::now();
+            dump_input_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
         }
 
         auto start = std::chrono::high_resolution_clock::now();
@@ -667,7 +738,7 @@ namespace llaminar2
         bool success = node.stage->execute(ctx);
 
         auto end = std::chrono::high_resolution_clock::now();
-        double ms = std::chrono::duration<double, std::milli>(end - start).count();
+        execute_ms = std::chrono::duration<double, std::milli>(end - start).count();
 
         // =========================================================================
         // Stage Coherence: Mark outputs as device-dirty IMMEDIATELY after execution
@@ -680,27 +751,51 @@ namespace llaminar2
 
             if (policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL)
             {
+                phase_start = std::chrono::high_resolution_clock::now();
+                auto getDumpInfo_start = std::chrono::high_resolution_clock::now();
                 auto dump_info = node.stage->getDumpInfo();
+                auto getDumpInfo_end = std::chrono::high_resolution_clock::now();
+                double getDumpInfo_ms = std::chrono::duration<double, std::milli>(getDumpInfo_end - getDumpInfo_start).count();
+                if (getDumpInfo_ms > 10.0)
+                {
+                    LOG_WARN("[GraphExecutor] getDumpInfo('" << node.name << "') took " << getDumpInfo_ms << " ms");
+                }
                 auto outputs = extractOutputBuffers(dump_info);
                 markOutputsDirty(outputs);
+                phase_end = std::chrono::high_resolution_clock::now();
+                mark_dirty_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
 
                 // Stage output printing (after coherence, so GPU→host sync has occurred)
                 printStageOutputs(node.name, dump_info);
             }
         }
 
-        if (config_.enable_profiling)
-        {
-            stats_.stage_times_ms[node.name] = ms;
-
-            LOG_DEBUG("[GraphExecutor] Stage '" << node.name << "' took " << ms << " ms");
-        }
+        // Timing for dump and validation phases (after core execution)
+        double dump_output_ms = 0.0;
+        double verify_ms = 0.0;
+        double callback_ms = 0.0;
 
         // Dump outputs after execution (if dumping enabled)
         if (should_dump && success)
         {
-            StageDumper::dumpOutputs(dump_ctx, node.stage.get());
-            StageDumper::finalizeDump(dump_ctx, ms);
+            phase_start = std::chrono::high_resolution_clock::now();
+
+            if (dump_cfg.async_dump)
+            {
+                // Enqueue outputs for async writing (fast memcpy only)
+                auto dump_info = node.stage->getDumpInfo();
+                AsyncStageDumper::enqueueOutputs(dump_ctx, dump_info);
+                // Note: finalizeDump not needed for async mode since metadata
+                // is written synchronously in beginDump
+            }
+            else
+            {
+                // Synchronous dump (legacy path)
+                StageDumper::dumpOutputs(dump_ctx, node.stage.get());
+                StageDumper::finalizeDump(dump_ctx, execute_ms);
+            }
+            phase_end = std::chrono::high_resolution_clock::now();
+            dump_output_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
         }
 
         // EXIT verification - validate outputs AFTER execute()
@@ -708,11 +803,14 @@ namespace llaminar2
 #if LLAMINAR_ASSERTIONS_ACTIVE
         if (success && debugEnv().validation.validate_buffers)
         {
+            phase_start = std::chrono::high_resolution_clock::now();
             // New exception-based validation (throws VerificationFailure)
             verifyStageExit(node, layer_idx);
 
             // Legacy bool-based validation (for compatibility)
             success = validateStageOutputs(node);
+            phase_end = std::chrono::high_resolution_clock::now();
+            verify_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
         }
 #endif
 
@@ -720,9 +818,40 @@ namespace llaminar2
         LOG_DEBUG("[GraphExecutor::executeNode] success=" << success << " callback=" << (config_.snapshot_callback ? "set" : "null") << " node=" << node.name);
         if (success && config_.snapshot_callback)
         {
+            phase_start = std::chrono::high_resolution_clock::now();
             auto dump_info = node.stage->getDumpInfo();
+            // IMPORTANT: Sync outputs from GPU before callback reads them
+            dump_info.ensureOutputsOnHost();
             LOG_DEBUG("[GraphExecutor::executeNode] Invoking callback for " << node.name);
             config_.snapshot_callback(node.name, dump_info);
+            phase_end = std::chrono::high_resolution_clock::now();
+            callback_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+        }
+
+        // Log phase breakdown at TRACE level (only for stages taking >1ms total or any phase >0.5ms)
+        double total_overhead_ms = input_cohere_ms + weight_cohere_ms + output_alloc_ms + dump_input_ms + mark_dirty_ms + dump_output_ms + verify_ms + callback_ms;
+        double total_ms = total_overhead_ms + execute_ms;
+        if (total_ms > 1.0 || input_cohere_ms > 0.5 || weight_cohere_ms > 0.5 ||
+            output_alloc_ms > 0.5 || execute_ms > 0.5 || verify_ms > 0.5 || callback_ms > 0.5)
+        {
+            LOG_TRACE("[GraphExecutor::PHASES] " << node.name
+                                                 << " input_cohere=" << input_cohere_ms << "ms"
+                                                 << " weight_cohere=" << weight_cohere_ms << "ms"
+                                                 << " output_alloc=" << output_alloc_ms << "ms"
+                                                 << " dump_input=" << dump_input_ms << "ms"
+                                                 << " execute=" << execute_ms << "ms"
+                                                 << " mark_dirty=" << mark_dirty_ms << "ms"
+                                                 << " dump_out=" << dump_output_ms << "ms"
+                                                 << " verify=" << verify_ms << "ms"
+                                                 << " callback=" << callback_ms << "ms"
+                                                 << " total=" << total_ms << "ms");
+        }
+
+        if (config_.enable_profiling)
+        {
+            stats_.stage_times_ms[node.name] = total_ms;
+
+            LOG_DEBUG("[GraphExecutor] Stage '" << node.name << "' took " << total_ms << " ms");
         }
 
         return success;
@@ -849,6 +978,9 @@ namespace llaminar2
         vconfig.check_all_zero = validation.fail_on_zero && !node.stage->allowsZeroOutput();
 
         // Verify all outputs (NaN/Inf/null checks)
+        // IMPORTANT: Sync outputs from GPU BEFORE reading data
+        dump_info.ensureOutputsOnHost();
+
         for (const auto &output : dump_info.outputs)
         {
             if (!output.data)
@@ -934,6 +1066,9 @@ namespace llaminar2
         const auto &validation = debugEnv().validation;
 
         // Get stage's dump info to access output buffers
+        // NOTE: We intentionally access getDumpInfo() here even though it may trigger
+        // GPU→host sync, because we only call this in Debug/Integration builds anyway.
+        // The StageDumpInfo provides tensor pointers that we can use for GPU validation.
         auto dump_info = node.stage->getDumpInfo();
 
         bool all_valid = true;
@@ -941,15 +1076,96 @@ namespace llaminar2
         // Validate output buffers
         for (const auto &output : dump_info.outputs)
         {
-            if (!output.data || output.rows == 0 || output.cols == 0)
+            if (output.rows == 0 || output.cols == 0)
                 continue;
 
-            // Check for zero tensor (uninitialized buffer)
-            // Only check FP32 outputs for now
+            size_t numel = output.rows * output.cols;
+
+            // Check if we have a tensor pointer with GPU data
+            // If so, use GPU-side validation to avoid expensive D2H sync
+            if (output.tensor)
+            {
+                auto *base_tensor = dynamic_cast<CPUTensorBase *>(output.tensor);
+                if (base_tensor && base_tensor->isDeviceValid())
+                {
+                    // Get GPU validator for this device type
+                    auto device_opt = base_tensor->current_device();
+                    if (device_opt.has_value())
+                    {
+                        ITensorValidator *validator = getTensorValidator(device_opt->type);
+                        if (validator)
+                        {
+                            const void *device_ptr = base_tensor->gpu_data_ptr();
+                            int device_id = device_opt->ordinal;
+
+                            // Launch GPU validation kernel (async)
+                            bool launched = false;
+                            if (std::string(output.dtype) == "FP32")
+                            {
+                                launched = validator->validateFP32Async(device_ptr, numel, device_id);
+                            }
+                            else if (std::string(output.dtype) == "BF16")
+                            {
+                                launched = validator->validateBF16Async(device_ptr, numel, device_id);
+                            }
+                            else if (std::string(output.dtype) == "FP16")
+                            {
+                                launched = validator->validateFP16Async(device_ptr, numel, device_id);
+                            }
+
+                            if (launched)
+                            {
+                                TensorValidationResult result;
+                                if (validator->getResult(result))
+                                {
+                                    if (result.appears_zero && numel > 10)
+                                    {
+                                        LOG_WARN("[GraphExecutor] Stage '" << node.name << "' output '" << output.name
+                                                                           << "' appears to be all zeros (GPU validation)");
+                                        if (validation.fail_on_zero)
+                                        {
+                                            LOG_ERROR("[GraphExecutor] Buffer validation failed: zero tensor detected");
+                                            all_valid = false;
+                                        }
+                                    }
+
+                                    if (result.has_nan || result.has_inf)
+                                    {
+                                        LOG_WARN("[GraphExecutor] Stage '" << node.name << "' output '" << output.name
+                                                                           << "' contains " << result.nan_count << " NaN, "
+                                                                           << result.inf_count << " Inf values (GPU validation)");
+                                        if (validation.fail_on_nan)
+                                        {
+                                            LOG_ERROR("[GraphExecutor] Buffer validation failed: NaN/Inf detected");
+                                            all_valid = false;
+                                        }
+                                    }
+
+                                    // Successfully validated on GPU, continue to next output
+                                    continue;
+                                }
+                            }
+                            // Fall through to host validation if GPU validation failed to launch
+                        }
+                    }
+                }
+            }
+
+            // Fallback: Host-side validation (for CPU tensors or when GPU validation unavailable)
+            // Need to ensure output is synced to host before reading
+            if (output.tensor)
+            {
+                if (auto *cpu_tensor = dynamic_cast<CPUTensorBase *>(output.tensor))
+                {
+                    cpu_tensor->ensureOnHost();
+                }
+            }
+            if (!output.data)
+                continue;
+
             if (std::string(output.dtype) == "FP32")
             {
                 const float *fp32_data = static_cast<const float *>(output.data);
-                size_t numel = output.rows * output.cols;
 
                 // Quick zero check: sample first, middle, last elements
                 bool appears_zero = true;

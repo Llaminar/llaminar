@@ -106,6 +106,7 @@ namespace llaminar2
     using TensorBase = CPUTensorBase; // Backward compatibility alias
     class Q8_1Tensor;
     class FP32Tensor;
+    class WeightPreloader; // For friend class access to ensureWeightsConverted
 
     namespace rocm
     {
@@ -285,6 +286,7 @@ namespace llaminar2
              * @param beta Scale for existing C (accumulate if != 0)
              * @param mpi_ctx MPI context (unused for ROCm kernel)
              * @param device_idx Device index (unused, kernel bound to rocm_device_id_)
+             * @param workspace Pre-allocated device workspace (nullptr = kernel allocates)
              *
              * @return true on success
              */
@@ -293,7 +295,8 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
              * @brief Tensor-based GEMM with explicit dimensions
@@ -306,7 +309,8 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
              * @brief Raw FP32 pointer GEMM (fallback path)
@@ -315,6 +319,7 @@ namespace llaminar2
              *
              * @param A FP32 activations [m, k] on device
              * @param C FP32 output [m, n] on device
+             * @param workspace Pre-allocated device workspace (nullptr = kernel allocates)
              */
             bool multiply(
                 const float *A, float *C,
@@ -322,7 +327,8 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
              * @brief Fused multi-projection GEMM with automatic host/device transfer
@@ -336,13 +342,15 @@ namespace llaminar2
              * @param k Input dimension
              * @param mpi_ctx MPI context (unused for ROCm)
              * @param device_idx Device index (unused, kernel bound to rocm_device_id_)
+             * @param workspace Pre-allocated device workspace (nullptr = kernel allocates)
              */
             bool multiply_fused(
                 const float *input,
                 const std::vector<FusedProjectionDesc> &projections,
                 int m, int k,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
              * @brief Tensor-aware fused multi-projection GEMM
@@ -360,13 +368,15 @@ namespace llaminar2
              * @param m Number of rows (seq_len)
              * @param k Input dimension (d_model)
              * @param mpi_ctx MPI context (unused)
+             * @param workspace Pre-allocated device workspace (nullptr = kernel allocates)
              * @return true on success
              */
             bool multiply_fused_tensor(
                 const TensorBase *input,
                 const std::vector<TensorProjectionDesc> &projections,
                 int m, int k,
-                const MPIContext *mpi_ctx = nullptr) override;
+                const MPIContext *mpi_ctx = nullptr,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
              * @brief Activation-activation GEMM (not supported for quantized kernel)
@@ -488,6 +498,9 @@ namespace llaminar2
             size_t weight_cols() const { return K_; }
             bool weights_converted() const { return weights_converted_; }
 
+            // Allow WeightPreloader to call ensureWeightsConverted() during preload
+            friend class ::llaminar2::WeightPreloader;
+
         private:
             // =========================================================================
             // Internal dispatch methods
@@ -597,6 +610,20 @@ namespace llaminar2
 extern "C"
 {
     /**
+     * @brief Pre-initialize all CK GEMM kernels to avoid first-call latency
+     *
+     * CK device objects are expensive to construct (5-10 seconds each on gfx906)
+     * due to template instantiation and GPU ISA checks. Call this function
+     * during backend initialization to avoid blocking on first inference call.
+     *
+     * Pre-initializes:
+     *   - 32x32 kernel (for decode, M <= 32)
+     *   - 64x64 kernel (for small batch, 32 < M < 128)
+     *   - 128x128 kernel (for prefill, M >= 128)
+     */
+    void rocmQuantGemm_warmupKernels();
+
+    /**
      * @brief Execute Two-Kernel INT8 GEMM (CK NoScale + applyScales_kernel)
      *
      * This is the DEFAULT and RECOMMENDED path. It uses:
@@ -641,4 +668,3 @@ extern "C"
 }
 
 #endif // LLAMINAR2_KERNELS_ROCM_ROCMQUANTISEDGEMMKERNEL_H
-

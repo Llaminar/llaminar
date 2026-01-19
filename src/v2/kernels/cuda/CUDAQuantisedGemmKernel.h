@@ -34,6 +34,7 @@
 
 #include "../../tensors/TensorKernels.h"
 #include "../../tensors/BlockStructures.h"
+#include "../../interfaces/IWorkspaceConsumer.h"
 #include <memory>
 #include <cstdint>
 #include <vector>
@@ -120,7 +121,7 @@ namespace llaminar2
          * - CUTLASS Tensor Core: 50-90 TFLOPS on RTX 3090
          * - Activation quantization: Per-row symmetric, fused with GEMM launch
          */
-        class CUDAQuantisedGemmKernel : public ITensorGemm
+        class CUDAQuantisedGemmKernel : public ITensorGemm, public IWorkspaceConsumer
         {
         public:
             /**
@@ -176,6 +177,7 @@ namespace llaminar2
              * @param beta Scale for existing C (accumulate if != 0)
              * @param mpi_ctx MPI context (unused for CUDA kernel)
              * @param device_idx Device index (unused, kernel bound to cuda_device_id_)
+             * @param workspace Pre-allocated device workspace (nullptr = kernel allocates)
              *
              * @return true on success
              */
@@ -184,7 +186,8 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
              * @brief Tensor-based GEMM with explicit dimensions
@@ -197,7 +200,8 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
              * @brief Raw FP32 pointer GEMM (fallback path)
@@ -206,6 +210,7 @@ namespace llaminar2
              *
              * @param A FP32 activations [m, k] on device
              * @param C FP32 output [m, n] on device
+             * @param workspace Pre-allocated device workspace (nullptr = kernel allocates)
              */
             bool multiply(
                 const float *A, float *C,
@@ -213,7 +218,8 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
              * @brief Fused multi-projection GEMM with automatic host/device transfer
@@ -227,13 +233,15 @@ namespace llaminar2
              * @param k Input dimension
              * @param mpi_ctx MPI context (unused for CUDA)
              * @param device_idx Device index (unused, kernel bound to cuda_device_id_)
+             * @param workspace Pre-allocated device workspace (nullptr = kernel allocates)
              */
             bool multiply_fused(
                 const float *input,
                 const std::vector<FusedProjectionDesc> &projections,
                 int m, int k,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
              * @brief Tensor-aware fused multi-projection GEMM
@@ -251,13 +259,15 @@ namespace llaminar2
              * @param m Number of rows (seq_len)
              * @param k Input dimension (d_model)
              * @param mpi_ctx MPI context (unused)
+             * @param workspace Pre-allocated device workspace (nullptr = kernel allocates)
              * @return true on success
              */
             bool multiply_fused_tensor(
                 const TensorBase *input,
                 const std::vector<TensorProjectionDesc> &projections,
                 int m, int k,
-                const MPIContext *mpi_ctx = nullptr) override;
+                const MPIContext *mpi_ctx = nullptr,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
              * @brief Activation-activation GEMM (not supported for quantized kernel)
@@ -296,6 +306,49 @@ namespace llaminar2
             // =========================================================================
 
             KernelSnapshotInfo getKernelSnapshotInfo() const override;
+
+            // =========================================================================
+            // IWorkspaceConsumer Interface
+            // =========================================================================
+
+            /**
+             * @brief Get workspace requirements for GEMM at given dimensions
+             *
+             * Returns buffers needed for INT8 GEMM:
+             * - quant_a [M×K]: INT8 quantized activations
+             * - scales_a [M]: per-row activation scales
+             * - acc_int32 [M×N]: INT32 GEMM accumulator
+             *
+             * @param m Maximum sequence length (batch size)
+             * @param n Number of output features (0 = use internal N_)
+             * @param k Number of input features (0 = use internal K_)
+             * @return WorkspaceRequirements describing all needed buffers
+             *
+             * @note Call with maximum expected M to allocate once and reuse.
+             */
+            WorkspaceRequirements getWorkspaceRequirements(
+                int m, int n = 0, int k = 0) const override;
+
+            /**
+             * @brief Bind workspace manager for managed mode
+             *
+             * After binding, the kernel uses pre-allocated buffers from the
+             * workspace manager instead of internal allocations.
+             *
+             * @param workspace Pointer to workspace manager (NOT owned, must outlive kernel)
+             *                  Pass nullptr to return to legacy mode.
+             */
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+
+            /**
+             * @brief Check if a workspace is currently bound
+             */
+            bool hasWorkspace() const override;
+
+            /**
+             * @brief Get the currently bound workspace manager
+             */
+            DeviceWorkspaceManager *getWorkspace() const override;
 
             // =========================================================================
             // Accessors
@@ -351,6 +404,34 @@ namespace llaminar2
                 int m, int n, int k);
 
             // =========================================================================
+            // Internal impl methods (for workspace override)
+            // =========================================================================
+
+            /**
+             * @brief Implementation for multiply_tensor with current workspace_ state
+             */
+            bool multiply_tensor_impl(
+                const TensorBase *A, TensorBase *C,
+                int m, int n, int k,
+                float alpha, float beta);
+
+            /**
+             * @brief Implementation for multiply_fused with current workspace_ state
+             */
+            bool multiply_fused_impl(
+                const float *input,
+                const std::vector<FusedProjectionDesc> &projections,
+                int m, int k);
+
+            /**
+             * @brief Implementation for multiply_fused_tensor with current workspace_ state
+             */
+            bool multiply_fused_tensor_impl(
+                const TensorBase *input,
+                const std::vector<TensorProjectionDesc> &projections,
+                int m, int k);
+
+            // =========================================================================
             // Weight conversion
             // =========================================================================
 
@@ -388,6 +469,9 @@ namespace llaminar2
             bool owns_weight_memory_ = false; // true if we allocated d_weights_int8_/d_scales_B_
             int32_t *d_C_int32_ = nullptr;    // [M × N] INT32 accumulator
             int work_buffer_M_ = 0;           // Current work buffer capacity
+
+            // IWorkspaceConsumer state
+            DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned)
 
             // PIMPL for CUTLASS implementation (avoids CUTLASS in header)
             struct Impl;

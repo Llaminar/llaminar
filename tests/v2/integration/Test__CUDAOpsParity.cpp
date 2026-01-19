@@ -438,6 +438,242 @@ TEST_F(Test__CUDAOpsParity, SwiGLU_FP32_Large)
     EXPECT_LE(l2_error, 0.01);
 }
 
+TEST_F(Test__CUDAOpsParity, SwiGLU_BF16_Small)
+{
+    SKIP_IF_NO_CUDA();
+
+    constexpr int rows = 4;
+    constexpr int cols = 64;
+    const size_t total = rows * cols;
+
+    // Generate FP32 data and convert to BF16
+    auto gate_data_fp32 = randomFP32(total);
+    auto up_data_fp32 = randomFP32(total);
+
+    std::vector<uint16_t> gate_bf16(total);
+    std::vector<uint16_t> up_bf16(total);
+    quantizeToBF16(gate_data_fp32.data(), gate_bf16.data(), total);
+    quantizeToBF16(up_data_fp32.data(), up_bf16.data(), total);
+
+    // CPU reference (BF16)
+    std::vector<uint16_t> cpu_output_bf16(total, 0);
+    CPUSwiGLUKernelT<ActivationPrecision::BF16> cpu_kernel;
+    cpu_kernel.apply_bf16(gate_bf16.data(), up_bf16.data(), cpu_output_bf16.data(),
+                          rows, cols, false, nullptr, -1);
+
+    // CUDA kernel
+    llaminar2::cuda::CUDASwiGLUKernelT<ActivationPrecision::BF16> cuda_kernel;
+
+    uint16_t *d_gate, *d_up, *d_output;
+    cudaMalloc(&d_gate, total * sizeof(uint16_t));
+    cudaMalloc(&d_up, total * sizeof(uint16_t));
+    cudaMalloc(&d_output, total * sizeof(uint16_t));
+
+    cudaMemcpy(d_gate, gate_bf16.data(), total * sizeof(uint16_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_up, up_bf16.data(), total * sizeof(uint16_t), cudaMemcpyHostToDevice);
+
+    ASSERT_TRUE(cuda_kernel.apply_typed(d_gate, d_up, d_output, total, 0));
+    cudaDeviceSynchronize();
+
+    std::vector<uint16_t> cuda_output_bf16(total);
+    cudaMemcpy(cuda_output_bf16.data(), d_output, total * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_gate);
+    cudaFree(d_up);
+    cudaFree(d_output);
+
+    // Convert outputs to FP32 for comparison
+    std::vector<float> cpu_output_fp32(total);
+    std::vector<float> cuda_output_fp32(total);
+    dequantizeBF16(cpu_output_bf16.data(), cpu_output_fp32.data(), total);
+    dequantizeBF16(cuda_output_bf16.data(), cuda_output_fp32.data(), total);
+
+    ASSERT_FALSE(hasNaNOrInf(cuda_output_fp32.data(), total));
+
+    double cosine = cosineSimilarity(cuda_output_fp32.data(), cpu_output_fp32.data(), total);
+    double l2_error = relativeL2Error(cuda_output_fp32.data(), cpu_output_fp32.data(), total);
+
+    std::cout << "  SwiGLU BF16 Small: cosine=" << cosine << ", L2_error=" << l2_error << std::endl;
+
+    EXPECT_GE(cosine, 0.999);  // Slightly relaxed for BF16
+    EXPECT_LE(l2_error, 0.02); // 2% tolerance for BF16
+}
+
+TEST_F(Test__CUDAOpsParity, SwiGLU_BF16_Large)
+{
+    SKIP_IF_NO_CUDA();
+
+    constexpr int rows = 32;
+    constexpr int cols = 4864;
+    const size_t total = rows * cols;
+
+    auto gate_data_fp32 = randomFP32(total);
+    auto up_data_fp32 = randomFP32(total);
+
+    std::vector<uint16_t> gate_bf16(total);
+    std::vector<uint16_t> up_bf16(total);
+    quantizeToBF16(gate_data_fp32.data(), gate_bf16.data(), total);
+    quantizeToBF16(up_data_fp32.data(), up_bf16.data(), total);
+
+    std::vector<uint16_t> cpu_output_bf16(total, 0);
+    CPUSwiGLUKernelT<ActivationPrecision::BF16> cpu_kernel;
+    cpu_kernel.apply_bf16(gate_bf16.data(), up_bf16.data(), cpu_output_bf16.data(),
+                          rows, cols, false, nullptr, -1);
+
+    llaminar2::cuda::CUDASwiGLUKernelT<ActivationPrecision::BF16> cuda_kernel;
+
+    uint16_t *d_gate, *d_up, *d_output;
+    cudaMalloc(&d_gate, total * sizeof(uint16_t));
+    cudaMalloc(&d_up, total * sizeof(uint16_t));
+    cudaMalloc(&d_output, total * sizeof(uint16_t));
+
+    cudaMemcpy(d_gate, gate_bf16.data(), total * sizeof(uint16_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_up, up_bf16.data(), total * sizeof(uint16_t), cudaMemcpyHostToDevice);
+
+    ASSERT_TRUE(cuda_kernel.apply_typed(d_gate, d_up, d_output, total, 0));
+    cudaDeviceSynchronize();
+
+    std::vector<uint16_t> cuda_output_bf16(total);
+    cudaMemcpy(cuda_output_bf16.data(), d_output, total * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_gate);
+    cudaFree(d_up);
+    cudaFree(d_output);
+
+    std::vector<float> cpu_output_fp32(total);
+    std::vector<float> cuda_output_fp32(total);
+    dequantizeBF16(cpu_output_bf16.data(), cpu_output_fp32.data(), total);
+    dequantizeBF16(cuda_output_bf16.data(), cuda_output_fp32.data(), total);
+
+    ASSERT_FALSE(hasNaNOrInf(cuda_output_fp32.data(), total));
+
+    double cosine = cosineSimilarity(cuda_output_fp32.data(), cpu_output_fp32.data(), total);
+    double l2_error = relativeL2Error(cuda_output_fp32.data(), cpu_output_fp32.data(), total);
+
+    std::cout << "  SwiGLU BF16 Large: cosine=" << cosine << ", L2_error=" << l2_error << std::endl;
+
+    EXPECT_GE(cosine, 0.999);
+    EXPECT_LE(l2_error, 0.02);
+}
+
+TEST_F(Test__CUDAOpsParity, SwiGLU_FP16_Small)
+{
+    SKIP_IF_NO_CUDA();
+
+    constexpr int rows = 4;
+    constexpr int cols = 64;
+    const size_t total = rows * cols;
+
+    // Generate FP32 data and convert to FP16
+    auto gate_data_fp32 = randomFP32(total);
+    auto up_data_fp32 = randomFP32(total);
+
+    std::vector<uint16_t> gate_fp16(total);
+    std::vector<uint16_t> up_fp16(total);
+    quantizeToFP16(gate_data_fp32.data(), gate_fp16.data(), total);
+    quantizeToFP16(up_data_fp32.data(), up_fp16.data(), total);
+
+    // CPU reference (FP16)
+    std::vector<uint16_t> cpu_output_fp16(total, 0);
+    CPUSwiGLUKernelT<ActivationPrecision::FP16> cpu_kernel;
+    cpu_kernel.apply_fp16(gate_fp16.data(), up_fp16.data(), cpu_output_fp16.data(),
+                          rows, cols, false, nullptr, -1);
+
+    // CUDA kernel
+    llaminar2::cuda::CUDASwiGLUKernelT<ActivationPrecision::FP16> cuda_kernel;
+
+    uint16_t *d_gate, *d_up, *d_output;
+    cudaMalloc(&d_gate, total * sizeof(uint16_t));
+    cudaMalloc(&d_up, total * sizeof(uint16_t));
+    cudaMalloc(&d_output, total * sizeof(uint16_t));
+
+    cudaMemcpy(d_gate, gate_fp16.data(), total * sizeof(uint16_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_up, up_fp16.data(), total * sizeof(uint16_t), cudaMemcpyHostToDevice);
+
+    ASSERT_TRUE(cuda_kernel.apply_typed(d_gate, d_up, d_output, total, 0));
+    cudaDeviceSynchronize();
+
+    std::vector<uint16_t> cuda_output_fp16(total);
+    cudaMemcpy(cuda_output_fp16.data(), d_output, total * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_gate);
+    cudaFree(d_up);
+    cudaFree(d_output);
+
+    // Convert outputs to FP32 for comparison
+    std::vector<float> cpu_output_fp32(total);
+    std::vector<float> cuda_output_fp32(total);
+    dequantizeFP16(cpu_output_fp16.data(), cpu_output_fp32.data(), total);
+    dequantizeFP16(cuda_output_fp16.data(), cuda_output_fp32.data(), total);
+
+    ASSERT_FALSE(hasNaNOrInf(cuda_output_fp32.data(), total));
+
+    double cosine = cosineSimilarity(cuda_output_fp32.data(), cpu_output_fp32.data(), total);
+    double l2_error = relativeL2Error(cuda_output_fp32.data(), cpu_output_fp32.data(), total);
+
+    std::cout << "  SwiGLU FP16 Small: cosine=" << cosine << ", L2_error=" << l2_error << std::endl;
+
+    EXPECT_GE(cosine, 0.999);  // Slightly relaxed for FP16
+    EXPECT_LE(l2_error, 0.02); // 2% tolerance for FP16
+}
+
+TEST_F(Test__CUDAOpsParity, SwiGLU_FP16_Large)
+{
+    SKIP_IF_NO_CUDA();
+
+    constexpr int rows = 32;
+    constexpr int cols = 4864;
+    const size_t total = rows * cols;
+
+    auto gate_data_fp32 = randomFP32(total);
+    auto up_data_fp32 = randomFP32(total);
+
+    std::vector<uint16_t> gate_fp16(total);
+    std::vector<uint16_t> up_fp16(total);
+    quantizeToFP16(gate_data_fp32.data(), gate_fp16.data(), total);
+    quantizeToFP16(up_data_fp32.data(), up_fp16.data(), total);
+
+    std::vector<uint16_t> cpu_output_fp16(total, 0);
+    CPUSwiGLUKernelT<ActivationPrecision::FP16> cpu_kernel;
+    cpu_kernel.apply_fp16(gate_fp16.data(), up_fp16.data(), cpu_output_fp16.data(),
+                          rows, cols, false, nullptr, -1);
+
+    llaminar2::cuda::CUDASwiGLUKernelT<ActivationPrecision::FP16> cuda_kernel;
+
+    uint16_t *d_gate, *d_up, *d_output;
+    cudaMalloc(&d_gate, total * sizeof(uint16_t));
+    cudaMalloc(&d_up, total * sizeof(uint16_t));
+    cudaMalloc(&d_output, total * sizeof(uint16_t));
+
+    cudaMemcpy(d_gate, gate_fp16.data(), total * sizeof(uint16_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_up, up_fp16.data(), total * sizeof(uint16_t), cudaMemcpyHostToDevice);
+
+    ASSERT_TRUE(cuda_kernel.apply_typed(d_gate, d_up, d_output, total, 0));
+    cudaDeviceSynchronize();
+
+    std::vector<uint16_t> cuda_output_fp16(total);
+    cudaMemcpy(cuda_output_fp16.data(), d_output, total * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_gate);
+    cudaFree(d_up);
+    cudaFree(d_output);
+
+    std::vector<float> cpu_output_fp32(total);
+    std::vector<float> cuda_output_fp32(total);
+    dequantizeFP16(cpu_output_fp16.data(), cpu_output_fp32.data(), total);
+    dequantizeFP16(cuda_output_fp16.data(), cuda_output_fp32.data(), total);
+
+    ASSERT_FALSE(hasNaNOrInf(cuda_output_fp32.data(), total));
+
+    double cosine = cosineSimilarity(cuda_output_fp32.data(), cpu_output_fp32.data(), total);
+    double l2_error = relativeL2Error(cuda_output_fp32.data(), cpu_output_fp32.data(), total);
+
+    std::cout << "  SwiGLU FP16 Large: cosine=" << cosine << ", L2_error=" << l2_error << std::endl;
+
+    EXPECT_GE(cosine, 0.999);
+    EXPECT_LE(l2_error, 0.02);
+}
+
 // ============================================================================
 // RoPE Parity Tests
 // ============================================================================

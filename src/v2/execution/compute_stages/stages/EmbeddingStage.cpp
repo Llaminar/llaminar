@@ -8,6 +8,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include <cstring>
 
 namespace llaminar2
@@ -18,9 +19,45 @@ namespace llaminar2
     // =============================================================================
 
     EmbeddingStage::EmbeddingStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    ITensorEmbedding *EmbeddingStage::getOrCreateKernel()
+    {
+        // Return cached kernel if available
+        if (cached_kernel_)
+        {
+            return cached_kernel_.get();
+        }
+
+        // Create kernel from output tensor's type
+        auto *output_base = dynamic_cast<TensorBase *>(params_.output);
+        if (!output_base)
+        {
+            LOG_ERROR("[EmbeddingStage::getOrCreateKernel] Output not TensorBase");
+            return nullptr;
+        }
+
+        auto *activation = dynamic_cast<IActivationTensor *>(output_base);
+        if (!activation)
+        {
+            LOG_ERROR("[EmbeddingStage::getOrCreateKernel] Output not IActivationTensor");
+            return nullptr;
+        }
+
+        cached_kernel_ = activation->createEmbedding();
+        return cached_kernel_.get();
+    }
+
+    IWorkspaceConsumer *EmbeddingStage::getKernelAsWorkspaceConsumer()
+    {
+        auto *kernel = getOrCreateKernel();
+        if (!kernel)
+        {
+            return nullptr;
+        }
+        return dynamic_cast<IWorkspaceConsumer *>(kernel);
     }
 
     bool EmbeddingStage::execute(IDeviceContext *ctx)
@@ -74,7 +111,8 @@ namespace llaminar2
             return false;
         }
 
-        auto kernel = activation->createEmbedding();
+        // Use cached kernel (enables workspace binding for GPU kernels)
+        auto *kernel = getOrCreateKernel();
         if (!kernel)
         {
             LOG_ERROR("[EmbeddingStage] Failed to create embedding kernel");

@@ -33,8 +33,9 @@
 #pragma once
 
 // Minimal includes - avoid MPI headers for hipcc compatibility
-#include "../../IKVCache.h"                   // Unified KVCache interface (src/v2/kernels/IKVCache.h)
-#include "../../../execution/RuntimeConfig.h" // For ActivationPrecision
+#include "../../IKVCache.h"                         // Unified KVCache interface (src/v2/kernels/IKVCache.h)
+#include "../../../execution/RuntimeConfig.h"       // For ActivationPrecision
+#include "../../../interfaces/IWorkspaceConsumer.h" // Workspace management
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
@@ -44,6 +45,29 @@
 
 namespace llaminar2
 {
+    // Forward declarations
+    class DeviceWorkspaceManager;
+    struct WorkspaceRequirements;
+
+    // =========================================================================
+    // KV Cache Workspace Buffer Names
+    // =========================================================================
+
+    /**
+     * Standard buffer names for KV cache gather workspace.
+     * Used by launch_gather_kernel() for batched attention.
+     */
+    namespace KVCacheWorkspaceBuffers
+    {
+        /// Array of K cache pointers [batch_size × sizeof(void*)]
+        constexpr const char *K_CACHE_PTRS = "kvcache_k_ptrs";
+        /// Array of V cache pointers [batch_size × sizeof(void*)]
+        constexpr const char *V_CACHE_PTRS = "kvcache_v_ptrs";
+        /// Array of tail indices [batch_size × sizeof(int)]
+        constexpr const char *TAILS = "kvcache_tails";
+        /// Array of count values [batch_size × sizeof(int)]
+        constexpr const char *COUNTS = "kvcache_counts";
+    }
 
     // =========================================================================
     // IROCmRingKVCache Interface
@@ -309,9 +333,13 @@ namespace llaminar2
      * - Uses HIP memory APIs for device allocation
      * - Kernel launch with 256 threads (4 wavefronts)
      * - Coalesced memory access patterns
+     *
+     * Implements IWorkspaceConsumer for zero-alloc gather operations.
+     * When workspace is bound, launch_gather_kernel() uses pre-allocated
+     * buffers instead of hipMalloc/hipFree per call.
      */
     template <ActivationPrecision Precision = ActivationPrecision::FP32>
-    class ROCmRingKVCache : public IROCmRingKVCache
+    class ROCmRingKVCache : public IROCmRingKVCache, public IWorkspaceConsumer
     {
     public:
         using DataT = typename detail::ROCmKVCacheType<Precision>::Type;
@@ -437,6 +465,45 @@ namespace llaminar2
                           const DataT *d_k, const DataT *d_v,
                           int num_tokens, hipStream_t stream = 0);
 
+        // =====================================================================
+        // IWorkspaceConsumer Interface
+        // =====================================================================
+
+        /**
+         * @brief Get workspace requirements for batched gather operations
+         *
+         * Returns buffer requirements for pointer arrays used in launch_gather_kernel().
+         * When workspace is bound, gather operations use pre-allocated buffers
+         * instead of hipMalloc/hipFree per call (which are slow on ROCm).
+         *
+         * @param m Batch size (number of sequences)
+         * @param n Unused
+         * @param k Unused
+         * @return WorkspaceRequirements with buffer specifications
+         */
+        WorkspaceRequirements getWorkspaceRequirements(
+            int m = 0, int n = 0, int k = 0) const override;
+
+        /**
+         * @brief Bind workspace manager for managed mode
+         *
+         * When bound, gather operations use pre-allocated buffers instead of
+         * per-call hipMalloc/hipFree (which add ~100-500μs overhead each on ROCm).
+         *
+         * @param workspace Pointer to workspace manager (NOT owned, must outlive cache)
+         */
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+
+        /**
+         * @brief Check if workspace is currently bound
+         */
+        bool hasWorkspace() const override;
+
+        /**
+         * @brief Get the currently bound workspace manager
+         */
+        DeviceWorkspaceManager *getWorkspace() const override;
+
     private:
         int n_layers_;
         int batch_size_;
@@ -448,6 +515,10 @@ namespace llaminar2
         int kv_dim_; // local_n_kv_heads * head_dim (storage dimension)
         int device_id_;
         bool is_sharded_; // True if using local KV heads (TP enabled)
+
+        // Workspace manager for batched gather operations
+        // When bound, launch_gather_kernel() uses pre-allocated buffers instead of hipMalloc/hipFree
+        DeviceWorkspaceManager *workspace_ = nullptr;
 
         // Entry storage: [n_layers][batch_size]
         std::vector<std::vector<EntryT>> entries_;

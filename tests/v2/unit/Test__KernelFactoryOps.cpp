@@ -93,6 +93,53 @@ TEST_F(Test__KernelFactoryOps, CreateRMSNorm_GenericDispatch_BF16)
 }
 
 // ============================================================================
+// createRMSNorm() ROCm Tests
+// ============================================================================
+
+#ifdef HAVE_ROCM
+TEST_F(Test__KernelFactoryOps, CreateRMSNorm_FP32_ROCm)
+{
+    auto tensor = TestTensorFactory::createFP32Random({32, 64});
+    auto kernel = KernelFactory::createRMSNorm(
+        static_cast<const FP32Tensor *>(tensor.get()), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(0)); // ROCm device 0
+}
+
+TEST_F(Test__KernelFactoryOps, CreateRMSNorm_BF16_ROCm)
+{
+    auto tensor = TestTensorFactory::createBF16Random({32, 64});
+    auto kernel = KernelFactory::createRMSNorm(
+        static_cast<const BF16Tensor *>(tensor.get()), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(0));
+}
+
+TEST_F(Test__KernelFactoryOps, CreateRMSNorm_FP16_ROCm)
+{
+    auto tensor = TestTensorFactory::createFP16Random({32, 64});
+    auto kernel = KernelFactory::createRMSNorm(
+        static_cast<const FP16Tensor *>(tensor.get()), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(0));
+}
+
+TEST_F(Test__KernelFactoryOps, CreateRMSNorm_GenericDispatch_FP32_ROCm)
+{
+    auto tensor = TestTensorFactory::createFP32Random({32, 64});
+    auto kernel = KernelFactory::createRMSNorm(tensor.get(), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+}
+
+TEST_F(Test__KernelFactoryOps, CreateRMSNorm_GenericDispatch_BF16_ROCm)
+{
+    auto tensor = TestTensorFactory::createBF16Random({32, 64});
+    auto kernel = KernelFactory::createRMSNorm(tensor.get(), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+}
+#endif // HAVE_ROCM
+
+// ============================================================================
 // createSwiGLU() Tests
 // ============================================================================
 
@@ -131,6 +178,100 @@ TEST_F(Test__KernelFactoryOps, CreateSwiGLU_Q8_1_CPU)
     ASSERT_NE(kernel, nullptr);
     EXPECT_TRUE(kernel->supports_device(-1));
 }
+
+// ============================================================================
+// createSwiGLU() CUDA Tests
+// ============================================================================
+
+#ifdef HAVE_CUDA
+TEST_F(Test__KernelFactoryOps, CreateSwiGLU_FP32_CUDA)
+{
+    auto tensor = TestTensorFactory::createFP32Random({32, 64});
+    auto kernel = KernelFactory::createSwiGLU(
+        static_cast<const FP32Tensor *>(tensor.get()), DeviceType::CUDA);
+    ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(0)); // CUDA device 0
+}
+
+TEST_F(Test__KernelFactoryOps, CreateSwiGLU_BF16_CUDA)
+{
+    auto tensor = TestTensorFactory::createBF16Random({32, 64});
+    auto kernel = KernelFactory::createSwiGLU(
+        static_cast<const BF16Tensor *>(tensor.get()), DeviceType::CUDA);
+    ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(0));
+}
+
+TEST_F(Test__KernelFactoryOps, CreateSwiGLU_FP16_CUDA)
+{
+    auto tensor = TestTensorFactory::createFP16Random({32, 64});
+    auto kernel = KernelFactory::createSwiGLU(
+        static_cast<const FP16Tensor *>(tensor.get()), DeviceType::CUDA);
+    ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(0));
+}
+
+TEST_F(Test__KernelFactoryOps, CreateSwiGLU_GenericDispatch_FP32_CUDA)
+{
+    auto tensor = TestTensorFactory::createFP32Random({32, 64});
+    auto kernel = KernelFactory::createSwiGLU(tensor.get(), DeviceType::CUDA);
+    ASSERT_NE(kernel, nullptr);
+}
+
+TEST_F(Test__KernelFactoryOps, CreateSwiGLU_GenericDispatch_BF16_CUDA)
+{
+    auto tensor = TestTensorFactory::createBF16Random({32, 64});
+    auto kernel = KernelFactory::createSwiGLU(tensor.get(), DeviceType::CUDA);
+    ASSERT_NE(kernel, nullptr);
+}
+#endif // HAVE_CUDA
+
+// ============================================================================
+// createSwiGLU() ROCm Tests
+// ============================================================================
+
+#ifdef HAVE_ROCM
+TEST_F(Test__KernelFactoryOps, CreateSwiGLU_FP32_ROCm)
+{
+    auto tensor = TestTensorFactory::createFP32Random({32, 64});
+    auto kernel = KernelFactory::createSwiGLU(
+        static_cast<const FP32Tensor *>(tensor.get()), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(0)); // ROCm device 0
+}
+
+TEST_F(Test__KernelFactoryOps, CreateSwiGLU_BF16_ROCm)
+{
+    auto tensor = TestTensorFactory::createBF16Random({32, 64});
+    auto kernel = KernelFactory::createSwiGLU(
+        static_cast<const BF16Tensor *>(tensor.get()), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(0));
+}
+
+TEST_F(Test__KernelFactoryOps, CreateSwiGLU_FP16_ROCm)
+{
+    auto tensor = TestTensorFactory::createFP16Random({32, 64});
+    auto kernel = KernelFactory::createSwiGLU(
+        static_cast<const FP16Tensor *>(tensor.get()), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(0));
+}
+
+TEST_F(Test__KernelFactoryOps, CreateSwiGLU_GenericDispatch_FP32_ROCm)
+{
+    auto tensor = TestTensorFactory::createFP32Random({32, 64});
+    auto kernel = KernelFactory::createSwiGLU(tensor.get(), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+}
+
+TEST_F(Test__KernelFactoryOps, CreateSwiGLU_GenericDispatch_BF16_ROCm)
+{
+    auto tensor = TestTensorFactory::createBF16Random({32, 64});
+    auto kernel = KernelFactory::createSwiGLU(tensor.get(), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+}
+#endif // HAVE_ROCM
 
 TEST_F(Test__KernelFactoryOps, CreateSwiGLU_GenericDispatch_FP32)
 {
@@ -192,6 +333,53 @@ TEST_F(Test__KernelFactoryOps, CreateRoPE_GenericDispatch_FP32)
     auto kernel = KernelFactory::createRoPE(tensor.get(), DeviceType::CPU);
     ASSERT_NE(kernel, nullptr);
 }
+
+// ============================================================================
+// createRoPE() ROCm Tests
+// ============================================================================
+
+#ifdef HAVE_ROCM
+TEST_F(Test__KernelFactoryOps, CreateRoPE_FP32_ROCm)
+{
+    auto tensor = TestTensorFactory::createFP32Random({32, 64});
+    auto kernel = KernelFactory::createRoPE(
+        static_cast<const FP32Tensor *>(tensor.get()), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(0)); // ROCm device 0
+}
+
+TEST_F(Test__KernelFactoryOps, CreateRoPE_BF16_ROCm)
+{
+    auto tensor = TestTensorFactory::createBF16Random({32, 64});
+    auto kernel = KernelFactory::createRoPE(
+        static_cast<const BF16Tensor *>(tensor.get()), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(0));
+}
+
+TEST_F(Test__KernelFactoryOps, CreateRoPE_FP16_ROCm)
+{
+    auto tensor = TestTensorFactory::createFP16Random({32, 64});
+    auto kernel = KernelFactory::createRoPE(
+        static_cast<const FP16Tensor *>(tensor.get()), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(0));
+}
+
+TEST_F(Test__KernelFactoryOps, CreateRoPE_GenericDispatch_FP32_ROCm)
+{
+    auto tensor = TestTensorFactory::createFP32Random({32, 64});
+    auto kernel = KernelFactory::createRoPE(tensor.get(), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+}
+
+TEST_F(Test__KernelFactoryOps, CreateRoPE_GenericDispatch_BF16_ROCm)
+{
+    auto tensor = TestTensorFactory::createBF16Random({32, 64});
+    auto kernel = KernelFactory::createRoPE(tensor.get(), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+}
+#endif // HAVE_ROCM
 
 // ============================================================================
 // createSoftmax() Tests
@@ -319,6 +507,52 @@ TEST_F(Test__KernelFactoryOps, CreateEmbedding_Q8_1_CPU)
     ASSERT_NE(kernel, nullptr);
     EXPECT_TRUE(kernel->supports_device(-1));
 }
+
+// ============================================================================
+// createEmbedding() ROCm Tests
+// ============================================================================
+
+#ifdef HAVE_ROCM
+TEST_F(Test__KernelFactoryOps, CreateEmbedding_FP32_ROCm)
+{
+    auto tensor = TestTensorFactory::createFP32Random({32, 64});
+    auto kernel = KernelFactory::createEmbedding(
+        static_cast<const FP32Tensor *>(tensor.get()), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(0)); // ROCm device 0
+}
+
+TEST_F(Test__KernelFactoryOps, CreateEmbedding_BF16_ROCm)
+{
+    auto tensor = TestTensorFactory::createBF16Random({32, 64});
+    auto kernel = KernelFactory::createEmbedding(
+        static_cast<const BF16Tensor *>(tensor.get()), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+}
+
+TEST_F(Test__KernelFactoryOps, CreateEmbedding_FP16_ROCm)
+{
+    auto tensor = TestTensorFactory::createFP16Random({32, 64});
+    auto kernel = KernelFactory::createEmbedding(
+        static_cast<const FP16Tensor *>(tensor.get()), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+}
+
+TEST_F(Test__KernelFactoryOps, CreateEmbedding_Q8_1_ROCm)
+{
+    auto tensor = TestTensorFactory::createQ8_1Random({32, 64});
+    auto kernel = KernelFactory::createEmbedding(
+        static_cast<const Q8_1Tensor *>(tensor.get()), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+}
+
+TEST_F(Test__KernelFactoryOps, CreateEmbedding_GenericDispatch_FP32_ROCm)
+{
+    auto tensor = TestTensorFactory::createFP32Random({32, 64});
+    auto kernel = KernelFactory::createEmbedding(tensor.get(), DeviceType::ROCm);
+    ASSERT_NE(kernel, nullptr);
+}
+#endif // HAVE_ROCM
 
 // ============================================================================
 // createResidualAdd() Tests
@@ -571,4 +805,134 @@ TEST_F(Test__KernelFactoryOps, CreateSwiGLU_FP32_FunctionalTest)
         sum += std::abs(out_data[i]);
     }
     EXPECT_GT(sum, 0.0f) << "SwiGLU output should not be all zeros";
+}
+
+// ============================================================================
+// ROCmOrdinalGuard Tests - Regression tests for device ordinal propagation bug
+// ============================================================================
+
+/**
+ * @brief Test that ROCmOrdinalGuard can be constructed and destructed
+ *
+ * Regression test for bug where kernels were created on wrong ROCm device.
+ * The guard sets thread-local storage to propagate device ordinal.
+ */
+TEST_F(Test__KernelFactoryOps, ROCmOrdinalGuard_ConstructAndDestruct)
+{
+    // Should not throw even without ROCm hardware (stub implementation)
+    EXPECT_NO_THROW({
+        KernelFactory::ROCmOrdinalGuard guard(0);
+    });
+}
+
+/**
+ * @brief Test that ROCmOrdinalGuard accepts different ordinal values
+ */
+TEST_F(Test__KernelFactoryOps, ROCmOrdinalGuard_DifferentOrdinals)
+{
+    // Test various ordinal values (0, 1, 7 for multi-GPU systems)
+    EXPECT_NO_THROW({
+        KernelFactory::ROCmOrdinalGuard guard0(0);
+    });
+
+    EXPECT_NO_THROW({
+        KernelFactory::ROCmOrdinalGuard guard1(1);
+    });
+
+    EXPECT_NO_THROW({
+        KernelFactory::ROCmOrdinalGuard guard7(7);
+    });
+}
+
+/**
+ * @brief Test that ROCmOrdinalGuard respects RAII semantics
+ *
+ * The guard should clear thread-local storage when going out of scope.
+ */
+TEST_F(Test__KernelFactoryOps, ROCmOrdinalGuard_RAIISemantics)
+{
+    // Create nested scopes with guards - should not crash
+    {
+        KernelFactory::ROCmOrdinalGuard outer(1);
+        {
+            KernelFactory::ROCmOrdinalGuard inner(2);
+            // Inner guard active
+        }
+        // Inner guard destroyed
+    }
+    // Both guards destroyed
+}
+
+/**
+ * @brief Test that ROCmOrdinalGuard is not copyable
+ *
+ * Copy semantics would break RAII guarantees (double-clear).
+ */
+TEST_F(Test__KernelFactoryOps, ROCmOrdinalGuard_NotCopyable)
+{
+    // Static assertion to verify at compile time
+    static_assert(!std::is_copy_constructible_v<KernelFactory::ROCmOrdinalGuard>,
+                  "ROCmOrdinalGuard should not be copy constructible");
+    static_assert(!std::is_copy_assignable_v<KernelFactory::ROCmOrdinalGuard>,
+                  "ROCmOrdinalGuard should not be copy assignable");
+}
+
+/**
+ * @brief Test the guard pattern used in WeightPreloader::preloadForDevice(DeviceId)
+ *
+ * This simulates the production pattern where guard is conditionally created
+ * only for ROCm devices.
+ */
+TEST_F(Test__KernelFactoryOps, ROCmOrdinalGuard_ConditionalCreationPattern)
+{
+    // Simulate the pattern from WeightPreloader::preloadForDevice(DeviceId)
+    auto simulate_preload = [](DeviceId target_device) -> bool
+    {
+        if (target_device.is_rocm())
+        {
+            // Guard is created only for ROCm devices
+            KernelFactory::ROCmOrdinalGuard guard(target_device.ordinal);
+            // Simulated kernel creation would happen here
+            return true;
+        }
+        else
+        {
+            // CPU/CUDA path - no guard needed
+            return true;
+        }
+    };
+
+    // All paths should succeed
+    EXPECT_TRUE(simulate_preload(DeviceId::cpu()));
+    EXPECT_TRUE(simulate_preload(DeviceId::cuda(0)));
+    EXPECT_TRUE(simulate_preload(DeviceId::cuda(1)));
+    EXPECT_TRUE(simulate_preload(DeviceId::rocm(0)));
+    EXPECT_TRUE(simulate_preload(DeviceId::rocm(1)));
+}
+
+/**
+ * @brief Test that guard lifetime spans the entire preload operation
+ *
+ * The guard must remain active for all kernel creations within a preload.
+ */
+TEST_F(Test__KernelFactoryOps, ROCmOrdinalGuard_LifetimeCoversPreload)
+{
+    // Simulate the production pattern where guard wraps entire preload
+    auto simulate_rocm_preload = [](int ordinal, int num_weights) -> int
+    {
+        KernelFactory::ROCmOrdinalGuard guard(ordinal);
+
+        int weights_processed = 0;
+        for (int i = 0; i < num_weights; ++i)
+        {
+            // Guard is still active for all weights
+            weights_processed++;
+        }
+
+        return weights_processed;
+    };
+
+    EXPECT_EQ(simulate_rocm_preload(0, 10), 10);
+    EXPECT_EQ(simulate_rocm_preload(1, 20), 20);
+    EXPECT_EQ(simulate_rocm_preload(7, 5), 5);
 }

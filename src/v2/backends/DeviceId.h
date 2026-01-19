@@ -30,41 +30,73 @@ namespace llaminar2
     struct DeviceId
     {
         DeviceType type;
-        int ordinal; // GPU ordinal (0-based), 0 for CPU
+        int ordinal; // GPU ordinal (0-based), 0 for CPU, -1 for invalid
 
-        // Factory methods for clarity
+        // =========================================================================
+        // Default constructor creates INVALID device (breaks silent CPU fallback)
+        // =========================================================================
+
+        /// Default constructor creates an INVALID device
+        /// This ensures uninitialized DeviceId variables cause loud failures
+        DeviceId() : type(DeviceType::CPU), ordinal(-1) {}
+
+        /// Explicit construction (use factory methods instead)
+        DeviceId(DeviceType t, int ord) : type(t), ordinal(ord) {}
+
+        // Factory methods for clarity (preferred way to create DeviceIds)
         static DeviceId cpu() { return {DeviceType::CPU, 0}; }
         static DeviceId cuda(int gpu_ordinal) { return {DeviceType::CUDA, gpu_ordinal}; }
         static DeviceId rocm(int gpu_ordinal) { return {DeviceType::ROCm, gpu_ordinal}; }
 
         /// Invalid/unset device marker (ordinal = -1)
-        static DeviceId invalid() { return {DeviceType::CPU, -1}; }
+        static DeviceId invalid() { return {}; } // Same as default constructor
 
         // Predicates
         bool is_cpu() const { return type == DeviceType::CPU && ordinal >= 0; }
-        bool is_cuda() const { return type == DeviceType::CUDA; }
-        bool is_rocm() const { return type == DeviceType::ROCm; }
-        bool is_gpu() const { return type != DeviceType::CPU && ordinal >= 0; }
+        bool is_cuda() const { return type == DeviceType::CUDA && ordinal >= 0; }
+        bool is_rocm() const { return type == DeviceType::ROCm && ordinal >= 0; }
+        bool is_gpu() const { return (type == DeviceType::CUDA || type == DeviceType::ROCm) && ordinal >= 0; }
         bool is_valid() const { return ordinal >= 0; }
 
-        // Get CUDA device ordinal - asserts if not CUDA
+        // Get CUDA device ordinal - throws if not valid CUDA
         int cuda_ordinal() const
         {
-            assert(type == DeviceType::CUDA && "cuda_ordinal() called on non-CUDA device");
+            if (!is_valid())
+            {
+                throw std::runtime_error("cuda_ordinal() called on INVALID DeviceId - was the device properly initialized?");
+            }
+            if (type != DeviceType::CUDA)
+            {
+                throw std::runtime_error("cuda_ordinal() called on non-CUDA device: " + to_string());
+            }
             return ordinal;
         }
 
-        // Get ROCm device ordinal - asserts if not ROCm
+        // Get ROCm device ordinal - throws if not valid ROCm
         int rocm_ordinal() const
         {
-            assert(type == DeviceType::ROCm && "rocm_ordinal() called on non-ROCm device");
+            if (!is_valid())
+            {
+                throw std::runtime_error("rocm_ordinal() called on INVALID DeviceId - was the device properly initialized?");
+            }
+            if (type != DeviceType::ROCm)
+            {
+                throw std::runtime_error("rocm_ordinal() called on non-ROCm device: " + to_string());
+            }
             return ordinal;
         }
 
         // Get GPU ordinal for any GPU type (CUDA or ROCm)
         int gpu_ordinal() const
         {
-            assert(is_gpu() && "gpu_ordinal() called on CPU device");
+            if (!is_valid())
+            {
+                throw std::runtime_error("gpu_ordinal() called on INVALID DeviceId - was the device properly initialized?");
+            }
+            if (!is_gpu())
+            {
+                throw std::runtime_error("gpu_ordinal() called on CPU device");
+            }
             return ordinal;
         }
 
@@ -74,17 +106,26 @@ namespace llaminar2
          * Returns the appropriate device index for CUDA/ROCm API calls:
          * - CPU: returns -1 (convention for CPU execution)
          * - CUDA/ROCm: returns the 0-based GPU ordinal
+         * @throws std::runtime_error if DeviceId is invalid
          */
         int toKernelDeviceIndex() const
         {
+            if (!is_valid())
+            {
+                throw std::runtime_error("toKernelDeviceIndex() called on INVALID DeviceId - was the device properly initialized?");
+            }
             if (is_cpu())
                 return -1;
             return ordinal; // Direct GPU ordinal for cudaSetDevice/hipSetDevice
         }
 
-        // String representation for logging
+        // String representation for logging (safe to call on invalid)
         std::string to_string() const
         {
+            if (!is_valid())
+            {
+                return "INVALID";
+            }
             switch (type)
             {
             case DeviceType::CPU:
@@ -119,10 +160,14 @@ namespace llaminar2
 
         /**
          * @brief Get string representation of the device
-         * @return String like "CPU", "CUDA:0", "ROCm:1", etc.
+         * @return String like "CPU", "CUDA:0", "ROCm:1", "INVALID"
          */
         std::string toString() const
         {
+            if (!is_valid())
+            {
+                return "INVALID";
+            }
             switch (type)
             {
             case DeviceType::CPU:

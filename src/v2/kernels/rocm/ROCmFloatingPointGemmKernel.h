@@ -117,7 +117,8 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
              * @brief Tensor-based GEMM with explicit dimensions
@@ -128,7 +129,8 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
              * @brief Raw FP32 pointer GEMM
@@ -141,7 +143,8 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override;
+                int device_idx = -1,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
              * @brief Activation-activation GEMM (not supported for FP ROCm kernel)
@@ -198,8 +201,9 @@ namespace llaminar2
             size_t N_; // Output features (weight rows)
             size_t K_; // Input features (weight cols)
 
-            // hipBLAS kernel (created at construction)
-            std::unique_ptr<HipBLASGemmKernel> hipblas_kernel_;
+            // hipBLAS kernel - shared across all ROCm GEMM kernels on same device
+            // Owned by DeviceKernelCache, not this kernel instance
+            HipBLASGemmKernel *hipblas_kernel_ = nullptr;
         };
 
     } // namespace rocm

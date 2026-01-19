@@ -92,6 +92,95 @@ namespace llaminar2
         return (err == hipSuccess);
     }
 
+    // ====================================================================
+    // Event Operations (Fine-grained Synchronization)
+    // ====================================================================
+
+    void *ROCmBackend::createEvent(int device_id)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            return nullptr;
+        }
+
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+        {
+            return nullptr;
+        }
+
+        hipEvent_t event;
+        err = hipEventCreate(&event);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::createEvent] hipEventCreate failed: " << hipGetErrorString(err));
+            return nullptr;
+        }
+
+        return reinterpret_cast<void *>(event);
+    }
+
+    void ROCmBackend::destroyEvent(void *event, int device_id)
+    {
+        if (!event || device_id >= device_count_ || device_id < 0)
+        {
+            return;
+        }
+
+        hipSetDevice(device_id);
+        hipEvent_t hip_event = reinterpret_cast<hipEvent_t>(event);
+        hipEventDestroy(hip_event);
+    }
+
+    bool ROCmBackend::recordEvent(void *event, int device_id)
+    {
+        if (!event || device_id >= device_count_ || device_id < 0)
+        {
+            return false;
+        }
+
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+        {
+            return false;
+        }
+
+        hipEvent_t hip_event = reinterpret_cast<hipEvent_t>(event);
+        // Record on default stream (0)
+        err = hipEventRecord(hip_event, 0);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::recordEvent] hipEventRecord failed: " << hipGetErrorString(err));
+            return false;
+        }
+
+        return true;
+    }
+
+    bool ROCmBackend::waitForEvent(void *event, int device_id)
+    {
+        if (!event || device_id >= device_count_ || device_id < 0)
+        {
+            return false;
+        }
+
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+        {
+            return false;
+        }
+
+        hipEvent_t hip_event = reinterpret_cast<hipEvent_t>(event);
+        err = hipEventSynchronize(hip_event);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::waitForEvent] hipEventSynchronize failed: " << hipGetErrorString(err));
+            return false;
+        }
+
+        return true;
+    }
+
     bool ROCmBackend::setDevice(int device_id)
     {
         if (device_id >= device_count_ || device_id < 0)
@@ -133,6 +222,80 @@ namespace llaminar2
         }
 
         return ptr;
+    }
+
+    void *ROCmBackend::allocateMapped(size_t bytes, int device_id, void **device_ptr)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            LOG_ERROR("[ROCmBackend] Invalid device ID " << device_id << " for allocateMapped");
+            if (device_ptr)
+                *device_ptr = nullptr;
+            return nullptr;
+        }
+
+        // Set device before allocation
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend] Failed to set device " << device_id << ": " << hipGetErrorString(err));
+            if (device_ptr)
+                *device_ptr = nullptr;
+            return nullptr;
+        }
+
+        // Allocate mapped host memory (GPU can write directly to this via PCIe)
+        void *host_ptr = nullptr;
+        err = hipHostMalloc(&host_ptr, bytes, hipHostMallocMapped | hipHostMallocWriteCombined);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend] hipHostMalloc(Mapped) failed for " << bytes << " bytes on device "
+                                                                        << device_id << ": " << hipGetErrorString(err));
+            if (device_ptr)
+                *device_ptr = nullptr;
+            return nullptr;
+        }
+
+        // Get the device-visible pointer for this mapped host memory
+        if (device_ptr)
+        {
+            err = hipHostGetDevicePointer(device_ptr, host_ptr, 0);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmBackend] hipHostGetDevicePointer failed: " << hipGetErrorString(err));
+                hipHostFree(host_ptr);
+                *device_ptr = nullptr;
+                return nullptr;
+            }
+            LOG_DEBUG("[ROCmBackend] allocateMapped: " << bytes << " bytes, host_ptr=" << host_ptr
+                                                       << ", device_ptr=" << *device_ptr);
+        }
+
+        return host_ptr;
+    }
+
+    void ROCmBackend::freeMapped(void *host_ptr, int device_id)
+    {
+        if (host_ptr == nullptr)
+        {
+            return; // Freeing nullptr is a no-op
+        }
+
+        // hipHostFree doesn't require setting device, but we do it for consistency
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            LOG_WARN("[ROCmBackend] Invalid device ID " << device_id << " for freeMapped, attempting anyway");
+        }
+        else
+        {
+            hipSetDevice(device_id); // Best effort
+        }
+
+        hipError_t err = hipHostFree(host_ptr);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend] hipHostFree failed: " << hipGetErrorString(err));
+        }
     }
 
     void ROCmBackend::free(void *ptr, int device_id)

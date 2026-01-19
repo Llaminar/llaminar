@@ -137,6 +137,12 @@ namespace llaminar2
     {
         struct CUDAPackedWeights; // Forward declare from CUDAQuantisedGemmKernel.h
     } // namespace cuda
+
+    namespace rocm
+    {
+        struct ROCmPackedWeights; // Forward declare from ROCmQuantisedGemmKernel.h
+    } // namespace rocm
+
 } // namespace llaminar2
 
 namespace llaminar
@@ -260,6 +266,34 @@ namespace llaminar
                  * @throws std::runtime_error if device_idx is invalid
                  */
                 static DeviceType getDeviceType(int device_idx);
+
+                // ==========================================================================
+                // ROCm Device Ordinal Threading Support
+                // ==========================================================================
+
+                /**
+                 * @brief RAII guard to set thread-local ROCm device ordinal for kernel creation
+                 *
+                 * In multi-GPU ROCm setups, when creating kernels via getOrCreateGemm(tensor, DeviceType),
+                 * we need to know which specific ROCm device to target. This guard sets a thread-local
+                 * variable that getROCmDeviceIdForKernel() will use.
+                 *
+                 * Usage:
+                 * @code
+                 * {
+                 *     KernelFactory::ROCmOrdinalGuard guard(1); // Target ROCm device 1
+                 *     auto* kernel = KernelFactory::getOrCreateGemm(tensor, DeviceType::ROCm);
+                 *     // kernel will be created on ROCm device 1
+                 * } // guard goes out of scope, thread-local cleared
+                 * @endcode
+                 */
+                struct ROCmOrdinalGuard
+                {
+                    ROCmOrdinalGuard(int ordinal);
+                    ~ROCmOrdinalGuard();
+                    ROCmOrdinalGuard(const ROCmOrdinalGuard &) = delete;
+                    ROCmOrdinalGuard &operator=(const ROCmOrdinalGuard &) = delete;
+                };
 
                 // ==========================================================================
                 // Activation/Weight Type Compatibility
@@ -952,6 +986,23 @@ namespace llaminar
                     DeviceType target_device);
 
                 /**
+                 * @brief Get or create a cached GEMM kernel with explicit target DeviceId
+                 *
+                 * Same as getOrCreateGemm but uses DeviceId to specify BOTH the device type
+                 * AND the device ordinal (e.g., ROCm:1 vs ROCm:0). Use this when you need
+                 * to ensure the kernel runs on a specific GPU device.
+                 *
+                 * @param tensor Weight tensor to create kernel for
+                 * @param target_device DeviceId specifying type and ordinal (e.g., ROCm:1)
+                 * @return Raw pointer to cached kernel (lifetime managed by cache)
+                 *
+                 * @note Cache key includes both tensor pointer AND DeviceId
+                 */
+                static llaminar2::ITensorGemm *getOrCreateGemm(
+                    const llaminar2::TensorBase *tensor,
+                    llaminar2::DeviceId target_device);
+
+                /**
                  * @brief Get or create a cached row-sliced GEMM kernel for tensor parallelism
                  *
                  * Creates a kernel that only packs rows [row_start, row_end) from the weight tensor.
@@ -1010,6 +1061,28 @@ namespace llaminar
                  */
                 static llaminar2::cuda::CUDAPackedWeights *
                 ensureCUDAPackedWeightsInTensorCache(const llaminar2::TensorBase *tensor);
+#endif
+
+#ifdef HAVE_ROCM
+                /**
+                 * @brief Ensure ROCm INT8 packed weights are cached in tensor
+                 *
+                 * Similar to ensurePackedWeightsInTensorCache but for ROCm backend.
+                 * Converts any quantized tensor to INT8 + per-column scales for CK.
+                 *
+                 * The packed weights are stored in tensor->rocm_cache_ so they outlive
+                 * any individual kernel and can be shared across multiple kernel instances.
+                 *
+                 * Device upload happens lazily on first kernel use (ROCmPackedWeights::uploaded flag).
+                 *
+                 * Thread-safe: can be called from multiple threads.
+                 *
+                 * @param tensor Quantized tensor
+                 * @return Pointer to ROCm packed weights (stored in tensor's rocm_cache_)
+                 * @throws std::runtime_error if packing fails
+                 */
+                static llaminar2::rocm::ROCmPackedWeights *
+                ensureROCmPackedWeightsInTensorCache(const llaminar2::TensorBase *tensor);
 #endif
 
                 /**
@@ -1146,6 +1219,9 @@ namespace llaminar
                 };
 
                 static std::unordered_map<FusedGateUpCacheKey, std::unique_ptr<llaminar2::ITensorFusedGateUpGemm>, FusedGateUpKeyHash> fused_gate_up_cache_;
+
+                // NOTE: Universal device kernel caching (hipBLAS, cuBLAS handles, etc.)
+                // has moved to DeviceKernelCache. See kernels/DeviceKernelCache.h
             };
 
         } // namespace kernels

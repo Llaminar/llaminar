@@ -92,6 +92,95 @@ namespace llaminar2
         return (err == cudaSuccess);
     }
 
+    // ====================================================================
+    // Event Operations (Fine-grained Synchronization)
+    // ====================================================================
+
+    void *CUDABackend::createEvent(int device_id)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            return nullptr;
+        }
+
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess)
+        {
+            return nullptr;
+        }
+
+        cudaEvent_t event;
+        err = cudaEventCreate(&event);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::createEvent] cudaEventCreate failed: " << cudaGetErrorString(err));
+            return nullptr;
+        }
+
+        return reinterpret_cast<void *>(event);
+    }
+
+    void CUDABackend::destroyEvent(void *event, int device_id)
+    {
+        if (!event || device_id >= device_count_ || device_id < 0)
+        {
+            return;
+        }
+
+        cudaSetDevice(device_id);
+        cudaEvent_t cuda_event = reinterpret_cast<cudaEvent_t>(event);
+        cudaEventDestroy(cuda_event);
+    }
+
+    bool CUDABackend::recordEvent(void *event, int device_id)
+    {
+        if (!event || device_id >= device_count_ || device_id < 0)
+        {
+            return false;
+        }
+
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess)
+        {
+            return false;
+        }
+
+        cudaEvent_t cuda_event = reinterpret_cast<cudaEvent_t>(event);
+        // Record on default stream (0)
+        err = cudaEventRecord(cuda_event, 0);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::recordEvent] cudaEventRecord failed: " << cudaGetErrorString(err));
+            return false;
+        }
+
+        return true;
+    }
+
+    bool CUDABackend::waitForEvent(void *event, int device_id)
+    {
+        if (!event || device_id >= device_count_ || device_id < 0)
+        {
+            return false;
+        }
+
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess)
+        {
+            return false;
+        }
+
+        cudaEvent_t cuda_event = reinterpret_cast<cudaEvent_t>(event);
+        err = cudaEventSynchronize(cuda_event);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::waitForEvent] cudaEventSynchronize failed: " << cudaGetErrorString(err));
+            return false;
+        }
+
+        return true;
+    }
+
     bool CUDABackend::setDevice(int device_id)
     {
         if (device_id >= device_count_ || device_id < 0)
@@ -194,6 +283,80 @@ namespace llaminar2
         }
 
         return true;
+    }
+
+    void *CUDABackend::allocateMapped(size_t bytes, int device_id, void **device_ptr)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            LOG_ERROR("[CUDABackend] Invalid device ID " << device_id << " for allocateMapped");
+            if (device_ptr)
+                *device_ptr = nullptr;
+            return nullptr;
+        }
+
+        // Set device before allocation
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend] Failed to set device " << device_id << ": " << cudaGetErrorString(err));
+            if (device_ptr)
+                *device_ptr = nullptr;
+            return nullptr;
+        }
+
+        // Allocate mapped host memory (GPU can write directly to this via PCIe)
+        void *host_ptr = nullptr;
+        err = cudaHostAlloc(&host_ptr, bytes, cudaHostAllocMapped | cudaHostAllocWriteCombined);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend] cudaHostAlloc(Mapped) failed for " << bytes << " bytes on device "
+                                                                        << device_id << ": " << cudaGetErrorString(err));
+            if (device_ptr)
+                *device_ptr = nullptr;
+            return nullptr;
+        }
+
+        // Get the device-visible pointer for this mapped host memory
+        if (device_ptr)
+        {
+            err = cudaHostGetDevicePointer(device_ptr, host_ptr, 0);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDABackend] cudaHostGetDevicePointer failed: " << cudaGetErrorString(err));
+                cudaFreeHost(host_ptr);
+                *device_ptr = nullptr;
+                return nullptr;
+            }
+            LOG_DEBUG("[CUDABackend] allocateMapped: " << bytes << " bytes, host_ptr=" << host_ptr
+                                                       << ", device_ptr=" << *device_ptr);
+        }
+
+        return host_ptr;
+    }
+
+    void CUDABackend::freeMapped(void *host_ptr, int device_id)
+    {
+        if (host_ptr == nullptr)
+        {
+            return; // Freeing nullptr is a no-op
+        }
+
+        // cudaFreeHost doesn't require setting device, but we do it for consistency
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            LOG_WARN("[CUDABackend] Invalid device ID " << device_id << " for freeMapped, attempting anyway");
+        }
+        else
+        {
+            cudaSetDevice(device_id); // Best effort
+        }
+
+        cudaError_t err = cudaFreeHost(host_ptr);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend] cudaFreeHost failed: " << cudaGetErrorString(err));
+        }
     }
 
     // ====================================================================

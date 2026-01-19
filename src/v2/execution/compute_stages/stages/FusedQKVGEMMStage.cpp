@@ -23,8 +23,7 @@ namespace llaminar2
     // =============================================================================
 
     FusedQKVGEMMStage::FusedQKVGEMMStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
     }
 
@@ -304,16 +303,10 @@ namespace llaminar2
         DeviceType target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
 
         // Get cached kernels from KernelFactory with device targeting
-        auto *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq_base, target_dev_type);
-        auto *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk_base, target_dev_type);
-        auto *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv_base, target_dev_type);
-
-        if (!gemm_q || !gemm_k || !gemm_v)
-        {
-            LOG_ERROR("[FusedQKVGEMMStage] Failed to get GEMM kernel(s)");
-            return false;
-        }
-
+        // Use DeviceId overload to ensure correct GPU ordinal is used (e.g., ROCm:1 vs ROCm:0)
+        auto *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq_base, params_.device_id);
+        auto *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk_base, params_.device_id);
+        auto *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv_base, params_.device_id);
         const bool gpu_execution = (target_dev_type == DeviceType::CUDA || target_dev_type == DeviceType::ROCm);
         LOG_DEBUG("[FusedQKVGEMMStage] device_id=" << params_.device_id.to_string()
                                                    << " is_gpu=" << gpu_execution);
@@ -533,6 +526,132 @@ namespace llaminar2
         }
 
         return reqs;
+    }
+
+    // =============================================================================
+    // IWorkspaceConsumerStage Implementation
+    // =============================================================================
+
+    IWorkspaceConsumer *FusedQKVGEMMStage::getKernelAsWorkspaceConsumer()
+    {
+        // Get kernel from KernelFactory for the Q projection weight
+        // All three projections share the same workspace, so returning any one works.
+        // The Q kernel is always present, so use that.
+        if (!params_.wq)
+        {
+            LOG_WARN("[FusedQKVGEMMStage::getKernelAsWorkspaceConsumer] Q weight tensor not set");
+            return nullptr;
+        }
+
+        auto *wq_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wq));
+        if (!wq_base)
+        {
+            LOG_WARN("[FusedQKVGEMMStage::getKernelAsWorkspaceConsumer] Q weight tensor is not TensorBase");
+            return nullptr;
+        }
+
+        ITensorGemm *gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq_base, params_.device_id);
+
+        return dynamic_cast<IWorkspaceConsumer *>(gemm);
+    }
+
+    void FusedQKVGEMMStage::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        // Bind workspace to ALL THREE kernels (Q, K, V)
+        // Each kernel needs workspace for GPU execution
+
+        // Q kernel
+        if (params_.wq)
+        {
+            auto *wq_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wq));
+            if (wq_base)
+            {
+                ITensorGemm *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq_base, params_.device_id);
+                if (auto *consumer_q = dynamic_cast<IWorkspaceConsumer *>(gemm_q))
+                {
+                    consumer_q->bindWorkspace(workspace);
+                    LOG_DEBUG("[FusedQKVGEMMStage] Bound workspace to Q kernel");
+                }
+            }
+        }
+
+        // K kernel
+        if (params_.wk)
+        {
+            auto *wk_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wk));
+            if (wk_base)
+            {
+                ITensorGemm *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk_base, params_.device_id);
+                if (auto *consumer_k = dynamic_cast<IWorkspaceConsumer *>(gemm_k))
+                {
+                    consumer_k->bindWorkspace(workspace);
+                    LOG_DEBUG("[FusedQKVGEMMStage] Bound workspace to K kernel");
+                }
+            }
+        }
+
+        // V kernel
+        if (params_.wv)
+        {
+            auto *wv_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wv));
+            if (wv_base)
+            {
+                ITensorGemm *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv_base, params_.device_id);
+                if (auto *consumer_v = dynamic_cast<IWorkspaceConsumer *>(gemm_v))
+                {
+                    consumer_v->bindWorkspace(workspace);
+                    LOG_DEBUG("[FusedQKVGEMMStage] Bound workspace to V kernel");
+                }
+            }
+        }
+
+        // Store workspace reference for hasWorkspace()/getWorkspace()
+        bound_workspace_ = workspace;
+    }
+
+    void FusedQKVGEMMStage::unbindWorkspace()
+    {
+        // Unbind workspace from all three kernels
+        if (params_.wq)
+        {
+            auto *wq_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wq));
+            if (wq_base)
+            {
+                ITensorGemm *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq_base, params_.device_id);
+                if (auto *consumer_q = dynamic_cast<IWorkspaceConsumer *>(gemm_q))
+                {
+                    consumer_q->unbindWorkspace();
+                }
+            }
+        }
+
+        if (params_.wk)
+        {
+            auto *wk_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wk));
+            if (wk_base)
+            {
+                ITensorGemm *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk_base, params_.device_id);
+                if (auto *consumer_k = dynamic_cast<IWorkspaceConsumer *>(gemm_k))
+                {
+                    consumer_k->unbindWorkspace();
+                }
+            }
+        }
+
+        if (params_.wv)
+        {
+            auto *wv_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wv));
+            if (wv_base)
+            {
+                ITensorGemm *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv_base, params_.device_id);
+                if (auto *consumer_v = dynamic_cast<IWorkspaceConsumer *>(gemm_v))
+                {
+                    consumer_v->unbindWorkspace();
+                }
+            }
+        }
+
+        bound_workspace_ = nullptr;
     }
 
 } // namespace llaminar2

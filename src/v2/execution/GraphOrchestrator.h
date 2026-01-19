@@ -35,13 +35,13 @@
 #include "GraphExecutor.h"
 #include "GraphBufferManager.h"
 #include "DeviceContext.h"
-#include "PlacementStrategy.h"            // For InferencePhase
-#include "compute_stages/ComputeStages.h" // For StageDumpInfo
-#include "../tensors/FP16Utils.h"         // For fp16_to_fp32, bf16_to_fp32
-#include "../tensors/BlockStructures.h"   // For Q8_1Block, Q16_1Block
-#include "../loaders/IWeightStreamer.h"   // For weight streaming (Option B)
-#include "../interfaces/IModelContext.h"  // For interface-based construction
-#include "../interfaces/IMPITopology.h"   // For interface-based construction
+#include "PlacementStrategy.h"                // For InferencePhase
+#include "compute_stages/ComputeStages.h"     // For StageDumpInfo
+#include "../tensors/FP16Utils.h"             // For fp16_to_fp32, bf16_to_fp32
+#include "../tensors/BlockStructures.h"       // For Q8_1Block, Q16_1Block
+#include "../loaders/IWeightStreamer.h"       // For weight streaming (Option B)
+#include "../interfaces/IModelContext.h"      // For interface-based construction
+#include "../interfaces/IMPITopology.h"       // For interface-based construction
 #include "../interfaces/ICollectiveContext.h" // For interface-based construction
 #include <memory>
 #include <unordered_map>
@@ -57,6 +57,7 @@ namespace llaminar2
     class IKVCache;
     class WeightManager;
     class WeightPlacementMap;
+    class DeviceWorkspaceManager;
 
     /**
      * @brief Configuration for graph caching behavior
@@ -233,13 +234,14 @@ namespace llaminar2
          * auto orchestrator = GraphOrchestrator(std::move(deps), graph_config);
          * @endcode
          */
-        struct Dependencies {
+        struct Dependencies
+        {
             /// Model context providing weights and metadata (required)
             std::shared_ptr<IModelContext> model_ctx;
-            
+
             /// MPI topology for work distribution (optional - nullptr for single-rank)
             std::shared_ptr<IMPITopology> topology = nullptr;
-            
+
             /// Collective context for MPI operations (optional - nullptr for single-rank)
             std::shared_ptr<ICollectiveContext> collective_ctx = nullptr;
         };
@@ -1146,6 +1148,15 @@ namespace llaminar2
                         // Convert graph stage name to pipeline-style key
                         std::string key = convertStageNameToSnapshotKey(name);
                         LOG_DEBUG("[Snapshot] Storing key=" << key << " count=" << data.size());
+
+                        // Debug: Log first few values of extracted data
+                        if (data.size() >= 8 && key == "EMBEDDING")
+                        {
+                            LOG_DEBUG("[Snapshot] " << key << " first 8 values: "
+                                                    << data[0] << "," << data[1] << "," << data[2] << "," << data[3] << ","
+                                                    << data[4] << "," << data[5] << "," << data[6] << "," << data[7]);
+                        }
+
                         if (!data.empty())
                             snapshots_[key] = std::move(data);
                     }
@@ -1405,6 +1416,23 @@ namespace llaminar2
 
         /// Model-level buffers (when using graph-managed allocation)
         Qwen2ModelBuffers managed_buffers_;
+
+        /// Whether GPU workspace has been allocated for GEMM kernels
+        bool device_workspace_allocated_ = false;
+
+        /// Per-device workspace managers for GPU GEMM kernels
+        std::unordered_map<DeviceId, std::unique_ptr<DeviceWorkspaceManager>> device_workspaces_;
+
+        /**
+         * @brief Allocate GPU workspace for stages in a graph
+         *
+         * This is called lazily on first graph execution to bind workspace
+         * to GEMM kernels, eliminating hot-path allocations on GPU.
+         *
+         * @param graph The compute graph whose stages need workspace
+         * @return true if allocation succeeded (or was already done)
+         */
+        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph);
 
         /**
          * @brief Populate managed_buffers_ from graph-managed allocations

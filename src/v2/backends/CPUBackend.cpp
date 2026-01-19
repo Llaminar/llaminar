@@ -251,6 +251,23 @@ namespace llaminar2
         return true;
     }
 
+    void *CPUBackend::allocateMapped(size_t bytes, int device_id, void **device_ptr)
+    {
+        // On CPU, "mapped" memory is just regular memory
+        void *ptr = allocate(bytes, device_id);
+        if (device_ptr)
+        {
+            *device_ptr = ptr; // Same pointer, no GPU
+        }
+        return ptr;
+    }
+
+    void CPUBackend::freeMapped(void *host_ptr, int device_id)
+    {
+        // On CPU, just use regular free
+        free(host_ptr, device_id);
+    }
+
     // ====================================================================
     // Transfer Operations (memcpy for CPU)
     // ====================================================================
@@ -307,6 +324,52 @@ namespace llaminar2
         }
 
         // No-op for CPU - single "device"
+        return true;
+    }
+
+    // ====================================================================
+    // Event Operations (no-op for CPU - always synchronous)
+    // ====================================================================
+
+    void *CPUBackend::createEvent(int device_id)
+    {
+        if (!isValidDeviceId(device_id))
+        {
+            return nullptr;
+        }
+
+        // Return a dummy non-null pointer
+        // CPU execution is always synchronous, so events are no-ops
+        static int dummy_event = 1;
+        return reinterpret_cast<void *>(&dummy_event);
+    }
+
+    void CPUBackend::destroyEvent(void *event, int device_id)
+    {
+        // No-op for CPU - nothing to destroy
+        (void)event;
+        (void)device_id;
+    }
+
+    bool CPUBackend::recordEvent(void *event, int device_id)
+    {
+        if (!event || !isValidDeviceId(device_id))
+        {
+            return false;
+        }
+
+        // No-op for CPU - always synchronous
+        return true;
+    }
+
+    bool CPUBackend::waitForEvent(void *event, int device_id)
+    {
+        if (!event || !isValidDeviceId(device_id))
+        {
+            return false;
+        }
+
+        // No-op for CPU - always synchronous
         return true;
     }
 

@@ -454,10 +454,15 @@ namespace llaminar2::test::parity
 
         void TearDown() override
         {
+            // CRITICAL: Clear kernel cache BEFORE destroying model context!
+            // KernelFactory::clearCache() accesses tensor->rocm_cache_ and tensor->cuda_cache_
+            // to free device memory. If we destroy the tensors first (via model_ctx_.reset()),
+            // clearCache() would be accessing freed memory (use-after-free).
+            llaminar::v2::kernels::KernelFactory::clearCache();
+
             model_ctx_.reset();
             runner_.reset();
             pytorch_snapshots_.clear();
-            llaminar::v2::kernels::KernelFactory::clearCache();
         }
 
         /**
@@ -736,6 +741,27 @@ namespace llaminar2::test::parity
             {
                 size_t llaminar_size;
                 const float *llaminar_data = runner_->getSnapshot("EMBEDDING", llaminar_size);
+
+                // Debug sizes and first values
+                LOG_INFO("[Parity Debug] EMBEDDING - llaminar_size=" << llaminar_size
+                                                                     << " pytorch_size=" << pytorch_embedding.size());
+                if (llaminar_data && llaminar_size >= 8)
+                {
+                    LOG_INFO("[Parity Debug] Llaminar first 8: "
+                             << llaminar_data[0] << "," << llaminar_data[1] << ","
+                             << llaminar_data[2] << "," << llaminar_data[3] << ","
+                             << llaminar_data[4] << "," << llaminar_data[5] << ","
+                             << llaminar_data[6] << "," << llaminar_data[7]);
+                }
+                if (!pytorch_embedding.empty() && pytorch_embedding.size() >= 8)
+                {
+                    LOG_INFO("[Parity Debug] PyTorch first 8: "
+                             << pytorch_embedding[0] << "," << pytorch_embedding[1] << ","
+                             << pytorch_embedding[2] << "," << pytorch_embedding[3] << ","
+                             << pytorch_embedding[4] << "," << pytorch_embedding[5] << ","
+                             << pytorch_embedding[6] << "," << pytorch_embedding[7]);
+                }
+
                 if (llaminar_data && !pytorch_embedding.empty())
                 {
                     summary.embedding_cosine = computeCosineSimilarity(

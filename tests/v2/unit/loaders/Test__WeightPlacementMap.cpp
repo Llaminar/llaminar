@@ -429,6 +429,121 @@ TEST_F(WeightPlacementMapTest, BackwardCompatibilityWithGetDeviceForWeight)
     EXPECT_EQ(map_->getDeviceForWeight("blk.1.attn_q.weight", 1), DeviceId::cpu());
 }
 
+// ============================================================================
+// DeviceId Ordinal Tests - Regression tests for device ordinal propagation bug
+// ============================================================================
+
+/**
+ * @brief Test that DeviceId correctly stores and reports ROCm ordinal
+ *
+ * Regression test for bug where WeightPreloader didn't propagate device ordinal.
+ */
+TEST_F(WeightPlacementMapTest, DeviceId_ROCmOrdinalStorage)
+{
+    DeviceId dev0 = DeviceId::rocm(0);
+    DeviceId dev1 = DeviceId::rocm(1);
+    DeviceId dev7 = DeviceId::rocm(7);
+
+    EXPECT_TRUE(dev0.is_rocm());
+    EXPECT_TRUE(dev1.is_rocm());
+    EXPECT_TRUE(dev7.is_rocm());
+
+    EXPECT_EQ(dev0.ordinal, 0);
+    EXPECT_EQ(dev1.ordinal, 1);
+    EXPECT_EQ(dev7.ordinal, 7);
+
+    EXPECT_EQ(dev0.type, DeviceType::ROCm);
+    EXPECT_EQ(dev1.type, DeviceType::ROCm);
+    EXPECT_EQ(dev7.type, DeviceType::ROCm);
+}
+
+/**
+ * @brief Test that DeviceId::cpu() has ordinal 0
+ * (CPU uses ordinal 0, GPU devices use ordinal 0, 1, 2, ...)
+ */
+TEST_F(WeightPlacementMapTest, DeviceId_CPUHasOrdinalZero)
+{
+    DeviceId cpu = DeviceId::cpu();
+
+    EXPECT_TRUE(cpu.is_cpu());
+    EXPECT_FALSE(cpu.is_rocm());
+    EXPECT_EQ(cpu.ordinal, 0);
+    EXPECT_EQ(cpu.type, DeviceType::CPU);
+}
+
+/**
+ * @brief Test that DeviceId equality considers ordinal
+ *
+ * Two DeviceIds with same type but different ordinal should NOT be equal.
+ */
+TEST_F(WeightPlacementMapTest, DeviceId_EqualityIncludesOrdinal)
+{
+    DeviceId rocm0 = DeviceId::rocm(0);
+    DeviceId rocm1 = DeviceId::rocm(1);
+    DeviceId rocm0_copy = DeviceId::rocm(0);
+
+    // Same type, same ordinal -> equal
+    EXPECT_EQ(rocm0, rocm0_copy);
+
+    // Same type, different ordinal -> not equal
+    EXPECT_NE(rocm0, rocm1);
+
+    // Different type -> not equal
+    DeviceId cpu = DeviceId::cpu();
+    EXPECT_NE(rocm0, cpu);
+}
+
+/**
+ * @brief Test placement map preserves ROCm device ordinal
+ *
+ * When setting a ROCm device with ordinal 1, getDeviceForWeight should return
+ * a DeviceId with ordinal 1, not ordinal 0.
+ */
+TEST_F(WeightPlacementMapTest, PlacementMap_PreservesROCmOrdinal)
+{
+    // Set up placement map with ROCm device 1
+    map_->setTensorDevice("blk.0.attn_q.weight", DeviceId::rocm(1));
+    map_->setTensorDevice("blk.0.attn_k.weight", DeviceId::rocm(1));
+
+    // Verify ordinal is preserved
+    DeviceId device = map_->getDeviceForWeight("blk.0.attn_q.weight", 0);
+    EXPECT_TRUE(device.is_rocm());
+    EXPECT_EQ(device.ordinal, 1) << "ROCm ordinal should be preserved through placement map";
+}
+
+/**
+ * @brief Test placement map with multiple GPU ordinals
+ *
+ * Simulates multi-GPU setup where different layers are on different GPUs.
+ */
+TEST_F(WeightPlacementMapTest, PlacementMap_MultipleGPUOrdinals)
+{
+    // Distribute weights across two GPUs
+    map_->setTensorDevice("blk.0.attn_q.weight", DeviceId::rocm(0));
+    map_->setTensorDevice("blk.1.attn_q.weight", DeviceId::rocm(1));
+
+    DeviceId dev0 = map_->getDeviceForWeight("blk.0.attn_q.weight", 0);
+    DeviceId dev1 = map_->getDeviceForWeight("blk.1.attn_q.weight", 1);
+
+    EXPECT_EQ(dev0.ordinal, 0);
+    EXPECT_EQ(dev1.ordinal, 1);
+}
+
+/**
+ * @brief Test DeviceId::to_string() includes ordinal
+ */
+TEST_F(WeightPlacementMapTest, DeviceId_ToStringIncludesOrdinal)
+{
+    DeviceId rocm0 = DeviceId::rocm(0);
+    DeviceId rocm1 = DeviceId::rocm(1);
+
+    std::string str0 = rocm0.to_string();
+    std::string str1 = rocm1.to_string();
+
+    // Strings should be different (include ordinal)
+    EXPECT_NE(str0, str1);
+}
+
 int main(int argc, char **argv)
 {
     ::testing::InitGoogleTest(&argc, argv);

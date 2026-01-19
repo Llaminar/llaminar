@@ -1036,6 +1036,8 @@ namespace llaminar2
         bool dump_inputs = true;                            ///< Dump input tensors
         bool dump_outputs = true;                           ///< Dump output tensors
         bool dump_weights = true;                           ///< Dump weight tensors
+        bool async_dump = true;                             ///< Use async I/O for dumps (default: true)
+        int async_threads = 2;                              ///< Number of async I/O threads
         bool dump_all_types = true;                         ///< Whether to dump all stage types
         bool dump_all_names = true;                         ///< Whether to dump all stage names
         bool dump_all_layers = true;                        ///< Whether to dump all layers
@@ -1196,6 +1198,22 @@ namespace llaminar2
             if (weights_env)
             {
                 dump_weights = (std::atoi(weights_env) != 0);
+            }
+
+            const char *async_env = std::getenv("LLAMINAR_STAGE_DUMP_ASYNC");
+            if (async_env)
+            {
+                async_dump = (std::atoi(async_env) != 0);
+            }
+
+            const char *async_threads_env = std::getenv("LLAMINAR_STAGE_DUMP_ASYNC_THREADS");
+            if (async_threads_env)
+            {
+                async_threads = std::atoi(async_threads_env);
+                if (async_threads < 1)
+                    async_threads = 1;
+                if (async_threads > 16)
+                    async_threads = 16;
             }
         }
 
@@ -1649,6 +1667,56 @@ namespace llaminar2
     };
 
     /**
+     * @brief ROCm-specific debugging and instrumentation configuration
+     *
+     * Environment variables:
+     * - `LLAMINAR_ROCM_TRACE_COHERENCE=1` - Enable detailed coherence timing logs
+     * - `LLAMINAR_ROCM_TRACE_KERNELS=1` - Enable per-kernel timing breakdown
+     * - `LLAMINAR_ROCM_SYNC_AFTER_KERNEL=1` - Force hipDeviceSynchronize after each kernel
+     *
+     * @code
+     *   LLAMINAR_ROCM_TRACE_COHERENCE=1 \
+     *   ./build_v2_e2e_release/llaminar2 -m model.gguf -p "test"
+     * @endcode
+     */
+    struct ROCmConfig
+    {
+        bool trace_coherence = false;   ///< Log detailed coherence timings (LLAMINAR_ROCM_TRACE_COHERENCE)
+        bool trace_kernels = false;     ///< Log per-kernel timing breakdown (LLAMINAR_ROCM_TRACE_KERNELS)
+        bool sync_after_kernel = false; ///< Force sync after each kernel (LLAMINAR_ROCM_SYNC_AFTER_KERNEL)
+
+        ROCmConfig()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            trace_coherence = false;
+            trace_kernels = false;
+            sync_after_kernel = false;
+
+            const char *trace_coh_env = std::getenv("LLAMINAR_ROCM_TRACE_COHERENCE");
+            if (trace_coh_env)
+            {
+                trace_coherence = (std::atoi(trace_coh_env) != 0);
+            }
+
+            const char *trace_kern_env = std::getenv("LLAMINAR_ROCM_TRACE_KERNELS");
+            if (trace_kern_env)
+            {
+                trace_kernels = (std::atoi(trace_kern_env) != 0);
+            }
+
+            const char *sync_env = std::getenv("LLAMINAR_ROCM_SYNC_AFTER_KERNEL");
+            if (sync_env)
+            {
+                sync_after_kernel = (std::atoi(sync_env) != 0);
+            }
+        }
+    };
+
+    /**
      * @brief Global debug environment snapshot
      */
     struct DebugEnv
@@ -1666,6 +1734,7 @@ namespace llaminar2
         StageOutputPrintConfig stage_output_print; ///< Stage output debug printing
         ValidationConfig validation;               ///< Buffer validation configuration
         StreamingEnv streaming;                    ///< Weight streaming configuration (Option B)
+        ROCmConfig rocm;                           ///< ROCm-specific debugging configuration
 
         DebugEnv() = default;
 
@@ -1683,6 +1752,7 @@ namespace llaminar2
             stage_output_print.reload();
             validation.reload();
             streaming.reload();
+            rocm.reload();
         }
     };
 

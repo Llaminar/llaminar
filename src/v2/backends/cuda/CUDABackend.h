@@ -35,10 +35,20 @@ namespace llaminar2
         bool synchronize(int device_id) override;
         bool setDevice(int device_id) override;
 
+        // Event operations (fine-grained synchronization)
+        void *createEvent(int device_id) override;
+        void destroyEvent(void *event, int device_id) override;
+        bool recordEvent(void *event, int device_id) override;
+        bool waitForEvent(void *event, int device_id) override;
+
         // Memory allocation operations
         void *allocate(size_t bytes, int device_id) override;
         void free(void *ptr, int device_id) override;
         bool memset(void *ptr, int value, size_t bytes, int device_id) override;
+
+        // Zero-copy mapped memory operations
+        void *allocateMapped(size_t bytes, int device_id, void **device_ptr) override;
+        void freeMapped(void *host_ptr, int device_id) override;
 
         // Device query operations
         int deviceCount() const override;

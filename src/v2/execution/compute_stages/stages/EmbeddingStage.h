@@ -6,7 +6,9 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
+#include "../../../tensors/TensorKernels.h"
 
 namespace llaminar2
 {
@@ -19,8 +21,11 @@ namespace llaminar2
      *
      * The embedding table is typically FP32 (stored in model weights).
      * Output format is determined by the output tensor's native_type().
+     *
+     * Implements IWorkspaceConsumerStage to delegate workspace requirements
+     * to the underlying embedding kernel (required for ROCm kernels).
      */
-    class EmbeddingStage : public IComputeStage
+    class EmbeddingStage : public IComputeStage, public IWorkspaceConsumerStage
     {
     public:
         struct Params
@@ -52,11 +57,18 @@ namespace llaminar2
         StageDumpInfo getDumpInfo() const override;
         StageBufferRequirements getBufferRequirements() const override;
 
+        // IWorkspaceConsumerStage Implementation
+        IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
+
     private:
         Params params_;
+        std::unique_ptr<ITensorEmbedding> cached_kernel_;
 
         bool executeQ16_1Output();
         static void zero_output_row(ITensor *output, int row_idx, int d_model);
+
+        // Get or create the embedding kernel (caches for workspace binding)
+        ITensorEmbedding *getOrCreateKernel();
     };
 
 } // namespace llaminar2

@@ -5,15 +5,16 @@
  * **Purpose**: Provide GPU GEMM for non-quantized (floating-point) tensors using hipBLAS.
  *
  * **Design**:
- * - Standalone kernel class (does not inherit ITensorGemm to avoid MPI header dependency in HIP)
+ * - Implements IDeviceKernel for universal caching via DeviceKernelCache
  * - Uses hipBLAS sgemm (FP32), hgemm (FP16), or emulated BF16 (via FP32 compute)
  * - Expects input/output matrices already on GPU device
  * - Caller responsible for device memory management
  *
- * **Usage**:
+ * **Usage** (via DeviceKernelCache):
  * ```cpp
- * auto kernel = std::make_unique<HipBLASGemmKernel>(device_id);
- * kernel->execute(d_A, d_B, d_C, M, N, K, transA, transB);
+ * auto* gemm = DeviceKernelCache::getKernel<HipBLASGemmKernel>(
+ *     DeviceId::rocm(0), KernelType::BLAS_GEMM);
+ * gemm->execute(d_A, d_B, d_C, M, N, K, transA, transB);
  * ```
  *
  * **Note**: MI50 (gfx906) does NOT have native BF16 support. BF16 operations
@@ -25,13 +26,16 @@
 
 #pragma once
 
+#include "../DeviceKernelCache.h"
+#include "../../backends/DeviceId.h"
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
 
-#ifdef HAVE_ROCM
-#include <hipblas/hipblas.h>
-#endif
+// NOTE: DO NOT include HIP headers here!
+// This header must be includable by g++-compiled code.
+// HIP headers cause std:: namespace pollution when included inside a namespace.
+// The hipblasHandle_t is stored as void* and cast in the implementation file.
 
 namespace llaminar2
 {
@@ -40,6 +44,8 @@ namespace llaminar2
 
         /**
          * @brief hipBLAS-based GEMM kernel for floating-point tensors
+         *
+         * Implements IDeviceKernel for universal caching.
          *
          * Supports:
          * - FP32: hipblasSgemm
@@ -55,7 +61,7 @@ namespace llaminar2
          * - No Tensor Cores, but matrix FMA is well optimized
          * - BF16 requires conversion overhead (no hardware support)
          */
-        class HipBLASGemmKernel
+        class HipBLASGemmKernel : public IDeviceKernel
         {
         public:
             /**
@@ -71,17 +77,17 @@ namespace llaminar2
             /**
              * @brief Create hipBLAS GEMM kernel
              *
-             * @param device_id HIP device ID (from hipGetDevice)
+             * @param device_id DeviceId (must be ROCm)
              * @param precision Floating-point precision to use
              *
              * @throws std::runtime_error if hipBLAS handle creation fails
              */
-            explicit HipBLASGemmKernel(int device_id, Precision precision = Precision::FP32);
+            explicit HipBLASGemmKernel(const DeviceId& device_id, Precision precision = Precision::FP32);
 
             /**
              * @brief Destructor - destroys hipBLAS handle
              */
-            ~HipBLASGemmKernel();
+            ~HipBLASGemmKernel() override;
 
             // Non-copyable
             HipBLASGemmKernel(const HipBLASGemmKernel &) = delete;
@@ -90,6 +96,13 @@ namespace llaminar2
             // Movable
             HipBLASGemmKernel(HipBLASGemmKernel &&other) noexcept;
             HipBLASGemmKernel &operator=(HipBLASGemmKernel &&other) noexcept;
+
+            // =================================================================
+            // IDeviceKernel Interface
+            // =================================================================
+
+            KernelType type() const override { return KernelType::BLAS_GEMM; }
+            DeviceId device() const override { return device_id_; }
 
             // =================================================================
             // Device Query
@@ -146,14 +159,14 @@ namespace llaminar2
                 float alpha = 1.0f, float beta = 0.0f);
 
             // Getters
-            int device_id() const { return device_id_; }
+            int device_ordinal() const { return device_id_.ordinal; }
             Precision precision() const { return precision_; }
 
         private:
-#ifdef HAVE_ROCM
-            hipblasHandle_t handle_ = nullptr;
-#endif
-            int device_id_ = 0;
+            // hipblasHandle_t stored as void* to avoid including HIP headers in this header.
+            // This allows g++-compiled files to include this header without HIP namespace pollution.
+            void* handle_ = nullptr;
+            DeviceId device_id_;
             Precision precision_ = Precision::FP32;
         };
 
@@ -161,8 +174,15 @@ namespace llaminar2
          * @brief Factory function for hipBLAS GEMM kernel
          */
         std::unique_ptr<HipBLASGemmKernel> createHipBLASGemm(
-            int device_id,
+            const DeviceId& device_id,
             HipBLASGemmKernel::Precision precision = HipBLASGemmKernel::Precision::FP32);
+
+        /**
+         * @brief Register hipBLAS GEMM kernel factory with DeviceKernelCache
+         *
+         * Call this at startup to enable automatic kernel creation for ROCm devices.
+         */
+        void registerHipBLASGemmKernelFactory();
 
     } // namespace rocm
 } // namespace llaminar2

@@ -6,6 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 
 namespace llaminar2
@@ -20,8 +21,11 @@ namespace llaminar2
      *
      * This stage delegates to QuantisedGemmKernel::multiply_fused_multi(), which
      * handles the quantization and multi-projection execution internally.
+     *
+     * Implements IWorkspaceConsumerStage to delegate workspace requirements to the
+     * underlying GEMM kernels for GPU execution.
      */
-    class FusedQKVGEMMStage : public IComputeStage
+    class FusedQKVGEMMStage : public IComputeStage, public IWorkspaceConsumerStage
     {
     public:
         struct Params
@@ -61,6 +65,34 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo getDumpInfo() const override;
         StageBufferRequirements getBufferRequirements() const override;
+
+        // =================================================================
+        // IWorkspaceConsumerStage Implementation
+        // =================================================================
+
+        /**
+         * @brief Get a GEMM kernel as IWorkspaceConsumer for delegation
+         *
+         * Returns the Q projection kernel from KernelFactory. All three kernels
+         * (Q, K, V) share the same workspace, so returning any one works for
+         * workspace requirements calculation.
+         *
+         * @return Kernel implementing IWorkspaceConsumer, or nullptr if not available
+         */
+        IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
+
+        /**
+         * @brief Bind workspace to ALL THREE underlying GEMM kernels (Q, K, V)
+         *
+         * Override the default single-kernel binding to bind all three projection
+         * kernels since they each need workspace for GPU execution.
+         */
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+
+        /**
+         * @brief Unbind workspace from all three kernels
+         */
+        void unbindWorkspace() override;
 
     private:
         Params params_;

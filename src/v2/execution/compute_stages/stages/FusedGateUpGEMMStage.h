@@ -6,10 +6,14 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 
 namespace llaminar2
 {
+
+    // Forward declaration
+    class ITensorFusedGateUpGemm;
 
     /**
      * @brief Fused Gate/Up projection stage for FFN
@@ -22,8 +26,13 @@ namespace llaminar2
      *
      * This stage delegates to QuantisedGemmKernel::multiply_fused_multi(), which
      * handles the quantization and multi-projection execution internally.
+     *
+     * **Workspace Management (Phase 4)**:
+     * Implements IWorkspaceConsumerStage to delegate workspace requirements to the
+     * underlying fused GEMM kernel. This enables zero-allocation GPU execution by
+     * pre-binding workspace buffers during graph setup.
      */
-    class FusedGateUpGEMMStage : public IComputeStage
+    class FusedGateUpGEMMStage : public IComputeStage, public IWorkspaceConsumerStage
     {
     public:
         struct Params
@@ -58,8 +67,14 @@ namespace llaminar2
         StageDumpInfo getDumpInfo() const override;
         StageBufferRequirements getBufferRequirements() const override;
 
+        // =============================================================================
+        // IWorkspaceConsumerStage Implementation
+        // =============================================================================
+        IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
+
     private:
         Params params_;
+        ITensorFusedGateUpGemm *cached_kernel_ = nullptr; ///< Cached for workspace binding
     };
 
 } // namespace llaminar2

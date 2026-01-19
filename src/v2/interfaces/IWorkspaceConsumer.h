@@ -166,6 +166,12 @@ namespace llaminar2
         constexpr const char *FULL_A_FP16 = "gemm_full_a_fp16"; ///< [M × K] FP16 full matrix
         constexpr const char *FULL_B_FP16 = "gemm_full_b_fp16"; ///< [K × N] FP16 full matrix
         constexpr const char *FULL_C_FP16 = "gemm_full_c_fp16"; ///< [M × N] FP16 full matrix
+
+        // ROCm M-padding buffers (for CK when M < 8)
+        constexpr const char *ROCM_A_PADDED = "rocm_a_padded";             ///< [padded_m × K] INT8 padded activations
+        constexpr const char *ROCM_SCALE_A_PADDED = "rocm_scale_a_padded"; ///< [padded_m] FP32 padded scales
+        constexpr const char *ROCM_E_PADDED = "rocm_e_padded";             ///< [padded_m × N] FP32 padded output
+        constexpr const char *ROCM_CK_INT32 = "rocm_ck_int32";             ///< [padded_m × N] INT32 CK accumulator
     }
 
 } // namespace llaminar2

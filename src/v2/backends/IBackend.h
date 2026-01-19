@@ -102,6 +102,76 @@ namespace llaminar2
          */
         virtual bool synchronize(int device_id) = 0;
 
+        // ====================================================================
+        // Event Operations (Fine-grained Synchronization)
+        // ====================================================================
+
+        /**
+         * @brief Create an event for fine-grained synchronization
+         *
+         * @param device_id GPU device ID (0-based)
+         * @return Opaque event handle (nullptr on failure)
+         *
+         * **Semantics**:
+         * - CUDA: cudaEventCreate()
+         * - ROCm: hipEventCreate()
+         * - CPU: returns dummy non-null pointer
+         *
+         * **Thread Safety**: Caller must ensure device is set before calling
+         * **Lifetime**: Caller owns the event and must call destroyEvent()
+         */
+        virtual void *createEvent(int device_id) = 0;
+
+        /**
+         * @brief Destroy an event created by createEvent()
+         *
+         * @param event Opaque event handle (may be nullptr)
+         * @param device_id GPU device ID (0-based)
+         *
+         * **Semantics**:
+         * - CUDA: cudaEventDestroy()
+         * - ROCm: hipEventDestroy()
+         * - CPU: no-op
+         */
+        virtual void destroyEvent(void *event, int device_id) = 0;
+
+        /**
+         * @brief Record an event on the current stream
+         *
+         * Marks the current point in the default stream. All operations
+         * submitted before this call will complete before the event is signaled.
+         *
+         * @param event Opaque event handle from createEvent()
+         * @param device_id GPU device ID (0-based)
+         * @return true on success, false on error
+         *
+         * **Semantics**:
+         * - CUDA: cudaEventRecord(event, 0) on default stream
+         * - ROCm: hipEventRecord(event, 0) on default stream
+         * - CPU: no-op (returns true)
+         */
+        virtual bool recordEvent(void *event, int device_id) = 0;
+
+        /**
+         * @brief Wait for an event to complete
+         *
+         * Blocks the host until all operations recorded before the event
+         * have completed on the device.
+         *
+         * @param event Opaque event handle from createEvent()
+         * @param device_id GPU device ID (0-based)
+         * @return true on success, false on error
+         *
+         * **Semantics**:
+         * - CUDA: cudaEventSynchronize(event)
+         * - ROCm: hipEventSynchronize(event)
+         * - CPU: no-op (returns true)
+         *
+         * **Performance Note**: This is lighter than synchronize() because it only
+         * waits for a specific point in the stream, not all device operations.
+         */
+        virtual bool waitForEvent(void *event, int device_id) = 0;
+
         /**
          * @brief Set active device for subsequent operations
          *
@@ -172,6 +242,56 @@ namespace llaminar2
          * **Thread Safety**: Caller must ensure device is set before calling
          */
         virtual bool memset(void *ptr, int value, size_t bytes, int device_id) = 0;
+
+        // ====================================================================
+        // Zero-Copy Mapped Memory Operations (GPU writes directly to host)
+        // ====================================================================
+
+        /**
+         * @brief Allocate zero-copy mapped memory (host memory accessible by GPU)
+         *
+         * Allocates pinned host memory that can be written to directly by GPU kernels.
+         * The GPU writes via PCIe, so no explicit D2H memcpy is needed - but writes
+         * are slower than to device memory (PCIe bandwidth limited).
+         *
+         * @param bytes Number of bytes to allocate
+         * @param device_id GPU device ID that will access this memory
+         * @param[out] device_ptr Receives the device-visible pointer for the GPU
+         * @return Host pointer (nullptr on failure). device_ptr set to GPU-visible address.
+         *
+         * **Use Case**: Output tensors that need to be read by host (verification, snapshots).
+         * Instead of: kernel writes to device mem -> hipMemcpy D2H
+         * Do: kernel writes directly to mapped host mem -> hipDeviceSynchronize -> read host
+         *
+         * **Performance Trade-off**:
+         * - Pro: Eliminates D2H memcpy entirely
+         * - Pro: Can read partial data while kernel is running (with care)
+         * - Con: GPU writes to host are PCIe-limited (~15 GB/s vs ~1 TB/s HBM)
+         *
+         * **Semantics**:
+         * - CUDA: cudaHostAlloc(&ptr, bytes, cudaHostAllocMapped)
+         *         cudaHostGetDevicePointer(&dev_ptr, ptr, 0)
+         * - ROCm: hipHostMalloc(&ptr, bytes, hipHostMallocMapped)
+         *         hipHostGetDevicePointer(&dev_ptr, ptr, 0)
+         * - CPU: malloc(bytes), device_ptr = nullptr (no GPU)
+         *
+         * **Thread Safety**: Caller must ensure device is set before calling
+         * **Lifetime**: Caller owns memory, must call freeMapped()
+         */
+        virtual void *allocateMapped(size_t bytes, int device_id, void **device_ptr) = 0;
+
+        /**
+         * @brief Free zero-copy mapped memory allocated by allocateMapped()
+         *
+         * @param host_ptr Host pointer returned by allocateMapped() (may be nullptr)
+         * @param device_id GPU device ID used for allocation
+         *
+         * **Semantics**:
+         * - CUDA: cudaFreeHost(host_ptr)
+         * - ROCm: hipHostFree(host_ptr)
+         * - CPU: free(host_ptr)
+         */
+        virtual void freeMapped(void *host_ptr, int device_id) = 0;
 
         // ====================================================================
         // Device Query Operations

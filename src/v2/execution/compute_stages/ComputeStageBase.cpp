@@ -10,6 +10,7 @@
 #include "../../tensors/TensorVerification.h"
 #include "../../utils/Logger.h"
 #include "../../kernels/KernelFactory.h"
+#include <chrono>
 
 namespace llaminar2
 {
@@ -503,18 +504,10 @@ namespace llaminar2
         // CRITICAL: Use the LOGICAL dimensions (rows, cols) to compute byte_size,
         // NOT tensor->size_bytes() which may reflect a larger pre-allocated buffer
 
-        // CRITICAL: Ensure host data is current before reading for verification
-        // GPU execution marks device as authoritative; we must sync back to host
-        // to read correct data for verification/dumping
-        if (tensor)
-        {
-            if (auto *cpu_tensor = dynamic_cast<const CPUTensorBase *>(tensor))
-            {
-                // const_cast is safe here: ensureOnHost() only modifies internal cache state
-                // and downloads GPU data to host - it doesn't change the tensor's logical content
-                const_cast<CPUTensorBase *>(cpu_tensor)->ensureOnHost();
-            }
-        }
+        // NOTE: We NO LONGER call ensureOnHost() here!
+        // The sync is now DEFERRED to ensureOutputsOnHost() which is called
+        // only when data is actually needed (e.g., verification, dumping).
+        // This allows GPU kernels to run async without blocking.
 
         const void *data = tensor ? tensor->raw_data() : nullptr;
         const char *dtype = tensor ? tensor->dtype_name() : "FP32";
@@ -538,6 +531,31 @@ namespace llaminar2
         buf.tensor = const_cast<ITensor *>(tensor); // Store tensor pointer for coherence
         outputs.push_back(buf);
         return *this;
+    }
+
+    void StageDumpInfo::ensureOutputsOnHost()
+    {
+        // Sync all output tensors from GPU to host.
+        // Call this BEFORE reading output.data for verification/dumping.
+        for (auto &output : outputs)
+        {
+            if (output.tensor)
+            {
+                if (auto *cpu_tensor = dynamic_cast<CPUTensorBase *>(output.tensor))
+                {
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    cpu_tensor->ensureOnHost();
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    auto elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    if (elapsed_ms > 1.0)
+                    {
+                        LOG_WARN("[StageDumpInfo::ensureOutputsOnHost] '" << output.name << "' took " << elapsed_ms << " ms");
+                    }
+                    // Update data pointer after sync (may have changed)
+                    output.data = cpu_tensor->raw_data();
+                }
+            }
+        }
     }
 
 } // namespace llaminar2

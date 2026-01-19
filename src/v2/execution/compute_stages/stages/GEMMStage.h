@@ -6,10 +6,14 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 
 namespace llaminar2
 {
+
+    // Forward declaration
+    class ITensorGemm;
 
     /**
      * @brief GEMM stage: C = alpha * A * B + beta * C
@@ -23,8 +27,13 @@ namespace llaminar2
      * - Uses `KernelFactory::getOrCreateGemmSliced()` to create sliced kernel
      * - Only computes output rows in [output_range.start, output_range.end)
      * - Caller is responsible for MPI AllReduce after execution if needed
+     *
+     * **Workspace Management (Phase 4)**:
+     * Implements IWorkspaceConsumerStage to delegate workspace requirements to the
+     * underlying GEMM kernel. This enables zero-allocation GPU execution by pre-binding
+     * workspace buffers during graph setup.
      */
-    class GEMMStage : public IComputeStage
+    class GEMMStage : public IComputeStage, public IWorkspaceConsumerStage
     {
     public:
         struct Params
@@ -104,8 +113,21 @@ namespace llaminar2
 
         /// Target device for coherence management
 
-
         const Params &getParams() const { return params_; }
+
+        // =================================================================
+        // IWorkspaceConsumerStage Implementation
+        // =================================================================
+
+        /**
+         * @brief Get the GEMM kernel as IWorkspaceConsumer for delegation
+         *
+         * Fetches the kernel from KernelFactory (which caches by tensor+device).
+         * The same kernel is returned on every call for this stage.
+         *
+         * @return Kernel implementing IWorkspaceConsumer, or nullptr if not available
+         */
+        IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
 
     private:
         Params params_;

@@ -28,6 +28,8 @@
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.
 #include "tensors/BlockStructures.h" // Q8_1Block
 #include "tensors/KernelSnapshotInfo.h"
+#include "execution/DeviceWorkspaceManager.h"
+#include "execution/WorkspaceDescriptor.h"
 #include "utils/Logger.h"
 
 #include <stdexcept>
@@ -124,6 +126,10 @@ namespace llaminar2
             // Flag to track if we own weight memory
             bool owns_weight_memory = false;
 
+            // Flag to track if work buffers come from workspace (vs self-allocated)
+            // When true, destructor must NOT free these buffers (workspace owns them)
+            bool using_workspace_buffers = false;
+
             ~Impl()
             {
                 // Only free weight memory if we own it (not from CUDAPackedWeights cache)
@@ -134,13 +140,17 @@ namespace llaminar2
                     if (d_scales_B)
                         cudaQuantGemm_freeDevice(d_scales_B);
                 }
-                // Always free work buffers (we always own these)
-                if (d_A_int8)
-                    cudaQuantGemm_freeDevice(d_A_int8);
-                if (d_scales_A)
-                    cudaQuantGemm_freeDevice(d_scales_A);
-                if (d_C_int32)
-                    cudaQuantGemm_freeDevice(d_C_int32);
+                // Only free work buffers if we allocated them ourselves (not from workspace)
+                // When using_workspace_buffers is true, these pointers reference workspace-owned memory
+                if (!using_workspace_buffers)
+                {
+                    if (d_A_int8)
+                        cudaQuantGemm_freeDevice(d_A_int8);
+                    if (d_scales_A)
+                        cudaQuantGemm_freeDevice(d_scales_A);
+                    if (d_C_int32)
+                        cudaQuantGemm_freeDevice(d_C_int32);
+                }
             }
         };
 
@@ -469,6 +479,30 @@ namespace llaminar2
 
         void CUDAQuantisedGemmKernel::ensureWorkBuffers(int m)
         {
+            // =========================================================================
+            // MANAGED MODE: Use pre-allocated workspace buffers (ZERO hot-path allocs!)
+            // =========================================================================
+            if (hasWorkspace())
+            {
+                // Get pointers from workspace (these are pre-allocated by GraphBufferManager)
+                impl_->d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+                impl_->d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
+                impl_->d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
+
+                // Mark workspace as having capacity for this M (workspace is pre-sized for max M)
+                impl_->work_buffer_M = m;
+                impl_->using_workspace_buffers = true;
+
+                LOG_TRACE("[CUDAQuantisedGemmKernel::ensureWorkBuffers] Using workspace buffers (managed mode)"
+                          << " A_int8=" << (void *)impl_->d_A_int8
+                          << " scales_A=" << (void *)impl_->d_scales_A
+                          << " C_int32=" << (void *)impl_->d_C_int32);
+                return;
+            }
+
+            // =========================================================================
+            // LEGACY MODE: Allocate on demand
+            // =========================================================================
             if (m <= impl_->work_buffer_M)
             {
                 return; // Already have enough capacity
@@ -497,7 +531,8 @@ namespace llaminar2
             bool transpose_B,
             float alpha, float beta,
             const MPIContext *mpi_ctx,
-            int device_idx)
+            int device_idx,
+            DeviceWorkspaceManager *workspace)
         {
             if (!A || !C)
             {
@@ -509,7 +544,7 @@ namespace llaminar2
             int n = static_cast<int>(N_);
             int k = static_cast<int>(K_);
 
-            return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
+            return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx, workspace);
         }
 
         bool CUDAQuantisedGemmKernel::multiply_tensor(
@@ -518,7 +553,27 @@ namespace llaminar2
             bool /*transpose_B*/,
             float alpha, float beta,
             const MPIContext * /*mpi_ctx*/,
-            int /*device_idx*/)
+            int /*device_idx*/,
+            DeviceWorkspaceManager *workspace)
+        {
+            // Use passed workspace if provided, otherwise fall back to bound workspace
+            DeviceWorkspaceManager *effective_ws = workspace ? workspace : workspace_;
+            if (effective_ws != workspace_)
+            {
+                // Temporarily use passed workspace for this call
+                DeviceWorkspaceManager *saved_ws = workspace_;
+                workspace_ = effective_ws;
+                bool result = multiply_tensor_impl(A, C, m, n, k, alpha, beta);
+                workspace_ = saved_ws;
+                return result;
+            }
+            return multiply_tensor_impl(A, C, m, n, k, alpha, beta);
+        }
+
+        bool CUDAQuantisedGemmKernel::multiply_tensor_impl(
+            const TensorBase *A, TensorBase *C,
+            int m, int n, int k,
+            float alpha, float beta)
         {
             if (!A || !C)
             {
@@ -631,8 +686,20 @@ namespace llaminar2
             bool /*transpose_B*/,
             float alpha, float beta,
             const MPIContext * /*mpi_ctx*/,
-            int /*device_idx*/)
+            int /*device_idx*/,
+            DeviceWorkspaceManager *workspace)
         {
+            // Use passed workspace if provided, otherwise fall back to bound workspace
+            DeviceWorkspaceManager *effective_ws = workspace ? workspace : workspace_;
+            if (effective_ws != workspace_)
+            {
+                // Temporarily use passed workspace for this call
+                DeviceWorkspaceManager *saved_ws = workspace_;
+                workspace_ = effective_ws;
+                bool result = multiply_fp32_to_fp32(A, C, m, n, k, alpha, beta);
+                workspace_ = saved_ws;
+                return result;
+            }
             return multiply_fp32_to_fp32(A, C, m, n, k, alpha, beta);
         }
 
@@ -645,7 +712,27 @@ namespace llaminar2
             const std::vector<FusedProjectionDesc> &projections,
             int m, int k,
             const MPIContext * /*mpi_ctx*/,
-            int /*device_idx*/)
+            int /*device_idx*/,
+            DeviceWorkspaceManager *workspace)
+        {
+            // Use passed workspace if provided, otherwise fall back to bound workspace
+            DeviceWorkspaceManager *effective_ws = workspace ? workspace : workspace_;
+            if (effective_ws != workspace_)
+            {
+                // Temporarily use passed workspace for this call
+                DeviceWorkspaceManager *saved_ws = workspace_;
+                workspace_ = effective_ws;
+                bool result = multiply_fused_impl(input, projections, m, k);
+                workspace_ = saved_ws;
+                return result;
+            }
+            return multiply_fused_impl(input, projections, m, k);
+        }
+
+        bool CUDAQuantisedGemmKernel::multiply_fused_impl(
+            const float *input,
+            const std::vector<FusedProjectionDesc> &projections,
+            int m, int k)
         {
             if (!input || projections.empty())
             {
@@ -770,7 +857,27 @@ namespace llaminar2
             const TensorBase *input,
             const std::vector<TensorProjectionDesc> &projections,
             int m, int k,
-            const MPIContext * /*mpi_ctx*/)
+            const MPIContext * /*mpi_ctx*/,
+            DeviceWorkspaceManager *workspace)
+        {
+            // Use passed workspace if provided, otherwise fall back to bound workspace
+            DeviceWorkspaceManager *effective_ws = workspace ? workspace : workspace_;
+            if (effective_ws != workspace_)
+            {
+                // Temporarily use passed workspace for this call
+                DeviceWorkspaceManager *saved_ws = workspace_;
+                workspace_ = effective_ws;
+                bool result = multiply_fused_tensor_impl(input, projections, m, k);
+                workspace_ = saved_ws;
+                return result;
+            }
+            return multiply_fused_tensor_impl(input, projections, m, k);
+        }
+
+        bool CUDAQuantisedGemmKernel::multiply_fused_tensor_impl(
+            const TensorBase *input,
+            const std::vector<TensorProjectionDesc> &projections,
+            int m, int k)
         {
             if (!input || projections.empty())
             {
@@ -1206,6 +1313,62 @@ namespace llaminar2
                 .withScalar("K", "input features", KernelBufferDtype::INT32)
                 .withScalar("cuda_device_id", "CUDA device ID", KernelBufferDtype::INT32)
                 .withScalar("weights_converted", "whether weights are converted to INT8", KernelBufferDtype::INT32);
+        }
+
+        // =====================================================================
+        // IWorkspaceConsumer Interface Implementation
+        // =====================================================================
+
+        WorkspaceRequirements CUDAQuantisedGemmKernel::getWorkspaceRequirements(
+            int m, int n, int k) const
+        {
+            WorkspaceRequirements reqs;
+
+            // Use internal dimensions if not specified
+            if (n == 0)
+                n = static_cast<int>(N_);
+            if (k == 0)
+                k = static_cast<int>(K_);
+
+            // INT8 path needs quantization + accumulator buffers
+            size_t quant_a_bytes = static_cast<size_t>(m) * k * sizeof(int8_t);
+            size_t scales_a_bytes = static_cast<size_t>(m) * sizeof(float);
+            size_t acc_int32_bytes = static_cast<size_t>(m) * n * sizeof(int32_t);
+
+            reqs.buffers.push_back({GemmWorkspaceBuffers::QUANT_A, quant_a_bytes, 256, true});
+            reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A, scales_a_bytes, 256, true});
+            reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32, acc_int32_bytes, 256, true});
+
+            LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
+                      << "quant_a=" << (quant_a_bytes / 1024) << "KB, "
+                      << "scales_a=" << (scales_a_bytes) << "B, "
+                      << "acc=" << (acc_int32_bytes / 1024) << "KB");
+
+            return reqs;
+        }
+
+        void CUDAQuantisedGemmKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
+        {
+            workspace_ = workspace;
+            if (workspace)
+            {
+                LOG_DEBUG("[CUDAQuantisedGemmKernel] Bound workspace manager at " << (void *)workspace
+                                                                                  << ", entering managed mode");
+            }
+            else
+            {
+                LOG_DEBUG("[CUDAQuantisedGemmKernel] Unbound workspace, returning to legacy mode");
+            }
+        }
+
+        bool CUDAQuantisedGemmKernel::hasWorkspace() const
+        {
+            return workspace_ != nullptr;
+        }
+
+        DeviceWorkspaceManager *CUDAQuantisedGemmKernel::getWorkspace() const
+        {
+            return workspace_;
         }
 
     } // namespace cuda

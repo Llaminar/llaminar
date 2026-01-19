@@ -216,6 +216,7 @@ if(HAVE_CUDA)
     # CUDA backend library includes backend + kernels + enumeration
     add_library(cuda_backend STATIC 
         backends/cuda/CUDABackend.cu
+        backends/cuda/CUDATensorValidation.cu
         backends/CUDAEnumeration.cu
         ${CUDA_KERNEL_SOURCES}
     )
@@ -367,15 +368,20 @@ if(HAVE_ROCM)
     
     # ROCm kernels compiled with hipcc
     set(ROCM_KERNEL_SOURCES
-        kernels/rocm/HipBLASGemmKernel.cpp      # hipBLAS wrapper for FP32/FP16 dense GEMM
         kernels/rocm/ROCmQuantisedGemmKernel_CK.hip  # ComposableKernel INT8 GEMM implementation
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
         kernels/rocm/kvcache/ROCmRingKVCacheKernels.hip       # Ring buffer KV cache kernels
+        kernels/rocm/ops/ROCmSwiGLUKernels.hip               # SwiGLU kernels (FP32, BF16, FP16)
+        kernels/rocm/ops/ROCmRoPEKernels.hip                 # RoPE kernels (FP32, BF16, FP16)
+        kernels/rocm/ops/ROCmRMSNormKernels.hip              # RMSNorm kernels (FP32, BF16, FP16)
+        kernels/rocm/ops/ROCmEmbeddingKernels.hip            # Embedding kernels (FP32, BF16, FP16, Q8_1)
+        kernels/rocm/ops/ROCmResidualAddKernels.hip          # Residual Add kernels (FP32, BF16, FP16)
     )
     
     # ROCm enumeration and backend must be compiled with hipcc to use HIP runtime
     add_library(rocm_backend STATIC 
         backends/rocm/ROCmBackend.cpp
+        backends/rocm/ROCmTensorValidation.cpp
         backends/ROCmEnumeration.cpp
         ${ROCM_KERNEL_SOURCES}
     )
@@ -394,6 +400,7 @@ if(HAVE_ROCM)
     # Set HIP compiler for ROCm source files
     set_source_files_properties(
         backends/rocm/ROCmBackend.cpp
+        backends/rocm/ROCmTensorValidation.cpp
         backends/ROCmEnumeration.cpp
         ${ROCM_KERNEL_SOURCES}
         PROPERTIES LANGUAGE HIP
@@ -766,6 +773,7 @@ add_library(llaminar2_core STATIC
     tensors/cpu/INT32Tensor.cpp
     tensors/cpu/INT8Tensor.cpp
     tensors/TensorFactory.cpp
+    tensors/TensorValidation.cpp
     tensors/cpu/IQ4_NLTensor.cpp
     # Simple quantization formats (Q8_0, Q8_1, Q16_1, Q4_0, Q4_1, Q5_0, Q5_1)
     tensors/cpu/Q8_0Tensor.cpp
@@ -832,6 +840,8 @@ add_library(llaminar2_core STATIC
     kernels/cpu/gemm_v4/FusedGEMM.cpp           # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp
+    # Universal device kernel cache (hipBLAS, cuBLAS handles, etc.)
+    kernels/DeviceKernelCache.cpp
     # Testing infrastructure
     testing/PerfHarness.cpp
     utils/ArgParser.cpp
@@ -955,9 +965,14 @@ if(HAVE_ROCM)
     target_sources(llaminar2_core PRIVATE
         kernels/rocm/ROCmFloatingPointGemmKernel.cpp
         kernels/rocm/ROCmQuantisedGemmKernel.cpp  # INT8 GEMM adapter (uses CK via extern "C")
+        kernels/rocm/HipBLASGemmKernel.cpp        # hipBLAS GEMM for FP32/FP16 (compiled with g++, linked with hipBLAS)
         kernels/rocm/attention/ROCmFlashAttentionKernelT.cpp  # Flash Attention ITensor implementation
         kernels/rocm/kvcache/ROCmRingKVCache.cpp              # Ring buffer KV cache implementation
         kernels/rocm/kvcache/ROCmRingKVCacheFactory.cpp       # Factory for creating ROCm KV cache instances
+        kernels/rocm/ops/ROCmSwiGLUKernelT.cpp                # SwiGLU ITensor implementation
+        kernels/rocm/ops/ROCmRoPEKernelT.cpp                  # RoPE ITensor implementation
+        kernels/rocm/ops/ROCmRMSNormKernelT.cpp               # RMSNorm ITensor implementation
+        kernels/rocm/ops/ROCmEmbeddingKernelT.cpp             # Embedding ITensor implementation
     )
     
     message(STATUS "V2: Linked ROCm backend library with hipBLAS GEMM")

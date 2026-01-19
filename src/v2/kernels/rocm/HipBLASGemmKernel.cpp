@@ -4,21 +4,30 @@
  *
  * This file is compiled with hipcc to use HIP runtime APIs.
  *
+ * NOTE: This file cannot include utils/Logger.h or <iostream> because hipcc has issues
+ * with libstdc++ locale/ostream headers when inside a namespace.
+ * Errors are reported via return codes and exceptions only.
+ *
  * @author David Sanftenberg
  * @date January 2026
  */
 
-#include "HipBLASGemmKernel.h"
-#include "utils/Logger.h"
-
-#include <iostream>
-#include <stdexcept>
-
+// HIP headers MUST be included BEFORE any other headers
+// to avoid std:: namespace conflicts in HIP template metaprogramming
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>  // For __half and __float2half
 #include <hipblas/hipblas.h>
 #endif
+
+#include "HipBLASGemmKernel.h"
+#include <stdexcept>
+#include <string>
+
+// Logging disabled in HIP files due to hipcc/libstdc++ conflicts
+// All errors are reported via exceptions or return codes
+#define HIP_LOG_DEBUG(msg) ((void)0)
+#define HIP_LOG_ERROR(msg) ((void)0)
 
 namespace llaminar2
 {
@@ -37,7 +46,7 @@ namespace llaminar2
         hipblasStatus_t status = call;                                           \
         if (status != HIPBLAS_STATUS_SUCCESS)                                    \
         {                                                                        \
-            LOG_ERROR("[HipBLASGemmKernel] hipBLAS error: " << status            \
+            HIP_LOG_ERROR("[HipBLASGemmKernel] hipBLAS error: " << status            \
                                                            << " at " << __FILE__ \
                                                            << ":" << __LINE__);  \
             return false;                                                        \
@@ -50,7 +59,7 @@ namespace llaminar2
         hipError_t err = call;                                                    \
         if (err != hipSuccess)                                                    \
         {                                                                         \
-            LOG_ERROR("[HipBLASGemmKernel] HIP error: " << hipGetErrorString(err) \
+            HIP_LOG_ERROR("[HipBLASGemmKernel] HIP error: " << hipGetErrorString(err) \
                                                         << " at " << __FILE__     \
                                                         << ":" << __LINE__);      \
             return false;                                                         \
@@ -61,31 +70,39 @@ namespace llaminar2
         // Constructor / Destructor
         // =====================================================================
 
-        HipBLASGemmKernel::HipBLASGemmKernel(int device_id, Precision precision)
+        HipBLASGemmKernel::HipBLASGemmKernel(const DeviceId& device_id, Precision precision)
             : device_id_(device_id), precision_(precision)
         {
+            if (device_id.type != DeviceType::ROCm)
+            {
+                throw std::runtime_error(
+                    "[HipBLASGemmKernel] Requires ROCm device, got: " + device_id.to_string());
+            }
+
             // Set device
-            hipError_t hip_err = hipSetDevice(device_id_);
+            hipError_t hip_err = hipSetDevice(device_id_.ordinal);
             if (hip_err != hipSuccess)
             {
                 throw std::runtime_error(
                     std::string("[HipBLASGemmKernel] Failed to set HIP device ") +
-                    std::to_string(device_id_) + ": " + hipGetErrorString(hip_err));
+                    std::to_string(device_id_.ordinal) + ": " + hipGetErrorString(hip_err));
             }
 
             // Create hipBLAS handle
-            hipblasStatus_t hipblas_err = hipblasCreate(&handle_);
+            hipblasHandle_t temp_handle = nullptr;
+            hipblasStatus_t hipblas_err = hipblasCreate(&temp_handle);
             if (hipblas_err != HIPBLAS_STATUS_SUCCESS)
             {
                 throw std::runtime_error(
                     std::string("[HipBLASGemmKernel] Failed to create hipBLAS handle: ") +
                     std::to_string(static_cast<int>(hipblas_err)));
             }
+            handle_ = static_cast<void*>(temp_handle);
 
             // Note: hipBLAS doesn't have explicit Tensor Core mode like cuBLAS
             // It will automatically use the best available math mode
 
-            LOG_DEBUG("[HipBLASGemmKernel] Created on device " << device_id_
+            HIP_LOG_DEBUG("[HipBLASGemmKernel] Created on device " << device_id_.to_string()
                                                                << " with precision "
                                                                << static_cast<int>(precision_));
         }
@@ -94,7 +111,7 @@ namespace llaminar2
         {
             if (handle_)
             {
-                hipblasDestroy(handle_);
+                hipblasDestroy(static_cast<hipblasHandle_t>(handle_));
                 handle_ = nullptr;
             }
         }
@@ -115,7 +132,7 @@ namespace llaminar2
             {
                 if (handle_)
                 {
-                    hipblasDestroy(handle_);
+                    hipblasDestroy(static_cast<hipblasHandle_t>(handle_));
                 }
                 handle_ = other.handle_;
                 device_id_ = other.device_id_;
@@ -137,15 +154,15 @@ namespace llaminar2
         {
             if (!handle_)
             {
-                LOG_ERROR("[HipBLASGemmKernel::execute] hipBLAS handle is null");
+                HIP_LOG_ERROR("[HipBLASGemmKernel::execute] hipBLAS handle is null");
                 return false;
             }
 
             // Ensure we're on the correct device
-            hipError_t hip_err = hipSetDevice(device_id_);
+            hipError_t hip_err = hipSetDevice(device_id_.ordinal);
             if (hip_err != hipSuccess)
             {
-                LOG_ERROR("[HipBLASGemmKernel::execute] Failed to set device: " << hipGetErrorString(hip_err));
+                HIP_LOG_ERROR("[HipBLASGemmKernel::execute] Failed to set device: " << hipGetErrorString(hip_err));
                 return false;
             }
 
@@ -192,7 +209,7 @@ namespace llaminar2
             // Computes: op(B_cm) @ op(A_cm) where B_cm, A_cm are hipBLAS's col-major views
 
             HIPBLAS_CHECK(hipblasSgemm(
-                handle_,
+                static_cast<hipblasHandle_t>(handle_),
                 opB, opA,
                 N, M, K,
                 &alpha,
@@ -216,15 +233,15 @@ namespace llaminar2
         {
             if (!handle_)
             {
-                LOG_ERROR("[HipBLASGemmKernel::execute_fp16] hipBLAS handle is null");
+                HIP_LOG_ERROR("[HipBLASGemmKernel::execute_fp16] hipBLAS handle is null");
                 return false;
             }
 
             // Ensure we're on the correct device
-            hipError_t hip_err = hipSetDevice(device_id_);
+            hipError_t hip_err = hipSetDevice(device_id_.ordinal);
             if (hip_err != hipSuccess)
             {
-                LOG_ERROR("[HipBLASGemmKernel::execute_fp16] Failed to set device: " << hipGetErrorString(hip_err));
+                HIP_LOG_ERROR("[HipBLASGemmKernel::execute_fp16] Failed to set device: " << hipGetErrorString(hip_err));
                 return false;
             }
 
@@ -241,7 +258,7 @@ namespace llaminar2
 
             // hipblasHgemm for native FP16 computation
             HIPBLAS_CHECK(hipblasHgemm(
-                handle_,
+                static_cast<hipblasHandle_t>(handle_),
                 opB, opA,
                 N, M, K,
                 &alpha_h,
@@ -258,17 +275,29 @@ namespace llaminar2
         // =====================================================================
 
         std::unique_ptr<HipBLASGemmKernel> createHipBLASGemm(
-            int device_id,
+            const DeviceId& device_id,
             HipBLASGemmKernel::Precision precision)
         {
             return std::make_unique<HipBLASGemmKernel>(device_id, precision);
+        }
+
+        void registerHipBLASGemmKernelFactory()
+        {
+            DeviceKernelCache::registerFactory(
+                DeviceType::ROCm,
+                KernelType::BLAS_GEMM,
+                [](const DeviceId& device) -> std::unique_ptr<IDeviceKernel>
+                {
+                    return std::make_unique<HipBLASGemmKernel>(device);
+                });
+            HIP_LOG_DEBUG("[HipBLASGemmKernel] Registered factory for ROCm BLAS_GEMM");
         }
 
 #else // !HAVE_ROCM
 
         // Stub implementations when ROCm is not available
 
-        HipBLASGemmKernel::HipBLASGemmKernel(int device_id, Precision precision)
+        HipBLASGemmKernel::HipBLASGemmKernel(const DeviceId& device_id, Precision precision)
             : device_id_(device_id), precision_(precision)
         {
             throw std::runtime_error("[HipBLASGemmKernel] ROCm support not compiled");
@@ -295,10 +324,12 @@ namespace llaminar2
             return false;
         }
 
-        std::unique_ptr<HipBLASGemmKernel> createHipBLASGemm(int, HipBLASGemmKernel::Precision)
+        std::unique_ptr<HipBLASGemmKernel> createHipBLASGemm(const DeviceId&, HipBLASGemmKernel::Precision)
         {
             return nullptr;
         }
+
+        void registerHipBLASGemmKernelFactory() {}
 
 #endif // HAVE_ROCM
 

@@ -15,6 +15,7 @@
 
 #include "kernels/rocm/ROCmFloatingPointGemmKernel.h"
 #include "kernels/rocm/HipBLASGemmKernel.h"
+#include "backends/DeviceId.h"
 #include "tensors/Tensors.h"
 #include "backends/ComputeBackend.h"
 #include "utils/Logger.h"
@@ -150,7 +151,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_SmallMatrix)
     float* d_B = allocate_and_copy_to_gpu(h_B);
     float* d_C = allocate_and_copy_to_gpu(h_C);
     
-    HipBLASGemmKernel kernel(rocm_device_id_);
+    HipBLASGemmKernel kernel(DeviceId::rocm(rocm_device_id_));
     ASSERT_TRUE(kernel.execute(d_A, d_B, d_C, M, N, K, false, true));
     
     copy_from_gpu(d_C, h_C);
@@ -188,7 +189,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Qwen05B_Sizes)
     float* d_B = allocate_and_copy_to_gpu(h_B);
     float* d_C = allocate_and_copy_to_gpu(h_C);
     
-    HipBLASGemmKernel kernel(rocm_device_id_);
+    HipBLASGemmKernel kernel(DeviceId::rocm(rocm_device_id_));
     ASSERT_TRUE(kernel.execute(d_A, d_B, d_C, M, N, K, false, true));
     
     copy_from_gpu(d_C, h_C);
@@ -226,7 +227,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Qwen14B_Sizes)
     float* d_B = allocate_and_copy_to_gpu(h_B);
     float* d_C = allocate_and_copy_to_gpu(h_C);
     
-    HipBLASGemmKernel kernel(rocm_device_id_);
+    HipBLASGemmKernel kernel(DeviceId::rocm(rocm_device_id_));
     ASSERT_TRUE(kernel.execute(d_A, d_B, d_C, M, N, K, false, true));
     
     copy_from_gpu(d_C, h_C);
@@ -261,7 +262,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Performance)
     float* d_B = allocate_and_copy_to_gpu(h_B);
     float* d_C = allocate_and_copy_to_gpu(h_C);
     
-    HipBLASGemmKernel kernel(rocm_device_id_);
+    HipBLASGemmKernel kernel(DeviceId::rocm(rocm_device_id_));
     
     // Warmup
     kernel.execute(d_A, d_B, d_C, M, N, K, false, true);

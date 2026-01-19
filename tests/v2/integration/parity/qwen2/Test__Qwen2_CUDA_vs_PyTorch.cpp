@@ -26,7 +26,7 @@ using namespace llaminar2::test::parity::qwen2;
 class Test__Qwen2_CUDA_vs_PyTorch : public Qwen2ParityTestBase
 {
 protected:
-    DeviceId gpu_device_ = DeviceId::cpu();
+    DeviceId gpu_device_{};  // Intentionally invalid - must be set in setupDeviceSpecific()
 
     BackendThresholds getBackendThresholds() override
     {
@@ -52,11 +52,6 @@ protected:
         auto &dm = DeviceManager::instance();
         dm.initialize(-1);
 
-        if (!dm.has_gpu())
-        {
-            GTEST_SKIP() << "No CUDA GPU available";
-        }
-
         int gpu_idx = dm.find_device(ComputeBackendType::GPU_CUDA);
         if (gpu_idx < 0)
         {
@@ -68,7 +63,13 @@ protected:
 #endif
     }
 
-    DeviceId getDevice() override { return gpu_device_; }
+    DeviceId getDevice() override
+    {
+        // Fail loudly if setupDeviceSpecific() wasn't called or failed to set device
+        EXPECT_TRUE(gpu_device_.is_cuda())
+            << "CUDA parity test requires CUDA device but got: " << gpu_device_.to_string();
+        return gpu_device_;
+    }
     std::string getBackendName() override { return "CUDA"; }
 };
 

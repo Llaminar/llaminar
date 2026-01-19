@@ -26,6 +26,8 @@
 #include "../tensors/Tensors.h"
 #include "../tensors/TensorKernels.h"
 #include "../execution/DeviceContext.h"
+#include "../execution/DeviceWorkspaceManager.h"
+#include "../interfaces/IWorkspaceConsumer.h"
 #include "../backends/ComputeBackend.h"
 #include "../utils/Logger.h"
 
@@ -43,8 +45,15 @@
 
 // ROCm kernel classes
 #ifdef HAVE_ROCM
-#include "rocm/ROCmFloatingPointGemmKernel.h"    // FP32/FP16/BF16 via hipBLAS
-#include "rocm/kvcache/ROCmRingKVCacheFactory.h" // ROCm Ring Buffer KV Cache factory
+#include "rocm/ROCmFloatingPointGemmKernel.h"         // FP32/FP16/BF16 via hipBLAS
+#include "rocm/ROCmQuantisedGemmKernel.h"             // Quantized tensors via CK INT8/FP16
+#include "rocm/kvcache/ROCmRingKVCacheFactory.h"      // ROCm Ring Buffer KV Cache factory
+#include "rocm/ops/ROCmEmbeddingKernelT.h"            // Embedding FP32/BF16/FP16/Q8_1
+#include "rocm/ops/ROCmRMSNormKernelT.h"              // RMSNorm FP32/BF16/FP16
+#include "rocm/ops/ROCmRoPEKernelT.h"                 // RoPE FP32
+#include "rocm/ops/ROCmSwiGLUKernelT.h"               // SwiGLU FP32
+#include "rocm/ops/ROCmResidualAddKernelT.h"          // ResidualAdd FP32
+#include "rocm/attention/ROCmFlashAttentionKernelT.h" // Flash Attention
 #endif
 
 namespace llaminar
@@ -166,6 +175,11 @@ namespace llaminar
 #endif
 
 #ifdef HAVE_ROCM
+                // Thread-local storage for target ROCm device ordinal
+                // Used when getOrCreateGemm is called with DeviceId to pass the ordinal
+                // to getROCmDeviceIdForKernel (since createGemm only receives DeviceType)
+                thread_local std::optional<int> tl_target_rocm_ordinal;
+
                 /**
                  * @brief Get ROCm device ID for kernel creation
                  *
@@ -178,6 +192,13 @@ namespace llaminar
                  */
                 int getROCmDeviceIdForKernel(const llaminar2::TensorBase *tensor)
                 {
+                    // First check if a target ROCm ordinal was set via DeviceId overload
+                    if (tl_target_rocm_ordinal.has_value())
+                    {
+                        LOG_DEBUG("[KernelFactory] Using thread-local ROCm ordinal: " << tl_target_rocm_ordinal.value());
+                        return tl_target_rocm_ordinal.value();
+                    }
+
                     const auto &dm = llaminar2::DeviceManager::instance();
                     const auto &devices = dm.devices();
 
@@ -531,6 +552,27 @@ namespace llaminar
             } // namespace
 
             // ==========================================================================
+            // ROCmOrdinalGuard implementation (must be outside anonymous namespace)
+            // ==========================================================================
+#ifdef HAVE_ROCM
+            KernelFactory::ROCmOrdinalGuard::ROCmOrdinalGuard(int ordinal)
+            {
+                tl_target_rocm_ordinal = ordinal;
+                LOG_DEBUG("[KernelFactory] ROCmOrdinalGuard: set thread-local ROCm ordinal to " << ordinal);
+            }
+
+            KernelFactory::ROCmOrdinalGuard::~ROCmOrdinalGuard()
+            {
+                LOG_DEBUG("[KernelFactory] ROCmOrdinalGuard: cleared thread-local ROCm ordinal");
+                tl_target_rocm_ordinal = std::nullopt;
+            }
+#else
+            // Stub implementations when ROCm is not available
+            KernelFactory::ROCmOrdinalGuard::ROCmOrdinalGuard(int) {}
+            KernelFactory::ROCmOrdinalGuard::~ROCmOrdinalGuard() {}
+#endif
+
+            // ==========================================================================
             // IQ4_NL Tensor GEMM
             // ==========================================================================
 
@@ -621,6 +663,16 @@ namespace llaminar
                     const auto &dm = llaminar2::DeviceManager::instance();
                     int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                }
+#endif
+
+#ifdef HAVE_ROCM
+                case DeviceType::ROCm:
+                {
+                    LOG_DEBUG("[KernelFactory] Q4_0 GEMM: Using ROCmQuantisedGemmKernel (pre-packed)");
+                    auto *packed = ensureROCmPackedWeightsInTensorCache(tensor);
+                    int rocm_device_id = getROCmDeviceIdForKernel(tensor);
+                    return std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(packed, rocm_device_id);
                 }
 #endif
 
@@ -1426,7 +1478,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "RoPE", "FP32");
+                    return std::make_unique<llaminar2::rocm::ROCmRoPEKernelT<llaminar2::ActivationPrecision::FP32>>();
 #endif
 
                 default:
@@ -1451,7 +1503,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "RoPE", "BF16");
+                    return std::make_unique<llaminar2::rocm::ROCmRoPEKernelT<llaminar2::ActivationPrecision::BF16>>();
 #endif
 
                 default:
@@ -1476,7 +1528,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "RoPE", "FP16");
+                    return std::make_unique<llaminar2::rocm::ROCmRoPEKernelT<llaminar2::ActivationPrecision::FP16>>();
 #endif
 
                 default:
@@ -1530,7 +1582,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "SwiGLU", "FP32");
+                    return std::make_unique<llaminar2::rocm::ROCmSwiGLUKernelT<llaminar2::ActivationPrecision::FP32>>();
 #endif
 
                 default:
@@ -1554,7 +1606,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "SwiGLU", "BF16");
+                    return std::make_unique<llaminar2::rocm::ROCmSwiGLUKernelT<llaminar2::ActivationPrecision::BF16>>();
 #endif
 
                 default:
@@ -1578,7 +1630,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "SwiGLU", "FP16");
+                    return std::make_unique<llaminar2::rocm::ROCmSwiGLUKernelT<llaminar2::ActivationPrecision::FP16>>();
 #endif
 
                 default:
@@ -1808,7 +1860,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "RMSNorm", "FP32");
+                    return std::make_unique<llaminar2::rocm::ROCmRMSNormKernelT<llaminar2::ActivationPrecision::FP32>>();
 #endif
 
                 default:
@@ -1832,7 +1884,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "RMSNorm", "BF16");
+                    return std::make_unique<llaminar2::rocm::ROCmRMSNormKernelT<llaminar2::ActivationPrecision::BF16>>();
 #endif
 
                 default:
@@ -1856,7 +1908,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "RMSNorm", "FP16");
+                    return std::make_unique<llaminar2::rocm::ROCmRMSNormKernelT<llaminar2::ActivationPrecision::FP16>>();
 #endif
 
                 default:
@@ -2049,27 +2101,46 @@ namespace llaminar
                     throw std::runtime_error("KernelFactory::createAttention: null tensor");
                 }
 
-                // For GPU tensors, dispatch to CUDA Flash Attention directly
+                // For GPU tensors, dispatch based on dev_type
                 if (tensor->is_on_gpu())
                 {
-#ifdef HAVE_CUDA
-                    // GPU tensors use CUDAFlashAttentionKernelT based on native_type
-                    switch (tensor->native_type())
+                    switch (dev_type)
                     {
-                    case llaminar2::TensorType::FP32:
-                        return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
-                    case llaminar2::TensorType::FP16:
-                        return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
-                    case llaminar2::TensorType::BF16:
-                        return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
-                    default:
-                        throw std::runtime_error(
-                            "KernelFactory::createAttention: unsupported GPU tensor type " +
-                            std::string(tensor->dtype_name()));
-                    }
-#else
-                    throw std::runtime_error("KernelFactory::createAttention: GPU tensor but CUDA not available");
+#ifdef HAVE_CUDA
+                    case DeviceType::CUDA:
+                        switch (tensor->native_type())
+                        {
+                        case llaminar2::TensorType::FP32:
+                            return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
+                        case llaminar2::TensorType::FP16:
+                            return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
+                        case llaminar2::TensorType::BF16:
+                            return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
+                        default:
+                            throw std::runtime_error(
+                                "KernelFactory::createAttention: unsupported CUDA GPU tensor type " +
+                                std::string(tensor->dtype_name()));
+                        }
 #endif
+#ifdef HAVE_ROCM
+                    case DeviceType::ROCm:
+                        switch (tensor->native_type())
+                        {
+                        case llaminar2::TensorType::FP32:
+                            return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
+                        case llaminar2::TensorType::FP16:
+                            return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
+                        case llaminar2::TensorType::BF16:
+                            return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
+                        default:
+                            throw std::runtime_error(
+                                "KernelFactory::createAttention: unsupported ROCm GPU tensor type " +
+                                std::string(tensor->dtype_name()));
+                        }
+#endif
+                    default:
+                        throw std::runtime_error("KernelFactory::createAttention: GPU tensor but requested backend not available");
+                    }
                 }
 
                 // For CPU tensors, use existing TensorBase* dispatch
@@ -2102,7 +2173,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "Attention", "FP32");
+                    return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
 #endif
 
                 default:
@@ -2126,7 +2197,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "Attention", "BF16");
+                    return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
 #endif
 
                 default:
@@ -2150,7 +2221,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "Attention", "FP16");
+                    return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
 #endif
 
                 default:
@@ -2203,7 +2274,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "Embedding", "FP32");
+                    return std::make_unique<llaminar2::ROCmEmbeddingKernelT>();
 #endif
 
                 default:
@@ -2227,7 +2298,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "Embedding", "BF16");
+                    return std::make_unique<llaminar2::ROCmEmbeddingKernelT>();
 #endif
 
                 default:
@@ -2251,7 +2322,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "Embedding", "FP16");
+                    return std::make_unique<llaminar2::ROCmEmbeddingKernelT>();
 #endif
 
                 default:
@@ -2275,7 +2346,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "Embedding", "Q8_1");
+                    return std::make_unique<llaminar2::ROCmEmbeddingKernelT>();
 #endif
 
                 default:
@@ -2293,6 +2364,9 @@ namespace llaminar
             std::unordered_map<KernelFactory::DeviceTargetedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, KernelFactory::DeviceTargetedKeyHash> KernelFactory::device_targeted_cache_;
             std::unordered_map<KernelFactory::FusedQKVCacheKey, std::unique_ptr<llaminar2::ITensorFusedQKVGemm>, KernelFactory::FusedQKVKeyHash> KernelFactory::fused_qkv_cache_;
             std::unordered_map<KernelFactory::FusedGateUpCacheKey, std::unique_ptr<llaminar2::ITensorFusedGateUpGemm>, KernelFactory::FusedGateUpKeyHash> KernelFactory::fused_gate_up_cache_;
+
+            // NOTE: Device-level kernel caching (hipBLAS, cuBLAS handles, etc.)
+            // has moved to DeviceKernelCache. See kernels/DeviceKernelCache.h
 
             // ==========================================================================
             // Kernel Cache - Implementation
@@ -2414,6 +2488,64 @@ namespace llaminar
                 return &new_cache->packed;
             }
 #endif
+
+#ifdef HAVE_ROCM
+            /**
+             * @brief Cache wrapper for ROCm packed weights
+             *
+             * Stored in tensor->rocm_cache_ to manage lifetime.
+             * The ROCmPackedWeights struct contains both host (int8_data, scales)
+             * and device (d_int8_data, d_scales) pointers. Device memory is uploaded
+             * lazily on first kernel use.
+             */
+            struct TensorROCmPackedWeightsCache
+            {
+                llaminar2::rocm::ROCmPackedWeights packed;
+            };
+
+            llaminar2::rocm::ROCmPackedWeights *
+            KernelFactory::ensureROCmPackedWeightsInTensorCache(const llaminar2::TensorBase *tensor)
+            {
+                // Check if tensor already has ROCm packed weights cached
+                TensorROCmPackedWeightsCache *packed_cache = nullptr;
+                if (tensor->rocm_cache_.has_value())
+                {
+                    try
+                    {
+                        packed_cache = std::any_cast<TensorROCmPackedWeightsCache *>(tensor->rocm_cache_);
+                        if (packed_cache)
+                        {
+                            return &packed_cache->packed;
+                        }
+                    }
+                    catch (const std::bad_any_cast &)
+                    {
+                        // rocm_cache_ contains something else - overwrite
+                    }
+                }
+
+                // Pack weights into tensor's rocm_cache_
+                auto *new_cache = new TensorROCmPackedWeightsCache();
+                if (!llaminar2::rocm::packWeightsToROCm(tensor, new_cache->packed))
+                {
+                    delete new_cache;
+                    LOG_ERROR("[KernelFactory] Failed to pack ROCm weights for tensor type "
+                              << static_cast<int>(tensor->native_type()));
+                    throw std::runtime_error("KernelFactory: failed to pack ROCm weights");
+                }
+
+                // Store in tensor's rocm_cache_ (tensor owns the packed data)
+                tensor->rocm_cache_ = new_cache;
+
+                LOG_DEBUG("[KernelFactory] Packed ROCm INT8 weights for tensor "
+                          << tensor << " (" << new_cache->packed.N << "x" << new_cache->packed.K << ")");
+
+                return &new_cache->packed;
+            }
+#endif
+
+            // NOTE: Shared device kernel caching (hipBLAS, cuBLAS handles, etc.)
+            // has been moved to DeviceKernelCache. See kernels/DeviceKernelCache.h
 
             llaminar2::ITensorGemm *KernelFactory::getOrCreateGemm(const llaminar2::TensorBase *tensor)
             {
@@ -2833,8 +2965,75 @@ namespace llaminar
 #ifdef HAVE_ROCM
                 if (target_device == DeviceType::ROCm)
                 {
-                    // NO FALLBACK: ROCm device-targeted kernels not yet implemented
-                    throw std::runtime_error("ROCm device-targeted GEMM kernels not yet implemented - no silent fallback to CPU");
+                    // For ROCm target, create ROCm kernel
+                    const auto *dispatch_tensor = tensor;
+
+                    // Handle TensorSlice - get inner tensor for type dispatch
+                    if (auto *slice = dynamic_cast<const llaminar2::TensorSlice *>(tensor))
+                    {
+                        if (!slice->supports_int8_unpack())
+                        {
+                            throw std::runtime_error(
+                                "TensorSlice of non-quantized type not supported on ROCm - no silent fallback to CPU");
+                        }
+                    }
+
+                    // Create ROCm kernel based on tensor type
+                    // Note: ROCmQuantisedGemmKernel handles many quantized types automatically
+                    // Use pre-packed weights from tensor cache for efficiency
+                    if (auto *t = dynamic_cast<const llaminar2::Q4_0Tensor *>(dispatch_tensor))
+                    {
+                        kernel = createGemm(t, target_device);
+                    }
+                    else if (auto *t = dynamic_cast<const llaminar2::IQ4_NLTensor *>(dispatch_tensor))
+                    {
+                        // IQ4_NL is supported by ROCmQuantisedGemmKernel - use pre-packed weights
+                        auto *packed = ensureROCmPackedWeightsInTensorCache(tensor);
+                        int rocm_device_id = getROCmDeviceIdForKernel(tensor);
+                        kernel = std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(packed, rocm_device_id);
+                    }
+                    else if (auto *t = dynamic_cast<const llaminar2::Q8_0Tensor *>(dispatch_tensor))
+                    {
+                        auto *packed = ensureROCmPackedWeightsInTensorCache(tensor);
+                        int rocm_device_id = getROCmDeviceIdForKernel(tensor);
+                        kernel = std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(packed, rocm_device_id);
+                    }
+                    else if (auto *t = dynamic_cast<const llaminar2::Q8_1Tensor *>(dispatch_tensor))
+                    {
+                        auto *packed = ensureROCmPackedWeightsInTensorCache(tensor);
+                        int rocm_device_id = getROCmDeviceIdForKernel(tensor);
+                        kernel = std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(packed, rocm_device_id);
+                    }
+                    else if (auto *t = dynamic_cast<const llaminar2::FP32Tensor *>(dispatch_tensor))
+                    {
+                        kernel = createGemm(t, target_device);
+                    }
+                    else if (auto *t = dynamic_cast<const llaminar2::FP16Tensor *>(dispatch_tensor))
+                    {
+                        kernel = createGemm(t, target_device);
+                    }
+                    else if (auto *t = dynamic_cast<const llaminar2::BF16Tensor *>(dispatch_tensor))
+                    {
+                        kernel = createGemm(t, target_device);
+                    }
+                    else
+                    {
+                        // Try using ROCmQuantisedGemmKernel for other quantized types
+                        // It supports IQ4_NL, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, and K-quants
+                        // Use pre-packed weights from tensor cache
+                        int rocm_device_id = getROCmDeviceIdForKernel(tensor);
+                        try
+                        {
+                            auto *packed = ensureROCmPackedWeightsInTensorCache(tensor);
+                            kernel = std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(packed, rocm_device_id);
+                        }
+                        catch (const std::exception &e)
+                        {
+                            throw std::runtime_error(
+                                "Tensor type " + std::to_string(static_cast<int>(tensor->native_type())) +
+                                " not supported on ROCm - no silent fallback to CPU: " + e.what());
+                        }
+                    }
                 }
 #endif
 
@@ -2864,6 +3063,32 @@ namespace llaminar
                 LOG_DEBUG("[KernelFactory] Cached device-targeted kernel: tensor="
                           << static_cast<const void *>(tensor) << " device=" << static_cast<int>(target_device));
                 return raw_ptr;
+            }
+
+            // =========================================================================
+            // getOrCreateGemm with DeviceId (extracts type AND ordinal)
+            // =========================================================================
+            llaminar2::ITensorGemm *KernelFactory::getOrCreateGemm(
+                const llaminar2::TensorBase *tensor,
+                llaminar2::DeviceId target_device)
+            {
+                DeviceType dev_type = getDeviceType(target_device);
+
+#ifdef HAVE_ROCM
+                // For ROCm: set the target ordinal so getROCmDeviceIdForKernel uses it
+                if (dev_type == DeviceType::ROCm)
+                {
+                    ROCmOrdinalGuard guard(target_device.rocm_ordinal());
+                    return getOrCreateGemm(tensor, dev_type);
+                }
+#endif
+
+#ifdef HAVE_CUDA
+                // TODO: Similar treatment for CUDA if needed
+#endif
+
+                // For CPU or if GPU-specific handling not needed, just delegate
+                return getOrCreateGemm(tensor, dev_type);
             }
 
             llaminar2::ITensorGemm *KernelFactory::getOrCreateGemmSliced(
@@ -2991,6 +3216,26 @@ namespace llaminar
                 }
 #endif
 
+#ifdef HAVE_ROCM
+                // Also clean up tensor's ROCm packed weights cache if present
+                if (tensor->rocm_cache_.has_value())
+                {
+                    try
+                    {
+                        auto *rocm_packed_cache = std::any_cast<TensorROCmPackedWeightsCache *>(tensor->rocm_cache_);
+                        if (rocm_packed_cache)
+                        {
+                            delete rocm_packed_cache; // ~ROCmPackedWeights frees device memory
+                            tensor->rocm_cache_.reset();
+                        }
+                    }
+                    catch (const std::bad_any_cast &)
+                    {
+                        // rocm_cache_ contains something else - leave it alone
+                    }
+                }
+#endif
+
                 // Clear any fused QKV kernels that reference this tensor
                 for (auto it = fused_qkv_cache_.begin(); it != fused_qkv_cache_.end();)
                 {
@@ -3075,6 +3320,26 @@ namespace llaminar
                             catch (const std::bad_any_cast &)
                             {
                                 // cuda_cache_ contains something else - leave it alone
+                            }
+                        }
+#endif
+
+#ifdef HAVE_ROCM
+                        // Clean up ROCm packed weights
+                        if (tensor->rocm_cache_.has_value())
+                        {
+                            try
+                            {
+                                auto *rocm_packed_cache = std::any_cast<TensorROCmPackedWeightsCache *>(tensor->rocm_cache_);
+                                if (rocm_packed_cache)
+                                {
+                                    delete rocm_packed_cache; // ~ROCmPackedWeights frees device memory
+                                    tensor->rocm_cache_.reset();
+                                }
+                            }
+                            catch (const std::bad_any_cast &)
+                            {
+                                // rocm_cache_ contains something else - leave it alone
                             }
                         }
 #endif
@@ -3386,10 +3651,92 @@ namespace llaminar
                     return device_idx >= 0;
                 }
 
+                // =============================================================
+                // IWorkspaceConsumer Implementation (forwards to both kernels)
+                // =============================================================
+
+                llaminar2::WorkspaceRequirements getWorkspaceRequirements(int m, int n, int k) const override
+                {
+                    // Aggregate requirements from both kernels
+                    llaminar2::WorkspaceRequirements combined;
+
+                    auto *gate_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(gemm_gate_);
+                    auto *up_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(gemm_up_);
+
+                    if (gate_consumer)
+                    {
+                        auto gate_reqs = gate_consumer->getWorkspaceRequirements(m, n, k);
+                        // Merge gate requirements into combined
+                        for (const auto &buf : gate_reqs.buffers)
+                        {
+                            combined.buffers.push_back(buf);
+                        }
+                    }
+                    if (up_consumer)
+                    {
+                        auto up_reqs = up_consumer->getWorkspaceRequirements(m, n, k);
+                        // Merge up requirements into combined
+                        for (const auto &buf : up_reqs.buffers)
+                        {
+                            combined.buffers.push_back(buf);
+                        }
+                    }
+
+                    return combined;
+                }
+
+                void bindWorkspace(llaminar2::DeviceWorkspaceManager *workspace) override
+                {
+                    // Forward to both underlying kernels
+                    auto *gate_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(gemm_gate_);
+                    auto *up_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(gemm_up_);
+
+                    if (gate_consumer)
+                    {
+                        gate_consumer->bindWorkspace(workspace);
+                        LOG_DEBUG("[FusedGateUpGemmAdapter] Bound workspace to gate kernel");
+                    }
+                    if (up_consumer)
+                    {
+                        up_consumer->bindWorkspace(workspace);
+                        LOG_DEBUG("[FusedGateUpGemmAdapter] Bound workspace to up kernel");
+                    }
+
+                    bound_workspace_ = workspace;
+                }
+
+                void unbindWorkspace() override
+                {
+                    auto *gate_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(gemm_gate_);
+                    auto *up_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(gemm_up_);
+
+                    if (gate_consumer)
+                    {
+                        gate_consumer->unbindWorkspace();
+                    }
+                    if (up_consumer)
+                    {
+                        up_consumer->unbindWorkspace();
+                    }
+
+                    bound_workspace_ = nullptr;
+                }
+
+                bool hasWorkspace() const override
+                {
+                    return bound_workspace_ != nullptr;
+                }
+
+                llaminar2::DeviceWorkspaceManager *getWorkspace() const override
+                {
+                    return bound_workspace_;
+                }
+
             private:
                 llaminar2::ITensorGemm *gemm_gate_;
                 llaminar2::ITensorGemm *gemm_up_;
                 DeviceType dev_type_;
+                llaminar2::DeviceWorkspaceManager *bound_workspace_ = nullptr;
             };
 
             std::unique_ptr<llaminar2::ITensorFusedGateUpGemm> KernelFactory::createFusedGateUpGemm(

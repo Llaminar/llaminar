@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
 #include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "execution/DeviceWorkspaceManager.h"
+#include "backends/DeviceId.h"
 #include <vector>
 #include <random>
 #include <cmath>
@@ -1233,4 +1235,236 @@ TEST(Test__QuantisedGemmKernel, MultiplyTensorINT8Activations)
         EXPECT_NEAR(C_act[i], C_ref[i], 3.0f) << "Mismatch at index " << i;
     }
     std::cout << "[INT8 GEMM] Max error: " << max_err << std::endl;
+}
+
+// =============================================================================
+// Workspace Parameter Tests
+// =============================================================================
+
+/**
+ * @brief Test that multiply() works with workspace=nullptr (existing behavior)
+ *
+ * CPU kernels don't use workspace, so nullptr should work fine.
+ */
+TEST(Test__QuantisedGemmKernel, Multiply_WithNullWorkspace_Succeeds)
+{
+    int M = 4;
+    int N = 64;
+    int K = 64;
+
+    // Create random weights (N x K)
+    std::vector<float> weights_fp32(N * K);
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto &x : weights_fp32)
+        x = dist(gen);
+
+    // Quantize weights to Q8_1Tensor
+    auto weights_tensor = Q8_1Tensor::quantize_from_fp32(weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
+    auto kernel = weights_tensor->createGemm();
+    ASSERT_NE(kernel, nullptr);
+
+    // Create random input A (M x K)
+    std::vector<float> A(M * K);
+    for (auto &x : A)
+        x = dist(gen);
+
+    // Create output buffer
+    std::vector<float> C(M * N, 0.0f);
+
+    // Call multiply with explicit workspace=nullptr
+    bool success = kernel->multiply(A.data(), C.data(), M, N, K, true, 1.0f, 0.0f, nullptr, -1, nullptr);
+    EXPECT_TRUE(success);
+
+    // Verify output is non-zero (kernel actually computed something)
+    float sum = 0.0f;
+    for (int i = 0; i < M * N; ++i)
+        sum += std::abs(C[i]);
+    EXPECT_GT(sum, 0.0f) << "Output should contain non-zero values";
+}
+
+/**
+ * @brief Test that multiply() works with a non-null workspace
+ *
+ * CPU kernels accept but ignore the workspace parameter.
+ * This tests that the parameter is accepted without error.
+ */
+TEST(Test__QuantisedGemmKernel, Multiply_WithWorkspace_Succeeds)
+{
+    int M = 4;
+    int N = 64;
+    int K = 64;
+
+    // Create random weights (N x K)
+    std::vector<float> weights_fp32(N * K);
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto &x : weights_fp32)
+        x = dist(gen);
+
+    // Quantize weights to Q8_1Tensor
+    auto weights_tensor = Q8_1Tensor::quantize_from_fp32(weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
+    auto kernel = weights_tensor->createGemm();
+    ASSERT_NE(kernel, nullptr);
+
+    // Create random input A (M x K)
+    std::vector<float> A(M * K);
+    for (auto &x : A)
+        x = dist(gen);
+
+    // Create output buffer
+    std::vector<float> C(M * N, 0.0f);
+
+    // Create a workspace manager for CPU
+    auto workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::cpu(), 1024 * 1024);
+    ASSERT_NE(workspace, nullptr);
+
+    // Call multiply with non-null workspace (CPU kernel should accept but ignore it)
+    bool success = kernel->multiply(A.data(), C.data(), M, N, K, true, 1.0f, 0.0f, nullptr, -1, workspace.get());
+    EXPECT_TRUE(success);
+
+    // Verify output is non-zero (kernel actually computed something)
+    float sum = 0.0f;
+    for (int i = 0; i < M * N; ++i)
+        sum += std::abs(C[i]);
+    EXPECT_GT(sum, 0.0f) << "Output should contain non-zero values";
+}
+
+/**
+ * @brief Test that multiply_tensor() works with workspace=nullptr (existing behavior)
+ */
+TEST(Test__QuantisedGemmKernel, MultiplyTensor_WithNullWorkspace_Succeeds)
+{
+    int M = 4;
+    int N = 128;
+    int K = 64;
+
+    // Create random weights (N x K)
+    std::vector<float> weights_fp32(N * K);
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto &x : weights_fp32)
+        x = dist(gen);
+
+    // Quantize weights to Q8_1Tensor
+    auto weights_tensor = Q8_1Tensor::quantize_from_fp32(weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
+    auto kernel = weights_tensor->createGemm();
+    ASSERT_NE(kernel, nullptr);
+
+    // Create random FP32 input tensor (M x K)
+    std::vector<float> A_data(M * K);
+    for (auto &x : A_data)
+        x = dist(gen);
+    auto A_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    std::memcpy(A_tensor->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+
+    // Create output tensor
+    auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+
+    // Call multiply_tensor with explicit workspace=nullptr
+    bool success = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), true, 1.0f, 0.0f, nullptr, -1, nullptr);
+    EXPECT_TRUE(success);
+
+    // Verify output is non-zero
+    const float *C_data = C_tensor->data();
+    float sum = 0.0f;
+    for (int i = 0; i < M * N; ++i)
+        sum += std::abs(C_data[i]);
+    EXPECT_GT(sum, 0.0f) << "Output should contain non-zero values";
+}
+
+/**
+ * @brief Test that multiply_tensor() works with a non-null workspace
+ *
+ * CPU kernels accept but ignore the workspace parameter.
+ */
+TEST(Test__QuantisedGemmKernel, MultiplyTensor_WithWorkspace_Succeeds)
+{
+    int M = 4;
+    int N = 128;
+    int K = 64;
+
+    // Create random weights (N x K)
+    std::vector<float> weights_fp32(N * K);
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto &x : weights_fp32)
+        x = dist(gen);
+
+    // Quantize weights to Q8_1Tensor
+    auto weights_tensor = Q8_1Tensor::quantize_from_fp32(weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
+    auto kernel = weights_tensor->createGemm();
+    ASSERT_NE(kernel, nullptr);
+
+    // Create random FP32 input tensor (M x K)
+    std::vector<float> A_data(M * K);
+    for (auto &x : A_data)
+        x = dist(gen);
+    auto A_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    std::memcpy(A_tensor->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+
+    // Create output tensor
+    auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+
+    // Create a workspace manager for CPU
+    auto workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::cpu(), 1024 * 1024);
+    ASSERT_NE(workspace, nullptr);
+
+    // Call multiply_tensor with non-null workspace (CPU kernel should accept but ignore it)
+    bool success = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), true, 1.0f, 0.0f, nullptr, -1, workspace.get());
+    EXPECT_TRUE(success);
+
+    // Verify output is non-zero
+    const float *C_data = C_tensor->data();
+    float sum = 0.0f;
+    for (int i = 0; i < M * N; ++i)
+        sum += std::abs(C_data[i]);
+    EXPECT_GT(sum, 0.0f) << "Output should contain non-zero values";
+}
+
+/**
+ * @brief Test that multiply_tensor() with explicit dims works with workspace
+ */
+TEST(Test__QuantisedGemmKernel, MultiplyTensorExplicitDims_WithWorkspace_Succeeds)
+{
+    int M = 4;
+    int N = 128;
+    int K = 64;
+
+    // Create random weights (N x K)
+    std::vector<float> weights_fp32(N * K);
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto &x : weights_fp32)
+        x = dist(gen);
+
+    // Quantize weights to Q8_1Tensor
+    auto weights_tensor = Q8_1Tensor::quantize_from_fp32(weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
+    auto kernel = weights_tensor->createGemm();
+    ASSERT_NE(kernel, nullptr);
+
+    // Create random FP32 input tensor (M x K)
+    std::vector<float> A_data(M * K);
+    for (auto &x : A_data)
+        x = dist(gen);
+    auto A_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    std::memcpy(A_tensor->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+
+    // Create output tensor
+    auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+
+    // Create a workspace manager for CPU
+    auto workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::cpu(), 1024 * 1024);
+    ASSERT_NE(workspace, nullptr);
+
+    // Call multiply_tensor with explicit dimensions and workspace
+    bool success = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K, true, 1.0f, 0.0f, nullptr, -1, workspace.get());
+    EXPECT_TRUE(success);
+
+    // Verify output is non-zero
+    const float *C_data = C_tensor->data();
+    float sum = 0.0f;
+    for (int i = 0; i < M * N; ++i)
+        sum += std::abs(C_data[i]);
+    EXPECT_GT(sum, 0.0f) << "Output should contain non-zero values";
 }

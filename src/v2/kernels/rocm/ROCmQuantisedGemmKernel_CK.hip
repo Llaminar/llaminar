@@ -130,6 +130,7 @@
 #include <cstdio>
 #include <cfloat>
 #include <cmath>
+#include <chrono>
 #include <iostream>
 #include <streambuf>
 
@@ -701,6 +702,52 @@ __global__ void applyScales_kernel(
 }
 
 // ============================================================================
+// Apply Scaling Kernel with Full Epilogue (alpha, beta, bias)
+// ============================================================================
+//
+// Full-featured scaling epilogue matching CUDA's apply_scaling_kernel:
+//   result = alpha * C_int32 * scale_A[m] * scale_B[n]
+//   if (beta != 0) result += beta * C_existing[idx]
+//   if (bias)      result += bias[n]
+//
+// Grid: ((N + 15) / 16, (M + 15) / 16, 1) blocks
+// Block: (16, 16, 1) threads
+//
+__global__ void applyScaling_full_kernel(
+    const int32_t* __restrict__ d_C_int32,  // [M×N] INT32 GEMM output
+    float* __restrict__ d_C_fp32,           // [M×N] FP32 output
+    const float* __restrict__ d_scale_A,    // [M] per-row scales
+    const float* __restrict__ d_scale_B,    // [N] per-column scales
+    int M, int N,
+    float alpha, float beta,
+    const float* __restrict__ d_C_existing, // [M×N] existing output (for beta != 0)
+    const float* __restrict__ d_bias)       // [N] optional bias, broadcasted across rows
+{
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (row < M && col < N)
+    {
+        const int idx = row * N + col;
+        const int32_t val_int32 = d_C_int32[idx];
+        const float scale_combined = d_scale_A[row] * d_scale_B[col];
+        float result = alpha * static_cast<float>(val_int32) * scale_combined;
+
+        if (beta != 0.0f && d_C_existing != nullptr)
+        {
+            result += beta * d_C_existing[idx];
+        }
+
+        if (d_bias != nullptr)
+        {
+            result += d_bias[col];
+        }
+
+        d_C_fp32[idx] = result;
+    }
+}
+
+// ============================================================================
 // STUBS: Phase 4 functions return success but log "not yet implemented"
 // ============================================================================
 
@@ -725,6 +772,51 @@ extern "C"
     bool rocmQuantGemm_areDimensionsSupported(int M, int N, int K)
     {
         return ck_dimensions_supported(M, N, K);
+    }
+
+    // -------------------------------------------------------------------------
+    // CK Kernel Warmup (Pre-initialization)
+    // -------------------------------------------------------------------------
+    //
+    // CK device objects are expensive to construct (5-10 seconds each on gfx906)
+    // because of:
+    //   - Template instantiation and LLVM IR generation
+    //   - GPU ISA compatibility checks
+    //   - Internal buffer allocation
+    //
+    // This function pre-initializes all 3 CK kernels (32x32, 64x64, 128x128)
+    // at startup to avoid blocking on first inference call.
+    //
+    // Call this from BackendManager::initROCmBackend() after device setup.
+    
+    void rocmQuantGemm_warmupKernels()
+    {
+        fprintf(stderr, "[CK Warmup] Pre-initializing CK INT8 GEMM kernels...\n");
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        // Force construction of all 3 kernel variants
+        // The static local initialization happens here
+        (void)getCachedNoScaleKernel32x32();  // 32x32 for decode (M <= 32)
+        
+        auto t1 = std::chrono::high_resolution_clock::now();
+        auto d1 = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - start).count();
+        fprintf(stderr, "[CK Warmup]   32x32 kernel: %ld ms\n", d1);
+        
+        (void)getCachedNoScaleKernel64x64();  // 64x64 for small batch (32 < M < 128)
+        
+        auto t2 = std::chrono::high_resolution_clock::now();
+        auto d2 = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+        fprintf(stderr, "[CK Warmup]   64x64 kernel: %ld ms\n", d2);
+        
+        (void)getCachedNoScaleKernel();       // 128x128 for prefill (M >= 128)
+        
+        auto t3 = std::chrono::high_resolution_clock::now();
+        auto d3 = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+        auto total = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - start).count();
+        
+        fprintf(stderr, "[CK Warmup]   128x128 kernel: %ld ms\n", d3);
+        fprintf(stderr, "[CK Warmup] All CK kernels initialized in %ld ms\n", total);
     }
 
     // -------------------------------------------------------------------------
@@ -767,6 +859,14 @@ extern "C"
                     hipGetErrorString(err));
             return false;
         }
+        // CRITICAL: Verify hipMalloc actually allocated memory
+        if (*d_weights_int8 == nullptr)
+        {
+            fprintf(stderr, "[rocmQuantGemm_uploadWeights] CRITICAL: hipMalloc returned success but pointer is NULL! "
+                    "(bytes=%zu K=%d N=%d device=%d)\n",
+                    weight_bytes, K, N, rocm_device_id);
+            return false;
+        }
 
         // Allocate device memory for scales
         size_t scale_bytes = static_cast<size_t>(N) * sizeof(float);
@@ -788,8 +888,10 @@ extern "C"
             hipFree(*d_scales_B);
             *d_weights_int8 = nullptr;
             *d_scales_B = nullptr;
-            fprintf(stderr, "[rocmQuantGemm_uploadWeights] hipMemcpy weights failed: %s\n",
-                    hipGetErrorString(err));
+            fprintf(stderr, "[rocmQuantGemm_uploadWeights] hipMemcpy weights failed: %s "
+                    "(src=%p dst=%p bytes=%zu K=%d N=%d device=%d)\n",
+                    hipGetErrorString(err), (void*)h_weights_int8, (void*)*d_weights_int8,
+                    weight_bytes, K, N, rocm_device_id);
             return false;
         }
 
@@ -1360,6 +1462,155 @@ extern "C"
     }
 
     // =========================================================================
+    // M-PADDED TWO-KERNEL CK APPROACH WITH CACHED BUFFERS (ALLOCATION-FREE)
+    // =========================================================================
+    //
+    // rocmQuantGemm_executeTwoKernel_padded_cached - Same as padded but with pre-allocated buffers
+    //
+    // This is the HOT-PATH version that uses pre-allocated padding buffers
+    // passed by the caller, avoiding hipMalloc/hipFree which can take seconds on ROCm.
+    //
+    // The caller is responsible for ensuring the buffers are large enough:
+    //   - d_A_padded: [padded_m × K] bytes
+    //   - d_scale_A_padded: [padded_m] floats
+    //   - d_E_padded: [padded_m × N] floats
+    //
+    // =========================================================================
+    bool rocmQuantGemm_executeTwoKernel_padded_cached(
+        const int8_t *d_A_int8,       // [M × K] INT8 activations (row-major)
+        const int8_t *d_B_int8,       // [N × K] INT8 weights (row-major, viewed as [K × N] col-major)
+        float *d_E_fp32,              // [M × N] FP32 output (only first M rows written)
+        const float *d_scale_A,       // [M] per-row activation scales
+        const float *d_scale_B,       // [N] per-column weight scales
+        int32_t *d_C_int32,           // [padded_m × N] Pre-allocated INT32 accumulator
+        int8_t *d_A_padded,           // [padded_m × K] Pre-allocated padded activations
+        float *d_scale_A_padded,      // [padded_m] Pre-allocated padded scales
+        float *d_E_padded,            // [padded_m × N] Pre-allocated padded output
+        int M,                        // Actual M (output rows needed)
+        int padded_m,                 // Padded M for CK (>= CK_SMALL_MIN_M = 8)
+        int N, int K,
+        int rocm_device_id)
+    {
+        if (M <= 0 || N <= 0 || K <= 0)
+            return true;
+
+        if (!d_C_int32 || !d_A_padded || !d_scale_A_padded || !d_E_padded)
+        {
+            fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] Null buffer\n");
+            return false;
+        }
+
+        if (padded_m < M)
+        {
+            fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] padded_m (%d) < M (%d)\n", padded_m, M);
+            return false;
+        }
+
+        hipError_t err;
+
+        // 1. Zero-initialize the padded activation buffer (padding rows will be zeros)
+        err = hipMemsetAsync(d_A_padded, 0, static_cast<size_t>(padded_m) * K * sizeof(int8_t), nullptr);
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] Failed to zero padded A: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+
+        // Copy actual activations into first M rows (async)
+        err = hipMemcpyAsync(d_A_padded, d_A_int8, static_cast<size_t>(M) * K * sizeof(int8_t), 
+                             hipMemcpyDeviceToDevice, nullptr);
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] Failed to copy A to padded: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+
+        // 2. Copy actual scales and fill padding with 1.0 (neutral scale)
+        err = hipMemcpyAsync(d_scale_A_padded, d_scale_A, static_cast<size_t>(M) * sizeof(float), 
+                             hipMemcpyDeviceToDevice, nullptr);
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] Failed to copy scales: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+
+        // Fill padding scales with 1.0 on host then copy (small buffer, ok to sync)
+        if (padded_m > M)
+        {
+            std::vector<float> padding_scales(padded_m - M, 1.0f);
+            err = hipMemcpy(d_scale_A_padded + M, padding_scales.data(),
+                           (padded_m - M) * sizeof(float), hipMemcpyHostToDevice);
+            if (err != hipSuccess)
+            {
+                fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] Failed to fill padding scales: %s\n",
+                        hipGetErrorString(err));
+                return false;
+            }
+        }
+
+        // 3. Run CK INT8 GEMM on padded dimensions: C_int32 = A_padded × B (no scaling)
+        if (!rocmQuantGemm_executeNoScale(d_A_padded, d_B_int8, d_C_int32, padded_m, N, K, rocm_device_id))
+        {
+            fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] CK NoScale GEMM failed\n");
+            return false;
+        }
+
+        // 4. Apply scales to full padded output: E_padded[m,n] = C_int32[m,n] * scale_A_padded[m] * scale_B[n]
+        const int total_padded = padded_m * N;
+        const int block_size = 256;
+        const int grid_size = (total_padded + block_size - 1) / block_size;
+
+        hipLaunchKernelGGL(
+            applyScales_kernel,
+            dim3(grid_size), dim3(block_size), 0, 0,
+            d_C_int32, d_E_padded, d_scale_A_padded, d_scale_B, padded_m, N);
+
+        err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] applyScales_kernel failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+
+        // 5. Extract first M rows of padded output to actual output (async)
+        //    E_fp32[M × N] = E_padded[0:M, :]
+        err = hipMemcpyAsync(d_E_fp32, d_E_padded, static_cast<size_t>(M) * N * sizeof(float), 
+                             hipMemcpyDeviceToDevice, nullptr);
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] Failed to extract output: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+
+        // No cleanup needed - buffers are caller-owned!
+        return true;
+    }
+
+    // =========================================================================
+    // INT8 ALLOCATION HELPER
+    // =========================================================================
+    
+    bool rocmQuantGemm_allocInt8(int8_t **d_ptr, size_t count, int rocm_device_id)
+    {
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+            return false;
+
+        hipError_t err = hipMalloc(d_ptr, count * sizeof(int8_t));
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_allocInt8] hipMalloc failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    // =========================================================================
     // ACTIVATION QUANTIZATION (FP32 → INT8)
     // =========================================================================
     //
@@ -1655,6 +1906,133 @@ extern "C"
         // Cleanup events
         hipEventDestroy(start);
         hipEventDestroy(stop);
+
+        return true;
+    }
+
+    // =========================================================================
+    // APPLY SCALING WITH FULL EPILOGUE (alpha, beta, bias)
+    // =========================================================================
+    //
+    // rocmQuantGemm_applyScaling - Matches CUDA's cudaQuantGemm_applyScaling API
+    //
+    // Full-featured scaling epilogue for INT32→FP32 conversion:
+    //   result = alpha * C_int32[m,n] * scale_A[m] * scale_B[n]
+    //   if (beta != 0) result += beta * C_existing[m,n]
+    //   if (bias)      result += bias[n]
+    //
+    // =========================================================================
+    bool rocmQuantGemm_applyScaling(
+        const int32_t *d_C_int32,    // [M×N] INT32 GEMM output
+        float *d_C_fp32,             // [M×N] FP32 output
+        const float *d_scales_A,     // [M] per-row scales
+        const float *d_scales_B,     // [N] per-column scales
+        int M, int N,
+        float alpha, float beta,
+        const float *d_C_existing,   // For beta != 0 (nullable)
+        const float *d_bias,         // [N] optional bias (nullable)
+        int rocm_device_id)
+    {
+        // Validate required pointers
+        if (!d_C_int32 || !d_C_fp32 || !d_scales_A || !d_scales_B)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyScaling] Null pointer: "
+                    "d_C_int32=%p d_C_fp32=%p d_scales_A=%p d_scales_B=%p\n",
+                    (void *)d_C_int32, (void *)d_C_fp32,
+                    (void *)d_scales_A, (void *)d_scales_B);
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+            return false;
+
+        // Use 16×16 thread blocks for 2D grid (matches CUDA)
+        dim3 block(16, 16);
+        dim3 grid((N + 15) / 16, (M + 15) / 16);
+
+        hipLaunchKernelGGL(
+            applyScaling_full_kernel,
+            grid, block, 0, 0,
+            d_C_int32, d_C_fp32, d_scales_A, d_scales_B,
+            M, N, alpha, beta, d_C_existing, d_bias);
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyScaling] applyScaling_full_kernel launch failed: %s "
+                    "(M=%d, N=%d)\n", hipGetErrorString(err), M, N);
+            return false;
+        }
+
+        err = hipDeviceSynchronize();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyScaling] hipDeviceSynchronize failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+
+        return true;
+    }
+
+    // =========================================================================
+    // IN-PLACE BIAS ADDITION KERNEL
+    // =========================================================================
+    //
+    // Simple bias addition: output[m,n] += bias[n]
+    // Broadcasts bias across rows.
+    //
+    // =========================================================================
+    __global__ void biasAdd_kernel(float *output, const float *bias, int M, int N)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= M * N)
+            return;
+        
+        const int col = idx % N;
+        output[idx] += bias[col];
+    }
+
+    bool rocmQuantGemm_biasAdd(
+        float *d_output,       // [M × N] FP32 output (modified in-place)
+        const float *d_bias,   // [N] bias vector
+        int M, int N,
+        int rocm_device_id)
+    {
+        if (!d_output || !d_bias)
+        {
+            fprintf(stderr, "[rocmQuantGemm_biasAdd] Null pointer: d_output=%p d_bias=%p\n",
+                    (void *)d_output, (void *)d_bias);
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+            return false;
+
+        const int total = M * N;
+        const int block_size = 256;
+        const int grid_size = (total + block_size - 1) / block_size;
+
+        hipLaunchKernelGGL(
+            biasAdd_kernel,
+            dim3(grid_size), dim3(block_size), 0, 0,
+            d_output, d_bias, M, N);
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_biasAdd] biasAdd_kernel launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+
+        err = hipDeviceSynchronize();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_biasAdd] hipDeviceSynchronize failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
 
         return true;
     }

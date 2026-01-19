@@ -1,0 +1,194 @@
+/**
+ * @file ROCmResidualAddKernels.hip
+ * @brief ROCm/HIP Residual Add kernel implementations
+ *
+ * Provides FP32, BF16, and FP16 element-wise addition kernels for AMD GPUs.
+ * Used in transformer residual connections: output = input + residual
+ */
+
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <cstdint>
+#include <cstdio>
+
+namespace {
+
+// ============================================================================
+// BF16 Conversion Helpers
+// ============================================================================
+
+__device__ __forceinline__ float bf16_to_float(uint16_t bf16)
+{
+    uint32_t bits = static_cast<uint32_t>(bf16) << 16;
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+__device__ __forceinline__ uint16_t float_to_bf16(float f)
+{
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(float));
+    // Round to nearest even (add 0x7FFF + bit 16)
+    bits += 0x7FFF + ((bits >> 16) & 1);
+    return static_cast<uint16_t>(bits >> 16);
+}
+
+// ============================================================================
+// FP16 Conversion Helpers
+// ============================================================================
+
+__device__ __forceinline__ float fp16_to_float(uint16_t fp16)
+{
+    return __half2float(*reinterpret_cast<const __half*>(&fp16));
+}
+
+__device__ __forceinline__ uint16_t float_to_fp16(float f)
+{
+    __half h = __float2half(f);
+    return *reinterpret_cast<uint16_t*>(&h);
+}
+
+} // anonymous namespace
+
+// ============================================================================
+// FP32 Residual Add Kernel
+// ============================================================================
+
+__global__ void rocm_residual_add_fp32_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ residual,
+    float* __restrict__ output,
+    int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size)
+    {
+        output[idx] = input[idx] + residual[idx];
+    }
+}
+
+// ============================================================================
+// BF16 Residual Add Kernel (FP32 computation with BF16 I/O)
+// ============================================================================
+
+__global__ void rocm_residual_add_bf16_kernel(
+    const uint16_t* __restrict__ input,
+    const uint16_t* __restrict__ residual,
+    uint16_t* __restrict__ output,
+    int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size)
+    {
+        float in_f = bf16_to_float(input[idx]);
+        float res_f = bf16_to_float(residual[idx]);
+        output[idx] = float_to_bf16(in_f + res_f);
+    }
+}
+
+// ============================================================================
+// FP16 Residual Add Kernel (FP32 computation with FP16 I/O)
+// ============================================================================
+
+__global__ void rocm_residual_add_fp16_kernel(
+    const uint16_t* __restrict__ input,
+    const uint16_t* __restrict__ residual,
+    uint16_t* __restrict__ output,
+    int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size)
+    {
+        float in_f = fp16_to_float(input[idx]);
+        float res_f = fp16_to_float(residual[idx]);
+        output[idx] = float_to_fp16(in_f + res_f);
+    }
+}
+
+// ============================================================================
+// Extern "C" Wrapper Functions
+// ============================================================================
+
+extern "C"
+{
+
+bool rocmOps_residual_add_fp32(
+    const float* input,
+    const float* residual,
+    float* output,
+    int size,
+    int device_idx)
+{
+    hipSetDevice(device_idx);
+
+    int threads_per_block = 256;
+    int num_blocks = (size + threads_per_block - 1) / threads_per_block;
+
+    hipLaunchKernelGGL(
+        rocm_residual_add_fp32_kernel,
+        dim3(num_blocks), dim3(threads_per_block), 0, 0,
+        input, residual, output, size);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "ROCm Residual Add FP32 kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_residual_add_bf16(
+    const uint16_t* input,
+    const uint16_t* residual,
+    uint16_t* output,
+    int size,
+    int device_idx)
+{
+    hipSetDevice(device_idx);
+
+    int threads_per_block = 256;
+    int num_blocks = (size + threads_per_block - 1) / threads_per_block;
+
+    hipLaunchKernelGGL(
+        rocm_residual_add_bf16_kernel,
+        dim3(num_blocks), dim3(threads_per_block), 0, 0,
+        input, residual, output, size);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "ROCm Residual Add BF16 kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_residual_add_fp16(
+    const uint16_t* input,
+    const uint16_t* residual,
+    uint16_t* output,
+    int size,
+    int device_idx)
+{
+    hipSetDevice(device_idx);
+
+    int threads_per_block = 256;
+    int num_blocks = (size + threads_per_block - 1) / threads_per_block;
+
+    hipLaunchKernelGGL(
+        rocm_residual_add_fp16_kernel,
+        dim3(num_blocks), dim3(threads_per_block), 0, 0,
+        input, residual, output, size);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "ROCm Residual Add FP16 kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+} // extern "C"
