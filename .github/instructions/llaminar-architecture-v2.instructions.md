@@ -1067,120 +1067,257 @@ class IUnifiedKVCache {
 
 Location: `src/v2/tensors/cpu/CPUTensors.h`, `src/v2/execution/StageCoherence.h`, `src/v2/execution/GpuCoherence.h`
 
-Llaminar uses a **coherence protocol** to manage tensor data movement between host (CPU) and device (GPU) memory. Each `CPUTensorBase` tracks whether the authoritative data resides on CPU or GPU.
+Llaminar uses a **dual-validity coherence protocol** to manage tensor data movement between host (CPU) and device (GPU) memory. Each `CPUTensorBase` tracks two independent validity flags: `host_valid_` and `device_valid_`.
 
 #### Coherence State Machine
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │        TENSOR COHERENCE STATE       │
-                    └─────────────────────────────────────┘
-                                    │
-        ┌───────────────────────────┼───────────────────────────┐
-        ▼                           ▼                           ▼
-┌───────────────┐         ┌───────────────┐         ┌───────────────┐
-│ CPU_AUTHORITATIVE │     │ GPU_AUTHORITATIVE │     │ NEVER_UPLOADED │
-│ (default)     │         │               │         │               │
-└───────────────┘         └───────────────┘         └───────────────┘
-        │                         │                         │
-        │ ensureOnDevice()        │ data()                  │ ensureOnDevice()
-        │ [uploads to GPU]        │ [syncs from GPU]        │ [allocates + uploads]
-        ▼                         ▼                         ▼
-┌───────────────┐         ┌───────────────┐         ┌───────────────┐
-│ GPU has copy  │         │ CPU updated   │         │ GPU has copy  │
-│ CPU authoritative│      │ CPU authoritative│      │ CPU authoritative│
-└───────────────┘         └───────────────┘         └───────────────┘
-        │
-        │ mark_device_dirty()
-        │ [after GPU kernel writes]
-        ▼
-┌───────────────┐
-│ GPU AUTHORITATIVE │
-│ (CPU stale)   │
-└───────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                      TENSOR COHERENCE STATE MACHINE                              │
+│                                                                                  │
+│  Two independent validity flags: host_valid_ and device_valid_                   │
+│  A tensor can be valid on both, either, or neither location.                    │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    ┌────────────────────┐                    ┌────────────────────┐
+    │   INITIAL STATE    │                    │   MAPPED MEMORY    │
+    │  host_valid = true │                    │  (Zero-Copy Mode)  │
+    │  device_valid = false                   │                    │
+    │  gpu_data_ptr = nullptr                 │  host_valid = true │
+    └─────────┬──────────┘                    │  device_valid = true
+              │                               │  (always both)     │
+              │ ensureOnDevice()              └────────────────────┘
+              │ [pins host memory]
+              │ [allocates GPU buffer]
+              │ [uploads data]
+              ▼
+    ┌────────────────────┐
+    │   BOTH VALID       │
+    │  host_valid = true │  ←─────────────────────────────────────┐
+    │  device_valid = true                                        │
+    │  gpu_data_ptr = 0x...                                       │
+    └─────────┬──────────┘                                        │
+              │                                                   │
+              │ mark_device_dirty()                               │
+              │ [after GPU kernel writes]                         │
+              ▼                                                   │
+    ┌────────────────────┐                                        │
+    │   GPU AUTHORITATIVE│                                        │
+    │  host_valid = false│                                        │
+    │  device_valid = true                                        │
+    └─────────┬──────────┘                                        │
+              │                                                   │
+              │ data() or ensureOnHost()                          │
+              │ [downloads from GPU]                              │
+              │ [waits on completion event if set]                │
+              └───────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────────────────┐
+    │  DESTRUCTOR (~CPUTensorBase):                                                │
+    │    1. freeMappedMemory() - if using zero-copy                               │
+    │    2. Free GPU buffer via IBackend::free() - if gpu_data_ptr_ != nullptr    │
+    │    3. Destroy completion event - if device_completion_event_ exists          │
+    │    4. unpinHostMemory() - if host_pinned_ == true                           │
+    │    5. Clear kernel cache entry                                               │
+    └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Internal State Variables
+
+```cpp
+class CPUTensorBase {
+protected:
+    // ===== Coherence State =====
+    bool host_valid_ = true;          // Host buffer contains valid data
+    bool device_valid_ = false;       // GPU buffer contains valid data
+    void* gpu_data_ptr_ = nullptr;    // GPU buffer pointer (nullptr if not allocated)
+    std::optional<DeviceId> gpu_device_;  // Which GPU owns the buffer
+    
+    // ===== Pinned Memory (for fast GPU transfers) =====
+    bool host_pinned_ = false;        // True if host buffer is page-locked
+    size_t pinned_bytes_ = 0;         // Size of pinned region
+    void* pinned_host_ptr_ = nullptr; // Pointer used when pinning (for destructor)
+    
+    // ===== Mapped Memory (zero-copy) =====
+    bool is_mapped_ = false;          // True if using shared host/device memory
+    void* mapped_ptr_ = nullptr;      // Mapped memory pointer
+    
+    // ===== Fine-Grained Sync =====
+    void* device_completion_event_ = nullptr;  // CUDA/HIP event for async sync
+};
 ```
 
 #### Core CPUTensorBase Methods
 
 ```cpp
 class CPUTensorBase {
-    // Upload tensor to GPU (allocates device buffer on first call)
-    // Returns false if upload fails
+public:
+    // ===== Device Coherence =====
+    
+    // Upload tensor to GPU (lazy-allocates GPU buffer, pins host memory)
+    // First call: pins host → allocates GPU buffer → uploads
+    // Subsequent calls: uploads if host_valid_ && !device_valid_
     bool ensureOnDevice(DeviceId device);
     
-    // Mark GPU as having authoritative data (MUST call after GPU kernel writes)
+    // Download from GPU to host (if device_valid_ && !host_valid_)
+    // Waits on completion event if set (fine-grained sync)
+    bool ensureOnHost();
+    
+    // Mark GPU as having authoritative data
+    // Sets device_valid_ = true, host_valid_ = false (unless mapped)
     void mark_device_dirty();
     
-    // Get host data pointer - if GPU is authoritative, syncs from GPU first
+    // Mark GPU dirty AND record a completion event for fine-grained sync
+    void mark_device_dirty_with_event();
+    
+    // ===== Data Access (Coherence-Aware) =====
+    
+    // Returns host pointer - calls ensureOnHost() if device_valid_ && !host_valid_
     const float* data();
-    float* mutable_data();  // Also marks CPU as authoritative
     
-    // Query device placement
-    DeviceId current_device() const;       // Where data currently resides
-    bool is_device_dirty() const;          // True if GPU is authoritative
+    // Returns mutable host pointer - also sets host_valid_ = true
+    float* mutable_data();
+    
+    // ===== Query Methods =====
+    
+    void* gpu_data_ptr();              // Raw GPU buffer pointer (nullptr if not on GPU)
+    bool isOnGPU() const;              // True if gpu_data_ptr_ != nullptr
+    bool isOnCPU() const;              // True if host_valid_
+    bool isDeviceValid() const;        // True if device_valid_ && gpu_data_ptr_
+    bool isMapped() const;             // True if using zero-copy memory
+    
+    // ===== Lifecycle =====
+    
+    bool releaseDeviceMemory();        // Download if needed, then free GPU buffer
+    void invalidateGpuData();          // Free GPU buffer without downloading
 };
 ```
 
-#### ITensor Interface (Virtual)
+#### Automatic Coherence via GraphExecutor
 
-Location: `src/v2/tensors/ITensor.h`
+Location: `src/v2/execution/GraphExecutor.cpp`, `src/v2/execution/StageCoherence.h`
 
-The abstract `ITensor` interface exposes device management virtualized:
-
-```cpp
-class ITensor {
-    // Device management (virtual - overridden by CPUTensorBase)
-    virtual DeviceId device_id() const = 0;
-    virtual bool ensureOnDevice(DeviceId target) = 0;
-    virtual void mark_device_dirty() = 0;
-};
-```
-
-This allows polymorphic device management across all tensor types.
-
-#### Automatic Coherence via StageCoherence
-
-Location: `src/v2/execution/StageCoherence.h`
-
-When using `GraphExecutor`, coherence is handled **automatically** at stage boundaries:
+The `GraphExecutor` handles coherence **automatically** at stage boundaries using the stage's `coherencePolicy()`:
 
 ```cpp
-// GraphExecutor stage execution flow
-void GraphExecutor::executeStage(const ComputeNode& node) {
-    // 1. ENTRY: Upload inputs to GPU
-    if (policy == FULL || policy == INPUT) {
-        StageCoherence::ensureInputsOnDevice(node.stage, device_);
+// GraphExecutor stage execution flow (simplified)
+bool GraphExecutor::executeStage(const ComputeNode& node) {
+    CoherencePolicy policy = node.stage->coherencePolicy();
+    auto dump_info = node.stage->getDumpInfo();
+    
+    // 1. ENTRY: Cohere inputs to GPU
+    if (policy == CoherencePolicy::INPUT || policy == CoherencePolicy::FULL) {
+        auto inputs = extractInputBuffers(dump_info);
+        cohereInputs(inputs, target_device);      // ensureOnDevice() on each
+        
+        auto weights = extractWeightBuffers(dump_info);
+        cohereInputs(weights, target_device);     // Weights are read-only inputs
     }
     
-    // 2. EXECUTE: Run the kernel
-    node.stage->execute();
-    
-    // 3. EXIT: Mark outputs as GPU-authoritative
-    if (policy == FULL || policy == OUTPUT) {
-        StageCoherence::markOutputsDirty(node.stage);
+    // 2. ENTRY: Allocate GPU buffers for outputs (CRITICAL for GPU kernels)
+    if (policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL) {
+        auto outputs = extractOutputBuffers(dump_info);
+        cohereOutputs(outputs, target_device);    // ensureOnDevice() to allocate
     }
+    
+    // 3. EXECUTE: Run the kernel
+    bool success = node.stage->execute();
+    
+    // 4. EXIT: Mark outputs as GPU-authoritative
+    if (policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL) {
+        auto outputs = extractOutputBuffers(dump_info);
+        markOutputsDirty(outputs);                // mark_device_dirty() on each
+    }
+    
+    return success;
 }
 ```
 
+**Key Insight: `cohereOutputs()` vs `cohereInputs()`**
+
+Both call `ensureOnDevice()`, but serve different purposes:
+- **`cohereInputs()`**: Upload data that the kernel will READ
+- **`cohereOutputs()`**: Allocate GPU buffer that the kernel will WRITE TO
+
+For GPU execution, outputs MUST have their GPU buffers allocated BEFORE the kernel runs, otherwise the kernel has nowhere to write results. This is why `CoherencePolicy::FULL` is the default for most stages - it ensures both inputs are uploaded AND outputs are allocated.
+
 **CoherencePolicy Enum:**
 
-| Policy | Entry Behavior | Exit Behavior |
-|--------|----------------|---------------|
-| `FULL` (default) | Upload inputs | Mark outputs dirty |
-| `INPUT` | Upload inputs | No-op |
-| `OUTPUT` | No-op | Mark outputs dirty |
-| `NONE` | No-op | No-op |
+| Policy | Entry: Inputs | Entry: Outputs | Exit |
+|--------|---------------|----------------|------|
+| `FULL` (default) | Upload inputs + weights | Allocate output buffers | Mark outputs dirty |
+| `INPUT` | Upload inputs + weights | No allocation | No-op |
+| `OUTPUT` | No upload | Allocate output buffers | Mark outputs dirty |
+| `NONE` | No-op | No-op | No-op |
 
-Stages declare their policy via `coherencePolicy()`:
+**When to Use Each Policy:**
 
 ```cpp
 class GEMMStage : public IComputeStage {
+    // FULL (default): Most compute stages
+    CoherencePolicy coherencePolicy() const override { return CoherencePolicy::FULL; }
+};
+
+class LMHeadStage : public IComputeStage {
+    // FULL: Needs GPU buffer for logits output, reads hidden state input
     CoherencePolicy coherencePolicy() const override { return CoherencePolicy::FULL; }
 };
 
 class AllreduceStage : public IComputeStage {
-    CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }  // MPI handles sync
+    // NONE: MPI collective manages its own synchronization
+    CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
 };
+
+class ResidualAddStage : public IComputeStage {
+    // FULL: In-place operation still needs input on GPU, output marked dirty
+    CoherencePolicy coherencePolicy() const override { return CoherencePolicy::FULL; }
+};
+```
+
+#### Pinned Host Memory
+
+For optimal GPU transfer performance, `CPUTensorBase` lazily pins host memory on first GPU upload:
+
+```cpp
+bool CPUTensorBase::ensureOnDevice(DeviceId device) {
+    // 1. Pin host memory (first time only) - enables DMA transfers
+    if (!host_pinned_) {
+        ensureHostPinned();  // cudaHostRegister / hipHostRegister
+    }
+    
+    // 2. Allocate GPU buffer (first time only)
+    if (!gpu_data_ptr_) {
+        gpu_data_ptr_ = backend->allocate(byte_size(), device.gpu_ordinal());
+    }
+    
+    // 3. Upload if host is newer than device
+    if (host_valid_ && !device_valid_) {
+        backend->hostToDevice(gpu_data_ptr_, raw_host_data_ptr(), byte_size(), ...);
+        device_valid_ = true;
+    }
+    
+    return true;
+}
+```
+
+**Pinned Memory Lifecycle:**
+- Pinned lazily on first `ensureOnDevice()` call
+- Unpinned in destructor (`unpinHostMemory()`)
+- Stored in `pinned_host_ptr_` for proper cleanup even if tensor is reallocated
+
+#### Mapped Memory (Zero-Copy)
+
+For tensors where GPU reads/writes directly to host memory via PCIe:
+
+```cpp
+// Allocate mapped memory (shared host/device)
+bool initMappedMemory(size_t bytes, DeviceId target_device);
+
+// When mapped:
+// - ensureOnDevice() and ensureOnHost() are no-ops
+// - Both host_valid_ and device_valid_ are always true
+// - mark_device_dirty() keeps both valid (shared memory)
+// - GPU reads/writes directly via PCIe BAR
 ```
 
 #### Manual Coherence Utilities
@@ -1192,11 +1329,11 @@ For tests and custom pipelines that bypass GraphExecutor, use RAII utilities:
 ```cpp
 #include "execution/GpuCoherence.h"
 
-// Pattern 1: Lambda wrapper (preferred for complex cases)
+// Pattern 1: Lambda wrapper (preferred - handles both inputs and outputs)
 bool ok = with_gpu_coherence(
     gpu_device,
     {input.get()},                           // inputs to upload
-    {output_q.get(), output_k.get()},        // outputs to upload + mark dirty
+    {output_q.get(), output_k.get()},        // outputs to allocate + mark dirty
     [&] {
         return kernel->multiply_fused(input.get(), projections, M, K);
     });
@@ -1214,6 +1351,24 @@ bool ok = with_gpu_coherence(
 }  // ← weights NOT marked dirty (read-only)
 ```
 
+**Anti-Pattern (WRONG):**
+
+```cpp
+// ❌ BAD: Forgetting to allocate output GPU buffer
+input->ensureOnDevice(gpu);
+// output->ensureOnDevice(gpu);  // MISSING! Kernel has nowhere to write!
+kernel->compute(input->gpu_data_ptr(), output->gpu_data_ptr(), ...);  // CRASH: output->gpu_data_ptr() == nullptr
+
+// ❌ BAD: Forgetting to mark output dirty
+input->ensureOnDevice(gpu);
+output->ensureOnDevice(gpu);
+kernel->compute(...);
+// output->mark_device_dirty();  // MISSING! Host thinks its data is still valid
+const float* result = output->data();  // Returns STALE host data!
+
+// ✅ CORRECT: Use with_gpu_coherence() or GpuOutput RAII
+```
+
 **C++20 Concept:**
 
 ```cpp
@@ -1223,6 +1378,20 @@ concept CoherableTensor = requires(T *t, DeviceId d) {
     { t->mark_device_dirty() } -> std::same_as<void>;
 };
 ```
+
+#### Fine-Grained Synchronization
+
+For optimal performance, use event-based synchronization instead of full device sync:
+
+```cpp
+// After GPU kernel writes to tensor:
+tensor->mark_device_dirty_with_event();  // Records completion event
+
+// Later, when reading on host:
+tensor->data();  // Waits on just this tensor's event, not full device sync
+```
+
+This is especially useful when multiple kernels run concurrently - each tensor tracks its own completion status.
 
 ---
 
