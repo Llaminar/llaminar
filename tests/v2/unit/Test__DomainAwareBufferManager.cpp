@@ -15,7 +15,7 @@
 #include "config/LayerPlacementConfig.h"
 #include "memory/NUMAAllocator.h"
 #include "backends/DeviceId.h"
-#include "tensors/cpu/CPUTensors.h"
+#include "tensors/TensorClasses.h"
 
 using namespace llaminar2;
 

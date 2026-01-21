@@ -33,8 +33,7 @@ namespace llaminar2
 
     // Forward declarations
     class ITensor;
-    class CPUTensorBase;
-    using TensorBase = CPUTensorBase;
+    class TensorBase;
     struct StageDumpInfo;
 
     /**
@@ -71,7 +70,7 @@ namespace llaminar2
      * @brief Ensure all input tensors are on the target device
      *
      * Calls ensureOnDevice() on each input tensor that supports device coherence.
-     * Tensors must be CPUTensorBase (or derived) to support coherence operations.
+     * Tensors must be TensorBase (or derived) to support coherence operations.
      *
      * @param inputs Vector of input buffers with tensor pointers
      * @param target_device Target device for execution

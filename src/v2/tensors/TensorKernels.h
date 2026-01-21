@@ -21,8 +21,7 @@ namespace llaminar2
 {
     // Forward declarations
     class ITensor; // Device-agnostic tensor interface
-    class CPUTensorBase;
-    using TensorBase = CPUTensorBase; // Backward compatibility alias
+    class TensorBase;
     struct Q8_1Block;                 // For apply_q8_1() interface
     class IDeviceContext;             // For kernel execute() interface
 

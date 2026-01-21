@@ -755,7 +755,7 @@ namespace llaminar2
     // =========================================================================
 
     template <ActivationPrecision Precision>
-    bool CPUKVCache<Precision>::append_kv(int layer, int seq_idx, const CPUTensorBase *new_k, const CPUTensorBase *new_v)
+    bool CPUKVCache<Precision>::append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v)
     {
         // Use tensor shape to determine token count
         if (!new_k || !new_v)
@@ -767,7 +767,7 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
-    bool CPUKVCache<Precision>::append_kv(int layer, int seq_idx, const CPUTensorBase *new_k, const CPUTensorBase *new_v, int num_tokens)
+    bool CPUKVCache<Precision>::append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v, int num_tokens)
     {
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
         {
@@ -945,7 +945,7 @@ namespace llaminar2
 
     template <ActivationPrecision Precision>
     int CPUKVCache<Precision>::gather_kv_batched(
-        int layer, int num_sequences, CPUTensorBase *out_k, CPUTensorBase *out_v,
+        int layer, int num_sequences, TensorBase *out_k, TensorBase *out_v,
         std::vector<int> &out_kv_lens)
     {
         if (layer < 0 || layer >= n_layers_)

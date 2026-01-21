@@ -1,6 +1,6 @@
 /**
  * @file Test__TensorAllocateOnDevice.cpp
- * @brief Unit tests for CPUTensorBase::allocateOnDevice()
+ * @brief Unit tests for TensorBase::allocateOnDevice()
  * @author GitHub Copilot
  * @date January 2026
  *

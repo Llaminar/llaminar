@@ -14,8 +14,8 @@
 #include "compute_stages/stages/AllGatherStage.h"
 #include "config/TPDomain.h"
 #include "../tensors/TensorVerification.h"
-#include "../tensors/TensorValidation.h"
-#include "../tensors/cpu/CPUTensors.h"
+#include "../tensors/GPUTensorVerification.h"
+#include "../tensors/TensorClasses.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include <algorithm>
@@ -1109,7 +1109,7 @@ namespace llaminar2
             // If so, use GPU-side validation to avoid expensive D2H sync
             if (output.tensor)
             {
-                auto *base_tensor = dynamic_cast<CPUTensorBase *>(output.tensor);
+                auto *base_tensor = dynamic_cast<TensorBase *>(output.tensor);
                 if (base_tensor && base_tensor->isDeviceValid())
                 {
                     // Get GPU validator for this device type
@@ -1179,7 +1179,7 @@ namespace llaminar2
             // Need to ensure output is synced to host before reading
             if (output.tensor)
             {
-                if (auto *cpu_tensor = dynamic_cast<CPUTensorBase *>(output.tensor))
+                if (auto *cpu_tensor = dynamic_cast<TensorBase *>(output.tensor))
                 {
                     cpu_tensor->ensureOnHost();
                 }

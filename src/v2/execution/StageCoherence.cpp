@@ -7,7 +7,7 @@
 
 #include "StageCoherence.h"
 #include "compute_stages/IComputeStage.h"
-#include "../tensors/cpu/CPUTensors.h"
+#include "../tensors/TensorClasses.h"
 #include "../tensors/TensorSlice.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
@@ -38,30 +38,38 @@ namespace llaminar2
                 continue;
             }
 
-            // Try to cast to CPUTensorBase to access coherence methods
-            auto *tensor_base = dynamic_cast<CPUTensorBase *>(buf.tensor);
-            if (!tensor_base)
+            // IMPORTANT: Check for TensorSlice FIRST before TensorBase!
+            // TensorSlice inherits from TensorBase (which IS TensorBase), so the
+            // TensorBase cast would succeed, but we need to cohere the INNER tensor,
+            // not the slice wrapper itself.
+            TensorBase *tensor_base = nullptr;
+            const void *slice_ptr_for_log = nullptr;
+
+            auto *slice = dynamic_cast<TensorSlice *>(buf.tensor);
+            if (slice)
             {
-                // Tensor doesn't support coherence - try to unwrap TensorSlice
-                auto *slice = dynamic_cast<TensorSlice *>(buf.tensor);
-                if (slice)
+                slice_ptr_for_log = slice;
+                // It's a TensorSlice - delegate to inner tensor
+                tensor_base = dynamic_cast<TensorBase *>(slice->inner());
+                if (!tensor_base)
                 {
-                    // It's a TensorSlice - delegate to inner tensor
-                    tensor_base = dynamic_cast<CPUTensorBase *>(slice->inner());
-                    if (!tensor_base)
-                    {
-                        LOG_DEBUG("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
-                                                             << "' is TensorSlice but inner doesn't support coherence");
-                        continue;
-                    }
                     LOG_DEBUG("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
-                                                         << "' unwrapped from TensorSlice to "
-                                                         << tensor_base->dtype_name());
+                                                         << "' is TensorSlice but inner doesn't support coherence");
+                    continue;
                 }
-                else
+                LOG_DEBUG("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
+                                                     << "' unwrapped from TensorSlice " << slice_ptr_for_log
+                                                     << " to " << tensor_base->dtype_name()
+                                                     << " inner_ptr=" << static_cast<void *>(tensor_base));
+            }
+            else
+            {
+                // Not a TensorSlice - try direct TensorBase cast
+                tensor_base = dynamic_cast<TensorBase *>(buf.tensor);
+                if (!tensor_base)
                 {
                     LOG_DEBUG("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
-                                                         << "' does not support device coherence (not CPUTensorBase or TensorSlice)");
+                                                         << "' does not support device coherence (not TensorBase or TensorSlice)");
                     continue;
                 }
             }
@@ -115,7 +123,9 @@ namespace llaminar2
                     LOG_INFO("[StageCoherence] ensureOnDevice('" << (buf.name ? buf.name : "unknown")
                                                                  << "') to " << target_device.to_string()
                                                                  << " took " << elapsed_us << " us"
-                                                                 << " (numel=" << tensor_base->numel() << ")");
+                                                                 << " (numel=" << tensor_base->numel() << ")"
+                                                                 << " ptr=" << static_cast<void *>(tensor_base)
+                                                                 << " gpu_ptr=" << tensor_base->gpu_data_ptr());
                 }
 
                 if (!success)
@@ -155,8 +165,8 @@ namespace llaminar2
                 continue;
             }
 
-            // Try to cast to CPUTensorBase to access coherence methods
-            auto *tensor_base = dynamic_cast<CPUTensorBase *>(buf.tensor);
+            // Try to cast to TensorBase to access coherence methods
+            auto *tensor_base = dynamic_cast<TensorBase *>(buf.tensor);
             if (!tensor_base)
             {
                 // Tensor doesn't support coherence - skip
@@ -221,8 +231,8 @@ namespace llaminar2
                 continue;
             }
 
-            // Try to cast to CPUTensorBase to access coherence methods
-            auto *tensor_base = dynamic_cast<CPUTensorBase *>(buf.tensor);
+            // Try to cast to TensorBase to access coherence methods
+            auto *tensor_base = dynamic_cast<TensorBase *>(buf.tensor);
             if (!tensor_base)
             {
                 // Tensor doesn't support coherence - skip

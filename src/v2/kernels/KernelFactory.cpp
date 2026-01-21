@@ -139,20 +139,30 @@ namespace llaminar
                 }
 
 #ifdef HAVE_CUDA
+                // Thread-local storage for target CUDA device ordinal
+                // Used when getOrCreateGemm is called with DeviceId to pass the ordinal
+                // to getCUDADeviceIdForKernel (since createGemm only receives DeviceType)
+                thread_local std::optional<int> tl_target_cuda_ordinal;
+
                 /**
                  * @brief Get CUDA device ID for kernel creation
                  *
-                 * For weight tensors that are CPU-only (typical for GGUF models), we use
-                 * the first available CUDA device (device 0). For tensors already on GPU,
-                 * we use their actual device.
+                 * Resolution order:
+                 * 1. Thread-local target ordinal (set via CUDAOrdinalGuard)
+                 * 2. Tensor's current device (if already on CUDA)
                  *
                  * @param tensor The tensor to check (usually a weight tensor)
-                 * @return CUDA device ID (backend-specific, usually 0)
+                 * @return CUDA device ID (backend-specific ordinal)
+                 * @throws std::runtime_error if no explicit device can be determined
                  */
                 int getCUDADeviceIdForKernel(const llaminar2::TensorBase *tensor)
                 {
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    const auto &devices = dm.devices();
+                    // First check if a target CUDA ordinal was set via DeviceId overload
+                    if (tl_target_cuda_ordinal.has_value())
+                    {
+                        LOG_DEBUG("[KernelFactory] Using thread-local CUDA ordinal: " << tl_target_cuda_ordinal.value());
+                        return tl_target_cuda_ordinal.value();
+                    }
 
                     // Check if tensor is currently on a CUDA device
                     auto current_dev = tensor->current_device();
@@ -161,16 +171,13 @@ namespace llaminar
                         return current_dev->cuda_ordinal();
                     }
 
-                    // Tensor not on CUDA GPU - find the first CUDA device
-                    int cuda_dm_idx = dm.find_device(llaminar2::ComputeBackendType::GPU_CUDA, 0);
-                    if (cuda_dm_idx >= 0 && static_cast<size_t>(cuda_dm_idx) < devices.size())
-                    {
-                        return devices[cuda_dm_idx].device_id;
-                    }
-
-                    // Fallback to device 0 if no CUDA device found via DeviceManager
-                    LOG_WARN("[KernelFactory] No CUDA device found in DeviceManager, using device 0");
-                    return 0;
+                    // No implicit fallback - require explicit device specification
+                    LOG_ERROR("[KernelFactory] Cannot determine CUDA device for kernel creation. "
+                              "Tensor is not on a CUDA device and no target device was specified. "
+                              "Use getOrCreateGemm(tensor, DeviceId) to specify the target device explicitly.");
+                    throw std::runtime_error(
+                        "KernelFactory: CUDA device must be specified explicitly - tensor is not on CUDA "
+                        "and no target device provided via CUDAOrdinalGuard or DeviceId");
                 }
 #endif
 
@@ -183,12 +190,13 @@ namespace llaminar
                 /**
                  * @brief Get ROCm device ID for kernel creation
                  *
-                 * For weight tensors that are CPU-only (typical for GGUF models), we use
-                 * the first available ROCm device (device 0). For tensors already on GPU,
-                 * we use their actual device.
+                 * Resolution order:
+                 * 1. Thread-local target ordinal (set via ROCmOrdinalGuard)
+                 * 2. Tensor's current device (if already on ROCm)
                  *
                  * @param tensor The tensor to check (usually a weight tensor)
-                 * @return ROCm device ID (backend-specific, usually 0)
+                 * @return ROCm device ID (backend-specific ordinal)
+                 * @throws std::runtime_error if no explicit device can be determined
                  */
                 int getROCmDeviceIdForKernel(const llaminar2::TensorBase *tensor)
                 {
@@ -199,9 +207,6 @@ namespace llaminar
                         return tl_target_rocm_ordinal.value();
                     }
 
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    const auto &devices = dm.devices();
-
                     // Check if tensor is currently on a ROCm device
                     auto current_dev = tensor->current_device();
                     if (current_dev.has_value() && current_dev->is_rocm())
@@ -209,16 +214,13 @@ namespace llaminar
                         return current_dev->rocm_ordinal();
                     }
 
-                    // Tensor not on ROCm GPU - find the first ROCm device
-                    int rocm_dm_idx = dm.find_device(llaminar2::ComputeBackendType::GPU_ROCM, 0);
-                    if (rocm_dm_idx >= 0 && static_cast<size_t>(rocm_dm_idx) < devices.size())
-                    {
-                        return devices[rocm_dm_idx].device_id;
-                    }
-
-                    // Fallback to device 0 if no ROCm device found via DeviceManager
-                    LOG_WARN("[KernelFactory] No ROCm device found in DeviceManager, using device 0");
-                    return 0;
+                    // No implicit fallback - require explicit device specification
+                    LOG_ERROR("[KernelFactory] Cannot determine ROCm device for kernel creation. "
+                              "Tensor is not on a ROCm device and no target device was specified. "
+                              "Use getOrCreateGemm(tensor, DeviceId) to specify the target device explicitly.");
+                    throw std::runtime_error(
+                        "KernelFactory: ROCm device must be specified explicitly - tensor is not on ROCm "
+                        "and no target device provided via ROCmOrdinalGuard or DeviceId");
                 }
 #endif
 
@@ -550,6 +552,27 @@ namespace llaminar
                 // implements ITensorSoftmax interface
 
             } // namespace
+
+            // ==========================================================================
+            // CUDAOrdinalGuard implementation (must be outside anonymous namespace)
+            // ==========================================================================
+#ifdef HAVE_CUDA
+            KernelFactory::CUDAOrdinalGuard::CUDAOrdinalGuard(int ordinal)
+            {
+                tl_target_cuda_ordinal = ordinal;
+                LOG_DEBUG("[KernelFactory] CUDAOrdinalGuard: set thread-local CUDA ordinal to " << ordinal);
+            }
+
+            KernelFactory::CUDAOrdinalGuard::~CUDAOrdinalGuard()
+            {
+                LOG_DEBUG("[KernelFactory] CUDAOrdinalGuard: cleared thread-local CUDA ordinal");
+                tl_target_cuda_ordinal = std::nullopt;
+            }
+#else
+            // Stub implementations when CUDA is not available
+            KernelFactory::CUDAOrdinalGuard::CUDAOrdinalGuard(int) {}
+            KernelFactory::CUDAOrdinalGuard::~CUDAOrdinalGuard() {}
+#endif
 
             // ==========================================================================
             // ROCmOrdinalGuard implementation (must be outside anonymous namespace)
@@ -3084,7 +3107,12 @@ namespace llaminar
 #endif
 
 #ifdef HAVE_CUDA
-                // TODO: Similar treatment for CUDA if needed
+                // For CUDA: set the target ordinal so getCUDADeviceIdForKernel uses it
+                if (dev_type == DeviceType::CUDA)
+                {
+                    CUDAOrdinalGuard guard(target_device.cuda_ordinal());
+                    return getOrCreateGemm(tensor, dev_type);
+                }
 #endif
 
                 // For CPU or if GPU-specific handling not needed, just delegate

@@ -38,7 +38,7 @@
 #include <memory>
 #include <vector>
 
-#include "tensors/cpu/CPUTensors.h"
+#include "tensors/TensorClasses.h"
 #include "backends/DeviceId.h"
 #include "backends/BackendManager.h"
 #include "mocks/MockBackend.h"

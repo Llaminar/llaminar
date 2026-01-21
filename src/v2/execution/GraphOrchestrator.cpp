@@ -19,7 +19,7 @@
 #include "../utils/DebugEnv.h"
 #include "../utils/MPIContext.h"
 #include "../tensors/TensorFactory.h"
-#include "../tensors/cpu/CPUTensors.h" // For FP32Tensor::createMapped()
+#include "../tensors/TensorClasses.h" // For FP32Tensor::createMapped()
 #include "../kernels/cpu/CPUKVCache.h"
 #include "../kernels/KernelFactory.h"
 #include "../interfaces/IWorkspaceConsumer.h"

@@ -14,7 +14,7 @@
 #include "../backends/BackendManager.h"
 #include "../interfaces/IWorkspaceConsumer.h"
 #include "../execution/compute_stages/IComputeStage.h"
-#include "../tensors/cpu/CPUTensors.h"
+#include "../tensors/TensorClasses.h"
 #include "../utils/Logger.h"
 
 namespace llaminar2

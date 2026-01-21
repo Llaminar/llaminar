@@ -6,7 +6,7 @@
  *
  * This test file verifies that each tensor type in the Llaminar V2 codebase properly
  * implements the byte_size() method via the public size_bytes() interface.
- * This is critical because the base class CPUTensorBase::byte_size() throws an
+ * This is critical because the base class TensorBase::byte_size() throws an
  * exception if not overridden, which causes GPU transfer failures.
  *
  * Tests cover:
@@ -20,7 +20,7 @@
 #include <memory>
 #include <vector>
 
-#include "tensors/cpu/CPUTensors.h"
+#include "tensors/TensorClasses.h"
 #include "tensors/TensorFactory.h"
 
 using namespace llaminar2;

@@ -88,8 +88,7 @@ namespace llaminar2
     class MPIContext;
     enum class KVCacheLayoutMode : uint8_t;
     class ITensor;
-    class CPUTensorBase;
-    using TensorBase = CPUTensorBase; // Backward compatibility alias
+    class TensorBase;
     class ITensorGemm;
     class ITensorRoPE;
     class ITensorSwiGLU;
@@ -266,6 +265,34 @@ namespace llaminar
                  * @throws std::runtime_error if device_idx is invalid
                  */
                 static DeviceType getDeviceType(int device_idx);
+
+                // ==========================================================================
+                // CUDA Device Ordinal Threading Support
+                // ==========================================================================
+
+                /**
+                 * @brief RAII guard to set thread-local CUDA device ordinal for kernel creation
+                 *
+                 * In multi-GPU CUDA setups, when creating kernels via getOrCreateGemm(tensor, DeviceType),
+                 * we need to know which specific CUDA device to target. This guard sets a thread-local
+                 * variable that getCUDADeviceIdForKernel() will use.
+                 *
+                 * Usage:
+                 * @code
+                 * {
+                 *     KernelFactory::CUDAOrdinalGuard guard(1); // Target CUDA device 1
+                 *     auto* kernel = KernelFactory::getOrCreateGemm(tensor, DeviceType::CUDA);
+                 *     // kernel will be created on CUDA device 1
+                 * } // guard goes out of scope, thread-local cleared
+                 * @endcode
+                 */
+                struct CUDAOrdinalGuard
+                {
+                    CUDAOrdinalGuard(int ordinal);
+                    ~CUDAOrdinalGuard();
+                    CUDAOrdinalGuard(const CUDAOrdinalGuard &) = delete;
+                    CUDAOrdinalGuard &operator=(const CUDAOrdinalGuard &) = delete;
+                };
 
                 // ==========================================================================
                 // ROCm Device Ordinal Threading Support

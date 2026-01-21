@@ -17,7 +17,7 @@
 #include "execution/CollectiveContext.h"
 #include "collective/test/CollectiveTestMocks.h"
 #include "config/TPDomain.h"
-#include "tensors/cpu/CPUTensors.h"
+#include "tensors/TensorClasses.h"
 #include "backends/DeviceId.h"
 
 using namespace llaminar2;

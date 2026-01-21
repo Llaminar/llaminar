@@ -41,8 +41,7 @@ namespace llaminar2
     }
     using verification::LayoutExpectation;
     class ITensor;
-    class CPUTensorBase;
-    using TensorBase = CPUTensorBase; // Backward compatibility alias
+    class TensorBase;
     class IKVCache;
     class ICPUKVCache;
     class MPIContext;

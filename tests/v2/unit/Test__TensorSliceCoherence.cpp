@@ -9,7 +9,7 @@
  * parallelism where weight tensors are wrapped in TensorSlice for sharding.
  *
  * Root cause of issue: While TensorSlice inherits from TensorBase (which is
- * aliased to CPUTensorBase), the StageCoherence code was calling ensureOnDevice()
+ * aliased to TensorBase), the StageCoherence code was calling ensureOnDevice()
  * on the TensorSlice wrapper rather than the inner tensor. Since TensorSlice
  * doesn't override the coherence methods, they operated on TensorSlice's own
  * (empty) coherence state rather than the inner tensor's state.
@@ -41,7 +41,7 @@ using namespace llaminar2;
 /**
  * @brief Mock tensor that tracks coherence method calls
  *
- * This mock inherits from FP32Tensor (which inherits from CPUTensorBase)
+ * This mock inherits from FP32Tensor (which inherits from TensorBase)
  * and overrides coherence methods to track whether they were called.
  */
 class MockCoherenceTensor : public FP32Tensor
@@ -170,28 +170,16 @@ TEST_F(Test__TensorSliceCoherence, TensorSliceInheritsFromTensorBase)
         << "TensorSlice should be castable to TensorBase";
 }
 
-TEST_F(Test__TensorSliceCoherence, TensorSliceInheritsFromCPUTensorBase)
+TEST_F(Test__TensorSliceCoherence, InnerTensorIsTensorBase)
 {
-    // Verify TensorSlice is-a CPUTensorBase (since TensorBase = CPUTensorBase)
+    // Verify the inner tensor is also a TensorBase
     auto inner = createQ4_0(512, 256);
     auto slice = createSlice(std::move(inner));
 
-    // TensorSlice should be castable to CPUTensorBase
-    CPUTensorBase *as_cpu_base = dynamic_cast<CPUTensorBase *>(slice.get());
-    EXPECT_NE(as_cpu_base, nullptr)
-        << "TensorSlice should be castable to CPUTensorBase (via TensorBase alias)";
-}
-
-TEST_F(Test__TensorSliceCoherence, InnerTensorIsCPUTensorBase)
-{
-    // Verify the inner tensor is also a CPUTensorBase
-    auto inner = createQ4_0(512, 256);
-    auto slice = createSlice(std::move(inner));
-
-    // Inner tensor should be castable to CPUTensorBase
-    CPUTensorBase *inner_as_cpu = dynamic_cast<CPUTensorBase *>(slice->inner());
+    // Inner tensor should be castable to TensorBase
+    TensorBase *inner_as_cpu = dynamic_cast<TensorBase *>(slice->inner());
     EXPECT_NE(inner_as_cpu, nullptr)
-        << "Inner tensor should be castable to CPUTensorBase";
+        << "Inner tensor should be castable to TensorBase";
 }
 
 // =============================================================================
@@ -252,8 +240,8 @@ TEST_F(Test__TensorSliceCoherence, EnsureOnDeviceCallsInner)
     auto slice = createSlice(std::move(mock));
 
     // The fix requires calling ensureOnDevice on the INNER tensor
-    // First, get inner and cast to CPUTensorBase
-    auto *inner_cpu = dynamic_cast<CPUTensorBase *>(slice->inner());
+    // First, get inner and cast to TensorBase
+    auto *inner_cpu = dynamic_cast<TensorBase *>(slice->inner());
     ASSERT_NE(inner_cpu, nullptr);
 
     // Call ensureOnDevice on inner
@@ -275,7 +263,7 @@ TEST_F(Test__TensorSliceCoherence, EnsureOnHostCallsInner)
     auto slice = createSlice(std::move(mock));
 
     // Get inner and call ensureOnHost
-    auto *inner_cpu = dynamic_cast<CPUTensorBase *>(slice->inner());
+    auto *inner_cpu = dynamic_cast<TensorBase *>(slice->inner());
     ASSERT_NE(inner_cpu, nullptr);
 
     // Reset counters after setup (FP32Tensor constructor may call ensureOnHost internally)
@@ -295,7 +283,7 @@ TEST_F(Test__TensorSliceCoherence, MarkDeviceDirtyCallsInner)
     auto slice = createSlice(std::move(mock));
 
     // Get inner and call mark_device_dirty
-    auto *inner_cpu = dynamic_cast<CPUTensorBase *>(slice->inner());
+    auto *inner_cpu = dynamic_cast<TensorBase *>(slice->inner());
     ASSERT_NE(inner_cpu, nullptr);
     inner_cpu->mark_device_dirty();
 
@@ -317,8 +305,8 @@ TEST_F(Test__TensorSliceCoherence, DirectEnsureOnDeviceDoesNotCallInner)
 
     auto slice = createSlice(std::move(mock));
 
-    // Call ensureOnDevice directly on TensorSlice (via CPUTensorBase cast)
-    auto *slice_as_cpu = dynamic_cast<CPUTensorBase *>(slice.get());
+    // Call ensureOnDevice directly on TensorSlice (via TensorBase cast)
+    auto *slice_as_cpu = dynamic_cast<TensorBase *>(slice.get());
     ASSERT_NE(slice_as_cpu, nullptr);
 
     // This calls TensorSlice's inherited ensureOnDevice, not MockCoherenceTensor's
@@ -345,9 +333,9 @@ TEST_F(Test__TensorSliceCoherence, UnwrappingPatternWorksCorrectly)
 
     // ===== Simulate StageCoherence.cpp unwrapping logic =====
     TensorBase *tensor = slice.get();
-    CPUTensorBase *tensor_base = dynamic_cast<CPUTensorBase *>(tensor);
+    TensorBase *tensor_base = dynamic_cast<TensorBase *>(tensor);
 
-    // First cast succeeds (TensorSlice inherits from CPUTensorBase)
+    // First cast succeeds (TensorSlice inherits from TensorBase)
     ASSERT_NE(tensor_base, nullptr);
 
     // But we need to check if it's a TensorSlice and unwrap
@@ -355,8 +343,8 @@ TEST_F(Test__TensorSliceCoherence, UnwrappingPatternWorksCorrectly)
     if (as_slice)
     {
         // It's a TensorSlice - get the inner tensor
-        tensor_base = dynamic_cast<CPUTensorBase *>(as_slice->inner());
-        ASSERT_NE(tensor_base, nullptr) << "Inner tensor should be CPUTensorBase";
+        tensor_base = dynamic_cast<TensorBase *>(as_slice->inner());
+        ASSERT_NE(tensor_base, nullptr) << "Inner tensor should be TensorBase";
     }
 
     // Now call ensureOnDevice on the unwrapped inner tensor
@@ -380,7 +368,7 @@ TEST_F(Test__TensorSliceCoherence, MultipleCalls_TrackAll)
     MockCoherenceTensor *mock_ptr = mock.get();
 
     auto slice = createSlice(std::move(mock));
-    auto *inner_cpu = dynamic_cast<CPUTensorBase *>(slice->inner());
+    auto *inner_cpu = dynamic_cast<TensorBase *>(slice->inner());
     ASSERT_NE(inner_cpu, nullptr);
 
     // Call multiple times
@@ -398,7 +386,7 @@ TEST_F(Test__TensorSliceCoherence, MixedCoherenceCalls)
     MockCoherenceTensor *mock_ptr = mock.get();
 
     auto slice = createSlice(std::move(mock));
-    auto *inner_cpu = dynamic_cast<CPUTensorBase *>(slice->inner());
+    auto *inner_cpu = dynamic_cast<TensorBase *>(slice->inner());
     ASSERT_NE(inner_cpu, nullptr);
 
     // Reset counters after setup (FP32Tensor constructor may call coherence methods internally)
@@ -443,8 +431,8 @@ TEST_F(Test__TensorSliceCoherence, NestedTensorSliceUnwrapping)
     ASSERT_NE(first_unwrap, nullptr) << "First unwrap should yield TensorSlice";
 
     // Unwrap again - should get MockCoherenceTensor
-    auto *second_unwrap = dynamic_cast<CPUTensorBase *>(first_unwrap->inner());
-    ASSERT_NE(second_unwrap, nullptr) << "Second unwrap should yield CPUTensorBase";
+    auto *second_unwrap = dynamic_cast<TensorBase *>(first_unwrap->inner());
+    ASSERT_NE(second_unwrap, nullptr) << "Second unwrap should yield TensorBase";
 
     // Call ensureOnDevice on the deepest inner
     second_unwrap->ensureOnDevice(DeviceId::rocm(0));
@@ -476,8 +464,8 @@ TEST_F(Test__TensorSliceCoherence, RealQ4_0TensorSlice_InnerCoherenceMethods)
     auto inner = createQ4_0(512, 256);
     auto slice = createSlice(std::move(inner));
 
-    // Get inner as CPUTensorBase
-    auto *inner_cpu = dynamic_cast<CPUTensorBase *>(slice->inner());
+    // Get inner as TensorBase
+    auto *inner_cpu = dynamic_cast<TensorBase *>(slice->inner());
     ASSERT_NE(inner_cpu, nullptr);
 
     // These should not throw (actual behavior depends on GPU availability)
@@ -512,7 +500,7 @@ TEST_F(Test__TensorSliceCoherence, RowParallelSlice_InnerAccessible)
     EXPECT_TRUE(slice->is_row_parallel());
     EXPECT_EQ(slice->slice_rows(), 1024);
 
-    auto *inner_cpu = dynamic_cast<CPUTensorBase *>(slice->inner());
+    auto *inner_cpu = dynamic_cast<TensorBase *>(slice->inner());
     EXPECT_NE(inner_cpu, nullptr);
 }
 
@@ -531,7 +519,7 @@ TEST_F(Test__TensorSliceCoherence, ColumnParallelSlice_InnerAccessible)
     EXPECT_TRUE(slice->is_column_parallel());
     EXPECT_EQ(slice->slice_cols(), 448);
 
-    auto *inner_cpu = dynamic_cast<CPUTensorBase *>(slice->inner());
+    auto *inner_cpu = dynamic_cast<TensorBase *>(slice->inner());
     EXPECT_NE(inner_cpu, nullptr);
 }
 
@@ -551,6 +539,6 @@ TEST_F(Test__TensorSliceCoherence, FullSlice_InnerAccessible)
 
     EXPECT_TRUE(slice->is_full());
 
-    auto *inner_cpu = dynamic_cast<CPUTensorBase *>(slice->inner());
+    auto *inner_cpu = dynamic_cast<TensorBase *>(slice->inner());
     EXPECT_NE(inner_cpu, nullptr);
 }

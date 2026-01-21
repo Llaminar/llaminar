@@ -6,7 +6,7 @@
 
 #include "TensorFactory.h"
 #include "BlockStructures.h"
-#include "cpu/CPUTensors.h" // For FP32Tensor::createMapped()
+#include "TensorClasses.h" // For FP32Tensor::createMapped()
 #include "../utils/Logger.h"
 #include <stdexcept>
 #include <sstream>
@@ -151,7 +151,7 @@ namespace llaminar2
         return std::make_unique<Q16_1Tensor>(shape, block_size, device);
     }
 
-    std::unique_ptr<CPUTensorBase> TensorFactory::createActivation(const std::vector<size_t> &shape,
+    std::unique_ptr<TensorBase> TensorFactory::createActivation(const std::vector<size_t> &shape,
                                                                    ActivationPrecision precision,
                                                                    DeviceId device)
     {
@@ -160,7 +160,7 @@ namespace llaminar2
             bindToNumaNode();
         }
 
-        std::unique_ptr<CPUTensorBase> tensor;
+        std::unique_ptr<TensorBase> tensor;
 
         switch (precision)
         {
@@ -200,7 +200,7 @@ namespace llaminar2
         return tensor;
     }
 
-    std::unique_ptr<CPUTensorBase> TensorFactory::createActivation(const std::vector<size_t> &shape,
+    std::unique_ptr<TensorBase> TensorFactory::createActivation(const std::vector<size_t> &shape,
                                                                    ActivationPrecision precision,
                                                                    int head_dim,
                                                                    DeviceId device)
@@ -219,7 +219,7 @@ namespace llaminar2
         return createActivation(shape, precision, device);
     }
 
-    std::unique_ptr<CPUTensorBase> TensorFactory::createQuantized(TensorType type,
+    std::unique_ptr<TensorBase> TensorFactory::createQuantized(TensorType type,
                                                                   const std::vector<size_t> &shape,
                                                                   const std::vector<uint8_t> &raw_data)
     {

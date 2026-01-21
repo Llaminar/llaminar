@@ -262,4 +262,53 @@ TEST_F(Test__Integration_NUMATopology_CUDA, AllCUDADevicesHaveValidNUMA)
 
     EXPECT_GT(cuda_device_idx, 0) << "No CUDA devices found in DeviceManager";
 }
+
+/**
+ * @test Verifies that dual-backend builds (CUDA+ROCm) actually detect NUMA via sysfs
+ *
+ * This test catches the bug where getCUDAGPUNUMANode() returns a hardcoded
+ * NUMA node 0 with detection_method="fallback_multi_gpu" instead of actually
+ * reading from sysfs.
+ *
+ * BUG: In dual-backend builds, the code path at NUMATopology.cpp:358-365
+ * unconditionally returns numa_node=0 without calling detectGPUViaSysfs().
+ */
+TEST_F(Test__Integration_NUMATopology_CUDA, DetectionMethod_NotFallbackMultiGPU)
+{
+    if (!has_cuda_device_)
+    {
+        GTEST_SKIP() << "No CUDA device available";
+    }
+
+    auto &dm = DeviceManager::instance();
+    const auto &devices = dm.devices();
+
+    int cuda_device_idx = 0;
+    for (size_t i = 0; i < devices.size(); ++i)
+    {
+        const auto &dev = devices[i];
+        if (dev.type == ComputeBackendType::GPU_CUDA)
+        {
+            auto info = NUMATopology::getCUDAGPUNUMANode(cuda_device_idx);
+
+            // This test MUST FAIL with the current buggy code!
+            // The dual-backend path returns "fallback_multi_gpu" instead of
+            // actually detecting via sysfs.
+            EXPECT_NE(info.detection_method, "fallback_multi_gpu")
+                << "CUDA device " << cuda_device_idx
+                << " used fallback_multi_gpu instead of actual sysfs detection. "
+                << "This indicates the dual-backend NUMA detection bug is present.";
+
+            // If detection worked, method should be nvml, sysfs, or rocm_smi
+            EXPECT_TRUE(info.detection_method == "nvml" ||
+                        info.detection_method == "sysfs" ||
+                        info.detection_method == "rocm_smi")
+                << "CUDA device " << cuda_device_idx
+                << " detection_method=" << info.detection_method
+                << " is not a valid hardware detection method";
+
+            ++cuda_device_idx;
+        }
+    }
+}
 #endif // HAVE_CUDA

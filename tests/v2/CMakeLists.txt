@@ -2220,6 +2220,19 @@ add_v2_test(V2_Unit_NUMAAllocator
     MPI_PROCS 1  # NUMAAllocator is single-rank only (memory allocation)
 )
 
+# Test: NUMATopology sysfs detection (hardware-independent unit tests with temp files)
+add_executable(v2_test_numa_topology_sysfs unit/Test__NUMATopologySysfs.cpp)
+target_link_libraries(v2_test_numa_topology_sysfs 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_NUMATopologySysfs 
+    COMMAND $<TARGET_FILE:v2_test_numa_topology_sysfs>
+    LABELS "V2;Unit;NUMA;Sysfs;Topology;HardwareIndependent"
+    MPI_PROCS 1  # Pure unit test using temp files, no hardware required
+)
+
 # Test: BPETokenizer byte encoding (GPT-2 style byte-level encoding/decoding)
 add_executable(v2_test_bpe_byte_encoding unit/Test__BPETokenizerByteEncoding.cpp)
 target_link_libraries(v2_test_bpe_byte_encoding 

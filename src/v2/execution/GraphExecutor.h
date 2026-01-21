@@ -46,8 +46,7 @@ namespace llaminar2
 {
 
     // Forward declarations
-    class CPUTensorBase;
-    using TensorBase = CPUTensorBase; // Backward compatibility alias
+    class TensorBase;
 
     /**
      * @brief Represents a node in the compute graph

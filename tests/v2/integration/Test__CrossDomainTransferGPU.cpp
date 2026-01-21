@@ -12,7 +12,7 @@
 #include <gtest/gtest.h>
 
 #include "execution/CrossDomainTransfer.h"
-#include "tensors/cpu/CPUTensors.h"
+#include "tensors/TensorClasses.h"
 #include "backends/DeviceId.h"
 #include "backends/ComputeBackend.h"
 #include "../utils/TestTensorFactory.h"

@@ -24,9 +24,8 @@
 
 namespace llaminar2 {
 
-// Forward declaration - CPUTensorBase is the base tensor type
-class CPUTensorBase;
-using TensorBase = CPUTensorBase;
+// Forward declaration - TensorBase is the base tensor type
+class TensorBase;
 
 /**
  * @brief Abstract interface for model loading operations

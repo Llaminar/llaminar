@@ -26,8 +26,7 @@ namespace llaminar2
 {
 
     // Forward declarations
-    class CPUTensorBase;
-    using TensorBase = CPUTensorBase; // Backward compatibility alias
+    class TensorBase;
 
     // =========================================================================
     // Buffer Role Enum

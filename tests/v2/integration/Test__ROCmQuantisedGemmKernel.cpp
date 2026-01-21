@@ -1833,6 +1833,8 @@ namespace llaminar2
                 Q4_0Tensor tensor({rows, cols}, raw_data);
 
                 // KernelFactory should create ROCmQuantisedGemmKernel for ROCm device
+                // Must use ROCmOrdinalGuard to specify target device (tensor is on CPU)
+                llaminar::v2::kernels::KernelFactory::ROCmOrdinalGuard guard(0);
                 auto kernel = llaminar::v2::kernels::KernelFactory::createGemm(&tensor, DeviceType::ROCm);
                 ASSERT_NE(kernel, nullptr) << "KernelFactory should create ROCm GEMM kernel for Q4_0";
 

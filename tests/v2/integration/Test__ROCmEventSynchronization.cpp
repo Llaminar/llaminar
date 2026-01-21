@@ -37,7 +37,7 @@
 
 #ifdef HAVE_ROCM
 #include "backends/rocm/ROCmBackend.h"
-#include "tensors/cpu/CPUTensors.h"
+#include "tensors/TensorClasses.h"
 #include "backends/BackendManager.h"
 #include <hip/hip_runtime.h>
 #endif

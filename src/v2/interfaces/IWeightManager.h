@@ -24,8 +24,7 @@ namespace llaminar2 {
 struct WeightShardingConfig;
 
 // Forward declarations
-class CPUTensorBase;
-using TensorBase = CPUTensorBase;
+class TensorBase;
 enum class ShardingMode;
 enum class WeightDistributionStrategy;
 

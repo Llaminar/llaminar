@@ -794,40 +794,40 @@ add_library(llaminar2_core STATIC
     loaders/LayerWeightStreamer.cpp
     loaders/WeightStreamerFactory.cpp
     models/qwen/Qwen2Graph.cpp
-    tensors/cpu/CPUTensorBase.cpp
-    tensors/cpu/FP32Tensor.cpp
-    tensors/cpu/FP16Tensor.cpp
-    tensors/cpu/BF16Tensor.cpp
-    tensors/cpu/INT32Tensor.cpp
-    tensors/cpu/INT8Tensor.cpp
+    tensors/TensorBase.cpp
+    tensors/FP32Tensor.cpp
+    tensors/FP16Tensor.cpp
+    tensors/BF16Tensor.cpp
+    tensors/INT32Tensor.cpp
+    tensors/INT8Tensor.cpp
     tensors/TensorFactory.cpp
-    tensors/TensorValidation.cpp
-    tensors/cpu/IQ4_NLTensor.cpp
+    tensors/GPUTensorVerification.cpp
+    tensors/IQ4_NLTensor.cpp
     # Simple quantization formats (Q8_0, Q8_1, Q16_1, Q4_0, Q4_1, Q5_0, Q5_1)
-    tensors/cpu/Q8_0Tensor.cpp
-    tensors/cpu/Q8_1Tensor.cpp
-    tensors/cpu/Q16_1Tensor.cpp
-    tensors/cpu/Q4_0Tensor.cpp
-    tensors/cpu/Q4_1Tensor.cpp
-    tensors/cpu/Q5_0Tensor.cpp
-    tensors/cpu/Q5_1Tensor.cpp
+    tensors/Q8_0Tensor.cpp
+    tensors/Q8_1Tensor.cpp
+    tensors/Q16_1Tensor.cpp
+    tensors/Q4_0Tensor.cpp
+    tensors/Q4_1Tensor.cpp
+    tensors/Q5_0Tensor.cpp
+    tensors/Q5_1Tensor.cpp
     # K-quant formats (Q6_K, Q2_K, Q5_K, Q3_K, Q4_K, Q8_K)
-    tensors/cpu/Q6_KTensor.cpp
-    tensors/cpu/Q2_KTensor.cpp
-    tensors/cpu/Q5_KTensor.cpp
-    tensors/cpu/Q3_KTensor.cpp
-    tensors/cpu/Q4_KTensor.cpp
-    tensors/cpu/Q8_KTensor.cpp
+    tensors/Q6_KTensor.cpp
+    tensors/Q2_KTensor.cpp
+    tensors/Q5_KTensor.cpp
+    tensors/Q3_KTensor.cpp
+    tensors/Q4_KTensor.cpp
+    tensors/Q8_KTensor.cpp
     # IQ formats (IQ4_XS, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ2_S, IQ3_S, IQ1_S, IQ1_M)
-    tensors/cpu/IQ4_XSTensor.cpp
-    tensors/cpu/IQ2_XXSTensor.cpp
-    tensors/cpu/IQ2_XSTensor.cpp
-    tensors/cpu/IQ3_XXSTensor.cpp
-    tensors/cpu/IQ2_STensor.cpp
-    tensors/cpu/IQ3_STensor.cpp
-    tensors/cpu/IQ1_STensor.cpp
-    tensors/cpu/IQ1_MTensor.cpp
-    # KV Cache implementation (moved from tensors/cpu/)
+    tensors/IQ4_XSTensor.cpp
+    tensors/IQ2_XXSTensor.cpp
+    tensors/IQ2_XSTensor.cpp
+    tensors/IQ3_XXSTensor.cpp
+    tensors/IQ2_STensor.cpp
+    tensors/IQ3_STensor.cpp
+    tensors/IQ1_STensor.cpp
+    tensors/IQ1_MTensor.cpp
+    # KV Cache implementation (moved from tensors/)
     kernels/cpu/CPUKVCache.cpp
     # Vectorized primitives (ported from V1)
     kernels/cpu/primitives/RoPEPrimitives.cpp

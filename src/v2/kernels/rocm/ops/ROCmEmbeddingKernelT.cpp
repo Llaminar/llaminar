@@ -5,7 +5,7 @@
 
 #include "ROCmEmbeddingKernelT.h"
 #include "utils/Logger.h"
-#include "../../../tensors/cpu/CPUTensors.h"
+#include "../../../tensors/TensorClasses.h"
 #include "../../../execution/DeviceWorkspaceManager.h"
 
 #include <hip/hip_runtime.h>

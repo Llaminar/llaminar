@@ -7,7 +7,7 @@
  * @author David Sanftenberg
  */
 
-#include "../../tensors/TensorValidation.h"
+#include "../../tensors/GPUTensorVerification.h"
 #include "../../utils/Logger.h"
 #include <cuda_runtime.h>
 #include <cfloat>

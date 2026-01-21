@@ -6,7 +6,7 @@
  */
 
 #include "CrossDomainTransfer.h"
-#include "../tensors/cpu/CPUTensors.h"
+#include "../tensors/TensorClasses.h"
 #include "../backends/ComputeBackend.h"
 #include "../backends/BackendManager.h"
 #include "../utils/Logger.h"
@@ -54,12 +54,12 @@ namespace llaminar2
         }
 
         // Get the CPU tensor base for coherence operations
-        auto *src_cpu = dynamic_cast<const CPUTensorBase *>(src);
-        auto *dst_cpu = dynamic_cast<CPUTensorBase *>(dst);
+        auto *src_cpu = dynamic_cast<const TensorBase *>(src);
+        auto *dst_cpu = dynamic_cast<TensorBase *>(dst);
 
         if (!src_cpu || !dst_cpu)
         {
-            LOG_ERROR("[CrossDomainTransfer::gpuToCpu] Tensors must be CPUTensorBase derived");
+            LOG_ERROR("[CrossDomainTransfer::gpuToCpu] Tensors must be TensorBase derived");
             return false;
         }
 
@@ -131,12 +131,12 @@ namespace llaminar2
         }
 
         // Get the CPU tensor base for coherence operations
-        auto *src_cpu = dynamic_cast<const CPUTensorBase *>(src);
-        auto *dst_cpu = dynamic_cast<CPUTensorBase *>(dst);
+        auto *src_cpu = dynamic_cast<const TensorBase *>(src);
+        auto *dst_cpu = dynamic_cast<TensorBase *>(dst);
 
         if (!src_cpu || !dst_cpu)
         {
-            LOG_ERROR("[CrossDomainTransfer::cpuToGpu] Tensors must be CPUTensorBase derived");
+            LOG_ERROR("[CrossDomainTransfer::cpuToGpu] Tensors must be TensorBase derived");
             return false;
         }
 
@@ -221,10 +221,10 @@ namespace llaminar2
             return nullptr;
         }
 
-        auto *src_cpu = dynamic_cast<const CPUTensorBase *>(src);
+        auto *src_cpu = dynamic_cast<const TensorBase *>(src);
         if (!src_cpu)
         {
-            LOG_ERROR("[CrossDomainTransfer::transfer] Source must be CPUTensorBase derived");
+            LOG_ERROR("[CrossDomainTransfer::transfer] Source must be TensorBase derived");
             return nullptr;
         }
 

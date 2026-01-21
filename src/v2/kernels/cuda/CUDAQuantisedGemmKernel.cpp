@@ -26,6 +26,7 @@
 #include "backends/ComputeBackend.h" // DeviceManager
 #include "backends/DeviceId.h"       // DeviceId
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.
+#include "tensors/TensorSlice.h"     // TensorSlice - for unwrapping sliced biases
 #include "tensors/BlockStructures.h" // Q8_1Block
 #include "tensors/KernelSnapshotInfo.h"
 #include "execution/DeviceWorkspaceManager.h"
@@ -117,18 +118,14 @@ namespace llaminar2
             int8_t *d_weights_int8 = nullptr; // [K x N] ColumnMajor
             float *d_scales_B = nullptr;      // [N] per-column scales
 
-            // Work buffers for activation quantization
-            int8_t *d_A_int8 = nullptr;   // [M x K]
-            float *d_scales_A = nullptr;  // [M]
-            int32_t *d_C_int32 = nullptr; // [M x N]
-            int work_buffer_M = 0;
+            // Work buffers - ALWAYS from workspace (never owned by kernel)
+            // These pointers are set from workspace in validateWorkspace()
+            int8_t *d_A_int8 = nullptr;   // [M x K] - from workspace
+            float *d_scales_A = nullptr;  // [M] - from workspace
+            int32_t *d_C_int32 = nullptr; // [M x N] - from workspace
 
             // Flag to track if we own weight memory
             bool owns_weight_memory = false;
-
-            // Flag to track if work buffers come from workspace (vs self-allocated)
-            // When true, destructor must NOT free these buffers (workspace owns them)
-            bool using_workspace_buffers = false;
 
             ~Impl()
             {
@@ -140,17 +137,7 @@ namespace llaminar2
                     if (d_scales_B)
                         cudaQuantGemm_freeDevice(d_scales_B);
                 }
-                // Only free work buffers if we allocated them ourselves (not from workspace)
-                // When using_workspace_buffers is true, these pointers reference workspace-owned memory
-                if (!using_workspace_buffers)
-                {
-                    if (d_A_int8)
-                        cudaQuantGemm_freeDevice(d_A_int8);
-                    if (d_scales_A)
-                        cudaQuantGemm_freeDevice(d_scales_A);
-                    if (d_C_int32)
-                        cudaQuantGemm_freeDevice(d_C_int32);
-                }
+                // Work buffers are NEVER owned by kernel - they come from workspace
             }
         };
 
@@ -477,49 +464,41 @@ namespace llaminar2
             LOG_DEBUG("[CUDAQuantisedGemmKernel] Weight conversion complete (legacy)");
         }
 
-        void CUDAQuantisedGemmKernel::ensureWorkBuffers(int m)
+        void CUDAQuantisedGemmKernel::validateWorkspace() const
         {
-            // =========================================================================
-            // MANAGED MODE: Use pre-allocated workspace buffers (ZERO hot-path allocs!)
-            // =========================================================================
-            if (hasWorkspace())
+            // Kernels REQUIRE workspace - no internal buffer allocation
+            if (!hasWorkspace())
             {
-                // Get pointers from workspace (these are pre-allocated by GraphBufferManager)
-                impl_->d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
-                impl_->d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
-                impl_->d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
-
-                // Mark workspace as having capacity for this M (workspace is pre-sized for max M)
-                impl_->work_buffer_M = m;
-                impl_->using_workspace_buffers = true;
-
-                LOG_TRACE("[CUDAQuantisedGemmKernel::ensureWorkBuffers] Using workspace buffers (managed mode)"
-                          << " A_int8=" << (void *)impl_->d_A_int8
-                          << " scales_A=" << (void *)impl_->d_scales_A
-                          << " C_int32=" << (void *)impl_->d_C_int32);
-                return;
+                throw std::runtime_error(
+                    "[CUDAQuantisedGemmKernel] Workspace not bound. Kernels require pre-allocated "
+                    "workspace buffers via bindWorkspace(). Call bindWorkspace() with a "
+                    "DeviceWorkspaceManager that has allocated the buffers from getWorkspaceRequirements().");
             }
 
-            // =========================================================================
-            // LEGACY MODE: Allocate on demand
-            // =========================================================================
-            if (m <= impl_->work_buffer_M)
+            // Validate required buffers exist
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::QUANT_A))
             {
-                return; // Already have enough capacity
+                throw std::runtime_error(
+                    "[CUDAQuantisedGemmKernel] Workspace missing required buffer: " +
+                    std::string(GemmWorkspaceBuffers::QUANT_A));
+            }
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::SCALES_A))
+            {
+                throw std::runtime_error(
+                    "[CUDAQuantisedGemmKernel] Workspace missing required buffer: " +
+                    std::string(GemmWorkspaceBuffers::SCALES_A));
+            }
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ACC_INT32))
+            {
+                throw std::runtime_error(
+                    "[CUDAQuantisedGemmKernel] Workspace missing required buffer: " +
+                    std::string(GemmWorkspaceBuffers::ACC_INT32));
             }
 
-            if (!cudaQuantGemm_ensureWorkBuffers(
-                    &impl_->d_A_int8,
-                    &impl_->d_scales_A,
-                    &impl_->d_C_int32,
-                    &impl_->work_buffer_M,
-                    m,
-                    static_cast<int>(K_),
-                    static_cast<int>(N_),
-                    cuda_device_id_))
-            {
-                throw std::runtime_error("[CUDAQuantisedGemmKernel] Failed to allocate work buffers");
-            }
+            LOG_TRACE("[CUDAQuantisedGemmKernel::validateWorkspace] Workspace validated"
+                      << " A_int8=" << workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A)
+                      << " scales_A=" << workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A)
+                      << " C_int32=" << workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
         }
 
         // =====================================================================
@@ -936,15 +915,17 @@ namespace llaminar2
                 return false;
             }
 
-            // Step 2: Allocate activation quantization buffers (shared across all projections)
-            // Use this kernel's work buffers for quantized activations
-            ensureWorkBuffers(m);
+            // Step 2: Validate workspace and get buffer pointers
+            // Use this kernel's workspace for quantized activations (shared across all projections)
+            validateWorkspace();
+            int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+            float *d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
 
             LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Quantizing activations once, m=" << m << " k=" << k);
 
             // Step 3: Quantize activations ONCE (shared across all projections)
             if (!cudaQuantGemm_quantizeActivations(
-                    d_input, impl_->d_A_int8, impl_->d_scales_A, m, k, cuda_device_id_))
+                    d_input, d_A_int8, d_scales_A, m, k, cuda_device_id_))
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Activation quantization failed");
                 return false;
@@ -979,9 +960,10 @@ namespace llaminar2
                 // Ensure the projection's weights are converted
                 cuda_kernel->ensureWeightsConverted();
 
-                // Ensure this projection has enough work buffer capacity for the output
-                // Note: We need d_C_int32 sized for this projection's N
-                cuda_kernel->ensureWorkBuffers(m);
+                // Validate this projection's workspace is bound and get its d_C_int32 buffer
+                cuda_kernel->validateWorkspace();
+                int32_t *proj_d_C_int32 = static_cast<int32_t *>(
+                    cuda_kernel->workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
 
                 // Ensure output tensor is on device
                 if (proj.output->native_type() != TensorType::FP32)
@@ -1011,9 +993,9 @@ namespace llaminar2
 
                 // Execute CUTLASS INT8 GEMM using SHARED quantized activations and this kernel's weights
                 if (!cudaQuantGemm_execute(
-                        impl_->d_A_int8,                    // SHARED quantized activations from this kernel
+                        d_A_int8,                           // SHARED quantized activations (from this kernel's workspace)
                         cuda_kernel->impl_->d_weights_int8, // This projection's weights
-                        cuda_kernel->impl_->d_C_int32,      // This projection's INT32 work buffer
+                        proj_d_C_int32,                     // This projection's INT32 work buffer (from its workspace)
                         m, n, k, cuda_device_id_))
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] CUTLASS GEMM failed for projection " << i);
@@ -1033,10 +1015,24 @@ namespace llaminar2
                         break;
                     }
 
-                    auto *fp32_bias = dynamic_cast<FP32Tensor *>(const_cast<TensorBase *>(proj.bias));
+                    // Handle TensorSlice - unwrap to get inner FP32Tensor
+                    const TensorBase *bias_tensor = proj.bias;
+                    bool was_slice = false;
+                    const void *slice_ptr = nullptr;
+                    if (auto *slice = dynamic_cast<const TensorSlice *>(proj.bias))
+                    {
+                        slice_ptr = slice;
+                        bias_tensor = slice->inner();
+                        was_slice = true;
+                    }
+
+                    auto *fp32_bias = dynamic_cast<FP32Tensor *>(const_cast<TensorBase *>(bias_tensor));
                     if (!fp32_bias)
                     {
-                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Failed to cast bias to FP32Tensor");
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Failed to cast bias to FP32Tensor"
+                                  << " | was_slice=" << was_slice
+                                  << " | bias_tensor=" << bias_tensor
+                                  << " | native_type=" << static_cast<int>(bias_tensor->native_type()));
                         all_success = false;
                         break;
                     }
@@ -1045,7 +1041,14 @@ namespace llaminar2
                     d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
                     if (!d_bias)
                     {
-                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Bias has no GPU data for projection " << i);
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Bias has no GPU data for projection " << i
+                                                                                                                          << " | was_slice=" << was_slice
+                                                                                                                          << " | slice_ptr=" << slice_ptr
+                                                                                                                          << " | fp32_bias=" << fp32_bias
+                                                                                                                          << " | numel=" << fp32_bias->numel()
+                                                                                                                          << " | host_data=" << fp32_bias->data()
+                                                                                                                          << " | device_valid=" << fp32_bias->isDeviceValid()
+                                                                                                                          << " | device=" << (fp32_bias->current_device().has_value() ? fp32_bias->current_device()->to_string() : "none"));
                         all_success = false;
                         break;
                     }
@@ -1054,11 +1057,11 @@ namespace llaminar2
                 }
 
                 // Apply scaling: output = int32_accum * scales_A * scales_B + bias
-                // Note: Use the SHARED scales_A from the quantized activations
+                // Note: Use the SHARED scales_A from the quantized activations (from this kernel's workspace)
                 if (!cudaQuantGemm_applyScaling(
-                        cuda_kernel->impl_->d_C_int32,  // This projection's INT32 result
+                        proj_d_C_int32,                 // This projection's INT32 result
                         d_output,                       // Output FP32
-                        impl_->d_scales_A,              // SHARED activation scales
+                        d_scales_A,                     // SHARED activation scales (from this kernel's workspace)
                         cuda_kernel->impl_->d_scales_B, // This projection's weight scales
                         m, n, 1.0f, 0.0f, nullptr, d_bias, cuda_device_id_))
                 {
@@ -1116,9 +1119,16 @@ namespace llaminar2
                                                                             << " d_A=" << static_cast<const void *>(d_A)
                                                                             << " d_C=" << static_cast<void *>(d_C));
 
-            // Ensure weights converted and work buffers allocated
+            // Validate workspace is bound (REQUIRED - kernels don't do internal allocation)
+            validateWorkspace();
+
+            // Get workspace buffer pointers
+            int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+            float *d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
+            int32_t *d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
+
+            // Ensure weights converted
             ensureWeightsConverted();
-            ensureWorkBuffers(m);
 
             // Debug: Sample scales_B (weight scales)
             LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] d_scales_B="
@@ -1135,17 +1145,17 @@ namespace llaminar2
 
             // Step 1: Quantize activations
             if (!cudaQuantGemm_quantizeActivations(
-                    d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, cuda_device_id_))
+                    d_A, d_A_int8, d_scales_A, m, k, cuda_device_id_))
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel] Activation quantization failed");
                 return false;
             }
 
             // Debug: dump scales_A (activation row scales)
-            if (impl_->d_scales_A && m > 0)
+            if (d_scales_A && m > 0)
             {
                 std::vector<float> h_scales_A(std::min(m, 8));
-                cudaQuantGemm_copyDeviceToHost(h_scales_A.data(), impl_->d_scales_A, h_scales_A.size(), cuda_device_id_);
+                cudaQuantGemm_copyDeviceToHost(h_scales_A.data(), d_scales_A, h_scales_A.size(), cuda_device_id_);
                 LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] scales_A[0:4]="
                           << h_scales_A[0] << "," << (h_scales_A.size() > 1 ? h_scales_A[1] : 0.f) << ","
                           << (h_scales_A.size() > 2 ? h_scales_A[2] : 0.f) << "," << (h_scales_A.size() > 3 ? h_scales_A[3] : 0.f));
@@ -1153,7 +1163,7 @@ namespace llaminar2
 
             // Step 2: Execute CUTLASS INT8 GEMM
             if (!cudaQuantGemm_execute(
-                    impl_->d_A_int8, impl_->d_weights_int8, impl_->d_C_int32,
+                    d_A_int8, impl_->d_weights_int8, d_C_int32,
                     m, n, k, cuda_device_id_))
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel] CUTLASS GEMM failed");
@@ -1161,11 +1171,11 @@ namespace llaminar2
             }
 
             // Debug: dump some int32 outputs
-            if (impl_->d_C_int32 && m > 0 && n > 0)
+            if (d_C_int32 && m > 0 && n > 0)
             {
                 size_t copy_count = std::min(static_cast<size_t>(m) * static_cast<size_t>(n), static_cast<size_t>(8));
                 std::vector<int32_t> h_C_int32(copy_count);
-                cudaQuantGemm_copyInt32DeviceToHost(h_C_int32.data(), impl_->d_C_int32, h_C_int32.size(), cuda_device_id_);
+                cudaQuantGemm_copyInt32DeviceToHost(h_C_int32.data(), d_C_int32, h_C_int32.size(), cuda_device_id_);
                 LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] C_int32[0:4]="
                           << h_C_int32[0] << "," << (h_C_int32.size() > 1 ? h_C_int32[1] : 0) << ","
                           << (h_C_int32.size() > 2 ? h_C_int32[2] : 0) << "," << (h_C_int32.size() > 3 ? h_C_int32[3] : 0));
@@ -1174,7 +1184,7 @@ namespace llaminar2
                 if (m == 2 && n > 1000)
                 {
                     std::vector<int32_t> h_C_int32_row1(8);
-                    cudaQuantGemm_copyInt32DeviceToHost(h_C_int32_row1.data(), impl_->d_C_int32 + n, 8, cuda_device_id_);
+                    cudaQuantGemm_copyInt32DeviceToHost(h_C_int32_row1.data(), d_C_int32 + n, 8, cuda_device_id_);
                     LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] C_int32[row1,0:4]="
                               << h_C_int32_row1[0] << "," << h_C_int32_row1[1] << ","
                               << h_C_int32_row1[2] << "," << h_C_int32_row1[3]);
@@ -1184,7 +1194,7 @@ namespace llaminar2
             // Step 3: Apply scaling and output to FP32 (no bias)
             const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
             if (!cudaQuantGemm_applyScaling(
-                    impl_->d_C_int32, d_C, impl_->d_scales_A, impl_->d_scales_B,
+                    d_C_int32, d_C, d_scales_A, impl_->d_scales_B,
                     m, n, alpha, beta, d_C_existing, nullptr, cuda_device_id_))
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel] Scaling failed");
@@ -1221,13 +1231,20 @@ namespace llaminar2
             int m, int n, int k,
             float alpha, float beta)
         {
-            // Ensure weights converted and work buffers allocated
+            // Validate workspace is bound (REQUIRED - kernels don't do internal allocation)
+            validateWorkspace();
+
+            // Get workspace buffer pointers
+            int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+            float *d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
+            int32_t *d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
+
+            // Ensure weights converted
             ensureWeightsConverted();
-            ensureWorkBuffers(m);
 
             // Step 1: Quantize activations
             if (!cudaQuantGemm_quantizeActivations(
-                    d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, cuda_device_id_))
+                    d_A, d_A_int8, d_scales_A, m, k, cuda_device_id_))
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel] Activation quantization failed");
                 return false;
@@ -1235,7 +1252,7 @@ namespace llaminar2
 
             // Step 2: Execute CUTLASS INT8 GEMM
             if (!cudaQuantGemm_execute(
-                    impl_->d_A_int8, impl_->d_weights_int8, impl_->d_C_int32,
+                    d_A_int8, impl_->d_weights_int8, d_C_int32,
                     m, n, k, cuda_device_id_))
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel] CUTLASS GEMM failed");
@@ -1245,7 +1262,7 @@ namespace llaminar2
             // Step 3: Apply scaling, bias, and output to FP32
             const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
             if (!cudaQuantGemm_applyScaling(
-                    impl_->d_C_int32, d_C, impl_->d_scales_A, impl_->d_scales_B,
+                    d_C_int32, d_C, d_scales_A, impl_->d_scales_B,
                     m, n, alpha, beta, d_C_existing, d_bias, cuda_device_id_))
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel] Scaling with bias failed");

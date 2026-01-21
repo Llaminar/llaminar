@@ -57,8 +57,7 @@ namespace llaminar2
 
     // Forward declarations
     class ComputeGraph;
-    class CPUTensorBase;
-    using TensorBase = CPUTensorBase; // Backward compatibility alias
+    class TensorBase;
     class ICPUKVCache;
     class MPIContext;
 

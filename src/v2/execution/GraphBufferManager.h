@@ -71,12 +71,11 @@ namespace llaminar2
 
     // Forward declarations
     class ComputeGraph;
-    class CPUTensorBase;
+    class TensorBase;
     class PCIeBARBackend;
     class IComputeStage;
     class IWorkspaceConsumer;
     class IBackend;
-    using TensorBase = CPUTensorBase; // Backward compatibility alias
 
     // =========================================================================
     // Workspace Budget Configuration (Phase 4: Memory Budget Enforcement)

@@ -20,7 +20,7 @@
 // Include the kernels
 #include "kernels/rocm/ops/ROCmEmbeddingKernelT.h"
 #include "kernels/cpu/ops/CPUEmbeddingKernelT.h"
-#include "tensors/cpu/CPUTensors.h"
+#include "tensors/TensorClasses.h"
 #include "tensors/BlockStructures.h"
 // Note: FP16Utils.h is already included via CPUTensors.h, provides llaminar2::fp16_to_fp32
 

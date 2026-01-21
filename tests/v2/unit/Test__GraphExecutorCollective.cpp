@@ -19,7 +19,7 @@
 #include "execution/compute_stages/stages/AllreduceStage.h"
 #include "execution/compute_stages/stages/AllGatherStage.h"
 #include "collective/test/CollectiveTestMocks.h"
-#include "tensors/cpu/CPUTensors.h"
+#include "tensors/TensorClasses.h"
 #include "backends/DeviceId.h"
 #include "mocks/MockCollectiveContext.h"
 #include "config/TPDomain.h"

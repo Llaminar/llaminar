@@ -42,8 +42,7 @@
 namespace llaminar2
 {
     // Forward declarations
-    class CPUTensorBase;
-    using TensorBase = CPUTensorBase; // Backward compatibility alias
+    class TensorBase;
     class Q8_1Tensor;
     class FP32Tensor;
 
@@ -451,9 +450,11 @@ namespace llaminar2
             void ensureWeightsConverted();
 
             /**
-             * @brief Ensure work buffers are allocated for given M
+             * @brief Validate workspace is bound and has required buffers
+             *
+             * @throws std::runtime_error if workspace not bound (kernels require workspace)
              */
-            void ensureWorkBuffers(int m);
+            void validateWorkspace() const;
 
             // =========================================================================
             // Member data
@@ -471,11 +472,10 @@ namespace llaminar2
             float *d_scales_B_ = nullptr;      // [N] per-column scales
             bool weights_converted_ = false;
             bool owns_weight_memory_ = false; // true if we allocated d_weights_int8_/d_scales_B_
-            int32_t *d_C_int32_ = nullptr;    // [M × N] INT32 accumulator
-            int work_buffer_M_ = 0;           // Current work buffer capacity
 
-            // IWorkspaceConsumer state
-            DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned)
+            // IWorkspaceConsumer state - REQUIRED for execution
+            // Kernels do not own any work buffers; all buffers come from workspace
+            DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned, REQUIRED)
 
             // PIMPL for CUTLASS implementation (avoids CUTLASS in header)
             struct Impl;

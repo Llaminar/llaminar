@@ -9,7 +9,7 @@
 #include "DomainAwareBufferManager.h"
 #include "BufferRole.h" // For BufferTensorType
 #include "../tensors/TensorFactory.h"
-#include "../tensors/cpu/CPUTensors.h"
+#include "../tensors/TensorClasses.h"
 #include "../utils/Logger.h"
 #include <stdexcept>
 #include <sstream>

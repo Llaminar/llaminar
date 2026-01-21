@@ -929,13 +929,13 @@ Llaminar uses a **coherence protocol** to manage tensor data movement between ho
 - Provides both automatic (GraphExecutor) and manual (test/utility) patterns
 
 **Key Files:**
-- `src/v2/tensors/cpu/CPUTensors.h` - `CPUTensorBase` coherence methods (`ensureOnDevice()`, `mark_device_dirty()`, `ensureOnHost()`, `data()`)
+- `src/v2/tensors/TensorClasses.h` - `TensorBase` coherence methods (`ensureOnDevice()`, `mark_device_dirty()`, `ensureOnHost()`, `data()`)
 - `src/v2/execution/StageCoherence.h` - `StageCoherence` helper for GraphExecutor
 - `src/v2/execution/GpuCoherence.h` - RAII utilities for tests and direct kernel calls
 
 ### Coherence Protocol
 
-Every `CPUTensorBase` tracks its coherence state:
+Every `TensorBase` tracks its coherence state:
 
 | State | Meaning | `data()` Returns |
 |-------|---------|------------------|
@@ -943,7 +943,7 @@ Every `CPUTensorBase` tracks its coherence state:
 | GPU is authoritative | `mark_device_dirty()` was called | Syncs GPU→host first |
 | Never uploaded | No GPU buffer allocated | Host data directly |
 
-**Core Methods on CPUTensorBase:**
+**Core Methods on TensorBase:**
 
 ```cpp
 // Upload to GPU if needed (allocates buffer on first call)

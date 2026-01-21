@@ -167,7 +167,7 @@ V2 is a **kernel-centric, operator-free** architecture:
 │   └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                              │
 │   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  CPUTensorBase (device coherence + host storage)                    │   │
+│   │  TensorBase (device coherence + host storage)                    │   │
 │   │    • ensureOnDevice(device) → upload to GPU                         │   │
 │   │    • mark_device_dirty() → mark GPU as authoritative                │   │
 │   │    • data() → host data (syncs from GPU if device-dirty)           │   │
@@ -1080,9 +1080,9 @@ class IUnifiedKVCache {
 
 ### 4.6 Device Coherence Protocol
 
-Location: `src/v2/tensors/cpu/CPUTensors.h`, `src/v2/execution/StageCoherence.h`, `src/v2/execution/GpuCoherence.h`
+Location: `src/v2/tensors/TensorClasses.h`, `src/v2/execution/StageCoherence.h`, `src/v2/execution/GpuCoherence.h`
 
-Llaminar uses a **dual-validity coherence protocol** to manage tensor data movement between host (CPU) and device (GPU) memory. Each `CPUTensorBase` tracks two independent validity flags: `host_valid_` and `device_valid_`.
+Llaminar uses a **dual-validity coherence protocol** to manage tensor data movement between host (CPU) and device (GPU) memory. Each `TensorBase` tracks two independent validity flags: `host_valid_` and `device_valid_`.
 
 #### Coherence State Machine
 
@@ -1128,7 +1128,7 @@ Llaminar uses a **dual-validity coherence protocol** to manage tensor data movem
               └───────────────────────────────────────────────────┘
 
     ┌─────────────────────────────────────────────────────────────────────────────┐
-    │  DESTRUCTOR (~CPUTensorBase):                                                │
+    │  DESTRUCTOR (~TensorBase):                                                │
     │    1. freeMappedMemory() - if using zero-copy                               │
     │    2. Free GPU buffer via IBackend::free() - if gpu_data_ptr_ != nullptr    │
     │    3. Destroy completion event - if device_completion_event_ exists          │
@@ -1140,7 +1140,7 @@ Llaminar uses a **dual-validity coherence protocol** to manage tensor data movem
 #### Internal State Variables
 
 ```cpp
-class CPUTensorBase {
+class TensorBase {
 protected:
     // ===== Coherence State =====
     bool host_valid_ = true;          // Host buffer contains valid data
@@ -1162,10 +1162,10 @@ protected:
 };
 ```
 
-#### Core CPUTensorBase Methods
+#### Core TensorBase Methods
 
 ```cpp
-class CPUTensorBase {
+class TensorBase {
 public:
     // ===== Device Coherence =====
     
@@ -1291,10 +1291,10 @@ class ResidualAddStage : public IComputeStage {
 
 #### Pinned Host Memory
 
-For optimal GPU transfer performance, `CPUTensorBase` lazily pins host memory on first GPU upload:
+For optimal GPU transfer performance, `TensorBase` lazily pins host memory on first GPU upload:
 
 ```cpp
-bool CPUTensorBase::ensureOnDevice(DeviceId device) {
+bool TensorBase::ensureOnDevice(DeviceId device) {
     // 1. Pin host memory (first time only) - enables DMA transfers
     if (!host_pinned_) {
         ensureHostPinned();  // cudaHostRegister / hipHostRegister
@@ -1758,7 +1758,7 @@ void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
 | DeviceId | `src/v2/backends/DeviceId.h` |
 | **Tensor Layer** | |
 | ITensor interface | `src/v2/tensors/ITensor.h` |
-| CPU tensors | `src/v2/tensors/cpu/CPUTensors.h` |
+| CPU tensors | `src/v2/tensors/TensorClasses.h` |
 | Tensor factory | `src/v2/tensors/TensorFactory.h` |
 | **MPI Layer** | |
 | MPI context | `src/v2/utils/MPIContext.h` |

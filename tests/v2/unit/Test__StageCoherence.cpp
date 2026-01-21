@@ -18,7 +18,7 @@
 #include "execution/compute_stages/stages/GEMMStage.h"
 #include "execution/compute_stages/stages/AllreduceStage.h"
 #include "execution/compute_stages/stages/AttentionComputeStage.h"
-#include "tensors/cpu/CPUTensors.h"
+#include "tensors/TensorClasses.h"
 #include "backends/DeviceId.h"
 
 using namespace llaminar2;

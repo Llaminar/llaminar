@@ -56,8 +56,7 @@ namespace llaminar2
 {
 
     // Forward declarations
-    class CPUTensorBase;
-    using TensorBase = CPUTensorBase;
+    class TensorBase;
 
     // =========================================================================
     // Concepts

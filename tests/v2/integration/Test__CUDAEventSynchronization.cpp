@@ -37,7 +37,7 @@
 
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
-#include "tensors/cpu/CPUTensors.h"
+#include "tensors/TensorClasses.h"
 #include "backends/BackendManager.h"
 #include <cuda_runtime.h>
 

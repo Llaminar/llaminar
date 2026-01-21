@@ -24,8 +24,7 @@ namespace llaminar2
 
     // Forward declarations
     class ComputeGraph;
-    class CPUTensorBase;
-    using TensorBase = CPUTensorBase; // Backward compatibility alias
+    class TensorBase;
     struct BufferAllocationStats;
     struct BufferKey;
     struct AliasingGroup;

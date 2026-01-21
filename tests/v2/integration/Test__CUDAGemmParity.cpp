@@ -28,7 +28,8 @@
 #include "kernels/KernelFactory.h"
 #include "backends/ComputeBackend.h"
 #include "execution/DeviceContext.h"
-#include "execution/GpuCoherence.h" // For gpu_output(), with_gpu_coherence()
+#include "execution/GpuCoherence.h"           // For gpu_output(), with_gpu_coherence()
+#include "execution/DeviceWorkspaceManager.h" // For workspace binding
 #include "loaders/ModelLoader.h"
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"
@@ -224,6 +225,145 @@ protected:
 
         return result;
     }
+
+    // =========================================================================
+    // Workspace Management Helpers
+    // =========================================================================
+
+    /**
+     * @brief Set up workspace for a CUDA GEMM kernel if it supports it
+     *
+     * CUDA quantized GEMM kernels require pre-allocated workspace buffers for:
+     * - Quantized activations (INT8)
+     * - Per-row scales
+     * - INT32 intermediate accumulator
+     *
+     * FP32 kernels don't need workspace, so this is a no-op for them.
+     *
+     * @param kernel The GEMM kernel
+     * @param M Maximum batch/sequence length
+     * @param N Output dimension
+     * @param K Input dimension
+     * @return true on success or if kernel doesn't need workspace, false on allocation failure
+     */
+    bool setupWorkspaceIfNeeded(ITensorGemm *kernel, int M, int N, int K)
+    {
+        auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
+        if (!ws_consumer)
+        {
+            // Kernel doesn't implement IWorkspaceConsumer (e.g., FP32 kernel)
+            return true;
+        }
+
+        auto reqs = ws_consumer->getWorkspaceRequirements(M, N, K);
+        workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 64 * 1024 * 1024); // 64MB
+        if (!workspace_->allocate(reqs))
+        {
+            LOG_ERROR("Failed to allocate workspace for CUDA GEMM kernel");
+            return false;
+        }
+        ws_consumer->bindWorkspace(workspace_.get());
+        return true;
+    }
+
+    /**
+     * @brief Clean up workspace after test
+     */
+    void cleanupWorkspaceIfNeeded(ITensorGemm *kernel)
+    {
+        if (workspace_)
+        {
+            auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
+            if (ws_consumer)
+            {
+                ws_consumer->unbindWorkspace();
+            }
+            workspace_.reset();
+        }
+    }
+
+    /**
+     * @brief Set up a shared workspace for multiple CUDA GEMM kernels
+     *
+     * Used for fused QKV operations where multiple kernels share workspace.
+     * Computes the maximum requirements across all kernels.
+     *
+     * @param kernels Vector of kernels that need workspace
+     * @param M Maximum batch/sequence length
+     * @param Ns Output dimensions for each kernel
+     * @param K Input dimension (shared)
+     * @return true on success, false on allocation failure
+     */
+    bool setupSharedWorkspace(
+        const std::vector<ITensorGemm *> &kernels,
+        int M,
+        const std::vector<int> &Ns,
+        int K)
+    {
+        // Find max requirements across all kernels
+        size_t max_quant_a = 0, max_scales_a = 0, max_acc = 0;
+
+        for (size_t i = 0; i < kernels.size(); ++i)
+        {
+            auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernels[i]);
+            if (ws_consumer)
+            {
+                auto reqs = ws_consumer->getWorkspaceRequirements(M, Ns[i], K);
+                for (const auto &buf : reqs.buffers)
+                {
+                    if (buf.name == "gemm_quant_a")
+                        max_quant_a = std::max(max_quant_a, buf.size_bytes);
+                    else if (buf.name == "gemm_scales_a")
+                        max_scales_a = std::max(max_scales_a, buf.size_bytes);
+                    else if (buf.name == "gemm_acc_int32")
+                        max_acc = std::max(max_acc, buf.size_bytes);
+                }
+            }
+        }
+
+        // Create shared workspace with max requirements
+        WorkspaceRequirements shared_reqs;
+        shared_reqs.buffers.push_back({"gemm_quant_a", max_quant_a, 256, true});
+        shared_reqs.buffers.push_back({"gemm_scales_a", max_scales_a, 256, true});
+        shared_reqs.buffers.push_back({"gemm_acc_int32", max_acc, 256, true});
+
+        workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 64 * 1024 * 1024); // 64MB
+        if (!workspace_->allocate(shared_reqs))
+        {
+            LOG_ERROR("Failed to allocate shared workspace");
+            return false;
+        }
+
+        // Bind shared workspace to ALL kernels
+        for (auto *kernel : kernels)
+        {
+            auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
+            if (ws_consumer)
+            {
+                ws_consumer->bindWorkspace(workspace_.get());
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief Clean up shared workspace from multiple kernels
+     */
+    void cleanupSharedWorkspace(const std::vector<ITensorGemm *> &kernels)
+    {
+        for (auto *kernel : kernels)
+        {
+            auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
+            if (ws_consumer && ws_consumer->hasWorkspace())
+            {
+                ws_consumer->unbindWorkspace();
+            }
+        }
+        workspace_.reset();
+    }
+
+    std::unique_ptr<DeviceWorkspaceManager> workspace_;
 };
 
 // ============================================================================
@@ -418,6 +558,9 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_SmallMatrix_128x896x896)
         weights.get(), KernelDeviceType::CUDA);
     ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA IQ4_NL kernel";
 
+    // Set up workspace for quantized kernel
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+
     // Allocate GPU memory for activations and output
     float *d_A, *d_C;
     ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
@@ -447,6 +590,7 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_SmallMatrix_128x896x896)
         << "Relative L2 error too high: " << (result.relative_l2_error * 100) << "%";
 
     // Cleanup
+    cleanupWorkspaceIfNeeded(cuda_kernel.get());
     cudaFree(d_A);
     cudaFree(d_C);
 }
@@ -474,6 +618,9 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_DecodeSize_1x896x896)
         weights.get(), KernelDeviceType::CUDA);
     ASSERT_NE(cuda_kernel, nullptr);
 
+    // Set up workspace for quantized kernel
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+
     float *d_A, *d_C;
     ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
     ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
@@ -490,6 +637,7 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_DecodeSize_1x896x896)
     EXPECT_GE(result.cosine_similarity, 0.99);
     EXPECT_FALSE(result.has_nan_inf);
 
+    cleanupWorkspaceIfNeeded(cuda_kernel.get());
     cudaFree(d_A);
     cudaFree(d_C);
 }
@@ -517,6 +665,9 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
         weights.get(), KernelDeviceType::CUDA);
     ASSERT_NE(cuda_kernel, nullptr);
 
+    // Set up workspace for quantized kernel
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+
     float *d_A, *d_C;
     ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
     ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
@@ -533,6 +684,7 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
     EXPECT_GE(result.cosine_similarity, 0.99);
     EXPECT_FALSE(result.has_nan_inf);
 
+    cleanupWorkspaceIfNeeded(cuda_kernel.get());
     cudaFree(d_A);
     cudaFree(d_C);
 }
@@ -575,6 +727,9 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
             weights.get(), KernelDeviceType::CUDA);                                         \
         ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel for " #TensorType; \
                                                                                             \
+        /* Set up workspace for quantized kernel */                                         \
+        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));                    \
+                                                                                            \
         float *d_A, *d_C;                                                                   \
         ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));                    \
         ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));                    \
@@ -595,6 +750,7 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
         EXPECT_GE(result.cosine_similarity, 0.99)                                           \
             << "Cosine similarity too low: " << result.cosine_similarity;                   \
                                                                                             \
+        cleanupWorkspaceIfNeeded(cuda_kernel.get());                                        \
         cudaFree(d_A);                                                                      \
         cudaFree(d_C);                                                                      \
     }
@@ -623,6 +779,9 @@ TEST_F(Test__CUDAGemmParity, Q8_0_DecodeSize_1x896x896)
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CUDA);
 
+    // Set up workspace for quantized kernel
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+
     float *d_A, *d_C;
     ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
     ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
@@ -639,6 +798,7 @@ TEST_F(Test__CUDAGemmParity, Q8_0_DecodeSize_1x896x896)
     EXPECT_GE(result.cosine_similarity, 0.99);
     EXPECT_FALSE(result.has_nan_inf);
 
+    cleanupWorkspaceIfNeeded(cuda_kernel.get());
     cudaFree(d_A);
     cudaFree(d_C);
 }
@@ -667,6 +827,9 @@ TEST_F(Test__CUDAGemmParity, Q4_0_DecodeSize_1x896x896)
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         weights.get(), KernelDeviceType::CUDA);
 
+    // Set up workspace for quantized kernel
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+
     float *d_A, *d_C;
     ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
     ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
@@ -683,6 +846,7 @@ TEST_F(Test__CUDAGemmParity, Q4_0_DecodeSize_1x896x896)
     EXPECT_GE(result.cosine_similarity, 0.99);
     EXPECT_FALSE(result.has_nan_inf);
 
+    cleanupWorkspaceIfNeeded(cuda_kernel.get());
     cudaFree(d_A);
     cudaFree(d_C);
 }
@@ -804,6 +968,9 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_Layer0)
         q4_tensor, KernelDeviceType::CUDA);
     ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel";
 
+    // Set up workspace for quantized kernel
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+
     float *d_A, *d_C;
     ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));
     ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));
@@ -823,6 +990,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_Layer0)
     EXPECT_GE(result.cosine_similarity, 0.99)
         << "Cosine similarity too low: " << result.cosine_similarity;
 
+    cleanupWorkspaceIfNeeded(cuda_kernel.get());
     cudaFree(d_A);
     cudaFree(d_C);
 }
@@ -874,6 +1042,9 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnK_Layer0)
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         q4_tensor, KernelDeviceType::CUDA);
 
+    // Set up workspace for quantized kernel
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+
     float *d_A, *d_C;
     cudaMalloc(&d_A, M * K * sizeof(float));
     cudaMalloc(&d_C, M * N * sizeof(float));
@@ -890,6 +1061,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnK_Layer0)
     EXPECT_GE(result.cosine_similarity, 0.99);
     EXPECT_FALSE(result.has_nan_inf);
 
+    cleanupWorkspaceIfNeeded(cuda_kernel.get());
     cudaFree(d_A);
     cudaFree(d_C);
 }
@@ -941,6 +1113,9 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnV_Layer0)
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         q4_tensor, KernelDeviceType::CUDA);
 
+    // Set up workspace for quantized kernel
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+
     float *d_A, *d_C;
     cudaMalloc(&d_A, M * K * sizeof(float));
     cudaMalloc(&d_C, M * N * sizeof(float));
@@ -957,6 +1132,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnV_Layer0)
     EXPECT_GE(result.cosine_similarity, 0.99);
     EXPECT_FALSE(result.has_nan_inf);
 
+    cleanupWorkspaceIfNeeded(cuda_kernel.get());
     cudaFree(d_A);
     cudaFree(d_C);
 }
@@ -1007,6 +1183,9 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_FFNGate_Layer0)
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         q4_tensor, KernelDeviceType::CUDA);
 
+    // Set up workspace for quantized kernel
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+
     float *d_A, *d_C;
     cudaMalloc(&d_A, M * K * sizeof(float));
     cudaMalloc(&d_C, M * N * sizeof(float));
@@ -1023,6 +1202,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_FFNGate_Layer0)
     EXPECT_GE(result.cosine_similarity, 0.99);
     EXPECT_FALSE(result.has_nan_inf);
 
+    cleanupWorkspaceIfNeeded(cuda_kernel.get());
     cudaFree(d_A);
     cudaFree(d_C);
 }
@@ -1080,6 +1260,9 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_LMHead)
     auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         q4_tensor, KernelDeviceType::CUDA);
 
+    // Set up workspace for quantized kernel
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+
     float *d_A, *d_C;
     cudaMalloc(&d_A, M * K * sizeof(float));
     cudaMalloc(&d_C, static_cast<size_t>(M) * N * sizeof(float));
@@ -1096,6 +1279,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_LMHead)
     EXPECT_GE(result.cosine_similarity, 0.99);
     EXPECT_FALSE(result.has_nan_inf);
 
+    cleanupWorkspaceIfNeeded(cuda_kernel.get());
     cudaFree(d_A);
     cudaFree(d_C);
 }
@@ -1163,6 +1347,9 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
         q4_tensor, KernelDeviceType::CUDA);
     ASSERT_NE(cuda_kernel, nullptr);
 
+    // Set up workspace for quantized kernel
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+
     // Use with_gpu_coherence for automatic input/output coherence management
     ASSERT_TRUE(with_gpu_coherence(
         gpu_device_,
@@ -1174,6 +1361,9 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
                 input_tensor.get(), output_cuda.get(),
                 M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
         }));
+
+    // Clean up workspace
+    cleanupWorkspaceIfNeeded(cuda_kernel.get());
 
     // ===== Compare =====
     // data() will automatically sync to host if needed
@@ -1262,6 +1452,11 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
     ASSERT_NE(cuda_kernel_q, nullptr) << "Failed to create CUDA kernel for Q";
     ASSERT_NE(cuda_kernel_k, nullptr) << "Failed to create CUDA kernel for K";
     ASSERT_NE(cuda_kernel_v, nullptr) << "Failed to create CUDA kernel for V";
+
+    // Set up SHARED workspace for fused QKV (all kernels share workspace)
+    ASSERT_TRUE(setupSharedWorkspace(
+        {cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()},
+        M, {N_q, N_k, N_v}, K));
 
     // Create input tensor with random data
     auto input_tensor = std::make_unique<FP32Tensor>(
@@ -1389,6 +1584,9 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
     auto result_v_cpu = checkParity(v_fused, v_cpu.data(), M * N_v, 0.99, 0.10);
     result_v_cpu.print("V projection (CUDA fused vs CPU)");
     EXPECT_GE(result_v_cpu.cosine_similarity, 0.99);
+
+    // Clean up shared workspace
+    cleanupSharedWorkspace({cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()});
 }
 
 /**
@@ -1448,6 +1646,11 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
         weights_k, KernelDeviceType::CUDA);
     auto cuda_kernel_v = llaminar::v2::kernels::KernelFactory::createGemm(
         weights_v, KernelDeviceType::CUDA);
+
+    // Set up SHARED workspace for fused QKV (all kernels share workspace)
+    ASSERT_TRUE(setupSharedWorkspace(
+        {cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()},
+        M, {N_q, N_k, N_v}, K));
 
     auto input_tensor = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
@@ -1516,6 +1719,9 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
     result_v.print("V decode (CUDA fused vs CPU)");
     EXPECT_GE(result_v.cosine_similarity, 0.99);
     EXPECT_FALSE(result_v.has_nan_inf);
+
+    // Clean up shared workspace
+    cleanupSharedWorkspace({cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()});
 }
 
 // ============================================================================
@@ -1576,6 +1782,11 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
         q4_tensor);
     ASSERT_NE(cached_kernel, nullptr);
 
+    // Set up SHARED workspace for both kernels
+    ASSERT_TRUE(setupSharedWorkspace(
+        {fresh_kernel.get(), cached_kernel},
+        M, {N, N}, K));
+
     // Create input and outputs
     auto input_tensor = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
@@ -1626,6 +1837,9 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
         << "Cached and fresh kernels should produce nearly identical results";
     EXPECT_FALSE(result.has_nan_inf);
 
+    // Clean up shared workspace
+    cleanupSharedWorkspace({fresh_kernel.get(), cached_kernel});
+
     // Clear cache for next test
     llaminar::v2::kernels::KernelFactory::clearCache();
 }
@@ -1669,6 +1883,9 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_MultipleCallsConsistent)
     // Get cached kernel
     auto *kernel = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(q4_tensor);
     ASSERT_NE(kernel, nullptr);
+
+    // Set up workspace for quantized kernel
+    ASSERT_TRUE(setupWorkspaceIfNeeded(kernel, M, N, K));
 
     // Create input
     auto input = std::make_unique<FP32Tensor>(
@@ -1715,6 +1932,9 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_MultipleCallsConsistent)
     EXPECT_GE(result_1_vs_3.cosine_similarity, 0.99999)
         << "Multiple runs with same input should be identical";
 
+    // Clean up workspace
+    cleanupWorkspaceIfNeeded(kernel);
+
     llaminar::v2::kernels::KernelFactory::clearCache();
 }
 
@@ -1757,6 +1977,9 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_VaryingBatchSizes)
     // Get ONE cached kernel
     auto *kernel = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(q4_tensor);
     ASSERT_NE(kernel, nullptr);
+
+    // Set up workspace for quantized kernel (with largest batch size = 128)
+    ASSERT_TRUE(setupWorkspaceIfNeeded(kernel, 128, N, K));
 
     // Also create a CPU kernel for reference
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
@@ -1808,6 +2031,9 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_VaryingBatchSizes)
             << "Cached kernel should work for M=" << M;
         EXPECT_FALSE(result.has_nan_inf);
     }
+
+    // Clean up workspace
+    cleanupWorkspaceIfNeeded(kernel);
 
     llaminar::v2::kernels::KernelFactory::clearCache();
 }
@@ -1899,6 +2125,11 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
         wk, KernelDeviceType::CUDA);
     auto cuda_kernel_v = llaminar::v2::kernels::KernelFactory::createGemm(
         wv, KernelDeviceType::CUDA);
+
+    // Set up SHARED workspace for fused QKV (all kernels share workspace)
+    ASSERT_TRUE(setupSharedWorkspace(
+        {cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()},
+        M, {N_q, N_k, N_v}, K));
 
     // Create input
     auto input = std::make_unique<FP32Tensor>(
@@ -2007,6 +2238,9 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
     EXPECT_GE(result_v.cosine_similarity, 0.99);
     EXPECT_FALSE(result_v.has_nan_inf);
 
+    // Clean up shared workspace
+    cleanupSharedWorkspace({cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()});
+
     llaminar::v2::kernels::KernelFactory::clearCache();
 }
 
@@ -2069,6 +2303,11 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
     ASSERT_NE(kernel_q, nullptr);
     ASSERT_NE(kernel_k, nullptr);
     ASSERT_NE(kernel_v, nullptr);
+
+    // Set up SHARED workspace for fused QKV (all kernels share workspace)
+    ASSERT_TRUE(setupSharedWorkspace(
+        {kernel_q, kernel_k, kernel_v},
+        M, {N_q, N_k, N_v}, K));
 
     // CPU kernels for reference
     auto cpu_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
@@ -2147,6 +2386,9 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
         EXPECT_FALSE(result_k.has_nan_inf);
         EXPECT_FALSE(result_v.has_nan_inf);
     }
+
+    // Clean up shared workspace
+    cleanupSharedWorkspace({kernel_q, kernel_k, kernel_v});
 
     llaminar::v2::kernels::KernelFactory::clearCache();
 }

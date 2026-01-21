@@ -251,7 +251,7 @@ namespace llaminar2
         // =======================================================================
         // GPU Transfer Support (delegate to inner) - Required for ensureOnDevice()
         // =======================================================================
-        // Note: TensorSlice is a friend of CPUTensorBase, so it can access
+        // Note: TensorSlice is a friend of TensorBase, so it can access
         // protected methods like byte_size() and raw_host_data_ptr() on inner().
 
         size_t size_bytes() const override { return inner()->byte_size(); }
@@ -261,7 +261,7 @@ namespace llaminar2
          * @brief Get raw host data pointer for GPU transfer
          *
          * TensorSlice delegates directly to inner tensor's protected raw_host_data_ptr().
-         * This works because TensorSlice is a friend of CPUTensorBase.
+         * This works because TensorSlice is a friend of TensorBase.
          */
         void *raw_host_data_ptr() override
         {

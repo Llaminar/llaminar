@@ -30,7 +30,9 @@
 
 // When both are enabled, we use GPUEnumeration.h declarations to access
 // NUMA detection functions implemented in separate compilation units
-#if defined(HAVE_ROCM)
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+#include "../backends/GPUEnumeration.h"
+#elif defined(HAVE_ROCM)
 #include "../backends/GPUEnumeration.h"
 #endif
 
@@ -356,12 +358,25 @@ namespace llaminar2
             }
         }
 #elif defined(HAVE_CUDA) && defined(HAVE_ROCM)
-        // Both backends enabled - use sysfs enumeration via nvidia-smi or lspci
-        // The CUDA enumeration unit will provide PCI bus ID
-        LOG_DEBUG("[NUMATopology] Both CUDA and ROCm enabled, using sysfs for CUDA GPU NUMA detection");
+        // Both backends enabled - use the CUDA enumeration helper which reads from sysfs
+        // without requiring CUDA headers in this translation unit
+        LOG_DEBUG("[NUMATopology] Both CUDA and ROCm enabled, using enumeration helper for CUDA GPU NUMA detection");
+
+        int node = cuda_enumeration::get_cuda_device_numa_node(cuda_device_id);
+        if (node >= 0)
+        {
+            info.numa_node = node;
+            info.affinity_detected = true;
+            info.detection_method = "sysfs";
+            LOG_DEBUG("[NUMATopology] CUDA GPU " << cuda_device_id << " on NUMA node " << node << " (via sysfs, dual-backend)");
+            return info;
+        }
+
+        // Fallback if sysfs detection failed
         info.numa_node = 0;
         info.affinity_detected = false;
-        info.detection_method = "fallback_multi_gpu";
+        info.detection_method = "fallback";
+        LOG_WARN("[NUMATopology] Could not detect NUMA affinity for CUDA GPU " << cuda_device_id << " (dual-backend), assuming node 0");
         return info;
 #endif
 
@@ -489,7 +504,7 @@ namespace llaminar2
     // CPU Memory Bandwidth Estimation
     // ========================================================================
 
-    float NUMATopology::getDDRBandwidth(const std::string& ddr_type, int channels)
+    float NUMATopology::getDDRBandwidth(const std::string &ddr_type, int channels)
     {
         // DDR bandwidth = transfers_per_second * 8 bytes_per_transfer * channels
         // Example: DDR5-4800 = 4800 MT/s * 8 bytes * 1 channel = 38.4 GB/s per channel
@@ -517,11 +532,11 @@ namespace llaminar2
             transfers_per_sec = 2400.0f;
         // Default assumption
         else if (ddr_type.find("DDR5") != std::string::npos)
-            transfers_per_sec = 4800.0f;  // Conservative DDR5 default
+            transfers_per_sec = 4800.0f; // Conservative DDR5 default
         else if (ddr_type.find("DDR4") != std::string::npos)
-            transfers_per_sec = 2666.0f;  // Conservative DDR4 default
+            transfers_per_sec = 2666.0f; // Conservative DDR4 default
         else
-            transfers_per_sec = 2666.0f;  // Very conservative fallback
+            transfers_per_sec = 2666.0f; // Very conservative fallback
 
         // Bandwidth = MT/s * 8 bytes * channels / 1000 (to GB/s)
         // Note: DDR is 64-bit wide = 8 bytes per transfer
@@ -541,28 +556,41 @@ namespace llaminar2
         // Try to detect processor model from /proc/cpuinfo
         std::string cpu_model;
         int physical_cores = 0;
-        try {
+        try
+        {
             std::ifstream cpuinfo("/proc/cpuinfo");
-            if (cpuinfo.is_open()) {
+            if (cpuinfo.is_open())
+            {
                 std::string line;
-                while (std::getline(cpuinfo, line)) {
-                    if (line.find("model name") != std::string::npos) {
+                while (std::getline(cpuinfo, line))
+                {
+                    if (line.find("model name") != std::string::npos)
+                    {
                         auto pos = line.find(':');
-                        if (pos != std::string::npos) {
+                        if (pos != std::string::npos)
+                        {
                             cpu_model = line.substr(pos + 2);
                         }
                     }
-                    if (line.find("cpu cores") != std::string::npos) {
+                    if (line.find("cpu cores") != std::string::npos)
+                    {
                         auto pos = line.find(':');
-                        if (pos != std::string::npos) {
-                            try {
+                        if (pos != std::string::npos)
+                        {
+                            try
+                            {
                                 physical_cores = std::stoi(line.substr(pos + 2));
-                            } catch (...) {}
+                            }
+                            catch (...)
+                            {
+                            }
                         }
                     }
                 }
             }
-        } catch (...) {
+        }
+        catch (...)
+        {
             // Ignore errors, use fallback
         }
 
@@ -575,67 +603,88 @@ namespace llaminar2
         // EPYC (Milan): 8-channel DDR4
         // Consumer (desktop): 2-channel
 
-        if (cpu_model.find("Xeon") != std::string::npos) {
-            if (cpu_model.find("Sapphire") != std::string::npos || 
+        if (cpu_model.find("Xeon") != std::string::npos)
+        {
+            if (cpu_model.find("Sapphire") != std::string::npos ||
                 cpu_model.find("Emerald") != std::string::npos ||
                 cpu_model.find("w5") != std::string::npos ||
                 cpu_model.find("w7") != std::string::npos ||
-                cpu_model.find("w9") != std::string::npos) {
+                cpu_model.find("w9") != std::string::npos)
+            {
                 // Sapphire/Emerald Rapids: 8-channel DDR5-4800
                 info.memory_channels = 8;
                 info.bandwidth_gbps = getDDRBandwidth("DDR5-4800", info.memory_channels) * info.num_sockets;
                 info.detection_method = "model_xeon_ddr5_8ch";
-            } else if (cpu_model.find("Platinum") != std::string::npos ||
-                       cpu_model.find("Gold") != std::string::npos ||
-                       cpu_model.find("Silver") != std::string::npos ||
-                       cpu_model.find("Bronze") != std::string::npos) {
+            }
+            else if (cpu_model.find("Platinum") != std::string::npos ||
+                     cpu_model.find("Gold") != std::string::npos ||
+                     cpu_model.find("Silver") != std::string::npos ||
+                     cpu_model.find("Bronze") != std::string::npos)
+            {
                 // Cascade Lake / Ice Lake Xeon: 6-channel DDR4-3200
                 info.memory_channels = 6;
                 info.bandwidth_gbps = getDDRBandwidth("DDR4-3200", info.memory_channels) * info.num_sockets;
                 info.detection_method = "model_xeon_ddr4_6ch";
-            } else {
+            }
+            else
+            {
                 // Generic Xeon: assume 6-channel DDR4-2933
                 info.memory_channels = 6;
                 info.bandwidth_gbps = getDDRBandwidth("DDR4-2933", info.memory_channels) * info.num_sockets;
                 info.detection_method = "model_xeon_generic";
             }
-        } else if (cpu_model.find("EPYC") != std::string::npos) {
-            if (cpu_model.find("9") != std::string::npos && physical_cores >= 64) {
+        }
+        else if (cpu_model.find("EPYC") != std::string::npos)
+        {
+            if (cpu_model.find("9") != std::string::npos && physical_cores >= 64)
+            {
                 // Genoa/Bergamo: 12-channel DDR5-4800
                 info.memory_channels = 12;
                 info.bandwidth_gbps = getDDRBandwidth("DDR5-4800", info.memory_channels) * info.num_sockets;
                 info.detection_method = "model_epyc_ddr5_12ch";
-            } else {
+            }
+            else
+            {
                 // Milan/Rome: 8-channel DDR4-3200
                 info.memory_channels = 8;
                 info.bandwidth_gbps = getDDRBandwidth("DDR4-3200", info.memory_channels) * info.num_sockets;
                 info.detection_method = "model_epyc_ddr4_8ch";
             }
-        } else if (cpu_model.find("Ryzen") != std::string::npos || 
-                   cpu_model.find("Core") != std::string::npos ||
-                   cpu_model.find("i7") != std::string::npos ||
-                   cpu_model.find("i9") != std::string::npos) {
+        }
+        else if (cpu_model.find("Ryzen") != std::string::npos ||
+                 cpu_model.find("Core") != std::string::npos ||
+                 cpu_model.find("i7") != std::string::npos ||
+                 cpu_model.find("i9") != std::string::npos)
+        {
             // Consumer desktop: 2-channel
             info.memory_channels = 2;
-            if (cpu_model.find("13") != std::string::npos || 
+            if (cpu_model.find("13") != std::string::npos ||
                 cpu_model.find("14") != std::string::npos ||
-                cpu_model.find("7") != std::string::npos) {
+                cpu_model.find("7") != std::string::npos)
+            {
                 // Newer desktop with DDR5
                 info.bandwidth_gbps = getDDRBandwidth("DDR5-5600", info.memory_channels);
                 info.detection_method = "model_desktop_ddr5";
-            } else {
+            }
+            else
+            {
                 // Older desktop with DDR4
                 info.bandwidth_gbps = getDDRBandwidth("DDR4-3200", info.memory_channels);
                 info.detection_method = "model_desktop_ddr4";
             }
-        } else {
+        }
+        else
+        {
             // Unknown: conservative estimate based on socket count
-            if (info.num_sockets >= 2) {
+            if (info.num_sockets >= 2)
+            {
                 // Server-class: assume 6-channel DDR4-2666
                 info.memory_channels = 6;
                 info.bandwidth_gbps = getDDRBandwidth("DDR4-2666", info.memory_channels) * info.num_sockets;
                 info.detection_method = "fallback_server";
-            } else {
+            }
+            else
+            {
                 // Single socket: assume consumer 2-channel DDR4-3200
                 info.memory_channels = 2;
                 info.bandwidth_gbps = getDDRBandwidth("DDR4-3200", info.memory_channels);
@@ -643,9 +692,9 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[NUMATopology] Estimated CPU memory bandwidth: " << info.bandwidth_gbps 
-                 << " GB/s (" << info.memory_channels << " channels × " << info.num_sockets 
-                 << " sockets, method=" << info.detection_method << ")");
+        LOG_INFO("[NUMATopology] Estimated CPU memory bandwidth: " << info.bandwidth_gbps
+                                                                   << " GB/s (" << info.memory_channels << " channels × " << info.num_sockets
+                                                                   << " sockets, method=" << info.detection_method << ")");
 
         return info;
     }

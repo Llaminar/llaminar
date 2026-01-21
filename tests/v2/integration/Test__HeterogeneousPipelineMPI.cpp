@@ -33,7 +33,7 @@
 #include "config/TPDomain.h"
 #include "backends/DeviceId.h"
 #include "backends/ComputeBackend.h" // For DeviceManager
-#include "tensors/cpu/CPUTensors.h"
+#include "tensors/TensorClasses.h"
 #include "../utils/TestTensorFactory.h"
 
 using namespace llaminar2;

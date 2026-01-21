@@ -547,7 +547,7 @@ namespace llaminar2
         {
             if (output.tensor)
             {
-                if (auto *cpu_tensor = dynamic_cast<CPUTensorBase *>(output.tensor))
+                if (auto *cpu_tensor = dynamic_cast<TensorBase *>(output.tensor))
                 {
                     auto t0 = std::chrono::high_resolution_clock::now();
                     cpu_tensor->ensureOnHost();

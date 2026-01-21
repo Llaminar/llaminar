@@ -17,12 +17,11 @@
  * - Captures full context: layer, stage, phase, tensor, dump path
  *
  * Integration with existing infrastructure:
- * - Absorbs TensorValidation.h functionality (tensorAppearsZero, tensorHasNaNOrInf)
  * - Uses StageDumper patterns for buffer dumping
  * - Respects debugEnv().validation configuration
  *
- * @see TensorValidation.h (legacy, functionality absorbed here)
  * @see StageDumper.h (reuses dump patterns)
+ * @see GPUTensorVerification.h (related GPU-side validation)
  * @see Assertions.h (follows same LLAMINAR_ASSERTIONS_ACTIVE pattern)
  */
 
