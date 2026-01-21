@@ -26,6 +26,7 @@
 #include "../ICollectiveBackend.h"
 #include "../BackendRouter.h"
 #include "../DeviceGroup.h"
+#include "../../config/TPDomain.h"
 #include <algorithm>
 #include <functional>
 #include <string>
@@ -134,6 +135,18 @@ namespace llaminar2
                 return allgather_result_;
             }
 
+            bool allgatherv(
+                const void * /*send_buf*/,
+                size_t /*send_count*/,
+                void * /*recv_buf*/,
+                const std::vector<int> & /*recv_counts*/,
+                const std::vector<int> & /*displacements*/,
+                CollectiveDataType /*dtype*/) override
+            {
+                allgatherv_calls_++;
+                return allgatherv_result_;
+            }
+
             bool reduceScatter(
                 const void *send_buf,
                 void *recv_buf,
@@ -169,6 +182,7 @@ namespace llaminar2
             void setInitResult(bool result) { init_result_ = result; }
             void setAllreduceResult(bool result) { allreduce_result_ = result; }
             void setAllgatherResult(bool result) { allgather_result_ = result; }
+            void setAllgathervResult(bool result) { allgatherv_result_ = result; }
             void setReduceScatterResult(bool result) { reduce_scatter_result_ = result; }
             void setBroadcastResult(bool result) { broadcast_result_ = result; }
             void setSupportsDirectTransfer(bool supports) { supports_direct_transfer_ = supports; }
@@ -186,6 +200,7 @@ namespace llaminar2
 
             int allreduceCallCount() const { return allreduce_calls_; }
             int allgatherCallCount() const { return allgather_calls_; }
+            int allgathervCallCount() const { return allgatherv_calls_; }
             int reduceScatterCallCount() const { return reduce_scatter_calls_; }
             int broadcastCallCount() const { return broadcast_calls_; }
             int syncCallCount() const { return sync_calls_; }
@@ -202,6 +217,7 @@ namespace llaminar2
             {
                 allreduce_calls_ = 0;
                 allgather_calls_ = 0;
+                allgatherv_calls_ = 0;
                 reduce_scatter_calls_ = 0;
                 broadcast_calls_ = 0;
                 sync_calls_ = 0;
@@ -218,6 +234,7 @@ namespace llaminar2
             bool init_result_ = true;
             bool allreduce_result_ = true;
             bool allgather_result_ = true;
+            bool allgatherv_result_ = true;
             bool reduce_scatter_result_ = true;
             bool broadcast_result_ = true;
             bool supports_direct_transfer_ = true;
@@ -234,6 +251,7 @@ namespace llaminar2
             // Call tracking
             int allreduce_calls_ = 0;
             int allgather_calls_ = 0;
+            int allgatherv_calls_ = 0;
             int reduce_scatter_calls_ = 0;
             int broadcast_calls_ = 0;
             int sync_calls_ = 0;
@@ -391,6 +409,18 @@ namespace llaminar2
                 return hetero_allgather_result_;
             }
 
+            ICollectiveBackend *selectBackendForDomain(const TPDomain *domain) override
+            {
+                select_domain_calls_++;
+                last_domain_ = domain;
+                return domain_backend_;
+            }
+
+            bool hasDomainSupport() const override
+            {
+                return has_domain_support_;
+            }
+
             // =====================================================================
             // Configuration
             // =====================================================================
@@ -409,6 +439,8 @@ namespace llaminar2
             void setAvailable(CollectiveBackendType type, bool avail) { availability_[type] = avail; }
             void setHeteroAllreduceResult(bool result) { hetero_allreduce_result_ = result; }
             void setHeteroAllgatherResult(bool result) { hetero_allgather_result_ = result; }
+            void setDomainBackend(ICollectiveBackend *backend) { domain_backend_ = backend; }
+            void setHasDomainSupport(bool has) { has_domain_support_ = has; }
 
             // =====================================================================
             // Verification
@@ -418,19 +450,25 @@ namespace llaminar2
             const DeviceGroup &lastGroup() const { return last_group_; }
             int heteroAllreduceCallCount() const { return hetero_allreduce_calls_; }
             int heteroAllgatherCallCount() const { return hetero_allgather_calls_; }
+            int selectDomainCallCount() const { return select_domain_calls_; }
+            const TPDomain *lastDomain() const { return last_domain_; }
 
         private:
             ICollectiveBackend *default_backend_ = nullptr;
+            ICollectiveBackend *domain_backend_ = nullptr;
             std::unordered_map<CollectiveBackendType, ICollectiveBackend *> backends_;
             std::unordered_map<CollectiveBackendType, bool> availability_;
             BackendSelection selection_;
             DeviceGroup last_group_;
+            const TPDomain *last_domain_ = nullptr;
 
             int get_backend_calls_ = 0;
             int hetero_allreduce_calls_ = 0;
             int hetero_allgather_calls_ = 0;
+            int select_domain_calls_ = 0;
             bool hetero_allreduce_result_ = true;
             bool hetero_allgather_result_ = true;
+            bool has_domain_support_ = false;
         };
 
         // =========================================================================

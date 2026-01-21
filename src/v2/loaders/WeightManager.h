@@ -22,6 +22,7 @@
 #include "ModelLoader.h"
 #include "WeightPlacementMap.h"
 #include "../backends/DeviceId.h"
+#include "../config/TensorParallelConfig.h"
 #include "../execution/GraphSchema.h"
 #include "../interfaces/IWeightManager.h"
 #include "../utils/MPIContext.h"
@@ -129,6 +130,27 @@ namespace llaminar2
             has_sharding_config_ = true;
             sharding_mode_cache_.clear(); // Invalidate cache
         }
+
+        /**
+         * @brief Set tensor parallelism configuration for proportional slicing
+         *
+         * When set, weight slicing uses the assignment from TensorParallelConfig
+         * instead of the default 1/world_size calculation. This enables
+         * heterogeneous tensor parallelism where devices get proportional work.
+         *
+         * @param config Tensor parallelism configuration with device assignments
+         */
+        void setTensorParallelConfig(std::shared_ptr<TensorParallelConfig> config)
+        {
+            tp_config_ = std::move(config);
+            cache_.clear(); // Invalidate cache since slices may change
+        }
+
+        /**
+         * @brief Get tensor parallelism configuration
+         * @return Pointer to config, or nullptr if not set
+         */
+        const TensorParallelConfig *tensorParallelConfig() const { return tp_config_.get(); }
 
         /**
          * @brief Check if a weight is sharded (only valid for SHARDED strategy)
@@ -305,6 +327,7 @@ namespace llaminar2
         ModelLoader &loader_;                                                       ///< GGUF loader
         std::shared_ptr<MPIContext> mpi_ctx_;                                       ///< MPI context (nullptr = single rank)
         std::shared_ptr<WeightPlacementMap> placement_map_;                         ///< Fine-grained placement decisions
+        std::shared_ptr<TensorParallelConfig> tp_config_;                           ///< Tensor parallelism configuration (optional)
         WeightDistributionStrategy strategy_;                                       ///< Distribution strategy
         WeightPrecision weight_precision_;                                          ///< How weights are loaded (NATIVE, CONVERT_TO_FP32, etc.)
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> cache_;        ///< Weight cache
@@ -314,6 +337,59 @@ namespace llaminar2
 
         // Decode weight shard cache (separate from prefill cache)
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> decode_cache_; ///< Decode shard cache
+
+        // =========================================================================
+        // Proportional slicing helpers (used when tp_config_ is set)
+        // =========================================================================
+
+        /**
+         * @brief Calculate proportional column slice for this rank
+         *
+         * Uses TensorParallelConfig to determine slice bounds instead of 1/world_size.
+         * Returns {start_row, num_rows} for column-parallel weights.
+         *
+         * @param name Weight tensor name (to determine weight type)
+         * @param total_rows Total number of rows in the weight
+         * @return {start_row, num_rows} pair for this rank's slice
+         */
+        std::pair<size_t, size_t> calculateProportionalColumnSlice(
+            const std::string &name, size_t total_rows) const;
+
+        /**
+         * @brief Calculate proportional row slice for this rank
+         *
+         * Uses TensorParallelConfig to determine slice bounds instead of 1/world_size.
+         * Returns {start_col, num_cols} for row-parallel/input-parallel weights.
+         *
+         * @param name Weight tensor name (to determine weight type)
+         * @param total_cols Total number of columns in the weight
+         * @return {start_col, num_cols} pair for this rank's slice
+         */
+        std::pair<size_t, size_t> calculateProportionalRowSlice(
+            const std::string &name, size_t total_cols) const;
+
+        /**
+         * @brief Determine weight category from name
+         *
+         * Categories:
+         * - ATTENTION_QKV: Q, K, V projections (column-parallel by heads)
+         * - ATTENTION_WO: Output projection (row-parallel, matches Q output)
+         * - FFN_GATE_UP: Gate and Up projections (column-parallel by d_ff)
+         * - FFN_DOWN: Down projection (input-parallel, matches gate/up output)
+         * - LM_HEAD: Language model head (column-parallel by vocab)
+         * - REPLICATE: Everything else (norms, biases, embeddings)
+         */
+        enum class WeightCategory
+        {
+            ATTENTION_QKV,
+            ATTENTION_WO,
+            FFN_GATE_UP,
+            FFN_DOWN,
+            LM_HEAD,
+            REPLICATE
+        };
+
+        WeightCategory categorizeWeight(const std::string &name) const;
     };
 
 } // namespace llaminar2

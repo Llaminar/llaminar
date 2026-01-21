@@ -26,8 +26,7 @@ namespace llaminar2
     // =============================================================================
 
     AllreduceStage::AllreduceStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
     }
 
@@ -109,8 +108,19 @@ namespace llaminar2
             return false;
         }
 
-        // Get MPI communicator from context
-        MPI_Comm comm = params_.mpi_ctx->comm();
+        // Get MPI communicator - prefer domain-specific communicator if available
+        MPI_Comm comm = MPI_COMM_NULL;
+        if (params_.domain && params_.domain->communicator != MPI_COMM_NULL)
+        {
+            comm = params_.domain->communicator;
+            LOG_DEBUG("[AllreduceStage] Using domain communicator: " << params_.domain->name
+                                                                     << " (size=" << params_.domain->domain_size << ")");
+        }
+        else
+        {
+            comm = params_.mpi_ctx->comm();
+            LOG_DEBUG("[AllreduceStage] Using MPI context communicator (legacy path)");
+        }
 
         // Start timing if enabled
         auto start_time = std::chrono::high_resolution_clock::now();

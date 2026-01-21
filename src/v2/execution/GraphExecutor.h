@@ -35,6 +35,7 @@
 #include "GraphBufferManager.h"
 #include "../backends/DeviceId.h"
 #include "../utils/DebugEnv.h" // For LLAMINAR_ASSERTIONS_ACTIVE
+#include "../interfaces/ICollectiveContext.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -308,6 +309,28 @@ namespace llaminar2
         void resetStats() override { stats_.reset(); }
 
         // =========================================================================
+        // Collective Context
+        // =========================================================================
+
+        /**
+         * @brief Set the collective context for GPU-native collectives
+         *
+         * When a collective context is set, ALLREDUCE and ALLGATHER stages
+         * will be intercepted and executed via the CollectiveContext
+         * infrastructure (RCCL, NCCL, PCIeBAR) instead of the stage's
+         * internal MPI fallback.
+         *
+         * @param ctx Collective context (not owned, must outlive executor)
+         */
+        void setCollectiveContext(ICollectiveContext *ctx) { collective_ctx_ = ctx; }
+
+        /**
+         * @brief Get the current collective context
+         * @return Pointer to collective context (nullptr if not set)
+         */
+        ICollectiveContext *collectiveContext() const { return collective_ctx_; }
+
+        // =========================================================================
         // Buffer Management
         // =========================================================================
 
@@ -347,11 +370,16 @@ namespace llaminar2
         GraphExecutorConfig config_;
         GraphExecutorStats stats_;
         GraphBufferManager *buffer_manager_ = nullptr; ///< Optional buffer manager (not owned)
+        ICollectiveContext *collective_ctx_ = nullptr; ///< Optional collective context (not owned)
 
         // Internal execution helpers
         bool executeSequential(ComputeGraph &graph, IDeviceContext *ctx);
         bool executeParallel(ComputeGraph &graph, IDeviceContext *ctx);
         bool executeNode(ComputeNode &node, IDeviceContext *ctx);
+
+        // Collective stage intercept helpers (GPU-native collectives)
+        bool executeCollectiveAllreduce(ComputeNode &node, IDeviceContext *ctx);
+        bool executeCollectiveAllgather(ComputeNode &node, IDeviceContext *ctx);
 
         // Buffer validation (Debug/Integration builds only)
 #if LLAMINAR_ASSERTIONS_ACTIVE

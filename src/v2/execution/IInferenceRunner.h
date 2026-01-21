@@ -11,9 +11,12 @@
 
 #include <string>
 #include <vector>
+#include <stdexcept>
 
 namespace llaminar2
 {
+    // Forward declaration for placement plan
+    struct PlacementPlan;
 
     /**
      * @brief Execution path type
@@ -181,6 +184,28 @@ namespace llaminar2
         virtual std::vector<std::string> getSnapshotKeys() const
         {
             return {}; // No snapshots by default
+        }
+
+        // =====================================================================
+        // Orchestration API (for heterogeneous device placement)
+        // =====================================================================
+
+        /**
+         * @brief Check if this runner has a PlacementPlan configured
+         *
+         * @return true if a PlacementPlan was provided during creation
+         */
+        virtual bool hasPlacementPlan() const { return false; }
+
+        /**
+         * @brief Get the PlacementPlan this runner is using
+         *
+         * @return Reference to the PlacementPlan
+         * @throws std::runtime_error if no plan is configured (check hasPlacementPlan first)
+         */
+        virtual const PlacementPlan &getPlacementPlan() const
+        {
+            throw std::runtime_error("No PlacementPlan configured for this runner");
         }
     };
 

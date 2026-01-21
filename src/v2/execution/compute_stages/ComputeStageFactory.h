@@ -25,6 +25,9 @@
 #include "stages/QuantizeToQ16_1Stage.h"
 #include "stages/AllreduceStage.h"
 #include "stages/AllGatherStage.h"
+#include "stages/AllGatherVStage.h"
+#include "stages/SendActivationsStage.h"
+#include "stages/ReceiveActivationsStage.h"
 #include "stages/MoEStages.h"
 
 namespace llaminar2
@@ -221,6 +224,46 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createAllGather(
             const AllGatherStage::Params &params);
+
+        /**
+         * @brief Create a variable-sized AllGather stage for heterogeneous tensor parallelism
+         *
+         * Unlike regular AllGather which assumes equal send counts, AllGatherV supports
+         * variable send counts per rank. This is needed when devices have different
+         * head counts (e.g., 20 heads on NVIDIA vs 8 heads on AMD).
+         *
+         * Input: local_input [seq_len, local_dim] - this rank's data
+         * Output: full_output [seq_len, sum(recv_counts)] - all gathered data
+         *
+         * @param params AllGatherV parameters including recv_counts and displacements per rank
+         * @return AllGatherVStage instance
+         */
+        static std::unique_ptr<IComputeStage> createAllGatherV(
+            const AllGatherVStage::Params &params);
+
+        /**
+         * @brief Create a SendActivations stage for pipeline parallelism
+         *
+         * Sends activations to the next pipeline stage (MPI rank).
+         * Supports both synchronous and asynchronous modes.
+         *
+         * @param params Send parameters including buffer, destination rank, tag
+         * @return SendActivationsStage instance
+         */
+        static std::unique_ptr<IComputeStage> createSendActivations(
+            const SendActivationsStage::Params &params);
+
+        /**
+         * @brief Create a ReceiveActivations stage for pipeline parallelism
+         *
+         * Receives activations from the previous pipeline stage (MPI rank).
+         * Supports both synchronous and asynchronous modes.
+         *
+         * @param params Receive parameters including buffer, source rank, tag
+         * @return ReceiveActivationsStage instance
+         */
+        static std::unique_ptr<IComputeStage> createReceiveActivations(
+            const ReceiveActivationsStage::Params &params);
 
         // =====================================================================
         // Model-Level Stage Factories (for ModelExecutor)

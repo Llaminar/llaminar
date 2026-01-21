@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 #include "execution/CollectiveContext.h"
 #include "collective/test/CollectiveTestMocks.h"
+#include "config/TPDomain.h"
 #include "tensors/cpu/CPUTensors.h"
 #include "backends/DeviceId.h"
 
@@ -423,4 +424,150 @@ TEST_F(Test__CollectiveContext, ExecuteAllreduceUsesCorrectOp)
 
     ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu(), CollectiveOp::ALLREDUCE_MAX);
     EXPECT_EQ(mock_backend_raw_->lastAllreduceOp(), CollectiveOp::ALLREDUCE_MAX);
+}
+
+// =============================================================================
+// Domain-Aware Collective Operation Tests
+// =============================================================================
+
+TEST_F(Test__CollectiveContext, ExecuteAllreduceInDomainWithNullFallsBack)
+{
+    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cpu()});
+    auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
+
+    // Execute with nullptr domain - should fall back to regular allreduce
+    bool result = ctx->executeAllreduceInDomain(
+        buffer.get(), 16, DeviceId::cpu(), CollectiveOp::ALLREDUCE_SUM, nullptr);
+
+    EXPECT_TRUE(result);
+    // Regular allreduce should have been called via the router
+    EXPECT_GE(mock_router_raw_->getBackendCallCount(), 1);
+    EXPECT_EQ(mock_backend_raw_->allreduceCallCount(), 1);
+}
+
+TEST_F(Test__CollectiveContext, ExecuteAllreduceInDomainUsesCorrectBackend)
+{
+    // Configure router to support domain routing
+    mock_router_raw_->setHasDomainSupport(true);
+    mock_router_raw_->setDomainBackend(mock_backend_raw_);
+
+    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cuda(0), DeviceId::rocm(0)});
+    auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
+
+    // Create a GPU domain for testing
+    TPDomain gpu_domain;
+    gpu_domain.type = TPDomainType::GPU_INTRA_RANK;
+    gpu_domain.name = "test_gpu_domain";
+    gpu_domain.domain_size = 2;
+    gpu_domain.local_rank_in_domain = 0;
+    gpu_domain.devices = {DeviceId::cuda(0), DeviceId::rocm(0)};
+    gpu_domain.communicator = MPI_COMM_NULL;
+
+    // Execute with domain
+    bool result = ctx->executeAllreduceInDomain(
+        buffer.get(), 16, DeviceId::cuda(0), CollectiveOp::ALLREDUCE_SUM, &gpu_domain);
+
+    EXPECT_TRUE(result);
+    // Domain-aware backend selection should have been used
+    EXPECT_GE(mock_router_raw_->selectDomainCallCount(), 1);
+    EXPECT_EQ(mock_backend_raw_->allreduceCallCount(), 1);
+}
+
+TEST_F(Test__CollectiveContext, ExecuteAllreduceInDomainSkipsTrivialDomain)
+{
+    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cpu()});
+    auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
+
+    // Create a trivial domain (size 1)
+    TPDomain trivial_domain;
+    trivial_domain.type = TPDomainType::GPU_INTRA_RANK;
+    trivial_domain.name = "trivial_domain";
+    trivial_domain.domain_size = 1;
+    trivial_domain.local_rank_in_domain = 0;
+    trivial_domain.devices = {DeviceId::cpu()};
+    trivial_domain.communicator = MPI_COMM_NULL;
+
+    // Execute with trivial domain - should return true without any backend call
+    bool result = ctx->executeAllreduceInDomain(
+        buffer.get(), 16, DeviceId::cpu(), CollectiveOp::ALLREDUCE_SUM, &trivial_domain);
+
+    EXPECT_TRUE(result);
+    // No backend should have been called for trivial domain
+    EXPECT_EQ(mock_backend_raw_->allreduceCallCount(), 0);
+}
+
+TEST_F(Test__CollectiveContext, ExecuteAllgatherInDomainWithNullFallsBack)
+{
+    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cpu()});
+    auto local_input = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 8});
+    auto full_output = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 16});
+
+    // Execute with nullptr domain - should fall back to regular allgather
+    bool result = ctx->executeAllgatherInDomain(
+        local_input.get(), full_output.get(), 2, DeviceId::cpu(), nullptr);
+
+    EXPECT_TRUE(result);
+    EXPECT_EQ(mock_backend_raw_->allgatherCallCount(), 1);
+}
+
+TEST_F(Test__CollectiveContext, ExecuteAllgathervInDomainWithNullFallsBack)
+{
+    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cpu()});
+    auto local_input = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 8});
+    auto full_output = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 16});
+    std::vector<int> recv_counts = {8, 8};
+    std::vector<int> displacements = {0, 8};
+
+    // Execute with nullptr domain - should fall back to regular allgatherv
+    bool result = ctx->executeAllgathervInDomain(
+        local_input.get(), full_output.get(), recv_counts, displacements,
+        2, DeviceId::cpu(), nullptr);
+
+    EXPECT_TRUE(result);
+    EXPECT_EQ(mock_backend_raw_->allgathervCallCount(), 1);
+}
+
+TEST_F(Test__CollectiveContext, ExecuteAllreduceInDomainFailsWithoutRouter)
+{
+    // Create context without router
+    CollectiveContext::Config config;
+    auto ctx = std::make_unique<CollectiveContext>(config);
+
+    auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
+
+    // Create a non-trivial domain
+    TPDomain domain;
+    domain.type = TPDomainType::GPU_INTRA_RANK;
+    domain.name = "test_domain";
+    domain.domain_size = 2;
+    domain.local_rank_in_domain = 0;
+    domain.devices = {DeviceId::cuda(0), DeviceId::cuda(1)};
+    domain.communicator = MPI_COMM_NULL;
+
+    // Should fail gracefully because fallback path also has no router
+    EXPECT_FALSE(ctx->executeAllreduceInDomain(
+        buffer.get(), 16, DeviceId::cpu(), CollectiveOp::ALLREDUCE_SUM, &domain));
+}
+
+TEST_F(Test__CollectiveContext, ExecuteAllreduceInDomainFailsWhenBackendReturnsNull)
+{
+    // Configure router to return null for domain
+    mock_router_raw_->setHasDomainSupport(true);
+    mock_router_raw_->setDomainBackend(nullptr);
+
+    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cpu()});
+    auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
+
+    // Create a non-trivial domain
+    TPDomain domain;
+    domain.type = TPDomainType::GPU_INTRA_RANK;
+    domain.name = "test_domain";
+    domain.domain_size = 2;
+    domain.local_rank_in_domain = 0;
+    domain.devices = {DeviceId::cuda(0), DeviceId::cuda(1)};
+    domain.communicator = MPI_COMM_NULL;
+
+    // Should fail when backend is null
+    EXPECT_FALSE(ctx->executeAllreduceInDomain(
+        buffer.get(), 16, DeviceId::cpu(), CollectiveOp::ALLREDUCE_SUM, &domain));
 }

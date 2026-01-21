@@ -743,6 +743,9 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/ResidualAddStage.cpp
     execution/compute_stages/stages/AllreduceStage.cpp
     execution/compute_stages/stages/AllGatherStage.cpp
+    execution/compute_stages/stages/AllGatherVStage.cpp
+    execution/compute_stages/stages/SendActivationsStage.cpp
+    execution/compute_stages/stages/ReceiveActivationsStage.cpp
     execution/compute_stages/stages/MoEStages.cpp
     execution/compute_stages/stages/AttentionWithKVCacheStage.cpp
     execution/compute_stages/stages/KVCacheAppendStage.cpp
@@ -753,20 +756,33 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/LMHeadStage.cpp
     execution/GraphExecutor.cpp
     execution/GraphBufferManager.cpp
+    execution/DomainAwareBufferManager.cpp
     execution/GraphResolver.cpp
     execution/LivenessAnalyzer.cpp
     execution/LayerExecutor.cpp
     execution/ModelExecutor.cpp
     execution/GraphOrchestrator.cpp
+    execution/MultiDomainOrchestrator.cpp
+    execution/HeterogeneousLayerExecutor.cpp
+    execution/CrossDomainTransfer.cpp
     execution/HybridPrecisionConfig.cpp
     execution/InferenceMode.cpp
     execution/StageCoherence.cpp
     execution/DeviceWorkspaceManager.cpp
+    # Tensor parallelism configuration (proportional sharding for heterogeneous TP)
+    config/TensorParallelConfig.cpp
+    # Pipeline parallelism configuration (layer range assignment for PP)
+    config/PipelineParallelConfig.cpp
+    # Layer placement configuration (layer-to-device assignment for CPU pipeline stages)
+    config/LayerPlacementConfig.cpp
+    # TP Domain configuration (multi-domain tensor parallelism for hybrid systems)
+    config/TPDomain.cpp
     # Slab GEMM configuration (for chunked FP16 GEMM workspace management)
     kernels/SlabGemmConfig.cpp
     # Placement strategy (weight/compute distribution)
     execution/PlacementPlan.cpp
     execution/PlacementStrategy.cpp
+    execution/placement/HeterogeneousMultiDomainStrategy.cpp
     # Inference dispatch (InferenceRunner decouples pipeline vs graph paths)
     execution/InferenceRunnerFactory.cpp
     loaders/ModelLoader.cpp
@@ -860,6 +876,7 @@ add_library(llaminar2_core STATIC
     utils/BatchPaddingUtils.cpp
     utils/MPIBootstrap.cpp
     utils/NUMATopology.cpp
+    utils/NodeTopology.cpp
     utils/MPITopology.cpp
     utils/MPIStager.cpp
     utils/Tokenizer.cpp
@@ -874,7 +891,10 @@ add_library(llaminar2_core STATIC
     collective/backends/MPIBackend.cpp
     collective/backends/NCCLBackend.cpp
     collective/backends/RCCLBackend.cpp
+    collective/backends/UPIBackend.cpp
     execution/CollectiveContext.cpp
+    # NUMA-aware memory allocation
+    memory/NUMAAllocator.cpp
     # NOTE: Legacy GEMM microkernel and instantiation systems removed (gemm v1/v2/v3)
     # GemmMicroKernelInit.cpp, Q8_1/VNNI instantiation sources - REMOVED
 )

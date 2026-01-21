@@ -24,6 +24,7 @@
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
 #include "backends/DeviceId.h"
+#include "config/TPDomain.h"
 #include "../mocks/MockComputeStage.h"
 
 using namespace llaminar2;
@@ -213,4 +214,78 @@ TEST_F(Test__AllGatherStage, FactoryCreatesStage)
 
     ASSERT_NE(stage, nullptr);
     EXPECT_EQ(stage->type(), ComputeStageType::ALLGATHER);
+}
+
+// =============================================================================
+// TPDomain Support Tests (Phase 4.1a)
+// =============================================================================
+
+/**
+ * @test Verify getDomain() returns nullptr by default
+ */
+TEST_F(Test__AllGatherStage, GetDomainReturnsNullByDefault)
+{
+    TensorFactory factory(*mpi_ctx_);
+    auto local_input = factory.createFP32({4, 128}, DeviceId::cpu());
+    auto full_output = factory.createFP32({4, 256}, DeviceId::cpu());
+
+    AllGatherStage::Params params;
+    params.local_input = local_input.get();
+    params.full_output = full_output.get();
+    params.mpi_ctx = mpi_ctx_.get();
+    // domain not set - should default to nullptr
+
+    auto stage = std::make_unique<AllGatherStage>(params);
+
+    EXPECT_EQ(stage->getDomain(), nullptr);
+}
+
+/**
+ * @test Verify getDomain() returns the configured domain
+ */
+TEST_F(Test__AllGatherStage, GetDomainReturnsConfiguredDomain)
+{
+    TensorFactory factory(*mpi_ctx_);
+    auto local_input = factory.createFP32({4, 128}, DeviceId::cpu());
+    auto full_output = factory.createFP32({4, 256}, DeviceId::cpu());
+
+    // Create a test domain
+    TPDomain test_domain;
+    test_domain.type = TPDomainType::GPU_INTRA_RANK;
+    test_domain.domain_size = 2;
+    test_domain.local_rank_in_domain = 0;
+    test_domain.name = "test_gpu_domain";
+    test_domain.devices = {DeviceId::cuda(0), DeviceId::rocm(0)};
+
+    AllGatherStage::Params params;
+    params.local_input = local_input.get();
+    params.full_output = full_output.get();
+    params.mpi_ctx = mpi_ctx_.get();
+    params.domain = &test_domain;
+
+    auto stage = std::make_unique<AllGatherStage>(params);
+
+    ASSERT_NE(stage->getDomain(), nullptr);
+    EXPECT_EQ(stage->getDomain(), &test_domain);
+    EXPECT_EQ(stage->getDomain()->name, "test_gpu_domain");
+    EXPECT_EQ(stage->getDomain()->domain_size, 2);
+}
+
+/**
+ * @test Verify Params stores domain field correctly
+ */
+TEST_F(Test__AllGatherStage, ParamsStoreDomain)
+{
+    TPDomain cpu_domain;
+    cpu_domain.type = TPDomainType::CPU_CROSS_RANK;
+    cpu_domain.domain_size = 4;
+    cpu_domain.name = "cpu_cross_rank_domain";
+
+    AllGatherStage::Params params;
+    params.domain = &cpu_domain;
+
+    // Verify the field is stored
+    EXPECT_EQ(params.domain, &cpu_domain);
+    EXPECT_EQ(params.domain->type, TPDomainType::CPU_CROSS_RANK);
+    EXPECT_TRUE(params.domain->isCrossRank());
 }

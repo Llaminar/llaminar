@@ -422,7 +422,59 @@ namespace llaminar2
 
         /// Get cluster-wide device inventory (required by IMPITopology)
         /// Note: Returns a reference to a local ClusterInventory built on demand
-        const ClusterInventory& clusterInventory() const override;
+        const ClusterInventory &clusterInventory() const override;
+
+        // =========================================================================
+        // Heterogeneous Device Detection
+        // =========================================================================
+
+        /**
+         * @brief Check if cluster has both CUDA and ROCm GPUs
+         * @return true if heterogeneous GPU types present
+         *
+         * This is useful for enabling cross-vendor tensor parallelism features.
+         */
+        bool hasHeterogeneousGPUs() const;
+
+        /**
+         * @brief Get the RankInventory for a specific rank
+         * @param rank MPI rank ID
+         * @return Reference to RankInventory for that rank
+         *
+         * Requires exchangeCapabilities() to have been called first.
+         */
+        const RankInventory &getRankInventory(int rank) const;
+
+        // =========================================================================
+        // RankInventory Serialization (for MPI capability exchange)
+        // =========================================================================
+
+        /**
+         * @brief Serialize a RankInventory to binary format for MPI transfer
+         * @param inventory The inventory to serialize
+         * @return Vector of bytes containing serialized data
+         *
+         * Binary format:
+         * [rank:4][node_id:4][local_rank:4][hostname_len:4][hostname:N]
+         * [cpu_cores:4][cpu_sockets:4][numa_nodes:4][cpu_memory:8]
+         * [cpu_device_info:variable]
+         * [gpu_count:4][gpu1_info:variable][gpu2_info:variable]...
+         *
+         * DeviceInfo format:
+         * [type:4][local_device_id:4][memory_bytes:8][free_memory_bytes:8]
+         * [compute_units:4][cc_major:4][cc_minor:4][tflops_fp16:4][tflops_int8:4]
+         * [memory_bandwidth_gbps:4][name_len:4][name:N][uuid_len:4][uuid:N]
+         * [supports_p2p:1][pcie_bus_id:4][numa_node:4]
+         */
+        static std::vector<uint8_t> serializeRankInventory(const RankInventory &inventory);
+
+        /**
+         * @brief Deserialize a RankInventory from binary data
+         * @param data Pointer to serialized data
+         * @param size Size of data in bytes
+         * @return Deserialized RankInventory
+         */
+        static RankInventory deserializeRankInventory(const uint8_t *data, size_t size);
 
         // =========================================================================
         // Placement Strategy
@@ -470,7 +522,7 @@ namespace llaminar2
          * @param input Placement input with model info (topology fields will be overwritten)
          * @return Computed PlacementPlan
          */
-        PlacementPlan computePlacement(PlacementInput input) const;
+        PlacementPlan computePlacement(const PlacementInput &input) const override;
 
         // =========================================================================
         // Device Mapping (IMPITopology interface)
@@ -503,8 +555,8 @@ namespace llaminar2
         bool compute_participant_ = true; ///< All ranks compute by default
 
         RankPlacement placement_;
-        std::vector<RankPlacement> all_placements_; ///< Placements from all ranks
-        mutable ClusterInventory cluster_inventory_; ///< Cached cluster inventory (lazy-built)
+        std::vector<RankPlacement> all_placements_;    ///< Placements from all ranks
+        mutable ClusterInventory cluster_inventory_;   ///< Cached cluster inventory (lazy-built)
         mutable bool cluster_inventory_built_ = false; ///< Whether cluster inventory was built
 
         MPI_Comm world_comm_;
@@ -525,6 +577,7 @@ namespace llaminar2
         void detect_device_capabilities();
 
         /// Build cluster inventory from all_placements_ (lazy)
-        void buildClusterInventory() const;    };
+        void buildClusterInventory() const;
+    };
 
 } // namespace llaminar2

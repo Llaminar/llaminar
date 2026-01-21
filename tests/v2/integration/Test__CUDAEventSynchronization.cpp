@@ -40,9 +40,9 @@
 #include "tensors/cpu/CPUTensors.h"
 #include "backends/BackendManager.h"
 #include <cuda_runtime.h>
-#endif
 
 using namespace llaminar2;
+#endif
 
 // ============================================================================
 // Test Fixture

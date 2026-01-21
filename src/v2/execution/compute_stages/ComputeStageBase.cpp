@@ -78,6 +78,12 @@ namespace llaminar2
             return "ALLREDUCE";
         case ComputeStageType::ALLGATHER:
             return "ALLGATHER";
+        case ComputeStageType::ALLGATHER_V:
+            return "ALLGATHER_V";
+        case ComputeStageType::SEND_ACTIVATIONS:
+            return "SEND_ACTIVATIONS";
+        case ComputeStageType::RECV_ACTIVATIONS:
+            return "RECV_ACTIVATIONS";
         case ComputeStageType::COPY:
             return "COPY";
         case ComputeStageType::DEQUANTIZE:

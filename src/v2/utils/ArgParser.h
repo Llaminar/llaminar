@@ -147,6 +147,13 @@ namespace llaminar2
         // Deterministic mode (for reproducible outputs and comparison testing)
         bool deterministic = false; // Forces temperature=0, seed=42, top_p=1.0, top_k=0
 
+        // Heterogeneous multi-domain parallelism (Phase 6.5)
+        bool heterogeneous_mode = false;   // --heterogeneous: Enable heterogeneous multi-domain TP/PP
+        float cpu_compute_fraction = 0.2f; // --cpu-fraction: Fraction of layers for CPU domains (0.0-1.0)
+        bool disable_gpu_tp = false;       // --no-gpu-tp: Disable GPU tensor parallelism
+        bool disable_cpu_tp = false;       // --no-cpu-tp: Disable CPU tensor parallelism
+        int min_layers_per_domain = 2;     // --min-layers-per-domain: Minimum layers per domain
+
         // Fused attention kernel
         bool use_fused_attention = false;        // Use fused attention+Wo kernel
         std::string fused_attention_backend_str; // Backend: "jit" (default), "reference", "tiled"

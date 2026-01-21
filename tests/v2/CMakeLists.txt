@@ -343,6 +343,22 @@ add_v2_test(V2_Unit_StageDumpConfig
     MPI_PROCS 1
 )
 
+# Test: CrossDomainTransfer - Cross-domain activation transfer utility
+add_executable(v2_test_cross_domain_transfer unit/Test__CrossDomainTransfer.cpp)
+target_link_libraries(v2_test_cross_domain_transfer 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+target_include_directories(v2_test_cross_domain_transfer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/utils
+)
+add_v2_test(V2_Unit_CrossDomainTransfer 
+    COMMAND $<TARGET_FILE:v2_test_cross_domain_transfer>
+    LABELS "V2;Unit;Execution;Transfer;Heterogeneous"
+    MPI_PROCS 1
+)
+
 # Test: DeviceGroup - Device group construction and predicates for collective operations
 add_executable(v2_unit_device_group unit/Test__DeviceGroup.cpp)
 target_link_libraries(v2_unit_device_group 
@@ -424,6 +440,24 @@ if(HAVE_CUDA AND HAVE_ROCM)
         RESOURCE_LOCK "PCIeBAR_P2P"
     )
 
+    # Test: PCIeBAR Latency Benchmark - Performance benchmark for cross-vendor collective latency
+    add_executable(v2_integration_pcie_bar_latency_benchmark integration/Test__PCIeBARLatencyBenchmark.cpp)
+    target_link_libraries(v2_integration_pcie_bar_latency_benchmark 
+        llaminar2_core 
+        device_benchmarks
+        GTest::gtest
+        GTest::gtest_main
+    )
+    target_include_directories(v2_integration_pcie_bar_latency_benchmark PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/utils
+    )
+    add_v2_test(V2_Integration_PCIeBAR_LatencyBenchmark 
+        COMMAND $<TARGET_FILE:v2_integration_pcie_bar_latency_benchmark>
+        LABELS "V2;Integration;Benchmark;PCIeBAR;Latency;P2P;CUDA;ROCm;CrossVendor;Performance"
+        MPI_PROCS 1
+        RESOURCE_LOCK "PCIeBAR_P2P"
+    )
+
     # Test: CUDA Vector Add Kernels - Accuracy tests for FP32/FP16/BF16/INT8/INT32 reduction kernels
     add_executable(v2_integration_cuda_vector_add_kernels integration/Test__CUDAVectorAddKernels.cpp)
     target_link_libraries(v2_integration_cuda_vector_add_kernels 
@@ -436,6 +470,26 @@ if(HAVE_CUDA AND HAVE_ROCM)
         LABELS "V2;Integration;CUDA;Kernels;VectorAdd;FP16;BF16;INT8"
         MPI_PROCS 1
     )
+endif()
+
+# Test: CrossDomainTransferGPU - GPU integration tests for cross-domain activation transfer
+# Requires either CUDA or ROCm - tests actual PCIe transfers
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_integration_cross_domain_transfer_gpu integration/Test__CrossDomainTransferGPU.cpp)
+    target_link_libraries(v2_integration_cross_domain_transfer_gpu 
+        llaminar2_core 
+        GTest::gtest
+        GTest::gtest_main
+    )
+    target_include_directories(v2_integration_cross_domain_transfer_gpu PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/utils
+    )
+    add_v2_test(V2_Integration_CrossDomainTransferGPU 
+        COMMAND $<TARGET_FILE:v2_integration_cross_domain_transfer_gpu>
+        LABELS "V2;Integration;Execution;Transfer;Heterogeneous;GPU"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added CrossDomainTransfer GPU integration tests")
 endif()
 
 # Test: BackendRouter - Backend selection and routing for collective operations
@@ -543,6 +597,19 @@ add_v2_test(V2_Unit_MPIBackend
     MPI_PROCS 1
 )
 
+# Test: UPIBackend - UPI-based collective backend for cross-socket CPU tensor parallelism
+add_executable(v2_unit_upi_backend unit/Test__UPIBackend.cpp)
+target_link_libraries(v2_unit_upi_backend 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_UPIBackend 
+    COMMAND $<TARGET_FILE:v2_unit_upi_backend>
+    LABELS "V2;Unit;Collective;UPIBackend;UPI;CPU"
+    MPI_PROCS 1
+)
+
 # Test: PCIeBARBackend - PCIe BAR direct P2P collective backend (CUDA + ROCm)
 if(HAVE_CUDA AND HAVE_ROCM)
     add_executable(v2_unit_pcie_bar_backend unit/Test__PCIeBARBackend.cpp)
@@ -569,6 +636,22 @@ target_link_libraries(v2_unit_collective_context
 add_v2_test(V2_Unit_CollectiveContext 
     COMMAND $<TARGET_FILE:v2_unit_collective_context>
     LABELS "V2;Unit;Collective;CollectiveContext;Execution"
+    MPI_PROCS 1
+)
+
+# Test: GraphExecutorCollective - CollectiveContext integration with GraphExecutor
+add_executable(v2_unit_graph_executor_collective unit/Test__GraphExecutorCollective.cpp)
+target_include_directories(v2_unit_graph_executor_collective PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_unit_graph_executor_collective 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_GraphExecutorCollective 
+    COMMAND $<TARGET_FILE:v2_unit_graph_executor_collective>
+    LABELS "V2;Unit;Collective;GraphExecutor;Execution"
     MPI_PROCS 1
 )
 
@@ -2098,6 +2181,45 @@ add_v2_test(V2_Unit_ArgParser
     MPI_PROCS 1  # ArgParser is single-rank only
 )
 
+# Test: ArgParserHeterogeneous (Phase 6.5 heterogeneous CLI flags)
+add_executable(v2_test_arg_parser_heterogeneous unit/Test__ArgParserHeterogeneous.cpp)
+target_link_libraries(v2_test_arg_parser_heterogeneous 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ArgParserHeterogeneous 
+    COMMAND $<TARGET_FILE:v2_test_arg_parser_heterogeneous>
+    LABELS "V2;Unit;CLI;ArgParser;Heterogeneous;TensorParallelism;Configuration"
+    MPI_PROCS 1  # ArgParser is single-rank only
+)
+
+# Test: NodeTopology (NUMA/socket topology detection for CPU tensor parallelism)
+add_executable(v2_test_node_topology unit/Test__NodeTopology.cpp)
+target_link_libraries(v2_test_node_topology 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_NodeTopology 
+    COMMAND $<TARGET_FILE:v2_test_node_topology>
+    LABELS "V2;Unit;Topology;NUMA;Socket;CPU;MPI;TensorParallelism"
+    MPI_PROCS 1  # NodeTopology is single-rank only (reads sysfs)
+)
+
+# Test: NUMAAllocator (NUMA-aware memory allocation for cross-socket CPU tensor parallelism)
+add_executable(v2_test_numa_allocator unit/Test__NUMAAllocator.cpp)
+target_link_libraries(v2_test_numa_allocator 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_NUMAAllocator 
+    COMMAND $<TARGET_FILE:v2_test_numa_allocator>
+    LABELS "V2;Unit;Memory;NUMA;Allocation;TensorParallelism"
+    MPI_PROCS 1  # NUMAAllocator is single-rank only (memory allocation)
+)
+
 # Test: BPETokenizer byte encoding (GPT-2 style byte-level encoding/decoding)
 add_executable(v2_test_bpe_byte_encoding unit/Test__BPETokenizerByteEncoding.cpp)
 target_link_libraries(v2_test_bpe_byte_encoding 
@@ -3463,6 +3585,17 @@ add_v2_test(V2_Unit_GraphBufferManager
     MPI_PROCS 1
 )
 
+# Test: DomainAwareBufferManager (Phase 5.2: Domain-aware buffer allocation)
+# Tests domain-aware buffer allocation based on layer placement configuration.
+# GPU layers get GPU buffers, CPU layers get NUMA-local CPU buffers.
+add_executable(v2_test_domain_aware_buffer_manager unit/Test__DomainAwareBufferManager.cpp)
+target_link_libraries(v2_test_domain_aware_buffer_manager llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DomainAwareBufferManager
+    COMMAND $<TARGET_FILE:v2_test_domain_aware_buffer_manager>
+    LABELS "V2;Unit;Execution;DomainAwareBufferManager;BufferManagement;LayerPlacement;NUMA"
+    MPI_PROCS 1
+)
+
 # Test: CollectiveBufferAllocation (Phase 3 Buffer Registration API)
 # Tests integration of BAR-region allocator with buffer management
 # for collective operations (AllReduce, AllGather)
@@ -3503,6 +3636,75 @@ target_link_libraries(v2_test_hybrid_precision_config llaminar2_core GTest::gtes
 add_v2_test(V2_Unit_HybridPrecisionConfig
     COMMAND $<TARGET_FILE:v2_test_hybrid_precision_config>
     LABELS "V2;Unit;Execution;HybridPrecision;BufferPrecision;ActivationPrecision"
+    MPI_PROCS 1
+)
+
+# Test: TensorParallelConfig (proportional head assignment for heterogeneous TP)
+# Tests equal splits, proportional splits (73%/27%), GQA alignment, d_ff alignment
+# Part of Phase 1a: Heterogeneous Tensor Parallelism Infrastructure
+add_executable(v2_test_tensor_parallel_config unit/Test__TensorParallelConfig.cpp)
+target_link_libraries(v2_test_tensor_parallel_config llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_TensorParallelConfig
+    COMMAND $<TARGET_FILE:v2_test_tensor_parallel_config>
+    LABELS "V2;Unit;Config;TensorParallelism;Heterogeneous;Sharding"
+    MPI_PROCS 1
+)
+
+# Test: PipelineParallelConfig (layer range assignment for pipeline parallelism)
+# Tests equal splits, custom splits, topology methods, validation
+# Part of Phase 2.3: Heterogeneous TP - Pipeline Parallelism Layer Assignment
+add_executable(v2_test_pipeline_parallel_config unit/Test__PipelineParallelConfig.cpp)
+target_link_libraries(v2_test_pipeline_parallel_config llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PipelineParallelConfig
+    COMMAND $<TARGET_FILE:v2_test_pipeline_parallel_config>
+    LABELS "V2;Unit;Config;PipelineParallelism;LayerAssignment;Topology"
+    MPI_PROCS 1
+)
+
+# Test: LayerPlacementConfig (layer-to-device placement for CPU pipeline stages)
+# Tests allOnDevice, cpuFirstLayers, cpuLastLayers, alternating, custom assignments,
+# transition point detection, device inventory, and validation
+# Part of Phase 3.1: CPU Pipeline Stage Support
+add_executable(v2_test_layer_placement_config unit/Test__LayerPlacementConfig.cpp)
+target_link_libraries(v2_test_layer_placement_config llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_LayerPlacementConfig
+    COMMAND $<TARGET_FILE:v2_test_layer_placement_config>
+    LABELS "V2;Unit;Config;LayerPlacement;CPUOffload;HeterogeneousCompute"
+    MPI_PROCS 1
+)
+
+# Test: LayerPlacementConfigExtended (extended methods for heterogeneous integration)
+# Tests getDeviceTypeForLayer, isGPULayer/isCPULayer predicates, getGPULayers/getCPULayers,
+# getDomainBoundaries for HeterogeneousLayerExecutor integration.
+# Part of Phase 5.4: HeterogeneousLayerExecutor + LayerPlacementConfig Integration
+add_executable(v2_test_layer_placement_config_extended unit/Test__LayerPlacementConfigExtended.cpp)
+target_link_libraries(v2_test_layer_placement_config_extended llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_LayerPlacementConfigExtended
+    COMMAND $<TARGET_FILE:v2_test_layer_placement_config_extended>
+    LABELS "V2;Unit;Config;LayerPlacement;HeterogeneousCompute"
+    MPI_PROCS 1
+)
+
+# Test: TPDomain (multi-domain tensor parallelism)
+# Tests TPDomain struct, MultiDomainTPConfig, domain type helpers, layer mapping
+# Part of Phase 3.2b: TPDomain for Hybrid Parallelism
+add_executable(v2_test_tpdomain unit/Test__TPDomain.cpp)
+target_link_libraries(v2_test_tpdomain llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_TPDomain
+    COMMAND $<TARGET_FILE:v2_test_tpdomain>
+    LABELS "V2;Unit;Config;TPDomain;TensorParallelism;HybridParallelism"
+    MPI_PROCS 1
+)
+
+# Test: HeterogeneousLayerExecutor (heterogeneous device layer execution)
+# Tests device routing based on LayerPlacementConfig, statistics tracking,
+# cross-domain transfer detection, and layer execution on GPU/CPU.
+# Part of Phase 5.1: Heterogeneous Layer Execution
+add_executable(v2_test_heterogeneous_layer_executor unit/Test__HeterogeneousLayerExecutor.cpp)
+target_link_libraries(v2_test_heterogeneous_layer_executor llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_HeterogeneousLayerExecutor
+    COMMAND $<TARGET_FILE:v2_test_heterogeneous_layer_executor>
+    LABELS "V2;Unit;Execution;HeterogeneousCompute;LayerExecution;DeviceRouting"
     MPI_PROCS 1
 )
 
@@ -3585,6 +3787,17 @@ add_v2_test(V2_Unit_StreamingEnv
     MPI_PROCS 1
 )
 
+# Test: MultiDomainOrchestrator (multi-domain tensor parallelism wrapper)
+# Tests factory methods, domain access, delegation to inner orchestrator, and stats.
+# Part of Phase 4.2: Multi-domain TP support for heterogeneous GPU systems
+add_executable(v2_test_multi_domain_orchestrator unit/Test__MultiDomainOrchestrator.cpp)
+target_link_libraries(v2_test_multi_domain_orchestrator llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MultiDomainOrchestrator
+    COMMAND $<TARGET_FILE:v2_test_multi_domain_orchestrator>
+    LABELS "V2;Unit;MultiDomainTP;GraphOrchestrator;TensorParallelism;Execution"
+    MPI_PROCS 1
+)
+
 # Test: StageCoherence (automatic device coherence at stage boundaries)
 # Tests CoherencePolicy enum, cohereInputs/markOutputsDirty, buffer extraction,
 # and stage coherence policy reporting.
@@ -3658,6 +3871,20 @@ target_link_libraries(v2_test_graph_orchestrator_weight_streaming llaminar2_core
 add_v2_test(V2_Unit_GraphOrchestrator_WeightStreaming
     COMMAND $<TARGET_FILE:v2_test_graph_orchestrator_weight_streaming>
     LABELS "V2;Unit;GraphOrchestrator;WeightStreaming;OptionB;IWeightStreamer"
+    MPI_PROCS 1
+)
+
+# Test: GraphOrchestrator Domain Wiring (Phase 6.3 - Heterogeneous TP)
+# Tests the MultiDomainTPConfig wiring in GraphOrchestrator:
+# - setDomainConfig() and domainConfig() accessor
+# - getDomainForLayer() routing logic
+# - Domain config persistence across operations
+# - Integration with AllreduceStage domain-aware communicator selection
+add_executable(v2_test_graph_orchestrator_domain_wiring unit/Test__GraphOrchestratorDomainWiring.cpp)
+target_link_libraries(v2_test_graph_orchestrator_domain_wiring llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GraphOrchestratorDomainWiring
+    COMMAND $<TARGET_FILE:v2_test_graph_orchestrator_domain_wiring>
+    LABELS "V2;Unit;GraphOrchestrator;MultiDomainTP;HeterogeneousTP;Phase6.3"
     MPI_PROCS 1
 )
 
@@ -3789,6 +4016,38 @@ add_v2_test(V2_Unit_AllGatherStage
     MPI_PROCS 1
 )
 
+# Test: AllGatherVStage (Variable-sized MPI collective for heterogeneous TP)
+# Phase 1d: Tests AllGatherVStage for variable send counts per rank
+add_executable(v2_test_allgatherv_stage unit/Test__AllGatherVStage.cpp)
+target_link_libraries(v2_test_allgatherv_stage llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_AllGatherVStage
+    COMMAND $<TARGET_FILE:v2_test_allgatherv_stage>
+    LABELS "V2;Unit;ComputeStage;AllGatherV;MPI;TensorParallel;HeterogeneousTP"
+    MPI_PROCS 1
+)
+
+# Test: AllreduceStage (MPI collective for tensor parallel reductions)
+# Phase 4.1a: Tests AllreduceStage including TPDomain support
+add_executable(v2_test_allreduce_stage unit/Test__AllreduceStage.cpp)
+target_link_libraries(v2_test_allreduce_stage llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_AllreduceStage
+    COMMAND $<TARGET_FILE:v2_test_allreduce_stage>
+    LABELS "V2;Unit;ComputeStage;Allreduce;MPI;TensorParallel;TPDomain"
+    MPI_PROCS 1
+)
+
+# Test: PPActivationStages (Pipeline Parallel activation stages)
+# Phase 6.4: Tests SendActivationsStage and ReceiveActivationsStage interfaces
+# Validates stage type, name generation, buffer requirements, dump info, and async support
+# Note: Unit tests only - no actual MPI communication (use integration test for real P2P)
+add_executable(v2_test_pp_activation_stages unit/Test__PPActivationStages.cpp)
+target_link_libraries(v2_test_pp_activation_stages llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PPActivationStages
+    COMMAND $<TARGET_FILE:v2_test_pp_activation_stages>
+    LABELS "V2;Unit;ComputeStage;PipelineParallel;SendActivations;ReceiveActivations;MPI;P2P"
+    MPI_PROCS 1
+)
+
 # Test: CollectiveStageIntegration (AllreduceStage and AllGatherStage with CollectiveContext)
 # Unit test for collective stages using the new collective infrastructure with mocks
 add_executable(v2_unit_collective_stage_integration integration/Test__CollectiveStageIntegration.cpp)
@@ -3820,6 +4079,93 @@ add_v2_test(V2_Unit_HeterogeneousExecution
     LABELS "V2;Unit;HeterogeneousExecution;Mock;MPI;Topology;DevicePlacement;CPU;GPU"
     MPI_PROCS 1
 )
+
+# Test: HeterogeneousLayerExecutorIntegration - Integration tests for executor + config
+# Phase 5.4: Tests integration of HeterogeneousLayerExecutor with LayerPlacementConfig
+# Verifies device routing, domain boundary detection, statistics tracking, and various
+# placement patterns (first N, last N, alternating, multi-GPU, etc.)
+# Note: Uses mocks, no real GPU required - runs as unit test
+add_executable(v2_integration_heterogeneous_layer_executor integration/Test__HeterogeneousLayerExecutorIntegration.cpp)
+target_link_libraries(v2_integration_heterogeneous_layer_executor 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_HeterogeneousLayerExecutorPlacement
+    COMMAND $<TARGET_FILE:v2_integration_heterogeneous_layer_executor>
+    LABELS "V2;Unit;HeterogeneousExecution;LayerPlacement;DeviceRouting;DomainBoundary"
+    MPI_PROCS 1
+)
+
+# =============================================================================
+# Phase 5.5: End-to-End Heterogeneous Pipeline Integration Tests
+# =============================================================================
+# Comprehensive integration tests for the complete heterogeneous execution pipeline:
+# - LayerPlacementConfig specifies which layers run where
+# - HeterogeneousLayerExecutor routes execution correctly
+# - CrossDomainTransfer handles activation transfers
+# - DomainAwareBufferManager allocates buffers correctly
+
+# Test: HeterogeneousPipeline - End-to-end heterogeneous pipeline tests
+# Tests full pipeline with actual GPU hardware (graceful fallback to CPU-only)
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_integration_heterogeneous_pipeline 
+        integration/Test__HeterogeneousPipeline.cpp
+    )
+    target_include_directories(v2_integration_heterogeneous_pipeline PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/utils
+    )
+    target_link_libraries(v2_integration_heterogeneous_pipeline 
+        llaminar2_core 
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_HeterogeneousPipeline 
+        COMMAND $<TARGET_FILE:v2_integration_heterogeneous_pipeline>
+        LABELS "V2;Integration;Heterogeneous;Pipeline;Phase5;GPU;CPU;Transfer;BufferManager"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added HeterogeneousPipeline end-to-end integration tests (GPU)")
+else()
+    # CPU-only version for systems without GPU
+    add_executable(v2_integration_heterogeneous_pipeline 
+        integration/Test__HeterogeneousPipeline.cpp
+    )
+    target_include_directories(v2_integration_heterogeneous_pipeline PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/utils
+    )
+    target_link_libraries(v2_integration_heterogeneous_pipeline 
+        llaminar2_core 
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_HeterogeneousPipeline 
+        COMMAND $<TARGET_FILE:v2_integration_heterogeneous_pipeline>
+        LABELS "V2;Integration;Heterogeneous;Pipeline;Phase5;CPU"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added HeterogeneousPipeline end-to-end integration tests (CPU-only)")
+endif()
+
+# Test: HeterogeneousPipelineMPI - Multi-rank heterogeneous pipeline tests
+# MPI-aware tests for cross-rank domain configuration and collective operations
+add_executable(v2_integration_heterogeneous_pipeline_mpi 
+    integration/Test__HeterogeneousPipelineMPI.cpp
+)
+target_include_directories(v2_integration_heterogeneous_pipeline_mpi PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/utils
+)
+target_link_libraries(v2_integration_heterogeneous_pipeline_mpi 
+    llaminar2_core 
+    GTest::gtest
+    # Note: No gtest_main - test has custom MPI main
+)
+add_v2_test(V2_Integration_HeterogeneousPipelineMPI 
+    COMMAND $<TARGET_FILE:v2_integration_heterogeneous_pipeline_mpi>
+    LABELS "V2;Integration;Heterogeneous;Pipeline;Phase5;MPI;CrossRank;TPDomain;Collective"
+    MPI_PROCS 2
+)
+message(STATUS "V2 Tests: Added HeterogeneousPipelineMPI multi-rank integration tests")
 
 # Test: WorkDistribution - Integration test for work distribution across ranks
 # Phase 5b testability refactoring: validates tensor-parallel work distribution via mocks
@@ -3920,6 +4266,101 @@ add_v2_test(V2_Unit_Orchestration_Scenario2_MultiNodeCluster
     MPI_PROCS 1
 )
 
+# Test: Scenario 3 - Single Machine with CPU Participation (1 GPU socket + 1 CPU-only socket)
+add_executable(v2_orchestration_scenario3
+    integration/orchestration/scenarios/Test__Scenario3_CPUParticipation.cpp
+)
+target_include_directories(v2_orchestration_scenario3 PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}           # For tests/v2/mocks/ include path
+    ${CMAKE_CURRENT_SOURCE_DIR}/integration/orchestration  # For OrchestrationTestBase.h
+)
+target_link_libraries(v2_orchestration_scenario3 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Orchestration_Scenario3_CPUParticipation 
+    COMMAND $<TARGET_FILE:v2_orchestration_scenario3>
+    LABELS "V2;Unit;Orchestration;Scenario;CPUParticipation;Hybrid;Placement;PlacementStrategy;Mock;MPI;Topology;CUDA;CPU;GPU;Qwen2;0.5B;7B;72B;Heterogeneous"
+    MPI_PROCS 1
+)
+
+# Test: Scenario 4 - Cross-Vendor TP (single socket, CUDA + ROCm, PCIe-based TP)
+add_executable(v2_orchestration_scenario4
+    integration/orchestration/scenarios/Test__Scenario4_CrossVendorTP.cpp
+)
+target_include_directories(v2_orchestration_scenario4 PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}           # For tests/v2/mocks/ include path
+    ${CMAKE_CURRENT_SOURCE_DIR}/integration/orchestration  # For OrchestrationTestBase.h
+)
+target_link_libraries(v2_orchestration_scenario4 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Orchestration_Scenario4_CrossVendorTP 
+    COMMAND $<TARGET_FILE:v2_orchestration_scenario4>
+    LABELS "V2;Unit;Orchestration;Scenario;CrossVendor;TP;TensorParallel;Placement;PlacementStrategy;Mock;MPI;Topology;CUDA;ROCm;GPU;PCIe;Qwen2;0.5B;7B;72B;Heterogeneous"
+    MPI_PROCS 1
+)
+
+# Test: Scenario 5 - Multi-Node Pipeline Parallel (2 nodes, HDR InfiniBand, PP)
+add_executable(v2_orchestration_scenario5
+    integration/orchestration/scenarios/Test__Scenario5_MultiNodePP.cpp
+)
+target_include_directories(v2_orchestration_scenario5 PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}           # For tests/v2/mocks/ include path
+    ${CMAKE_CURRENT_SOURCE_DIR}/integration/orchestration  # For OrchestrationTestBase.h
+)
+target_link_libraries(v2_orchestration_scenario5 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Orchestration_Scenario5_MultiNodePP 
+    COMMAND $<TARGET_FILE:v2_orchestration_scenario5>
+    LABELS "V2;Unit;Orchestration;Scenario;MultiNode;PipelineParallel;PP;Placement;PlacementStrategy;Mock;MPI;Topology;CUDA;GPU;A100;Infiniband;NVLink;Qwen2;7B;72B;235B;571B"
+    MPI_PROCS 1
+)
+
+# Test: Scenario 6 - Single Socket, Asymmetric VRAM (24GB RTX 4090 + 80GB A100)
+add_executable(v2_orchestration_scenario6
+    integration/orchestration/scenarios/Test__Scenario6_AsymmetricVRAM.cpp
+)
+target_include_directories(v2_orchestration_scenario6 PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}           # For tests/v2/mocks/ include path
+    ${CMAKE_CURRENT_SOURCE_DIR}/integration/orchestration  # For OrchestrationTestBase.h
+)
+target_link_libraries(v2_orchestration_scenario6 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Orchestration_Scenario6_AsymmetricVRAM 
+    COMMAND $<TARGET_FILE:v2_orchestration_scenario6>
+    LABELS "V2;Unit;Orchestration;Scenario;AsymmetricVRAM;VRAM;Proportional;Placement;PlacementStrategy;Mock;MPI;Topology;CUDA;GPU;RTX4090;A100;NVLink;Qwen2;0.5B;7B;72B;Heterogeneous"
+    MPI_PROCS 1
+)
+
+# Test: Scenario 7 - 2-Node Heterogeneous Pipeline Cluster (Cross-Vendor TP + Intra-Node PP)
+add_executable(v2_orchestration_scenario7
+    integration/orchestration/scenarios/Test__Scenario7_HeterogeneousPipelineCluster.cpp
+)
+target_include_directories(v2_orchestration_scenario7 PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}           # For tests/v2/mocks/ include path
+    ${CMAKE_CURRENT_SOURCE_DIR}/integration/orchestration  # For OrchestrationTestBase.h
+)
+target_link_libraries(v2_orchestration_scenario7 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Orchestration_Scenario7_HeterogeneousPipelineCluster 
+    COMMAND $<TARGET_FILE:v2_orchestration_scenario7>
+    LABELS "V2;Unit;Orchestration;Scenario;HeterogeneousPipeline;CrossVendor;IntraNode;PP;PipelineParallel;TP;TensorParallel;CUDA;ROCm;GPU;RTX3090;MI50;PCIeBAR;UPI;Infiniband;MultiNode;Qwen2;7B;72B;120B;NUMA"
+    MPI_PROCS 1
+)
+
 # Test: PipelineExecutor (LayerExecutor-to-pipeline adapter)
 # Test: GQAAttention Second Sequence Handling
 # Tests that sequence 1 in batched attention is handled correctly
@@ -3964,6 +4405,47 @@ add_v2_test(V2_Integration_WeightManagerMemoryEfficient
     LABELS "V2;Integration;WeightManager;TensorSlice;MemoryEfficient;Sharding"
 )
 
+# Test: WeightManager Proportional Slicing (TensorParallelConfig support)
+add_executable(v2_test_weight_manager_proportional integration/Test__WeightManagerProportional.cpp)
+target_link_libraries(v2_test_weight_manager_proportional 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_WeightManagerProportional 
+    COMMAND $<TARGET_FILE:v2_test_weight_manager_proportional>
+    MPI_PROCS 1
+    LABELS "V2;Integration;WeightManager;TensorParallel;Proportional;Heterogeneous"
+)
+
+# Test: Qwen2Graph with TensorParallelConfig (Phase 1c: Proportional TP)
+add_executable(v2_test_qwen2graph_proportional_tp integration/Test__Qwen2GraphProportionalTP.cpp)
+target_link_libraries(v2_test_qwen2graph_proportional_tp 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_Qwen2GraphProportionalTP 
+    COMMAND $<TARGET_FILE:v2_test_qwen2graph_proportional_tp>
+    MPI_PROCS 1
+    LABELS "V2;Integration;Qwen2Graph;TensorParallel;Proportional;Heterogeneous;Phase1c"
+)
+
+# Test: Qwen2Graph with MultiDomainTPConfig (Phase 4.3: Heterogeneous TP Domains)
+# Tests that Qwen2Graph correctly passes TPDomain to AllreduceStage for
+# domain-based collective routing in heterogeneous tensor parallelism scenarios.
+add_executable(v2_test_qwen2graph_domain unit/Test__Qwen2GraphDomain.cpp)
+target_link_libraries(v2_test_qwen2graph_domain 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Qwen2GraphDomain 
+    COMMAND $<TARGET_FILE:v2_test_qwen2graph_domain>
+    MPI_PROCS 1
+    LABELS "V2;Unit;Qwen2Graph;TensorParallel;TPDomain;MultiDomain;Heterogeneous;Phase4_3"
+)
+
 # Test: PlacementStrategy and PlacementPlan (weight/compute placement algorithms)
 add_executable(v2_test_placement_strategy unit/Test__PlacementStrategy.cpp)
 target_link_libraries(v2_test_placement_strategy 
@@ -3975,6 +4457,50 @@ add_v2_test(V2_Unit_PlacementStrategy
     COMMAND $<TARGET_FILE:v2_test_placement_strategy>
     MPI_PROCS 1
     LABELS "V2;Unit;Placement;Strategy;WeightDistribution;DeviceMapping"
+)
+
+# Test: MPITopology Capability Exchange (serialization/deserialization of RankInventory)
+add_executable(v2_test_mpi_topology_capability_exchange unit/Test__MPITopologyCapabilityExchange.cpp)
+target_link_libraries(v2_test_mpi_topology_capability_exchange 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MPITopologyCapabilityExchange 
+    COMMAND $<TARGET_FILE:v2_test_mpi_topology_capability_exchange>
+    MPI_PROCS 1
+    LABELS "V2;Unit;MPI;Topology;Serialization;DeviceInventory;Heterogeneous"
+)
+
+# Test: HeterogeneousMultiDomainStrategy (multi-domain TP + PP for heterogeneous clusters)
+add_executable(v2_test_heterogeneous_multi_domain_strategy unit/Test__HeterogeneousMultiDomainStrategy.cpp)
+target_link_libraries(v2_test_heterogeneous_multi_domain_strategy 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_HeterogeneousMultiDomainStrategy 
+    COMMAND $<TARGET_FILE:v2_test_heterogeneous_multi_domain_strategy>
+    MPI_PROCS 1
+    LABELS "V2;Unit;Placement;Strategy;Heterogeneous;MultiDomain;TPDomain;PipelineParallel"
+)
+
+# Test: Phase 6 Heterogeneous Domain Integration (Phase 6.6)
+# End-to-end integration tests for heterogeneous multi-domain parallelism:
+# - Capability exchange (MPITopology)
+# - HeterogeneousMultiDomainStrategy
+# - Domain wiring in GraphOrchestrator
+# - PP Send/Recv stages
+# - Plan broadcast and deterministic computation
+add_executable(v2_integration_phase6_domain integration/Test__Phase6HeterogeneousDomainIntegration.cpp)
+target_link_libraries(v2_integration_phase6_domain 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Phase6_HeterogeneousDomain 
+    COMMAND $<TARGET_FILE:v2_integration_phase6_domain>
+    MPI_PROCS 2
+    LABELS "V2;Integration;Phase6;Heterogeneous;Domain;MultiDomain;TPDomain;PipelineParallel;MPI;CapabilityExchange"
 )
 
 # Test: Quantised GEMM Sliced Parity (verifies sliced GEMM across MPI ranks matches unsliced)
@@ -4268,6 +4794,48 @@ add_v2_test(V2_Integration_MPI_PrecisionAwareAllreduce
     COMMAND $<TARGET_FILE:v2_integration_mpi_precision_allreduce>
     MPI_PROCS 2
     LABELS "V2;Integration;MPI;Allreduce;FP32;FP16;BF16;Q8_1;Q16_1;Bandwidth"
+)
+
+# Test: Point-to-Point MPI Operations (Pipeline Parallelism Foundation)
+# Tests send/recv, isend/irecv, wait, waitAll, probe, iprobe operations:
+# - Synchronous and async point-to-point communication
+# - Large buffer transfers (1MB)
+# - Multiple concurrent requests with waitAll
+# - Message probing before receive
+# - Tag-based message differentiation
+# - Bidirectional communication patterns
+add_executable(v2_integration_mpi_context_p2p 
+    integration/Test__MPIContextP2P.cpp
+    integration/mpi_gtest_main.cpp
+)
+target_link_libraries(v2_integration_mpi_context_p2p
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_MPI_ContextP2P
+    COMMAND $<TARGET_FILE:v2_integration_mpi_context_p2p>
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;P2P;Send;Recv;PipelineParallel"
+)
+
+# Test: Pipeline Activation Transfer (Phase 2.2 - P2P stages)
+# Tests SendActivationsStage and ReceiveActivationsStage for pipeline parallelism:
+# - Sync/async send/recv
+# - Bidirectional exchange
+# - Multi-layer sequence with tags
+# - Error handling
+add_executable(v2_integration_pipeline_activation_transfer
+    integration/Test__PipelineActivationTransfer.cpp
+    integration/mpi_gtest_main.cpp
+)
+target_link_libraries(v2_integration_pipeline_activation_transfer
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_PipelineActivationTransfer
+    COMMAND $<TARGET_FILE:v2_integration_pipeline_activation_transfer>
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;P2P;PipelineParallel;Stages;SendActivations;ReceiveActivations"
 )
 
 # Test: Row-Parallel Multi-Precision MPI Integration Tests
@@ -5403,6 +5971,75 @@ add_v2_test(V2_Integration_PlacementStrategy_MPI
     COMMAND $<TARGET_FILE:v2_integration_placement_strategy_mpi>
     MPI_PROCS 2
     LABELS "V2;Integration;MPI;PlacementStrategy;Determinism;CPUOnly;GPUFirst;PhaseG0"
+)
+
+# Test: Orchestrator Wiring Integration Tests (Phase G1 - TDD)
+# TDD tests verifying that the orchestration system is properly wired:
+#   1. MPITopology::computePlacement() is called during inference setup
+#   2. PlacementStrategyFactory::autoSelect() selects the right strategy
+#   3. HeterogeneousMultiDomainStrategy is used when appropriate
+#   4. PlacementPlan flows through to GraphOrchestrator
+add_executable(v2_integration_orchestrator_wiring integration/Test__OrchestratorWiringIntegration.cpp)
+target_include_directories(v2_integration_orchestrator_wiring PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_integration_orchestrator_wiring
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_OrchestratorWiring
+    COMMAND $<TARGET_FILE:v2_integration_orchestrator_wiring>
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;Orchestrator;Wiring;TDD;HeterogeneousMultiDomain;PhaseG1"
+)
+
+# Test: Orchestration Wiring Integration Tests (TDD - define expected behavior)
+# These tests verify the EXPECTED correct behavior of orchestration wiring.
+# They will FAIL until the wiring is properly implemented, then PASS.
+# Purpose:
+#   1. InferenceRunnerConfig should accept a PlacementPlan
+#   2. createInferenceRunner() should use PlacementPlan for execution
+#   3. MPIContext should expose topology() for placement computation
+#   4. PlacementPlan should be honored during actual inference
+add_executable(v2_integration_orchestration_wiring integration/Test__OrchestrationWiring.cpp)
+target_include_directories(v2_integration_orchestration_wiring PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_integration_orchestration_wiring
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_OrchestrationWiring
+    COMMAND $<TARGET_FILE:v2_integration_orchestration_wiring>
+    LABELS "V2;Integration;Orchestrator;Wiring;TDD;PhaseG1"
+)
+
+# Test: TPDomain MPI Integration Tests (Phase 3.2b)
+# Tests TPDomainBuilder, MPI_Comm_split, cross-rank domain creation, and cleanup
+# Verifies communicator management and domain consistency across ranks.
+add_executable(v2_integration_tpdomain_mpi integration/Test__TPDomainMPI.cpp)
+target_link_libraries(v2_integration_tpdomain_mpi
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_TPDomainMPI
+    COMMAND $<TARGET_FILE:v2_integration_tpdomain_mpi>
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;TPDomain;TensorParallelism;HybridParallelism;Phase3"
+)
+
+# Test: UPIBackend MPI Integration Tests (Phase 3.3)
+# Tests UPICollectiveBackend with actual MPI collectives over UPI fabric
+# Verifies AllReduce, AllGather, AllGatherV, Broadcast, Barrier, and performance
+add_executable(v2_integration_upi_backend_mpi integration/Test__UPIBackendMPI.cpp integration/mpi_gtest_main.cpp)
+target_link_libraries(v2_integration_upi_backend_mpi
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_UPIBackendMPI
+    COMMAND $<TARGET_FILE:v2_integration_upi_backend_mpi>
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;UPI;Collective;TensorParallelism;Phase3"
 )
 
 

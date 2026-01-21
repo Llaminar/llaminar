@@ -15,6 +15,7 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "config/TPDomain.h"
 
 namespace llaminar2
 {
@@ -34,9 +35,10 @@ namespace llaminar2
         {
             STAGE_PARAMS_COMMON_FIELDS;
 
-            ITensor *buffer = nullptr;                  ///< Buffer to allreduce (in-place)
-            size_t count = 0;                           ///< Number of elements to reduce (0 = use buffer->numel())
+            ITensor *buffer = nullptr;                   ///< Buffer to allreduce (in-place)
+            size_t count = 0;                            ///< Number of elements to reduce (0 = use buffer->numel())
             CollectiveContext *collective_ctx = nullptr; ///< Collective context (preferred over direct MPI)
+            const TPDomain *domain = nullptr;            ///< Domain for routing (nullptr = use mpi_ctx legacy path)
         };
 
         explicit AllreduceStage(Params params);
@@ -53,6 +55,9 @@ namespace llaminar2
 
         /// Check if this stage uses the new CollectiveContext
         bool usesCollectiveContext() const { return params_.collective_ctx != nullptr; }
+
+        /// Get the TPDomain this stage belongs to (nullptr = legacy mpi_ctx path)
+        const TPDomain *getDomain() const { return params_.domain; }
 
     private:
         Params params_;

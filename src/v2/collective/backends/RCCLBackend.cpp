@@ -253,6 +253,114 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLBackend::allgatherv(
+        const void *send_buf,
+        size_t send_count,
+        void *recv_buf,
+        const std::vector<int> &recv_counts,
+        const std::vector<int> &displacements,
+        CollectiveDataType dtype)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            return false;
+        }
+
+        // RCCL does not have a native allgatherv. We emulate it using ncclSend/ncclRecv.
+        // For now, we use a simpler approach: regular allgather with max count, then extract.
+        // This is less efficient but works correctly.
+
+        // Find max recv count to use as uniform count
+        int max_count = 0;
+        for (int c : recv_counts)
+        {
+            max_count = std::max(max_count, c);
+        }
+
+        // If all counts are equal, use regular allgather
+        bool all_equal = true;
+        for (int c : recv_counts)
+        {
+            if (c != recv_counts[0])
+            {
+                all_equal = false;
+                break;
+            }
+        }
+
+        if (all_equal)
+        {
+            return allgather(send_buf, recv_buf, send_count, dtype);
+        }
+
+        // Variable counts - RCCL doesn't support this natively
+        // Fall back to point-to-point sends/recvs
+        ncclDataType_t rccl_dtype = toRcclDataType(dtype);
+
+        ncclResult_t err = ncclGroupStart();
+        if (err != ncclSuccess)
+        {
+            last_error_ = "ncclGroupStart failed";
+            return false;
+        }
+
+        size_t dtype_size = 0;
+        switch (dtype)
+        {
+        case CollectiveDataType::FLOAT32:
+            dtype_size = 4;
+            break;
+        case CollectiveDataType::FLOAT16:
+        case CollectiveDataType::BFLOAT16:
+            dtype_size = 2;
+            break;
+        case CollectiveDataType::INT32:
+            dtype_size = 4;
+            break;
+        case CollectiveDataType::INT8:
+            dtype_size = 1;
+            break;
+        }
+
+        // Each rank sends to all others and receives from all others
+        for (int peer = 0; peer < num_ranks_; ++peer)
+        {
+            // Send my data to peer
+            err = ncclSend(send_buf, send_count, rccl_dtype, peer, comm_, stream_);
+            if (err != ncclSuccess)
+            {
+                ncclGroupEnd();
+                last_error_ = "ncclSend failed in allgatherv";
+                return false;
+            }
+
+            // Receive from peer at their offset
+            char *recv_ptr = static_cast<char *>(recv_buf) + displacements[peer] * dtype_size;
+            err = ncclRecv(recv_ptr, recv_counts[peer], rccl_dtype, peer, comm_, stream_);
+            if (err != ncclSuccess)
+            {
+                ncclGroupEnd();
+                last_error_ = "ncclRecv failed in allgatherv";
+                return false;
+            }
+        }
+
+        err = ncclGroupEnd();
+        if (err != ncclSuccess)
+        {
+            last_error_ = "ncclGroupEnd failed";
+            return false;
+        }
+
+        return true;
+#else
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
     bool RCCLBackend::reduceScatter(
         const void *send_buf,
         void *recv_buf,

@@ -24,6 +24,8 @@ V2 is a **kernel-centric, operator-free** architecture:
 8. **Graph caching** – `LayerGraphCache` builds DAGs that are cached and reused during decode
 9. **Zero-allocation hot path** – all buffers pre-allocated via `GraphBufferManager` + `DeviceWorkspaceManager`
 10. **Automatic coherence** – GPU↔CPU memory sync handled by `StageCoherence` at stage boundaries
+11. **Hybrid parallelism** – Three-level parallelism: cross-rank PP, intra-rank layer placement, heterogeneous GPU TP
+12. **Proportional work distribution** – Unequal work splits for mixed GPU vendors (e.g., NVIDIA 73%, AMD 27%)
 
 ### 1.2 Mental Model
 
@@ -476,6 +478,11 @@ enum class ComputeStageType {
     // MPI collective
     ALLREDUCE,             // MPI_Allreduce(SUM)
     ALLGATHER,             // MPI_Allgather
+    ALLGATHER_V,           // MPI_Allgatherv (variable counts)
+    
+    // Pipeline parallelism
+    SEND_ACTIVATIONS,      // MPI send for PP
+    RECEIVE_ACTIVATIONS,   // MPI recv for PP
     
     // Model-level
     EMBEDDING,             // Token embedding lookup
@@ -512,6 +519,9 @@ enum class ComputeStageType {
 | `QuantizeQ16_1Stage` | QUANTIZE_Q16_1 | Activation quantization | No |
 | `AllreduceStage` | ALLREDUCE | **MPI sync** | **Yes** |
 | `AllGatherStage` | ALLGATHER | **MPI sync** | **Yes** |
+| `AllGatherVStage` | ALLGATHER_V | **MPI sync (variable counts)** | **Yes** |
+| `SendActivationsStage` | SEND_ACTIVATIONS | **Pipeline parallelism send** | **Yes** |
+| `ReceiveActivationsStage` | RECEIVE_ACTIVATIONS | **Pipeline parallelism recv** | **Yes** |
 
 ### 3.7 Execution Flow
 
@@ -705,20 +715,25 @@ enum class CollectiveBackendType {
     MPI,        // MPI (fallback, inter-node)
     NCCL,       // NVIDIA Collective Communication Library
     RCCL,       // ROCm Collective Communication Library
-    PCIE_BAR,   // Direct PCIe BAR mapping (CUDA↔ROCm)
-    HOST,       // Host-staged fallback (heterogeneous)
+    PCIE_BAR,   // Direct PCIe BAR mapping (CUDA↔ROCm, ~25μs)
+    HOST,       // Host-staged fallback (heterogeneous, ~200μs)
 };
 ```
 
 ### 4.4 Backend Selection Logic
 
-| Device Group | Selected Backend | Reason |
-|--------------|------------------|--------|
-| All CUDA | NCCL | NVLink/PCIe fast path |
-| All ROCm | RCCL | xGMI/PCIe fast path |
-| Mixed CUDA+ROCm | PCIE_BAR or HOST | Direct BAR or staged |
-| Cross-node | MPI | Infiniband/Ethernet |
-| CPU only | MPI | Standard MPI |
+| Device Group | Selected Backend | Latency | Reason |
+|--------------|------------------|---------|--------|
+| All CUDA | NCCL | ~5μs | NVLink/PCIe fast path |
+| All ROCm | RCCL | ~5μs | xGMI/PCIe fast path |
+| Mixed CUDA+ROCm (same node) | **PCIE_BAR** | ~25μs | Direct BAR mapping |
+| Mixed CUDA+ROCm (fallback) | HOST | ~200μs | Host-staged transfer |
+| Cross-node | MPI | ~10-50μs | Infiniband/Ethernet |
+| CPU only | MPI | ~1-5μs | Standard MPI |
+
+**PCIeBAR Performance (validated):**
+- 25μs latency for 14KB transfers (8× better than HOST backend)
+- 731 tok/s sustained decode throughput with heterogeneous TP
 
 ---
 
@@ -1720,6 +1735,15 @@ void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
 | Backend router | `src/v2/collective/BackendRouter.h` |
 | Backend interface | `src/v2/collective/ICollectiveBackend.h` |
 | NCCL/RCCL/MPI backends | `src/v2/collective/backends/` |
+| PCIeBAR backend | `src/v2/collective/backends/PCIeBARBackend.h` |
+| **Hybrid Parallelism** | |
+| TensorParallelConfig | `src/v2/config/TensorParallelConfig.h` |
+| PipelineParallelConfig | `src/v2/config/PipelineParallelConfig.h` |
+| LayerPlacementConfig | `src/v2/config/LayerPlacementConfig.h` |
+| SendActivationsStage | `src/v2/execution/compute_stages/stages/SendActivationsStage.h` |
+| ReceiveActivationsStage | `src/v2/execution/compute_stages/stages/ReceiveActivationsStage.h` |
+| AllGatherVStage | `src/v2/execution/compute_stages/stages/AllGatherVStage.h` |
+| MPI tags | `src/v2/utils/MPITags.h` |
 | **Coherence** | |
 | Stage coherence | `src/v2/execution/StageCoherence.h` |
 | GPU coherence utilities | `src/v2/execution/GpuCoherence.h` |
@@ -1754,6 +1778,8 @@ void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
 7. **Implement getDumpInfo()** – All stages must support introspection
 8. **DeviceId not int** – Use typed `DeviceId` for device identification
 9. **Collective via BackendRouter** – Let the router select optimal MPI backend
+10. **Configure parallelism via Config classes** – Use `TensorParallelConfig`, `PipelineParallelConfig`, `LayerPlacementConfig`
+11. **Use PCIeBAR for heterogeneous TP** – Direct BAR mapping is 8× faster than host staging
 
 ### 9.3 Environment Variables
 
@@ -1796,7 +1822,7 @@ ctest --test-dir build_v2_release -R "^V2_Perf_" --verbose
 
 ### 10.1 Sharding Patterns
 
-Llaminar implements **Megatron-style tensor parallelism** with automatic weight sharding:
+Llaminar implements **Megatron-style tensor parallelism** with automatic weight sharding. Supports both **equal splits** (backward compatible) and **proportional splits** for heterogeneous GPU configurations.
 
 | Weight | Sharding Mode | Description |
 |--------|---------------|-------------|
@@ -1806,6 +1832,19 @@ Llaminar implements **Megatron-style tensor parallelism** with automatic weight 
 | `ffn_down.weight` | INPUT_PARALLEL | Split input dim, allreduce after |
 | `output.weight` (LM head) | COLUMN_PARALLEL | Split vocab, allgather logits |
 | Norms, embeddings | REPLICATE | Full copy on each rank |
+
+**Proportional Sharding Example (73%/27% split):**
+```cpp
+auto tp_config = TensorParallelConfig::proportionalSplit(
+    {DeviceId::cuda(0), DeviceId::rocm(0)},
+    {0.73f, 0.27f},  // NVIDIA 73%, AMD 27%
+    n_heads, n_kv_heads, d_ff, vocab_size);
+
+// NVIDIA gets: heads 0-22 (73%), d_ff 0-8032 (73%), vocab 0-110913
+// AMD gets: heads 23-31 (27%), d_ff 8032-11008 (27%), vocab 110913-151936
+```
+
+> **📖 For detailed hybrid parallelism configuration, see Section 11.**
 
 ### 10.2 MPI Synchronization Stages
 
@@ -1887,6 +1926,632 @@ struct PlacementInput {
 
 enum class InferencePhase { PREFILL, DECODE };
 ```
+
+---
+
+## 11. Hybrid Parallelism Infrastructure
+
+### 11.1 Three-Level Hybrid Architecture
+
+Llaminar V2 supports a **three-level hybrid parallelism** model for maximum hardware utilization:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                     THREE-LEVEL HYBRID PARALLELISM                               │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  LEVEL 1: Cross-Rank Pipeline Parallelism (PP)                                  │
+│  ═══════════════════════════════════════════════                                │
+│  • Layers distributed across MPI ranks                                           │
+│  • MPI P2P for activation forwarding between ranks                              │
+│  • PipelineParallelConfig manages layer ranges per rank                         │
+│                                                                                  │
+│  ┌────────────────┐     MPI Send/Recv     ┌────────────────┐                    │
+│  │   MPI Rank 0   │◄───────────────────►│   MPI Rank 1   │                    │
+│  │  Layers 0-13   │                       │  Layers 14-27  │                    │
+│  └────────────────┘                       └────────────────┘                    │
+│                                                                                  │
+│  LEVEL 2: Intra-Rank Layer Placement                                            │
+│  ═══════════════════════════════════════                                         │
+│  • Layers assigned to CPU or GPU within a single rank                           │
+│  • LayerPlacementConfig tracks device per layer                                  │
+│  • TransitionPoints identify CPU↔GPU data transfers                             │
+│                                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐                  │
+│  │                    Within MPI Rank 0                       │                  │
+│  │   ┌──────────────┐  copy  ┌────────────────────────────┐  │                  │
+│  │   │  CPU Layers  │◄──────►│       GPU Layers           │  │                  │
+│  │   │  (0-3)       │        │       (4-13)               │  │                  │
+│  │   └──────────────┘        └────────────────────────────┘  │                  │
+│  └───────────────────────────────────────────────────────────┘                  │
+│                                                                                  │
+│  LEVEL 3: Heterogeneous Tensor Parallelism (TP)                                 │
+│  ═══════════════════════════════════════════════                                │
+│  • Heads/FFN split across multiple GPUs (same rank)                             │
+│  • Proportional splits for mixed vendors (NVIDIA 73%, AMD 27%)                  │
+│  • AllGatherV for variable-sized output collection                              │
+│                                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐                  │
+│  │                  GPU Tensor Parallelism                    │                  │
+│  │   ┌────────────────┐  Allreduce  ┌────────────────────┐   │                  │
+│  │   │  NVIDIA GPU    │◄───────────►│     AMD GPU        │   │                  │
+│  │   │  73% heads     │   PCIeBAR   │     27% heads      │   │                  │
+│  │   │  (heads 0-22)  │             │     (heads 23-31)  │   │                  │
+│  │   └────────────────┘             └────────────────────┘   │                  │
+│  └───────────────────────────────────────────────────────────┘                  │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 11.2 Configuration Classes
+
+#### 11.2.1 TensorParallelConfig
+
+Location: `src/v2/config/TensorParallelConfig.h`
+
+Configures how attention heads, FFN dimensions, and vocabulary are distributed across GPUs within a rank:
+
+```cpp
+// Per-device assignment for tensor parallelism
+struct DeviceShardingAssignment {
+    DeviceId device;
+    
+    // Attention sharding
+    int head_start = 0;      // First Q head index
+    int head_count = 0;      // Number of Q heads
+    int kv_head_start = 0;   // First KV head (for GQA)
+    int kv_head_count = 0;   // Number of KV heads
+    
+    // FFN sharding
+    int d_ff_start = 0;      // Start index in FFN dimension
+    int d_ff_count = 0;      // FFN slice size
+    
+    // LM Head sharding
+    int vocab_start = 0;     // Start index in vocabulary
+    int vocab_count = 0;     // Vocab slice size
+    
+    float work_fraction;     // e.g., 0.73 for 73%
+    int local_rank;          // Rank in device group
+};
+
+class TensorParallelConfig {
+public:
+    // Factory methods
+    static TensorParallelConfig equalSplit(
+        int world_size, int n_heads, int n_kv_heads, int d_ff, int vocab_size,
+        std::optional<std::vector<DeviceId>> devices = std::nullopt);
+    
+    static TensorParallelConfig proportionalSplit(
+        const std::vector<DeviceId>& devices,
+        const std::vector<float>& work_fractions,  // e.g., {0.73, 0.27}
+        int n_heads, int n_kv_heads, int d_ff, int vocab_size);
+    
+    static TensorParallelConfig singleDevice(
+        DeviceId device, int n_heads, int n_kv_heads, int d_ff, int vocab_size);
+    
+    // Accessors
+    const DeviceShardingAssignment& forDevice(DeviceId device) const;
+    const DeviceShardingAssignment& forRank(int rank) const;
+    int worldSize() const;
+    bool isProportional() const;
+};
+```
+
+**Usage Example: 73%/27% Split:**
+```cpp
+// NVIDIA gets 73%, AMD gets 27%
+auto tp_config = TensorParallelConfig::proportionalSplit(
+    {DeviceId::cuda(0), DeviceId::rocm(0)},  // devices
+    {0.73f, 0.27f},                           // fractions
+    32,    // n_heads (→ NVIDIA: 23, AMD: 9)
+    8,     // n_kv_heads (→ NVIDIA: 6, AMD: 2)  
+    11008, // d_ff (→ aligned to 32-boundary)
+    151936 // vocab_size
+);
+
+// Query assignments
+auto nvidia_shard = tp_config.forDevice(DeviceId::cuda(0));
+// nvidia_shard.head_start = 0, head_count = 23, d_ff_start = 0, d_ff_count = 8032
+```
+
+#### 11.2.2 PipelineParallelConfig
+
+Location: `src/v2/config/PipelineParallelConfig.h`
+
+Configures how transformer layers are distributed across MPI ranks:
+
+```cpp
+// Layer range assigned to a pipeline stage
+struct LayerRange {
+    int first_layer;   // Inclusive, 0-indexed
+    int last_layer;    // Inclusive
+    int owning_rank;   // MPI rank
+    
+    int count() const { return last_layer - first_layer + 1; }
+    bool contains(int layer) const;
+};
+
+class PipelineParallelConfig {
+public:
+    // Factory methods
+    static PipelineParallelConfig equalSplit(int num_ranks, int total_layers);
+    static PipelineParallelConfig customSplit(
+        const std::vector<std::pair<int, int>>& layer_ranges);  // {first, last} pairs
+    static PipelineParallelConfig singleRank(int total_layers);
+    
+    // Accessors
+    const LayerRange& forRank(int rank) const;
+    int rankForLayer(int layer) const;
+    bool ownsLayer(int rank, int layer) const;
+    
+    // Pipeline topology
+    int prevRank(int rank) const;   // -1 if first stage
+    int nextRank(int rank) const;   // -1 if last stage
+    bool isFirstStage(int rank) const;
+    bool isLastStage(int rank) const;
+};
+```
+
+**Usage Example: 2-Rank Pipeline:**
+```cpp
+// Equal split: 28 layers across 2 ranks
+auto pp_config = PipelineParallelConfig::equalSplit(2, 28);
+// Rank 0: layers 0-13, Rank 1: layers 14-27
+
+// Custom split: unequal distribution
+auto pp_config = PipelineParallelConfig::customSplit({
+    {0, 9},    // Rank 0: layers 0-9
+    {10, 27}   // Rank 1: layers 10-27
+});
+
+// Topology queries
+pp_config.isFirstStage(0);  // true
+pp_config.nextRank(0);      // 1
+pp_config.prevRank(1);      // 0
+```
+
+#### 11.2.3 LayerPlacementConfig
+
+Location: `src/v2/config/LayerPlacementConfig.h`
+
+Configures per-layer device assignment within a single MPI rank:
+
+```cpp
+struct LayerDeviceAssignment {
+    int layer_index;
+    DeviceId device;
+    int priority = 0;  // For scheduling
+};
+
+struct TransitionPoint {
+    int from_layer;
+    int to_layer;
+    DeviceId from_device;
+    DeviceId to_device;  // Identifies where data transfers are needed
+};
+
+class LayerPlacementConfig {
+public:
+    // Factory methods
+    static LayerPlacementConfig allOnDevice(DeviceId device, int n_layers);
+    static LayerPlacementConfig cpuFirstLayers(int cpu_layers, int total, DeviceId gpu);
+    static LayerPlacementConfig cpuLastLayers(int cpu_layers, int total, DeviceId gpu);
+    static LayerPlacementConfig alternating(int n_layers, DeviceId dev_a, DeviceId dev_b);
+    
+    // Accessors
+    DeviceId deviceForLayer(int layer) const;
+    std::vector<int> layersForDevice(DeviceId device) const;
+    bool hasLayersOnCPU() const;
+    bool hasLayersOnGPU() const;
+    
+    // Transition detection
+    std::vector<TransitionPoint> transitionPoints() const;
+};
+```
+
+**Usage Example: CPU as Pipeline Stage:**
+```cpp
+// First 4 layers on CPU, rest on GPU (memory offload pattern)
+auto placement = LayerPlacementConfig::cpuFirstLayers(4, 28, DeviceId::cuda(0));
+
+// Find transition points for data transfer insertion
+auto transitions = placement.transitionPoints();
+// transitions[0]: {from_layer=3, to_layer=4, from_device=CPU, to_device=CUDA:0}
+```
+
+### 11.3 CollectiveContext and BackendRouter
+
+#### 11.3.1 CollectiveContext Integration
+
+Location: `src/v2/execution/CollectiveContext.h`
+
+The `CollectiveContext` bridges compute stages to MPI/GPU collective backends:
+
+```cpp
+class CollectiveContext : public ICollectiveContext {
+public:
+    struct Config {
+        std::shared_ptr<MPIContext> mpi_ctx;
+        std::shared_ptr<IMPITopology> topology;
+        CollectiveBackendType preferred_backend = CollectiveBackendType::AUTO;
+    };
+    
+    // Execute collective operations (routes to optimal backend)
+    bool executeAllreduce(TensorBase* buffer, CollectiveOp op, DeviceId device);
+    bool executeAllgather(TensorBase* local, TensorBase* full, int seq_len, DeviceId device);
+    bool executeAllgatherV(TensorBase* local, TensorBase* full, 
+                           const std::vector<int>& send_counts, DeviceId device);
+    bool executeBroadcast(TensorBase* buffer, int root, DeviceId device);
+};
+```
+
+**GraphExecutor Integration:**
+```cpp
+// Inject CollectiveContext into GraphExecutor
+executor.setCollectiveContext(collective_ctx);
+
+// GraphExecutor automatically intercepts ALLREDUCE/ALLGATHER stages
+// and routes to CollectiveContext instead of stage's internal MPI
+```
+
+#### 11.3.2 Backend Selection
+
+| Device Group | Selected Backend | Latency | Use Case |
+|--------------|------------------|---------|----------|
+| All NVIDIA | NCCL | ~5μs | NVLink/PCIe fast path |
+| All AMD | RCCL | ~5μs | xGMI/PCIe fast path |
+| NVIDIA + AMD (same node) | **PCIeBAR** | ~25μs | Direct BAR mapping |
+| NVIDIA + AMD (fallback) | HOST | ~200μs | Host-staged transfer |
+| Cross-node | MPI | ~10-50μs | Infiniband/Ethernet |
+| CPU only | MPI | ~1-5μs | Standard MPI |
+
+### 11.4 MPI P2P for Pipeline Parallelism
+
+#### 11.4.1 MPIContext P2P Primitives
+
+Location: `src/v2/utils/MPIContext.h`
+
+```cpp
+class MPIContext {
+public:
+    // Synchronous P2P
+    bool send(const void* data, size_t count, MPI_Datatype dtype, int dest, int tag);
+    bool recv(void* data, size_t count, MPI_Datatype dtype, int source, int tag);
+    
+    // Asynchronous P2P  
+    MPI_Request isend(const void* data, size_t count, MPI_Datatype dtype, int dest, int tag);
+    MPI_Request irecv(void* data, size_t count, MPI_Datatype dtype, int source, int tag);
+    
+    // Completion
+    bool wait(MPI_Request& request);
+    bool waitAll(std::vector<MPI_Request>& requests);
+    
+    // Probing
+    bool probe(int source, int tag, MPI_Status& status);
+    bool iprobe(int source, int tag, MPI_Status& status, bool& flag);
+};
+```
+
+#### 11.4.2 MPI Tag Constants
+
+Location: `src/v2/utils/MPITags.h`
+
+```cpp
+namespace mpi_tags {
+    constexpr int ACTIVATION_FORWARD = 1000;   // Forward pass activations
+    constexpr int ACTIVATION_BACKWARD = 2000;  // Future: backward pass
+    constexpr int KV_CACHE = 3000;             // KV cache transfer
+    constexpr int CONTROL = 4000;              // Control messages
+    constexpr int TENSOR_DATA = 5000;          // Generic tensor data
+    constexpr int SYNC = 6000;                 // Synchronization signals
+    
+    // Per-layer tag generation
+    inline constexpr int forwardTag(int layer);
+    inline constexpr int kvCacheKeyTag(int layer);
+    inline constexpr int kvCacheValueTag(int layer);
+}
+```
+
+#### 11.4.3 Pipeline Stages
+
+Location: `src/v2/execution/compute_stages/stages/`
+
+**SendActivationsStage:**
+```cpp
+class SendActivationsStage : public IComputeStage {
+public:
+    struct Params {
+        TensorBase* buffer;           // Tensor to send
+        int dest_rank;                // Destination MPI rank
+        int tag;                      // MPI tag (e.g., mpi_tags::forwardTag(layer))
+        MPIContext* mpi_ctx;
+        bool async = false;           // Use non-blocking isend
+    };
+    
+    bool execute(IDeviceContext* ctx) override;
+    bool isComplete() const;          // For async mode
+    void wait();                      // Block until complete
+};
+```
+
+**ReceiveActivationsStage:**
+```cpp
+class ReceiveActivationsStage : public IComputeStage {
+public:
+    struct Params {
+        TensorBase* buffer;           // Tensor to receive into
+        int source_rank;              // Source MPI rank
+        int tag;                      // MPI tag
+        MPIContext* mpi_ctx;
+        bool async = false;           // Use non-blocking irecv
+    };
+    
+    bool execute(IDeviceContext* ctx) override;
+    bool isComplete() const;
+    void wait();
+};
+```
+
+**AllGatherVStage (for heterogeneous TP):**
+```cpp
+class AllGatherVStage : public IComputeStage {
+public:
+    struct Params {
+        TensorBase* local_input;      // This rank's contribution
+        TensorBase* gathered_output;  // Full gathered result
+        std::vector<int> send_counts; // Elements per rank (variable)
+        std::vector<int> displacements;
+        MPIContext* mpi_ctx;
+    };
+    
+    // Used for proportional TP where ranks have different output sizes
+    // e.g., NVIDIA outputs 73% of vocab, AMD outputs 27%
+};
+```
+
+### 11.5 PCIeBAR for Heterogeneous GPU Communication
+
+Location: `src/v2/collective/backends/PCIeBARBackend.h`
+
+**Key Performance:**
+- **25μs latency** for 14KB transfers (8× better than 200μs HOST backend)
+- **731 tok/s** sustained decode throughput with NVIDIA+AMD heterogeneous TP
+
+**How It Works:**
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                        PCIeBAR Direct Transfer                              │
+│                                                                             │
+│  ┌─────────────┐                              ┌─────────────┐              │
+│  │  NVIDIA GPU │                              │   AMD GPU   │              │
+│  │  (CUDA)     │                              │   (ROCm)    │              │
+│  │             │                              │             │              │
+│  │  ┌───────┐  │     PCIe BAR Mapping         │  ┌───────┐  │              │
+│  │  │ Data  │══════════════════════════════════│  │ BAR   │  │              │
+│  │  └───────┘  │  cuMemcpy to mapped addr     │  └───────┘  │              │
+│  │             │  (bypasses host memory)      │             │              │
+│  └─────────────┘                              └─────────────┘              │
+│                                                                             │
+│  1. AMD GPU exposes BAR (Base Address Register) via PCIe                   │
+│  2. CUDA maps AMD's BAR into its address space                             │
+│  3. cuMemcpy writes directly to AMD GPU memory                             │
+│  4. No host staging, no extra copies                                       │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 11.6 WeightManager Proportional Slicing
+
+Location: `src/v2/loaders/WeightManager.h`
+
+The `WeightManager` automatically slices weights according to `TensorParallelConfig`:
+
+```cpp
+class WeightManager {
+public:
+    void setTensorParallelConfig(const TensorParallelConfig& config);
+    
+    // Weight categorization for sharding decisions
+    enum class WeightCategory {
+        ATTENTION_Q,      // Column-parallel (split output dim)
+        ATTENTION_KV,     // Column-parallel (split KV heads)
+        ATTENTION_WO,     // Row-parallel (split input dim)
+        FFN_GATE,         // Column-parallel (split d_ff)
+        FFN_UP,           // Column-parallel (split d_ff)
+        FFN_DOWN,         // Row-parallel (split input dim)
+        LM_HEAD,          // Column-parallel (split vocab)
+        OTHER             // Replicated
+    };
+    
+    // Returns sliced tensor for this device's assignment
+    ITensor* getWeight(const std::string& name, DeviceId device);
+};
+```
+
+**Proportional Sharding Table:**
+
+| Weight | Category | NVIDIA (73%) | AMD (27%) |
+|--------|----------|--------------|-----------|
+| `attn_q.weight` | ATTENTION_Q | heads 0-22 | heads 23-31 |
+| `attn_k.weight` | ATTENTION_KV | kv_heads 0-5 | kv_heads 6-7 |
+| `attn_v.weight` | ATTENTION_KV | kv_heads 0-5 | kv_heads 6-7 |
+| `attn_output.weight` | ATTENTION_WO | input_dim 0-73% | input_dim 73%-100% |
+| `ffn_gate.weight` | FFN_GATE | d_ff 0-8032 | d_ff 8032-11008 |
+| `ffn_up.weight` | FFN_UP | d_ff 0-8032 | d_ff 8032-11008 |
+| `ffn_down.weight` | FFN_DOWN | input_dim 0-73% | input_dim 73%-100% |
+| `output.weight` | LM_HEAD | vocab 0-110913 | vocab 110913-151936 |
+
+### 11.7 Hybrid Parallel Execution Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              HYBRID PARALLEL INFERENCE (2 ranks, heterogeneous TP)              │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  MPI RANK 0 (layers 0-13)                  MPI RANK 1 (layers 14-27)            │
+│  ┌────────────────────────────────┐        ┌────────────────────────────────┐   │
+│  │                                │        │                                │   │
+│  │  ┌──────────────────────────┐  │        │  ┌──────────────────────────┐  │   │
+│  │  │   Embedding (replicated) │  │        │  │   [waits for recv]       │  │   │
+│  │  └────────────┬─────────────┘  │        │  └──────────────────────────┘  │   │
+│  │               │                │        │                                │   │
+│  │               ▼                │        │                                │   │
+│  │  ┌──────────────────────────┐  │        │                                │   │
+│  │  │  Layer 0-13 (TP across   │  │        │                                │   │
+│  │  │  NVIDIA 73% + AMD 27%)   │  │        │                                │   │
+│  │  │                          │  │        │                                │   │
+│  │  │  ┌────────┐  ┌────────┐  │  │        │                                │   │
+│  │  │  │ NVIDIA │  │  AMD   │  │  │        │                                │   │
+│  │  │  │  GPU   │◄►│  GPU   │  │  │        │                                │   │
+│  │  │  └────────┘  └────────┘  │  │        │                                │   │
+│  │  │    PCIeBAR AllReduce     │  │        │                                │   │
+│  │  └────────────┬─────────────┘  │        │                                │   │
+│  │               │                │        │                                │   │
+│  │               ▼                │        │                                │   │
+│  │  ┌──────────────────────────┐  │  MPI   │  ┌──────────────────────────┐  │   │
+│  │  │  SendActivationsStage    │──┼───────►┼──│  ReceiveActivationsStage │  │   │
+│  │  │  (hidden → rank 1)       │  │  P2P   │  │  (hidden from rank 0)    │  │   │
+│  │  └──────────────────────────┘  │        │  └────────────┬─────────────┘  │   │
+│  │                                │        │               │                │   │
+│  │                                │        │               ▼                │   │
+│  │                                │        │  ┌──────────────────────────┐  │   │
+│  │                                │        │  │  Layer 14-27 (TP)        │  │   │
+│  │                                │        │  └────────────┬─────────────┘  │   │
+│  │                                │        │               │                │   │
+│  │                                │        │               ▼                │   │
+│  │                                │        │  ┌──────────────────────────┐  │   │
+│  │                                │        │  │  Final Norm + LM Head    │  │   │
+│  │                                │        │  │  (AllGatherV for logits) │  │   │
+│  │                                │        │  └──────────────────────────┘  │   │
+│  │                                │        │                                │   │
+│  └────────────────────────────────┘        └────────────────────────────────┘   │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 11.8 Configuration Code Examples
+
+#### Example 1: Heterogeneous TP (73%/27% split)
+
+```cpp
+#include "config/TensorParallelConfig.h"
+#include "execution/CollectiveContext.h"
+
+// Configure proportional tensor parallelism
+auto tp_config = TensorParallelConfig::proportionalSplit(
+    {DeviceId::cuda(0), DeviceId::rocm(0)},
+    {0.73f, 0.27f},  // NVIDIA gets 73%, AMD gets 27%
+    model_ctx->n_head(),
+    model_ctx->n_kv_head(),
+    model_ctx->n_ff(),
+    model_ctx->n_vocab()
+);
+
+// Apply to weight manager
+weight_manager->setTensorParallelConfig(tp_config);
+
+// Create collective context with PCIeBAR backend preference
+CollectiveContext::Config coll_config{
+    .mpi_ctx = mpi_ctx,
+    .topology = topology,
+    .preferred_backend = CollectiveBackendType::PCIE_BAR
+};
+auto collective_ctx = std::make_shared<CollectiveContext>(coll_config);
+
+// Inject into executor
+executor.setCollectiveContext(collective_ctx);
+```
+
+#### Example 2: Pipeline Parallelism (2 ranks)
+
+```cpp
+#include "config/PipelineParallelConfig.h"
+#include "execution/compute_stages/stages/SendActivationsStage.h"
+#include "execution/compute_stages/stages/ReceiveActivationsStage.h"
+#include "utils/MPITags.h"
+
+// Configure pipeline parallelism
+auto pp_config = PipelineParallelConfig::equalSplit(
+    mpi_ctx->world_size(),  // 2 ranks
+    model_ctx->n_layer()    // 28 layers → 14 per rank
+);
+
+// In layer execution loop
+int layer = current_layer;
+if (!pp_config.ownsLayer(mpi_ctx->rank(), layer)) {
+    continue;  // Skip layers this rank doesn't own
+}
+
+// After last layer on this rank, send to next rank
+if (layer == pp_config.forRank(mpi_ctx->rank()).last_layer) {
+    if (!pp_config.isLastStage(mpi_ctx->rank())) {
+        SendActivationsStage::Params params{
+            .buffer = hidden_state.get(),
+            .dest_rank = pp_config.nextRank(mpi_ctx->rank()),
+            .tag = mpi_tags::forwardTag(layer),
+            .mpi_ctx = mpi_ctx.get(),
+            .async = false
+        };
+        auto send_stage = std::make_unique<SendActivationsStage>(params);
+        send_stage->execute(nullptr);
+    }
+}
+
+// At start of rank's layers, receive from previous rank
+if (layer == pp_config.forRank(mpi_ctx->rank()).first_layer) {
+    if (!pp_config.isFirstStage(mpi_ctx->rank())) {
+        ReceiveActivationsStage::Params params{
+            .buffer = hidden_state.get(),
+            .source_rank = pp_config.prevRank(mpi_ctx->rank()),
+            .tag = mpi_tags::forwardTag(layer - 1),
+            .mpi_ctx = mpi_ctx.get()
+        };
+        auto recv_stage = std::make_unique<ReceiveActivationsStage>(params);
+        recv_stage->execute(nullptr);
+    }
+}
+```
+
+#### Example 3: CPU as Pipeline Stage
+
+```cpp
+#include "config/LayerPlacementConfig.h"
+
+// First 4 layers on CPU (memory offload), rest on GPU
+auto placement = LayerPlacementConfig::cpuFirstLayers(
+    4,                  // CPU layers
+    28,                 // Total layers
+    DeviceId::cuda(0)   // GPU for remaining layers
+);
+
+// Find where we need explicit data transfers
+auto transitions = placement.transitionPoints();
+// transitions[0]: layer 3 (CPU) → layer 4 (GPU)
+
+// In graph builder, insert transfer stages at transition points
+for (const auto& tp : transitions) {
+    if (tp.from_device.is_cpu() && tp.to_device.is_gpu()) {
+        // Insert CPU→GPU copy stage
+        graph.addNode("cpu_to_gpu_" + std::to_string(tp.to_layer),
+            std::make_shared<DeviceTransferStage>(hidden, tp.from_device, tp.to_device));
+    }
+}
+```
+
+### 11.9 File Locations
+
+| Component | Location |
+|-----------|----------|
+| TensorParallelConfig | `src/v2/config/TensorParallelConfig.h` |
+| PipelineParallelConfig | `src/v2/config/PipelineParallelConfig.h` |
+| LayerPlacementConfig | `src/v2/config/LayerPlacementConfig.h` |
+| CollectiveContext | `src/v2/execution/CollectiveContext.h` |
+| BackendRouter | `src/v2/collective/BackendRouter.h` |
+| PCIeBARBackend | `src/v2/collective/backends/PCIeBARBackend.h` |
+| SendActivationsStage | `src/v2/execution/compute_stages/stages/SendActivationsStage.h` |
+| ReceiveActivationsStage | `src/v2/execution/compute_stages/stages/ReceiveActivationsStage.h` |
+| AllGatherVStage | `src/v2/execution/compute_stages/stages/AllGatherVStage.h` |
+| MPIContext P2P | `src/v2/utils/MPIContext.h` |
+| MPITags | `src/v2/utils/MPITags.h` |
 
 ---
 

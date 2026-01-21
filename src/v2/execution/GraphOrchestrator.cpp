@@ -14,6 +14,7 @@
 #include "WorkspaceDescriptor.h"
 #include "../loaders/WeightManager.h"
 #include "../loaders/WeightPlacementMap.h"
+#include "../config/TensorParallelConfig.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/MPIContext.h"
@@ -83,6 +84,13 @@ namespace llaminar2
         if (injected_topology_)
         {
             executor_.setMPIRank(injected_topology_->rank());
+        }
+
+        // Wire CollectiveContext to executor for GPU-native collectives (RCCL/NCCL/PCIeBAR)
+        if (injected_collective_ctx_)
+        {
+            executor_.setCollectiveContext(injected_collective_ctx_.get());
+            LOG_INFO("[GraphOrchestrator] Wired CollectiveContext to GraphExecutor");
         }
 
         LOG_INFO("[GraphOrchestrator] Initialized with injected dependencies, caching="
@@ -1741,6 +1749,80 @@ namespace llaminar2
     {
         weight_placement_map_ = std::move(placement_map);
         LOG_DEBUG("[GraphOrchestrator] WeightPlacementMap set");
+    }
+
+    // =========================================================================
+    // Tensor Parallel Configuration (Phase 1c: Proportional TP)
+    // =========================================================================
+
+    void GraphOrchestrator::setTensorParallelConfig(std::shared_ptr<TensorParallelConfig> config)
+    {
+        tp_config_ = std::move(config);
+
+        if (tp_config_)
+        {
+            LOG_INFO("[GraphOrchestrator] TensorParallelConfig set: "
+                     << "world_size=" << tp_config_->worldSize()
+                     << ", proportional=" << (tp_config_->isProportional() ? "yes" : "no"));
+
+            // If we have a graph builder, propagate the config to it
+            if (graph_builder_)
+            {
+                // Note: The graph builder's config is read-only after construction,
+                // but we store the tp_config for use in buffer allocation and KV cache creation
+                LOG_DEBUG("[GraphOrchestrator] TensorParallelConfig will be used for buffer sizing");
+            }
+        }
+        else
+        {
+            LOG_DEBUG("[GraphOrchestrator] TensorParallelConfig cleared");
+        }
+    }
+
+    // =========================================================================
+    // Multi-Domain Tensor Parallel Configuration (Phase 6.3: Heterogeneous TP)
+    // =========================================================================
+
+    void GraphOrchestrator::setDomainConfig(std::shared_ptr<MultiDomainTPConfig> config)
+    {
+        domain_config_ = std::move(config);
+
+        if (domain_config_)
+        {
+            LOG_INFO("[GraphOrchestrator] MultiDomainTPConfig set: "
+                     << "domains=" << domain_config_->domains().size()
+                     << ", has_gpu=" << (domain_config_->gpuDomain() ? "yes" : "no")
+                     << ", has_cpu=" << (domain_config_->cpuDomain() ? "yes" : "no")
+                     << ", cross_rank=" << (domain_config_->hasCrossRankTP() ? "yes" : "no"));
+
+            // Propagate domain config to graph builder if present
+            if (graph_builder_)
+            {
+                // Graph builder can access domain config through config_.multi_domain_tp_config
+                // Note: The graph builder uses getDomainForLayer() which delegates to this config
+                LOG_DEBUG("[GraphOrchestrator] Domain config available for AllreduceStage routing");
+            }
+        }
+        else
+        {
+            LOG_DEBUG("[GraphOrchestrator] MultiDomainTPConfig cleared (legacy MPI path)");
+        }
+    }
+
+    const TPDomain *GraphOrchestrator::getDomainForLayer(int layer_idx, bool is_attention) const
+    {
+        if (!domain_config_)
+        {
+            return nullptr; // No domain config - use legacy MPI path
+        }
+
+        const TPDomain *domain = domain_config_->domainForLayer(layer_idx, is_attention);
+
+        LOG_DEBUG("[GraphOrchestrator] getDomainForLayer: layer=" << layer_idx
+                                                                  << ", is_attention=" << (is_attention ? "true" : "false")
+                                                                  << " -> domain=" << (domain ? domain->name : "nullptr"));
+
+        return domain;
     }
 
     void GraphOrchestrator::transitionToPhase(InferencePhase phase)

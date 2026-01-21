@@ -32,28 +32,28 @@ namespace llaminar2
 
         switch (config_.strategy)
         {
-        case PlacementStrategy::ALL_GPU:
+        case WeightPlacementStrategy::ALL_GPU:
             return createAllGPUMap(model_ctx);
 
-        case PlacementStrategy::ALL_CPU:
+        case WeightPlacementStrategy::ALL_CPU:
             return createAllCPUMap(model_ctx);
 
-        case PlacementStrategy::LAYER_SPLIT:
+        case WeightPlacementStrategy::LAYER_SPLIT:
             return createLayerSplitMap(model_ctx);
 
-        case PlacementStrategy::AUTO:
+        case WeightPlacementStrategy::AUTO:
             return createAutoMap(model_ctx);
 
-        case PlacementStrategy::MEMORY_AWARE:
+        case WeightPlacementStrategy::MEMORY_AWARE:
             return createMemoryAwareMap(model_ctx);
 
-        case PlacementStrategy::MOE_OPTIMIZED:
+        case WeightPlacementStrategy::MOE_OPTIMIZED:
             return createMoEOptimizedMap(model_ctx);
 
-        case PlacementStrategy::CUSTOM:
+        case WeightPlacementStrategy::CUSTOM:
             return createCustomMap(model_ctx);
 
-        case PlacementStrategy::MULTI_GPU:
+        case WeightPlacementStrategy::MULTI_GPU:
             return createMultiGPUMap(model_ctx);
 
         default:
@@ -300,7 +300,7 @@ namespace llaminar2
 
         // Use LAYER_SPLIT strategy with calculated layer count
         OrchestrationConfig temp_config = config_;
-        temp_config.strategy = PlacementStrategy::LAYER_SPLIT;
+        temp_config.strategy = WeightPlacementStrategy::LAYER_SPLIT;
         temp_config.offload_layers = gpu_layers;
 
         DeviceOrchestrator temp_orchestrator(device_mgr_, mpi_ctx_, temp_config);

@@ -108,7 +108,7 @@ namespace llaminar2
          * @param group Device group that will participate in collectives
          * @return true on success, false if no MPI context
          */
-        bool initialize(const DeviceGroup& group) override;
+        bool initialize(const DeviceGroup &group) override;
 
         /**
          * @brief Check if backend is initialized
@@ -137,7 +137,7 @@ namespace llaminar2
          * @return true on success
          */
         bool allreduce(
-            void* buffer,
+            void *buffer,
             size_t count,
             CollectiveDataType dtype,
             CollectiveOp op) override;
@@ -155,9 +155,30 @@ namespace llaminar2
          * @return true on success
          */
         bool allgather(
-            const void* send_buf,
-            void* recv_buf,
+            const void *send_buf,
+            void *recv_buf,
             size_t send_count,
+            CollectiveDataType dtype) override;
+
+        /**
+         * @brief Variable-count AllGather operation via MPI_Allgatherv
+         *
+         * Each rank may send a different amount of data.
+         *
+         * @param send_buf Local data to send
+         * @param send_count Number of elements this rank sends
+         * @param recv_buf Buffer to receive all data
+         * @param recv_counts Array of counts per rank (size = world_size)
+         * @param displacements Array of offsets in recv_buf per rank
+         * @param dtype Data type
+         * @return true on success
+         */
+        bool allgatherv(
+            const void *send_buf,
+            size_t send_count,
+            void *recv_buf,
+            const std::vector<int> &recv_counts,
+            const std::vector<int> &displacements,
             CollectiveDataType dtype) override;
 
         /**
@@ -174,8 +195,8 @@ namespace llaminar2
          * @return true on success
          */
         bool reduceScatter(
-            const void* send_buf,
-            void* recv_buf,
+            const void *send_buf,
+            void *recv_buf,
             size_t recv_count,
             CollectiveDataType dtype,
             CollectiveOp op) override;
@@ -190,7 +211,7 @@ namespace llaminar2
          * @return true on success
          */
         bool broadcast(
-            void* buffer,
+            void *buffer,
             size_t count,
             CollectiveDataType dtype,
             int root_rank) override;

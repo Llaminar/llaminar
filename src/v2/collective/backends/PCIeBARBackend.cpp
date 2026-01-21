@@ -442,6 +442,79 @@ namespace llaminar2
 #endif
     }
 
+    bool PCIeBARBackend::allgatherv(
+        const void *send_buf,
+        size_t send_count,
+        void *recv_buf,
+        const std::vector<int> &recv_counts,
+        const std::vector<int> &displacements,
+        CollectiveDataType dtype)
+    {
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+        if (!initialized_)
+        {
+            LOG_ERROR("PCIeBARBackend::allgatherv not initialized");
+            return false;
+        }
+
+        // For 2-device variable AllGather (CUDA + ROCm):
+        // recv_buf layout: [device0_data @ disp[0] | device1_data @ disp[1]]
+
+        // If counts are equal, fall back to regular allgather
+        if (recv_counts.size() == 2 && recv_counts[0] == recv_counts[1])
+        {
+            return allgather(send_buf, recv_buf, send_count, dtype);
+        }
+
+        size_t elem_size = datatypeSize(dtype);
+
+        // Assuming device 0 is CUDA, device 1 is ROCm
+        // Step 1: Copy local CUDA data to its position
+        size_t cuda_bytes = recv_counts[0] * elem_size;
+        size_t cuda_offset = displacements[0] * elem_size;
+        char *cuda_dst = static_cast<char *>(recv_buf) + cuda_offset;
+        if (send_buf != cuda_dst)
+        {
+            cudaMemcpy(cuda_dst, send_buf, cuda_bytes, cudaMemcpyDeviceToDevice);
+        }
+
+        // Step 2: Read ROCm data to its position via BAR
+        size_t rocm_bytes = recv_counts[1] * elem_size;
+        size_t rocm_offset = displacements[1] * elem_size;
+        char *rocm_dst = static_cast<char *>(recv_buf) + rocm_offset;
+        if (!transferROCmtoCUDA(0, rocm_dst, rocm_bytes))
+        {
+            LOG_ERROR("AllGatherV: failed to read ROCm data");
+            return false;
+        }
+
+        // Step 3: Calculate total size and write full buffer to ROCm
+        size_t total_bytes = 0;
+        for (size_t i = 0; i < recv_counts.size(); ++i)
+        {
+            size_t end = (displacements[i] + recv_counts[i]) * elem_size;
+            total_bytes = std::max(total_bytes, end);
+        }
+
+        if (!transferCUDAtoROCm(recv_buf, 0, total_bytes))
+        {
+            LOG_ERROR("AllGatherV: failed to write to ROCm");
+            return false;
+        }
+
+        return synchronize();
+#else
+        (void)send_buf;
+        (void)send_count;
+        (void)recv_buf;
+        (void)recv_counts;
+        (void)displacements;
+        (void)dtype;
+        LOG_ERROR("PCIeBARBackend::allgatherv requires HAVE_CUDA and HAVE_ROCM");
+        return false;
+#endif
+    }
+
     bool PCIeBARBackend::reduceScatter(
         const void *send_buf,
         void *recv_buf,

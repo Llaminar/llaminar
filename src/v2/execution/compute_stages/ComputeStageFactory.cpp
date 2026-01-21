@@ -5,6 +5,7 @@
 
 #include "ComputeStageFactory.h"
 #include "stages/AllGatherStage.h"
+#include "stages/AllGatherVStage.h"
 #include "stages/AllreduceStage.h"
 #include "stages/AttentionComputeStage.h"
 #include "stages/AttentionWithKVCacheStage.h"
@@ -17,9 +18,11 @@
 #include "stages/KVCacheGatherStage.h"
 #include "stages/LMHeadStage.h"
 #include "stages/MoEStages.h"
+#include "stages/ReceiveActivationsStage.h"
 #include "stages/ResidualAddStage.h"
 #include "stages/RMSNormStage.h"
 #include "stages/RoPEStage.h"
+#include "stages/SendActivationsStage.h"
 #include "stages/SwiGLUStage.h"
 // Include complete types for unique_ptr deletion
 #include "../../kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h"
@@ -114,6 +117,27 @@ namespace llaminar2
     {
         // AllGather is backend-agnostic (uses MPI directly)
         return std::make_unique<AllGatherStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createAllGatherV(
+        const AllGatherVStage::Params &params)
+    {
+        // AllGatherV is backend-agnostic (uses MPI_Allgatherv or CollectiveContext)
+        return std::make_unique<AllGatherVStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createSendActivations(
+        const SendActivationsStage::Params &params)
+    {
+        // SendActivations is backend-agnostic (uses MPI point-to-point)
+        return std::make_unique<SendActivationsStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createReceiveActivations(
+        const ReceiveActivationsStage::Params &params)
+    {
+        // ReceiveActivations is backend-agnostic (uses MPI point-to-point)
+        return std::make_unique<ReceiveActivationsStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createAttentionWithKVCache(

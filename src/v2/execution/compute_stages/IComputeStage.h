@@ -291,6 +291,11 @@ namespace llaminar2
         // Collective
         ALLREDUCE,
         ALLGATHER,
+        ALLGATHER_V, ///< Variable-count allgather for heterogeneous TP
+
+        // Point-to-Point (Pipeline Parallelism)
+        SEND_ACTIVATIONS,
+        RECV_ACTIVATIONS,
 
         // Utility
         COPY,

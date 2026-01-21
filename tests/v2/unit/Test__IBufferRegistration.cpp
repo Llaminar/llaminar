@@ -127,6 +127,14 @@ namespace llaminar2::test
             return true;
         }
 
+        bool allgatherv(const void * /*send_buf*/, size_t /*send_count*/,
+                        void * /*recv_buf*/, const std::vector<int> & /*recv_counts*/,
+                        const std::vector<int> & /*displacements*/,
+                        CollectiveDataType /*dtype*/) override
+        {
+            return true;
+        }
+
         bool reduceScatter(const void * /*send_buf*/, void * /*recv_buf*/,
                            size_t /*recv_count*/, CollectiveDataType /*dtype*/,
                            CollectiveOp /*op*/) override
@@ -174,6 +182,14 @@ namespace llaminar2::test
 
         bool allgather(const void * /*send_buf*/, void * /*recv_buf*/,
                        size_t /*send_count*/, CollectiveDataType /*dtype*/) override
+        {
+            return true;
+        }
+
+        bool allgatherv(const void * /*send_buf*/, size_t /*send_count*/,
+                        void * /*recv_buf*/, const std::vector<int> & /*recv_counts*/,
+                        const std::vector<int> & /*displacements*/,
+                        CollectiveDataType /*dtype*/) override
         {
             return true;
         }

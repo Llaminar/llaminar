@@ -9,6 +9,7 @@
 #include "CollectiveContext.h"
 #include "DeviceInventory.h"
 #include "../collective/backends/PCIeBARBackend.h"
+#include "../config/TPDomain.h"
 #include "../tensors/ITensor.h"
 #include "../utils/Logger.h"
 
@@ -137,6 +138,58 @@ namespace llaminar2
         size_t send_count = actual_seq_len > 0 ? actual_seq_len : local_input->numel();
 
         return backend->allgather(send_buf, recv_buf, send_count, CollectiveDataType::FLOAT32);
+    }
+
+    bool CollectiveContext::executeAllgatherv(
+        ITensor *local_input,
+        ITensor *full_output,
+        const std::vector<int> &recv_counts,
+        const std::vector<int> &displacements,
+        size_t actual_seq_len,
+        DeviceId tensor_device)
+    {
+        if (!router_)
+        {
+            LOG_ERROR("CollectiveContext: No router available for allgatherv");
+            return false;
+        }
+
+        // Build device group
+        DeviceGroup group = buildDeviceGroup(tensor_device);
+
+        // Get backend
+        ICollectiveBackend *backend = router_->getBackend(group);
+        if (!backend)
+        {
+            LOG_ERROR("CollectiveContext: No backend available for device group " << group.name);
+            return false;
+        }
+
+        // Get shapes and calculate send count
+        const auto &local_shape = local_input->shape();
+        size_t buffer_seq_len = local_shape.size() >= 2 ? local_shape[0] : 1;
+        size_t local_dim = local_shape.size() >= 2 ? local_shape[1] : local_shape[0];
+        size_t seq_len = actual_seq_len > 0 ? actual_seq_len : buffer_seq_len;
+
+        // Calculate send count for this rank (seq_len * local_dim)
+        size_t send_count = seq_len * local_dim;
+
+        // Scale recv_counts and displacements by seq_len
+        std::vector<int> scaled_recv_counts(recv_counts.size());
+        std::vector<int> scaled_displacements(displacements.size());
+        for (size_t i = 0; i < recv_counts.size(); ++i)
+        {
+            scaled_recv_counts[i] = static_cast<int>(seq_len) * recv_counts[i];
+            scaled_displacements[i] = static_cast<int>(seq_len) * displacements[i];
+        }
+
+        // Execute collective
+        const void *send_buf = local_input->data();
+        void *recv_buf = full_output->mutable_data();
+
+        return backend->allgatherv(send_buf, send_count, recv_buf,
+                                   scaled_recv_counts, scaled_displacements,
+                                   CollectiveDataType::FLOAT32);
     }
 
     bool CollectiveContext::executeBroadcast(
@@ -291,6 +344,185 @@ namespace llaminar2
         }
 
         return builder.build();
+    }
+
+    // =========================================================================
+    // Domain-Aware Collective Operations
+    // =========================================================================
+
+    bool CollectiveContext::executeAllreduceInDomain(
+        ITensor *buffer,
+        size_t count,
+        DeviceId tensor_device,
+        CollectiveOp op,
+        const TPDomain *domain)
+    {
+        // Fallback to legacy path when domain is nullptr
+        if (!domain)
+        {
+            LOG_DEBUG("CollectiveContext::executeAllreduceInDomain: No domain specified, "
+                      "falling back to non-domain executeAllreduce");
+            return executeAllreduce(buffer, count, tensor_device, op);
+        }
+
+        if (!router_)
+        {
+            LOG_ERROR("CollectiveContext: No router available for domain-aware allreduce");
+            return false;
+        }
+
+        // Skip trivial domains (size 1, no communication needed)
+        if (domain->isTrivial())
+        {
+            LOG_DEBUG("CollectiveContext::executeAllreduceInDomain: Domain '" << domain->name
+                                                                              << "' is trivial (size=" << domain->domain_size << "), skipping");
+            return true;
+        }
+
+        // Use domain-aware backend selection
+        ICollectiveBackend *backend = router_->selectBackendForDomain(domain);
+        if (!backend)
+        {
+            LOG_ERROR("CollectiveContext: No backend available for domain '" << domain->name << "'");
+            return false;
+        }
+
+        LOG_DEBUG("CollectiveContext: Executing allreduce in domain '" << domain->name
+                                                                       << "' (type=" << tpDomainTypeToString(domain->type)
+                                                                       << ", size=" << domain->domain_size
+                                                                       << ") via " << toString(backend->type()));
+
+        // Determine data type from buffer
+        CollectiveDataType dtype = CollectiveDataType::FLOAT32; // Default
+        // TODO: Query buffer for actual dtype
+
+        // Execute collective
+        void *data_ptr = buffer->mutable_data();
+        size_t actual_count = count > 0 ? count : buffer->numel();
+
+        return backend->allreduce(data_ptr, actual_count, dtype, op);
+    }
+
+    bool CollectiveContext::executeAllgatherInDomain(
+        ITensor *local_input,
+        ITensor *full_output,
+        size_t actual_seq_len,
+        DeviceId tensor_device,
+        const TPDomain *domain)
+    {
+        // Fallback to legacy path when domain is nullptr
+        if (!domain)
+        {
+            LOG_DEBUG("CollectiveContext::executeAllgatherInDomain: No domain specified, "
+                      "falling back to non-domain executeAllgather");
+            return executeAllgather(local_input, full_output, actual_seq_len, tensor_device);
+        }
+
+        if (!router_)
+        {
+            LOG_ERROR("CollectiveContext: No router available for domain-aware allgather");
+            return false;
+        }
+
+        // Skip trivial domains (size 1, no communication needed)
+        if (domain->isTrivial())
+        {
+            LOG_DEBUG("CollectiveContext::executeAllgatherInDomain: Domain '" << domain->name
+                                                                              << "' is trivial, skipping");
+            return true;
+        }
+
+        // Use domain-aware backend selection
+        ICollectiveBackend *backend = router_->selectBackendForDomain(domain);
+        if (!backend)
+        {
+            LOG_ERROR("CollectiveContext: No backend available for domain '" << domain->name << "'");
+            return false;
+        }
+
+        LOG_DEBUG("CollectiveContext: Executing allgather in domain '" << domain->name
+                                                                       << "' (type=" << tpDomainTypeToString(domain->type)
+                                                                       << ", size=" << domain->domain_size
+                                                                       << ") via " << toString(backend->type()));
+
+        // Execute collective
+        const void *send_buf = local_input->data();
+        void *recv_buf = full_output->mutable_data();
+        size_t send_count = actual_seq_len > 0 ? actual_seq_len : local_input->numel();
+
+        return backend->allgather(send_buf, recv_buf, send_count, CollectiveDataType::FLOAT32);
+    }
+
+    bool CollectiveContext::executeAllgathervInDomain(
+        ITensor *local_input,
+        ITensor *full_output,
+        const std::vector<int> &recv_counts,
+        const std::vector<int> &displacements,
+        size_t actual_seq_len,
+        DeviceId tensor_device,
+        const TPDomain *domain)
+    {
+        // Fallback to legacy path when domain is nullptr
+        if (!domain)
+        {
+            LOG_DEBUG("CollectiveContext::executeAllgathervInDomain: No domain specified, "
+                      "falling back to non-domain executeAllgatherv");
+            return executeAllgatherv(local_input, full_output, recv_counts, displacements,
+                                     actual_seq_len, tensor_device);
+        }
+
+        if (!router_)
+        {
+            LOG_ERROR("CollectiveContext: No router available for domain-aware allgatherv");
+            return false;
+        }
+
+        // Skip trivial domains (size 1, no communication needed)
+        if (domain->isTrivial())
+        {
+            LOG_DEBUG("CollectiveContext::executeAllgathervInDomain: Domain '" << domain->name
+                                                                               << "' is trivial, skipping");
+            return true;
+        }
+
+        // Use domain-aware backend selection
+        ICollectiveBackend *backend = router_->selectBackendForDomain(domain);
+        if (!backend)
+        {
+            LOG_ERROR("CollectiveContext: No backend available for domain '" << domain->name << "'");
+            return false;
+        }
+
+        LOG_DEBUG("CollectiveContext: Executing allgatherv in domain '" << domain->name
+                                                                        << "' (type=" << tpDomainTypeToString(domain->type)
+                                                                        << ", size=" << domain->domain_size
+                                                                        << ") via " << toString(backend->type()));
+
+        // Get shapes and calculate send count
+        const auto &local_shape = local_input->shape();
+        size_t buffer_seq_len = local_shape.size() >= 2 ? local_shape[0] : 1;
+        size_t local_dim = local_shape.size() >= 2 ? local_shape[1] : local_shape[0];
+        size_t seq_len = actual_seq_len > 0 ? actual_seq_len : buffer_seq_len;
+
+        // Calculate send count for this rank (seq_len * local_dim)
+        size_t send_count = seq_len * local_dim;
+
+        // Scale recv_counts and displacements by seq_len
+        std::vector<int> scaled_recv_counts(recv_counts.size());
+        std::vector<int> scaled_displacements(displacements.size());
+        for (size_t i = 0; i < recv_counts.size(); ++i)
+        {
+            scaled_recv_counts[i] = static_cast<int>(seq_len) * recv_counts[i];
+            scaled_displacements[i] = static_cast<int>(seq_len) * displacements[i];
+        }
+
+        // Execute collective
+        const void *send_buf = local_input->data();
+        void *recv_buf = full_output->mutable_data();
+
+        return backend->allgatherv(send_buf, send_count, recv_buf,
+                                   scaled_recv_counts, scaled_displacements,
+                                   CollectiveDataType::FLOAT32);
     }
 
     // =========================================================================

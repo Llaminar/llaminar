@@ -26,8 +26,7 @@ namespace llaminar2
     // =============================================================================
 
     AllGatherStage::AllGatherStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
     }
 
@@ -168,7 +167,19 @@ namespace llaminar2
                                                        << " vocab_full=" << vocab_full
                                                        << " world_size=" << world_size);
 
-        MPI_Comm comm = params_.mpi_ctx->comm();
+        // Get MPI communicator - prefer domain-specific communicator if available
+        MPI_Comm comm = MPI_COMM_NULL;
+        if (params_.domain && params_.domain->communicator != MPI_COMM_NULL)
+        {
+            comm = params_.domain->communicator;
+            LOG_DEBUG("[AllGatherStage] Using domain communicator: " << params_.domain->name
+                                                                     << " (size=" << params_.domain->domain_size << ")");
+        }
+        else
+        {
+            comm = params_.mpi_ctx->comm();
+            LOG_DEBUG("[AllGatherStage] Using MPI context communicator (legacy path)");
+        }
 
         // Get data pointers based on tensor type
         const float *send_ptr = nullptr;

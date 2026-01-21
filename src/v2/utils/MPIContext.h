@@ -17,19 +17,23 @@
 #include <utility>
 #include <cstddef>
 #include <vector>
+#include <stdexcept>
+#include <string>
 #include "../tensors/BlockStructures.h"
 #include "../tensors/SIMDHelpers.h"
 #include "../interfaces/IMPIContext.h"
 
 namespace llaminar2
 {
+    // Forward declaration for lazy topology access
+    class MPITopology;
 
     /**
      * @brief MPI context for distributed coordination
      *
      * Encapsulates MPI state and provides clean API for collective operations.
      * Thread-safe for MPI_THREAD_MULTIPLE environments.
-     * 
+     *
      * Implements IMPIContext interface for testability.
      */
     class MPIContext : public IMPIContext
@@ -50,6 +54,16 @@ namespace llaminar2
         int world_size() const override { return world_size_; }
         bool is_root() const override { return rank_ == 0; }
         MPI_Comm comm() const { return comm_; }
+
+        /**
+         * @brief Get the MPI topology for placement computation
+         *
+         * Lazily initializes the topology on first access. The topology
+         * provides device inventory and placement strategy computation.
+         *
+         * @return Reference to the MPITopology instance
+         */
+        const MPITopology &topology() const;
 
         /**
          * @brief All-reduce sum operation
@@ -388,10 +402,260 @@ namespace llaminar2
             return get_local_slice(total_rows);
         }
 
+        // =========================================================================
+        // Point-to-Point Operations (Pipeline Parallelism)
+        // =========================================================================
+
+        /**
+         * @brief Synchronous send operation
+         *
+         * Blocks until the message is safely buffered or received by dest.
+         *
+         * @param data Pointer to data to send
+         * @param count Number of elements
+         * @param type MPI datatype
+         * @param dest Destination rank
+         * @param tag Message tag
+         * @throws std::runtime_error if MPI_Send fails
+         */
+        void send(const void *data, size_t count, MPI_Datatype type, int dest, int tag) const override
+        {
+            int ret = MPI_Send(data, static_cast<int>(count), type, dest, tag, comm_);
+            if (ret != MPI_SUCCESS)
+            {
+                char error_string[MPI_MAX_ERROR_STRING];
+                int length;
+                MPI_Error_string(ret, error_string, &length);
+                throw std::runtime_error(std::string("MPI_Send failed: ") + error_string);
+            }
+        }
+
+        /**
+         * @brief Synchronous receive operation
+         *
+         * Blocks until a matching message is received.
+         *
+         * @param data Pointer to receive buffer
+         * @param count Maximum number of elements to receive
+         * @param type MPI datatype
+         * @param src Source rank (or MPI_ANY_SOURCE)
+         * @param tag Message tag (or MPI_ANY_TAG)
+         * @param status Optional status object (nullptr for MPI_STATUS_IGNORE)
+         * @throws std::runtime_error if MPI_Recv fails
+         */
+        void recv(void *data, size_t count, MPI_Datatype type, int src, int tag,
+                  MPI_Status *status = nullptr) const override
+        {
+            int ret = MPI_Recv(data, static_cast<int>(count), type, src, tag, comm_,
+                               status ? status : MPI_STATUS_IGNORE);
+            if (ret != MPI_SUCCESS)
+            {
+                char error_string[MPI_MAX_ERROR_STRING];
+                int length;
+                MPI_Error_string(ret, error_string, &length);
+                throw std::runtime_error(std::string("MPI_Recv failed: ") + error_string);
+            }
+        }
+
+        /**
+         * @brief Non-blocking send operation
+         *
+         * Initiates send and returns immediately. Use wait() to complete.
+         *
+         * @param data Pointer to data to send (must remain valid until wait)
+         * @param count Number of elements
+         * @param type MPI datatype
+         * @param dest Destination rank
+         * @param tag Message tag
+         * @return MPI_Request handle for wait operations
+         * @throws std::runtime_error if MPI_Isend fails
+         */
+        MPI_Request isend(const void *data, size_t count, MPI_Datatype type,
+                          int dest, int tag) const override
+        {
+            MPI_Request request;
+            int ret = MPI_Isend(data, static_cast<int>(count), type, dest, tag, comm_, &request);
+            if (ret != MPI_SUCCESS)
+            {
+                char error_string[MPI_MAX_ERROR_STRING];
+                int length;
+                MPI_Error_string(ret, error_string, &length);
+                throw std::runtime_error(std::string("MPI_Isend failed: ") + error_string);
+            }
+            return request;
+        }
+
+        /**
+         * @brief Non-blocking receive operation
+         *
+         * Initiates receive and returns immediately. Use wait() to complete.
+         *
+         * @param data Pointer to receive buffer (must remain valid until wait)
+         * @param count Maximum number of elements to receive
+         * @param type MPI datatype
+         * @param src Source rank (or MPI_ANY_SOURCE)
+         * @param tag Message tag (or MPI_ANY_TAG)
+         * @return MPI_Request handle for wait operations
+         * @throws std::runtime_error if MPI_Irecv fails
+         */
+        MPI_Request irecv(void *data, size_t count, MPI_Datatype type,
+                          int src, int tag) const override
+        {
+            MPI_Request request;
+            int ret = MPI_Irecv(data, static_cast<int>(count), type, src, tag, comm_, &request);
+            if (ret != MPI_SUCCESS)
+            {
+                char error_string[MPI_MAX_ERROR_STRING];
+                int length;
+                MPI_Error_string(ret, error_string, &length);
+                throw std::runtime_error(std::string("MPI_Irecv failed: ") + error_string);
+            }
+            return request;
+        }
+
+        /**
+         * @brief Wait for a single non-blocking operation to complete
+         *
+         * @param request Pointer to MPI_Request handle (set to MPI_REQUEST_NULL on completion)
+         * @param status Optional status object (nullptr for MPI_STATUS_IGNORE)
+         * @throws std::runtime_error if MPI_Wait fails
+         */
+        void wait(MPI_Request *request, MPI_Status *status = nullptr) const override
+        {
+            int ret = MPI_Wait(request, status ? status : MPI_STATUS_IGNORE);
+            if (ret != MPI_SUCCESS)
+            {
+                char error_string[MPI_MAX_ERROR_STRING];
+                int length;
+                MPI_Error_string(ret, error_string, &length);
+                throw std::runtime_error(std::string("MPI_Wait failed: ") + error_string);
+            }
+        }
+
+        /**
+         * @brief Wait for all non-blocking operations to complete
+         *
+         * @param requests Vector of MPI_Request handles (all set to MPI_REQUEST_NULL on completion)
+         * @throws std::runtime_error if MPI_Waitall fails
+         */
+        void waitAll(std::vector<MPI_Request> &requests) const override
+        {
+            if (requests.empty())
+                return;
+            int ret = MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+            if (ret != MPI_SUCCESS)
+            {
+                char error_string[MPI_MAX_ERROR_STRING];
+                int length;
+                MPI_Error_string(ret, error_string, &length);
+                throw std::runtime_error(std::string("MPI_Waitall failed: ") + error_string);
+            }
+        }
+
+        /**
+         * @brief Blocking probe for incoming message
+         *
+         * Blocks until a matching message is available (does not receive it).
+         *
+         * @param src Source rank (or MPI_ANY_SOURCE)
+         * @param tag Message tag (or MPI_ANY_TAG)
+         * @param status Status object to receive message info
+         * @throws std::runtime_error if MPI_Probe fails
+         */
+        void probe(int src, int tag, MPI_Status *status) const override
+        {
+            int ret = MPI_Probe(src, tag, comm_, status);
+            if (ret != MPI_SUCCESS)
+            {
+                char error_string[MPI_MAX_ERROR_STRING];
+                int length;
+                MPI_Error_string(ret, error_string, &length);
+                throw std::runtime_error(std::string("MPI_Probe failed: ") + error_string);
+            }
+        }
+
+        /**
+         * @brief Non-blocking probe for incoming message
+         *
+         * Returns immediately with flag indicating if a matching message is available.
+         *
+         * @param src Source rank (or MPI_ANY_SOURCE)
+         * @param tag Message tag (or MPI_ANY_TAG)
+         * @param status Status object to receive message info (if available)
+         * @return true if a matching message is available, false otherwise
+         * @throws std::runtime_error if MPI_Iprobe fails
+         */
+        bool iprobe(int src, int tag, MPI_Status *status) const override
+        {
+            int flag;
+            int ret = MPI_Iprobe(src, tag, comm_, &flag, status ? status : MPI_STATUS_IGNORE);
+            if (ret != MPI_SUCCESS)
+            {
+                char error_string[MPI_MAX_ERROR_STRING];
+                int length;
+                MPI_Error_string(ret, error_string, &length);
+                throw std::runtime_error(std::string("MPI_Iprobe failed: ") + error_string);
+            }
+            return flag != 0;
+        }
+
+        // =========================================================================
+        // Typed Point-to-Point Convenience Methods
+        // =========================================================================
+
+        /**
+         * @brief Send typed data (float specialization)
+         */
+        void sendFloat(const float *data, size_t count, int dest, int tag) const override
+        {
+            send(data, count, MPI_FLOAT, dest, tag);
+        }
+
+        /**
+         * @brief Receive typed data (float specialization)
+         */
+        void recvFloat(float *data, size_t count, int src, int tag,
+                       MPI_Status *status = nullptr) const override
+        {
+            recv(data, count, MPI_FLOAT, src, tag, status);
+        }
+
+        /**
+         * @brief Send raw bytes
+         */
+        void sendBytes(const void *data, size_t byte_count, int dest, int tag) const override
+        {
+            send(data, byte_count, MPI_BYTE, dest, tag);
+        }
+
+        /**
+         * @brief Receive raw bytes
+         */
+        void recvBytes(void *data, size_t byte_count, int src, int tag,
+                       MPI_Status *status = nullptr) const override
+        {
+            recv(data, byte_count, MPI_BYTE, src, tag, status);
+        }
+
+        /**
+         * @brief Get message count from status
+         *
+         * @param status MPI_Status from recv or probe
+         * @param type MPI datatype
+         * @return Number of elements in the message
+         */
+        int getCount(const MPI_Status &status, MPI_Datatype type) const override
+        {
+            int count;
+            MPI_Get_count(&status, type, &count);
+            return count;
+        }
+
     private:
         int rank_;
         int world_size_;
         MPI_Comm comm_;
+        mutable std::unique_ptr<MPITopology> topology_; ///< Lazily initialized topology
     };
 
     /**
@@ -431,4 +695,19 @@ namespace llaminar2
         }
     };
 
+} // namespace llaminar2
+
+// Include topology implementation after class definition to avoid circular dependency
+#include "MPITopology.h"
+
+namespace llaminar2
+{
+    inline const MPITopology &MPIContext::topology() const
+    {
+        if (!topology_)
+        {
+            topology_ = std::make_unique<MPITopology>(comm_);
+        }
+        return *topology_;
+    }
 } // namespace llaminar2

@@ -26,7 +26,7 @@ using namespace llaminar2::test::parity::qwen2;
 class Test__Qwen2_CUDA_vs_PyTorch : public Qwen2ParityTestBase
 {
 protected:
-    DeviceId gpu_device_{};  // Intentionally invalid - must be set in setupDeviceSpecific()
+    DeviceId gpu_device_{}; // Intentionally invalid - must be set in setupDeviceSpecific()
 
     BackendThresholds getBackendThresholds() override
     {
@@ -52,14 +52,19 @@ protected:
         auto &dm = DeviceManager::instance();
         dm.initialize(-1);
 
-        int gpu_idx = dm.find_device(ComputeBackendType::GPU_CUDA);
-        if (gpu_idx < 0)
+        int dm_idx = dm.find_device(ComputeBackendType::GPU_CUDA);
+        if (dm_idx < 0)
         {
             GTEST_SKIP() << "No CUDA device found";
         }
 
-        gpu_device_ = DeviceId::cuda(gpu_idx - 1);
-        LOG_INFO("[Qwen2 CUDA Parity] Using CUDA device " << (gpu_idx - 1));
+        // Get the backend-specific device ordinal from DeviceManager
+        const auto &device_info = dm.devices()[dm_idx];
+        int cuda_ordinal = device_info.device_id;
+
+        gpu_device_ = DeviceId::cuda(cuda_ordinal);
+        LOG_INFO("[Qwen2 CUDA Parity] Using CUDA device " << cuda_ordinal
+                                                          << " (DeviceManager index " << dm_idx << ")");
 #endif
     }
 

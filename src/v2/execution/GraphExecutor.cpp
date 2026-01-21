@@ -9,6 +9,10 @@
 #include "StageDumper.h"
 #include "AsyncStageDumper.h"
 #include "StageCoherence.h"
+#include "CollectiveContext.h"
+#include "compute_stages/stages/AllreduceStage.h"
+#include "compute_stages/stages/AllGatherStage.h"
+#include "config/TPDomain.h"
 #include "../tensors/TensorVerification.h"
 #include "../tensors/TensorValidation.h"
 #include "../tensors/cpu/CPUTensors.h"
@@ -615,6 +619,26 @@ namespace llaminar2
         {
             LOG_ERROR("[GraphExecutor] Node '" << node.name << "' has no stage");
             return false;
+        }
+
+        // =========================================================================
+        // Collective Stage Intercept: Use CollectiveContext for GPU-native collectives
+        // This bypasses the stage's internal MPI fallback path when CollectiveContext
+        // is available, enabling RCCL/NCCL/PCIeBAR backends.
+        // =========================================================================
+        if (collective_ctx_)
+        {
+            auto stage_type = node.stage->type();
+            if (stage_type == ComputeStageType::ALLREDUCE)
+            {
+                LOG_DEBUG("[GraphExecutor] Intercepting ALLREDUCE stage '" << node.name << "' via CollectiveContext");
+                return executeCollectiveAllreduce(node, ctx);
+            }
+            if (stage_type == ComputeStageType::ALLGATHER)
+            {
+                LOG_DEBUG("[GraphExecutor] Intercepting ALLGATHER stage '" << node.name << "' via CollectiveContext");
+                return executeCollectiveAllgather(node, ctx);
+            }
         }
 
         // Extract layer index from config
@@ -1261,6 +1285,174 @@ namespace llaminar2
         // Note: Buffers are intentionally NOT released here
         // Caller can retrieve them via buffer_manager_->getBuffer()
         // Caller is responsible for releasing via buffer_manager_->releaseAll()
+
+        return success;
+    }
+
+    // =============================================================================
+    // Collective Stage Intercept Implementation
+    // =============================================================================
+
+    bool GraphExecutor::executeCollectiveAllreduce(ComputeNode &node, IDeviceContext *ctx)
+    {
+        (void)ctx; // Device context not needed - CollectiveContext handles device
+
+        auto *stage = dynamic_cast<AllreduceStage *>(node.stage.get());
+        if (!stage)
+        {
+            LOG_ERROR("[GraphExecutor] Failed to cast stage '" << node.name << "' to AllreduceStage");
+            return false;
+        }
+
+        // Get buffer info from stage's dump info
+        auto dump_info = stage->getDumpInfo();
+        if (dump_info.inputs.empty() || !dump_info.inputs[0].tensor)
+        {
+            LOG_ERROR("[GraphExecutor] AllreduceStage '" << node.name << "' has no input buffer");
+            return false;
+        }
+
+        // The allreduce buffer is both input and output (in-place operation)
+        ITensor *buffer = dump_info.inputs[0].tensor;
+        size_t count = buffer->numel();
+
+        // Determine device where tensor resides
+        DeviceId tensor_device = node.device.is_valid() ? node.device : DeviceId::cpu();
+
+        // Extract domain from stage (may be nullptr for legacy path)
+        const TPDomain *domain = stage->getDomain();
+
+        // Log timing if profiling is enabled
+        auto start = std::chrono::high_resolution_clock::now();
+
+        // Delegate to CollectiveContext - use domain-aware path if domain is set
+        bool success;
+        if (domain)
+        {
+            LOG_DEBUG("[GraphExecutor] Executing allreduce in domain: " << domain->name);
+            success = collective_ctx_->executeAllreduceInDomain(
+                buffer,
+                count,
+                tensor_device,
+                CollectiveOp::ALLREDUCE_SUM,
+                domain);
+        }
+        else
+        {
+            LOG_DEBUG("[GraphExecutor] Executing allreduce via legacy (no domain) path");
+            success = collective_ctx_->executeAllreduce(
+                buffer,
+                count,
+                tensor_device,
+                CollectiveOp::ALLREDUCE_SUM);
+        }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+        if (config_.enable_profiling)
+        {
+            stats_.stage_times_ms[node.name] = ms;
+            LOG_DEBUG("[GraphExecutor] ALLREDUCE '" << node.name << "' via CollectiveContext took " << ms << " ms");
+        }
+
+        if (!success)
+        {
+            LOG_ERROR("[GraphExecutor] CollectiveContext::executeAllreduce failed for '" << node.name << "'");
+        }
+
+        return success;
+    }
+
+    bool GraphExecutor::executeCollectiveAllgather(ComputeNode &node, IDeviceContext *ctx)
+    {
+        (void)ctx; // Device context not needed - CollectiveContext handles device
+
+        auto *stage = dynamic_cast<AllGatherStage *>(node.stage.get());
+        if (!stage)
+        {
+            LOG_ERROR("[GraphExecutor] Failed to cast stage '" << node.name << "' to AllGatherStage");
+            return false;
+        }
+
+        // Get buffer info from stage's dump info
+        auto dump_info = stage->getDumpInfo();
+
+        // AllGather has separate input and output buffers
+        ITensor *local_input = nullptr;
+        ITensor *full_output = nullptr;
+
+        for (const auto &input : dump_info.inputs)
+        {
+            if (input.tensor)
+            {
+                local_input = input.tensor;
+                break;
+            }
+        }
+
+        for (const auto &output : dump_info.outputs)
+        {
+            if (output.tensor)
+            {
+                full_output = output.tensor;
+                break;
+            }
+        }
+
+        if (!local_input || !full_output)
+        {
+            LOG_ERROR("[GraphExecutor] AllGatherStage '" << node.name << "' missing input or output buffer");
+            return false;
+        }
+
+        // Determine actual sequence length (rows)
+        size_t actual_seq_len = local_input->rows();
+
+        // Determine device where tensors reside
+        DeviceId tensor_device = node.device.is_valid() ? node.device : DeviceId::cpu();
+
+        // Extract domain from stage (may be nullptr for legacy path)
+        const TPDomain *domain = stage->getDomain();
+
+        // Log timing if profiling is enabled
+        auto start = std::chrono::high_resolution_clock::now();
+
+        // Delegate to CollectiveContext - use domain-aware path if domain is set
+        bool success;
+        if (domain)
+        {
+            LOG_DEBUG("[GraphExecutor] Executing allgather in domain: " << domain->name);
+            success = collective_ctx_->executeAllgatherInDomain(
+                local_input,
+                full_output,
+                actual_seq_len,
+                tensor_device,
+                domain);
+        }
+        else
+        {
+            LOG_DEBUG("[GraphExecutor] Executing allgather via legacy (no domain) path");
+            success = collective_ctx_->executeAllgather(
+                local_input,
+                full_output,
+                actual_seq_len,
+                tensor_device);
+        }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+        if (config_.enable_profiling)
+        {
+            stats_.stage_times_ms[node.name] = ms;
+            LOG_DEBUG("[GraphExecutor] ALLGATHER '" << node.name << "' via CollectiveContext took " << ms << " ms");
+        }
+
+        if (!success)
+        {
+            LOG_ERROR("[GraphExecutor] CollectiveContext::executeAllgather failed for '" << node.name << "'");
+        }
 
         return success;
     }

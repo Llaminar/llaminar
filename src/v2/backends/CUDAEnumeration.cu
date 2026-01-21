@@ -35,6 +35,11 @@ namespace llaminar2
 
             LOG_INFO("[CUDA] Found " << device_count << " CUDA device(s)");
 
+            // Save current device to restore after enumeration
+            // (enumeration changes current device via cudaSetDevice for memory queries)
+            int original_device = 0;
+            cudaGetDevice(&original_device);
+
             for (int i = 0; i < device_count; ++i)
             {
                 cudaDeviceProp prop;
@@ -73,6 +78,9 @@ namespace llaminar2
 
                 devices.push_back(dev);
             }
+
+            // Restore original device context to avoid disrupting caller's CUDA state
+            cudaSetDevice(original_device);
 
             return devices;
         }

@@ -1046,6 +1046,13 @@ TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_IdempotentAcrossMultipleExec
     // Test that workspace manager is created only once across multiple executions.
     // NOTE: bindWorkspace() IS called each time because each graph has new stage objects.
     // The idempotency is in workspace CREATION (device_workspaces_ map), not binding.
+
+    // Skip if CUDA backend not available
+    if (DeviceManager::instance().cuda_device_count() == 0)
+    {
+        GTEST_SKIP() << "CUDA backend not available";
+    }
+
     auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
 
     ComputeGraph graph;
@@ -1466,22 +1473,40 @@ TEST_F(Test__GraphOrchestrator, WorkspaceSizing_CPUStage_SkipsWorkspace)
 
 TEST_F(Test__GraphOrchestrator, WorkspaceSizing_MixedDevices_OnlyGPUGetWorkspace)
 {
+    // Skip if neither CUDA nor ROCm backend available
+    const auto &dm = DeviceManager::instance();
+    bool has_cuda = dm.cuda_device_count() > 0;
+    bool has_rocm = dm.rocm_device_count() > 0;
+    if (!has_cuda && !has_rocm)
+    {
+        GTEST_SKIP() << "Neither CUDA nor ROCm backend available";
+    }
+
     auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
 
     ComputeGraph graph;
 
-    // Mix of CPU and GPU stages
+    // Mix of CPU and GPU stages - only add GPU stages for available backends
     auto cpu_stage = std::make_unique<MockWorkspaceConsumerStage>("cpu_gemm", DeviceId::cpu(), 4096);
-    auto cuda_stage = std::make_unique<MockWorkspaceConsumerStage>("cuda_gemm", DeviceId::cuda(0), 4096);
-    auto rocm_stage = std::make_unique<MockWorkspaceConsumerStage>("rocm_gemm", DeviceId::rocm(0), 4096);
-
     auto *cpu_ptr = cpu_stage.get();
-    auto *cuda_ptr = cuda_stage.get();
-    auto *rocm_ptr = rocm_stage.get();
-
     graph.addNode("cpu_node", std::move(cpu_stage), DeviceId::cpu());
-    graph.addNode("cuda_node", std::move(cuda_stage), DeviceId::cuda(0));
-    graph.addNode("rocm_node", std::move(rocm_stage), DeviceId::rocm(0));
+
+    MockWorkspaceConsumerStage *cuda_ptr = nullptr;
+    MockWorkspaceConsumerStage *rocm_ptr = nullptr;
+
+    if (has_cuda)
+    {
+        auto cuda_stage = std::make_unique<MockWorkspaceConsumerStage>("cuda_gemm", DeviceId::cuda(0), 4096);
+        cuda_ptr = cuda_stage.get();
+        graph.addNode("cuda_node", std::move(cuda_stage), DeviceId::cuda(0));
+    }
+
+    if (has_rocm)
+    {
+        auto rocm_stage = std::make_unique<MockWorkspaceConsumerStage>("rocm_gemm", DeviceId::rocm(0), 4096);
+        rocm_ptr = rocm_stage.get();
+        graph.addNode("rocm_node", std::move(rocm_stage), DeviceId::rocm(0));
+    }
 
     IDeviceContext *ctx = orchestrator->getDeviceContext(DeviceId::cpu());
     if (ctx == nullptr)
@@ -1493,10 +1518,15 @@ TEST_F(Test__GraphOrchestrator, WorkspaceSizing_MixedDevices_OnlyGPUGetWorkspace
 
     // Only GPU stages should have workspace
     EXPECT_FALSE(cpu_ptr->wasBound()) << "CPU stage should not have workspace";
-    // GPU stages may or may not be bound depending on device availability,
-    // but they should have requirements queried
-    EXPECT_GT(cuda_ptr->getRequirementsCallCount(), 0) << "CUDA stage requirements should be queried";
-    EXPECT_GT(rocm_ptr->getRequirementsCallCount(), 0) << "ROCm stage requirements should be queried";
+    // GPU stages should have requirements queried for available backends
+    if (cuda_ptr)
+    {
+        EXPECT_GT(cuda_ptr->getRequirementsCallCount(), 0) << "CUDA stage requirements should be queried";
+    }
+    if (rocm_ptr)
+    {
+        EXPECT_GT(rocm_ptr->getRequirementsCallCount(), 0) << "ROCm stage requirements should be queried";
+    }
 }
 
 // =============================================================================

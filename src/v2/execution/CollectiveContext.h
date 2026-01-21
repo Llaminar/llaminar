@@ -30,6 +30,7 @@
 #include "../interfaces/ICollectiveContext.h"
 #include "../collective/ICollectiveBackend.h"
 #include "../collective/BackendRouter.h"
+#include "../config/TPDomain.h"
 #include "../backends/DeviceId.h"
 #include "../utils/MPIContext.h"
 #include <memory>
@@ -142,6 +143,29 @@ namespace llaminar2
             DeviceId tensor_device) override;
 
         /**
+         * @brief Execute a variable-sized AllGather operation (allgatherv)
+         *
+         * Unlike executeAllgather which assumes equal send counts per rank,
+         * this method supports variable send counts needed for heterogeneous
+         * tensor parallelism (e.g., different head counts per device).
+         *
+         * @param local_input Local slice to send [seq_len, local_dim]
+         * @param full_output Full output [seq_len, sum(recv_counts)]
+         * @param recv_counts Elements per rank (size = world_size)
+         * @param displacements Offset in output per rank (size = world_size)
+         * @param actual_seq_len Actual sequence length (0 = use tensor rows)
+         * @param tensor_device Device where tensors reside
+         * @return true on success
+         */
+        bool executeAllgatherv(
+            ITensor *local_input,
+            ITensor *full_output,
+            const std::vector<int> &recv_counts,
+            const std::vector<int> &displacements,
+            size_t actual_seq_len,
+            DeviceId tensor_device) override;
+
+        /**
          * @brief Execute a Broadcast operation
          *
          * @param buffer Buffer to broadcast (in-place)
@@ -184,6 +208,69 @@ namespace llaminar2
 
         /// Get the MPI context (may be nullptr)
         MPIContext *mpiContext() override { return mpi_ctx_.get(); }
+
+        // =====================================================================
+        // Domain-Aware Collective Operations
+        // =====================================================================
+
+        /**
+         * @brief Execute an AllReduce operation in a specific TP domain
+         *
+         * Uses BackendRouter::selectBackendForDomain() for domain-aware
+         * backend selection. Falls back to non-domain executeAllreduce()
+         * when domain is nullptr.
+         *
+         * @param buffer In-place buffer to reduce
+         * @param count Number of elements (0 = use buffer->numel())
+         * @param tensor_device Device where tensor resides
+         * @param op Reduction operation
+         * @param domain TP domain to use (nullptr = fallback)
+         * @return true on success
+         */
+        bool executeAllreduceInDomain(
+            ITensor *buffer,
+            size_t count,
+            DeviceId tensor_device,
+            CollectiveOp op,
+            const TPDomain *domain) override;
+
+        /**
+         * @brief Execute an AllGather operation in a specific TP domain
+         *
+         * @param local_input Local slice [seq_len, local_dim]
+         * @param full_output Full output [seq_len, full_dim]
+         * @param actual_seq_len Actual sequence length (0 = use tensor rows)
+         * @param tensor_device Device where tensors reside
+         * @param domain TP domain to use (nullptr = fallback)
+         * @return true on success
+         */
+        bool executeAllgatherInDomain(
+            ITensor *local_input,
+            ITensor *full_output,
+            size_t actual_seq_len,
+            DeviceId tensor_device,
+            const TPDomain *domain) override;
+
+        /**
+         * @brief Execute a variable-sized AllGather operation in a specific TP domain
+         *
+         * @param local_input Local slice to send [seq_len, local_dim]
+         * @param full_output Full output [seq_len, sum(recv_counts)]
+         * @param recv_counts Elements per rank (size = world_size)
+         * @param displacements Offset in output per rank (size = world_size)
+         * @param actual_seq_len Actual sequence length (0 = use tensor rows)
+         * @param tensor_device Device where tensors reside
+         * @param domain TP domain to use (nullptr = fallback)
+         * @return true on success
+         */
+        bool executeAllgathervInDomain(
+            ITensor *local_input,
+            ITensor *full_output,
+            const std::vector<int> &recv_counts,
+            const std::vector<int> &displacements,
+            size_t actual_seq_len,
+            DeviceId tensor_device,
+            const TPDomain *domain) override;
 
         // =====================================================================
         // Buffer Registration Support (Phase 3)

@@ -268,6 +268,28 @@ namespace llaminar2
             CollectiveDataType dtype) = 0;
 
         /**
+         * @brief Variable-count AllGather operation
+         *
+         * Each rank may send a different amount of data. This is needed for
+         * heterogeneous tensor parallelism where devices have different head counts.
+         *
+         * @param send_buf Local data to send
+         * @param send_count Number of elements this rank sends
+         * @param recv_buf Buffer to receive all data
+         * @param recv_counts Array of counts per rank (size = world_size)
+         * @param displacements Array of offsets in recv_buf per rank
+         * @param dtype Data type
+         * @return true on success
+         */
+        virtual bool allgatherv(
+            const void *send_buf,
+            size_t send_count,
+            void *recv_buf,
+            const std::vector<int> &recv_counts,
+            const std::vector<int> &displacements,
+            CollectiveDataType dtype) = 0;
+
+        /**
          * @brief ReduceScatter operation
          *
          * Reduce across all devices, then scatter result slices.

@@ -81,12 +81,20 @@ namespace llaminar2::test::cuda
  * @brief Skip test if no CUDA GPU is available
  *
  * Usage: Place at the start of any CUDA-dependent test
+ *
+ * NOTE: This macro is safe to use with CUDATestBase, which already initializes
+ * DeviceManager. The initialize() call only runs if devices haven't been
+ * enumerated yet. However, for tests using CUDATestBase, this macro is
+ * redundant since CUDATestBase::SetUp() already handles the skip logic.
  */
 #define SKIP_IF_NO_CUDA()                                           \
     do                                                              \
     {                                                               \
         auto &dm = ::llaminar2::DeviceManager::instance();          \
-        dm.initialize(-1); /* Enumerate all devices */              \
+        if (dm.devices().empty())                                   \
+        {                                                           \
+            dm.initialize(-1); /* Enumerate all devices */          \
+        }                                                           \
         if (!dm.has_gpu())                                          \
         {                                                           \
             GTEST_SKIP() << "No CUDA GPU available, skipping test"; \
@@ -181,11 +189,19 @@ namespace llaminar2::test::cuda
                 GTEST_SKIP() << "No CUDA device found";
             }
 
-            // Create DeviceId from the discovered device
-            // gpu_idx_ is the DeviceManager legacy index (CPU=0, GPU=1+)
-            // DeviceId::cuda(0) means CUDA device ordinal 0
-            int cuda_ordinal = gpu_idx_ - 1; // Convert DeviceManager index to CUDA ordinal
+            // Get the backend-specific CUDA ordinal from DeviceManager
+            // (gpu_idx_ - 1 is wrong when ROCm devices are also present)
+            const auto &device_info = dm.devices()[gpu_idx_];
+            int cuda_ordinal = device_info.device_id;
             gpu_device_ = DeviceId::cuda(cuda_ordinal);
+
+            // CRITICAL: Set the active CUDA device for subsequent cudaMalloc/etc calls
+            cudaError_t set_err = cudaSetDevice(cuda_ordinal);
+            if (set_err != cudaSuccess)
+            {
+                GTEST_SKIP() << "Failed to set CUDA device " << cuda_ordinal
+                             << ": " << cudaGetErrorString(set_err);
+            }
 
             backend_ = std::make_unique<CUDABackend>();
             device_count_ = backend_->deviceCount();
@@ -195,8 +211,11 @@ namespace llaminar2::test::cuda
                 GTEST_SKIP() << "CUDABackend reports 0 devices";
             }
 
-            std::cout << "Using CUDA device " << gpu_idx_ << ": "
-                      << backend_->deviceName(0) << std::endl;
+            std::cout << "Using CUDA device " << cuda_ordinal << ": "
+                      << backend_->deviceName(cuda_ordinal) << std::endl;
+
+            // Store the CUDA ordinal for tests that need direct CUDA API calls
+            cuda_ordinal_ = cuda_ordinal;
 #endif
         }
 
@@ -215,6 +234,7 @@ namespace llaminar2::test::cuda
         }
 
         int gpu_idx_ = -1;                      ///< Legacy DeviceManager index (for backward compat)
+        int cuda_ordinal_ = 0;                  ///< CUDA device ordinal for cudaSetDevice() etc
         DeviceId gpu_device_ = DeviceId::cpu(); ///< Preferred: DeviceId for the CUDA device
         int device_count_ = 0;
 

@@ -6,6 +6,7 @@
  */
 
 #include "PlacementStrategy.h"
+#include "placement/HeterogeneousMultiDomainStrategy.h"
 #include "../utils/Logger.h"
 #include <algorithm>
 #include <cmath>
@@ -276,10 +277,10 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // CPUOnlyPlacementStrategy Implementation
+    // CPUOnlyLayerPlacementStrategy Implementation
     // =========================================================================
 
-    bool CPUOnlyPlacementStrategy::isApplicable(const PlacementInput &input) const
+    bool CPUOnlyLayerPlacementStrategy::isApplicable(const PlacementInput &input) const
     {
         // CPU-only is ALWAYS applicable (every system has a CPU)
         // User can explicitly choose CPU even when GPU is available
@@ -287,7 +288,7 @@ namespace llaminar2
         return true;
     }
 
-    PlacementPlan CPUOnlyPlacementStrategy::compute(const PlacementInput &input) const
+    PlacementPlan CPUOnlyLayerPlacementStrategy::compute(const PlacementInput &input) const
     {
         PlacementPlan plan;
 
@@ -332,24 +333,24 @@ namespace llaminar2
             lp.split_attention_ffn = false;
         }
 
-        LOG_DEBUG("[CPUOnlyPlacementStrategy] Generated plan: " << input.n_layers << " layers, "
-                                                                << input.world_size << " ranks, all CPU");
+        LOG_DEBUG("[CPUOnlyLayerPlacementStrategy] Generated plan: " << input.n_layers << " layers, "
+                                                                     << input.world_size << " ranks, all CPU");
 
         return plan;
     }
 
     // =========================================================================
-    // GPUFirstPlacementStrategy Implementation
+    // GPUFirstLayerPlacementStrategy Implementation
     // =========================================================================
 
-    bool GPUFirstPlacementStrategy::isApplicable(const PlacementInput &input) const
+    bool GPUFirstLayerPlacementStrategy::isApplicable(const PlacementInput &input) const
     {
         // GPU-first requires at least one GPU and not forced CPU-only
         return !input.force_cpu_only && input.any_rank_has_gpu;
     }
 
-    size_t GPUFirstPlacementStrategy::estimateLayerMemory(const PlacementInput &input,
-                                                          PlacementDevice device) const
+    size_t GPUFirstLayerPlacementStrategy::estimateLayerMemory(const PlacementInput &input,
+                                                               PlacementDevice device) const
     {
         // Estimate memory per transformer layer on specified device:
         // 1. Attention weights: Q, K, V, O projections
@@ -405,8 +406,8 @@ namespace llaminar2
         return weight_memory + norm_memory + activation_memory + kv_cache_per_layer;
     }
 
-    size_t GPUFirstPlacementStrategy::estimateGlobalMemory(const PlacementInput &input,
-                                                           PlacementDevice device) const
+    size_t GPUFirstLayerPlacementStrategy::estimateGlobalMemory(const PlacementInput &input,
+                                                                PlacementDevice device) const
     {
         (void)device; // Currently same for all devices
         size_t d_model = input.d_model;
@@ -432,7 +433,7 @@ namespace llaminar2
         return embedding + lm_head + final_norm + logits_buffer;
     }
 
-    PlacementPlan GPUFirstPlacementStrategy::compute(const PlacementInput &input) const
+    PlacementPlan GPUFirstLayerPlacementStrategy::compute(const PlacementInput &input) const
     {
         PlacementPlan plan;
 
@@ -508,19 +509,19 @@ namespace llaminar2
         int total_gpus = static_cast<int>(all_gpus.size());
         if (total_gpus == 0)
         {
-            LOG_WARN("[GPUFirstPlacementStrategy] No GPU memory info available, falling back to CPU");
+            LOG_WARN("[GPUFirstLayerPlacementStrategy] No GPU memory info available, falling back to CPU");
         }
 
-        LOG_DEBUG("[GPUFirstPlacementStrategy] Layer memory estimate (GPU): "
+        LOG_DEBUG("[GPUFirstLayerPlacementStrategy] Layer memory estimate (GPU): "
                   << (layer_memory_gpu / (1024 * 1024)) << " MB");
-        LOG_DEBUG("[GPUFirstPlacementStrategy] Global memory estimate: "
+        LOG_DEBUG("[GPUFirstLayerPlacementStrategy] Global memory estimate: "
                   << (global_memory_gpu / (1024 * 1024)) << " MB");
-        LOG_DEBUG("[GPUFirstPlacementStrategy] Total GPUs across cluster: " << total_gpus);
+        LOG_DEBUG("[GPUFirstLayerPlacementStrategy] Total GPUs across cluster: " << total_gpus);
         for (const auto &gpu : all_gpus)
         {
-            LOG_DEBUG("[GPUFirstPlacementStrategy] Rank " << gpu.rank << " GPU " << gpu.local_gpu_idx
-                                                          << " usable memory: "
-                                                          << (gpu.remaining / (1024 * 1024)) << " MB");
+            LOG_DEBUG("[GPUFirstLayerPlacementStrategy] Rank " << gpu.rank << " GPU " << gpu.local_gpu_idx
+                                                               << " usable memory: "
+                                                               << (gpu.remaining / (1024 * 1024)) << " MB");
         }
 
         // Apply max_gpu_layers constraint if specified
@@ -566,18 +567,18 @@ namespace llaminar2
         }
 
         // Log placement summary
-        LOG_INFO("[GPUFirstPlacementStrategy] Placing " << layers_assigned_to_gpu << "/"
-                                                        << input.n_layers << " layers on GPU(s)");
+        LOG_INFO("[GPUFirstLayerPlacementStrategy] Placing " << layers_assigned_to_gpu << "/"
+                                                             << input.n_layers << " layers on GPU(s)");
         for (int g = 0; g < total_gpus; ++g)
         {
             if (!all_gpus[g].assigned_layers.empty())
             {
-                LOG_INFO("[GPUFirstPlacementStrategy] Rank " << all_gpus[g].rank
-                                                             << " GPU_" << all_gpus[g].local_gpu_idx << ": "
-                                                             << all_gpus[g].assigned_layers.size()
-                                                             << " layers, "
-                                                             << (all_gpus[g].remaining / (1024 * 1024))
-                                                             << " MB remaining");
+                LOG_INFO("[GPUFirstLayerPlacementStrategy] Rank " << all_gpus[g].rank
+                                                                  << " GPU_" << all_gpus[g].local_gpu_idx << ": "
+                                                                  << all_gpus[g].assigned_layers.size()
+                                                                  << " layers, "
+                                                                  << (all_gpus[g].remaining / (1024 * 1024))
+                                                                  << " MB remaining");
             }
         }
 
@@ -639,10 +640,10 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // HybridOptimalPlacementStrategy Implementation
+    // HybridOptimalLayerPlacementStrategy Implementation
     // =========================================================================
 
-    bool HybridOptimalPlacementStrategy::isApplicable(const PlacementInput &input) const
+    bool HybridOptimalLayerPlacementStrategy::isApplicable(const PlacementInput &input) const
     {
         // Hybrid requires:
         // 1. At least one GPU
@@ -653,8 +654,8 @@ namespace llaminar2
                input.any_rank_has_gpu;
     }
 
-    size_t HybridOptimalPlacementStrategy::estimateBytesPerToken(const PlacementInput &input,
-                                                                 PlacementDevice device) const
+    size_t HybridOptimalLayerPlacementStrategy::estimateBytesPerToken(const PlacementInput &input,
+                                                                      PlacementDevice device) const
     {
         // For decode (seq_len=1), memory bandwidth dominates
         // Bytes read = all weights for one layer (after packing)
@@ -688,7 +689,7 @@ namespace llaminar2
         return static_cast<size_t>(total_elements * bytes_per_weight);
     }
 
-    float HybridOptimalPlacementStrategy::estimateCPUDecodeTokensPerSec(const PlacementInput &input) const
+    float HybridOptimalLayerPlacementStrategy::estimateCPUDecodeTokensPerSec(const PlacementInput &input) const
     {
         // Memory-bound estimate for CPU decode
         // tokens/sec = bandwidth / (bytes_per_token × n_layers)
@@ -707,7 +708,7 @@ namespace llaminar2
         return bandwidth_bps / static_cast<float>(bytes_per_token * input.n_layers);
     }
 
-    float HybridOptimalPlacementStrategy::estimateGPUDecodeTokensPerSec(const PlacementInput &input) const
+    float HybridOptimalLayerPlacementStrategy::estimateGPUDecodeTokensPerSec(const PlacementInput &input) const
     {
         // Memory-bound estimate for GPU decode (single token doesn't saturate compute)
         // tokens/sec = bandwidth / (bytes_per_token × n_layers)
@@ -726,8 +727,8 @@ namespace llaminar2
         return bandwidth_bps / static_cast<float>(bytes_per_token * input.n_layers);
     }
 
-    int HybridOptimalPlacementStrategy::computeOptimalGPULayers(const PlacementInput &input,
-                                                                const std::vector<size_t> &gpu_memories) const
+    int HybridOptimalLayerPlacementStrategy::computeOptimalGPULayers(const PlacementInput &input,
+                                                                     const std::vector<size_t> &gpu_memories) const
     {
         // Calculate total usable GPU memory across all GPUs
         size_t total_gpu_memory = 0;
@@ -769,8 +770,8 @@ namespace llaminar2
         float cpu_tps = estimateCPUDecodeTokensPerSec(input);
         float gpu_tps = estimateGPUDecodeTokensPerSec(input);
 
-        LOG_DEBUG("[HybridOptimalPlacementStrategy] CPU decode estimate: " << cpu_tps << " tok/s");
-        LOG_DEBUG("[HybridOptimalPlacementStrategy] GPU decode estimate: " << gpu_tps << " tok/s");
+        LOG_DEBUG("[HybridOptimalLayerPlacementStrategy] CPU decode estimate: " << cpu_tps << " tok/s");
+        LOG_DEBUG("[HybridOptimalLayerPlacementStrategy] GPU decode estimate: " << gpu_tps << " tok/s");
 
         // If CPU is competitive (>30% of GPU), consider hybrid split
         float cpu_efficiency = cpu_tps / (gpu_tps + 1e-6f);
@@ -781,8 +782,8 @@ namespace llaminar2
             // Put compute-heavy attention on GPU, memory-heavy FFN can spill to CPU
             // Heuristic: use GPU for up to 75% of capacity
             int optimal_gpu = static_cast<int>(max_gpu_layers * 0.75);
-            LOG_INFO("[HybridOptimalPlacementStrategy] CPU is " << static_cast<int>(cpu_efficiency * 100)
-                                                                << "% as efficient as GPU, using hybrid split");
+            LOG_INFO("[HybridOptimalLayerPlacementStrategy] CPU is " << static_cast<int>(cpu_efficiency * 100)
+                                                                     << "% as efficient as GPU, using hybrid split");
             return std::max(optimal_gpu, 1);
         }
 
@@ -790,7 +791,7 @@ namespace llaminar2
         return max_gpu_layers;
     }
 
-    PlacementPlan HybridOptimalPlacementStrategy::compute(const PlacementInput &input) const
+    PlacementPlan HybridOptimalLayerPlacementStrategy::compute(const PlacementInput &input) const
     {
         PlacementPlan plan;
 
@@ -880,8 +881,8 @@ namespace llaminar2
             gpu_layers = std::min(gpu_layers, input.max_gpu_layers);
         }
 
-        LOG_INFO("[HybridOptimalPlacementStrategy] Placing " << gpu_layers << "/" << input.n_layers
-                                                             << " layers on " << total_gpus << " GPU(s) (hybrid optimal)");
+        LOG_INFO("[HybridOptimalLayerPlacementStrategy] Placing " << gpu_layers << "/" << input.n_layers
+                                                                  << " layers on " << total_gpus << " GPU(s) (hybrid optimal)");
 
         // Estimate bytes per layer for distribution
         size_t d_model = input.d_model;
@@ -933,7 +934,7 @@ namespace llaminar2
         auto [decode_gpu_weight, decode_cpu_weight] = input.getPhaseDeviceWeights(InferencePhase::DECODE);
         bool cpu_should_decode = input.cpuShouldParticipate(InferencePhase::DECODE);
 
-        LOG_INFO("[HybridOptimalPlacementStrategy] Phase-aware decode: CPU_weight=" 
+        LOG_INFO("[HybridOptimalLayerPlacementStrategy] Phase-aware decode: CPU_weight="
                  << decode_cpu_weight << ", GPU_weight=" << decode_gpu_weight
                  << ", CPU_participates=" << (cpu_should_decode ? "yes" : "no"));
 
@@ -983,10 +984,10 @@ namespace llaminar2
 
                     lp.cpu_participates_in_decode = true;
 
-                    LOG_DEBUG("[HybridOptimalPlacementStrategy] Layer " << layer 
-                              << ": PREFILL on GPU_" << gpu.local_gpu_idx
-                              << ", DECODE on GPU(" << decode_gpu_weight 
-                              << ") + CPU(" << decode_cpu_weight << ")");
+                    LOG_DEBUG("[HybridOptimalLayerPlacementStrategy] Layer " << layer
+                                                                             << ": PREFILL on GPU_" << gpu.local_gpu_idx
+                                                                             << ", DECODE on GPU(" << decode_gpu_weight
+                                                                             << ") + CPU(" << decode_cpu_weight << ")");
                 }
             }
         }
@@ -1014,29 +1015,33 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // PlacementStrategyFactory Implementation
+    // LayerPlacementStrategyFactory Implementation
     // =========================================================================
 
-    std::unique_ptr<PlacementStrategy> PlacementStrategyFactory::create(const std::string &name)
+    std::unique_ptr<LayerPlacementStrategy> LayerPlacementStrategyFactory::create(const std::string &name)
     {
         if (name == "CPUOnly" || name == "cpu" || name == "cpu_only")
         {
-            return std::make_unique<CPUOnlyPlacementStrategy>();
+            return std::make_unique<CPUOnlyLayerPlacementStrategy>();
         }
         if (name == "GPUFirst" || name == "gpu" || name == "gpu_first")
         {
-            return std::make_unique<GPUFirstPlacementStrategy>();
+            return std::make_unique<GPUFirstLayerPlacementStrategy>();
         }
         if (name == "HybridOptimal" || name == "hybrid" || name == "hybrid_optimal")
         {
-            return std::make_unique<HybridOptimalPlacementStrategy>();
+            return std::make_unique<HybridOptimalLayerPlacementStrategy>();
+        }
+        if (name == "HeterogeneousMultiDomain" || name == "heterogeneous" || name == "multi_domain")
+        {
+            return std::make_unique<HeterogeneousMultiDomainStrategy>();
         }
 
-        LOG_WARN("[PlacementStrategyFactory] Unknown strategy: " << name);
+        LOG_WARN("[LayerPlacementStrategyFactory] Unknown strategy: " << name);
         return nullptr;
     }
 
-    std::unique_ptr<PlacementStrategy> PlacementStrategyFactory::autoSelect(const PlacementInput &input)
+    std::unique_ptr<LayerPlacementStrategy> LayerPlacementStrategyFactory::autoSelect(const PlacementInput &input)
     {
         // Priority 1: User-specified strategy
         if (!input.preferred_strategy.empty())
@@ -1045,17 +1050,17 @@ namespace llaminar2
             if (!strategy)
             {
                 throw std::runtime_error(
-                    "[PlacementStrategyFactory] Unknown strategy: '" + input.preferred_strategy +
+                    "[LayerPlacementStrategyFactory] Unknown strategy: '" + input.preferred_strategy +
                     "'. Valid strategies: CPUOnly, GPUFirst, HybridOptimal.");
             }
             if (!strategy->isApplicable(input))
             {
                 throw std::runtime_error(
-                    "[PlacementStrategyFactory] Strategy '" + input.preferred_strategy +
+                    "[LayerPlacementStrategyFactory] Strategy '" + input.preferred_strategy +
                     "' is not applicable for current configuration. "
                     "Check GPU availability and force_cpu_only flag.");
             }
-            LOG_DEBUG("[PlacementStrategyFactory] Using user-specified strategy: "
+            LOG_DEBUG("[LayerPlacementStrategyFactory] Using user-specified strategy: "
                       << input.preferred_strategy);
             return strategy;
         }
@@ -1063,14 +1068,14 @@ namespace llaminar2
         // Priority 2: Force flags
         if (input.force_cpu_only)
         {
-            LOG_DEBUG("[PlacementStrategyFactory] CPU-only mode forced");
-            return std::make_unique<CPUOnlyPlacementStrategy>();
+            LOG_DEBUG("[LayerPlacementStrategyFactory] CPU-only mode forced");
+            return std::make_unique<CPUOnlyLayerPlacementStrategy>();
         }
 
         if (input.force_gpu_only && input.any_rank_has_gpu)
         {
-            LOG_DEBUG("[PlacementStrategyFactory] GPU-only mode forced");
-            return std::make_unique<GPUFirstPlacementStrategy>();
+            LOG_DEBUG("[LayerPlacementStrategyFactory] GPU-only mode forced");
+            return std::make_unique<GPUFirstLayerPlacementStrategy>();
         }
 
         // Priority 3: Auto-select based on device availability and info
@@ -1080,24 +1085,24 @@ namespace llaminar2
             // Use HybridOptimal if we have bandwidth info (suggests optimization intent)
             if (input.cpu_memory_bandwidth_gbps > 0 || input.gpu_memory_bandwidth_gbps > 0)
             {
-                LOG_DEBUG("[PlacementStrategyFactory] GPU available with bandwidth info, using HybridOptimal");
-                return std::make_unique<HybridOptimalPlacementStrategy>();
+                LOG_DEBUG("[LayerPlacementStrategyFactory] GPU available with bandwidth info, using HybridOptimal");
+                return std::make_unique<HybridOptimalLayerPlacementStrategy>();
             }
             else
             {
-                LOG_DEBUG("[PlacementStrategyFactory] GPU available, using GPUFirst");
-                return std::make_unique<GPUFirstPlacementStrategy>();
+                LOG_DEBUG("[LayerPlacementStrategyFactory] GPU available, using GPUFirst");
+                return std::make_unique<GPUFirstLayerPlacementStrategy>();
             }
         }
 
         // No GPU available: CPU-only
-        LOG_DEBUG("[PlacementStrategyFactory] No GPU available, using CPUOnly");
-        return std::make_unique<CPUOnlyPlacementStrategy>();
+        LOG_DEBUG("[LayerPlacementStrategyFactory] No GPU available, using CPUOnly");
+        return std::make_unique<CPUOnlyLayerPlacementStrategy>();
     }
 
-    std::vector<std::string> PlacementStrategyFactory::availableStrategies()
+    std::vector<std::string> LayerPlacementStrategyFactory::availableStrategies()
     {
-        return {"CPUOnly", "GPUFirst", "HybridOptimal"};
+        return {"CPUOnly", "GPUFirst", "HybridOptimal", "HeterogeneousMultiDomain"};
     }
 
 } // namespace llaminar2

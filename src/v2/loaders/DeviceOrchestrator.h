@@ -52,9 +52,12 @@ namespace llaminar2
     };
 
     /**
-     * @brief Placement strategy types supported by the orchestrator
+     * @brief Weight placement strategy types supported by the orchestrator
+     *
+     * Controls where model weights are stored (CPU vs GPU memory).
+     * Distinct from LayerPlacementStrategy which controls where compute runs.
      */
-    enum class PlacementStrategy
+    enum class WeightPlacementStrategy
     {
         ALL_GPU,       ///< All weights on GPU device 0
         ALL_CPU,       ///< All weights on CPU
@@ -71,7 +74,7 @@ namespace llaminar2
      */
     struct OrchestrationConfig
     {
-        PlacementStrategy strategy = PlacementStrategy::AUTO;
+        WeightPlacementStrategy strategy = WeightPlacementStrategy::AUTO;
         DeviceId gpu_device = DeviceId::cuda(0); ///< Which GPU to use (if multiple)
         DeviceId cpu_device = DeviceId::cpu();   ///< CPU device
         int offload_layers = 0;                  ///< Number of layers to keep on GPU (LAYER_SPLIT)
@@ -91,6 +94,13 @@ namespace llaminar2
         bool multi_gpu = false;            ///< Enable multi-GPU distribution
         std::string gpu_split = "even";    ///< GPU split strategy: "even", "weighted", or "0.6,0.4"
         std::vector<DeviceId> gpu_devices; ///< Specific GPU devices to use (empty = all GPUs)
+
+        // Phase 6.5: Heterogeneous Multi-Domain Parallelism
+        bool heterogeneous_mode = false;   ///< Enable heterogeneous multi-domain TP/PP
+        float cpu_compute_fraction = 0.2f; ///< Fraction of layers for CPU domains (0.0-1.0)
+        bool enable_gpu_tp = true;         ///< Use GPU tensor parallelism
+        bool enable_cpu_tp = true;         ///< Use CPU tensor parallelism
+        int min_layers_per_domain = 2;     ///< Minimum layers per TP domain
 
         bool verbose = false; ///< Log placement decisions
     };
@@ -147,7 +157,7 @@ namespace llaminar2
         /**
          * @brief Get current strategy
          */
-        PlacementStrategy strategy() const { return config_.strategy; }
+        WeightPlacementStrategy strategy() const { return config_.strategy; }
 
         /**
          * @brief Get configuration

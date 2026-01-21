@@ -21,9 +21,169 @@
 #include <algorithm>
 #include <numeric>
 #include <unistd.h> // gethostname
+#include <cstring>  // memcpy
 
 namespace llaminar2
 {
+
+    // =========================================================================
+    // Serialization Helpers
+    // =========================================================================
+
+    namespace
+    {
+        // Helper to write a value to a byte buffer
+        template <typename T>
+        void writeValue(std::vector<uint8_t> &buffer, T value)
+        {
+            const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&value);
+            buffer.insert(buffer.end(), bytes, bytes + sizeof(T));
+        }
+
+        // Helper to write a string to a byte buffer (length-prefixed)
+        void writeString(std::vector<uint8_t> &buffer, const std::string &str)
+        {
+            uint32_t len = static_cast<uint32_t>(str.size());
+            writeValue(buffer, len);
+            buffer.insert(buffer.end(), str.begin(), str.end());
+        }
+
+        // Helper to read a value from a byte buffer
+        template <typename T>
+        T readValue(const uint8_t *&ptr, const uint8_t *end)
+        {
+            if (ptr + sizeof(T) > end)
+            {
+                throw std::runtime_error("Buffer underflow in RankInventory deserialization");
+            }
+            T value;
+            std::memcpy(&value, ptr, sizeof(T));
+            ptr += sizeof(T);
+            return value;
+        }
+
+        // Helper to read a string from a byte buffer (length-prefixed)
+        std::string readString(const uint8_t *&ptr, const uint8_t *end)
+        {
+            uint32_t len = readValue<uint32_t>(ptr, end);
+            if (ptr + len > end)
+            {
+                throw std::runtime_error("Buffer underflow reading string in RankInventory deserialization");
+            }
+            std::string str(reinterpret_cast<const char *>(ptr), len);
+            ptr += len;
+            return str;
+        }
+
+        // Serialize a single DeviceInfo
+        void serializeDeviceInfo(std::vector<uint8_t> &buffer, const DeviceInfo &info)
+        {
+            writeValue(buffer, static_cast<int32_t>(info.type));
+            writeValue(buffer, static_cast<int32_t>(info.local_device_id));
+            writeValue(buffer, static_cast<uint64_t>(info.memory_bytes));
+            writeValue(buffer, static_cast<uint64_t>(info.free_memory_bytes));
+            writeValue(buffer, static_cast<int32_t>(info.compute_units));
+            writeValue(buffer, static_cast<int32_t>(info.compute_capability_major));
+            writeValue(buffer, static_cast<int32_t>(info.compute_capability_minor));
+            writeValue(buffer, info.tflops_fp16);
+            writeValue(buffer, info.tflops_int8);
+            writeValue(buffer, info.memory_bandwidth_gbps);
+            writeString(buffer, info.name);
+            writeString(buffer, info.uuid);
+            writeValue(buffer, static_cast<uint8_t>(info.supports_p2p ? 1 : 0));
+            writeValue(buffer, static_cast<int32_t>(info.pcie_bus_id));
+            writeValue(buffer, static_cast<int32_t>(info.numa_node));
+        }
+
+        // Deserialize a single DeviceInfo
+        DeviceInfo deserializeDeviceInfo(const uint8_t *&ptr, const uint8_t *end)
+        {
+            DeviceInfo info;
+            info.type = static_cast<DeviceType>(readValue<int32_t>(ptr, end));
+            info.local_device_id = readValue<int32_t>(ptr, end);
+            info.memory_bytes = readValue<uint64_t>(ptr, end);
+            info.free_memory_bytes = readValue<uint64_t>(ptr, end);
+            info.compute_units = readValue<int32_t>(ptr, end);
+            info.compute_capability_major = readValue<int32_t>(ptr, end);
+            info.compute_capability_minor = readValue<int32_t>(ptr, end);
+            info.tflops_fp16 = readValue<float>(ptr, end);
+            info.tflops_int8 = readValue<float>(ptr, end);
+            info.memory_bandwidth_gbps = readValue<float>(ptr, end);
+            info.name = readString(ptr, end);
+            info.uuid = readString(ptr, end);
+            info.supports_p2p = (readValue<uint8_t>(ptr, end) != 0);
+            info.pcie_bus_id = readValue<int32_t>(ptr, end);
+            info.numa_node = readValue<int32_t>(ptr, end);
+            return info;
+        }
+    } // anonymous namespace
+
+    // =========================================================================
+    // RankInventory Serialization
+    // =========================================================================
+
+    std::vector<uint8_t> MPITopology::serializeRankInventory(const RankInventory &inventory)
+    {
+        std::vector<uint8_t> buffer;
+        buffer.reserve(512); // Pre-allocate reasonable size
+
+        // Write rank identification
+        writeValue(buffer, static_cast<int32_t>(inventory.rank));
+        writeValue(buffer, static_cast<int32_t>(inventory.node_id));
+        writeValue(buffer, static_cast<int32_t>(inventory.local_rank));
+        writeString(buffer, inventory.hostname);
+
+        // Write CPU info
+        writeValue(buffer, static_cast<int32_t>(inventory.cpu_cores));
+        writeValue(buffer, static_cast<int32_t>(inventory.cpu_sockets));
+        writeValue(buffer, static_cast<int32_t>(inventory.numa_nodes));
+        writeValue(buffer, static_cast<uint64_t>(inventory.cpu_memory_bytes));
+
+        // Write CPU device info
+        serializeDeviceInfo(buffer, inventory.cpu);
+
+        // Write GPU count and GPU device infos
+        writeValue(buffer, static_cast<int32_t>(inventory.gpus.size()));
+        for (const auto &gpu : inventory.gpus)
+        {
+            serializeDeviceInfo(buffer, gpu);
+        }
+
+        return buffer;
+    }
+
+    RankInventory MPITopology::deserializeRankInventory(const uint8_t *data, size_t size)
+    {
+        const uint8_t *ptr = data;
+        const uint8_t *end = data + size;
+
+        RankInventory inventory;
+
+        // Read rank identification
+        inventory.rank = readValue<int32_t>(ptr, end);
+        inventory.node_id = readValue<int32_t>(ptr, end);
+        inventory.local_rank = readValue<int32_t>(ptr, end);
+        inventory.hostname = readString(ptr, end);
+
+        // Read CPU info
+        inventory.cpu_cores = readValue<int32_t>(ptr, end);
+        inventory.cpu_sockets = readValue<int32_t>(ptr, end);
+        inventory.numa_nodes = readValue<int32_t>(ptr, end);
+        inventory.cpu_memory_bytes = readValue<uint64_t>(ptr, end);
+
+        // Read CPU device info
+        inventory.cpu = deserializeDeviceInfo(ptr, end);
+
+        // Read GPU count and GPU device infos
+        int32_t gpu_count = readValue<int32_t>(ptr, end);
+        inventory.gpus.reserve(gpu_count);
+        for (int32_t i = 0; i < gpu_count; ++i)
+        {
+            inventory.gpus.push_back(deserializeDeviceInfo(ptr, end));
+        }
+
+        return inventory;
+    }
 
     // =========================================================================
     // Construction / Destruction
@@ -248,8 +408,9 @@ namespace llaminar2
         // Set CPU memory bandwidth - critical for decode phase placement!
         // This determines CPU's share of decode work (bandwidth-proportional sharding)
         // Per-socket bandwidth (divide by num_sockets since this is per-rank)
-        if (cpu_bw_info.num_sockets > 0) {
-            cpu_dev.compute_units = cpu_bw_info.memory_channels;  // Channels as "units"
+        if (cpu_bw_info.num_sockets > 0)
+        {
+            cpu_dev.compute_units = cpu_bw_info.memory_channels; // Channels as "units"
             // Note: For multi-rank-per-node, bandwidth is shared among local ranks
             // TODO: Better handling of intra-node bandwidth sharing
         }
@@ -319,60 +480,182 @@ namespace llaminar2
 
     void MPITopology::exchangeCapabilities()
     {
-        // For now, use simple all-to-all exchange
-        // Each rank broadcasts its placement to all others
+        // Build local RankInventory from placement info
+        RankInventory local_inventory;
+        local_inventory.rank = rank_;
+        local_inventory.node_id = placement_.node_id;
+        local_inventory.local_rank = placement_.local_rank;
+        local_inventory.hostname = placement_.hostname;
+        local_inventory.numa_nodes = 1; // Default
 
+        // Convert DeviceCapability to DeviceInfo for CPU and GPUs
+        for (const auto &dev : placement_.devices)
+        {
+            DeviceInfo info;
+            info.local_device_id = dev.device_id;
+            info.memory_bytes = dev.memory_bytes;
+            info.compute_units = static_cast<int>(dev.compute_units);
+            info.name = dev.name;
+            // Set relative TFLOPS based on relative_compute for weight calculations
+            info.tflops_int8 = dev.relative_compute;
+
+            if (dev.type == DeviceCapability::Type::CPU)
+            {
+                info.type = DeviceType::CPU;
+                local_inventory.cpu = info;
+            }
+            else if (dev.type == DeviceCapability::Type::CUDA)
+            {
+                info.type = DeviceType::CUDA;
+                local_inventory.gpus.push_back(info);
+            }
+            else if (dev.type == DeviceCapability::Type::ROCm)
+            {
+                info.type = DeviceType::ROCm;
+                local_inventory.gpus.push_back(info);
+            }
+        }
+
+        // Serialize local inventory
+        std::vector<uint8_t> local_data = serializeRankInventory(local_inventory);
+        int local_size = static_cast<int>(local_data.size());
+
+        LOG_DEBUG("[MPITopology] Serialized local RankInventory: " << local_size << " bytes, "
+                                                                   << local_inventory.gpus.size() << " GPUs");
+
+        // Gather all sizes first (MPI_Allgather of sizes)
+        std::vector<int> all_sizes(world_size_);
+        MPI_Allgather(&local_size, 1, MPI_INT,
+                      all_sizes.data(), 1, MPI_INT,
+                      world_comm_);
+
+        // Calculate displacements for MPI_Allgatherv
+        std::vector<int> displacements(world_size_);
+        int total_size = 0;
+        for (int r = 0; r < world_size_; ++r)
+        {
+            displacements[r] = total_size;
+            total_size += all_sizes[r];
+        }
+
+        // Allocate receive buffer
+        std::vector<uint8_t> all_data(total_size);
+
+        // Gather all serialized inventories
+        MPI_Allgatherv(local_data.data(), local_size, MPI_BYTE,
+                       all_data.data(), all_sizes.data(), displacements.data(), MPI_BYTE,
+                       world_comm_);
+
+        // Deserialize all inventories into ClusterInventory
+        cluster_inventory_.world_size = world_size_;
+        cluster_inventory_.node_count = node_count_;
+        cluster_inventory_.ranks.resize(world_size_);
+
+        bool has_cuda = false;
+        bool has_rocm = false;
+
+        for (int r = 0; r < world_size_; ++r)
+        {
+            const uint8_t *ptr = all_data.data() + displacements[r];
+            size_t size = static_cast<size_t>(all_sizes[r]);
+
+            try
+            {
+                cluster_inventory_.ranks[r] = deserializeRankInventory(ptr, size);
+
+                // Track GPU types for heterogeneous detection
+                for (const auto &gpu : cluster_inventory_.ranks[r].gpus)
+                {
+                    if (gpu.type == DeviceType::CUDA)
+                    {
+                        has_cuda = true;
+                    }
+                    else if (gpu.type == DeviceType::ROCm)
+                    {
+                        has_rocm = true;
+                    }
+                }
+
+                LOG_TRACE("[MPITopology] Deserialized rank " << r << ": "
+                                                             << cluster_inventory_.ranks[r].hostname << ", "
+                                                             << cluster_inventory_.ranks[r].gpus.size() << " GPUs");
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[MPITopology] Failed to deserialize inventory for rank " << r
+                                                                                    << ": " << e.what());
+                // Create empty placeholder
+                cluster_inventory_.ranks[r].rank = r;
+                cluster_inventory_.ranks[r].hostname = "error";
+            }
+        }
+
+        // Build node aggregations
+        cluster_inventory_.buildNodeAggregations();
+        cluster_inventory_built_ = true;
+
+        // Also update all_placements_ for backward compatibility
         all_placements_.resize(world_size_);
         all_placements_[rank_] = placement_;
 
-        // Serialize minimal info for exchange (hostname, device count, compute power)
-        // Full exchange would require custom MPI datatype or serialization
-        // For now, just exchange compute weights
-
-        std::vector<float> local_compute(1);
-        local_compute[0] = 0.0f;
-        for (const auto &dev : placement_.devices)
-        {
-            local_compute[0] += dev.relative_compute;
-        }
-
-        std::vector<float> all_compute(world_size_);
-        MPI_Allgather(local_compute.data(), 1, MPI_FLOAT,
-                      all_compute.data(), 1, MPI_FLOAT,
-                      world_comm_);
-
-        // Store compute weights in placements
         for (int r = 0; r < world_size_; ++r)
         {
             if (r != rank_)
             {
-                // Create placeholder placement for remote ranks
+                const auto &ri = cluster_inventory_.ranks[r];
                 RankPlacement remote;
-                remote.rank = r;
-                remote.node_id = r / ranks_per_node_;
-                remote.local_rank = r % ranks_per_node_;
-                remote.socket_id = remote.local_rank;
-                remote.numa_node = remote.local_rank;
-                remote.hostname = "remote";
+                remote.rank = ri.rank;
+                remote.node_id = ri.node_id;
+                remote.local_rank = ri.local_rank;
+                remote.socket_id = ri.local_rank; // Simplified
+                remote.numa_node = ri.local_rank; // Simplified
+                remote.hostname = ri.hostname;
 
-                // Add placeholder device with gathered compute power
-                DeviceCapability placeholder;
-                placeholder.type = DeviceCapability::Type::CPU;
-                placeholder.device_id = 0;
-                placeholder.relative_compute = all_compute[r];
-                placeholder.memory_bytes = 0;
-                placeholder.name = "remote_compute";
-                remote.devices.push_back(placeholder);
+                // Convert DeviceInfo back to DeviceCapability
+                DeviceCapability cpu_cap;
+                cpu_cap.type = DeviceCapability::Type::CPU;
+                cpu_cap.device_id = ri.cpu.local_device_id;
+                cpu_cap.memory_bytes = ri.cpu.memory_bytes;
+                cpu_cap.compute_units = ri.cpu.compute_units;
+                cpu_cap.relative_compute = ri.cpu.tflops_int8; // Stored here
+                cpu_cap.name = ri.cpu.name;
+                remote.devices.push_back(cpu_cap);
+
+                for (const auto &gpu : ri.gpus)
+                {
+                    DeviceCapability gpu_cap;
+                    if (gpu.type == DeviceType::CUDA)
+                    {
+                        gpu_cap.type = DeviceCapability::Type::CUDA;
+                    }
+                    else if (gpu.type == DeviceType::ROCm)
+                    {
+                        gpu_cap.type = DeviceCapability::Type::ROCm;
+                    }
+                    else
+                    {
+                        gpu_cap.type = DeviceCapability::Type::Unknown;
+                    }
+                    gpu_cap.device_id = gpu.local_device_id;
+                    gpu_cap.memory_bytes = gpu.memory_bytes;
+                    gpu_cap.compute_units = gpu.compute_units;
+                    gpu_cap.relative_compute = gpu.tflops_int8; // Stored here
+                    gpu_cap.name = gpu.name;
+                    remote.devices.push_back(gpu_cap);
+                }
 
                 all_placements_[r] = remote;
             }
         }
 
-        LOG_TRACE("[MPITopology] Capability exchange complete, total compute weights:");
-        for (int r = 0; r < world_size_; ++r)
+        // Log heterogeneous status
+        if (has_cuda && has_rocm)
         {
-            LOG_TRACE("  Rank " << r << ": " << all_compute[r]);
+            LOG_INFO("[MPITopology] Heterogeneous cluster detected: CUDA + ROCm GPUs present");
         }
+
+        LOG_DEBUG("[MPITopology] Full capability exchange complete for " << world_size_ << " ranks, "
+                                                                         << cluster_inventory_.total_gpus << " total GPUs");
     }
 
     // =========================================================================
@@ -608,11 +891,14 @@ namespace llaminar2
         input.estimated_memory_bytes = estimated_memory;
         input.preferred_strategy = strategy_name;
 
-        return computePlacement(std::move(input));
+        return computePlacement(input);
     }
 
-    PlacementPlan MPITopology::computePlacement(PlacementInput input) const
+    PlacementPlan MPITopology::computePlacement(const PlacementInput &input_ref) const
     {
+        // Make a copy since we need to modify it
+        PlacementInput input = input_ref;
+
         // Fill in topology fields from our gathered data
         input.world_size = world_size_;
         input.ranks_per_node = ranks_per_node_;
@@ -673,7 +959,7 @@ namespace llaminar2
     // ClusterInventory (IMPITopology interface)
     // =========================================================================
 
-    const ClusterInventory& MPITopology::clusterInventory() const
+    const ClusterInventory &MPITopology::clusterInventory() const
     {
         if (!cluster_inventory_built_)
         {
@@ -700,7 +986,7 @@ namespace llaminar2
             ri.node_id = rp.node_id;
             ri.local_rank = rp.local_rank;
             ri.hostname = rp.hostname;
-            ri.numa_nodes = 1;  // Simplified from RankPlacement
+            ri.numa_nodes = 1; // Simplified from RankPlacement
 
             // Convert DeviceCapability to DeviceInfo
             for (const auto &dev : rp.devices)
@@ -738,5 +1024,46 @@ namespace llaminar2
         cluster_inventory_built_ = true;
     }
 
-} // namespace llaminar2
+    // =========================================================================
+    // Heterogeneous Device Detection
+    // =========================================================================
 
+    bool MPITopology::hasHeterogeneousGPUs() const
+    {
+        // Ensure cluster inventory is built
+        const auto &inventory = clusterInventory();
+
+        bool has_cuda = false;
+        bool has_rocm = false;
+
+        for (const auto &rank_inv : inventory.ranks)
+        {
+            for (const auto &gpu : rank_inv.gpus)
+            {
+                if (gpu.type == DeviceType::CUDA)
+                {
+                    has_cuda = true;
+                }
+                else if (gpu.type == DeviceType::ROCm)
+                {
+                    has_rocm = true;
+                }
+
+                // Early exit if both found
+                if (has_cuda && has_rocm)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    const RankInventory &MPITopology::getRankInventory(int rank) const
+    {
+        const auto &inventory = clusterInventory();
+        return inventory.getRank(rank);
+    }
+
+} // namespace llaminar2

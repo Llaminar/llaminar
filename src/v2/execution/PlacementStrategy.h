@@ -58,14 +58,14 @@ namespace llaminar2
      */
     enum class InferencePhase
     {
-        PREFILL,  ///< Processing prompt tokens (compute-bound, GPUs only)
-        DECODE    ///< Generating tokens (bandwidth-bound, all devices)
+        PREFILL, ///< Processing prompt tokens (compute-bound, GPUs only)
+        DECODE   ///< Generating tokens (bandwidth-bound, all devices)
     };
 
     /**
      * @brief Convert InferencePhase to string for logging
      */
-    inline const char* toString(InferencePhase phase)
+    inline const char *toString(InferencePhase phase)
     {
         switch (phase)
         {
@@ -105,9 +105,9 @@ namespace llaminar2
         // =====================================================================
         // Cluster topology (from ClusterInventory after capability exchange)
         // =====================================================================
-        int world_size = 1;                    ///< Total MPI ranks
-        int ranks_per_node = 1;                ///< Ranks per physical node
-        int node_count = 1;                    ///< Number of physical nodes
+        int world_size = 1;                      ///< Total MPI ranks
+        int ranks_per_node = 1;                  ///< Ranks per physical node
+        int node_count = 1;                      ///< Number of physical nodes
         std::vector<float> rank_compute_weights; ///< Relative compute power per rank
 
         // Complete cluster device inventory (populated by MPITopology::exchangeCapabilities)
@@ -116,10 +116,10 @@ namespace llaminar2
         // =====================================================================
         // Aggregated device info (convenience, derived from cluster_inventory)
         // =====================================================================
-        bool any_rank_has_gpu = false;         ///< Any rank has GPU?
-        size_t total_gpu_memory = 0;           ///< Total GPU memory across cluster
-        size_t total_cpu_memory = 0;           ///< Total CPU memory across cluster
-        int total_gpu_count = 0;               ///< Total GPUs across cluster
+        bool any_rank_has_gpu = false; ///< Any rank has GPU?
+        size_t total_gpu_memory = 0;   ///< Total GPU memory across cluster
+        size_t total_cpu_memory = 0;   ///< Total CPU memory across cluster
+        int total_gpu_count = 0;       ///< Total GPUs across cluster
 
         // Per-rank GPU info (for backward compatibility)
         // DEPRECATED: Use cluster_inventory.ranks[rank].gpus instead
@@ -140,6 +140,13 @@ namespace llaminar2
         bool force_gpu_only = false;    ///< --gpu-only flag
         int max_gpu_layers = -1;        ///< --n-gpu-layers N (-1 = no limit)
         std::string preferred_strategy; ///< User-specified strategy name
+
+        // =====================================================================
+        // Convenience fields for simple GPU availability testing
+        // (These are derived from cluster_inventory but provided for simpler APIs)
+        // =====================================================================
+        bool has_gpu = false;        ///< Local rank has at least one GPU available
+        size_t gpu_memory_bytes = 0; ///< Total GPU memory on local rank (bytes)
 
         // =====================================================================
         // Helper methods
@@ -237,7 +244,7 @@ namespace llaminar2
         bool cpuShouldParticipate(InferencePhase phase) const
         {
             if (!any_rank_has_gpu)
-                return true;  // No GPUs: CPU must participate
+                return true; // No GPUs: CPU must participate
 
             if (phase == InferencePhase::PREFILL)
                 return false; // Prefill: GPU-only (compute-bound)
@@ -246,9 +253,9 @@ namespace llaminar2
             // Threshold: CPU should have at least 10% of total bandwidth
             if (cpu_memory_bandwidth_gbps > 0.0f && gpu_memory_bandwidth_gbps > 0.0f)
             {
-                float cpu_fraction = cpu_memory_bandwidth_gbps / 
-                    (cpu_memory_bandwidth_gbps + gpu_memory_bandwidth_gbps);
-                return cpu_fraction >= 0.05f;  // 5% threshold (very inclusive)
+                float cpu_fraction = cpu_memory_bandwidth_gbps /
+                                     (cpu_memory_bandwidth_gbps + gpu_memory_bandwidth_gbps);
+                return cpu_fraction >= 0.05f; // 5% threshold (very inclusive)
             }
 
             // No bandwidth info: conservative - include CPU for decode
@@ -269,15 +276,18 @@ namespace llaminar2
     };
 
     /**
-     * @brief Abstract base class for placement strategies
+     * @brief Abstract base class for layer placement strategies
      *
      * Subclasses implement compute() to generate a PlacementPlan
      * based on model info and device capabilities.
+     *
+     * NOTE: This class controls where COMPUTE runs (layers on CPU vs GPU).
+     * For weight storage placement, see WeightPlacementStrategy enum in DeviceOrchestrator.h.
      */
-    class PlacementStrategy
+    class LayerPlacementStrategy
     {
     public:
-        virtual ~PlacementStrategy() = default;
+        virtual ~LayerPlacementStrategy() = default;
 
         /**
          * @brief Compute a placement plan from inputs
@@ -306,7 +316,7 @@ namespace llaminar2
     };
 
     /**
-     * @brief CPU-only placement strategy: All compute on CPU
+     * @brief CPU-only layer placement strategy: All compute on CPU
      *
      * This is the baseline strategy. All layers execute on CPU.
      * Weights are distributed across ranks for tensor parallelism,
@@ -322,7 +332,7 @@ namespace llaminar2
      * - No GPU is available on any rank, OR
      * - User explicitly selects this strategy
      */
-    class CPUOnlyPlacementStrategy : public PlacementStrategy
+    class CPUOnlyLayerPlacementStrategy : public LayerPlacementStrategy
     {
     public:
         PlacementPlan compute(const PlacementInput &input) const override;
@@ -331,7 +341,7 @@ namespace llaminar2
     };
 
     /**
-     * @brief GPU-first placement strategy: Maximize GPU utilization
+     * @brief GPU-first layer placement strategy: Maximize GPU utilization
      *
      * Places as many layers on GPU as memory allows, then spills
      * remaining layers to CPU. Simple greedy approach that prioritizes
@@ -357,7 +367,7 @@ namespace llaminar2
      * - At least one GPU is available
      * - force_cpu_only is false
      */
-    class GPUFirstPlacementStrategy : public PlacementStrategy
+    class GPUFirstLayerPlacementStrategy : public LayerPlacementStrategy
     {
     public:
         PlacementPlan compute(const PlacementInput &input) const override;
@@ -423,7 +433,7 @@ namespace llaminar2
      * - CPU memory bandwidth info is provided (optional but helps)
      * - force_cpu_only and force_gpu_only are both false
      */
-    class HybridOptimalPlacementStrategy : public PlacementStrategy
+    class HybridOptimalLayerPlacementStrategy : public LayerPlacementStrategy
     {
     public:
         PlacementPlan compute(const PlacementInput &input) const override;
@@ -467,20 +477,32 @@ namespace llaminar2
     // Legacy Aliases (for backward compatibility)
     // =========================================================================
 
-    /// @deprecated Use CPUOnlyPlacementStrategy instead
-    using CPUOnlyStrategy = CPUOnlyPlacementStrategy;
+    /// @deprecated Use CPUOnlyLayerPlacementStrategy instead
+    using CPUOnlyPlacementStrategy = CPUOnlyLayerPlacementStrategy;
 
-    /// @deprecated Use GPUFirstPlacementStrategy instead
-    using GPUFirstStrategy = GPUFirstPlacementStrategy;
+    /// @deprecated Use GPUFirstLayerPlacementStrategy instead
+    using GPUFirstPlacementStrategy = GPUFirstLayerPlacementStrategy;
+
+    /// @deprecated Use HybridOptimalLayerPlacementStrategy instead
+    using HybridOptimalPlacementStrategy = HybridOptimalLayerPlacementStrategy;
+
+    /// @deprecated Use LayerPlacementStrategy instead
+    using PlacementStrategy = LayerPlacementStrategy;
+
+    /// @deprecated Legacy alias
+    using CPUOnlyStrategy = CPUOnlyLayerPlacementStrategy;
+
+    /// @deprecated Legacy alias
+    using GPUFirstStrategy = GPUFirstLayerPlacementStrategy;
 
     /**
-     * @brief Factory for creating placement strategies
+     * @brief Factory for creating layer placement strategies
      *
      * Supports:
      * - Automatic selection based on capabilities
      * - Manual selection by name
      */
-    class PlacementStrategyFactory
+    class LayerPlacementStrategyFactory
     {
     public:
         /**
@@ -488,7 +510,7 @@ namespace llaminar2
          * @param name Strategy name ("CPUOnly", "GPUFirst", "HybridOptimal")
          * @return Strategy instance, or nullptr if unknown name
          */
-        static std::unique_ptr<PlacementStrategy> create(const std::string &name);
+        static std::unique_ptr<LayerPlacementStrategy> create(const std::string &name);
 
         /**
          * @brief Auto-select best strategy for given input
@@ -502,12 +524,15 @@ namespace llaminar2
          * 4. GPUFirst if GPU available
          * 5. CPUOnly as fallback
          */
-        static std::unique_ptr<PlacementStrategy> autoSelect(const PlacementInput &input);
+        static std::unique_ptr<LayerPlacementStrategy> autoSelect(const PlacementInput &input);
 
         /**
          * @brief Get list of all available strategy names
          */
         static std::vector<std::string> availableStrategies();
     };
+
+    /// @deprecated Use LayerPlacementStrategyFactory instead
+    using PlacementStrategyFactory = LayerPlacementStrategyFactory;
 
 } // namespace llaminar2

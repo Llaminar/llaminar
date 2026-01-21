@@ -51,7 +51,7 @@ namespace llaminar2
     // Lifecycle
     // =========================================================================
 
-    bool MPIBackend::initialize(const DeviceGroup& group)
+    bool MPIBackend::initialize(const DeviceGroup &group)
     {
         if (!mpi_ctx_)
         {
@@ -62,7 +62,7 @@ namespace llaminar2
 
         // Validate group scope - MPI is typically used for GLOBAL scope
         // but can also be used for LOCAL scope with appropriate configuration
-        if (group.scope != CollectiveScope::GLOBAL && 
+        if (group.scope != CollectiveScope::GLOBAL &&
             group.scope != CollectiveScope::LOCAL)
         {
             last_error_ = "Invalid group scope for MPI backend";
@@ -73,8 +73,8 @@ namespace llaminar2
         group_ = group;
         initialized_ = true;
 
-        LOG_DEBUG("MPIBackend initialized for group '" << group.name 
-                  << "' with " << mpi_ctx_->world_size() << " ranks");
+        LOG_DEBUG("MPIBackend initialized for group '" << group.name
+                                                       << "' with " << mpi_ctx_->world_size() << " ranks");
 
         return true;
     }
@@ -99,7 +99,7 @@ namespace llaminar2
     // =========================================================================
 
     bool MPIBackend::allreduce(
-        void* buffer,
+        void *buffer,
         size_t count,
         CollectiveDataType dtype,
         CollectiveOp op)
@@ -132,8 +132,8 @@ namespace llaminar2
     }
 
     bool MPIBackend::allgather(
-        const void* send_buf,
-        void* recv_buf,
+        const void *send_buf,
+        void *recv_buf,
         size_t send_count,
         CollectiveDataType dtype)
     {
@@ -164,9 +164,45 @@ namespace llaminar2
         return true;
     }
 
+    bool MPIBackend::allgatherv(
+        const void *send_buf,
+        size_t send_count,
+        void *recv_buf,
+        const std::vector<int> &recv_counts,
+        const std::vector<int> &displacements,
+        CollectiveDataType dtype)
+    {
+        if (!initialized_ || !mpi_ctx_)
+        {
+            last_error_ = "MPI backend not initialized";
+            return false;
+        }
+
+        MPI_Datatype mpi_dtype = toMPIDatatype(dtype);
+
+        int result = MPI_Allgatherv(
+            send_buf,
+            static_cast<int>(send_count),
+            mpi_dtype,
+            recv_buf,
+            recv_counts.data(),
+            displacements.data(),
+            mpi_dtype,
+            mpi_ctx_->comm());
+
+        if (result != MPI_SUCCESS)
+        {
+            last_error_ = "MPI_Allgatherv failed with code " + std::to_string(result);
+            LOG_ERROR("MPIBackend::allgatherv - " << last_error_);
+            return false;
+        }
+
+        return true;
+    }
+
     bool MPIBackend::reduceScatter(
-        const void* send_buf,
-        void* recv_buf,
+        const void *send_buf,
+        void *recv_buf,
         size_t recv_count,
         CollectiveDataType dtype,
         CollectiveOp op)
@@ -203,7 +239,7 @@ namespace llaminar2
     }
 
     bool MPIBackend::broadcast(
-        void* buffer,
+        void *buffer,
         size_t count,
         CollectiveDataType dtype,
         int root_rank)

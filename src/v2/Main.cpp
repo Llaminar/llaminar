@@ -333,34 +333,34 @@ int main(int argc, char *argv[])
     }
 
     // Parse placement strategy
-    PlacementStrategy strategy = PlacementStrategy::AUTO;
+    WeightPlacementStrategy strategy = WeightPlacementStrategy::AUTO;
     if (args.strategy == "all-gpu")
     {
-        strategy = PlacementStrategy::ALL_GPU;
+        strategy = WeightPlacementStrategy::ALL_GPU;
     }
     else if (args.strategy == "all-cpu")
     {
-        strategy = PlacementStrategy::ALL_CPU;
+        strategy = WeightPlacementStrategy::ALL_CPU;
     }
     else if (args.strategy == "layer-split")
     {
-        strategy = PlacementStrategy::LAYER_SPLIT;
+        strategy = WeightPlacementStrategy::LAYER_SPLIT;
     }
     else if (args.strategy == "memory-aware")
     {
-        strategy = PlacementStrategy::MEMORY_AWARE;
+        strategy = WeightPlacementStrategy::MEMORY_AWARE;
     }
     else if (args.strategy == "moe-optimized")
     {
-        strategy = PlacementStrategy::MOE_OPTIMIZED;
+        strategy = WeightPlacementStrategy::MOE_OPTIMIZED;
     }
     else if (args.strategy == "custom")
     {
-        strategy = PlacementStrategy::CUSTOM;
+        strategy = WeightPlacementStrategy::CUSTOM;
     }
     else if (args.strategy == "multi-gpu")
     {
-        strategy = PlacementStrategy::MULTI_GPU;
+        strategy = WeightPlacementStrategy::MULTI_GPU;
     }
     else if (args.strategy != "auto")
     {
@@ -371,9 +371,9 @@ int main(int argc, char *argv[])
     }
 
     // Auto-enable multi-gpu strategy if --multi-gpu or --gpus specified
-    if (args.multi_gpu && strategy == PlacementStrategy::AUTO)
+    if (args.multi_gpu && strategy == WeightPlacementStrategy::AUTO)
     {
-        strategy = PlacementStrategy::MULTI_GPU;
+        strategy = WeightPlacementStrategy::MULTI_GPU;
     }
 
     // Create orchestration config from ArgContext
@@ -393,6 +393,24 @@ int main(int argc, char *argv[])
     for (int gpu_idx : args.gpu_devices)
     {
         orch_config.gpu_devices.push_back(DeviceId::cuda(gpu_idx));
+    }
+
+    // Phase 6.5: Heterogeneous multi-domain parallelism configuration
+    orch_config.heterogeneous_mode = args.heterogeneous_mode;
+    orch_config.cpu_compute_fraction = args.cpu_compute_fraction;
+    orch_config.enable_gpu_tp = !args.disable_gpu_tp;
+    orch_config.enable_cpu_tp = !args.disable_cpu_tp;
+    orch_config.min_layers_per_domain = args.min_layers_per_domain;
+
+    // Warn if heterogeneous mode is used with single rank
+    if (args.heterogeneous_mode && mpi_ctx->world_size() == 1)
+    {
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_WARN("--heterogeneous specified with single MPI rank. "
+                     "Multi-domain parallelism works best with world_size >= 2. "
+                     "Consider using --mpi-procs to specify more ranks.");
+        }
     }
 
     // Create device orchestrator

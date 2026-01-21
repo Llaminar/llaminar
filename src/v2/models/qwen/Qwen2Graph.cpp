@@ -346,6 +346,9 @@ namespace llaminar2
             allgather_params.full_output = buffers_.logits;
             allgather_params.mpi_ctx = mpi_ctx_.get();
             allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
+            // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
+            // Multi-domain TP typically doesn't route LM head to a specific domain
+            allgather_params.domain = nullptr;
 
             graph.addNode("lm_head_allgather",
                           ComputeStageFactory::createAllGather(allgather_params),
@@ -658,6 +661,8 @@ namespace llaminar2
             allgather_params.full_output = output_logits;
             allgather_params.mpi_ctx = mpi_ctx_.get();
             allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
+            // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
+            allgather_params.domain = nullptr;
 
             graph.addNode("lm_head_allgather",
                           ComputeStageFactory::createAllGather(allgather_params),
@@ -1260,7 +1265,9 @@ namespace llaminar2
                                           .device_id = device,
                                           .mpi_ctx = mpi_ctx_.get(),
                                           .buffer = allreduce_buffer,
-                                          .count = allreduce_count}),
+                                          .count = allreduce_count,
+                                          .collective_ctx = nullptr,
+                                          .domain = getDomainForLayer(layer_idx, /*is_attention=*/true)}),
                                   device);
 
                     graph.addDependency(prefix + "wo_allreduce", wo_producer_node);
@@ -1438,7 +1445,9 @@ namespace llaminar2
                                       .device_id = device,
                                       .mpi_ctx = mpi_ctx_.get(),
                                       .buffer = buffers.attn_proj,
-                                      .count = allreduce_count}),
+                                      .count = allreduce_count,
+                                      .collective_ctx = nullptr,
+                                      .domain = getDomainForLayer(layer_idx, /*is_attention=*/false)}),
                               device);
 
                 graph.addDependency(prefix + "down_allreduce", prefix + "down_proj");
@@ -1606,6 +1615,15 @@ namespace llaminar2
         {
             graph.addDependency("final_norm", prev_node);
         }
+    }
+
+    const TPDomain *Qwen2Graph::getDomainForLayer(int layer_idx, bool is_attention) const
+    {
+        if (!config_.multi_domain_tp_config)
+        {
+            return nullptr; // No domain config - use legacy MPI path
+        }
+        return config_.multi_domain_tp_config->domainForLayer(layer_idx, is_attention);
     }
 
 } // namespace llaminar2

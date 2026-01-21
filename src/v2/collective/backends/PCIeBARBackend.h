@@ -106,6 +106,14 @@ namespace llaminar2
             size_t send_count,
             CollectiveDataType dtype) override;
 
+        bool allgatherv(
+            const void *send_buf,
+            size_t send_count,
+            void *recv_buf,
+            const std::vector<int> &recv_counts,
+            const std::vector<int> &displacements,
+            CollectiveDataType dtype) override;
+
         bool reduceScatter(
             const void *send_buf,
             void *recv_buf,

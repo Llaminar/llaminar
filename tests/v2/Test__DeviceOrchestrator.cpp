@@ -38,14 +38,14 @@ protected:
 TEST_F(Test__DeviceOrchestrator, AllGPUStrategy)
 {
     OrchestrationConfig config;
-    config.strategy = PlacementStrategy::ALL_GPU;
+    config.strategy = WeightPlacementStrategy::ALL_GPU;
     config.gpu_device_idx = 0;
     config.verbose = true;
 
     auto orchestrator = std::make_shared<DeviceOrchestrator>(
         device_mgr_, mpi_ctx_, config);
 
-    EXPECT_EQ(PlacementStrategy::ALL_GPU, orchestrator->strategy());
+    EXPECT_EQ(WeightPlacementStrategy::ALL_GPU, orchestrator->strategy());
 
     // Create mock model context (for testing)
     auto model_ctx = ModelContext::createForTesting("test.gguf");
@@ -67,13 +67,13 @@ TEST_F(Test__DeviceOrchestrator, AllGPUStrategy)
 TEST_F(Test__DeviceOrchestrator, AllCPUStrategy)
 {
     OrchestrationConfig config;
-    config.strategy = PlacementStrategy::ALL_CPU;
+    config.strategy = WeightPlacementStrategy::ALL_CPU;
     config.cpu_device_idx = 0; // Assume CPU is device 0
 
     auto orchestrator = std::make_shared<DeviceOrchestrator>(
         device_mgr_, mpi_ctx_, config);
 
-    EXPECT_EQ(PlacementStrategy::ALL_CPU, orchestrator->strategy());
+    EXPECT_EQ(WeightPlacementStrategy::ALL_CPU, orchestrator->strategy());
 
     auto model_ctx = ModelContext::createForTesting("test.gguf");
     auto placement_map = orchestrator->createPlacementMap(model_ctx);
@@ -92,7 +92,7 @@ TEST_F(Test__DeviceOrchestrator, AllCPUStrategy)
 TEST_F(Test__DeviceOrchestrator, LayerSplitStrategy)
 {
     OrchestrationConfig config;
-    config.strategy = PlacementStrategy::LAYER_SPLIT;
+    config.strategy = WeightPlacementStrategy::LAYER_SPLIT;
     config.gpu_device_idx = 1; // GPU
     config.cpu_device_idx = 0; // CPU
     config.offload_layers = 4; // First 4 layers on GPU
@@ -133,7 +133,7 @@ TEST_F(Test__DeviceOrchestrator, LayerSplitStrategy)
 TEST_F(Test__DeviceOrchestrator, LayerSplitZeroOffload)
 {
     OrchestrationConfig config;
-    config.strategy = PlacementStrategy::LAYER_SPLIT;
+    config.strategy = WeightPlacementStrategy::LAYER_SPLIT;
     config.gpu_device_idx = 1;
     config.cpu_device_idx = 0;
     config.offload_layers = 0; // No layers on GPU
@@ -161,14 +161,14 @@ TEST_F(Test__DeviceOrchestrator, LayerSplitZeroOffload)
 TEST_F(Test__DeviceOrchestrator, AutoStrategy)
 {
     OrchestrationConfig config;
-    config.strategy = PlacementStrategy::AUTO;
+    config.strategy = WeightPlacementStrategy::AUTO;
     config.gpu_device_idx = 0;
     config.verbose = false;
 
     auto orchestrator = std::make_shared<DeviceOrchestrator>(
         device_mgr_, mpi_ctx_, config);
 
-    EXPECT_EQ(PlacementStrategy::AUTO, orchestrator->strategy());
+    EXPECT_EQ(WeightPlacementStrategy::AUTO, orchestrator->strategy());
 
     auto model_ctx = ModelContext::createForTesting("test.gguf");
     auto placement_map = orchestrator->createPlacementMap(model_ctx);
@@ -187,7 +187,7 @@ TEST_F(Test__DeviceOrchestrator, AutoStrategy)
 TEST_F(Test__DeviceOrchestrator, ConfigAccessor)
 {
     OrchestrationConfig config;
-    config.strategy = PlacementStrategy::LAYER_SPLIT;
+    config.strategy = WeightPlacementStrategy::LAYER_SPLIT;
     config.gpu_device_idx = 1;
     config.offload_layers = 8;
     config.verbose = true;
@@ -196,7 +196,7 @@ TEST_F(Test__DeviceOrchestrator, ConfigAccessor)
         device_mgr_, mpi_ctx_, config);
 
     const auto &retrieved_config = orchestrator->config();
-    EXPECT_EQ(PlacementStrategy::LAYER_SPLIT, retrieved_config.strategy);
+    EXPECT_EQ(WeightPlacementStrategy::LAYER_SPLIT, retrieved_config.strategy);
     EXPECT_EQ(1, retrieved_config.gpu_device_idx);
     EXPECT_EQ(8, retrieved_config.offload_layers);
     EXPECT_TRUE(retrieved_config.verbose);
@@ -208,7 +208,7 @@ TEST_F(Test__DeviceOrchestrator, ConfigAccessor)
 TEST_F(Test__DeviceOrchestrator, CPUAutoDetection)
 {
     OrchestrationConfig config;
-    config.strategy = PlacementStrategy::ALL_CPU;
+    config.strategy = WeightPlacementStrategy::ALL_CPU;
     config.cpu_device_idx = -1; // Auto-detect
 
     auto orchestrator = std::make_shared<DeviceOrchestrator>(
@@ -225,7 +225,7 @@ TEST_F(Test__DeviceOrchestrator, VerboseLogging)
 {
     // Test with verbose on
     OrchestrationConfig config_verbose;
-    config_verbose.strategy = PlacementStrategy::ALL_GPU;
+    config_verbose.strategy = WeightPlacementStrategy::ALL_GPU;
     config_verbose.verbose = true;
 
     auto orch_verbose = std::make_shared<DeviceOrchestrator>(
@@ -239,7 +239,7 @@ TEST_F(Test__DeviceOrchestrator, VerboseLogging)
 
     // Test with verbose off
     OrchestrationConfig config_quiet;
-    config_quiet.strategy = PlacementStrategy::ALL_GPU;
+    config_quiet.strategy = WeightPlacementStrategy::ALL_GPU;
     config_quiet.verbose = false;
 
     auto orch_quiet = std::make_shared<DeviceOrchestrator>(

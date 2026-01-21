@@ -365,9 +365,24 @@ namespace llaminar2
             size_t cols = info->dimensions[1];
 
             // Calculate row range for this rank
-            size_t rows_per_rank = total_rows / world_size;
-            size_t row_start = rows_per_rank * rank;
-            size_t row_end = (rank == world_size - 1) ? total_rows : row_start + rows_per_rank;
+            // Use proportional slicing if TensorParallelConfig is set, otherwise equal split
+            size_t row_start, row_count;
+            if (tp_config_)
+            {
+                // Row-parallel actually splits ROWS (for Wo, which has shape [d_model, n_heads*head_dim])
+                // But the input dimension to match is from the column-parallel output
+                // For Wo: we split rows based on head assignment since input comes from Q output
+                auto [start, count] = calculateProportionalRowSlice(name, total_rows);
+                row_start = start;
+                row_count = count;
+            }
+            else
+            {
+                size_t rows_per_rank = total_rows / world_size;
+                row_start = rows_per_rank * rank;
+                row_count = (rank == world_size - 1) ? (total_rows - row_start) : rows_per_rank;
+            }
+            size_t row_end = row_start + row_count;
 
             // Load ONLY the slice from GGUF file (memory efficient!)
             auto slice_tensor = loader_.loadTensorRowSlice(
@@ -382,7 +397,8 @@ namespace llaminar2
             LOG_TRACE("[WeightManager] Rank " << rank << " row-parallel " << name
                                               << " [" << total_rows << ", " << cols
                                               << "] -> loaded ONLY rows [" << row_start << ", " << row_end
-                                              << ") = " << (row_end - row_start) << " rows (memory efficient)");
+                                              << ") = " << row_count << " rows"
+                                              << (tp_config_ ? " (proportional)" : " (equal)"));
 
             // Wrap in TensorSlice with metadata (inner_is_presliced=true)
             // The inner tensor already contains only the slice data
@@ -430,10 +446,23 @@ namespace llaminar2
             if (info->dimensions.size() == 1)
             {
                 size_t total_elements = info->dimensions[0];
-                size_t elements_per_rank = total_elements / world_size;
-                size_t start = elements_per_rank * rank;
-                size_t end = (rank == world_size - 1) ? total_elements : start + elements_per_rank;
-                size_t slice_elements = end - start;
+
+                // Calculate slice range - use proportional if config set
+                size_t start, slice_elements;
+                if (tp_config_)
+                {
+                    // Use column slice calculation (1D bias treated as single-row 2D)
+                    auto [s, count] = calculateProportionalColumnSlice(name, total_elements);
+                    start = s;
+                    slice_elements = count;
+                }
+                else
+                {
+                    size_t elements_per_rank = total_elements / world_size;
+                    start = elements_per_rank * rank;
+                    slice_elements = (rank == world_size - 1) ? (total_elements - start) : elements_per_rank;
+                }
+                size_t end = start + slice_elements;
 
                 // Load full 1D tensor first (biases are small, ~3KB)
                 auto full_tensor = loader_.loadTensor(name, device, WeightPrecision::NATIVE);
@@ -460,7 +489,8 @@ namespace llaminar2
                 LOG_TRACE("[WeightManager] Rank " << rank << " column-parallel 1D " << name
                                                   << " [" << total_elements
                                                   << "] -> sliced elements [" << start << ", " << end
-                                                  << ") = " << slice_elements << " elements");
+                                                  << ") = " << slice_elements << " elements"
+                                                  << (tp_config_ ? " (proportional)" : " (equal)"));
 
                 // For 1D tensors, use row-parallel metadata with cols=1
                 auto meta = SliceMetadata::forRowParallel(
@@ -481,11 +511,23 @@ namespace llaminar2
 
             size_t total_rows = info->dimensions[0]; // N = output features
             size_t cols = info->dimensions[1];       // K = input features
-            size_t rows_per_rank = total_rows / world_size;
 
             // Calculate this rank's ROW range (splitting output dimension)
-            size_t row_start = rows_per_rank * rank;
-            size_t row_end = (rank == world_size - 1) ? total_rows : row_start + rows_per_rank;
+            // Use proportional slicing if TensorParallelConfig is set, otherwise equal split
+            size_t row_start, row_count;
+            if (tp_config_)
+            {
+                auto [start, count] = calculateProportionalColumnSlice(name, total_rows);
+                row_start = start;
+                row_count = count;
+            }
+            else
+            {
+                size_t rows_per_rank = total_rows / world_size;
+                row_start = rows_per_rank * rank;
+                row_count = (rank == world_size - 1) ? (total_rows - row_start) : rows_per_rank;
+            }
+            size_t row_end = row_start + row_count;
 
             // Load only this rank's row slice (preserves quantized format)
             auto slice_tensor = loader_.loadTensorRowSlice(
@@ -500,7 +542,8 @@ namespace llaminar2
             LOG_TRACE("[WeightManager] Rank " << rank << " column-parallel " << name
                                               << " [" << total_rows << ", " << cols
                                               << "] -> loaded ONLY rows [" << row_start << ", " << row_end
-                                              << ") = " << (row_end - row_start) << " rows (memory efficient, quantized)");
+                                              << ") = " << row_count << " rows"
+                                              << (tp_config_ ? " (proportional)" : " (equal)"));
 
             // Wrap in TensorSlice with metadata (inner_is_presliced=true)
             // Note: forColumnParallel stores original dimensions for allgather reconstruction
@@ -539,11 +582,23 @@ namespace llaminar2
 
             size_t rows = info->dimensions[0];       // N = output features (d_model)
             size_t total_cols = info->dimensions[1]; // K = input features (d_ff)
-            size_t cols_per_rank = total_cols / world_size;
 
             // Calculate this rank's COLUMN range (splitting input dimension)
-            size_t col_start = cols_per_rank * rank;
-            size_t col_end = (rank == world_size - 1) ? total_cols : col_start + cols_per_rank;
+            // Use proportional slicing if TensorParallelConfig is set, otherwise equal split
+            size_t col_start, col_count;
+            if (tp_config_)
+            {
+                auto [start, count] = calculateProportionalRowSlice(name, total_cols);
+                col_start = start;
+                col_count = count;
+            }
+            else
+            {
+                size_t cols_per_rank = total_cols / world_size;
+                col_start = cols_per_rank * rank;
+                col_count = (rank == world_size - 1) ? (total_cols - col_start) : cols_per_rank;
+            }
+            size_t col_end = col_start + col_count;
 
             // Load only this rank's column slice (preserves quantized format)
             auto slice_tensor = loader_.loadTensorColumnSlice(
@@ -558,7 +613,8 @@ namespace llaminar2
             LOG_TRACE("[WeightManager] Rank " << rank << " input-parallel " << name
                                               << " [" << rows << ", " << total_cols
                                               << "] -> loaded ONLY cols [" << col_start << ", " << col_end
-                                              << ") = " << (col_end - col_start) << " cols (memory efficient, quantized)");
+                                              << ") = " << col_count << " cols"
+                                              << (tp_config_ ? " (proportional)" : " (equal)"));
 
             // Wrap in TensorSlice with row-parallel metadata
             // (input-parallel is mathematically like row-parallel but with column slicing)
@@ -824,6 +880,200 @@ namespace llaminar2
         }
 
         return sliced;
+    }
+
+    // =========================================================================
+    // Proportional Slicing (TensorParallelConfig support)
+    // =========================================================================
+
+    WeightManager::WeightCategory WeightManager::categorizeWeight(const std::string &name) const
+    {
+        // Attention Q/K/V projections (column-parallel by heads)
+        if (name.find("attn_q.") != std::string::npos ||
+            name.find("attn_k.") != std::string::npos ||
+            name.find("attn_v.") != std::string::npos ||
+            name.find("attn_qkv.") != std::string::npos)
+        {
+            return WeightCategory::ATTENTION_QKV;
+        }
+
+        // Attention output projection (row-parallel)
+        if (name.find("attn_output.") != std::string::npos)
+        {
+            return WeightCategory::ATTENTION_WO;
+        }
+
+        // FFN gate and up projections (column-parallel by d_ff)
+        if (name.find("ffn_gate.") != std::string::npos ||
+            name.find("ffn_up.") != std::string::npos ||
+            name.find("ffn_gate_up.") != std::string::npos)
+        {
+            return WeightCategory::FFN_GATE_UP;
+        }
+
+        // FFN down projection (input-parallel)
+        if (name.find("ffn_down.") != std::string::npos)
+        {
+            return WeightCategory::FFN_DOWN;
+        }
+
+        // LM head (column-parallel by vocab)
+        if (name.find("output.weight") != std::string::npos)
+        {
+            return WeightCategory::LM_HEAD;
+        }
+
+        // Everything else is replicated
+        return WeightCategory::REPLICATE;
+    }
+
+    std::pair<size_t, size_t> WeightManager::calculateProportionalColumnSlice(
+        const std::string &name, size_t total_rows) const
+    {
+        if (!tp_config_ || !mpi_ctx_)
+        {
+            // Fallback to equal split
+            int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+            int world_size = mpi_ctx_ ? mpi_ctx_->world_size() : 1;
+            size_t rows_per_rank = total_rows / world_size;
+            size_t start = rows_per_rank * rank;
+            size_t count = (rank == world_size - 1) ? (total_rows - start) : rows_per_rank;
+            return {start, count};
+        }
+
+        int rank = mpi_ctx_->rank();
+        const auto &assignment = tp_config_->forRank(rank);
+        WeightCategory category = categorizeWeight(name);
+
+        switch (category)
+        {
+        case WeightCategory::ATTENTION_QKV:
+        {
+            // Column-parallel by Q heads
+            // For Q: full head_dim per head, for K/V: use kv_head mapping
+            // Weight shape: [n_heads * head_dim, d_model]
+            // Each rank gets [head_count * head_dim, d_model]
+            int total_heads = tp_config_->totalHeads();
+            if (total_heads <= 0)
+            {
+                LOG_ERROR("[WeightManager] Invalid total_heads in TensorParallelConfig");
+                return {0, total_rows};
+            }
+            size_t head_dim = total_rows / total_heads;
+
+            // Check if this is K or V (use KV head assignment)
+            if (name.find("attn_k.") != std::string::npos ||
+                name.find("attn_v.") != std::string::npos)
+            {
+                // K/V use KV heads
+                size_t start = assignment.kv_head_start * head_dim;
+                size_t count = assignment.kv_head_count * head_dim;
+                LOG_TRACE("[WeightManager] Proportional KV slice for " << name
+                                                                       << ": heads [" << assignment.kv_head_start << ", "
+                                                                       << (assignment.kv_head_start + assignment.kv_head_count) << ")"
+                                                                       << " -> rows [" << start << ", " << (start + count) << ")");
+                return {start, count};
+            }
+            else
+            {
+                // Q uses full Q heads
+                size_t start = assignment.head_start * head_dim;
+                size_t count = assignment.head_count * head_dim;
+                LOG_TRACE("[WeightManager] Proportional Q slice for " << name
+                                                                      << ": heads [" << assignment.head_start << ", "
+                                                                      << (assignment.head_start + assignment.head_count) << ")"
+                                                                      << " -> rows [" << start << ", " << (start + count) << ")");
+                return {start, count};
+            }
+        }
+
+        case WeightCategory::FFN_GATE_UP:
+        {
+            // Column-parallel by d_ff
+            // Weight shape: [d_ff, d_model]
+            // Each rank gets [d_ff_count, d_model]
+            size_t start = assignment.d_ff_start;
+            size_t count = assignment.d_ff_count;
+            LOG_TRACE("[WeightManager] Proportional FFN gate/up slice for " << name
+                                                                            << ": d_ff [" << start << ", " << (start + count) << ")");
+            return {start, count};
+        }
+
+        case WeightCategory::LM_HEAD:
+        {
+            // Column-parallel by vocab
+            // Weight shape: [vocab_size, d_model]
+            // Each rank gets [vocab_count, d_model]
+            size_t start = assignment.vocab_start;
+            size_t count = assignment.vocab_count;
+            LOG_TRACE("[WeightManager] Proportional LM head slice for " << name
+                                                                        << ": vocab [" << start << ", " << (start + count) << ")");
+            return {start, count};
+        }
+
+        default:
+            // Shouldn't reach here for column-parallel weights
+            LOG_WARN("[WeightManager] calculateProportionalColumnSlice called for non-column weight: " << name);
+            return {0, total_rows};
+        }
+    }
+
+    std::pair<size_t, size_t> WeightManager::calculateProportionalRowSlice(
+        const std::string &name, size_t total_cols) const
+    {
+        if (!tp_config_ || !mpi_ctx_)
+        {
+            // Fallback to equal split
+            int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+            int world_size = mpi_ctx_ ? mpi_ctx_->world_size() : 1;
+            size_t cols_per_rank = total_cols / world_size;
+            size_t start = cols_per_rank * rank;
+            size_t count = (rank == world_size - 1) ? (total_cols - start) : cols_per_rank;
+            return {start, count};
+        }
+
+        int rank = mpi_ctx_->rank();
+        const auto &assignment = tp_config_->forRank(rank);
+        WeightCategory category = categorizeWeight(name);
+
+        switch (category)
+        {
+        case WeightCategory::ATTENTION_WO:
+        {
+            // Row-parallel: input dimension matches column-parallel Q output
+            // Weight shape: [d_model, n_heads * head_dim]
+            // Each rank needs columns [head_start * head_dim, (head_start + head_count) * head_dim)
+            int total_heads = tp_config_->totalHeads();
+            if (total_heads <= 0)
+            {
+                LOG_ERROR("[WeightManager] Invalid total_heads in TensorParallelConfig");
+                return {0, total_cols};
+            }
+            size_t head_dim = total_cols / total_heads;
+            size_t start = assignment.head_start * head_dim;
+            size_t count = assignment.head_count * head_dim;
+            LOG_TRACE("[WeightManager] Proportional Wo slice for " << name
+                                                                   << ": cols [" << start << ", " << (start + count) << ")");
+            return {start, count};
+        }
+
+        case WeightCategory::FFN_DOWN:
+        {
+            // Input-parallel: input dimension matches column-parallel gate/up output
+            // Weight shape: [d_model, d_ff]
+            // Each rank needs columns [d_ff_start, d_ff_start + d_ff_count)
+            size_t start = assignment.d_ff_start;
+            size_t count = assignment.d_ff_count;
+            LOG_TRACE("[WeightManager] Proportional FFN down slice for " << name
+                                                                         << ": cols [" << start << ", " << (start + count) << ")");
+            return {start, count};
+        }
+
+        default:
+            // Shouldn't reach here for row-parallel weights
+            LOG_WARN("[WeightManager] calculateProportionalRowSlice called for non-row weight: " << name);
+            return {0, total_cols};
+        }
     }
 
 } // namespace llaminar2

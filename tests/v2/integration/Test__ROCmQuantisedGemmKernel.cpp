@@ -24,6 +24,7 @@
 #include <numeric>
 
 #include "kernels/rocm/ROCmQuantisedGemmKernel.h"
+#include "kernels/KernelFactory.h"
 #include "execution/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
 #include "../utils/TestTensorFactory.h"
@@ -1805,6 +1806,38 @@ namespace llaminar2
             }
 
             // MScaling tests removed - covered by decode/prefill tests above
+
+            // =============================================================================
+            // KernelFactory Integration Tests
+            // =============================================================================
+            // These tests verify that KernelFactory correctly creates ROCm kernels.
+            // Moved from unit tests since HAVE_ROCM is only enabled in integration builds.
+
+            /**
+             * @test KernelFactory creates ROCmQuantisedGemmKernel for Q4_0 tensors
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, KernelFactory_CreateGemm_Q4_0)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                const size_t rows = 32;
+                const size_t cols = 32;
+                const size_t block_size = 32;
+                const size_t bytes_per_block = 18;
+                const size_t num_blocks = rows * (cols / block_size);
+                std::vector<uint8_t> raw_data(num_blocks * bytes_per_block, 0);
+
+                Q4_0Tensor tensor({rows, cols}, raw_data);
+
+                // KernelFactory should create ROCmQuantisedGemmKernel for ROCm device
+                auto kernel = llaminar::v2::kernels::KernelFactory::createGemm(&tensor, DeviceType::ROCm);
+                ASSERT_NE(kernel, nullptr) << "KernelFactory should create ROCm GEMM kernel for Q4_0";
+
+                LOG_INFO("[Integration] KernelFactory successfully created ROCm GEMM for Q4_0 tensor");
+            }
 
         } // namespace integration_test
     } // namespace rocm

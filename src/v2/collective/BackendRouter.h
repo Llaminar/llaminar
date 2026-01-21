@@ -36,12 +36,17 @@
 #include "DeviceGroup.h"
 #include "../execution/DeviceInventory.h"
 #include "../utils/MPIContext.h"
+#include <algorithm>
 #include <memory>
 #include <unordered_map>
 #include <functional>
 
 namespace llaminar2
 {
+
+    // Forward declarations for domain-aware routing
+    struct TPDomain;
+    class UPICollectiveBackend;
 
     /**
      * @brief Backend selection result
@@ -120,6 +125,12 @@ namespace llaminar2
             void *recv_buf,
             size_t send_count,
             CollectiveDataType dtype) = 0;
+
+        /// Select backend for a specific TP domain
+        virtual ICollectiveBackend *selectBackendForDomain(const TPDomain *domain) = 0;
+
+        /// Check if domain-aware routing is available
+        virtual bool hasDomainSupport() const = 0;
     };
 
     // =========================================================================
@@ -264,6 +275,46 @@ namespace llaminar2
          */
         std::string diagnostics() const;
 
+        // =====================================================================
+        // Domain-Aware Backend Selection
+        // =====================================================================
+
+        /**
+         * @brief Select backend for a specific TP domain
+         *
+         * Domain-aware routing logic:
+         * - GPU_INTRA_RANK domains:
+         *   - Heterogeneous GPUs (CUDA+ROCm) → PCIeBAR backend (~25μs latency)
+         *   - All CUDA → NCCL backend
+         *   - All ROCm → RCCL backend
+         * - CPU_CROSS_RANK domains → UPI backend (MPI over UPI ~50 GB/s)
+         *
+         * Falls back to MPI backend if preferred backend unavailable.
+         *
+         * @param domain The tensor parallel domain (may be nullptr)
+         * @return Backend appropriate for the domain, or nullptr if unavailable
+         */
+        ICollectiveBackend *selectBackendForDomain(const TPDomain *domain);
+
+        /**
+         * @brief Register UPI backend for CPU cross-rank domains
+         *
+         * The UPI backend uses a domain-specific MPI communicator for
+         * cross-socket CPU tensor parallelism over UPI/QPI/Infinity Fabric.
+         *
+         * @param backend UPI backend instance (ownership transferred)
+         */
+        void registerUPIBackend(std::unique_ptr<UPICollectiveBackend> backend);
+
+        /**
+         * @brief Check if domain-aware routing is available
+         *
+         * Domain support requires a UPI backend to be registered.
+         *
+         * @return true if UPI backend is registered
+         */
+        bool hasDomainSupport() const;
+
     private:
         std::shared_ptr<MPIContext> mpi_ctx_;
         ClusterInventory cluster_inventory_;
@@ -279,10 +330,18 @@ namespace llaminar2
         // Group name → initialized backend mapping
         std::unordered_map<std::string, ICollectiveBackend *> group_backend_cache_;
 
+        // UPI backend for CPU cross-rank domains (optional)
+        std::unique_ptr<UPICollectiveBackend> upi_backend_;
+
         // Internal helpers
         ICollectiveBackend *getOrCreateBackend(CollectiveBackendType type);
         CollectiveBackendType selectBackendType(const DeviceGroup &group) const;
         std::string makeGroupKey(const DeviceGroup &group) const;
+
+        // Domain-aware selection helpers
+        bool hasHeterogeneousGPUs(const std::vector<DeviceId> &devices) const;
+        bool allCUDA(const std::vector<DeviceId> &devices) const;
+        bool allROCm(const std::vector<DeviceId> &devices) const;
     };
 
     // =========================================================================

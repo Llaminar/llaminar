@@ -37,6 +37,8 @@
 #include "../../kernels/cpu/CPUKVCache.h"
 #include "../../loaders/ModelContext.h"
 #include "../../utils/MPIContext.h"
+#include "../../config/TensorParallelConfig.h"
+#include "../../config/TPDomain.h"
 #include "Qwen2Schema.h"
 #include <memory>
 #include <string>
@@ -144,6 +146,37 @@ namespace llaminar2
         /// - TILED: Cache-blocked implementation
         /// - Q16_INTEGER: Pure Q16 integer-domain kernel (experimental, requires HybridQ16)
         FusedAttentionBackend fused_attention_backend = FusedAttentionBackend::JIT;
+
+        // =================================================================
+        // Heterogeneous Tensor Parallelism (Phase 1c: Proportional TP)
+        // =================================================================
+        /// Optional TensorParallelConfig for proportional head/FFN/vocab assignment.
+        /// When set, overrides equal-split head/KV/FFN computation.
+        /// Use for heterogeneous GPU setups (e.g., NVIDIA 73% + AMD 27%).
+        std::shared_ptr<TensorParallelConfig> tp_config = nullptr;
+
+        /// Local rank index (used with tp_config to look up assignment)
+        int local_rank = 0;
+
+        // =================================================================
+        // Multi-Domain Tensor Parallelism (Phase 4.3: Heterogeneous TP)
+        // =================================================================
+        /// Optional MultiDomainTPConfig for domain-based collective routing.
+        /// When set, collective operations (AllreduceStage, AllGatherStage) will
+        /// use the domain communicator instead of the global MPI communicator.
+        /// This enables heterogeneous TP with separate GPU and CPU domains.
+        MultiDomainTPConfig *multi_domain_tp_config = nullptr;
+
+        /**
+         * @brief Helper to get DeviceShardingAssignment for current rank
+         * @return Pointer to assignment, or nullptr if tp_config is not set
+         */
+        const DeviceShardingAssignment *getAssignment() const
+        {
+            if (!tp_config)
+                return nullptr;
+            return &tp_config->forRank(local_rank);
+        }
     };
 
     // =========================================================================
@@ -638,6 +671,18 @@ namespace llaminar2
             const std::string &prev_node,
             int seq_len,
             DeviceId device);
+
+        /**
+         * @brief Get TPDomain for collective operations in a specific layer
+         *
+         * Queries the MultiDomainTPConfig (if set) to determine which domain
+         * should handle collective operations for the given layer.
+         *
+         * @param layer_idx Layer index (0 to n_layers-1)
+         * @param is_attention True for attention Wo allreduce, false for FFN down allreduce
+         * @return Pointer to TPDomain, or nullptr if no domain config (legacy MPI path)
+         */
+        const TPDomain *getDomainForLayer(int layer_idx, bool is_attention) const;
     };
 
 } // namespace llaminar2

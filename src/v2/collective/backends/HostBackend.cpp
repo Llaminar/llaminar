@@ -325,6 +325,126 @@ namespace llaminar2
         return true;
     }
 
+    bool HostBackend::allgatherv(
+        const void *send_buf,
+        size_t send_count,
+        void *recv_buf,
+        const std::vector<int> &recv_counts,
+        const std::vector<int> &displacements,
+        CollectiveDataType dtype)
+    {
+        if (!initialized_)
+        {
+            last_error_ = "HostBackend::allgatherv: Backend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        size_t element_bytes = elementSize(dtype);
+
+        LOG_DEBUG("HostBackend::allgatherv: send_count=" << send_count
+                                                         << " dtype=" << static_cast<int>(dtype)
+                                                         << " num_ranks=" << recv_counts.size());
+
+        // For single-device group: copy send to appropriate offset in recv
+        if (group_.size() <= 1)
+        {
+            size_t send_bytes = send_count * element_bytes;
+            // Single device = rank 0, use displacement[0]
+            int offset = displacements.empty() ? 0 : displacements[0];
+            size_t offset_bytes = static_cast<size_t>(offset) * element_bytes;
+
+            LOG_DEBUG("HostBackend::allgatherv: Single device, copying " << send_bytes
+                                                                         << " bytes to offset " << offset_bytes);
+
+            uint8_t *dst = static_cast<uint8_t *>(recv_buf) + offset_bytes;
+            std::memcpy(dst, send_buf, send_bytes);
+            return true;
+        }
+
+        // For multi-device groups: gather from each device at variable offsets
+        size_t send_bytes = send_count * element_bytes;
+
+        // Ensure staging buffer for largest receive
+        int max_recv = 0;
+        for (int count : recv_counts)
+        {
+            max_recv = std::max(max_recv, count);
+        }
+        size_t max_recv_bytes = static_cast<size_t>(max_recv) * element_bytes;
+
+        if (!ensureStagingBuffer(max_recv_bytes))
+        {
+            last_error_ = "HostBackend::allgatherv: Failed to allocate staging buffer";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        LOG_DEBUG("HostBackend::allgatherv: Gathering from " << group_.size() << " devices");
+
+        // Phase 1: Gather each device's slice to recv buffer at variable offsets
+        for (size_t i = 0; i < group_.size(); ++i)
+        {
+            const auto &device = group_.devices[i];
+            int recv_count_i = (i < recv_counts.size()) ? recv_counts[i] : 0;
+            int displacement_i = (i < displacements.size()) ? displacements[i] : 0;
+
+            size_t recv_bytes_i = static_cast<size_t>(recv_count_i) * element_bytes;
+            size_t offset_bytes = static_cast<size_t>(displacement_i) * element_bytes;
+            uint8_t *dst = static_cast<uint8_t *>(recv_buf) + offset_bytes;
+
+            // Copy this device's slice to recv buffer
+            if (!copyToHost(staging_buffer_, send_buf, device, recv_bytes_i))
+            {
+                last_error_ = "HostBackend::allgatherv: Failed to gather from device " +
+                              std::to_string(device.ordinal);
+                LOG_ERROR(last_error_);
+                return false;
+            }
+            std::memcpy(dst, staging_buffer_, recv_bytes_i);
+        }
+
+        // Phase 2: Copy gathered buffer back to all devices
+        // Calculate total gathered size
+        size_t total_bytes = 0;
+        for (size_t i = 0; i < recv_counts.size(); ++i)
+        {
+            size_t end_offset = static_cast<size_t>(displacements[i]) * element_bytes +
+                                static_cast<size_t>(recv_counts[i]) * element_bytes;
+            total_bytes = std::max(total_bytes, end_offset);
+        }
+
+        for (const auto &device : group_.devices)
+        {
+            if (device.type == DeviceType::CPU)
+            {
+                // Already in host memory, no copy needed
+                continue;
+            }
+            else
+            {
+                // Copy in chunks via staging buffer
+                size_t offset = 0;
+                while (offset < total_bytes)
+                {
+                    size_t chunk = std::min(staging_buffer_size_, total_bytes - offset);
+                    std::memcpy(staging_buffer_, static_cast<const uint8_t *>(recv_buf) + offset, chunk);
+                    if (!copyFromHost(static_cast<uint8_t *>(recv_buf) + offset,
+                                      staging_buffer_, device, chunk))
+                    {
+                        last_error_ = "HostBackend::allgatherv: Failed to broadcast to device";
+                        LOG_ERROR(last_error_);
+                        return false;
+                    }
+                    offset += chunk;
+                }
+            }
+        }
+
+        LOG_DEBUG("HostBackend::allgatherv: Completed successfully");
+        return true;
+    }
+
     bool HostBackend::reduceScatter(
         const void *send_buf,
         void *recv_buf,

@@ -182,16 +182,14 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Phase 3: Tensor-Parallel Configuration for Column-Parallel QKV
+        // Phase 3+: Tensor-Parallel Configuration (Proportional or Equal Split)
         // =====================================================================
-        // When running with multiple MPI ranks AND weights are sharded, compute head distribution:
-        // - Each rank handles local_n_heads = n_heads / world_size
-        // - Each rank handles local_n_kv_heads = n_kv_heads / world_size (for GQA)
-        // - head_start identifies which head range this rank owns
-        //
-        // Weight sharding in WeightManager uses COLUMN_PARALLEL for Q/K/V:
-        // - Q: [n_heads * head_dim, d_model] → [local_n_heads * head_dim, d_model]
-        // - K/V: [n_kv_heads * head_dim, d_model] → [local_n_kv_heads * head_dim, d_model]
+        // Two modes are supported:
+        // A) TensorParallelConfig (Phase 1c): Proportional head/FFN/vocab assignment
+        //    - Used for heterogeneous GPUs (e.g., NVIDIA 73% + AMD 27%)
+        //    - Assignment comes from DeviceShardingAssignment per rank
+        // B) Equal split (legacy): 1/world_size equal division
+        //    - Used for homogeneous setups
         //
         // IMPORTANT: Only enable tensor parallelism if weights are actually sharded.
         // If weights are REPLICATED, each rank has the full weight and should use
@@ -199,8 +197,51 @@ namespace llaminar2
         // =====================================================================
         const bool weights_sharded = weight_mgr &&
                                      (weight_mgr->strategy() == WeightDistributionStrategy::SHARDED);
-        if (mpi_ctx && mpi_ctx->world_size() > 1 && weights_sharded)
+
+        // Check if TensorParallelConfig is available from WeightManager
+        const TensorParallelConfig *tp_config = weight_mgr ? weight_mgr->tensorParallelConfig() : nullptr;
+        const int current_rank = mpi_ctx ? mpi_ctx->rank() : 0;
+
+        if (tp_config && weights_sharded)
         {
+            // =====================================================================
+            // Phase 1c: Use TensorParallelConfig for proportional assignment
+            // =====================================================================
+            const DeviceShardingAssignment &assignment = tp_config->forRank(current_rank);
+
+            // Store config and rank in graph_config for downstream use
+            graph_config.tp_config = std::make_shared<TensorParallelConfig>(*tp_config);
+            graph_config.local_rank = current_rank;
+
+            // QKV head assignment
+            graph_config.head_start = assignment.head_start;
+            graph_config.local_n_heads = assignment.head_count;
+            graph_config.local_n_kv_heads = assignment.kv_head_count;
+            graph_config.qkv_column_parallel = true;
+
+            // FFN dimension assignment
+            graph_config.d_ff_local = assignment.d_ff_count;
+            graph_config.ffn_column_parallel = true;
+
+            // Vocab/LM head assignment
+            graph_config.vocab_local = assignment.vocab_count;
+            graph_config.lm_head_column_parallel = true;
+
+            LOG_INFO("[InferenceRunner] Using TensorParallelConfig (proportional split): "
+                     << "rank=" << current_rank << "/" << tp_config->worldSize()
+                     << " device=" << assignment.device.to_string()
+                     << " work_fraction=" << (assignment.work_fraction * 100.0f) << "%");
+            LOG_DEBUG("[InferenceRunner] QKV: head_start=" << graph_config.head_start
+                                                           << " local_n_heads=" << graph_config.local_n_heads << "/" << graph_config.n_heads
+                                                           << " local_n_kv_heads=" << graph_config.local_n_kv_heads << "/" << graph_config.n_kv_heads);
+            LOG_DEBUG("[InferenceRunner] FFN: d_ff_local=" << graph_config.d_ff_local << "/" << graph_config.d_ff);
+            LOG_DEBUG("[InferenceRunner] LMHead: vocab_local=" << graph_config.vocab_local << "/" << graph_config.vocab_size);
+        }
+        else if (mpi_ctx && mpi_ctx->world_size() > 1 && weights_sharded)
+        {
+            // =====================================================================
+            // Legacy: Equal 1/world_size split
+            // =====================================================================
             // Compute local head distribution
             auto [q_head_start, local_n_q_heads] = mpi_ctx->get_local_slice(
                 static_cast<size_t>(graph_config.n_heads));
@@ -211,40 +252,15 @@ namespace llaminar2
             graph_config.local_n_heads = static_cast<int>(local_n_q_heads);
             graph_config.local_n_kv_heads = static_cast<int>(local_n_kv_h);
             graph_config.qkv_column_parallel = true;
+            graph_config.local_rank = current_rank;
 
-            LOG_DEBUG("[InferenceRunner] QKV Column-Parallel enabled: "
+            LOG_DEBUG("[InferenceRunner] QKV Column-Parallel enabled (equal split): "
                       << "head_start=" << graph_config.head_start
                       << ", local_n_heads=" << graph_config.local_n_heads << "/" << graph_config.n_heads
                       << ", local_n_kv_heads=" << graph_config.local_n_kv_heads << "/" << graph_config.n_kv_heads
                       << " (rank " << mpi_ctx->rank() << "/" << mpi_ctx->world_size() << ")");
-        }
-        else
-        {
-            // Single rank OR weights not sharded: use full head counts
-            graph_config.head_start = 0;
-            graph_config.local_n_heads = graph_config.n_heads;
-            graph_config.local_n_kv_heads = graph_config.n_kv_heads;
-            graph_config.qkv_column_parallel = false;
 
-            if (mpi_ctx && mpi_ctx->world_size() > 1 && !weights_sharded)
-            {
-                LOG_WARN("[InferenceRunner] MPI world_size > 1 but weights are REPLICATED, "
-                         << "not SHARDED. Using full buffer sizes (no tensor parallelism). "
-                         << "Pass WeightDistributionStrategy::SHARDED to ModelContext::create() "
-                         << "to enable tensor parallelism.");
-            }
-        }
-
-        // =====================================================================
-        // Phase 4: Tensor-Parallel Configuration for Column-Parallel FFN
-        // =====================================================================
-        // When running with multiple MPI ranks AND weights are sharded, compute local FFN dimension:
-        // - Each rank handles d_ff_local = d_ff / world_size
-        // - Gate/Up weights: [d_ff, d_model] → [d_ff_local, d_model]
-        // - Down weight remains row-parallel: [d_model, d_ff_local] per rank
-        // =====================================================================
-        if (mpi_ctx && mpi_ctx->world_size() > 1 && weights_sharded)
-        {
+            // FFN dimension (equal split)
             int world_size = mpi_ctx->world_size();
             if (graph_config.d_ff % world_size != 0)
             {
@@ -255,28 +271,11 @@ namespace llaminar2
             graph_config.d_ff_local = graph_config.d_ff / world_size;
             graph_config.ffn_column_parallel = true;
 
-            LOG_DEBUG("[InferenceRunner] FFN Column-Parallel enabled: "
+            LOG_DEBUG("[InferenceRunner] FFN Column-Parallel enabled (equal split): "
                       << "d_ff_local=" << graph_config.d_ff_local << "/" << graph_config.d_ff
                       << " (rank " << mpi_ctx->rank() << "/" << world_size << ")");
-        }
-        else
-        {
-            // Single rank: use full FFN dimension (no sharding)
-            graph_config.d_ff_local = graph_config.d_ff;
-            graph_config.ffn_column_parallel = false;
-        }
 
-        // =====================================================================
-        // Phase 5: Tensor-Parallel Configuration for Column-Parallel LM Head
-        // =====================================================================
-        // When running with multiple MPI ranks AND weights are sharded, compute local vocab dimension:
-        // - Each rank handles vocab_local = vocab_size / world_size
-        // - LM head weight: [vocab_size, d_model] → [vocab_local, d_model]
-        // - Output: [seq, vocab_local] per rank, then AllGather to [seq, vocab_size]
-        // =====================================================================
-        if (mpi_ctx && mpi_ctx->world_size() > 1 && weights_sharded)
-        {
-            int world_size = mpi_ctx->world_size();
+            // Vocab/LM head (equal split)
             if (graph_config.vocab_size % world_size != 0)
             {
                 LOG_ERROR("[InferenceRunner] vocab_size (" << graph_config.vocab_size
@@ -286,15 +285,32 @@ namespace llaminar2
             graph_config.vocab_local = graph_config.vocab_size / world_size;
             graph_config.lm_head_column_parallel = true;
 
-            LOG_DEBUG("[InferenceRunner] LM Head Column-Parallel enabled: "
+            LOG_DEBUG("[InferenceRunner] LM Head Column-Parallel enabled (equal split): "
                       << "vocab_local=" << graph_config.vocab_local << "/" << graph_config.vocab_size
                       << " (rank " << mpi_ctx->rank() << "/" << world_size << ")");
         }
         else
         {
-            // Single rank: use full vocab size (no sharding)
+            // Single rank OR weights not sharded: use full dimensions (no sharding)
+            graph_config.head_start = 0;
+            graph_config.local_n_heads = graph_config.n_heads;
+            graph_config.local_n_kv_heads = graph_config.n_kv_heads;
+            graph_config.qkv_column_parallel = false;
+            graph_config.local_rank = 0;
+
+            graph_config.d_ff_local = graph_config.d_ff;
+            graph_config.ffn_column_parallel = false;
+
             graph_config.vocab_local = graph_config.vocab_size;
             graph_config.lm_head_column_parallel = false;
+
+            if (mpi_ctx && mpi_ctx->world_size() > 1 && !weights_sharded)
+            {
+                LOG_WARN("[InferenceRunner] MPI world_size > 1 but weights are REPLICATED, "
+                         << "not SHARDED. Using full buffer sizes (no tensor parallelism). "
+                         << "Pass WeightDistributionStrategy::SHARDED to ModelContext::create() "
+                         << "to enable tensor parallelism.");
+            }
         }
 
         LOG_DEBUG("[InferenceRunner] GraphConfig: "

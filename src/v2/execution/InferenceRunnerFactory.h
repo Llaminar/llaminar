@@ -31,7 +31,9 @@
 #include "RuntimeConfig.h"
 #include "../backends/DeviceId.h"
 #include "../utils/MPIContext.h"
+#include "PlacementPlan.h"
 #include <memory>
+#include <optional>
 
 namespace llaminar2
 {
@@ -69,6 +71,11 @@ namespace llaminar2
         // hipHostMallocMapped, enabling direct host access without memcpy.
         // Essential for snapshot capture mode on GPU to avoid slow D2H syncs.
         bool use_mapped_memory = false;
+
+        // Orchestration: computed PlacementPlan for layer device assignment
+        // When set, the inference runner will use this plan to determine which
+        // device executes each layer. If not set, defaults to single-device execution.
+        std::optional<PlacementPlan> placement_plan;
     };
 
     /**

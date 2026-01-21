@@ -43,6 +43,7 @@
 #include "../interfaces/IModelContext.h"      // For interface-based construction
 #include "../interfaces/IMPITopology.h"       // For interface-based construction
 #include "../interfaces/ICollectiveContext.h" // For interface-based construction
+#include "../config/TPDomain.h"               // For MultiDomainTPConfig (Phase 6.3)
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -58,6 +59,7 @@ namespace llaminar2
     class WeightManager;
     class WeightPlacementMap;
     class DeviceWorkspaceManager;
+    class TensorParallelConfig;
 
     /**
      * @brief Configuration for graph caching behavior
@@ -580,6 +582,75 @@ namespace llaminar2
          * @return Shared pointer to WeightPlacementMap (may be nullptr)
          */
         std::shared_ptr<WeightPlacementMap> weightPlacementMap() const { return weight_placement_map_; }
+
+        // =========================================================================
+        // Tensor Parallel Configuration (Phase 1c: Proportional TP)
+        // =========================================================================
+
+        /**
+         * @brief Set tensor parallelism configuration for proportional head assignment
+         *
+         * When set, the orchestrator uses TensorParallelConfig to determine
+         * per-device head/FFN/vocab assignments instead of equal 1/world_size splits.
+         * This enables heterogeneous GPU setups (e.g., NVIDIA 73% + AMD 27%).
+         *
+         * The config is propagated to the graph builder and used for:
+         * - Buffer allocation sizing (Q/K/V/attention output)
+         * - KV cache creation (local KV heads)
+         * - Weight sharding hints
+         *
+         * @param config Shared pointer to TensorParallelConfig (nullptr to disable)
+         */
+        void setTensorParallelConfig(std::shared_ptr<TensorParallelConfig> config);
+
+        /**
+         * @brief Get tensor parallelism configuration
+         * @return Shared pointer to TensorParallelConfig (may be nullptr)
+         */
+        std::shared_ptr<TensorParallelConfig> tensorParallelConfig() const { return tp_config_; }
+
+        /**
+         * @brief Check if proportional tensor parallelism is active
+         * @return true if TensorParallelConfig is set and has proportional splits
+         */
+        bool isProportionalTPEnabled() const { return tp_config_ && tp_config_->isProportional(); }
+
+        // =========================================================================
+        // Multi-Domain Tensor Parallel Configuration (Phase 6.3: Heterogeneous TP)
+        // =========================================================================
+
+        /**
+         * @brief Set multi-domain tensor parallelism configuration
+         *
+         * When set, enables heterogeneous tensor parallelism with separate
+         * domains for different compute operations (e.g., GPU domain for attention,
+         * CPU domain for FFN). Each domain has its own MPI communicator.
+         *
+         * The config is:
+         * - Propagated to graph builder's config.multi_domain_tp_config
+         * - Used by getDomainForLayer() to route AllreduceStage calls
+         *
+         * @param config Shared pointer to MultiDomainTPConfig (nullptr to disable)
+         */
+        void setDomainConfig(std::shared_ptr<MultiDomainTPConfig> config);
+
+        /**
+         * @brief Get multi-domain tensor parallelism configuration
+         * @return Shared pointer to MultiDomainTPConfig (may be nullptr)
+         */
+        std::shared_ptr<MultiDomainTPConfig> domainConfig() const { return domain_config_; }
+
+        /**
+         * @brief Get TPDomain for collective operations in a specific layer
+         *
+         * Queries the MultiDomainTPConfig (if set) to determine which domain
+         * should handle collective operations for the given layer.
+         *
+         * @param layer_idx Layer index (0 to n_layers-1)
+         * @param is_attention True for attention Wo allreduce, false for FFN down allreduce
+         * @return Pointer to TPDomain, or nullptr if no domain config (legacy MPI path)
+         */
+        const TPDomain *getDomainForLayer(int layer_idx, bool is_attention) const;
 
         /**
          * @brief Set current inference phase (low-level, no logging)
@@ -1482,6 +1553,22 @@ namespace llaminar2
 
         /// Current inference phase (PREFILL or DECODE)
         InferencePhase current_phase_ = InferencePhase::PREFILL;
+
+        // =========================================================================
+        // Tensor Parallel Configuration (Phase 1c: Proportional TP)
+        // =========================================================================
+
+        /// Tensor parallelism configuration for proportional head/FFN/vocab assignment
+        /// When set, overrides equal 1/world_size splits for heterogeneous GPU setups
+        std::shared_ptr<TensorParallelConfig> tp_config_;
+
+        // =========================================================================
+        // Multi-Domain Tensor Parallel Configuration (Phase 6.3: Heterogeneous TP)
+        // =========================================================================
+
+        /// Multi-domain tensor parallelism configuration for heterogeneous TP
+        /// When set, enables separate domains for attention (GPU) and FFN (CPU)
+        std::shared_ptr<MultiDomainTPConfig> domain_config_;
 
         // =========================================================================
         // Weight Streaming Members (Option B)

@@ -499,6 +499,40 @@ namespace llaminar2
                 ctx.use_fused_attention = true; // Implicitly enable fused attention
             }
 
+            // Heterogeneous multi-domain parallelism (Phase 6.5)
+            else if (arg == "--heterogeneous")
+            {
+                ctx.heterogeneous_mode = true;
+            }
+            else if (arg == "--cpu-fraction")
+            {
+                std::string val = getNextArg(argv, argc, i, "cpu-fraction");
+                if (!val.empty())
+                    ctx.cpu_compute_fraction = std::stof(val);
+            }
+            else if (arg.rfind("--cpu-fraction=", 0) == 0)
+            {
+                ctx.cpu_compute_fraction = std::stof(arg.substr(15));
+            }
+            else if (arg == "--no-gpu-tp")
+            {
+                ctx.disable_gpu_tp = true;
+            }
+            else if (arg == "--no-cpu-tp")
+            {
+                ctx.disable_cpu_tp = true;
+            }
+            else if (arg == "--min-layers-per-domain")
+            {
+                std::string val = getNextArg(argv, argc, i, "min-layers-per-domain");
+                if (!val.empty())
+                    ctx.min_layers_per_domain = std::stoi(val);
+            }
+            else if (arg.rfind("--min-layers-per-domain=", 0) == 0)
+            {
+                ctx.min_layers_per_domain = std::stoi(arg.substr(24));
+            }
+
             // MPI Bootstrap Options
             else if (arg == "--mpi-procs")
             {
@@ -639,6 +673,28 @@ namespace llaminar2
             return ctx;
         }
 
+        // Heterogeneous mode validation
+        if (ctx.cpu_compute_fraction < 0.0f || ctx.cpu_compute_fraction > 1.0f)
+        {
+            ctx.error = "Invalid --cpu-fraction value: must be between 0.0 and 1.0 (got " +
+                        std::to_string(ctx.cpu_compute_fraction) + ")";
+            return ctx;
+        }
+
+        if (ctx.min_layers_per_domain < 1)
+        {
+            ctx.error = "Invalid --min-layers-per-domain value: must be >= 1 (got " +
+                        std::to_string(ctx.min_layers_per_domain) + ")";
+            return ctx;
+        }
+
+        if (ctx.heterogeneous_mode && ctx.disable_gpu_tp && ctx.disable_cpu_tp)
+        {
+            ctx.error = "Cannot use --heterogeneous with both --no-gpu-tp and --no-cpu-tp. "
+                        "At least one TP domain type must be enabled.";
+            return ctx;
+        }
+
         return ctx;
     }
 
@@ -711,6 +767,17 @@ namespace llaminar2
         std::cout << "  --no-shard-weights        Disable weight sharding (use replicated weights)\n";
         std::cout << "                              By default, sharding is enabled when MPI ranks > 1\n";
         std::cout << "                              Sharding reduces memory per rank by ~25-40%%\n\n";
+
+        std::cout << "Heterogeneous Multi-Domain Parallelism:\n";
+        std::cout << "  --heterogeneous           Enable heterogeneous multi-domain TP/PP\n";
+        std::cout << "                              Uses mixed GPU+CPU domains for diverse hardware\n";
+        std::cout << "                              Requires MPI (world_size >= 2 for full benefit)\n";
+        std::cout << "  --cpu-fraction F          Fraction of layers for CPU domains (default: 0.2)\n";
+        std::cout << "                              Range: 0.0 (GPU-only) to 1.0 (CPU-only)\n";
+        std::cout << "  --no-gpu-tp               Disable GPU tensor parallelism (CPU-only domains)\n";
+        std::cout << "  --no-cpu-tp               Disable CPU tensor parallelism (GPU-only domains)\n";
+        std::cout << "  --min-layers-per-domain N Minimum layers per TP domain (default: 2)\n";
+        std::cout << "                              Higher values reduce domain overhead\n\n";
 
         std::cout << "Chat Mode:\n";
         std::cout << "  --chat                    Interactive chat mode (FTXUI terminal UI)\n";
@@ -789,6 +856,15 @@ namespace llaminar2
 
         std::cout << "  # Benchmark with custom prompt\n";
         std::cout << "  " << prog_name << " -m model.gguf --benchmark -p \"Your prompt here\" -n 100\n\n";
+
+        std::cout << "  # Heterogeneous multi-domain (mixed GPU+CPU tensor parallelism)\n";
+        std::cout << "  " << prog_name << " -m model.gguf --heterogeneous --mpi-procs 4\n\n";
+
+        std::cout << "  # Heterogeneous with 30%% CPU compute fraction\n";
+        std::cout << "  " << prog_name << " -m model.gguf --heterogeneous --cpu-fraction 0.3\n\n";
+
+        std::cout << "  # GPU-only heterogeneous (multi-GPU TP without CPU participation)\n";
+        std::cout << "  " << prog_name << " -m model.gguf --heterogeneous --no-cpu-tp\n\n";
     }
 
     bool ArgParser::matchesFlag(const std::string &arg,
