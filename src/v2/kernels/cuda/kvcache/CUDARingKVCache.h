@@ -349,6 +349,22 @@ namespace llaminar2
         CUDARingKVCache(int n_layers, int batch_size, int max_seq_len,
                         int n_kv_heads, int head_dim, int device_id = 0);
 
+        /**
+         * @brief Construct CUDA ring buffer KV cache with sharding (tensor parallelism)
+         *
+         * @param n_layers Number of transformer layers
+         * @param batch_size Number of sequences (1 for single-sequence mode)
+         * @param max_seq_len Maximum sequence length (ring buffer capacity)
+         * @param n_kv_heads Total number of KV heads (for GQA, across all ranks)
+         * @param local_n_kv_heads Number of KV heads stored on this rank
+         * @param kv_head_start Starting KV head index for this rank
+         * @param head_dim Dimension per head
+         * @param device_id CUDA device ID
+         */
+        CUDARingKVCache(int n_layers, int batch_size, int max_seq_len,
+                        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+                        int head_dim, int device_id = 0);
+
         ~CUDARingKVCache();
 
         // Non-copyable, non-movable (owns GPU memory)
@@ -390,6 +406,15 @@ namespace llaminar2
         int n_kv_heads() const override { return n_kv_heads_; }
         int head_dim() const override { return head_dim_; }
         int kv_dim() const override { return kv_dim_; }
+
+        // =====================================================================
+        // Sharding (Tensor Parallelism) Accessors (IKVCache interface)
+        // =====================================================================
+
+        bool is_sharded() const override { return is_sharded_; }
+        int local_n_kv_heads() const override { return local_n_kv_heads_; }
+        int kv_head_start() const override { return kv_head_start_; }
+        int local_kv_dim() const override { return kv_dim_; }
 
         int get_head_position(int layer, int seq_idx = 0) const override;
         bool is_wrapped(int layer, int seq_idx = 0) const override;
@@ -474,10 +499,13 @@ namespace llaminar2
         int n_layers_;
         int batch_size_;
         int max_seq_len_;
-        int n_kv_heads_;
+        int n_kv_heads_;       // Total KV heads (across all ranks)
+        int local_n_kv_heads_; // Local KV heads (this rank), == n_kv_heads_ if not sharded
+        int kv_head_start_;    // Starting KV head index (0 if not sharded)
         int head_dim_;
-        int kv_dim_;
+        int kv_dim_;           // local_n_kv_heads * head_dim (storage dimension)
         int device_id_;
+        bool is_sharded_;      // True if using local KV heads (TP enabled)
 
         // Workspace manager for batched gather operations
         // When bound, launch_gather_kernel() uses pre-allocated buffers instead of cudaMalloc/cudaFree
@@ -539,5 +567,28 @@ namespace llaminar2
         ActivationPrecision precision,
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim, int device_id = 0);
+
+    /**
+     * @brief Create sharded CUDA ring buffer KV cache for tensor parallelism
+     *
+     * Creates a cache that stores only a subset of KV heads, used when
+     * tensor parallelism distributes attention across multiple ranks.
+     *
+     * @param precision Activation precision (FP32, FP16, BF16)
+     * @param n_layers Number of transformer layers
+     * @param batch_size Number of sequences
+     * @param max_seq_len Maximum sequence length
+     * @param n_kv_heads Total number of KV heads (across all ranks)
+     * @param local_n_kv_heads Number of KV heads on this rank
+     * @param kv_head_start Starting KV head index for this rank
+     * @param head_dim Dimension per head
+     * @param device_id CUDA device ID
+     * @return Unique pointer to cache, or nullptr on failure
+     */
+    std::unique_ptr<ICUDARingKVCache> createShardedCUDARingKVCache(
+        ActivationPrecision precision,
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+        int head_dim, int device_id = 0);
 
 } // namespace llaminar2

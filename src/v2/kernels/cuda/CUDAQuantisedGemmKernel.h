@@ -45,6 +45,7 @@ namespace llaminar2
     class TensorBase;
     class Q8_1Tensor;
     class FP32Tensor;
+    class WeightPreloader; // For friend class access to ensureWeightsConverted
 
     namespace cuda
     {
@@ -365,6 +366,9 @@ namespace llaminar2
             size_t weight_rows() const { return N_; }
             size_t weight_cols() const { return K_; }
             bool weights_converted() const { return weights_converted_; }
+
+            // Allow WeightPreloader to call ensureWeightsConverted() during preload
+            friend class ::llaminar2::WeightPreloader;
 
         private:
             // =========================================================================

@@ -34,6 +34,10 @@
 #include "kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "kernels/cpu/ops/CPURoPEKernelT.h"
 #include <cuda_runtime.h>
+
+// External functions from CUDA RoPE kernels for debugging
+extern "C" void cudaOps_rope_clear_inv_freq_cache();
+extern "C" void cudaOps_rope_verify_inv_freq_cache(int head_dim, float freq_base, int device_idx);
 #endif
 
 // Now include test utils
@@ -753,6 +757,9 @@ TEST_F(Test__CUDAOpsParity, RoPE_FP32_Small)
 TEST_F(Test__CUDAOpsParity, RoPE_FP32_Large)
 {
     SKIP_IF_NO_CUDA();
+
+    // DON'T clear cache - we want to observe the corruption
+    // cudaOps_rope_clear_inv_freq_cache();
 
     constexpr int seq_len = 128;
     constexpr int n_heads = 14;

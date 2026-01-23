@@ -949,7 +949,10 @@ namespace llaminar
                  *
                  * Limitations:
                  * - Only FP32, BF16, FP16 precisions supported (no Q8_1/Q16_1)
-                 * - Sharded CUDA KV cache not yet supported (logs warning, uses full heads)
+                 *
+                 * Sharding Support:
+                 * - Sharded CUDA KV cache IS supported for tensor parallelism
+                 * - Set config.local_n_kv_heads and config.kv_head_start for sharding
                  *
                  * @param config KVCacheConfig with CUDA device
                  * @return Unique pointer to ICUDARingKVCache implementation

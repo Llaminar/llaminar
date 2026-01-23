@@ -3988,23 +3988,38 @@ namespace llaminar
                     throw std::runtime_error("KernelFactory::createCUDAKVCache: invalid parameters");
                 }
 
-                // Handle sharding - not yet supported for CUDA
-                int effective_n_kv_heads = config.n_kv_heads;
+                int cuda_device = config.device.cuda_ordinal();
+
+                // Handle sharding for tensor parallelism
                 if (config.is_sharded())
                 {
-                    LOG_WARN("[KernelFactory] Sharded CUDA KVCache not yet supported. "
-                             << "Using full n_kv_heads=" << config.n_kv_heads
-                             << " instead of local_n_kv_heads=" << config.local_n_kv_heads);
-                    // Continue with full heads - caller should handle partial KV or implement sharding
-                }
+                    LOG_DEBUG("[KernelFactory] Creating sharded CUDA Ring KVCache: "
+                              << "precision=" << llaminar2::activationPrecisionToString(config.precision)
+                              << ", device=CUDA:" << cuda_device
+                              << ", layers=" << config.num_layers
+                              << ", total_kv_heads=" << config.n_kv_heads
+                              << ", local_kv_heads=" << config.local_n_kv_heads
+                              << ", kv_head_start=" << config.kv_head_start
+                              << ", head_dim=" << config.head_dim
+                              << ", max_seq_len=" << config.max_seq_len);
 
-                int cuda_device = config.device.cuda_ordinal();
+                    return llaminar2::createShardedCUDARingKVCache(
+                        config.precision,
+                        config.num_layers,
+                        config.batch_size,
+                        config.max_seq_len,
+                        config.n_kv_heads,
+                        config.local_n_kv_heads,
+                        config.kv_head_start,
+                        config.head_dim,
+                        cuda_device);
+                }
 
                 LOG_DEBUG("[KernelFactory] Creating CUDA Ring KVCache: "
                           << "precision=" << llaminar2::activationPrecisionToString(config.precision)
                           << ", device=CUDA:" << cuda_device
                           << ", layers=" << config.num_layers
-                          << ", n_kv_heads=" << effective_n_kv_heads
+                          << ", n_kv_heads=" << config.n_kv_heads
                           << ", head_dim=" << config.head_dim
                           << ", max_seq_len=" << config.max_seq_len);
 
@@ -4016,7 +4031,7 @@ namespace llaminar
                         config.num_layers,
                         config.batch_size,
                         config.max_seq_len,
-                        effective_n_kv_heads,
+                        config.n_kv_heads,
                         config.head_dim,
                         cuda_device);
 
@@ -4025,7 +4040,7 @@ namespace llaminar
                         config.num_layers,
                         config.batch_size,
                         config.max_seq_len,
-                        effective_n_kv_heads,
+                        config.n_kv_heads,
                         config.head_dim,
                         cuda_device);
 
@@ -4034,7 +4049,7 @@ namespace llaminar
                         config.num_layers,
                         config.batch_size,
                         config.max_seq_len,
-                        effective_n_kv_heads,
+                        config.n_kv_heads,
                         config.head_dim,
                         cuda_device);
 

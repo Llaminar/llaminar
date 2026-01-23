@@ -130,7 +130,7 @@ TEST_F(Test__CUDARingKVCache_Sharding, ShardedCache_Rank0_HasLocalKVDim)
     int rank = 0;
     int kv_head_start = rank * kLocalKVHeads;
 
-    auto cache = createCUDARingKVCache(
+    auto cache = createShardedCUDARingKVCache(
         ActivationPrecision::FP32,
         kNumLayers, kBatchSize, kMaxSeqLen,
         kNKVHeads, kLocalKVHeads, kv_head_start,
@@ -162,7 +162,7 @@ TEST_F(Test__CUDARingKVCache_Sharding, ShardedCache_Rank1_HasCorrectOffset)
     int rank = 1;
     int kv_head_start = rank * kLocalKVHeads;
 
-    auto cache = createCUDARingKVCache(
+    auto cache = createShardedCUDARingKVCache(
         ActivationPrecision::FP32,
         kNumLayers, kBatchSize, kMaxSeqLen,
         kNKVHeads, kLocalKVHeads, kv_head_start,
@@ -192,7 +192,7 @@ TEST_F(Test__CUDARingKVCache_Sharding, ShardedCache_FP16_Works)
         GTEST_SKIP() << "CUDA not available";
     }
 
-    auto cache = createCUDARingKVCache(
+    auto cache = createShardedCUDARingKVCache(
         ActivationPrecision::FP16,
         kNumLayers, kBatchSize, kMaxSeqLen,
         kNKVHeads, kLocalKVHeads, 0, // rank 0
@@ -214,7 +214,7 @@ TEST_F(Test__CUDARingKVCache_Sharding, ShardedCache_BF16_Works)
         GTEST_SKIP() << "CUDA not available";
     }
 
-    auto cache = createCUDARingKVCache(
+    auto cache = createShardedCUDARingKVCache(
         ActivationPrecision::BF16,
         kNumLayers, kBatchSize, kMaxSeqLen,
         kNKVHeads, kLocalKVHeads, 0, // rank 0
@@ -241,7 +241,7 @@ TEST_F(Test__CUDARingKVCache_Sharding, IsSharded_FalseWhenLocalEqualsTotal)
     }
 
     // Create with local_n_kv_heads == n_kv_heads (not actually sharded)
-    auto cache = createCUDARingKVCache(
+    auto cache = createShardedCUDARingKVCache(
         ActivationPrecision::FP32,
         kNumLayers, kBatchSize, kMaxSeqLen,
         kNKVHeads, kNKVHeads, 0, // local == total
@@ -262,7 +262,7 @@ TEST_F(Test__CUDARingKVCache_Sharding, IsSharded_TrueWhenLocalLessThanTotal)
     }
 
     // Create with local_n_kv_heads < n_kv_heads (actually sharded)
-    auto cache = createCUDARingKVCache(
+    auto cache = createShardedCUDARingKVCache(
         ActivationPrecision::FP32,
         kNumLayers, kBatchSize, kMaxSeqLen,
         kNKVHeads, kLocalKVHeads, 0, // local < total
@@ -297,7 +297,7 @@ TEST_F(Test__CUDARingKVCache_Sharding, ShardedCache_Qwen7BLike_4RankTP)
     {
         int kv_head_start = rank * local_kv_heads;
 
-        auto cache = createCUDARingKVCache(
+        auto cache = createShardedCUDARingKVCache(
             ActivationPrecision::FP16,
             n_layers, 1, 128, // batch=1, max_seq=128
             n_kv_heads, local_kv_heads, kv_head_start,
@@ -326,7 +326,7 @@ TEST_F(Test__CUDARingKVCache_Sharding, ShardedCache_AppendAndRetrieve)
     }
 
     // Create sharded cache for rank 0
-    auto cache = createCUDARingKVCache(
+    auto cache = createShardedCUDARingKVCache(
         ActivationPrecision::FP32,
         kNumLayers, kBatchSize, kMaxSeqLen,
         kNKVHeads, kLocalKVHeads, 0,
@@ -396,7 +396,7 @@ TEST_F(Test__CUDARingKVCache_Sharding, IKVCacheInterfaceCompliance)
     }
 
     // Create sharded cache and access through IKVCache interface
-    std::unique_ptr<ICUDARingKVCache> cuda_cache = createCUDARingKVCache(
+    std::unique_ptr<ICUDARingKVCache> cuda_cache = createShardedCUDARingKVCache(
         ActivationPrecision::FP32,
         kNumLayers, kBatchSize, kMaxSeqLen,
         kNKVHeads, kLocalKVHeads, 0,

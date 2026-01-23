@@ -18,6 +18,7 @@
 #include "../../../backends/DeviceId.h"
 #include "../../../execution/DeviceWorkspaceManager.h"
 #include "../../../execution/WorkspaceDescriptor.h"
+#include "../../../utils/Logger.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -764,11 +765,10 @@ namespace llaminar2
         }
         else
         {
-            // Slow path: Need to copy dequantized embedding data to GPU using workspace
-            size_t vocab_size = embed_table->rows();
-            size_t embed_dim = static_cast<size_t>(d_model);
-            size_t embed_bytes = vocab_size * embed_dim * sizeof(float);
-
+            // Workspace-cached path: Upload dequantized embedding table once, reuse across calls
+            // This is critical for performance with quantized embeddings (Q4_0, etc.)
+            // The embedding table (~500MB) should only be uploaded once per model load
+            
             // Use pre-allocated workspace buffer (workspace is required)
             d_embed = static_cast<float *>(workspace_->getBuffer(EmbeddingWorkspaceBuffers::EMBED_TABLE));
             if (!d_embed)
@@ -777,14 +777,28 @@ namespace llaminar2
                         EmbeddingWorkspaceBuffers::EMBED_TABLE);
                 return false;
             }
-
-            err = cudaMemcpy(d_embed, embed_data, embed_bytes, cudaMemcpyHostToDevice);
-            if (err != cudaSuccess)
+            
+            // Check if we need to upload (first call or different embedding table)
+            if (s_cached_embed_table_ != embed_table)
             {
-                fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to copy embeddings to GPU: %s\n",
-                        cudaGetErrorString(err));
-                return false;
+                size_t vocab_size = embed_table->rows();
+                size_t embed_dim = static_cast<size_t>(d_model);
+                size_t embed_bytes = vocab_size * embed_dim * sizeof(float);
+
+                err = cudaMemcpy(d_embed, embed_data, embed_bytes, cudaMemcpyHostToDevice);
+                if (err != cudaSuccess)
+                {
+                    fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to copy embeddings to GPU: %s\n",
+                            cudaGetErrorString(err));
+                    return false;
+                }
+                
+                // Cache the tensor pointer to avoid re-upload on subsequent calls
+                s_cached_embed_table_ = embed_table;
+                LOG_INFO("[CUDAEmbeddingKernelT] Uploaded dequantized embedding table: " 
+                         << vocab_size << "x" << embed_dim << " (" << embed_bytes / (1024*1024) << " MB)");
             }
+            // else: embedding already uploaded to workspace buffer, reuse d_embed
         }
 
         // =====================================================================

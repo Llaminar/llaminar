@@ -38,11 +38,53 @@ namespace
         float freq_base = 0.0f;
         int device_idx = -1;
 
+        InvFreqCache() = default;
+
+        // Disable copy (would cause double-free)
+        InvFreqCache(const InvFreqCache &) = delete;
+        InvFreqCache &operator=(const InvFreqCache &) = delete;
+
+        // Enable move
+        InvFreqCache(InvFreqCache &&other) noexcept
+            : d_inv_freq(other.d_inv_freq), head_dim(other.head_dim), freq_base(other.freq_base), device_idx(other.device_idx)
+        {
+            other.d_inv_freq = nullptr; // Prevent double-free
+            other.device_idx = -1;
+        }
+
+        InvFreqCache &operator=(InvFreqCache &&other) noexcept
+        {
+            if (this != &other)
+            {
+                // Free our current resource
+                if (d_inv_freq && device_idx >= 0)
+                {
+                    cudaSetDevice(device_idx);
+                    cudaFree(d_inv_freq);
+                }
+                // Take ownership of other's resource
+                d_inv_freq = other.d_inv_freq;
+                head_dim = other.head_dim;
+                freq_base = other.freq_base;
+                device_idx = other.device_idx;
+                // Clear other to prevent double-free
+                other.d_inv_freq = nullptr;
+                other.device_idx = -1;
+            }
+            return *this;
+        }
+
         ~InvFreqCache()
         {
-            if (d_inv_freq)
+            if (d_inv_freq && device_idx >= 0)
             {
-                cudaFree(d_inv_freq);
+                // Must set correct device before freeing
+                cudaSetDevice(device_idx);
+                cudaError_t err = cudaFree(d_inv_freq);
+                if (err != cudaSuccess)
+                {
+                    fprintf(stderr, "WARNING: cudaFree(inv_freq) failed: %s\n", cudaGetErrorString(err));
+                }
             }
         }
     };
@@ -68,6 +110,7 @@ namespace
         uint64_t key = make_cache_key(head_dim, freq_base, device_idx);
 
         std::lock_guard<std::mutex> lock(g_cache_mutex);
+
         auto it = g_inv_freq_cache.find(key);
         if (it != g_inv_freq_cache.end())
         {
@@ -88,8 +131,19 @@ namespace
         // Allocate and copy to device
         cudaSetDevice(device_idx);
         float *d_inv_freq = nullptr;
-        cudaMalloc(&d_inv_freq, half_dim * sizeof(float));
-        cudaMemcpy(d_inv_freq, h_inv_freq.data(), half_dim * sizeof(float), cudaMemcpyHostToDevice);
+        cudaError_t alloc_err = cudaMalloc(&d_inv_freq, half_dim * sizeof(float));
+        if (alloc_err != cudaSuccess)
+        {
+            fprintf(stderr, "ERROR: Failed to allocate inv_freq: %s\n", cudaGetErrorString(alloc_err));
+            return nullptr;
+        }
+        cudaError_t copy_err = cudaMemcpy(d_inv_freq, h_inv_freq.data(), half_dim * sizeof(float), cudaMemcpyHostToDevice);
+        if (copy_err != cudaSuccess)
+        {
+            fprintf(stderr, "ERROR: Failed to copy inv_freq: %s\n", cudaGetErrorString(copy_err));
+            cudaFree(d_inv_freq);
+            return nullptr;
+        }
 
         // Cache it
         InvFreqCache cache;
@@ -518,10 +572,40 @@ __global__ void rope_fp16_fused_qk_kernel(
 extern "C"
 {
 
+    /**
+     * @brief Clear the inv_freq cache (for testing)
+     * This is useful to force fresh computation of inverse frequencies
+     */
+    void cudaOps_rope_clear_inv_freq_cache()
+    {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        g_inv_freq_cache.clear();
+    }
+
+    /**
+     * @brief Verify inv_freq cache content (for debugging)
+     */
+    void cudaOps_rope_verify_inv_freq_cache(int head_dim, float freq_base, int device_idx)
+    {
+        uint64_t key = make_cache_key(head_dim, freq_base, device_idx);
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        auto it = g_inv_freq_cache.find(key);
+        if (it == g_inv_freq_cache.end())
+        {
+            return;
+        }
+
+        // Verify by reading back first 3 values (debugging only)
+        cudaSetDevice(device_idx);
+        float verify_buf[3];
+        cudaMemcpy(verify_buf, it->second.d_inv_freq, 3 * sizeof(float), cudaMemcpyDeviceToHost);
+        (void)verify_buf; // Suppress unused warning in release
+    }
+
     bool cudaOps_rope_fp32(
         float *Q,
-        float *K, // Can be nullptr
-        const int *position_ids,
+        float *K,                // Can be nullptr
+        const int *position_ids, // Can be host or device pointer - auto-detected
         int seq_len,
         int n_heads,
         int n_kv_heads,
@@ -538,34 +622,97 @@ extern "C"
         const int threads_per_block = min(256, half_dim);      // At least one thread per pair
         const size_t smem_size = 2 * half_dim * sizeof(float); // sin + cos tables
 
+        // Determine if position_ids is already on device or needs to be copied
+        int *d_position_ids = nullptr;
+        bool need_free = false;
+
+        if (position_ids != nullptr)
+        {
+            // Query pointer attributes to determine if it's a host or device pointer
+            cudaPointerAttributes attrs;
+            cudaError_t attr_err = cudaPointerGetAttributes(&attrs, position_ids);
+
+            // If query failed or pointer is unregistered host memory, copy to device
+            // cudaMemoryTypeHost = 1, cudaMemoryTypeDevice = 2, cudaMemoryTypeManaged = 3
+            bool is_device_ptr = (attr_err == cudaSuccess &&
+                                  (attrs.type == cudaMemoryTypeDevice || attrs.type == cudaMemoryTypeManaged));
+
+            if (is_device_ptr)
+            {
+                // Already on device - use directly
+                d_position_ids = const_cast<int *>(position_ids);
+                need_free = false;
+            }
+            else
+            {
+                // Host pointer - copy to device
+                // Clear any error from failed pointer query (unregistered host memory is fine)
+                cudaGetLastError();
+
+                cudaError_t alloc_err = cudaMalloc(&d_position_ids, seq_len * sizeof(int));
+                if (alloc_err != cudaSuccess)
+                {
+                    fprintf(stderr, "CUDA RoPE FP32: Failed to allocate position_ids: %s\n", cudaGetErrorString(alloc_err));
+                    return false;
+                }
+                cudaError_t copy_err = cudaMemcpy(d_position_ids, position_ids, seq_len * sizeof(int), cudaMemcpyHostToDevice);
+                if (copy_err != cudaSuccess)
+                {
+                    fprintf(stderr, "CUDA RoPE FP32: Failed to copy position_ids: %s\n", cudaGetErrorString(copy_err));
+                    cudaFree(d_position_ids);
+                    return false;
+                }
+                need_free = true;
+            }
+        }
+
         if (K != nullptr)
         {
             // Fused Q+K kernel - single launch for both
             int total_blocks = seq_len * (n_heads + n_kv_heads);
+
             rope_fp32_fused_qk_kernel<<<total_blocks, threads_per_block, smem_size>>>(
-                Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
+                Q, K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim);
         }
         else
         {
             // Q only
             int num_blocks_q = seq_len * n_heads;
             rope_fp32_kernel_v3<<<num_blocks_q, threads_per_block, smem_size>>>(
-                Q, d_inv_freq, position_ids, seq_len, n_heads, head_dim);
+                Q, d_inv_freq, d_position_ids, seq_len, n_heads, head_dim);
         }
+
+        // Synchronize to ensure kernel completes before returning
+        cudaDeviceSynchronize();
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             fprintf(stderr, "CUDA RoPE FP32 v3 kernel launch failed: %s\n", cudaGetErrorString(err));
+            if (need_free && d_position_ids)
+            {
+                cudaDeviceSynchronize(); // Wait before free in error path
+                cudaFree(d_position_ids);
+            }
             return false;
         }
+
+        // Free temporary position_ids allocation only if we allocated it
+        if (need_free && d_position_ids)
+        {
+            // CRITICAL: Must synchronize before freeing position_ids
+            // because the kernel is asynchronous and still reading from it
+            cudaDeviceSynchronize();
+            cudaFree(d_position_ids);
+        }
+
         return true;
     }
 
     bool cudaOps_rope_bf16(
         uint16_t *Q,
-        uint16_t *K, // Can be nullptr
-        const int *position_ids,
+        uint16_t *K,             // Can be nullptr
+        const int *position_ids, // Can be host or device pointer - auto-detected
         int seq_len,
         int n_heads,
         int n_kv_heads,
@@ -581,32 +728,83 @@ extern "C"
         const int threads_per_block = min(256, half_dim);
         const size_t smem_size = 2 * half_dim * sizeof(float);
 
+        // Determine if position_ids is already on device or needs to be copied
+        int *d_position_ids = nullptr;
+        bool need_free = false;
+
+        if (position_ids != nullptr)
+        {
+            cudaPointerAttributes attrs;
+            cudaError_t attr_err = cudaPointerGetAttributes(&attrs, position_ids);
+
+            bool is_device_ptr = (attr_err == cudaSuccess &&
+                                  (attrs.type == cudaMemoryTypeDevice || attrs.type == cudaMemoryTypeManaged));
+
+            if (is_device_ptr)
+            {
+                d_position_ids = const_cast<int *>(position_ids);
+                need_free = false;
+            }
+            else
+            {
+                cudaGetLastError(); // Clear any error from failed pointer query
+
+                cudaError_t alloc_err = cudaMalloc(&d_position_ids, seq_len * sizeof(int));
+                if (alloc_err != cudaSuccess)
+                {
+                    fprintf(stderr, "CUDA RoPE BF16: Failed to allocate position_ids: %s\n", cudaGetErrorString(alloc_err));
+                    return false;
+                }
+                cudaError_t copy_err = cudaMemcpy(d_position_ids, position_ids, seq_len * sizeof(int), cudaMemcpyHostToDevice);
+                if (copy_err != cudaSuccess)
+                {
+                    fprintf(stderr, "CUDA RoPE BF16: Failed to copy position_ids: %s\n", cudaGetErrorString(copy_err));
+                    cudaFree(d_position_ids);
+                    return false;
+                }
+                need_free = true;
+            }
+        }
+
         if (K != nullptr)
         {
             int total_blocks = seq_len * (n_heads + n_kv_heads);
             rope_bf16_fused_qk_kernel<<<total_blocks, threads_per_block, smem_size>>>(
-                Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
+                Q, K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim);
         }
         else
         {
             int num_blocks_q = seq_len * n_heads;
             rope_bf16_kernel_v3<<<num_blocks_q, threads_per_block, smem_size>>>(
-                Q, d_inv_freq, position_ids, seq_len, n_heads, head_dim);
+                Q, d_inv_freq, d_position_ids, seq_len, n_heads, head_dim);
         }
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             fprintf(stderr, "CUDA RoPE BF16 v3 kernel launch failed: %s\n", cudaGetErrorString(err));
+            if (need_free && d_position_ids)
+            {
+                cudaDeviceSynchronize();
+                cudaFree(d_position_ids);
+            }
             return false;
         }
+
+        if (need_free && d_position_ids)
+        {
+            // CRITICAL: Must synchronize before freeing position_ids
+            cudaDeviceSynchronize();
+            cudaFree(d_position_ids);
+        }
+
         return true;
     }
 
     bool cudaOps_rope_fp16(
         uint16_t *Q,
-        uint16_t *K, // Can be nullptr
-        const int *position_ids,
+        uint16_t *K,             // Can be nullptr
+        const int *position_ids, // Can be host or device pointer - auto-detected
         int seq_len,
         int n_heads,
         int n_kv_heads,
@@ -622,25 +820,76 @@ extern "C"
         const int threads_per_block = min(256, half_dim);
         const size_t smem_size = 2 * half_dim * sizeof(float);
 
+        // Determine if position_ids is already on device or needs to be copied
+        int *d_position_ids = nullptr;
+        bool need_free = false;
+
+        if (position_ids != nullptr)
+        {
+            cudaPointerAttributes attrs;
+            cudaError_t attr_err = cudaPointerGetAttributes(&attrs, position_ids);
+
+            bool is_device_ptr = (attr_err == cudaSuccess &&
+                                  (attrs.type == cudaMemoryTypeDevice || attrs.type == cudaMemoryTypeManaged));
+
+            if (is_device_ptr)
+            {
+                d_position_ids = const_cast<int *>(position_ids);
+                need_free = false;
+            }
+            else
+            {
+                cudaGetLastError(); // Clear any error from failed pointer query
+
+                cudaError_t alloc_err = cudaMalloc(&d_position_ids, seq_len * sizeof(int));
+                if (alloc_err != cudaSuccess)
+                {
+                    fprintf(stderr, "CUDA RoPE FP16: Failed to allocate position_ids: %s\n", cudaGetErrorString(alloc_err));
+                    return false;
+                }
+                cudaError_t copy_err = cudaMemcpy(d_position_ids, position_ids, seq_len * sizeof(int), cudaMemcpyHostToDevice);
+                if (copy_err != cudaSuccess)
+                {
+                    fprintf(stderr, "CUDA RoPE FP16: Failed to copy position_ids: %s\n", cudaGetErrorString(copy_err));
+                    cudaFree(d_position_ids);
+                    return false;
+                }
+                need_free = true;
+            }
+        }
+
         if (K != nullptr)
         {
             int total_blocks = seq_len * (n_heads + n_kv_heads);
             rope_fp16_fused_qk_kernel<<<total_blocks, threads_per_block, smem_size>>>(
-                Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
+                Q, K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim);
         }
         else
         {
             int num_blocks_q = seq_len * n_heads;
             rope_fp16_kernel_v3<<<num_blocks_q, threads_per_block, smem_size>>>(
-                Q, d_inv_freq, position_ids, seq_len, n_heads, head_dim);
+                Q, d_inv_freq, d_position_ids, seq_len, n_heads, head_dim);
         }
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             fprintf(stderr, "CUDA RoPE FP16 v3 kernel launch failed: %s\n", cudaGetErrorString(err));
+            if (need_free && d_position_ids)
+            {
+                cudaDeviceSynchronize();
+                cudaFree(d_position_ids);
+            }
             return false;
         }
+
+        if (need_free && d_position_ids)
+        {
+            // CRITICAL: Must synchronize before freeing position_ids
+            cudaDeviceSynchronize();
+            cudaFree(d_position_ids);
+        }
+
         return true;
     }
 

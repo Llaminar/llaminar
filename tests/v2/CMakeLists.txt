@@ -3342,6 +3342,18 @@ add_v2_test(V2_Integration_CUDARingKVCacheParity
     MPI_PROCS 1  # Tests GPU KV cache locally, no MPI needed
 )
 
+# Test: CUDA Ring Buffer KV Cache Sharding (Tensor Parallelism)
+# Tests sharded KV cache for tensor-parallel inference: per-rank metadata,
+# local_n_kv_heads, kv_head_start offsets, memory allocation, IKVCache interface.
+add_executable(v2_unit_cuda_ring_kv_cache_sharding unit/Test__CUDARingKVCache_Sharding.cpp)
+target_link_libraries(v2_unit_cuda_ring_kv_cache_sharding llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CUDARingKVCache_Sharding
+    COMMAND $<TARGET_FILE:v2_unit_cuda_ring_kv_cache_sharding>
+    LABELS "V2;Unit;CUDA;KVCache;RingBuffer;Sharding;TensorParallelism;FP32;FP16;BF16;GQA"
+    MPI_PROCS 1  # Tests GPU KV cache sharding locally, no MPI needed
+)
+message(STATUS "V2 Tests: Added CUDA Ring KV Cache sharding unit tests")
+
 # Test: NCCL Backend Integration
 # Tests NCCL-based collective operations for multi-GPU communication
 # Validates initialization, allreduce, allgather, broadcast, and clean shutdown

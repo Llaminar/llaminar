@@ -161,6 +161,18 @@ namespace llaminar2
             bool release_raw_data);
 
         /**
+         * @brief Upload all non-GEMM weights to GPU
+         *
+         * Non-GEMM weights (norms, embeddings, biases) don't need GEMM packing
+         * but still need to be uploaded to GPU for kernel access.
+         * This eliminates lazy upload overhead during inference.
+         *
+         * @param target_device Target GPU device
+         * @return Number of weights uploaded
+         */
+        size_t uploadNonGemmWeights(DeviceId target_device);
+
+        /**
          * @brief Preload weights with explicit device override
          *
          * Used when no placement map exists - forces all weights to specific device.

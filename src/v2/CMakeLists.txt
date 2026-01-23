@@ -144,6 +144,13 @@ if(HAVE_CUDA)
     # Enable nvcc multi-threaded compilation (auto-detect optimal thread count)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -t 0")
     
+    # CUDA optimization flags for Release builds
+    # --use_fast_math: Enable fast math intrinsics (~10-30% speedup, slight precision loss)
+    # --ftz=true: Flush denormals to zero (faster, no denormals in LLM inference anyway)
+    # --prec-div=false: Fast division (slightly less accurate, negligible for inference)
+    # --prec-sqrt=false: Fast sqrt (slightly less accurate)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math --ftz=true --prec-div=false --prec-sqrt=false")
+    
     # Relocatable device code for separate compilation
     set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 endif()

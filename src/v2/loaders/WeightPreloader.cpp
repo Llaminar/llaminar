@@ -13,6 +13,10 @@
 #include "../kernels/rocm/ROCmQuantisedGemmKernel.h"
 #endif
 
+#ifdef HAVE_CUDA
+#include "../kernels/cuda/CUDAQuantisedGemmKernel.h"
+#endif
+
 namespace llaminar2
 {
 
@@ -82,11 +86,31 @@ namespace llaminar2
                 progress_callback(current, total, name);
             }
 
-            // Skip non-GEMM weights (embeddings, norms, biases)
-            // These don't need packing
+            // Skip non-GEMM weights (embeddings, norms, biases) for GEMM packing
+            // But still upload them to GPU for kernel access!
             if (!weight_manager_->isGemmWeight(name))
             {
-                LOG_TRACE("[WeightPreloader] Skipping non-GEMM weight: " << name);
+                if (target.is_gpu())
+                {
+                    // Non-GEMM weights still need to be on GPU for kernels like RMSNorm
+                    // Use ensureOnDevice to upload without GEMM packing
+                    if (tensor->ensureOnDevice(target))
+                    {
+                        LOG_TRACE("[WeightPreloader] Uploaded non-GEMM weight to " << target.to_string()
+                                                                                   << ": " << name << " ["
+                                                                                   << tensor->shape()[0] << "x"
+                                                                                   << (tensor->shape().size() > 1 ? tensor->shape()[1] : 1) << "]");
+                        num_gpu_packed_++; // Track as uploaded even though not GEMM-packed
+                    }
+                    else
+                    {
+                        LOG_WARN("[WeightPreloader] Failed to upload non-GEMM weight: " << name);
+                    }
+                }
+                else
+                {
+                    LOG_TRACE("[WeightPreloader] Skipping non-GEMM weight (CPU target): " << name);
+                }
                 continue;
             }
 
@@ -178,18 +202,30 @@ namespace llaminar2
 
         // Override target device in the preload call when no placement map exists
         // This ensures weights are packed for the actual target device, not CPU
-        // Convert DeviceType to DeviceId (ordinal 0 by default since we don't know better)
+        // Convert DeviceType to DeviceId with ordinal 0 (legacy path)
+        DeviceId target_id = (target_device == DeviceType::CPU) ? DeviceId::cpu() : (target_device == DeviceType::CUDA) ? DeviceId::cuda(0)
+                                                                                                                        : DeviceId::rocm(0);
+
+        bool gemm_success = true;
         if (!placement_map_ && !matching_names.empty())
         {
             LOG_DEBUG("[WeightPreloader] No placement map - preloading all "
                       << matching_names.size() << " GEMM weights to target device");
-            // Convert DeviceType to DeviceId with ordinal 0 (legacy path)
-            DeviceId target_id = (target_device == DeviceType::CPU) ? DeviceId::cpu() : (target_device == DeviceType::CUDA) ? DeviceId::cuda(0)
-                                                                                                                            : DeviceId::rocm(0);
-            return preloadWithOverrideDevice(matching_names, target_id, progress_callback, release_raw_data);
+            gemm_success = preloadWithOverrideDevice(matching_names, target_id, progress_callback, release_raw_data);
+        }
+        else
+        {
+            gemm_success = preload(matching_names, progress_callback, release_raw_data);
         }
 
-        return preload(matching_names, progress_callback, release_raw_data);
+        // Also upload non-GEMM weights (norms, embeddings) to GPU
+        // This eliminates lazy upload overhead during inference
+        if (target_id.is_gpu())
+        {
+            uploadNonGemmWeights(target_id);
+        }
+
+        return gemm_success;
     }
 
     bool WeightPreloader::preloadForDevice(
@@ -231,14 +267,23 @@ namespace llaminar2
                 }
             }
 
+            bool gemm_success = true;
             if (!placement_map_ && !matching_names.empty())
             {
                 LOG_DEBUG("[WeightPreloader] No placement map - preloading all "
                           << matching_names.size() << " GEMM weights to ROCm device "
                           << target_device.ordinal);
-                return preloadWithOverrideDevice(matching_names, target_device, progress_callback, release_raw_data);
+                gemm_success = preloadWithOverrideDevice(matching_names, target_device, progress_callback, release_raw_data);
             }
-            return preload(matching_names, progress_callback, release_raw_data);
+            else
+            {
+                gemm_success = preload(matching_names, progress_callback, release_raw_data);
+            }
+
+            // Also upload non-GEMM weights (norms, embeddings) to GPU
+            uploadNonGemmWeights(target_device);
+
+            return gemm_success;
         }
         else
         {
@@ -321,6 +366,27 @@ namespace llaminar2
                 }
 #endif
 
+#ifdef HAVE_CUDA
+                // For CUDA, force upload to device NOW to avoid cudaMalloc during inference
+                if (target_device.is_cuda())
+                {
+                    auto *cuda_kernel = dynamic_cast<llaminar2::cuda::CUDAQuantisedGemmKernel *>(kernel);
+                    if (cuda_kernel)
+                    {
+                        LOG_TRACE("[WeightPreloader] Calling ensureWeightsConverted for CUDA tensor="
+                                  << (void *)tensor << " kernel=" << (void *)kernel
+                                  << " shape=" << tensor->shape()[0] << "x" << tensor->shape()[1]);
+                        cuda_kernel->ensureWeightsConverted();
+                        LOG_TRACE("[WeightPreloader] Uploaded CUDA weights: "
+                                  << tensor->shape()[0] << "x" << tensor->shape()[1]);
+                    }
+                    else
+                    {
+                        LOG_WARN("[WeightPreloader] Cast to CUDAQuantisedGemmKernel failed!");
+                    }
+                }
+#endif
+
                 // For GPU, do NOT release raw data!
                 // The tensor coherence system (ensureOnDevice) still needs the host data
                 // to upload to GPU buffers during stage execution.
@@ -330,6 +396,55 @@ namespace llaminar2
         }
 
         return success;
+    }
+
+    size_t WeightPreloader::uploadNonGemmWeights(DeviceId target_device)
+    {
+        if (!target_device.is_gpu())
+        {
+            LOG_DEBUG("[WeightPreloader] uploadNonGemmWeights skipped for CPU target");
+            return 0;
+        }
+
+        auto &cache = weight_manager_->cache_;
+        size_t uploaded_count = 0;
+
+        LOG_DEBUG("[WeightPreloader] Uploading non-GEMM weights to " << target_device.to_string() << "...");
+
+        for (const auto &[name, tensor] : cache)
+        {
+            // Only process non-GEMM weights (norms, embeddings, biases)
+            if (weight_manager_->isGemmWeight(name))
+            {
+                continue;
+            }
+
+            if (!tensor)
+            {
+                LOG_WARN("[WeightPreloader] Non-GEMM weight is null: " << name);
+                continue;
+            }
+
+            // Upload to GPU using ensureOnDevice (no GEMM packing needed)
+            if (tensor->ensureOnDevice(target_device))
+            {
+                size_t rows = tensor->shape()[0];
+                size_t cols = tensor->shape().size() > 1 ? tensor->shape()[1] : 1;
+                size_t bytes = rows * cols * sizeof(float);
+                LOG_TRACE("[WeightPreloader] Uploaded non-GEMM weight: " << name
+                                                                         << " [" << rows << "x" << cols << "] = " << bytes << " bytes");
+                uploaded_count++;
+            }
+            else
+            {
+                LOG_WARN("[WeightPreloader] Failed to upload non-GEMM weight: " << name);
+            }
+        }
+
+        LOG_INFO("[WeightPreloader] Uploaded " << uploaded_count << " non-GEMM weights to "
+                                               << target_device.to_string());
+
+        return uploaded_count;
     }
 
 } // namespace llaminar2
