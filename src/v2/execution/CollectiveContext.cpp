@@ -9,9 +9,12 @@
 #include "CollectiveContext.h"
 #include "DeviceInventory.h"
 #include "../collective/backends/PCIeBARBackend.h"
+#include "../collective/backends/NCCLBackend.h"
 #include "../config/TPDomain.h"
 #include "../tensors/ITensor.h"
+#include "../tensors/TensorClasses.h" // For TensorBase (MPIStager compatibility)
 #include "../utils/Logger.h"
+#include "../utils/MPIStager.h" // For GPU↔Host staging with MPI backend
 
 namespace llaminar2
 {
@@ -65,26 +68,25 @@ namespace llaminar2
         : config_(config), mpi_ctx_(config.mpi_ctx)
     {
         // Build local device list from cluster inventory
-        if (config.cluster_inventory && mpi_ctx_)
+        if (config.cluster_inventory && !config.cluster_inventory->ranks.empty())
         {
-            int rank = mpi_ctx_->rank();
-            if (rank < static_cast<int>(config.cluster_inventory->ranks.size()))
+            // Note: buildLocalClusterInventory creates a single-entry ranks array
+            // containing this rank's local devices. The entry is always at index 0,
+            // not at index == mpi_rank. Use the first (and only) entry.
+            const RankInventory &inv = config.cluster_inventory->ranks[0];
+            for (const auto &gpu : inv.gpus)
             {
-                const RankInventory &inv = config.cluster_inventory->ranks[rank];
-                for (const auto &gpu : inv.gpus)
+                if (gpu.type == DeviceType::CUDA)
                 {
-                    if (gpu.type == DeviceType::CUDA)
-                    {
-                        local_devices_.push_back(DeviceId::cuda(gpu.local_device_id));
-                    }
-                    else if (gpu.type == DeviceType::ROCm)
-                    {
-                        local_devices_.push_back(DeviceId::rocm(gpu.local_device_id));
-                    }
+                    local_devices_.push_back(DeviceId::cuda(gpu.local_device_id));
                 }
-                // Always include CPU
-                local_devices_.push_back(DeviceId::cpu());
+                else if (gpu.type == DeviceType::ROCm)
+                {
+                    local_devices_.push_back(DeviceId::rocm(gpu.local_device_id));
+                }
             }
+            // Always include CPU
+            local_devices_.push_back(DeviceId::cpu());
         }
         else
         {
@@ -141,13 +143,55 @@ namespace llaminar2
 
         // Query buffer for actual dtype
         CollectiveDataType dtype = tensorToCollectiveDataType(buffer);
+        size_t actual_count = count > 0 ? count : buffer->numel();
 
-        // Execute collective
+        // =========================================================================
+        // MPI Backend with GPU Buffer: Requires Host Staging
+        // =========================================================================
+        // MPI cannot access GPU memory directly (CUDA/ROCm pointers).
+        // When using MPI backend with GPU-resident tensors, we must:
+        // 1. Stage GPU→Host
+        // 2. MPI_Allreduce on host buffer
+        // 3. Stage Host→GPU
+        // =========================================================================
+        if (backend->type() == CollectiveBackendType::MPI && buffer->is_on_gpu())
+        {
+            LOG_DEBUG("CollectiveContext: MPI+GPU staging for allreduce (count=" << actual_count << ")");
+
+            // Cast to TensorBase for MPIStager compatibility
+            auto *tensor_base = dynamic_cast<TensorBase *>(buffer);
+            if (!tensor_base)
+            {
+                LOG_ERROR("CollectiveContext: Buffer is not TensorBase, cannot stage for MPI");
+                return false;
+            }
+
+            // Ensure GPU kernels complete before staging
+            MPIStager::synchronizeDevice(tensor_base->home_device().gpu_ordinal());
+
+            // Stage GPU→Host
+            std::vector<float> host_buffer = MPIStager::toHost(tensor_base);
+
+            // MPI allreduce on host memory (in-place)
+            if (!backend->allreduce(host_buffer.data(), actual_count, dtype, op))
+            {
+                LOG_ERROR("CollectiveContext: MPI allreduce failed during staged operation");
+                return false;
+            }
+
+            // Stage Host→GPU (copy result back to device)
+            MPIStager::toDevice(host_buffer, tensor_base);
+
+            return true;
+        }
+
+        // =========================================================================
+        // Standard Path: Direct backend call (NCCL, RCCL, PCIeBAR, or MPI+CPU)
+        // =========================================================================
         // CRITICAL: Use active_mutable_data_ptr() to get GPU pointer without invalidating
         // GPU data. Using mutable_data() would mark device_valid_=false, causing expensive
         // re-uploads on subsequent operations that need this tensor on GPU.
         void *data_ptr = buffer->active_mutable_data_ptr();
-        size_t actual_count = count > 0 ? count : buffer->numel();
 
         return backend->allreduce(data_ptr, actual_count, dtype, op);
     }
@@ -177,15 +221,157 @@ namespace llaminar2
 
         // Query buffer for actual dtype (use input tensor as reference)
         CollectiveDataType dtype = tensorToCollectiveDataType(local_input);
+        size_t send_count = actual_seq_len > 0 ? actual_seq_len : local_input->numel();
 
-        // Execute collective
+        // =========================================================================
+        // MPI Backend with GPU Buffers: Requires Host Staging
+        // =========================================================================
+        bool input_on_gpu = local_input->is_on_gpu();
+        bool output_on_gpu = full_output->is_on_gpu();
+
+        if (backend->type() == CollectiveBackendType::MPI && (input_on_gpu || output_on_gpu))
+        {
+            LOG_DEBUG("CollectiveContext: MPI+GPU staging for allgather (send_count=" << send_count << ")");
+
+            // Cast to TensorBase for MPIStager compatibility
+            auto *input_base = dynamic_cast<TensorBase *>(local_input);
+            auto *output_base = dynamic_cast<TensorBase *>(full_output);
+            if (!input_base || !output_base)
+            {
+                LOG_ERROR("CollectiveContext: Buffers are not TensorBase, cannot stage for MPI");
+                return false;
+            }
+
+            // Sync input device if on GPU
+            if (input_on_gpu)
+            {
+                MPIStager::synchronizeDevice(input_base->home_device().gpu_ordinal());
+            }
+
+            // Stage input GPU→Host
+            std::vector<float> host_send = input_on_gpu ? MPIStager::toHost(input_base)
+                                                        : std::vector<float>(input_base->data(), input_base->data() + input_base->numel());
+
+            // Allocate host receive buffer (full size for all ranks)
+            size_t recv_count = send_count * (mpi_ctx_ ? mpi_ctx_->world_size() : 1);
+            std::vector<float> host_recv(recv_count);
+
+            // MPI allgather on host memory
+            if (!backend->allgather(host_send.data(), host_recv.data(), send_count, dtype))
+            {
+                LOG_ERROR("CollectiveContext: MPI allgather failed during staged operation");
+                return false;
+            }
+
+            // Stage Host→GPU for output (or copy to CPU tensor)
+            if (output_on_gpu)
+            {
+                MPIStager::toDevice(host_recv, output_base);
+            }
+            else
+            {
+                std::memcpy(output_base->mutable_data(), host_recv.data(), host_recv.size() * sizeof(float));
+            }
+
+            return true;
+        }
+
+        // =========================================================================
+        // Standard Path: Direct backend call (NCCL, RCCL, PCIeBAR, or MPI+CPU)
+        // =========================================================================
         // Use active_data_ptr() for send and active_mutable_data_ptr() for receive
         // to avoid invalidating GPU data on tensors that should remain on device
         const void *send_buf = local_input->active_data_ptr();
         void *recv_buf = full_output->active_mutable_data_ptr();
-        size_t send_count = actual_seq_len > 0 ? actual_seq_len : local_input->numel();
 
         return backend->allgather(send_buf, recv_buf, send_count, dtype);
+    }
+
+    bool CollectiveContext::executeStridedAllgather(
+        ITensor *local_input,
+        ITensor *full_output,
+        size_t actual_seq_len,
+        DeviceId tensor_device)
+    {
+        if (!router_)
+        {
+            LOG_ERROR("CollectiveContext: No router available for stridedAllgather");
+            return false;
+        }
+
+        // Strided allgather only works on CUDA devices (uses NCCL + CUDA kernel)
+        if (tensor_device.type != DeviceType::CUDA)
+        {
+            LOG_DEBUG("CollectiveContext: stridedAllgather requires CUDA device, got "
+                      << tensor_device.to_string());
+            return false;
+        }
+
+        // Build device group
+        DeviceGroup group = buildDeviceGroup(tensor_device);
+
+        // Get backend - must be NCCL for strided allgather
+        ICollectiveBackend *backend = router_->getBackend(group);
+        if (!backend || backend->type() != CollectiveBackendType::NCCL)
+        {
+            LOG_DEBUG("CollectiveContext: stridedAllgather requires NCCL backend, got "
+                      << (backend ? toString(backend->type()) : "none"));
+            return false;
+        }
+
+        // Cast to NCCLBackend to access stridedAllgather
+        NCCLBackend *nccl_backend = dynamic_cast<NCCLBackend *>(backend);
+        if (!nccl_backend)
+        {
+            LOG_ERROR("CollectiveContext: Failed to cast backend to NCCLBackend");
+            return false;
+        }
+
+        // Only supports FP32 currently
+        CollectiveDataType dtype = tensorToCollectiveDataType(local_input);
+        if (dtype != CollectiveDataType::FLOAT32)
+        {
+            LOG_DEBUG("CollectiveContext: stridedAllgather only supports FP32, got "
+                      << static_cast<int>(dtype));
+            return false;
+        }
+
+        // Get tensor dimensions
+        const auto &local_shape = local_input->shape();
+        const auto &full_shape = full_output->shape();
+
+        if (local_shape.size() != 2 || full_shape.size() != 2)
+        {
+            LOG_ERROR("CollectiveContext: stridedAllgather requires 2D tensors");
+            return false;
+        }
+
+        size_t buffer_seq_len = local_shape[0];
+        size_t seq_len = actual_seq_len > 0 ? actual_seq_len : buffer_seq_len;
+        size_t local_dim = local_shape[1];
+
+        // Use active_data_ptr for GPU memory access
+        const void *send_buf = local_input->active_data_ptr();
+        void *recv_buf = full_output->active_mutable_data_ptr();
+
+        bool success = nccl_backend->stridedAllgather(
+            send_buf,
+            recv_buf,
+            seq_len,
+            local_dim,
+            dtype);
+
+        if (success)
+        {
+            LOG_DEBUG("CollectiveContext: stridedAllgather completed seq_len=" << seq_len
+                                                                               << " local_dim=" << local_dim);
+        }
+        else
+        {
+            LOG_ERROR("CollectiveContext: stridedAllgather failed: " << nccl_backend->lastError());
+        }
+
+        return success;
     }
 
     bool CollectiveContext::executeAllgatherv(
@@ -234,7 +420,67 @@ namespace llaminar2
         // Query buffer for actual dtype (use input tensor as reference)
         CollectiveDataType dtype = tensorToCollectiveDataType(local_input);
 
-        // Execute collective
+        // =========================================================================
+        // MPI Backend with GPU Buffers: Requires Host Staging
+        // =========================================================================
+        bool input_on_gpu = local_input->is_on_gpu();
+        bool output_on_gpu = full_output->is_on_gpu();
+
+        if (backend->type() == CollectiveBackendType::MPI && (input_on_gpu || output_on_gpu))
+        {
+            LOG_DEBUG("CollectiveContext: MPI+GPU staging for allgatherv (send_count=" << send_count << ")");
+
+            // Cast to TensorBase for MPIStager compatibility
+            auto *input_base = dynamic_cast<TensorBase *>(local_input);
+            auto *output_base = dynamic_cast<TensorBase *>(full_output);
+            if (!input_base || !output_base)
+            {
+                LOG_ERROR("CollectiveContext: Buffers are not TensorBase, cannot stage for MPI");
+                return false;
+            }
+
+            // Sync input device if on GPU
+            if (input_on_gpu)
+            {
+                MPIStager::synchronizeDevice(input_base->home_device().gpu_ordinal());
+            }
+
+            // Stage input GPU→Host
+            std::vector<float> host_send = input_on_gpu ? MPIStager::toHost(input_base)
+                                                        : std::vector<float>(input_base->data(), input_base->data() + input_base->numel());
+
+            // Calculate total receive size
+            size_t total_recv = 0;
+            for (int count_i : scaled_recv_counts)
+            {
+                total_recv += static_cast<size_t>(count_i);
+            }
+            std::vector<float> host_recv(total_recv);
+
+            // MPI allgatherv on host memory
+            if (!backend->allgatherv(host_send.data(), send_count, host_recv.data(),
+                                     scaled_recv_counts, scaled_displacements, dtype))
+            {
+                LOG_ERROR("CollectiveContext: MPI allgatherv failed during staged operation");
+                return false;
+            }
+
+            // Stage Host→GPU for output (or copy to CPU tensor)
+            if (output_on_gpu)
+            {
+                MPIStager::toDevice(host_recv, output_base);
+            }
+            else
+            {
+                std::memcpy(output_base->mutable_data(), host_recv.data(), host_recv.size() * sizeof(float));
+            }
+
+            return true;
+        }
+
+        // =========================================================================
+        // Standard Path: Direct backend call (NCCL, RCCL, PCIeBAR, or MPI+CPU)
+        // =========================================================================
         // Use active_data_ptr() for send and active_mutable_data_ptr() for receive
         // to avoid invalidating GPU data on tensors that should remain on device
         const void *send_buf = local_input->active_data_ptr();
@@ -270,11 +516,47 @@ namespace llaminar2
 
         // Query buffer for actual dtype
         CollectiveDataType dtype = tensorToCollectiveDataType(buffer);
+        size_t actual_count = count > 0 ? count : buffer->numel();
 
-        // Execute collective
+        // =========================================================================
+        // MPI Backend with GPU Buffer: Requires Host Staging
+        // =========================================================================
+        if (backend->type() == CollectiveBackendType::MPI && buffer->is_on_gpu())
+        {
+            LOG_DEBUG("CollectiveContext: MPI+GPU staging for broadcast (count=" << actual_count << ")");
+
+            // Cast to TensorBase for MPIStager compatibility
+            auto *tensor_base = dynamic_cast<TensorBase *>(buffer);
+            if (!tensor_base)
+            {
+                LOG_ERROR("CollectiveContext: Buffer is not TensorBase, cannot stage for MPI");
+                return false;
+            }
+
+            // Ensure GPU kernels complete before staging
+            MPIStager::synchronizeDevice(tensor_base->home_device().gpu_ordinal());
+
+            // Stage GPU→Host (root has data, others will receive)
+            std::vector<float> host_buffer = MPIStager::toHost(tensor_base);
+
+            // MPI broadcast on host memory
+            if (!backend->broadcast(host_buffer.data(), actual_count, dtype, root_rank))
+            {
+                LOG_ERROR("CollectiveContext: MPI broadcast failed during staged operation");
+                return false;
+            }
+
+            // Stage Host→GPU (all ranks copy result back to device)
+            MPIStager::toDevice(host_buffer, tensor_base);
+
+            return true;
+        }
+
+        // =========================================================================
+        // Standard Path: Direct backend call (NCCL, RCCL, PCIeBAR, or MPI+CPU)
+        // =========================================================================
         // Use active_mutable_data_ptr() to get GPU pointer without invalidating GPU data
         void *data_ptr = buffer->active_mutable_data_ptr();
-        size_t actual_count = count > 0 ? count : buffer->numel();
 
         return backend->broadcast(data_ptr, actual_count, dtype, root_rank);
     }
@@ -382,10 +664,32 @@ namespace llaminar2
         {
             builder.setName("global_mpi_group")
                 .setScope(CollectiveScope::GLOBAL)
-                .setLocalRank(rank());
+                // local_rank is the index into devices[], not the MPI rank.
+                // Since we add only the tensor_device (1 device), local_rank = 0.
+                // The MPI rank is used by the backend for comm coordination.
+                .setLocalRank(0);
 
-            // Add local device for this rank
-            builder.addDevice(tensor_device);
+            // CRITICAL: Add ALL local devices to enable heterogeneous detection.
+            // This allows the backend router to see if this node has both CUDA and ROCm,
+            // which indicates potential cross-rank heterogeneity.
+            //
+            // The local_devices_ list contains all GPUs available to this rank,
+            // populated from the cluster_inventory during construction.
+            bool added_any_gpu = false;
+            for (const auto &device : local_devices_)
+            {
+                if (device.type == DeviceType::CUDA || device.type == DeviceType::ROCm)
+                {
+                    builder.addDevice(device);
+                    added_any_gpu = true;
+                }
+            }
+
+            // Fallback: if no GPUs in local_devices_, add the tensor device
+            if (!added_any_gpu)
+            {
+                builder.addDevice(tensor_device);
+            }
         }
         else
         {

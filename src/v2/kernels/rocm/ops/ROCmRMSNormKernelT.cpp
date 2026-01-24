@@ -7,6 +7,7 @@
 
 #include "ROCmRMSNormKernelT.h"
 #include "utils/Logger.h"
+#include "utils/KernelProfiler.h"
 #include <cstdint>
 #include <hip/hip_runtime.h>
 
@@ -73,6 +74,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx,
             int device_idx)
         {
+            KERNEL_PROFILE_SCOPE(KernelType::RMS_NORM);
             (void)mpi_ctx;
             if (!input || !weight || !output)
             {
@@ -164,6 +166,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx,
             int device_idx)
         {
+            KERNEL_PROFILE_SCOPE(KernelType::RMS_NORM);
             (void)mpi_ctx;
             if (!input || !weight || !output)
             {
@@ -254,6 +257,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx,
             int device_idx)
         {
+            KERNEL_PROFILE_SCOPE(KernelType::RMS_NORM);
             (void)mpi_ctx;
             if (!input || !weight || !output)
             {

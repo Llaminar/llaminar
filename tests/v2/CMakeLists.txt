@@ -470,6 +470,26 @@ if(HAVE_CUDA AND HAVE_ROCM)
         LABELS "V2;Integration;CUDA;Kernels;VectorAdd;FP16;BF16;INT8"
         MPI_PROCS 1
     )
+
+    # Test: CollectiveBackendIntegration - Comprehensive collective backend tests
+    # Tests CPU+CPU (MPI), NVIDIA+NVIDIA (NCCL), AMD+AMD (RCCL), NVIDIA+AMD (PCIeBAR),
+    # and complex heterogeneous scenarios with multi-domain tensor parallelism
+    add_executable(v2_integration_collective_backend integration/Test__CollectiveBackendIntegration.cpp)
+    target_link_libraries(v2_integration_collective_backend 
+        llaminar2_core 
+        device_benchmarks
+        GTest::gtest
+        GTest::gtest_main
+    )
+    target_include_directories(v2_integration_collective_backend PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/utils
+    )
+    add_v2_test(V2_Integration_CollectiveBackendIntegration 
+        COMMAND $<TARGET_FILE:v2_integration_collective_backend>
+        LABELS "V2;Integration;Collective;BackendRouter;MPI;NCCL;RCCL;PCIeBAR;TensorParallel;Heterogeneous;AllReduce"
+        MPI_PROCS 2
+        RESOURCE_LOCK "PCIeBAR_P2P"
+    )
 endif()
 
 # Test: CrossDomainTransferGPU - GPU integration tests for cross-domain activation transfer
@@ -3487,7 +3507,99 @@ if(ZLIB_FOUND)
         MPI_PROCS 1
     )
 
-    message(STATUS "V2: Qwen2 parity tests enabled (CUDA, CPU, ROCm vs PyTorch)")
+    # Qwen2 Tensor-Parallel MPI Backend (GLOBAL scope, 2+ ranks) vs PyTorch Parity Test
+    # Tests correctness of weight sharding, allreduce/allgather, and cross-vendor TP via MPI
+    add_executable(v2_integration_parity_qwen2_tp_mpi_vs_pytorch 
+        integration/parity/qwen2/Test__Qwen2_TP_MPI_vs_PyTorch.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen2_tp_mpi_vs_pytorch 
+        llaminar2_core 
+        GTest::gtest
+        ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen2_tp_mpi_vs_pytorch PRIVATE 
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+    )
+    add_v2_test(V2_Integration_Parity_Qwen2_TP_MPI_vs_PyTorch
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_tp_mpi_vs_pytorch>
+        LABELS "V2;Integration;Parity;Qwen2;TensorParallel;MPI;GLOBAL;PyTorch;GoldenReference;FullModel;Pipeline;Sharding;Allreduce"
+        MPI_PROCS 2
+    )
+
+    # Qwen2 PCIe BAR LOCAL TP (single rank, CUDA+ROCm) vs PyTorch Parity Test
+    # Tests PCIe BAR direct P2P for CUDA↔ROCm LOCAL scope tensor parallelism
+    if(HAVE_CUDA AND HAVE_ROCM)
+        add_executable(v2_integration_parity_qwen2_tp_pciebar_vs_pytorch 
+            integration/parity/qwen2/Test__Qwen2_TP_PCIeBAR_vs_PyTorch.cpp
+            ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+        )
+        target_link_libraries(v2_integration_parity_qwen2_tp_pciebar_vs_pytorch 
+            llaminar2_core 
+            GTest::gtest
+            ZLIB::ZLIB
+        )
+        target_include_directories(v2_integration_parity_qwen2_tp_pciebar_vs_pytorch PRIVATE 
+            ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        )
+        # Set CAP_SYS_ADMIN for PCIe BAR access
+        add_custom_command(TARGET v2_integration_parity_qwen2_tp_pciebar_vs_pytorch POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E echo "Setting CAP_SYS_ADMIN on v2_integration_parity_qwen2_tp_pciebar_vs_pytorch for PCIe BAR P2P"
+            COMMAND sudo setcap cap_sys_admin+ep $<TARGET_FILE:v2_integration_parity_qwen2_tp_pciebar_vs_pytorch> || true
+        )
+        add_v2_test(V2_Integration_Parity_Qwen2_TP_PCIeBAR_vs_PyTorch
+            COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_tp_pciebar_vs_pytorch>
+            LABELS "V2;Integration;Parity;Qwen2;PCIeBAR;LOCAL;CrossVendor;CUDA;ROCm;TensorParallel;PyTorch;GoldenReference;FullModel;Pipeline;SameNUMA"
+            MPI_PROCS 1
+            RESOURCE_LOCK "PCIeBAR_P2P"
+        )
+    endif()
+
+    # Qwen2 NCCL LOCAL TP (single rank, 2 CUDA devices) vs PyTorch Parity Test
+    # Tests LOCAL scope tensor parallelism with 2 CUDA GPUs using NCCL backend
+    if(HAVE_CUDA AND HAVE_NCCL)
+        add_executable(v2_integration_parity_qwen2_tp_nccl_vs_pytorch 
+            integration/parity/qwen2/Test__Qwen2_TP_NCCL_vs_PyTorch.cpp
+            ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+        )
+        target_link_libraries(v2_integration_parity_qwen2_tp_nccl_vs_pytorch 
+            llaminar2_core 
+            GTest::gtest
+            ZLIB::ZLIB
+        )
+        target_include_directories(v2_integration_parity_qwen2_tp_nccl_vs_pytorch PRIVATE 
+            ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        )
+        add_v2_test(V2_Integration_Parity_Qwen2_TP_NCCL_vs_PyTorch
+            COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_tp_nccl_vs_pytorch>
+            LABELS "V2;Integration;Parity;Qwen2;NCCL;LOCAL;CUDA;TensorParallel;PyTorch;GoldenReference;FullModel;Pipeline"
+            MPI_PROCS 1
+        )
+    endif()
+
+    # Qwen2 RCCL LOCAL TP (single rank, 2 ROCm devices) vs PyTorch Parity Test  
+    # Tests LOCAL scope tensor parallelism with 2 ROCm GPUs using RCCL backend
+    if(HAVE_ROCM AND HAVE_RCCL)
+        add_executable(v2_integration_parity_qwen2_tp_rccl_vs_pytorch 
+            integration/parity/qwen2/Test__Qwen2_TP_RCCL_vs_PyTorch.cpp
+            ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+        )
+        target_link_libraries(v2_integration_parity_qwen2_tp_rccl_vs_pytorch 
+            llaminar2_core 
+            GTest::gtest
+            ZLIB::ZLIB
+        )
+        target_include_directories(v2_integration_parity_qwen2_tp_rccl_vs_pytorch PRIVATE 
+            ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        )
+        add_v2_test(V2_Integration_Parity_Qwen2_TP_RCCL_vs_PyTorch
+            COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_tp_rccl_vs_pytorch>
+            LABELS "V2;Integration;Parity;Qwen2;RCCL;LOCAL;ROCm;TensorParallel;PyTorch;GoldenReference;FullModel;Pipeline"
+            MPI_PROCS 1
+        )
+    endif()
+
+    message(STATUS "V2: Qwen2 parity tests enabled (CUDA, CPU, ROCm, TP vs PyTorch)")
 else()
     message(STATUS "V2: Parity tests disabled (ZLIB not found)")
 endif()

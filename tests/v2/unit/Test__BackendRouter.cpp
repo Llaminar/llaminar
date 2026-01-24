@@ -209,22 +209,86 @@ namespace llaminar2::test
     }
 #endif // HAVE_CUDA && HAVE_ROCM
 
-    TEST_F(Test__BackendRouter, SelectsMPIForGlobalScope)
+    // =========================================================================
+    // GLOBAL scope tests - NCCL/RCCL are preferred for homogeneous GPU groups
+    // even at global scope, since they support cross-rank communication via
+    // ncclCommInitRank/rcclCommInitRank with MPI-broadcast unique ID.
+    // =========================================================================
+
+    TEST_F(Test__BackendRouter, SelectsNCCLForGlobalScopeHomogeneousCUDA)
     {
         auto factory = std::make_unique<MockBackendFactory>();
 
-        // Configure MPI and NCCL as available
+        // Configure both MPI and NCCL as available
         factory->setAvailable(CollectiveBackendType::MPI, true);
         factory->setAvailable(CollectiveBackendType::NCCL, true);
+
+        // Add mock NCCL backend (should be selected for homogeneous CUDA)
+        auto *mock_nccl = factory->addMockBackend(CollectiveBackendType::NCCL);
+        mock_nccl->setAvailable(true);
+
+        auto router = createRouter(std::move(factory));
+        auto group = createGlobalGroup("global_cuda_ranks"); // All CUDA devices
+
+        auto selection = router->selectBackend(group);
+        EXPECT_EQ(selection.type, CollectiveBackendType::NCCL);
+        EXPECT_FALSE(selection.requires_multi_phase);
+    }
+
+    TEST_F(Test__BackendRouter, SelectsMPIForGlobalScopeHeterogeneousDevices)
+    {
+        auto factory = std::make_unique<MockBackendFactory>();
+
+        // Configure MPI as available
+        factory->setAvailable(CollectiveBackendType::MPI, true);
+        factory->setAvailable(CollectiveBackendType::NCCL, true);
+        factory->setAvailable(CollectiveBackendType::RCCL, true);
 
         // Add mock MPI backend
         auto *mock_mpi = factory->addMockBackend(CollectiveBackendType::MPI);
         mock_mpi->setAvailable(true);
 
         auto router = createRouter(std::move(factory));
-        auto group = createGlobalGroup("global_ranks");
+
+        // Create a heterogeneous global group (CUDA + ROCm)
+        DeviceGroupBuilder builder;
+        auto group = builder
+                         .setName("global_hetero_ranks")
+                         .setScope(CollectiveScope::GLOBAL)
+                         .addDevice(DeviceId::cuda(0))
+                         .addDevice(DeviceId::rocm(0))
+                         .build();
 
         auto selection = router->selectBackend(group);
+        // Heterogeneous global groups should fall back to MPI
+        // (PCIeBAR is only for local scope)
+        EXPECT_EQ(selection.type, CollectiveBackendType::MPI);
+        EXPECT_FALSE(selection.requires_multi_phase);
+    }
+
+    TEST_F(Test__BackendRouter, SelectsMPIForGlobalScopeCPUOnly)
+    {
+        auto factory = std::make_unique<MockBackendFactory>();
+
+        // Configure MPI as available
+        factory->setAvailable(CollectiveBackendType::MPI, true);
+
+        // Add mock MPI backend
+        auto *mock_mpi = factory->addMockBackend(CollectiveBackendType::MPI);
+        mock_mpi->setAvailable(true);
+
+        auto router = createRouter(std::move(factory));
+
+        // Create a CPU-only global group
+        DeviceGroupBuilder builder;
+        auto group = builder
+                         .setName("global_cpu_ranks")
+                         .setScope(CollectiveScope::GLOBAL)
+                         .addDevice(DeviceId::cpu())
+                         .build();
+
+        auto selection = router->selectBackend(group);
+        // CPU-only groups should use MPI
         EXPECT_EQ(selection.type, CollectiveBackendType::MPI);
         EXPECT_FALSE(selection.requires_multi_phase);
     }

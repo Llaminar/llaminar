@@ -44,6 +44,11 @@ namespace llaminar2::test::parity::qwen2
         int early_layers_count = 6;            ///< Number of early layers to check strictly
         int min_early_layers_passed = 6;       ///< Minimum early layers that must pass
         float kl_threshold = 0.15f;            ///< Maximum KL divergence for LM_HEAD
+
+        /// Stages to exclude from per-layer parity comparison.
+        /// Used for GLOBAL scope TP where column-parallel stages (Q/K/V projections)
+        /// produce partial outputs that can't be directly compared to full PyTorch outputs.
+        std::vector<std::string> excluded_stages;
     };
 
     /**
@@ -75,6 +80,7 @@ namespace llaminar2::test::parity::qwen2
             config_.early_layers_count = thresholds.early_layers_count;
             config_.min_early_layers_passed = thresholds.min_early_layers_passed;
             config_.kl_threshold = thresholds.kl_threshold;
+            config_.excluded_stages = thresholds.excluded_stages;
 
             // Qwen2-specific model configuration (already defaults in ParityConfig)
             // config_.model_path = "models/qwen2.5-0.5b-instruct-q4_0.gguf";

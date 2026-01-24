@@ -41,17 +41,19 @@
  * MINIMUM DIMENSION REQUIREMENTS (CRITICAL!)
  * ============================================================================
  *
- * CK's DeviceGemmMultipleD_Dl has tile-based requirements. We use 3-WAY DISPATCH
+ * CK's DeviceGemmMultipleD_Dl has tile-based requirements. We use 4-WAY DISPATCH
  * to optimize for different M values:
  *
- *   | M Range    | Kernel    | Tile Size | Why?                              |
- *   |------------|-----------|-----------|-----------------------------------|
- *   | M ≤ 32     | 32×32     | 32×32×32  | Minimal waste for decode (M=1)   |
- *   | 32 < M < 128| 64×64    | 64×64×32  | Good balance for small batches   |
- *   | M ≥ 128   | 128×128   | 128×128×64| Peak throughput for prefill      |
+ *   | M Range           | Kernel           | Tile Size | Why?                    |
+ *   |-------------------|------------------|-----------|-------------------------|
+ *   | M ≤ 32            | 32×32            | 32×32×32  | Minimal waste for decode|
+ *   | 32 < M < 128      | 64×64            | 64×64×32  | Good balance for batches|
+ *   | M ≥ 128, M%128==0 | 128×128          | 128×128×64| Peak throughput         |
+ *   | M ≥ 128, M%128!=0 | 128×128 MNPadding| 128×128×64| Irregular prefill (e.g. M=596) |
  *
  * The 32×32 and 64×64 kernels use GemmSpecialization::MNPadding for irregular M.
- * The 128×128 kernel uses GemmSpecialization::Default (requires M ≥ 128).
+ * The 128×128 kernel uses GemmSpecialization::Default for aligned M (peak perf).
+ * The 128×128 MNPadding kernel handles M >= 128 with irregular dimensions.
  * N and K requirements: N ≥ 64, K ≥ 64 (satisfied by all LLM dimensions).
  *
  * For decode (M=1), the 32×32 kernel handles it directly - no explicit padding!
@@ -235,13 +237,14 @@ using PassThrough = ck::tensor_operation::element_wise::PassThrough;
 //
 // LARGE KERNEL (128×128 tiles) - for prefill (M ≥ 128):
 //   - MPerBlock = 128, NPerBlock = 128, K0×K1 = 16×4 = 64
-//   - Uses GemmDefault (requires M ≥ 128)
-//   - Peak throughput for large batch sizes
+//   - Uses GemmDefault when M % 128 == 0 (peak throughput)
+//   - Uses GemmMNPadding when M % 128 != 0 (handles irregular M like M=596)
 //
-// DISPATCH STRATEGY:
-//   M ≤ 32:      Use 32×32 kernel (GemmMNPadding handles irregular M)
-//   32 < M < 128: Use 64×64 kernel (GemmMNPadding handles irregular M)  
-//   M ≥ 128:     Use 128×128 kernel (GemmDefault, peak throughput)
+// DISPATCH STRATEGY (4-WAY):
+//   M ≤ 32:           Use 32×32 kernel (GemmMNPadding handles irregular M)
+//   32 < M < 128:     Use 64×64 kernel (GemmMNPadding handles irregular M)  
+//   M ≥ 128, M%128==0: Use 128×128 kernel (GemmDefault, peak throughput)
+//   M ≥ 128, M%128!=0: Use 128×128 kernel (GemmMNPadding, handles irregular M)
 //
 // Dimension requirements for each kernel (used by ck_dimensions_supported())
 // Note: The 32×32 and 64×64 kernels use GemmMNPadding, so they can handle
@@ -530,6 +533,69 @@ using DeviceGemmInt8_NoScale_64x64 = ck::tensor_operation::device::DeviceGemmMul
 // clang-format on
 
 // ============================================================================
+// 128×128 TILE KERNEL WITH MN-PADDING (For M >= 128, irregular M)
+// ============================================================================
+//
+// This kernel is identical to DeviceGemmInt8_NoScale but uses GemmMNPadding
+// instead of GemmDefault, allowing it to handle M values that are not
+// multiples of 128 (e.g., M=596 for prefill with 596 tokens).
+//
+// The GemmMNPadding specialization adds boundary checking at the tile level,
+// which has minimal overhead (~5%) compared to GemmDefault.
+//
+// USE CASE:
+//   - Prefill with arbitrary sequence lengths (M = seq_len)
+//   - M >= 128 but M % 128 != 0 (e.g., M=596, M=1024+13, etc.)
+//
+// clang-format off
+using DeviceGemmInt8_NoScale_128x128_MNPadding = ck::tensor_operation::device::DeviceGemmMultipleD_Dl<
+    ALayout,              // A layout: RowMajor [M×K]
+    BLayout,              // B layout: ColumnMajor [K×N] (mk_nk_mn convention)
+    DsLayout_None,        // No D tensors (empty tuple)
+    ELayout,              // E layout: RowMajor [M×N]
+    ADataType,            // A element type: int8_t
+    BDataType,            // B element type: int8_t
+    AccDataType,          // Accumulator type: int32_t
+    DsDataType_None,      // No D data types (empty tuple)
+    EDataType_None,       // E element type: int32_t (raw accumulator)
+    AElementOp,           // A element-wise op: PassThrough
+    BElementOp,           // B element-wise op: PassThrough
+    CDEElementOp_None,    // Output element-wise op: PassThrough
+    GemmMNPadding,        // GemmSpecialization::MNPadding for irregular M!
+    // =========================================================================
+    // BLOCK AND TILE CONFIGURATION (mk_nk_mn - 128x128 tiles!)
+    // Same configuration as DeviceGemmInt8_NoScale
+    // =========================================================================
+    256,                  // BlockSize: 256 threads per block (16×16 thread tile)
+    128,                  // MPerBlock: 128 output rows per block
+    128,                  // NPerBlock: 128 output cols per block
+    16,                   // K0PerBlock: K outer loop (16 iterations)
+    4,                    // K1: K inner loop (16×4=64 K per iteration)
+    4,                    // M1PerThread: 4 output rows per thread
+    4,                    // N1PerThread: 4 output cols per thread  
+    1,                    // KPerThread: 1 K element per thread per iteration
+    S<2, 8>,              // M1N1ThreadClusterM1Xs: thread cluster M tiling
+    S<2, 8>,              // M1N1ThreadClusterN1Xs: thread cluster N tiling
+    S<8, 1, 1, 4>,        // ABlockTransferThreadSliceLengths_K0_M0_M1_K1
+    S<2, 1, 128, 1>,      // ABlockTransferThreadClusterLengths_K0_M0_M1_K1
+    S<1, 2, 0, 3>,        // ABlockTransferThreadClusterArrangeOrder
+    S<1, 2, 0, 3>,        // ABlockTransferSrcAccessOrder
+    S<4, 1, 1, 4>,        // ABlockTransferSrcVectorTensorLengths_K0_M0_M1_K1
+    S<1, 2, 0, 3>,        // ABlockTransferSrcVectorTensorContiguousDimOrder
+    S<1, 1, 1, 4>,        // ABlockTransferDstVectorTensorLengths_K0_M0_M1_K1
+    S<8, 1, 1, 4>,        // BBlockTransferThreadSliceLengths_K0_N0_N1_K1
+    S<2, 1, 128, 1>,      // BBlockTransferThreadClusterLengths_K0_N0_N1_K1
+    S<1, 2, 0, 3>,        // BBlockTransferThreadClusterArrangeOrder
+    S<1, 2, 0, 3>,        // BBlockTransferSrcAccessOrder
+    S<4, 1, 1, 4>,        // BBlockTransferSrcVectorTensorLengths_K0_N0_N1_K1
+    S<1, 2, 0, 3>,        // BBlockTransferSrcVectorTensorContiguousDimOrder
+    S<1, 1, 1, 4>,        // BBlockTransferDstVectorTensorLengths_K0_N0_N1_K1
+    S<0, 1, 2, 3, 4, 5>,  // CThreadTransferSrcDstAccessOrder
+    5,                    // CThreadTransferSrcDstVectorDim (vectorize dim 5)
+    4>;                   // CThreadTransferDstScalarPerVector (4-wide writes)
+// clang-format on
+
+// ============================================================================
 // CACHED KERNEL INSTANCES (Lazy Initialization Pattern)
 // ============================================================================
 //
@@ -551,7 +617,8 @@ using DeviceGemmInt8_NoScale_64x64 = ck::tensor_operation::device::DeviceGemmMul
 //   ├────────────────────────┼───────────────────────────────────────────────────┤
 //   │ M ≤ 32                 │ 32×32 kernel (GemmMNPadding handles irregular M)  │
 //   │ 32 < M < 128           │ 64×64 kernel (GemmMNPadding handles irregular M)  │
-//   │ M ≥ 128                │ 128×128 kernel (GemmDefault, peak throughput)     │
+//   │ M ≥ 128, M % 128 == 0  │ 128×128 kernel (GemmDefault, peak throughput)     │
+//   │ M ≥ 128, M % 128 != 0  │ 128×128 kernel (GemmMNPadding, handles irregular) │
 //   └────────────────────────┴───────────────────────────────────────────────────┘
 //
 // Performance (FFN Up: K=3584, N=18944, MI50 gfx906):
@@ -563,9 +630,15 @@ using DeviceGemmInt8_NoScale_64x64 = ck::tensor_operation::device::DeviceGemmMul
 //
 // ============================================================================
 
-// 128×128 kernel (for M >= 128) - peak throughput
+// 128×128 kernel (for M >= 128, M % 128 == 0) - peak throughput, no padding
 static DeviceGemmInt8_NoScale& getCachedNoScaleKernel() {
     static DeviceGemmInt8_NoScale device;
+    return device;
+}
+
+// 128×128 kernel with MN-padding (for M >= 128, M % 128 != 0) - handles irregular M
+static DeviceGemmInt8_NoScale_128x128_MNPadding& getCachedNoScaleKernel128x128MNPadding() {
+    static DeviceGemmInt8_NoScale_128x128_MNPadding device;
     return device;
 }
 
@@ -809,13 +882,19 @@ extern "C"
         auto d2 = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
         fprintf(stderr, "[CK Warmup]   64x64 kernel: %ld ms\n", d2);
         
-        (void)getCachedNoScaleKernel();       // 128x128 for prefill (M >= 128)
+        (void)getCachedNoScaleKernel();       // 128x128 for prefill (M >= 128, M%128==0)
         
         auto t3 = std::chrono::high_resolution_clock::now();
         auto d3 = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
-        auto total = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - start).count();
-        
         fprintf(stderr, "[CK Warmup]   128x128 kernel: %ld ms\n", d3);
+        
+        (void)getCachedNoScaleKernel128x128MNPadding();  // 128x128 MNPadding for M%128!=0
+        
+        auto t4 = std::chrono::high_resolution_clock::now();
+        auto d4 = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count();
+        auto total = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - start).count();
+        
+        fprintf(stderr, "[CK Warmup]   128x128 MNPadding kernel: %ld ms\n", d4);
         fprintf(stderr, "[CK Warmup] All CK kernels initialized in %ld ms\n", total);
     }
 
@@ -1053,10 +1132,11 @@ extern "C"
         auto t0 = std::chrono::high_resolution_clock::now();
 
         // =====================================================================
-        // 3-WAY DISPATCH BASED ON M
+        // 4-WAY DISPATCH BASED ON M
         // =====================================================================
         // The 32×32 and 64×64 kernels use GemmMNPadding to handle irregular M.
-        // The 128×128 kernel uses GemmDefault and requires M ≥ 128.
+        // The 128×128 kernel uses GemmDefault for M % 128 == 0 (peak throughput).
+        // The 128×128 MNPadding kernel handles M >= 128 with irregular M.
         // =====================================================================
 
         ScopedCoutSilence silence;
@@ -1103,9 +1183,9 @@ extern "C"
             auto invoker = device_gemm.MakeInvoker();
             invoker.Run(argument, StreamConfig{nullptr, false});
         }
-        else
+        else if (M % 128 == 0)
         {
-            // Large M: Use 128×128 kernel (optimal for M>=128, peak throughput)
+            // Large M, multiple of 128: Use 128×128 kernel with GemmDefault (peak throughput)
             auto& device_gemm = getCachedNoScaleKernel();
             auto argument = device_gemm.MakeArgument(
                 d_A_int8, d_weights_int8, p_ds, d_C_int32,
@@ -1117,6 +1197,27 @@ extern "C"
             if (!device_gemm.IsSupportedArgument(argument))
             {
                 fprintf(stderr, "[rocmQuantGemm_executeNoScale] 128×128 kernel doesn't support M=%d N=%d K=%d\n",
+                        M, N, K);
+                return false;
+            }
+
+            auto invoker = device_gemm.MakeInvoker();
+            invoker.Run(argument, StreamConfig{nullptr, false});
+        }
+        else
+        {
+            // Large M, irregular: Use 128×128 kernel with GemmMNPadding
+            auto& device_gemm = getCachedNoScaleKernel128x128MNPadding();
+            auto argument = device_gemm.MakeArgument(
+                d_A_int8, d_weights_int8, p_ds, d_C_int32,
+                M, N, K,
+                K, K, strides_ds, N,
+                AElementOp{}, BElementOp{}, CDEElementOp_None{}
+            );
+
+            if (!device_gemm.IsSupportedArgument(argument))
+            {
+                fprintf(stderr, "[rocmQuantGemm_executeNoScale] 128×128 MNPadding kernel doesn't support M=%d N=%d K=%d\n",
                         M, N, K);
                 return false;
             }

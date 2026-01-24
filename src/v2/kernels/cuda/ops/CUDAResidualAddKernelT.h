@@ -12,6 +12,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/CUDAKernelProfiler.h"
 
 // Forward declarations for CUDA kernels
 extern "C"
@@ -52,6 +53,7 @@ namespace llaminar2::cuda
             (void)mpi_ctx;
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             LOG_DEBUG("[CUDAResidualAddKernelT::FP32] Executing on device " << dev);
+            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::RESIDUAL_ADD);
             return cudaOps_residual_add_fp32(input, residual, output, static_cast<int>(num_elements), dev);
         }
 
@@ -123,6 +125,7 @@ namespace llaminar2::cuda
             (void)mpi_ctx;
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             LOG_DEBUG("[CUDAResidualAddKernelT::BF16] Executing on device " << dev);
+            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::RESIDUAL_ADD);
             return cudaOps_residual_add_bf16(input, residual, output, static_cast<int>(num_elements), dev);
         }
 
@@ -193,6 +196,7 @@ namespace llaminar2::cuda
             (void)mpi_ctx;
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             LOG_DEBUG("[CUDAResidualAddKernelT::FP16] Executing on device " << dev);
+            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::RESIDUAL_ADD);
             return cudaOps_residual_add_fp16(input, residual, output, static_cast<int>(num_elements), dev);
         }
 

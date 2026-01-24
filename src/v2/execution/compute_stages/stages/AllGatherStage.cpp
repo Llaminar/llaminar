@@ -365,7 +365,7 @@ namespace llaminar2
         return reqs;
     }
 
-    StageDumpInfo AllGatherStage::getDumpInfo() const
+    StageDumpInfo AllGatherStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
 

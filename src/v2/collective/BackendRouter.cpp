@@ -56,6 +56,12 @@ namespace llaminar2
 
         // Select and initialize backend
         CollectiveBackendType type = selectBackendType(group);
+
+        // Log backend selection with group composition
+        LOG_INFO("BackendRouter: Selected " << toString(type) << " for group '" << group.name
+                                            << "' (cuda_count=" << group.cuda_count << ", rocm_count=" << group.rocm_count
+                                            << ", heterogeneous=" << (group.isHeterogeneous() ? "true" : "false") << ")");
+
         ICollectiveBackend *backend = getOrCreateBackend(type);
 
         if (backend && !backend->isInitialized())
@@ -81,23 +87,39 @@ namespace llaminar2
         BackendSelection selection;
         selection.type = selectBackendType(group);
 
-        // Generate reason string
-        if (group.isGlobal())
+        // Generate reason string based on selection type and group composition
+        // Note: NCCL/RCCL support cross-rank (GLOBAL scope) communication via
+        // ncclCommInitRank/rcclCommInitRank, so we prefer them for homogeneous GPU groups.
+        if (group.allCUDA() && selection.type == CollectiveBackendType::NCCL)
         {
-            selection.reason = "Global scope requires MPI";
+            if (group.isGlobal())
+            {
+                selection.reason = "All CUDA devices (cross-rank) - using NCCL";
+            }
+            else
+            {
+                selection.reason = "All CUDA devices - using NCCL";
+            }
         }
-        else if (group.allCUDA())
+        else if (group.allROCm() && selection.type == CollectiveBackendType::RCCL)
         {
-            selection.reason = "All CUDA devices - using NCCL";
-        }
-        else if (group.allROCm())
-        {
-            selection.reason = "All ROCm devices - using RCCL";
+            if (group.isGlobal())
+            {
+                selection.reason = "All ROCm devices (cross-rank) - using RCCL";
+            }
+            else
+            {
+                selection.reason = "All ROCm devices - using RCCL";
+            }
         }
         else if (group.isHeterogeneous() && group.cuda_count > 0 && group.rocm_count > 0 &&
                  selection.type == CollectiveBackendType::PCIE_BAR)
         {
             selection.reason = "CUDA + ROCm mix - using direct PCIe BAR P2P (~2.65 GB/s)";
+        }
+        else if (group.isGlobal() && selection.type == CollectiveBackendType::MPI)
+        {
+            selection.reason = "Global scope (heterogeneous or CPU-only) - using MPI";
         }
         else if (group.isHeterogeneous())
         {
@@ -465,13 +487,17 @@ namespace llaminar2
 
     CollectiveBackendType BackendRouter::selectBackendType(const DeviceGroup &group) const
     {
-        // Global scope always uses MPI
-        if (group.isGlobal())
-        {
-            return CollectiveBackendType::MPI;
-        }
+        // =========================================================================
+        // Native GPU Collectives (NCCL/RCCL)
+        // =========================================================================
+        // Both NCCL and RCCL support cross-rank (MPI) communication via
+        // ncclCommInitRank/rcclCommInitRank. They are preferred for GPU collectives
+        // regardless of scope (LOCAL or GLOBAL) when the group is homogeneous.
+        //
+        // This enables GPU-native AllReduce even for tensor-parallel inference
+        // across MPI ranks, avoiding GPU→CPU→GPU transfers through MPI.
+        // =========================================================================
 
-        // Local scope: prefer native GPU backend if homogeneous
         if (group.allCUDA() && factory_->isAvailable(CollectiveBackendType::NCCL))
         {
             return CollectiveBackendType::NCCL;
@@ -482,8 +508,18 @@ namespace llaminar2
             return CollectiveBackendType::RCCL;
         }
 
+        // For GLOBAL scope (cross-rank MPI), heterogeneous groups MUST use MPI.
+        // PCIeBAR is only valid for LOCAL scope (intra-rank, same process)
+        // because it requires both CUDA and ROCm devices to be in the same process.
+        if (group.isGlobal())
+        {
+            return CollectiveBackendType::MPI;
+        }
+
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-        // CUDA + ROCm mix: prefer PCIe BAR if available (direct P2P)
+        // LOCAL scope with CUDA + ROCm mix: prefer PCIe BAR if available (direct P2P)
+        // This is for intra-rank heterogeneous GPU communication where both
+        // CUDA and ROCm devices are accessible from the same MPI rank.
         if (group.isHeterogeneous() && group.cuda_count > 0 && group.rocm_count > 0)
         {
             if (factory_->isAvailable(CollectiveBackendType::PCIE_BAR))

@@ -22,6 +22,7 @@
 #include "DirectP2P.h"
 #include "../../utils/Logger.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <map>
@@ -153,6 +154,38 @@ namespace llaminar2
                 return true;
             }
             return false;
+        }
+
+        /**
+         * @brief Get PCIe bus ID for a ROCm device ordinal
+         * @param rocm_ordinal ROCm device ordinal (0, 1, ...)
+         * @return PCIe bus ID string (e.g., "0000:1a:00.0") or empty if failed
+         */
+        std::string getROCmPCIBusID(int rocm_ordinal)
+        {
+            hipDeviceProp_t prop;
+            if (hipGetDeviceProperties(&prop, rocm_ordinal) != hipSuccess)
+            {
+                return "";
+            }
+
+            // Format: domain:bus:device.function
+            char bus_id[32];
+            snprintf(bus_id, sizeof(bus_id), "%04x:%02x:%02x.0",
+                     prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+            return std::string(bus_id);
+        }
+
+        /**
+         * @brief Normalize PCIe bus ID for comparison (handles case differences)
+         * Converts "0000:1a:00.0" to lowercase without leading zeros in domain
+         */
+        std::string normalizePCIBusID(const std::string &bus_id)
+        {
+            std::string result = bus_id;
+            // Convert to lowercase for comparison
+            std::transform(result.begin(), result.end(), result.begin(), ::tolower);
+            return result;
         }
 
         /**
@@ -382,6 +415,15 @@ namespace llaminar2
         impl_->cuda_device = cuda_device.ordinal;
         impl_->rocm_device = rocm_device.ordinal;
 
+        // Get the PCIe bus ID for the requested ROCm device
+        std::string requested_pci = getROCmPCIBusID(rocm_device.ordinal);
+        if (requested_pci.empty())
+        {
+            LOG_ERROR("Cannot get PCIe bus ID for ROCm device " << rocm_device.ordinal);
+            return false;
+        }
+        LOG_INFO("ROCm device " << rocm_device.ordinal << " has PCIe bus ID: " << requested_pci);
+
         // Discover AMD GPU BARs
         auto bars = discoverAmdBars();
         if (bars.empty())
@@ -390,13 +432,61 @@ namespace llaminar2
             return false;
         }
 
-        // Find the largest BAR (MI50s have 32GB BARs)
+        // Find the BAR matching the requested ROCm device
+        // The BAR's pci_address is the full PCI address (e.g., "0000:1a:00.0")
+        // We need to match it to the device's PCI address
         PCIeBarInfo *best_bar = nullptr;
+        std::string norm_requested = normalizePCIBusID(requested_pci);
+
+        // First try to find an exact match for the requested ROCm device
         for (auto &bar : bars)
         {
-            if (bar.bar_size > 0 && (!best_bar || bar.bar_size > best_bar->bar_size))
+            // The bar.pci_address might be different format, normalize for comparison
+            // sysfs uses lowercase, hip uses uppercase in some fields
+            std::string norm_bar = normalizePCIBusID(bar.pci_address);
+
+            if (bar.bar_size > 0 && norm_bar == norm_requested)
             {
                 best_bar = &bar;
+                LOG_INFO("Found matching BAR for ROCm device " << rocm_device.ordinal
+                                                               << " at " << bar.pci_address);
+                break;
+            }
+        }
+
+        // If no exact match, try to find the BAR on the same PCIe switch/bus
+        // by comparing the bus portion (e.g., "0000:1a" from "0000:1a:00.0")
+        if (!best_bar)
+        {
+            LOG_WARN("No exact BAR match for " << requested_pci << ", searching for same-bus BAR");
+            std::string req_bus_prefix = norm_requested.substr(0, norm_requested.find_last_of(':'));
+
+            for (auto &bar : bars)
+            {
+                std::string norm_bar = normalizePCIBusID(bar.pci_address);
+                std::string bar_bus_prefix = norm_bar.substr(0, norm_bar.find_last_of(':'));
+
+                if (bar.bar_size > 0 && bar_bus_prefix == req_bus_prefix)
+                {
+                    best_bar = &bar;
+                    LOG_INFO("Found same-bus BAR for ROCm device " << rocm_device.ordinal
+                                                                   << " at " << bar.pci_address);
+                    break;
+                }
+            }
+        }
+
+        // If still no match, fall back to largest BAR (legacy behavior) with warning
+        if (!best_bar)
+        {
+            LOG_WARN("No matching BAR found for ROCm device " << rocm_device.ordinal
+                                                              << " at " << requested_pci << ", falling back to largest BAR");
+            for (auto &bar : bars)
+            {
+                if (bar.bar_size > 0 && (!best_bar || bar.bar_size > best_bar->bar_size))
+                {
+                    best_bar = &bar;
+                }
             }
         }
 

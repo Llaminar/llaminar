@@ -35,7 +35,7 @@ public:
     StageBufferRequirements getBufferRequirements() const override { return {}; }
     ComputeStageType type() const override { return ComputeStageType::COPY; }
     bool supportsBackend(ComputeBackendType) const override { return true; }
-    StageDumpInfo getDumpInfo() const override { return {}; }
+    StageDumpInfo buildDumpInfoImpl() const override { return {}; }
 
 private:
     std::string name_;

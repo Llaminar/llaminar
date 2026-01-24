@@ -140,8 +140,8 @@ The executable automatically configures:
 # Custom prompt and decode length
 ./build_v2_release/llaminar2 --benchmark -m model.gguf -p "Your prompt here" -n 100
 
-# With kernel profiling
-LLAMINAR_PROFILE_KERNELS=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -n 50
+# With full profiling (kernel + executor overhead)
+LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -n 50
 ```
 
 **Features**:
@@ -171,10 +171,12 @@ LLAMINAR_PROFILE_KERNELS=1 ./build_v2_release/llaminar2 --benchmark -m model.ggu
 Enable per-kernel timing breakdown:
 
 ```bash
-LLAMINAR_PROFILE_KERNELS=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -n 50
+LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -n 50
 ```
 
 **Profiled Operations**: `GEMM_Q8`, `ATTENTION`, `FFN_DOWN`, `FFN_GATE`, `FFN_UP`, `LM_HEAD`, `QUANTIZE_Q8`, `RMS_NORM`, `SWIGLU`, `ROPE`, `RESIDUAL_ADD`, `EMBEDDING`
+
+**Note**: `LLAMINAR_PROFILING=1` enables both kernel timing and executor overhead profiling in a single flag.
 
 ---
 
@@ -1330,8 +1332,9 @@ TEST(Test__MyNewKernel, BasicFunctionality) {
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `LLAMINAR_LOG_LEVEL` | Logging verbosity (ERROR/WARN/INFO/DEBUG/TRACE) | INFO |
-| `LLAMINAR_PROFILE_KERNELS` | Enable per-kernel timing in benchmark mode | Disabled |
-| `LLAMINAR_EXECUTOR_PROFILING` | Enable per-stage profiling in GraphExecutor | Disabled |
+| `LLAMINAR_PROFILING` | Enable all profiling (kernel timing + executor overhead) | Disabled |
+| `LLAMINAR_PROFILE_KERNELS` | (Legacy) Enable per-kernel timing in benchmark mode | Disabled |
+| `LLAMINAR_EXECUTOR_PROFILING` | (Legacy) Enable per-stage profiling in GraphExecutor | Disabled |
 | `LLAMINAR_VALIDATE_BUFFERS` | Enable buffer validation after stage execution | Auto-ON in Debug/Integration |
 | `LLAMINAR_VALIDATE_INPUTS` | Enable input validation before stage execution | Auto-ON in Debug/Integration |
 | `LLAMINAR_FAIL_ON_ZERO` | Fail on zero tensors during validation | Disabled |

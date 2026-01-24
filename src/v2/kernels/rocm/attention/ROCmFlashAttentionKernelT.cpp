@@ -14,6 +14,7 @@
 #include "../../../execution/DeviceWorkspaceManager.h"
 #include "../../../execution/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/KernelProfiler.h"
 #include <cstring>
 
 // Extern "C" declarations for HIP kernel wrappers
@@ -216,6 +217,8 @@ namespace llaminar2
             bool causal, int window_size, int position_offset,
             int device_idx)
         {
+            KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
+
             if (!Q || !K || !V || !output)
             {
                 LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Null pointer input");

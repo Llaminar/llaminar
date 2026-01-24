@@ -399,6 +399,17 @@ namespace llaminar2::test
             return true;
         }
 
+        bool executeStridedAllgather(
+            ITensor *local_input,
+            ITensor *full_output,
+            size_t actual_seq_len,
+            DeviceId tensor_device) override
+        {
+            // Mock just delegates to regular allgather
+            // Real implementation uses NCCL + CUDA deinterleave kernel
+            return executeAllgather(local_input, full_output, actual_seq_len, tensor_device);
+        }
+
         bool executeAllgatherv(
             ITensor * /*local_input*/,
             ITensor * /*full_output*/,

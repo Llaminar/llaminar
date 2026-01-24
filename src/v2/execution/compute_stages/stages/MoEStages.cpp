@@ -124,7 +124,7 @@ namespace llaminar2
         return reqs;
     }
 
-    StageDumpInfo MoERouterStage::getDumpInfo() const
+    StageDumpInfo MoERouterStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
 
@@ -247,7 +247,7 @@ namespace llaminar2
         return reqs;
     }
 
-    StageDumpInfo MoEExpertStage::getDumpInfo() const
+    StageDumpInfo MoEExpertStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
 
@@ -352,7 +352,7 @@ namespace llaminar2
         return reqs;
     }
 
-    StageDumpInfo MoECombineStage::getDumpInfo() const
+    StageDumpInfo MoECombineStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
 

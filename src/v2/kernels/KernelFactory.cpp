@@ -266,9 +266,11 @@ namespace llaminar
                         int head_dim,
                         float rope_theta,
                         const llaminar2::MPIContext *mpi_ctx,
-                        int device_idx) override
+                        int device_idx,
+                        int pos_offset = 0) override
                     {
-                        (void)mpi_ctx; // Not used in typed kernel
+                        (void)mpi_ctx;    // Not used in typed kernel
+                        (void)pos_offset; // CPU kernel doesn't need this optimization
 
                         // Validate tensors are FP32
                         if (!Q)
@@ -346,9 +348,11 @@ namespace llaminar
                         int head_dim,
                         float rope_theta,
                         const llaminar2::MPIContext *mpi_ctx,
-                        int device_idx) override
+                        int device_idx,
+                        int pos_offset = 0) override
                     {
-                        (void)mpi_ctx; // Not used in typed kernel
+                        (void)mpi_ctx;    // Not used in typed kernel
+                        (void)pos_offset; // CPU kernel doesn't need this optimization
 
                         // Validate tensors are Q8_1
                         if (!Q)
@@ -594,6 +598,90 @@ namespace llaminar
             KernelFactory::ROCmOrdinalGuard::ROCmOrdinalGuard(int) {}
             KernelFactory::ROCmOrdinalGuard::~ROCmOrdinalGuard() {}
 #endif
+
+            // ==========================================================================
+            // TensorBase Dynamic Dispatch GEMM
+            // ==========================================================================
+
+            std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
+                const llaminar2::TensorBase *tensor, DeviceType dev_type)
+            {
+                // Two-way dispatch based on interface:
+                // 1. IINT8Unpackable → QuantisedGemmKernel (quantized weights)
+                // 2. Otherwise → FloatingPointGemmKernel (FP32/FP16/BF16)
+
+                const auto *quantized = dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor);
+
+                if (quantized)
+                {
+                    // Quantized tensor - use INT8 GEMM kernel
+                    switch (dev_type)
+                    {
+                    case DeviceType::CPU:
+                    {
+                        auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                        return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    }
+#ifdef HAVE_CUDA
+                    case DeviceType::CUDA:
+                    {
+                        auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
+                        int cuda_device_id = getCUDADeviceIdForKernel(tensor);
+                        return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    }
+#endif
+#ifdef HAVE_ROCM
+                    case DeviceType::ROCm:
+                    {
+                        auto *packed = ensureROCmPackedWeightsInTensorCache(tensor);
+                        int rocm_device_id = getROCmDeviceIdForKernel(tensor);
+                        return std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(packed, rocm_device_id);
+                    }
+#endif
+                    default:
+                        throw std::runtime_error(
+                            "Quantized GEMM not supported on device " + std::to_string(static_cast<int>(dev_type)));
+                    }
+                }
+                else
+                {
+                    // Floating point tensor - use BLAS-based kernel
+                    switch (dev_type)
+                    {
+                    case DeviceType::CPU:
+                        return std::make_unique<llaminar2::gemm_v4::FloatingPointGemmKernel>(tensor);
+#ifdef HAVE_CUDA
+                    case DeviceType::CUDA:
+                    {
+                        int cuda_device_id = getCUDADeviceIdForKernel(tensor);
+                        auto precision = llaminar2::cuda::CUDAFloatingPointGemmKernel::Precision::FP32;
+                        if (tensor->native_type() == llaminar2::TensorType::FP16)
+                            precision = llaminar2::cuda::CUDAFloatingPointGemmKernel::Precision::FP16;
+                        else if (tensor->native_type() == llaminar2::TensorType::BF16)
+                            precision = llaminar2::cuda::CUDAFloatingPointGemmKernel::Precision::BF16;
+                        return std::make_unique<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
+                            tensor, cuda_device_id, precision);
+                    }
+#endif
+#ifdef HAVE_ROCM
+                    case DeviceType::ROCm:
+                    {
+                        int rocm_device_id = getROCmDeviceIdForKernel(tensor);
+                        auto precision = llaminar2::rocm::ROCmFloatingPointGemmKernel::Precision::FP32;
+                        if (tensor->native_type() == llaminar2::TensorType::FP16)
+                            precision = llaminar2::rocm::ROCmFloatingPointGemmKernel::Precision::FP16;
+                        else if (tensor->native_type() == llaminar2::TensorType::BF16)
+                            precision = llaminar2::rocm::ROCmFloatingPointGemmKernel::Precision::BF16;
+                        return std::make_unique<llaminar2::rocm::ROCmFloatingPointGemmKernel>(
+                            tensor, rocm_device_id, precision);
+                    }
+#endif
+                    default:
+                        throw std::runtime_error(
+                            "Floating-point GEMM not supported on device " + std::to_string(static_cast<int>(dev_type)));
+                    }
+                }
+            }
 
             // ==========================================================================
             // IQ4_NL Tensor GEMM
@@ -1806,7 +1894,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "ResidualAdd", "FP32");
+                    return std::make_unique<llaminar2::rocm::ROCmResidualAddKernelT<llaminar2::ActivationPrecision::FP32>>();
 #endif
 
                 default:
@@ -1830,7 +1918,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "ResidualAdd", "BF16");
+                    return std::make_unique<llaminar2::rocm::ROCmResidualAddKernelT<llaminar2::ActivationPrecision::BF16>>();
 #endif
 
                 default:
@@ -1854,7 +1942,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "ResidualAdd", "FP16");
+                    return std::make_unique<llaminar2::rocm::ROCmResidualAddKernelT<llaminar2::ActivationPrecision::FP16>>();
 #endif
 
                 default:
@@ -2954,48 +3042,8 @@ namespace llaminar
                         dispatch_tensor = slice->inner();
                     }
 
-                    // Create CUDA kernel based on tensor type
-                    if (auto *t = dynamic_cast<const llaminar2::IQ4_NLTensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, target_device);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q4_0Tensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, target_device);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q8_0Tensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, target_device);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q8_1Tensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, target_device);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::FP32Tensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, target_device);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::FP16Tensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, target_device);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::BF16Tensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, target_device);
-                    }
-                    else
-                    {
-                        // Debug: What type IS dispatch_tensor?
-                        LOG_ERROR("[KernelFactory::getOrCreateGemm] CUDA dispatch FAILED for tensor type "
-                                  << static_cast<int>(tensor->native_type())
-                                  << " (dispatch_tensor=" << dispatch_tensor
-                                  << " tensor=" << tensor
-                                  << " typeid=" << typeid(*dispatch_tensor).name() << ")");
-                        // NO FALLBACK: tensor type not supported on CUDA
-                        throw std::runtime_error(
-                            "Tensor type " + std::to_string(static_cast<int>(tensor->native_type())) +
-                            " not supported on CUDA - no silent fallback to CPU");
-                    }
+                    // Dispatch to type-specific createGemm via dynamic dispatch
+                    kernel = createGemm(dispatch_tensor, target_device);
                 }
 #endif
 #ifdef HAVE_ROCM
@@ -3016,62 +3064,8 @@ namespace llaminar
                         dispatch_tensor = slice->inner();
                     }
 
-                    // Create ROCm kernel based on tensor type
-                    // Note: ROCmQuantisedGemmKernel handles many quantized types automatically
-                    // Use pre-packed weights from tensor cache for efficiency
-                    if (auto *t = dynamic_cast<const llaminar2::Q4_0Tensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, target_device);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ4_NLTensor *>(dispatch_tensor))
-                    {
-                        // IQ4_NL is supported by ROCmQuantisedGemmKernel - use pre-packed weights
-                        auto *packed = ensureROCmPackedWeightsInTensorCache(tensor);
-                        int rocm_device_id = getROCmDeviceIdForKernel(tensor);
-                        kernel = std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(packed, rocm_device_id);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q8_0Tensor *>(dispatch_tensor))
-                    {
-                        auto *packed = ensureROCmPackedWeightsInTensorCache(tensor);
-                        int rocm_device_id = getROCmDeviceIdForKernel(tensor);
-                        kernel = std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(packed, rocm_device_id);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q8_1Tensor *>(dispatch_tensor))
-                    {
-                        auto *packed = ensureROCmPackedWeightsInTensorCache(tensor);
-                        int rocm_device_id = getROCmDeviceIdForKernel(tensor);
-                        kernel = std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(packed, rocm_device_id);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::FP32Tensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, target_device);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::FP16Tensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, target_device);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::BF16Tensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, target_device);
-                    }
-                    else
-                    {
-                        // Try using ROCmQuantisedGemmKernel for other quantized types
-                        // It supports IQ4_NL, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, and K-quants
-                        // Use pre-packed weights from tensor cache
-                        int rocm_device_id = getROCmDeviceIdForKernel(tensor);
-                        try
-                        {
-                            auto *packed = ensureROCmPackedWeightsInTensorCache(tensor);
-                            kernel = std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(packed, rocm_device_id);
-                        }
-                        catch (const std::exception &e)
-                        {
-                            throw std::runtime_error(
-                                "Tensor type " + std::to_string(static_cast<int>(tensor->native_type())) +
-                                " not supported on ROCm - no silent fallback to CPU: " + e.what());
-                        }
-                    }
+                    // Dispatch to type-specific createGemm via dynamic dispatch
+                    kernel = createGemm(dispatch_tensor, target_device);
                 }
 #endif
 

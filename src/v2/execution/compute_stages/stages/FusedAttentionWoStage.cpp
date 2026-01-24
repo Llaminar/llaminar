@@ -793,7 +793,7 @@ namespace llaminar2
         return backend == ComputeBackendType::CPU;
     }
 
-    StageDumpInfo FusedAttentionWoStage::getDumpInfo() const
+    StageDumpInfo FusedAttentionWoStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
 

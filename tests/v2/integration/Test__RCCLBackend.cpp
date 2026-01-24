@@ -22,17 +22,23 @@
 
 #ifdef HAVE_RCCL
 #include "collective/backends/RCCLBackend.h"
+#include "collective/backends/RCCLDynamicLoader.h"
 #include "collective/DeviceGroup.h"
 #include "backends/DeviceId.h"
 #include "utils/Logger.h"
 #include <hip/hip_runtime.h>
-#include <rccl/rccl.h>
+// NOTE: We do NOT include <rccl/rccl.h> directly!
+// Instead, we use the rccl_dynamic namespace which loads RCCL via dlopen
+// with RTLD_LOCAL to avoid symbol conflicts with NCCL.
 #include <vector>
 #include <cmath>
 #include <numeric>
 #include <iostream>
 #include <thread>
 #include <atomic>
+
+// Import RCCL types and functions from our dynamic loader namespace
+using namespace llaminar2::rccl_dynamic;
 
 namespace llaminar2
 {

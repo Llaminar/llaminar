@@ -157,6 +157,28 @@ namespace llaminar2
             DeviceId tensor_device) override;
 
         /**
+         * @brief Execute a strided AllGather for column-parallel operations
+         *
+         * Optimized for column-parallel LM head where output has interleaved
+         * columns from all ranks. Uses NCCL + GPU deinterleave kernel to avoid
+         * host memory staging.
+         *
+         * Input:  [seq_len, local_dim] on each rank
+         * Output: [seq_len, local_dim * world_size] with strided layout
+         *
+         * @param local_input Local slice [seq_len, local_dim]
+         * @param full_output Full output [seq_len, full_dim]
+         * @param actual_seq_len Actual sequence length (0 = use tensor rows)
+         * @param tensor_device Device where tensors reside (must be CUDA)
+         * @return true on success, false if not CUDA or backend not available
+         */
+        bool executeStridedAllgather(
+            ITensor *local_input,
+            ITensor *full_output,
+            size_t actual_seq_len,
+            DeviceId tensor_device);
+
+        /**
          * @brief Execute a variable-sized AllGather operation (allgatherv)
          *
          * Unlike executeAllgather which assumes equal send counts per rank,

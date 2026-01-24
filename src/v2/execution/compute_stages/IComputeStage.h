@@ -186,7 +186,7 @@ namespace llaminar2
         };
 
         std::vector<InputBuffer> inputs;
-        std::vector<OutputBuffer> outputs;
+        mutable std::vector<OutputBuffer> outputs;  // mutable for ensureOutputsOnHost() const
         std::vector<WeightBuffer> weights;
         std::vector<ScalarParam> scalars;
 
@@ -247,7 +247,7 @@ namespace llaminar2
          * This is a deferred sync - outputs are NOT synced in addOutput().
          * This allows GPU kernels to run async without blocking.
          */
-        void ensureOutputsOnHost();
+        void ensureOutputsOnHost() const;
     };
 
     /**
@@ -391,17 +391,32 @@ namespace llaminar2
         virtual bool supportsBackend(ComputeBackendType backend) const = 0;
 
         /**
-         * @brief Get detailed dump info for debugging
+         * @brief Get detailed dump info for debugging (cached)
          *
          * Returns comprehensive information about all buffers and parameters
          * used by this stage, enabling full reproducibility of execution.
          *
-         * @note This is a REQUIRED method - all stages must implement it for
-         *       the TensorVerification framework to work correctly. Without
-         *       proper getDumpInfo(), entry/exit validation cannot inspect
-         *       stage inputs and outputs.
+         * This method caches the result after first call since tensor pointers
+         * don't change after graph construction. Call invalidateDumpInfoCache()
+         * if stage parameters change (rare - only for dynamic reconfiguration).
+         *
+         * @note Performance: First call builds info, subsequent calls return cached.
          */
-        virtual StageDumpInfo getDumpInfo() const = 0;
+        const StageDumpInfo& getDumpInfo() const
+        {
+            if (!dump_info_cached_) {
+                cached_dump_info_ = buildDumpInfoImpl();
+                dump_info_cached_ = true;
+            }
+            return cached_dump_info_;
+        }
+
+        /**
+         * @brief Invalidate cached dump info (for dynamic reconfiguration)
+         *
+         * Call this if stage parameters change after construction (rare).
+         */
+        void invalidateDumpInfoCache() const { dump_info_cached_ = false; }
 
         /**
          * @brief Get buffer requirements for this stage
@@ -526,6 +541,16 @@ namespace llaminar2
         }
 
     protected:
+        /**
+         * @brief Build dump info (implemented by derived classes)
+         *
+         * This is the method stages implement to describe their buffers.
+         * Called once by getDumpInfo() and cached thereafter.
+         *
+         * @note This is a REQUIRED method - all stages must implement it for
+         *       the TensorVerification framework to work correctly.
+         */
+        virtual StageDumpInfo buildDumpInfoImpl() const = 0;
         // =========================================================================
         // Tracing Infrastructure (for debugging/profiling)
         // =========================================================================
@@ -628,6 +653,10 @@ namespace llaminar2
 
     private:
         DeviceId device_id_; ///< Authoritative device (set via constructor, no default)
+
+        // Cached dump info (built once, reused for all subsequent calls)
+        mutable StageDumpInfo cached_dump_info_;
+        mutable bool dump_info_cached_ = false;
 
         static bool shapesMatch(const std::vector<size_t> &actual,
                                 const std::vector<size_t> &expected,

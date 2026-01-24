@@ -388,9 +388,11 @@ namespace llaminar2
         int head_dim,
         float rope_theta,
         const MPIContext *mpi_ctx,
-        int device_idx)
+        int device_idx,
+        int pos_offset)
     {
         (void)mpi_ctx;
+        (void)pos_offset; // CPU kernel doesn't need this optimization
 
         if (!Q || Q->native_type() != TensorType::FP32)
         {
@@ -439,9 +441,11 @@ namespace llaminar2
         int head_dim,
         float rope_theta,
         const MPIContext *mpi_ctx,
-        int device_idx)
+        int device_idx,
+        int pos_offset)
     {
         (void)mpi_ctx;
+        (void)pos_offset; // CPU kernel doesn't need this optimization
 
         if (!Q || Q->native_type() != TensorType::BF16)
         {
@@ -490,9 +494,11 @@ namespace llaminar2
         int head_dim,
         float rope_theta,
         const MPIContext *mpi_ctx,
-        int device_idx)
+        int device_idx,
+        int pos_offset)
     {
         (void)mpi_ctx;
+        (void)pos_offset; // CPU kernel doesn't need this optimization
 
         if (!Q || Q->native_type() != TensorType::FP16)
         {
@@ -544,9 +550,11 @@ namespace llaminar2
         int head_dim,
         float rope_theta,
         const MPIContext *mpi_ctx,
-        int device_idx)
+        int device_idx,
+        int pos_offset)
     {
         (void)mpi_ctx;
+        (void)pos_offset; // CPU kernel doesn't need this optimization
 
         if (!Q || Q->native_type() != TensorType::Q8_1)
         {
@@ -1082,9 +1090,11 @@ namespace llaminar2
         int head_dim,
         float rope_theta,
         const MPIContext *mpi_ctx,
-        int device_idx)
+        int device_idx,
+        int pos_offset)
     {
         (void)mpi_ctx;
+        (void)pos_offset; // CPU kernel doesn't need this optimization
 
         if (!Q || Q->native_type() != TensorType::Q16_1)
         {

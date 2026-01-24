@@ -205,7 +205,8 @@ namespace llaminar2
             int head_dim,
             float rope_theta,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1,
+            int pos_offset = 0) override;
     };
 
     // =========================================================================
@@ -295,7 +296,8 @@ namespace llaminar2
             int head_dim,
             float rope_theta,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1,
+            int pos_offset = 0) override;
     };
 
     // =========================================================================
@@ -385,7 +387,8 @@ namespace llaminar2
             int head_dim,
             float rope_theta,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1,
+            int pos_offset = 0) override;
     };
 
     // =========================================================================
@@ -485,7 +488,8 @@ namespace llaminar2
             int head_dim,
             float rope_theta,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1,
+            int pos_offset = 0) override;
 
         // Hybrid mode: Q8_1 input → FP32 output (no requantization)
         bool apply_q8_1_to_fp32(
@@ -695,7 +699,8 @@ namespace llaminar2
             int head_dim,
             float rope_theta,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
+            int device_idx = -1,
+            int pos_offset = 0) override;
 
     private:
         primitives::RoPEPersistentState tls_state_;

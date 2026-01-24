@@ -6,13 +6,22 @@
  * the same template pattern as CPURoPEKernelT. Specialized for FP32,
  * BF16, and FP16 precisions.
  *
+ * Supports IWorkspaceConsumer for pre-allocated position_ids buffer.
+ *
+ * OPTIMIZATION PATHS (v5):
+ * - DECODE (seq_len=1): Scalar position parameter - NO memcpy
+ * - CONTIGUOUS (nullptr position_ids + pos_offset): Compute on GPU - ZERO memcpy
+ * - NON-CONTIGUOUS: Use workspace buffer if bound, else fallback to malloc/memcpy
+ *
  * @author Llaminar Team
  * @date 2025-01-14
  */
 
 #pragma once
 
+#include "../../../execution/DeviceWorkspaceManager.h"
 #include "../../../execution/RuntimeConfig.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h" // For FP32Tensor, BF16Tensor, FP16Tensor
 #include "../../../tensors/BlockStructures.h"
@@ -42,16 +51,35 @@ namespace llaminar2
         // =========================================================================
 
         template <>
-        class CUDARoPEKernelT<ActivationPrecision::FP32> : public ITensorRoPE
+        class CUDARoPEKernelT<ActivationPrecision::FP32> : public ITensorRoPE, public IWorkspaceConsumer
         {
         public:
             using StorageType = float;
 
             explicit CUDARoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
-                : device_idx_(device_idx), rope_theta_(rope_theta) {}
+                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr) {}
             ~CUDARoPEKernelT() override = default;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
+
+            // ===== IWorkspaceConsumer interface =====
+            WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
+            {
+                (void)n;
+                (void)k;
+                WorkspaceRequirements reqs;
+                reqs.buffers.push_back({
+                    RoPEWorkspaceBuffers::POSITION_IDS,
+                    static_cast<size_t>(m) * sizeof(int),
+                    256, // CUDA alignment
+                    true // Required
+                });
+                return reqs;
+            }
+
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override { workspace_ = workspace; }
+            bool hasWorkspace() const override { return workspace_ != nullptr; }
+            DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
 
             // ===== ITensorRoPE interface =====
             bool apply(
@@ -126,7 +154,8 @@ namespace llaminar2
                 int n_kv_heads,
                 int head_dim,
                 float rope_theta,
-                int device_idx = -1);
+                int device_idx = -1,
+                int pos_offset = 0);
 
             // ===== Tensor-aware API (uses GPU memory, marks outputs dirty) =====
             bool apply_tensor(
@@ -139,12 +168,14 @@ namespace llaminar2
                 int head_dim,
                 float rope_theta,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1,
+                int pos_offset = 0) override
             {
                 (void)mpi_ctx;
 
-                LOG_DEBUG("[CUDARoPEKernelT<FP32>] apply_tensor called: seq_len=" << seq_len 
-                          << " n_heads=" << n_heads << " device_idx=" << device_idx);
+                LOG_DEBUG("[CUDARoPEKernelT<FP32>] apply_tensor called: seq_len=" << seq_len
+                                                                                  << " n_heads=" << n_heads << " device_idx=" << device_idx
+                                                                                  << " pos_offset=" << pos_offset);
 
                 if (!Q || Q->native_type() != TensorType::FP32)
                 {
@@ -192,7 +223,7 @@ namespace llaminar2
                 }
 
                 // Execute on GPU
-                bool success = apply_typed(q_gpu, k_gpu, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+                bool success = apply_typed(q_gpu, k_gpu, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, pos_offset);
 
                 // Mark tensors as modified on GPU
                 if (success)
@@ -213,6 +244,7 @@ namespace llaminar2
         private:
             int device_idx_;
             float rope_theta_;
+            DeviceWorkspaceManager *workspace_;
         };
 
         // =========================================================================
@@ -220,16 +252,35 @@ namespace llaminar2
         // =========================================================================
 
         template <>
-        class CUDARoPEKernelT<ActivationPrecision::BF16> : public ITensorRoPE
+        class CUDARoPEKernelT<ActivationPrecision::BF16> : public ITensorRoPE, public IWorkspaceConsumer
         {
         public:
             using StorageType = uint16_t;
 
             explicit CUDARoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
-                : device_idx_(device_idx), rope_theta_(rope_theta) {}
+                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr) {}
             ~CUDARoPEKernelT() override = default;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
+
+            // ===== IWorkspaceConsumer interface =====
+            WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
+            {
+                (void)n;
+                (void)k;
+                WorkspaceRequirements reqs;
+                reqs.buffers.push_back({
+                    RoPEWorkspaceBuffers::POSITION_IDS,
+                    static_cast<size_t>(m) * sizeof(int),
+                    256, // CUDA alignment
+                    true // Required
+                });
+                return reqs;
+            }
+
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override { workspace_ = workspace; }
+            bool hasWorkspace() const override { return workspace_ != nullptr; }
+            DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
 
             // ===== ITensorRoPE interface =====
             bool apply(
@@ -306,7 +357,8 @@ namespace llaminar2
                 int n_kv_heads,
                 int head_dim,
                 float rope_theta,
-                int device_idx = -1);
+                int device_idx = -1,
+                int pos_offset = 0);
 
             // ===== Tensor-aware API (uses GPU memory, marks outputs dirty) =====
             bool apply_tensor(
@@ -319,7 +371,8 @@ namespace llaminar2
                 int head_dim,
                 float rope_theta,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1,
+                int pos_offset = 0) override
             {
                 (void)mpi_ctx;
 
@@ -369,7 +422,7 @@ namespace llaminar2
                 }
 
                 // Execute on GPU
-                bool success = apply_typed(q_gpu, k_gpu, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+                bool success = apply_typed(q_gpu, k_gpu, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, pos_offset);
 
                 // Mark tensors as modified on GPU
                 if (success)
@@ -390,6 +443,7 @@ namespace llaminar2
         private:
             int device_idx_;
             float rope_theta_;
+            DeviceWorkspaceManager *workspace_;
         };
 
         // =========================================================================
@@ -397,16 +451,35 @@ namespace llaminar2
         // =========================================================================
 
         template <>
-        class CUDARoPEKernelT<ActivationPrecision::FP16> : public ITensorRoPE
+        class CUDARoPEKernelT<ActivationPrecision::FP16> : public ITensorRoPE, public IWorkspaceConsumer
         {
         public:
             using StorageType = uint16_t;
 
             explicit CUDARoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
-                : device_idx_(device_idx), rope_theta_(rope_theta) {}
+                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr) {}
             ~CUDARoPEKernelT() override = default;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
+
+            // ===== IWorkspaceConsumer interface =====
+            WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
+            {
+                (void)n;
+                (void)k;
+                WorkspaceRequirements reqs;
+                reqs.buffers.push_back({
+                    RoPEWorkspaceBuffers::POSITION_IDS,
+                    static_cast<size_t>(m) * sizeof(int),
+                    256, // CUDA alignment
+                    true // Required
+                });
+                return reqs;
+            }
+
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override { workspace_ = workspace; }
+            bool hasWorkspace() const override { return workspace_ != nullptr; }
+            DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
 
             // ===== ITensorRoPE interface =====
             bool apply(
@@ -483,7 +556,8 @@ namespace llaminar2
                 int n_kv_heads,
                 int head_dim,
                 float rope_theta,
-                int device_idx = -1);
+                int device_idx = -1,
+                int pos_offset = 0);
 
             // ===== Tensor-aware API (uses GPU memory, marks outputs dirty) =====
             bool apply_tensor(
@@ -496,7 +570,8 @@ namespace llaminar2
                 int head_dim,
                 float rope_theta,
                 const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                int device_idx = -1,
+                int pos_offset = 0) override
             {
                 (void)mpi_ctx;
 
@@ -546,7 +621,7 @@ namespace llaminar2
                 }
 
                 // Execute on GPU
-                bool success = apply_typed(q_gpu, k_gpu, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+                bool success = apply_typed(q_gpu, k_gpu, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, pos_offset);
 
                 // Mark tensors as modified on GPU
                 if (success)
@@ -567,6 +642,7 @@ namespace llaminar2
         private:
             int device_idx_;
             float rope_theta_;
+            DeviceWorkspaceManager *workspace_;
         };
 
     } // namespace cuda

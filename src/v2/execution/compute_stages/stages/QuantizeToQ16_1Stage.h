@@ -39,7 +39,7 @@ namespace llaminar2
         size_t estimatedFlops() const override { return params_.num_elements * 4; }
         size_t estimatedMemoryBytes() const override { return params_.num_elements * 6; }
         bool supportsBackend(ComputeBackendType backend) const override { return backend == ComputeBackendType::CPU; }
-        StageDumpInfo getDumpInfo() const override;
+        StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
 
     private:

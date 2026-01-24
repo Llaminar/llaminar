@@ -85,17 +85,54 @@ void list_devices()
     LOG_DEBUG("\n");
 }
 
-DeviceId parse_device(const std::string &device_str, DeviceManager &dm)
+DeviceId parse_device(const std::string &device_str, DeviceManager &dm, int local_rank = 0, int local_size = 1)
 {
     if (device_str == "auto")
     {
-        // DeviceManager returns 1-based indices for GPUs (0 = CPU)
-        int dm_idx = dm.select_device();
-        if (dm_idx == 0)
+        // MPI-aware device selection: distribute GPUs round-robin across local ranks
+        // This ensures that different MPI ranks on the same node use different GPUs
+
+        const auto &devices = dm.devices();
+
+        // Count available GPUs (skip device 0 which is CPU)
+        std::vector<size_t> gpu_indices;
+        for (size_t i = 1; i < devices.size(); ++i)
         {
+            const auto &dev = devices[i];
+            if (dev.type == ComputeBackendType::GPU_CUDA ||
+                dev.type == ComputeBackendType::GPU_ROCM)
+            {
+                gpu_indices.push_back(i);
+            }
+        }
+
+        if (gpu_indices.empty())
+        {
+            LOG_DEBUG("No GPUs available, falling back to CPU");
             return DeviceId::cpu();
         }
-        return DeviceId::cuda(dm_idx - 1);
+
+        // Round-robin GPU assignment based on local_rank
+        // local_rank 0 -> GPU 0, local_rank 1 -> GPU 1, etc.
+        size_t gpu_idx = local_rank % gpu_indices.size();
+        size_t dm_idx = gpu_indices[gpu_idx];
+
+        const auto &dev = devices[dm_idx];
+        LOG_DEBUG("MPI-aware auto-selected device: " << dev.name << " (type=" << static_cast<int>(dev.type)
+                                                     << ", device_id=" << dev.device_id << ")"
+                                                     << " for local_rank " << local_rank << "/" << local_size);
+
+        // Create DeviceId with the physical device ordinal, not the array index
+        switch (dev.type)
+        {
+        case ComputeBackendType::GPU_CUDA:
+            return DeviceId::cuda(dev.device_id);
+        case ComputeBackendType::GPU_ROCM:
+            return DeviceId::rocm(dev.device_id);
+        default:
+            LOG_WARN("Unknown GPU type in auto-select, falling back to CUDA ordinal");
+            return DeviceId::cuda(dev.device_id);
+        }
     }
 
     if (device_str == "cpu")
@@ -324,13 +361,38 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Parse device
-    DeviceId device_id = parse_device(args.device, dm);
+    // Get local rank for MPI-aware device selection
+    // This uses MPI_Comm_split_type to identify ranks on the same node
+    MPI_Comm local_comm;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, mpi_ctx->rank(),
+                        MPI_INFO_NULL, &local_comm);
+    int local_rank, local_size;
+    MPI_Comm_rank(local_comm, &local_rank);
+    MPI_Comm_size(local_comm, &local_size);
+    MPI_Comm_free(&local_comm);
+
+    LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Local rank: " << local_rank << "/" << local_size
+                       << " (for GPU assignment)");
+
+    // When --no-mpi-bootstrap is used and there are multiple local ranks,
+    // re-initialize DeviceManager WITHOUT NUMA filtering so all GPUs are visible.
+    // This allows manual multi-rank setups to cross NUMA boundaries if needed.
+    // Standard bootstrap respects NUMA affinity for optimal memory bandwidth.
+    if (args.mpi_no_bootstrap && local_size > 1)
+    {
+        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] --no-mpi-bootstrap with multi-rank: re-initializing DeviceManager without NUMA filtering");
+        dm.initialize(-1); // -1 = no NUMA filtering, all GPUs visible
+    }
+
+    // Parse device (MPI-aware: distributes GPUs across local ranks)
+    DeviceId device_id = parse_device(args.device, dm, local_rank, local_size);
     if (!device_id.is_valid())
     {
         MPI_Finalize();
         return 1;
     }
+
+    LOG_INFO("[Rank " << mpi_ctx->rank() << "] Using device: " << device_id.to_string());
 
     // Parse placement strategy
     WeightPlacementStrategy strategy = WeightPlacementStrategy::AUTO;

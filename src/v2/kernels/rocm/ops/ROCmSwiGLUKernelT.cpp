@@ -15,6 +15,7 @@
 #include "ROCmSwiGLUKernelT.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../backends/DeviceId.h"
+#include "../../../utils/KernelProfiler.h"
 
 #include <hip/hip_runtime.h>
 #include <cstdio>
@@ -68,6 +69,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx,
             int device_idx)
         {
+            KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
             (void)add_residual;
             (void)mpi_ctx;
             if (!gate || !up || !output)
@@ -137,6 +139,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx,
             int device_idx)
         {
+            KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
             (void)add_residual;
             (void)mpi_ctx;
             if (!gate || !up || !output)
@@ -204,6 +207,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx,
             int device_idx)
         {
+            KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
             (void)add_residual;
             (void)mpi_ctx;
             if (!gate || !up || !output)

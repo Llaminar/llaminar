@@ -206,7 +206,7 @@ namespace llaminar2::test
         ComputeStageType type() const override { return ComputeStageType::GEMM; }
         bool supportsBackend(ComputeBackendType /*backend*/) const override { return true; }
 
-        StageDumpInfo getDumpInfo() const override
+        StageDumpInfo buildDumpInfoImpl() const override
         {
             StageDumpInfo info;
             info.addOutput("output", data_, rows_, cols_);

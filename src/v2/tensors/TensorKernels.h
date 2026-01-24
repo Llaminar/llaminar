@@ -22,8 +22,8 @@ namespace llaminar2
     // Forward declarations
     class ITensor; // Device-agnostic tensor interface
     class TensorBase;
-    struct Q8_1Block;                 // For apply_q8_1() interface
-    class IDeviceContext;             // For kernel execute() interface
+    struct Q8_1Block;     // For apply_q8_1() interface
+    class IDeviceContext; // For kernel execute() interface
 
     // =============================================================================
     // Fused Operation Configuration
@@ -2799,6 +2799,10 @@ namespace llaminar2
          * @return true on success, false on failure or unsupported type
          *
          * @note Default returns false. Subclasses should override with type-aware dispatch.
+         *
+         * @note If position_ids is nullptr, positions are computed as (pos_offset + seq_idx)
+         *       on the GPU, eliminating the need for host-to-device memory copy.
+         *       This is the PREFERRED path for contiguous positions (decode and most prefill).
          */
         virtual bool apply_tensor(
             TensorBase *Q,
@@ -2810,7 +2814,8 @@ namespace llaminar2
             int head_dim,
             float rope_theta,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
+            int device_idx = -1,
+            int pos_offset = 0)
         {
             (void)Q;
             (void)K;
@@ -2822,6 +2827,7 @@ namespace llaminar2
             (void)rope_theta;
             (void)mpi_ctx;
             (void)device_idx;
+            (void)pos_offset;
             return false; // Subclasses override with type-aware dispatch
         }
     };

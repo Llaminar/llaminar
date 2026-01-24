@@ -70,7 +70,7 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override { return true; }
         StageBufferRequirements getBufferRequirements() const override;
         std::vector<BufferDescriptor> getDeclaredOutputs() const override;
-        StageDumpInfo getDumpInfo() const override;
+        StageDumpInfo buildDumpInfoImpl() const override;
 
         bool producesVDequant() const { return params_.V_dequant_out != nullptr; }
 

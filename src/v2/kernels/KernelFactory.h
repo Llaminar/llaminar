@@ -387,6 +387,16 @@ namespace llaminar
                 // ==========================================================================
 
                 /**
+                 * @brief Create GEMM kernel for any tensor type (dynamic dispatch)
+                 * @param tensor Pointer to TensorBase (any quantized or float tensor)
+                 * @param dev_type Target device type
+                 * @return ITensorGemm implementation for the device
+                 * @throws std::runtime_error if tensor type not supported on target device
+                 */
+                static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
+                    const llaminar2::TensorBase *tensor, DeviceType dev_type);
+
+                /**
                  * @brief Create GEMM kernel for IQ4_NL tensor
                  * @param tensor Pointer to IQ4_NL tensor (quantized weights)
                  * @param dev_type Target device type

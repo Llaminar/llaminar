@@ -48,7 +48,7 @@ namespace llaminar2
         bool requiresAllreduce() const override { return true; }
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
-        StageDumpInfo getDumpInfo() const override;
+        StageDumpInfo buildDumpInfoImpl() const override;
 
         /// MPI stages handle their own synchronization - no automatic coherence
         CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }

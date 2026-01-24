@@ -72,6 +72,15 @@ namespace llaminar2
                              void *comm, void *stream, std::string &error_out);
         bool ncclRecvWrapper(void *recvbuff, size_t count, int dtype_int, int peer,
                              void *comm, void *stream, std::string &error_out);
+
+        // Strided deinterleave kernel (for column-parallel AllGather)
+        bool launchDeinterleaveKernel(const void *input, void *output,
+                                      int seq_len, int local_dim, int world_size,
+                                      void *stream);
+
+        // Temporary buffer allocation
+        bool cudaAllocTempBuffer(void **ptr, size_t bytes);
+        void cudaFreeTempBuffer(void *ptr);
     } // namespace nccl_backend_detail
 } // namespace llaminar2
 
@@ -449,6 +458,14 @@ namespace llaminar2
             stream_ = nullptr;
         }
 
+        // Free persistent stridedAllgather temp buffer
+        if (strided_allgather_temp_buf_ != nullptr)
+        {
+            nccl_backend_detail::cudaFreeTempBuffer(strided_allgather_temp_buf_);
+            strided_allgather_temp_buf_ = nullptr;
+            strided_allgather_temp_size_ = 0;
+        }
+
         initialized_ = false;
         LOG_DEBUG("NCCLBackend: Shutdown complete");
 #endif
@@ -699,6 +716,119 @@ namespace llaminar2
             return false;
         }
 
+        return true;
+#else
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    // =========================================================================
+    // Column-Parallel (Strided) AllGather Implementation
+    // =========================================================================
+
+    bool NCCLBackend::stridedAllgather(
+        const void *send_buf,
+        void *recv_buf,
+        size_t seq_len,
+        size_t local_dim,
+        CollectiveDataType dtype)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            return false;
+        }
+
+        if (dtype != CollectiveDataType::FLOAT32)
+        {
+            last_error_ = "stridedAllgather only supports FLOAT32";
+            return false;
+        }
+
+        if (seq_len == 0 || local_dim == 0)
+        {
+            // Nothing to do
+            return true;
+        }
+
+        // Total elements per rank = seq_len * local_dim
+        // After AllGather, temp buffer has: [num_ranks * seq_len, local_dim]
+        // Final output layout: [seq_len, local_dim * num_ranks]
+
+        const size_t send_count = seq_len * local_dim;
+        const size_t temp_buffer_bytes = send_count * num_ranks_ * sizeof(float);
+
+        // Use persistent temp buffer to avoid per-call alloc/sync overhead.
+        // Only reallocate if current buffer is too small.
+        if (strided_allgather_temp_buf_ == nullptr || strided_allgather_temp_size_ < temp_buffer_bytes)
+        {
+            // Free old buffer if exists
+            if (strided_allgather_temp_buf_ != nullptr)
+            {
+                nccl_backend_detail::cudaFreeTempBuffer(strided_allgather_temp_buf_);
+                strided_allgather_temp_buf_ = nullptr;
+                strided_allgather_temp_size_ = 0;
+            }
+
+            // Allocate new buffer (with some headroom to reduce reallocations)
+            size_t alloc_bytes = temp_buffer_bytes + (temp_buffer_bytes / 4); // 25% extra
+            if (!nccl_backend_detail::cudaAllocTempBuffer(&strided_allgather_temp_buf_, alloc_bytes))
+            {
+                last_error_ = "Failed to allocate temp buffer for stridedAllgather: " +
+                              std::to_string(alloc_bytes) + " bytes";
+                LOG_ERROR(last_error_);
+                return false;
+            }
+            strided_allgather_temp_size_ = alloc_bytes;
+            LOG_DEBUG("[NCCLBackend] Allocated persistent stridedAllgather temp buffer: " << alloc_bytes << " bytes");
+        }
+
+        // Step 1: NCCL AllGather to contiguous temp buffer (async)
+        std::string nccl_error;
+        bool success = nccl_backend_detail::ncclAllGatherWrapper(
+            send_buf,
+            strided_allgather_temp_buf_, // Use persistent buffer
+            send_count,
+            toNcclDataTypeInt(dtype),
+            comm_,
+            stream_,
+            nccl_error);
+
+        if (!success)
+        {
+            last_error_ = "ncclAllGather failed in stridedAllgather: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Step 2: Launch deinterleave kernel to convert contiguous→strided (async)
+        // Kernel is queued AFTER NCCL op on same stream, so ordering is correct.
+        success = nccl_backend_detail::launchDeinterleaveKernel(
+            strided_allgather_temp_buf_, // Use persistent buffer
+            recv_buf,
+            static_cast<int>(seq_len),
+            static_cast<int>(local_dim),
+            num_ranks_,
+            stream_);
+
+        if (!success)
+        {
+            last_error_ = "Deinterleave kernel launch failed in stridedAllgather";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // NO SYNC NEEDED: Both NCCL op and deinterleave kernel are enqueued on stream_.
+        // The persistent temp buffer is safe to reuse because:
+        // 1. Next stridedAllgather call will enqueue AFTER this one completes (CUDA stream ordering)
+        // 2. The temp buffer is not freed, so no race with cudaFree()
+        //
+        // This removes the ~200ms sync overhead that was killing decode performance!
+
+        LOG_DEBUG("[NCCLBackend] stridedAllgather completed: seq_len=" << seq_len
+                                                                       << " local_dim=" << local_dim << " num_ranks=" << num_ranks_);
         return true;
 #else
         last_error_ = "NCCL not available";

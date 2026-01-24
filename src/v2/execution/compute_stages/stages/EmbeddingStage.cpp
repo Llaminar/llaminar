@@ -380,7 +380,7 @@ namespace llaminar2
         }
     }
 
-    StageDumpInfo EmbeddingStage::getDumpInfo() const
+    StageDumpInfo EmbeddingStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
 

@@ -80,7 +80,7 @@ namespace llaminar2
                        std::find(supported_backends_.begin(), supported_backends_.end(), backend) != supported_backends_.end();
             }
 
-            StageDumpInfo getDumpInfo() const override
+            StageDumpInfo buildDumpInfoImpl() const override
             {
                 return dump_info_;
             }

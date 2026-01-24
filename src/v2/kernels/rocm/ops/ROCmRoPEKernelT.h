@@ -1,10 +1,16 @@
 /**
  * @file ROCmRoPEKernelT.h
- * @brief ROCm RoPE kernel with typed precision support
+ * @brief ROCm RoPE kernel with typed precision support and workspace caching
  *
  * HIP/ROCm implementation of Rotary Positional Embeddings (RoPE) following
  * the same template pattern as CUDARoPEKernelT. Specialized for FP32,
  * BF16, and FP16 precisions.
+ *
+ * OPTIMIZATIONS (matching CUDA v3 strategy):
+ * - Pre-computed inverse frequency table cached in device memory
+ * - Workspace-based position_ids buffer to avoid per-call hipMalloc/hipFree
+ * - Shared memory sin/cos tables in HIP kernels
+ * - Fused Q+K kernel to reduce launch overhead
  *
  * @author Llaminar Team
  * @date 2025-01-17
@@ -15,7 +21,14 @@
 #include "../../../execution/RuntimeConfig.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/BlockStructures.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include <cstdint>
+
+// Forward declaration
+namespace llaminar2
+{
+    class DeviceWorkspaceManager;
+}
 
 namespace llaminar2
 {
@@ -40,7 +53,7 @@ namespace llaminar2
         // =========================================================================
 
         template <>
-        class ROCmRoPEKernelT<ActivationPrecision::FP32> : public ITensorRoPE
+        class ROCmRoPEKernelT<ActivationPrecision::FP32> : public ITensorRoPE, public IWorkspaceConsumer
         {
         public:
             using StorageType = float;
@@ -114,6 +127,20 @@ namespace llaminar2
                 return false;
             }
 
+            // ===== Tensor API (for RoPEStage) =====
+            bool apply_tensor(
+                TensorBase *Q,
+                TensorBase *K,
+                const int *position_ids,
+                int seq_len,
+                int n_heads,
+                int n_kv_heads,
+                int head_dim,
+                float rope_theta,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1,
+                int pos_offset = 0) override;
+
             // ===== Typed API =====
             bool apply_typed(
                 float *Q,
@@ -129,9 +156,49 @@ namespace llaminar2
             static constexpr ActivationPrecision precision() { return ActivationPrecision::FP32; }
             static const char *precision_name() { return "FP32"; }
 
+            // ===== IWorkspaceConsumer interface =====
+
+            /**
+             * @brief Get workspace requirements for RoPE
+             *
+             * @param m Maximum sequence length
+             * @param n Not used (pass 0)
+             * @param k head_dim (for inverse frequency table size)
+             * @return WorkspaceRequirements describing needed buffers
+             */
+            WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+
+            /**
+             * @brief Bind workspace manager (recommended for hot-path performance)
+             */
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+
+            /**
+             * @brief Check if a workspace is currently bound
+             */
+            bool hasWorkspace() const override;
+
+            /**
+             * @brief Get the currently bound workspace manager
+             */
+            DeviceWorkspaceManager *getWorkspace() const override;
+
+            /**
+             * @brief Clear cached inverse frequency table
+             * Call this when model is unloaded or head_dim/rope_theta changes
+             */
+            static void clearInvFreqCache();
+
         private:
             int device_idx_;
             float rope_theta_;
+
+            // Workspace state
+            DeviceWorkspaceManager *workspace_ = nullptr;
+
+            // Inverse frequency cache (shared across all instances for same config)
+            // Key: (head_dim << 32) | device_idx, Value: device pointer
+            static float *getOrCreateInvFreq(int head_dim, float rope_theta, int device_idx);
         };
 
         // =========================================================================
@@ -139,7 +206,7 @@ namespace llaminar2
         // =========================================================================
 
         template <>
-        class ROCmRoPEKernelT<ActivationPrecision::BF16> : public ITensorRoPE
+        class ROCmRoPEKernelT<ActivationPrecision::BF16> : public ITensorRoPE, public IWorkspaceConsumer
         {
         public:
             using StorageType = uint16_t;
@@ -214,6 +281,20 @@ namespace llaminar2
                 (void)device_idx;
                 return false;
             }
+
+            // ===== Tensor API (for RoPEStage) =====
+            bool apply_tensor(
+                TensorBase *Q,
+                TensorBase *K,
+                const int *position_ids,
+                int seq_len,
+                int n_heads,
+                int n_kv_heads,
+                int head_dim,
+                float rope_theta,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1,
+                int pos_offset = 0) override;
 
             // ===== Typed API =====
             bool apply_typed(
@@ -230,9 +311,20 @@ namespace llaminar2
             static constexpr ActivationPrecision precision() { return ActivationPrecision::BF16; }
             static const char *precision_name() { return "BF16"; }
 
+            // ===== IWorkspaceConsumer interface =====
+            WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+            bool hasWorkspace() const override;
+            DeviceWorkspaceManager *getWorkspace() const override;
+
+            static void clearInvFreqCache();
+
         private:
             int device_idx_;
             float rope_theta_;
+            DeviceWorkspaceManager *workspace_ = nullptr;
+
+            static float *getOrCreateInvFreq(int head_dim, float rope_theta, int device_idx);
         };
 
         // =========================================================================
@@ -240,7 +332,7 @@ namespace llaminar2
         // =========================================================================
 
         template <>
-        class ROCmRoPEKernelT<ActivationPrecision::FP16> : public ITensorRoPE
+        class ROCmRoPEKernelT<ActivationPrecision::FP16> : public ITensorRoPE, public IWorkspaceConsumer
         {
         public:
             using StorageType = uint16_t;
@@ -316,6 +408,20 @@ namespace llaminar2
                 return false;
             }
 
+            // ===== Tensor API (for RoPEStage) =====
+            bool apply_tensor(
+                TensorBase *Q,
+                TensorBase *K,
+                const int *position_ids,
+                int seq_len,
+                int n_heads,
+                int n_kv_heads,
+                int head_dim,
+                float rope_theta,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1,
+                int pos_offset = 0) override;
+
             // ===== Typed API =====
             bool apply_typed(
                 uint16_t *Q,
@@ -331,9 +437,20 @@ namespace llaminar2
             static constexpr ActivationPrecision precision() { return ActivationPrecision::FP16; }
             static const char *precision_name() { return "FP16"; }
 
+            // ===== IWorkspaceConsumer interface =====
+            WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+            bool hasWorkspace() const override;
+            DeviceWorkspaceManager *getWorkspace() const override;
+
+            static void clearInvFreqCache();
+
         private:
             int device_idx_;
             float rope_theta_;
+            DeviceWorkspaceManager *workspace_ = nullptr;
+
+            static float *getOrCreateInvFreq(int head_dim, float rope_theta, int device_idx);
         };
 
     } // namespace rocm

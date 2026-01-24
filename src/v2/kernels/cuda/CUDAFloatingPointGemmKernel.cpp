@@ -21,6 +21,7 @@
 #include "tensors/Tensors.h"         // FP32Tensor, BF16Tensor, FP16Tensor
 #include "tensors/KernelSnapshotInfo.h"
 #include "utils/Logger.h"
+#include "utils/CUDAKernelProfiler.h"
 
 #include <stdexcept>
 
@@ -230,6 +231,7 @@ namespace llaminar2
             // Use fused GEMM+bias when bias is provided, otherwise use regular GEMM
             if (d_bias)
             {
+                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUBLAS);
                 return cublas_kernel_->execute_with_bias(
                     d_A,                                    // d_A
                     static_cast<const float *>(d_weights_), // d_B
@@ -242,6 +244,7 @@ namespace llaminar2
             }
             else
             {
+                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUBLAS);
                 return cublas_kernel_->execute(
                     d_A,                                    // d_A
                     static_cast<const float *>(d_weights_), // d_B
@@ -277,6 +280,7 @@ namespace llaminar2
             // Weight (B) is stored in d_weights_
             // Execute: C = alpha * A @ B^T + beta * C (transpose_B is typically true)
 
+            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUBLAS);
             return cublas_kernel_->execute(
                 A,                                      // d_A
                 static_cast<const float *>(d_weights_), // d_B

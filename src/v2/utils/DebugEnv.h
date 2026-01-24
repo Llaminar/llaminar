@@ -109,7 +109,7 @@ namespace llaminar2
      */
     struct ProfileConfig
     {
-        bool enabled = false;       ///< Enable kernel profiling (LLAMINAR_PROFILE_KERNELS=1)
+        bool enabled = false;       ///< Enable profiling (LLAMINAR_PROFILING=1 or legacy LLAMINAR_PROFILE_KERNELS=1)
         bool per_layer = false;     ///< Breakdown by layer index (LLAMINAR_PROFILE_PER_LAYER=1)
         bool per_iteration = false; ///< Print stats per decode iteration (LLAMINAR_PROFILE_PER_ITER=1)
         int print_interval = 0;     ///< Print every N iterations (0=only at end)
@@ -121,10 +121,17 @@ namespace llaminar2
 
         void reload()
         {
+            // New unified env var - enables all profiling
+            const char *unified_env = std::getenv("LLAMINAR_PROFILING");
+            if (unified_env)
+            {
+                enabled = (std::atoi(unified_env) != 0);
+            }
+            // Legacy env var - still supported for backward compatibility
             const char *enabled_env = std::getenv("LLAMINAR_PROFILE_KERNELS");
             if (enabled_env)
             {
-                enabled = (std::atoi(enabled_env) != 0);
+                enabled = enabled || (std::atoi(enabled_env) != 0);
             }
 
             const char *per_layer_env = std::getenv("LLAMINAR_PROFILE_PER_LAYER");
@@ -651,10 +658,17 @@ namespace llaminar2
                 execution_mode = mode_env;
             }
 
+            // New unified env var - enables all profiling including executor profiling
+            const char *unified_env = std::getenv("LLAMINAR_PROFILING");
+            if (unified_env)
+            {
+                executor_profiling = (std::atoi(unified_env) != 0);
+            }
+            // Legacy env var - still supported for backward compatibility
             const char *prof_env = std::getenv("LLAMINAR_EXECUTOR_PROFILING");
             if (prof_env)
             {
-                executor_profiling = (std::atoi(prof_env) != 0);
+                executor_profiling = executor_profiling || (std::atoi(prof_env) != 0);
             }
 
             const char *valid_env = std::getenv("LLAMINAR_EXECUTOR_VALIDATION");

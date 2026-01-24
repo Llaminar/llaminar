@@ -107,7 +107,7 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
-        StageDumpInfo getDumpInfo() const override;
+        StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
         bool requiresAllreduce() const override { return params_.needs_allreduce; }
 

@@ -11,7 +11,14 @@
  * - Pass/fail assertions with configurable thresholds
  * - Snapshot loading and regeneration
  *
- * Usage:
+ * MPI Support:
+ *   For tensor-parallel tests, set mpi_ctx_ in SetUp() and override
+ *   getDeviceForRank() instead of getDevice(). The base class handles:
+ *   - Printing only on rank 0
+ *   - Snapshot regeneration only on rank 0 (with barrier)
+ *   - MPI barriers at key synchronization points
+ *
+ * Usage (single-rank):
  *   class Test__MyCUDAParity : public ParityTestBase {
  *   protected:
  *       void SetUp() override {
@@ -22,6 +29,20 @@
  *
  *       DeviceId getDevice() override { return gpu_device_; }
  *       std::string getBackendName() override { return "CUDA"; }
+ *   };
+ *
+ * Usage (tensor-parallel MPI):
+ *   class Test__MyTPParity : public ParityTestBase {
+ *   protected:
+ *       void SetUp() override {
+ *           mpi_ctx_ = std::make_shared<MPIContext>();
+ *           config_.cosine_threshold = 0.94f;  // Relaxed for TP
+ *           ParityTestBase::SetUp();
+ *       }
+ *       DeviceId getDeviceForRank() override {
+ *           return (mpi_ctx_->rank() == 0) ? DeviceId::cuda(0) : DeviceId::rocm(0);
+ *       }
+ *       std::string getBackendName() override { return "TensorParallel"; }
  *   };
  *
  * @author David Sanftenberg
@@ -48,11 +69,15 @@
 #include "execution/IInferenceRunner.h"
 #include "kernels/KernelFactory.h"
 #include "utils/Logger.h"
+#include "utils/MPIContext.h"
 #include "backends/DeviceId.h"
 #include "backends/ComputeBackend.h"
 
 // NumPy .npy file loading
 #include <cnpy.h>
+
+// MPI for tensor-parallel tests
+#include <mpi.h>
 
 namespace llaminar2::test::parity
 {
@@ -89,6 +114,11 @@ namespace llaminar2::test::parity
         // Decode thresholds (for incremental decode tests)
         float decode_cosine_threshold = 0.99f;
         float min_decode_pass_rate = 0.8f; ///< Minimum fraction of decode steps that must pass
+
+        /// Stages to exclude from per-layer parity comparison.
+        /// Used for GLOBAL scope TP where column-parallel stages (Q/K/V projections)
+        /// produce partial outputs that can't be directly compared to full PyTorch outputs.
+        std::vector<std::string> excluded_stages;
     };
 
     // =============================================================================
@@ -406,8 +436,12 @@ namespace llaminar2::test::parity
      *
      * Provides common infrastructure for comparing Llaminar backends against
      * PyTorch ground truth. Subclasses must implement:
-     * - getDevice() - Return the DeviceId to use for inference
+     * - getDevice() OR getDeviceForRank() - Return the DeviceId to use for inference
      * - getBackendName() - Return a display name (e.g., "CUDA", "CPU", "ROCm")
+     *
+     * For MPI/tensor-parallel tests:
+     * - Set mpi_ctx_ in SetUp() before calling ParityTestBase::SetUp()
+     * - Override getDeviceForRank() instead of getDevice()
      *
      * Optional overrides:
      * - setupDeviceSpecific() - Device-specific initialization (e.g., CUDA checks)
@@ -420,17 +454,110 @@ namespace llaminar2::test::parity
         std::unique_ptr<IInferenceRunner> runner_;
         std::unordered_map<std::string, std::vector<float>> pytorch_snapshots_;
 
+        // MPI context for tensor-parallel tests (optional, null for single-rank)
+        std::shared_ptr<MPIContext> mpi_ctx_;
+
+        // =============================================================================
+        // MPI Helper Methods
+        // =============================================================================
+
         /**
-         * @brief Get the device to use for inference
-         * @return DeviceId (e.g., DeviceId::cpu(), DeviceId::cuda(0))
+         * @brief Check if this is rank 0 (or single-rank mode)
+         * @return true if rank 0 or no MPI context
          */
-        virtual DeviceId getDevice() = 0;
+        bool isRank0() const
+        {
+            return !mpi_ctx_ || mpi_ctx_->rank() == 0;
+        }
+
+        /**
+         * @brief Get MPI rank (0 if no MPI context)
+         */
+        int mpiRank() const
+        {
+            return mpi_ctx_ ? mpi_ctx_->rank() : 0;
+        }
+
+        /**
+         * @brief Get MPI world size (1 if no MPI context)
+         */
+        int mpiWorldSize() const
+        {
+            return mpi_ctx_ ? mpi_ctx_->world_size() : 1;
+        }
+
+        /**
+         * @brief Execute MPI barrier if MPI context exists
+         */
+        void mpiBarrier()
+        {
+            if (mpi_ctx_)
+            {
+                mpi_ctx_->barrier();
+            }
+        }
+
+        // =============================================================================
+        // Device Selection (override one of these)
+        // =============================================================================
+
+        /**
+         * @brief Get the device to use for inference (single-rank tests)
+         * @return DeviceId (e.g., DeviceId::cpu(), DeviceId::cuda(0))
+         *
+         * Override this for single-rank tests. For MPI tests, override
+         * getDeviceForRank() instead.
+         */
+        virtual DeviceId getDevice()
+        {
+            // Default implementation calls getDeviceForRank() for MPI compatibility
+            return getDeviceForRank();
+        }
+
+        /**
+         * @brief Get the device for this MPI rank (tensor-parallel tests)
+         * @return DeviceId for the current rank
+         *
+         * Override this for MPI tests to return different devices per rank.
+         * Default implementation returns CPU.
+         */
+        virtual DeviceId getDeviceForRank()
+        {
+            return DeviceId::cpu();
+        }
 
         /**
          * @brief Get the backend name for display
          * @return Name string (e.g., "CUDA", "CPU", "ROCm")
          */
         virtual std::string getBackendName() = 0;
+
+        // =============================================================================
+        // Weight Distribution (override for tensor parallelism)
+        // =============================================================================
+
+        /**
+         * @brief Get the weight distribution strategy
+         * @return WeightDistributionStrategy (REPLICATED for single-rank, SHARDED for TP)
+         *
+         * Override this for tensor-parallel tests to enable weight sharding.
+         */
+        virtual WeightDistributionStrategy getWeightStrategy()
+        {
+            return WeightDistributionStrategy::REPLICATED;
+        }
+
+        /**
+         * @brief Configure model after loading (optional hook)
+         * @param model_ctx The loaded model context
+         *
+         * Override this for tensor-parallel tests to configure weight sharding schema.
+         * Called after ModelContext::create() but before createInferenceRunner().
+         */
+        virtual void configureModel(std::shared_ptr<ModelContext> model_ctx)
+        {
+            // Default: no additional configuration
+        }
 
         /**
          * @brief Device-specific setup (optional)
@@ -445,15 +572,23 @@ namespace llaminar2::test::parity
             // Device-specific setup first (may skip)
             setupDeviceSpecific();
 
-            // Regenerate snapshots to ensure consistency
-            if (!regeneratePyTorchSnapshots())
+            // Regenerate snapshots only on rank 0 to avoid race conditions
+            // and redundant work. All ranks wait at barrier before proceeding.
+            if (isRank0())
             {
-                FAIL() << "PyTorch snapshot generation failed";
+                if (!regeneratePyTorchSnapshots())
+                {
+                    FAIL() << "PyTorch snapshot generation failed";
+                }
             }
+            mpiBarrier(); // All ranks wait for snapshots to be ready
         }
 
         void TearDown() override
         {
+            // Barrier before teardown to ensure all ranks are done
+            mpiBarrier();
+
             // CRITICAL: Clear kernel cache BEFORE destroying model context!
             // KernelFactory::clearCache() accesses tensor->rocm_cache_ and tensor->cuda_cache_
             // to free device memory. If we destroy the tensors first (via model_ctx_.reset()),
@@ -613,17 +748,32 @@ namespace llaminar2::test::parity
 
         /**
          * @brief Setup the inference pipeline
+         *
+         * MPI-aware: Uses getDevice() which calls getDeviceForRank() for per-rank device selection.
+         * Passes mpi_ctx_ to createInferenceRunner (nullptr for single-rank tests).
+         * Uses getWeightStrategy() for weight distribution (REPLICATED or SHARDED).
+         * Calls configureModel() hook for tensor-parallel schema configuration.
          */
         bool setupPipeline()
         {
             DeviceManager::instance().initialize(-1);
 
-            model_ctx_ = ModelContext::create(config_.model_path);
+            // Load model with MPI context and weight strategy
+            model_ctx_ = ModelContext::create(
+                config_.model_path,
+                mpi_ctx_,           // nullptr for single-rank
+                nullptr,            // placement_map
+                nullptr,            // factory
+                getWeightStrategy() // REPLICATED or SHARDED
+            );
             if (!model_ctx_)
             {
                 LOG_ERROR("[Parity] Failed to load model");
                 return false;
             }
+
+            // Allow subclasses to configure model (e.g., weight sharding schema)
+            configureModel(model_ctx_);
 
             InferenceRunnerConfig inf_config;
             inf_config.max_seq_len = 4096;
@@ -636,10 +786,14 @@ namespace llaminar2::test::parity
             if (device.is_gpu())
             {
                 inf_config.use_mapped_memory = true;
-                LOG_INFO("[" << getBackendName() << " Parity] Enabling mapped memory for GPU snapshot capture");
+                if (isRank0())
+                {
+                    LOG_INFO("[" << getBackendName() << " Parity] Enabling mapped memory for GPU snapshot capture");
+                }
             }
 
-            runner_ = createInferenceRunner(model_ctx_, nullptr, device, inf_config);
+            // Pass mpi_ctx_ to enable tensor parallelism (nullptr for single-rank tests)
+            runner_ = createInferenceRunner(model_ctx_, mpi_ctx_, device, inf_config);
             if (!runner_)
             {
                 LOG_ERROR("[Parity] Failed to create inference runner");
@@ -647,7 +801,11 @@ namespace llaminar2::test::parity
             }
 
             runner_->enableSnapshotCapture();
-            LOG_INFO("[" << getBackendName() << " Parity] Inference runner created");
+            if (isRank0())
+            {
+                LOG_INFO("[" << getBackendName() << " Parity] Inference runner created"
+                             << (mpi_ctx_ ? " (MPI world_size=" + std::to_string(mpiWorldSize()) + ")" : ""));
+            }
             return true;
         }
 
@@ -751,24 +909,27 @@ namespace llaminar2::test::parity
                 size_t llaminar_size;
                 const float *llaminar_data = runner_->getSnapshot("EMBEDDING", llaminar_size);
 
-                // Debug sizes and first values
-                LOG_INFO("[Parity Debug] EMBEDDING - llaminar_size=" << llaminar_size
-                                                                     << " pytorch_size=" << pytorch_embedding.size());
-                if (llaminar_data && llaminar_size >= 8)
+                // Debug sizes and first values (rank 0 only)
+                if (isRank0())
                 {
-                    LOG_INFO("[Parity Debug] Llaminar first 8: "
-                             << llaminar_data[0] << "," << llaminar_data[1] << ","
-                             << llaminar_data[2] << "," << llaminar_data[3] << ","
-                             << llaminar_data[4] << "," << llaminar_data[5] << ","
-                             << llaminar_data[6] << "," << llaminar_data[7]);
-                }
-                if (!pytorch_embedding.empty() && pytorch_embedding.size() >= 8)
-                {
-                    LOG_INFO("[Parity Debug] PyTorch first 8: "
-                             << pytorch_embedding[0] << "," << pytorch_embedding[1] << ","
-                             << pytorch_embedding[2] << "," << pytorch_embedding[3] << ","
-                             << pytorch_embedding[4] << "," << pytorch_embedding[5] << ","
-                             << pytorch_embedding[6] << "," << pytorch_embedding[7]);
+                    LOG_INFO("[Parity Debug] EMBEDDING - llaminar_size=" << llaminar_size
+                                                                         << " pytorch_size=" << pytorch_embedding.size());
+                    if (llaminar_data && llaminar_size >= 8)
+                    {
+                        LOG_INFO("[Parity Debug] Llaminar first 8: "
+                                 << llaminar_data[0] << "," << llaminar_data[1] << ","
+                                 << llaminar_data[2] << "," << llaminar_data[3] << ","
+                                 << llaminar_data[4] << "," << llaminar_data[5] << ","
+                                 << llaminar_data[6] << "," << llaminar_data[7]);
+                    }
+                    if (!pytorch_embedding.empty() && pytorch_embedding.size() >= 8)
+                    {
+                        LOG_INFO("[Parity Debug] PyTorch first 8: "
+                                 << pytorch_embedding[0] << "," << pytorch_embedding[1] << ","
+                                 << pytorch_embedding[2] << "," << pytorch_embedding[3] << ","
+                                 << pytorch_embedding[4] << "," << pytorch_embedding[5] << ","
+                                 << pytorch_embedding[6] << "," << pytorch_embedding[7]);
+                    }
                 }
 
                 if (llaminar_data && !pytorch_embedding.empty())
@@ -789,6 +950,17 @@ namespace llaminar2::test::parity
 
                 for (const auto &stage : per_layer_stages)
                 {
+                    // Skip excluded stages (e.g., Q/K/V_PROJECTION for GLOBAL scope TP)
+                    if (!config_.excluded_stages.empty())
+                    {
+                        bool is_excluded = std::find(
+                                               config_.excluded_stages.begin(),
+                                               config_.excluded_stages.end(),
+                                               stage) != config_.excluded_stages.end();
+                        if (is_excluded)
+                            continue;
+                    }
+
                     std::string llaminar_key = "layer" + std::to_string(layer_idx) + "_" + stage;
                     std::string pytorch_key = llaminar_key;
 
@@ -890,13 +1062,17 @@ namespace llaminar2::test::parity
          * @brief Assert standard parity criteria
          *
          * Call this after runPrefillParity() to apply standard assertions.
+         * MPI-aware: Only renders table on rank 0.
          */
         void assertParity(const ParityTestSummary &summary)
         {
-            // Render the table first
-            renderParityTable(summary, config_, getBackendName());
+            // Render the table first (rank 0 only)
+            if (isRank0())
+            {
+                renderParityTable(summary, config_, getBackendName());
+            }
 
-            // Assertions
+            // Assertions (all ranks - GTest will aggregate failures)
             EXPECT_GE(summary.early_layers_passed, config_.min_early_layers_passed)
                 << "At least " << config_.min_early_layers_passed << " of the first "
                 << config_.early_layers_count << " layers should pass parity (cosine >= "
@@ -1116,6 +1292,7 @@ namespace llaminar2::test::parity
          * @brief Assert decode parity criteria
          *
          * Call this after runDecodeParity() to apply standard assertions.
+         * MPI-aware: Only renders table on rank 0.
          */
         void assertDecodeParity(const DecodeParitySummary &summary)
         {
@@ -1125,10 +1302,13 @@ namespace llaminar2::test::parity
                 GTEST_SKIP() << "No decode snapshots found - skipping decode parity assertions";
             }
 
-            // Render table first
-            renderDecodeParityTable(summary, getBackendName());
+            // Render table first (rank 0 only)
+            if (isRank0())
+            {
+                renderDecodeParityTable(summary, getBackendName());
+            }
 
-            // Assertions
+            // Assertions (all ranks - GTest will aggregate failures)
             int min_steps_required = static_cast<int>(summary.steps_total * config_.min_decode_pass_rate);
             EXPECT_GE(summary.steps_passed, min_steps_required)
                 << "Not enough decode steps passed: " << summary.steps_passed << "/" << summary.steps_total

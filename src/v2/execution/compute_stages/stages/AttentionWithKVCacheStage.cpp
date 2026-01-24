@@ -491,7 +491,7 @@ namespace llaminar2
         }
     }
 
-    StageDumpInfo AttentionWithKVCacheStage::getDumpInfo() const
+    StageDumpInfo AttentionWithKVCacheStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
 

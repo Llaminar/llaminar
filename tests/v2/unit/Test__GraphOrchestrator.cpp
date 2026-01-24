@@ -835,7 +835,7 @@ namespace
             return true;
         }
 
-        StageDumpInfo getDumpInfo() const override { return {}; }
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
 
         // IWorkspaceConsumer interface
         WorkspaceRequirements getWorkspaceRequirements(int m, int n, int k) const override
@@ -924,7 +924,7 @@ namespace
             return true;
         }
 
-        StageDumpInfo getDumpInfo() const override { return {}; }
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
 
     private:
         std::string name_;

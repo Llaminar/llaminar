@@ -162,7 +162,7 @@ namespace llaminar2
         }
     }
 
-    StageDumpInfo RMSNormStage::getDumpInfo() const
+    StageDumpInfo RMSNormStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
 

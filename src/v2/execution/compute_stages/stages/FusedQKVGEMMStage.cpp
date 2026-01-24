@@ -439,7 +439,7 @@ namespace llaminar2
         }
     }
 
-    StageDumpInfo FusedQKVGEMMStage::getDumpInfo() const
+    StageDumpInfo FusedQKVGEMMStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
 

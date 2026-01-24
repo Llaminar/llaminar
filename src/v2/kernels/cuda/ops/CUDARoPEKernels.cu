@@ -566,6 +566,414 @@ __global__ void rope_fp16_fused_qk_kernel(
 }
 
 // =========================================================================
+// DECODE KERNELS (seq_len=1, scalar position - NO MEMCPY)
+// =========================================================================
+
+/**
+ * @brief FP32 RoPE decode kernel - single token, scalar position
+ * No position_ids array needed - position passed as scalar parameter
+ */
+__global__ void rope_fp32_decode_kernel(
+    float *__restrict__ Q,
+    float *__restrict__ K,
+    const float *__restrict__ inv_freq,
+    int pos,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    // Blocks for Q: 0 .. n_q_heads-1
+    // Blocks for K: n_q_heads .. n_q_heads + n_kv_heads - 1
+    int total_q_blocks = n_q_heads;
+    int block_idx = blockIdx.x;
+
+    float *data;
+    int n_heads;
+    int head_idx;
+
+    if (block_idx < total_q_blocks)
+    {
+        data = Q;
+        n_heads = n_q_heads;
+        head_idx = block_idx;
+    }
+    else
+    {
+        if (K == nullptr)
+            return;
+        data = K;
+        n_heads = n_kv_heads;
+        head_idx = block_idx - total_q_blocks;
+    }
+
+    // Compute sin/cos table for this position
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        __sincosf(angle, &s_sin[i], &s_cos[i]);
+    }
+    __syncthreads();
+
+    // Apply rotation (seq_idx=0 for decode)
+    int base_idx = head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = data[i0];
+        float x1 = data[i1];
+
+        data[i0] = x0 * s_cos[i] - x1 * s_sin[i];
+        data[i1] = x0 * s_sin[i] + x1 * s_cos[i];
+    }
+}
+
+/**
+ * @brief BF16 RoPE decode kernel - single token, scalar position
+ */
+__global__ void rope_bf16_decode_kernel(
+    uint16_t *__restrict__ Q,
+    uint16_t *__restrict__ K,
+    const float *__restrict__ inv_freq,
+    int pos,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    int total_q_blocks = n_q_heads;
+    int block_idx = blockIdx.x;
+
+    uint16_t *data;
+    int head_idx;
+
+    if (block_idx < total_q_blocks)
+    {
+        data = Q;
+        head_idx = block_idx;
+    }
+    else
+    {
+        if (K == nullptr)
+            return;
+        data = K;
+        head_idx = block_idx - total_q_blocks;
+    }
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        __sincosf(angle, &s_sin[i], &s_cos[i]);
+    }
+    __syncthreads();
+
+    int base_idx = head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = bf16_to_float(data[i0]);
+        float x1 = bf16_to_float(data[i1]);
+
+        data[i0] = float_to_bf16(x0 * s_cos[i] - x1 * s_sin[i]);
+        data[i1] = float_to_bf16(x0 * s_sin[i] + x1 * s_cos[i]);
+    }
+}
+
+/**
+ * @brief FP16 RoPE decode kernel - single token, scalar position
+ */
+__global__ void rope_fp16_decode_kernel(
+    uint16_t *__restrict__ Q,
+    uint16_t *__restrict__ K,
+    const float *__restrict__ inv_freq,
+    int pos,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    int total_q_blocks = n_q_heads;
+    int block_idx = blockIdx.x;
+
+    uint16_t *data;
+    int head_idx;
+
+    if (block_idx < total_q_blocks)
+    {
+        data = Q;
+        head_idx = block_idx;
+    }
+    else
+    {
+        if (K == nullptr)
+            return;
+        data = K;
+        head_idx = block_idx - total_q_blocks;
+    }
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        __sincosf(angle, &s_sin[i], &s_cos[i]);
+    }
+    __syncthreads();
+
+    int base_idx = head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = fp16_to_float(data[i0]);
+        float x1 = fp16_to_float(data[i1]);
+
+        data[i0] = float_to_fp16(x0 * s_cos[i] - x1 * s_sin[i]);
+        data[i1] = float_to_fp16(x0 * s_sin[i] + x1 * s_cos[i]);
+    }
+}
+
+// =========================================================================
+// CONTIGUOUS KERNELS (positions computed on GPU - ZERO MEMCPY)
+// =========================================================================
+
+/**
+ * @brief FP32 RoPE contiguous kernel - position computed from offset
+ * Position is: pos_offset + seq_idx (no position_ids array needed)
+ */
+__global__ void rope_fp32_contiguous_kernel(
+    float *__restrict__ Q,
+    float *__restrict__ K,
+    const float *__restrict__ inv_freq,
+    int pos_offset,
+    int seq_len,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    int total_q_blocks = seq_len * n_q_heads;
+    int block_idx = blockIdx.x;
+
+    float *data;
+    int n_heads;
+    int local_block_idx;
+
+    if (block_idx < total_q_blocks)
+    {
+        data = Q;
+        n_heads = n_q_heads;
+        local_block_idx = block_idx;
+    }
+    else
+    {
+        if (K == nullptr)
+            return;
+        data = K;
+        n_heads = n_kv_heads;
+        local_block_idx = block_idx - total_q_blocks;
+    }
+
+    int head_idx = local_block_idx % n_heads;
+    int seq_idx = local_block_idx / n_heads;
+
+    if (seq_idx >= seq_len)
+        return;
+
+    // ZERO COPY: Position computed on GPU
+    int pos = pos_offset + seq_idx;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        __sincosf(angle, &s_sin[i], &s_cos[i]);
+    }
+    __syncthreads();
+
+    int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = data[i0];
+        float x1 = data[i1];
+
+        data[i0] = x0 * s_cos[i] - x1 * s_sin[i];
+        data[i1] = x0 * s_sin[i] + x1 * s_cos[i];
+    }
+}
+
+/**
+ * @brief BF16 RoPE contiguous kernel - position computed from offset
+ */
+__global__ void rope_bf16_contiguous_kernel(
+    uint16_t *__restrict__ Q,
+    uint16_t *__restrict__ K,
+    const float *__restrict__ inv_freq,
+    int pos_offset,
+    int seq_len,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    int total_q_blocks = seq_len * n_q_heads;
+    int block_idx = blockIdx.x;
+
+    uint16_t *data;
+    int n_heads;
+    int local_block_idx;
+
+    if (block_idx < total_q_blocks)
+    {
+        data = Q;
+        n_heads = n_q_heads;
+        local_block_idx = block_idx;
+    }
+    else
+    {
+        if (K == nullptr)
+            return;
+        data = K;
+        n_heads = n_kv_heads;
+        local_block_idx = block_idx - total_q_blocks;
+    }
+
+    int head_idx = local_block_idx % n_heads;
+    int seq_idx = local_block_idx / n_heads;
+
+    if (seq_idx >= seq_len)
+        return;
+
+    int pos = pos_offset + seq_idx;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        __sincosf(angle, &s_sin[i], &s_cos[i]);
+    }
+    __syncthreads();
+
+    int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = bf16_to_float(data[i0]);
+        float x1 = bf16_to_float(data[i1]);
+
+        data[i0] = float_to_bf16(x0 * s_cos[i] - x1 * s_sin[i]);
+        data[i1] = float_to_bf16(x0 * s_sin[i] + x1 * s_cos[i]);
+    }
+}
+
+/**
+ * @brief FP16 RoPE contiguous kernel - position computed from offset
+ */
+__global__ void rope_fp16_contiguous_kernel(
+    uint16_t *__restrict__ Q,
+    uint16_t *__restrict__ K,
+    const float *__restrict__ inv_freq,
+    int pos_offset,
+    int seq_len,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    int total_q_blocks = seq_len * n_q_heads;
+    int block_idx = blockIdx.x;
+
+    uint16_t *data;
+    int n_heads;
+    int local_block_idx;
+
+    if (block_idx < total_q_blocks)
+    {
+        data = Q;
+        n_heads = n_q_heads;
+        local_block_idx = block_idx;
+    }
+    else
+    {
+        if (K == nullptr)
+            return;
+        data = K;
+        n_heads = n_kv_heads;
+        local_block_idx = block_idx - total_q_blocks;
+    }
+
+    int head_idx = local_block_idx % n_heads;
+    int seq_idx = local_block_idx / n_heads;
+
+    if (seq_idx >= seq_len)
+        return;
+
+    int pos = pos_offset + seq_idx;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        __sincosf(angle, &s_sin[i], &s_cos[i]);
+    }
+    __syncthreads();
+
+    int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = fp16_to_float(data[i0]);
+        float x1 = fp16_to_float(data[i1]);
+
+        data[i0] = float_to_fp16(x0 * s_cos[i] - x1 * s_sin[i]);
+        data[i1] = float_to_fp16(x0 * s_sin[i] + x1 * s_cos[i]);
+    }
+}
+
+// =========================================================================
 // Extern "C" Wrapper Functions
 // =========================================================================
 
@@ -888,6 +1296,227 @@ extern "C"
             // CRITICAL: Must synchronize before freeing position_ids
             cudaDeviceSynchronize();
             cudaFree(d_position_ids);
+        }
+
+        return true;
+    }
+
+    // =========================================================================
+    // DECODE WRAPPER FUNCTIONS (seq_len=1, scalar position - NO MEMCPY)
+    // =========================================================================
+
+    bool cudaOps_rope_fp32_decode(
+        float *Q,
+        float *K,
+        int pos,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int device_idx)
+    {
+        cudaSetDevice(device_idx);
+
+        float *d_inv_freq = get_inv_freq_device(head_dim, rope_theta, device_idx);
+        if (!d_inv_freq)
+            return false;
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        int total_blocks = n_heads + (K ? n_kv_heads : 0);
+
+        rope_fp32_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+            Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA RoPE FP32 decode kernel failed: %s\n", cudaGetErrorString(err));
+            return false;
+        }
+
+        return true;
+    }
+
+    bool cudaOps_rope_bf16_decode(
+        uint16_t *Q,
+        uint16_t *K,
+        int pos,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int device_idx)
+    {
+        cudaSetDevice(device_idx);
+
+        float *d_inv_freq = get_inv_freq_device(head_dim, rope_theta, device_idx);
+        if (!d_inv_freq)
+            return false;
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        int total_blocks = n_heads + (K ? n_kv_heads : 0);
+
+        rope_bf16_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+            Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA RoPE BF16 decode kernel failed: %s\n", cudaGetErrorString(err));
+            return false;
+        }
+
+        return true;
+    }
+
+    bool cudaOps_rope_fp16_decode(
+        uint16_t *Q,
+        uint16_t *K,
+        int pos,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int device_idx)
+    {
+        cudaSetDevice(device_idx);
+
+        float *d_inv_freq = get_inv_freq_device(head_dim, rope_theta, device_idx);
+        if (!d_inv_freq)
+            return false;
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        int total_blocks = n_heads + (K ? n_kv_heads : 0);
+
+        rope_fp16_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+            Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA RoPE FP16 decode kernel failed: %s\n", cudaGetErrorString(err));
+            return false;
+        }
+
+        return true;
+    }
+
+    // =========================================================================
+    // CONTIGUOUS WRAPPER FUNCTIONS (pos computed on GPU - ZERO MEMCPY)
+    // =========================================================================
+
+    bool cudaOps_rope_fp32_contiguous(
+        float *Q,
+        float *K,
+        int pos_offset,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int device_idx)
+    {
+        cudaSetDevice(device_idx);
+
+        float *d_inv_freq = get_inv_freq_device(head_dim, rope_theta, device_idx);
+        if (!d_inv_freq)
+            return false;
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        int total_blocks = seq_len * (n_heads + (K ? n_kv_heads : 0));
+
+        rope_fp32_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA RoPE FP32 contiguous kernel failed: %s\n", cudaGetErrorString(err));
+            return false;
+        }
+
+        return true;
+    }
+
+    bool cudaOps_rope_bf16_contiguous(
+        uint16_t *Q,
+        uint16_t *K,
+        int pos_offset,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int device_idx)
+    {
+        cudaSetDevice(device_idx);
+
+        float *d_inv_freq = get_inv_freq_device(head_dim, rope_theta, device_idx);
+        if (!d_inv_freq)
+            return false;
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        int total_blocks = seq_len * (n_heads + (K ? n_kv_heads : 0));
+
+        rope_bf16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA RoPE BF16 contiguous kernel failed: %s\n", cudaGetErrorString(err));
+            return false;
+        }
+
+        return true;
+    }
+
+    bool cudaOps_rope_fp16_contiguous(
+        uint16_t *Q,
+        uint16_t *K,
+        int pos_offset,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int device_idx)
+    {
+        cudaSetDevice(device_idx);
+
+        float *d_inv_freq = get_inv_freq_device(head_dim, rope_theta, device_idx);
+        if (!d_inv_freq)
+            return false;
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        int total_blocks = seq_len * (n_heads + (K ? n_kv_heads : 0));
+
+        rope_fp16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA RoPE FP16 contiguous kernel failed: %s\n", cudaGetErrorString(err));
+            return false;
         }
 
         return true;

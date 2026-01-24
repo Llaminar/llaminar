@@ -124,6 +124,37 @@ namespace llaminar2
             int root) override;
 
         // =====================================================================
+        // Column-Parallel (Strided) AllGather for LM Head
+        // =====================================================================
+
+        /**
+         * @brief Strided AllGather for column-parallel operations
+         *
+         * This is optimized for column-parallel LM head where:
+         * - Each rank has local logits [seq_len, vocab_local]
+         * - Output is [seq_len, vocab_full] with interleaved columns
+         *
+         * Implementation:
+         * 1. NCCL AllGather to temp buffer (contiguous by rank)
+         * 2. CUDA kernel to deinterleave into strided output
+         *
+         * This avoids host memory staging that MPI_Type_vector would require.
+         *
+         * @param send_buf Local slice [seq_len * local_dim] contiguous
+         * @param recv_buf Output [seq_len * full_dim] with strided layout
+         * @param seq_len Number of rows (tokens)
+         * @param local_dim Columns per rank (vocab_local)
+         * @param dtype Data type (must be FLOAT32)
+         * @return true on success
+         */
+        bool stridedAllgather(
+            const void *send_buf,
+            void *recv_buf,
+            size_t seq_len,
+            size_t local_dim,
+            CollectiveDataType dtype);
+
+        // =====================================================================
         // Multi-GPU Single-Process Operations
         // =====================================================================
 
@@ -192,6 +223,10 @@ namespace llaminar2
         std::vector<void *> all_comms_;    // One communicator per GPU (ncclComm_t)
         std::vector<void *> all_streams_;  // One stream per GPU (cudaStream_t)
         std::vector<int> device_ordinals_; // Device ordinals for each GPU
+
+        // Persistent temp buffer for stridedAllgather (avoids per-call alloc/sync)
+        void *strided_allgather_temp_buf_ = nullptr;
+        size_t strided_allgather_temp_size_ = 0;
 #endif
     };
 

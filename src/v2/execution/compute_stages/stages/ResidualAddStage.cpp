@@ -577,7 +577,7 @@ namespace llaminar2
         }
     }
 
-    StageDumpInfo ResidualAddStage::getDumpInfo() const
+    StageDumpInfo ResidualAddStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
 

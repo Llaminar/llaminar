@@ -380,6 +380,18 @@ namespace llaminar2
         bool executeCollectiveAllreduce(ComputeNode &node, IDeviceContext *ctx);
         bool executeCollectiveAllgather(ComputeNode &node, IDeviceContext *ctx);
 
+        /**
+         * @brief Execute strided AllGather using NCCL + CUDA deinterleave
+         *
+         * Optimized for column-parallel LM head. Returns false if NCCL not
+         * available or device is not CUDA, allowing fallback to MPI path.
+         *
+         * @param node The compute node containing AllGatherStage
+         * @param ctx Device context (unused, CollectiveContext handles device)
+         * @return true if executed successfully, false to fall back to stage execution
+         */
+        bool executeCollectiveStridedAllgather(ComputeNode &node, IDeviceContext *ctx);
+
         // Buffer validation (Debug/Integration builds only)
 #if LLAMINAR_ASSERTIONS_ACTIVE
         /**

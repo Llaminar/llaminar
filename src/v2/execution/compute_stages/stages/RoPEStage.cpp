@@ -345,7 +345,7 @@ namespace llaminar2
         }
     }
 
-    StageDumpInfo RoPEStage::getDumpInfo() const
+    StageDumpInfo RoPEStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
         if (!params_.Q)

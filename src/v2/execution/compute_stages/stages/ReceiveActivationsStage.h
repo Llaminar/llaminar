@@ -70,7 +70,7 @@ namespace llaminar2
         std::string name() const override { return name_; }
 
         bool supportsBackend(ComputeBackendType backend) const override;
-        StageDumpInfo getDumpInfo() const override;
+        StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
 
         /// MPI stages handle their own synchronization - no automatic coherence

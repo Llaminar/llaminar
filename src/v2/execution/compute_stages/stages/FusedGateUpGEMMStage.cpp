@@ -170,7 +170,7 @@ namespace llaminar2
         }
     }
 
-    StageDumpInfo FusedGateUpGEMMStage::getDumpInfo() const
+    StageDumpInfo FusedGateUpGEMMStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
 

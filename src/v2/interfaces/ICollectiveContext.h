@@ -82,6 +82,28 @@ namespace llaminar2
             DeviceId tensor_device) = 0;
 
         /**
+         * @brief Execute a GPU-native strided AllGather operation
+         *
+         * This is an optimized path for column-parallel GEMM outputs where:
+         * - Standard allgather would collect into contiguous layout
+         * - But output needs strided interleaved layout for next operation
+         *
+         * Uses NCCL AllGather to temp buffer, then CUDA kernel to deinterleave.
+         * Falls back to false if NCCL not available or not on CUDA device.
+         *
+         * @param local_input Local slice [seq_len, local_dim]
+         * @param full_output Full output [seq_len, full_dim] (strided)
+         * @param actual_seq_len Actual sequence length (0 = use tensor rows)
+         * @param tensor_device Device where tensors reside (must be CUDA)
+         * @return true if successfully executed via GPU-native path, false to fallback
+         */
+        virtual bool executeStridedAllgather(
+            ITensor *local_input,
+            ITensor *full_output,
+            size_t actual_seq_len,
+            DeviceId tensor_device) = 0;
+
+        /**
          * @brief Execute a variable-sized AllGather operation (allgatherv)
          *
          * Unlike executeAllgather which assumes equal send counts per rank,

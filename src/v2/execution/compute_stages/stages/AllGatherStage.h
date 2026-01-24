@@ -56,7 +56,7 @@ namespace llaminar2
         bool requiresAllreduce() const override { return true; }
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
-        StageDumpInfo getDumpInfo() const override;
+        StageDumpInfo buildDumpInfoImpl() const override;
 
         /// MPI stages handle their own synchronization - no automatic coherence
         CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
@@ -66,6 +66,9 @@ namespace llaminar2
 
         /// Get the TPDomain this stage belongs to (nullptr = legacy mpi_ctx path)
         const TPDomain *getDomain() const { return params_.domain; }
+
+        /// Get the stage parameters (for GraphExecutor strided allgather path)
+        const Params &getParams() const { return params_; }
 
     private:
         Params params_;

@@ -82,6 +82,7 @@
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/SlabGemmConfig.h"
 #include "utils/Logger.h"
+#include "utils/KernelProfiler.h"
 
 #include <stdexcept>
 #include <vector>
@@ -582,6 +583,7 @@ namespace llaminar2
             int device_idx,
             DeviceWorkspaceManager *workspace)
         {
+            KERNEL_PROFILE_SCOPE(KernelType::GEMM_Q8);
             (void)mpi_ctx;
             (void)device_idx;
             (void)transpose_B;

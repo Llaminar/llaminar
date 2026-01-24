@@ -122,7 +122,7 @@ namespace llaminar2
         }
     }
 
-    StageDumpInfo LMHeadStage::getDumpInfo() const
+    StageDumpInfo LMHeadStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
 

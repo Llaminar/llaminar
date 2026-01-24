@@ -214,16 +214,23 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDAVectorAddKernels.cu      # Vector add kernels (for collective reductions)
         kernels/cuda/attention/CUDAFlashAttentionKernels.cu  # Flash Attention 2 and Flash Decoding kernels
         kernels/cuda/kvcache/CUDARingKVCache.cu       # Ring buffer KV cache with O(1) eviction
+        # Profiling utilities
+        utils/CUDAKernelProfiler.cu                   # CUDA event-based kernel profiling
     )
     
     # NOTE: CUDA kernel ITensorGemm adapters (CUDAFloatingPointGemmKernel.cpp, CUDAQuantisedGemmKernel.cpp)
     # are added to llaminar2_core with target_sources() below, compiled with regular C++ compiler (NOT nvcc)
     # because they include MPI headers which nvcc cannot process
     
-    # CUDA backend library includes backend + kernels + enumeration
+    # CUDA backend library includes backend + kernels + enumeration + NCCLBackend
+    # 
+    # CRITICAL: NCCLBackend MUST be in cuda_backend (not llaminar2_core) to isolate
+    # NCCL symbols from RCCL. Both NCCL and RCCL export identical symbols (ncclCommInitRank,
+    # ncclAllReduce, etc.). If both are linked to llaminar2_core, whichever loads first
+    # will shadow the other's symbols, causing AMD code to call NVIDIA's NCCL or vice versa.
+    #
     # Note: NCCLBackendCUDA.cu isolates CUDA runtime calls from NCCLBackend.cpp
     # Note: HostBackendCUDA.cu isolates CUDA runtime calls from HostBackend.cpp
-    # Both are needed to avoid conflicts with HIP headers when building with both CUDA and ROCm
     # Note: CUDARingKVCacheTensorAdapter.cpp provides ITensor interface implementations for
     # CUDARingKVCache and must be in cuda_backend to satisfy template instantiation dependencies
     add_library(cuda_backend STATIC 
@@ -236,6 +243,20 @@ if(HAVE_CUDA)
         ${CUDA_KERNEL_SOURCES}
     )
     target_include_directories(cuda_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    
+    # NCCLBackend.cpp must be compiled with g++ (not nvcc) because it includes MPI headers.
+    # NCCLDynamicLoader.cpp must also be compiled with g++ as it uses dlopen/dlsym.
+    # Add them as separate sources with regular C++ compilation.
+    target_sources(cuda_backend PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/collective/backends/NCCLBackend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/collective/backends/NCCLDynamicLoader.cpp
+    )
+    # Set the source files to be compiled with C++ compiler, not nvcc
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/collective/backends/NCCLBackend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/collective/backends/NCCLDynamicLoader.cpp
+        PROPERTIES LANGUAGE CXX
+    )
     
     # Link CUDA libraries:
     # - cudart: CUDA Runtime API (for memory management, streams, etc.)
@@ -250,6 +271,9 @@ if(HAVE_CUDA)
         CUDA::cublas
         CUDA::cublasLt
     )
+    
+    # Link MPI for NCCLBackend.cpp (which uses MPI_Comm_rank for distributed communication)
+    target_link_libraries(cuda_backend PUBLIC MPI::MPI_CXX)
     
     # Link ONNX Runtime if enabled
     if(USE_ONNX_HEURISTIC AND ONNXRUNTIME_INCLUDE_DIR)
@@ -348,6 +372,16 @@ if(HAVE_CUDA)
         message(STATUS "V2: NCCL found")
         message(STATUS "V2:   Include: ${NCCL_INCLUDE_DIR}")
         message(STATUS "V2:   Library: ${NCCL_LIBRARY}")
+        
+        # CRITICAL: NCCL is now loaded dynamically via dlopen() in NCCLDynamicLoader.cpp
+        # to avoid symbol conflicts with RCCL, which exports identical symbol names.
+        # We only need the headers for NCCLBackendCUDA.cu (it doesn't actually link NCCL anymore).
+        # NCCLDynamicLoader loads NCCL at runtime with RTLD_LOCAL to isolate symbols.
+        target_include_directories(cuda_backend PUBLIC ${NCCL_INCLUDE_DIR})
+        target_compile_definitions(cuda_backend PUBLIC HAVE_NCCL)
+        # Link dl for dlopen/dlsym
+        target_link_libraries(cuda_backend PUBLIC ${CMAKE_DL_LIBS})
+        message(STATUS "V2: NCCL will be loaded dynamically (dlopen) from cuda_backend for symbol isolation")
     else()
         set(HAVE_NCCL OFF CACHE BOOL "NCCL library not found")
         message(WARNING "V2: NCCL not found - NCCLBackend will be disabled")
@@ -441,15 +475,45 @@ if(HAVE_ROCM)
     )
     
     # ROCm enumeration and backend must be compiled with hipcc to use HIP runtime
+    # CRITICAL: RCCLBackend MUST be in rocm_backend (not llaminar2_core) to isolate
+    # RCCL symbols from NCCL. Both libraries export the same symbol names
+    # (ncclCommInitRank, etc.). If both are linked to the same target, only one
+    # set resolves, causing ROCm code to accidentally call NVIDIA NCCL.
+    #
+    # CRITICAL: RCCL is now loaded dynamically via dlopen() in RCCLDynamicLoader.cpp
+    # to avoid symbol conflicts with NCCL, which exports identical symbol names.
+    # RCCLBackendHIP.cpp isolates HIP runtime calls and uses the dynamic loader.
     add_library(rocm_backend STATIC 
         backends/rocm/ROCmBackend.cpp
         backends/rocm/ROCmTensorValidation.cpp
         backends/ROCmEnumeration.cpp
         collective/backends/HostBackendROCm.cpp              # HIP-specific host memory registration
+        collective/backends/RCCLBackend.cpp                  # RCCL backend (MUST be here, not in llaminar2_core)
+        collective/backends/RCCLDynamicLoader.cpp            # Dynamic loader for RCCL (dlopen/dlsym)
+        collective/backends/RCCLBackendHIP.cpp               # HIP runtime wrappers for RCCL backend
         ${ROCM_KERNEL_SOURCES}
     )
     target_include_directories(rocm_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(rocm_backend PUBLIC hip::host roc::hipblas)
+    
+    # RCCLBackend.cpp needs MPI for MPIContext
+    target_link_libraries(rocm_backend PUBLIC MPI::MPI_CXX)
+    
+    # Link dl for dlopen/dlsym (RCCLDynamicLoader uses dlopen to load RCCL dynamically)
+    target_link_libraries(rocm_backend PUBLIC ${CMAKE_DL_LIBS})
+    
+    # CRITICAL: RCCL is now loaded dynamically via dlopen() instead of direct linking
+    # This avoids symbol conflicts with NCCL - both libraries export identical symbol
+    # names (ncclAllReduce, ncclCommInitRank, etc.). Dynamic loading with RTLD_LOCAL
+    # keeps symbols in isolated namespaces.
+    if(HAVE_RCCL)
+        # Only need RCCL headers (if available) - library is loaded at runtime
+        if(RCCL_INCLUDE_DIR)
+            target_include_directories(rocm_backend PUBLIC ${RCCL_INCLUDE_DIR})
+        endif()
+        target_compile_definitions(rocm_backend PUBLIC HAVE_RCCL)
+        message(STATUS "V2: RCCL will be loaded dynamically (dlopen) from rocm_backend for symbol isolation")
+    endif()
     
     # Link ComposableKernel if found
     if(ComposableKernel_FOUND)
@@ -461,13 +525,27 @@ if(HAVE_ROCM)
     endif()
     
     # Set HIP compiler for ROCm source files
+    # NOTE: RCCLBackend.cpp, RCCLDynamicLoader.cpp, and RCCLBackendHIP.cpp are NOT
+    # compiled with HIP because:
+    # - RCCLBackend.cpp needs MPI headers which hipcc cannot process
+    # - RCCLDynamicLoader.cpp uses dlopen/dlsym
+    # - RCCLBackendHIP.cpp uses HIP runtime API via standard C++ includes, but
+    #   is compiled with HIP to access hip/hip_runtime.h
     set_source_files_properties(
         backends/rocm/ROCmBackend.cpp
         backends/rocm/ROCmTensorValidation.cpp
         backends/ROCmEnumeration.cpp
         collective/backends/HostBackendROCm.cpp
+        collective/backends/RCCLBackendHIP.cpp
         ${ROCM_KERNEL_SOURCES}
         PROPERTIES LANGUAGE HIP
+    )
+    
+    # RCCLBackend.cpp and RCCLDynamicLoader.cpp must be compiled with regular C++ compiler
+    set_source_files_properties(
+        collective/backends/RCCLBackend.cpp
+        collective/backends/RCCLDynamicLoader.cpp
+        PROPERTIES LANGUAGE CXX
     )
     
     # =============================================================================
@@ -1142,8 +1220,10 @@ add_library(llaminar2_core STATIC
     collective/BackendRouter.cpp
     collective/backends/HostBackend.cpp
     collective/backends/MPIBackend.cpp
-    collective/backends/NCCLBackend.cpp
-    collective/backends/RCCLBackend.cpp
+    # NOTE: NCCLBackend.cpp is NOT here - it's in cuda_backend to isolate NCCL symbols
+    # from RCCL. Both export the same symbols (ncclCommInitRank, etc.) and would conflict.
+    # NOTE: RCCLBackend.cpp is NOT here - it's in rocm_backend to isolate RCCL symbols
+    # from NCCL. Both export the same symbols (ncclCommInitRank, etc.) and would conflict.
     collective/backends/UPIBackend.cpp
     execution/CollectiveContext.cpp
     # NUMA-aware memory allocation
@@ -1301,11 +1381,14 @@ if(HAVE_CUDA)
     )
     message(STATUS "V2: Linked CUDA runtime, cuBLAS, cuBLASLt, and NVML")
     
-    # Link NCCL if found
+    # NOTE: NCCL is linked to cuda_backend (not llaminar2_core) to isolate symbols
+    # from RCCL. Both export identical symbols and would conflict if in same library.
+    # If HAVE_NCCL is set, cuda_backend already has NCCL linked via HAVE_NCCL check above
     if(HAVE_NCCL)
+        # Only include headers for compilation - the library is linked via cuda_backend
         target_include_directories(llaminar2_core PUBLIC ${NCCL_INCLUDE_DIR})
-        target_link_libraries(llaminar2_core PUBLIC ${NCCL_LIBRARY})
-        message(STATUS "V2: Linked NCCL for multi-GPU collective operations")
+        # DO NOT link NCCL library here - it comes via cuda_backend to prevent symbol conflicts
+        message(STATUS "V2: NCCL headers available (library linked via cuda_backend)")
     endif()
 endif()
 
@@ -1327,11 +1410,14 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2: Linked HIP runtime, hipBLAS, and hipBLASLt")
     
-    # Link RCCL if found
+    # NOTE: RCCL is linked to rocm_backend (not llaminar2_core) to isolate symbols
+    # from NCCL. Both libraries export the same symbols (ncclCommInitRank, etc.)
+    # If HAVE_RCCL is set, rocm_backend already has RCCL linked via HAVE_RCCL check above
     if(HAVE_RCCL)
+        target_compile_definitions(llaminar2_core PUBLIC HAVE_RCCL)
         target_include_directories(llaminar2_core PUBLIC ${RCCL_INCLUDE_DIR})
-        target_link_libraries(llaminar2_core PUBLIC ${RCCL_LIBRARY})
-        message(STATUS "V2: Linked RCCL for multi-GPU collective operations")
+        # DO NOT link RCCL library here - it comes via rocm_backend to prevent symbol conflicts
+        message(STATUS "V2: RCCL headers available (library linked via rocm_backend)")
     endif()
 endif()
 

@@ -89,10 +89,13 @@ namespace llaminar2
         else
         {
             // GPU tensor - device-to-host transfer
+            // CRITICAL: Use active_data_ptr() to get the GPU pointer directly,
+            // NOT data() which would sync GPU→Host and return the host pointer!
             int device_id = home_device.toKernelDeviceIndex();
+            const float *gpu_ptr = static_cast<const float *>(tensor->active_data_ptr());
             LOG_DEBUG("[MPIStager] toHost: GPU tensor (" << home_device.toString() << "), staging " << numel << " elements");
             synchronizeDevice(device_id);
-            deviceToHost(host_buffer.data(), tensor->data(), numel, device_id);
+            deviceToHost(host_buffer.data(), gpu_ptr, numel, device_id);
         }
 
         return host_buffer;
@@ -129,10 +132,15 @@ namespace llaminar2
         else
         {
             // GPU tensor - host-to-device transfer
+            // CRITICAL: Use active_mutable_data_ptr() to get the GPU pointer directly,
+            // NOT mutable_data() which would return the host pointer!
             int device_id = home_device.toKernelDeviceIndex();
+            float *gpu_ptr = static_cast<float *>(tensor->active_mutable_data_ptr());
             LOG_DEBUG("[MPIStager] toDevice: GPU tensor (" << home_device.toString() << "), staging " << numel << " elements");
-            hostToDevice(tensor->mutable_data(), host_buffer.data(), numel, device_id);
+            hostToDevice(gpu_ptr, host_buffer.data(), numel, device_id);
             synchronizeDevice(device_id);
+            // Mark device data as authoritative after H2D transfer
+            tensor->mark_device_dirty();
         }
     }
 

@@ -163,10 +163,19 @@ TEST_F(Test__GraphExecutorCollective, AllreduceStage_NotInterceptedWhenContextNu
 }
 
 // =============================================================================
-// ALLGATHER Intercept Tests
+// ALLGATHER Stage Tests
+// NOTE: GraphExecutor does NOT intercept ALLGATHER stages via CollectiveContext.
+// This is intentional because column-parallel operations (e.g., LM head) require
+// strided placement using MPI_Type_vector, which AllGatherStage::executeViaMPI()
+// handles correctly. The CollectiveContext path only supports simple contiguous
+// allgather, which is insufficient for the strided output layout needed by
+// column-parallel tensor parallelism.
+//
+// These tests verify that AllGather stages are NOT intercepted and instead
+// execute their internal path (which requires MPI context).
 // =============================================================================
 
-TEST_F(Test__GraphExecutorCollective, AllgatherStage_InterceptedWhenContextSet)
+TEST_F(Test__GraphExecutorCollective, AllgatherStage_NotInterceptedEvenWithContext)
 {
     // Create test buffers (local and full)
     auto local_input = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 8});  // [seq, local_dim]
@@ -183,12 +192,12 @@ TEST_F(Test__GraphExecutorCollective, AllgatherStage_InterceptedWhenContextSet)
     auto collective_ctx = createMockCollectiveContext();
     executor_->setCollectiveContext(collective_ctx.get());
 
-    // Create AllGatherStage
+    // Create AllGatherStage WITHOUT MPI context (to verify it's not intercepted)
     AllGatherStage::Params params;
     params.local_input = local_input.get();
     params.full_output = full_output.get();
     params.actual_seq_len = 4;
-    params.mpi_ctx = nullptr; // No MPI fallback
+    params.mpi_ctx = nullptr; // No MPI - will fail if stage executes internally
 
     auto stage = std::make_unique<AllGatherStage>(params);
 
@@ -196,14 +205,18 @@ TEST_F(Test__GraphExecutorCollective, AllgatherStage_InterceptedWhenContextSet)
     ComputeGraph graph;
     graph.addNode("allgather", std::move(stage), DeviceId::cpu());
 
-    // Execute graph
+    // Execute graph - should FAIL because:
+    // 1. GraphExecutor does NOT intercept ALLGATHER (by design)
+    // 2. AllGatherStage::execute() falls back to MPI path
+    // 3. MPI context is null, so executeViaMPI() returns false
     bool success = executor_->execute(graph, cpu_ctx_.get());
 
-    // Verify execution succeeded
-    EXPECT_TRUE(success);
+    // Verify execution FAILED (AllGather not intercepted, MPI context missing)
+    EXPECT_FALSE(success);
 
-    // Verify the backend was called
-    EXPECT_GE(mock_backend_raw_->allgatherCallCount(), 1);
+    // Verify the CollectiveContext backend was NOT called
+    // (AllGather stages are not routed through CollectiveContext)
+    EXPECT_EQ(mock_backend_raw_->allgatherCallCount(), 0);
 }
 
 // =============================================================================
@@ -433,8 +446,18 @@ TEST_F(Test__GraphExecutorCollective, AllreduceWithNullDomainUsesLegacyMethod)
     EXPECT_EQ(mock_ctx->allreduce_in_domain_call_count(), 0);
 }
 
-TEST_F(Test__GraphExecutorCollective, AllgatherWithDomainUsesInDomainMethod)
+TEST_F(Test__GraphExecutorCollective, AllgatherWithDomain_NotIntercepted_ExecutesViaMPI)
 {
+    // NOTE: GraphExecutor does NOT intercept ALLGATHER stages, even when they have
+    // a domain configured. This is because column-parallel operations require
+    // strided output layout via MPI_Type_vector, which CollectiveContext doesn't
+    // support. The AllGatherStage handles this internally via executeViaMPI().
+    //
+    // This test verifies that:
+    // 1. AllGather stages are NOT routed through CollectiveContext
+    // 2. The stage's internal execution path is used instead
+    // 3. Without MPI context, execution fails (as expected)
+
     // Create mock collective context with call tracking
     auto mock_ctx = MockCollectiveContext::Builder()
                         .withWorldSize(2)
@@ -458,12 +481,13 @@ TEST_F(Test__GraphExecutorCollective, AllgatherWithDomainUsesInDomainMethod)
     test_domain.devices = {DeviceId::cpu()};
     test_domain.communicator = MPI_COMM_NULL;
 
-    // Create AllGatherStage WITH domain
+    // Create AllGatherStage WITH domain but WITHOUT MPI context
     AllGatherStage::Params params;
     params.local_input = local_input.get();
     params.full_output = full_output.get();
     params.actual_seq_len = 4;
     params.domain = &test_domain;
+    params.mpi_ctx = nullptr; // No MPI context - stage will fail if not intercepted
 
     auto stage = std::make_unique<AllGatherStage>(params);
 
@@ -472,16 +496,19 @@ TEST_F(Test__GraphExecutorCollective, AllgatherWithDomainUsesInDomainMethod)
     graph.addNode("allgather_with_domain", std::move(stage), DeviceId::cpu());
     bool success = executor_->execute(graph, cpu_ctx_.get());
 
-    // Verify execution succeeded
-    EXPECT_TRUE(success);
+    // Verify execution FAILED (AllGather not intercepted, MPI context missing)
+    EXPECT_FALSE(success);
 
-    // Verify the domain-aware method was called (not the legacy method)
-    EXPECT_EQ(mock_ctx->allgather_in_domain_call_count(), 1);
-    EXPECT_EQ(mock_ctx->last_allgather_domain(), &test_domain);
+    // Verify CollectiveContext methods were NOT called
+    // (AllGather stages bypass CollectiveContext routing)
+    EXPECT_EQ(mock_ctx->allgather_in_domain_call_count(), 0);
+    EXPECT_EQ(mock_ctx->allgather_call_count(), 0);
 }
 
-TEST_F(Test__GraphExecutorCollective, AllgatherWithNullDomainUsesLegacyMethod)
+TEST_F(Test__GraphExecutorCollective, AllgatherWithNullDomain_NotIntercepted_ExecutesViaMPI)
 {
+    // Same as above - AllGather is NOT intercepted regardless of domain config
+
     // Create mock collective context with call tracking
     auto mock_ctx = MockCollectiveContext::Builder()
                         .withWorldSize(2)
@@ -496,12 +523,13 @@ TEST_F(Test__GraphExecutorCollective, AllgatherWithNullDomainUsesLegacyMethod)
     auto local_input = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 8});
     auto full_output = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 16});
 
-    // Create AllGatherStage WITHOUT domain (nullptr)
+    // Create AllGatherStage WITHOUT domain and WITHOUT MPI context
     AllGatherStage::Params params;
     params.local_input = local_input.get();
     params.full_output = full_output.get();
     params.actual_seq_len = 4;
-    params.domain = nullptr; // No domain - use legacy path
+    params.domain = nullptr;  // No domain
+    params.mpi_ctx = nullptr; // No MPI context
 
     auto stage = std::make_unique<AllGatherStage>(params);
 
@@ -510,10 +538,10 @@ TEST_F(Test__GraphExecutorCollective, AllgatherWithNullDomainUsesLegacyMethod)
     graph.addNode("allgather_no_domain", std::move(stage), DeviceId::cpu());
     bool success = executor_->execute(graph, cpu_ctx_.get());
 
-    // Verify execution succeeded
-    EXPECT_TRUE(success);
+    // Verify execution FAILED (AllGather not intercepted, MPI context missing)
+    EXPECT_FALSE(success);
 
-    // Verify the legacy method was called (not the domain-aware method)
-    EXPECT_EQ(mock_ctx->allgather_call_count(), 1);
+    // Verify CollectiveContext methods were NOT called
+    EXPECT_EQ(mock_ctx->allgather_call_count(), 0);
     EXPECT_EQ(mock_ctx->allgather_in_domain_call_count(), 0);
 }

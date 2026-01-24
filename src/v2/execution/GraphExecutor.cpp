@@ -18,6 +18,7 @@
 #include "../tensors/TensorClasses.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
+#include "../utils/KernelProfiler.h"
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
@@ -518,7 +519,11 @@ namespace llaminar2
         LOG_DEBUG("[GraphExecutor] Total execution: " << total_ms << "ms for " << order.size() << " stages (" << (total_ms / order.size()) << "ms/stage avg)");
 
         stats_.total_time_ms += total_ms;
-        stats_.total_stages_executed += order.size();
+        // Only increment here if profiling is disabled - executeNode already increments when profiling is enabled
+        if (!config_.enable_profiling)
+        {
+            stats_.total_stages_executed += order.size();
+        }
         stats_.total_flops += graph.totalEstimatedFlops();
 
         return true;
@@ -712,6 +717,12 @@ namespace llaminar2
         }
 
         // =========================================================================
+        // Transfer Profiling: Set stage context for per-stage transfer tracking
+        // Uses RAII to automatically clear context when function exits
+        // =========================================================================
+        TransferProfiler::StageScope transfer_scope(node.name);
+
+        // =========================================================================
         // Collective Stage Intercept: Use CollectiveContext for GPU-native collectives
         // This bypasses the stage's internal MPI fallback path when CollectiveContext
         // is available, enabling RCCL/NCCL/PCIeBAR backends.
@@ -724,19 +735,26 @@ namespace llaminar2
                 LOG_DEBUG("[GraphExecutor] Intercepting ALLREDUCE stage '" << node.name << "' via CollectiveContext");
                 return executeCollectiveAllreduce(node, ctx);
             }
-            if (stage_type == ComputeStageType::ALLGATHER)
+            else if (stage_type == ComputeStageType::ALLGATHER)
             {
-                LOG_DEBUG("[GraphExecutor] Intercepting ALLGATHER stage '" << node.name << "' via CollectiveContext");
-                return executeCollectiveAllgather(node, ctx);
+                // Try GPU-native strided allgather (NCCL + CUDA deinterleave kernel)
+                // Falls back to stage's MPI path if not CUDA or NCCL unavailable
+                LOG_DEBUG("[GraphExecutor] Attempting strided ALLGATHER intercept for '" << node.name << "'");
+                if (executeCollectiveStridedAllgather(node, ctx))
+                {
+                    return true;
+                }
+                // Fall through to normal execution if strided path not available
+                LOG_DEBUG("[GraphExecutor] Strided ALLGATHER not available, using stage execution");
             }
         }
 
         // Extract layer index from config
         const int layer_idx = config_.current_layer_idx;
+        const bool profiling = config_.enable_profiling;
 
-        // Timing variables for phase breakdown
-        auto phase_start = std::chrono::high_resolution_clock::now();
-        auto phase_end = phase_start;
+        // Timing variables for phase breakdown (only initialized if profiling enabled)
+        std::chrono::high_resolution_clock::time_point phase_start{}, phase_end{};
         double input_cohere_ms = 0.0;
         double weight_cohere_ms = 0.0;
         double output_alloc_ms = 0.0;
@@ -745,6 +763,19 @@ namespace llaminar2
         double mark_dirty_ms = 0.0;
         double get_dump_info_ms = 0.0;
         double extract_buffers_ms = 0.0;
+
+        // =========================================================================
+        // OPTIMIZATION: Cache getDumpInfo() once at start (avoid 3-4 calls per stage)
+        // getDumpInfo() now caches internally, so this is just a reference lookup after first call
+        // =========================================================================
+        if (profiling)
+            phase_start = std::chrono::high_resolution_clock::now();
+        const StageDumpInfo &cached_dump_info = node.stage->getDumpInfo();
+        if (profiling)
+        {
+            phase_end = std::chrono::high_resolution_clock::now();
+            get_dump_info_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+        }
 
         // =========================================================================
         // Stage Coherence: Ensure inputs are on target device BEFORE execution
@@ -758,65 +789,78 @@ namespace llaminar2
 
             if (policy == CoherencePolicy::INPUT || policy == CoherencePolicy::FULL)
             {
-                // Time getDumpInfo separately
-                phase_start = std::chrono::high_resolution_clock::now();
-                auto dump_info = node.stage->getDumpInfo();
-                phase_end = std::chrono::high_resolution_clock::now();
-                get_dump_info_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                // Use cached dump_info (no separate getDumpInfo call needed)
 
                 // Cohere inputs (includes extract time)
-                phase_start = std::chrono::high_resolution_clock::now();
-                auto inputs = extractInputBuffers(dump_info);
-                phase_end = std::chrono::high_resolution_clock::now();
-                extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                if (profiling)
+                    phase_start = std::chrono::high_resolution_clock::now();
+                auto inputs = extractInputBuffers(cached_dump_info);
+                if (profiling)
+                {
+                    phase_end = std::chrono::high_resolution_clock::now();
+                    extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                    phase_start = phase_end;
+                }
 
-                phase_start = std::chrono::high_resolution_clock::now();
                 if (!cohereInputs(inputs, target_device))
                 {
                     LOG_ERROR("[GraphExecutor] Failed to cohere inputs for stage '" << node.name << "'");
                     return false;
                 }
-                phase_end = std::chrono::high_resolution_clock::now();
-                input_cohere_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                if (profiling)
+                {
+                    phase_end = std::chrono::high_resolution_clock::now();
+                    input_cohere_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                }
 
                 // Cohere weights (needed for GPU execution - biases, etc.)
-                phase_start = std::chrono::high_resolution_clock::now();
-                auto weights = extractWeightBuffers(dump_info);
-                phase_end = std::chrono::high_resolution_clock::now();
-                extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                if (profiling)
+                    phase_start = std::chrono::high_resolution_clock::now();
+                auto weights = extractWeightBuffers(cached_dump_info);
+                if (profiling)
+                {
+                    phase_end = std::chrono::high_resolution_clock::now();
+                    extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                    phase_start = phase_end;
+                }
 
-                phase_start = std::chrono::high_resolution_clock::now();
                 if (!cohereInputs(weights, target_device)) // Weights are read-only like inputs
                 {
                     LOG_ERROR("[GraphExecutor] Failed to cohere weights for stage '" << node.name << "'");
                     return false;
                 }
-                phase_end = std::chrono::high_resolution_clock::now();
-                weight_cohere_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                if (profiling)
+                {
+                    phase_end = std::chrono::high_resolution_clock::now();
+                    weight_cohere_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                }
             }
 
             // For GPU targets, outputs also need GPU buffers allocated before kernel runs
             if (policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL)
             {
-                // Time getDumpInfo separately
-                phase_start = std::chrono::high_resolution_clock::now();
-                auto dump_info = node.stage->getDumpInfo();
-                phase_end = std::chrono::high_resolution_clock::now();
-                get_dump_info_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                // Use cached dump_info (no separate getDumpInfo call needed)
 
-                phase_start = std::chrono::high_resolution_clock::now();
-                auto outputs = extractOutputBuffers(dump_info);
-                phase_end = std::chrono::high_resolution_clock::now();
-                extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                if (profiling)
+                    phase_start = std::chrono::high_resolution_clock::now();
+                auto outputs = extractOutputBuffers(cached_dump_info);
+                if (profiling)
+                {
+                    phase_end = std::chrono::high_resolution_clock::now();
+                    extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                    phase_start = phase_end;
+                }
 
-                phase_start = std::chrono::high_resolution_clock::now();
                 if (!cohereOutputs(outputs, target_device))
                 {
                     LOG_ERROR("[GraphExecutor] Failed to allocate output buffers for stage '" << node.name << "'");
                     return false;
                 }
-                phase_end = std::chrono::high_resolution_clock::now();
-                output_alloc_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                if (profiling)
+                {
+                    phase_end = std::chrono::high_resolution_clock::now();
+                    output_alloc_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                }
             }
         }
 
@@ -840,7 +884,8 @@ namespace llaminar2
 
         if (should_dump)
         {
-            phase_start = std::chrono::high_resolution_clock::now();
+            if (profiling)
+                phase_start = std::chrono::high_resolution_clock::now();
             dump_ctx = StageDumper::beginDump(
                 node.stage.get(),
                 node.name, // Pass node name for directory naming
@@ -857,24 +902,29 @@ namespace llaminar2
                     AsyncStageDumper::initialize(dump_cfg.async_threads);
                 }
                 // Enqueue inputs for async writing (fast memcpy only)
-                auto dump_info = node.stage->getDumpInfo();
-                AsyncStageDumper::enqueueInputs(dump_ctx, dump_info);
+                // Use cached dump_info instead of calling getDumpInfo() again
+                AsyncStageDumper::enqueueInputs(dump_ctx, cached_dump_info);
             }
             else
             {
                 // Synchronous dump (legacy path)
                 StageDumper::dumpInputs(dump_ctx, node.stage.get());
             }
-            phase_end = std::chrono::high_resolution_clock::now();
-            dump_input_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+            if (profiling)
+            {
+                phase_end = std::chrono::high_resolution_clock::now();
+                dump_input_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+            }
         }
 
-        auto start = std::chrono::high_resolution_clock::now();
-
+        if (profiling)
+            phase_start = std::chrono::high_resolution_clock::now();
         bool success = node.stage->execute(ctx);
-
-        auto end = std::chrono::high_resolution_clock::now();
-        execute_ms = std::chrono::duration<double, std::milli>(end - start).count();
+        if (profiling)
+        {
+            phase_end = std::chrono::high_resolution_clock::now();
+            execute_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+        }
 
         // =========================================================================
         // Stage Coherence: Mark outputs as device-dirty IMMEDIATELY after execution
@@ -887,29 +937,27 @@ namespace llaminar2
 
             if (policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL)
             {
-                // Time getDumpInfo separately
-                phase_start = std::chrono::high_resolution_clock::now();
-                auto dump_info = node.stage->getDumpInfo();
-                phase_end = std::chrono::high_resolution_clock::now();
-                double this_get_dump_info_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                get_dump_info_ms += this_get_dump_info_ms;
-                if (this_get_dump_info_ms > 10.0)
+                // Use cached dump_info (no separate getDumpInfo call needed)
+
+                if (profiling)
+                    phase_start = std::chrono::high_resolution_clock::now();
+                auto outputs = extractOutputBuffers(cached_dump_info);
+                if (profiling)
                 {
-                    LOG_WARN("[GraphExecutor] getDumpInfo('" << node.name << "') took " << this_get_dump_info_ms << " ms");
+                    phase_end = std::chrono::high_resolution_clock::now();
+                    extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                    phase_start = phase_end;
                 }
 
-                phase_start = std::chrono::high_resolution_clock::now();
-                auto outputs = extractOutputBuffers(dump_info);
-                phase_end = std::chrono::high_resolution_clock::now();
-                extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-
-                phase_start = std::chrono::high_resolution_clock::now();
                 markOutputsDirty(outputs);
-                phase_end = std::chrono::high_resolution_clock::now();
-                mark_dirty_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                if (profiling)
+                {
+                    phase_end = std::chrono::high_resolution_clock::now();
+                    mark_dirty_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                }
 
                 // Stage output printing (after coherence, so GPU→host sync has occurred)
-                printStageOutputs(node.name, dump_info);
+                printStageOutputs(node.name, cached_dump_info);
             }
         }
 
@@ -921,13 +969,14 @@ namespace llaminar2
         // Dump outputs after execution (if dumping enabled)
         if (should_dump && success)
         {
-            phase_start = std::chrono::high_resolution_clock::now();
+            if (profiling)
+                phase_start = std::chrono::high_resolution_clock::now();
 
             if (dump_cfg.async_dump)
             {
                 // Enqueue outputs for async writing (fast memcpy only)
-                auto dump_info = node.stage->getDumpInfo();
-                AsyncStageDumper::enqueueOutputs(dump_ctx, dump_info);
+                // Use cached dump_info instead of calling getDumpInfo() again
+                AsyncStageDumper::enqueueOutputs(dump_ctx, cached_dump_info);
                 // Note: finalizeDump not needed for async mode since metadata
                 // is written synchronously in beginDump
             }
@@ -937,8 +986,11 @@ namespace llaminar2
                 StageDumper::dumpOutputs(dump_ctx, node.stage.get());
                 StageDumper::finalizeDump(dump_ctx, execute_ms);
             }
-            phase_end = std::chrono::high_resolution_clock::now();
-            dump_output_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+            if (profiling)
+            {
+                phase_end = std::chrono::high_resolution_clock::now();
+                dump_output_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+            }
         }
 
         // EXIT verification - validate outputs AFTER execute()
@@ -946,36 +998,43 @@ namespace llaminar2
 #if LLAMINAR_ASSERTIONS_ACTIVE
         if (success && debugEnv().validation.validate_buffers)
         {
-            phase_start = std::chrono::high_resolution_clock::now();
+            if (profiling)
+                phase_start = std::chrono::high_resolution_clock::now();
             // New exception-based validation (throws VerificationFailure)
             verifyStageExit(node, layer_idx);
 
             // Legacy bool-based validation (for compatibility)
             success = validateStageOutputs(node);
-            phase_end = std::chrono::high_resolution_clock::now();
-            verify_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+            if (profiling)
+            {
+                phase_end = std::chrono::high_resolution_clock::now();
+                verify_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+            }
         }
 #endif
 
-        // Invoke snapshot callback if configured (uses same dump info for efficiency)
+        // Invoke snapshot callback if configured (uses cached dump info for efficiency)
         LOG_DEBUG("[GraphExecutor::executeNode] success=" << success << " callback=" << (config_.snapshot_callback ? "set" : "null") << " node=" << node.name);
         if (success && config_.snapshot_callback)
         {
-            phase_start = std::chrono::high_resolution_clock::now();
-            auto dump_info = node.stage->getDumpInfo();
+            if (profiling)
+                phase_start = std::chrono::high_resolution_clock::now();
             // IMPORTANT: Sync outputs from GPU before callback reads them
-            dump_info.ensureOutputsOnHost();
+            cached_dump_info.ensureOutputsOnHost();
             LOG_DEBUG("[GraphExecutor::executeNode] Invoking callback for " << node.name);
-            config_.snapshot_callback(node.name, dump_info);
-            phase_end = std::chrono::high_resolution_clock::now();
-            callback_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+            config_.snapshot_callback(node.name, cached_dump_info);
+            if (profiling)
+            {
+                phase_end = std::chrono::high_resolution_clock::now();
+                callback_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+            }
         }
 
         // Log phase breakdown at TRACE level (only for stages taking >1ms total or any phase >0.5ms)
         double total_overhead_ms = input_cohere_ms + weight_cohere_ms + output_alloc_ms + dump_input_ms + mark_dirty_ms + dump_output_ms + verify_ms + callback_ms + get_dump_info_ms + extract_buffers_ms;
         double total_ms = total_overhead_ms + execute_ms;
-        if (total_ms > 1.0 || input_cohere_ms > 0.5 || weight_cohere_ms > 0.5 ||
-            output_alloc_ms > 0.5 || execute_ms > 0.5 || verify_ms > 0.5 || callback_ms > 0.5)
+        if (profiling && (total_ms > 1.0 || input_cohere_ms > 0.5 || weight_cohere_ms > 0.5 ||
+                          output_alloc_ms > 0.5 || execute_ms > 0.5 || verify_ms > 0.5 || callback_ms > 0.5))
         {
             LOG_TRACE("[GraphExecutor::PHASES] " << node.name
                                                  << " input_cohere=" << input_cohere_ms << "ms"
@@ -1587,6 +1646,72 @@ namespace llaminar2
         if (!success)
         {
             LOG_ERROR("[GraphExecutor] CollectiveContext::executeAllgather failed for '" << node.name << "'");
+        }
+
+        return success;
+    }
+
+    bool GraphExecutor::executeCollectiveStridedAllgather(ComputeNode &node, IDeviceContext *ctx)
+    {
+        (void)ctx; // Device context not needed - CollectiveContext handles device
+
+        auto *stage = dynamic_cast<AllGatherStage *>(node.stage.get());
+        if (!stage)
+        {
+            LOG_ERROR("[GraphExecutor] Failed to cast stage '" << node.name << "' to AllGatherStage");
+            return false;
+        }
+
+        // Get parameters directly from stage
+        const auto &params = stage->getParams();
+
+        ITensor *local_input = params.local_input;
+        ITensor *full_output = params.full_output;
+
+        if (!local_input || !full_output)
+        {
+            LOG_DEBUG("[GraphExecutor] AllGatherStage '" << node.name << "' missing input or output buffer");
+            return false;
+        }
+
+        // Use actual_seq_len from params, fallback to buffer rows
+        size_t actual_seq_len = params.actual_seq_len > 0 ? params.actual_seq_len : local_input->rows();
+
+        // Determine device where tensors reside
+        DeviceId tensor_device = node.device.is_valid() ? node.device : DeviceId::cpu();
+
+        // Strided allgather only works on CUDA
+        if (tensor_device.type != DeviceType::CUDA)
+        {
+            LOG_DEBUG("[GraphExecutor] Strided allgather requires CUDA device, falling back");
+            return false;
+        }
+
+        // Log timing if profiling is enabled
+        auto start = std::chrono::high_resolution_clock::now();
+
+        // Try strided allgather via CollectiveContext
+        // This uses NCCL + CUDA deinterleave kernel to avoid host transfers
+        bool success = collective_ctx_->executeStridedAllgather(
+            local_input,
+            full_output,
+            actual_seq_len,
+            tensor_device);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+        if (success)
+        {
+            if (config_.enable_profiling)
+            {
+                stats_.stage_times_ms[node.name] = ms;
+            }
+            LOG_DEBUG("[GraphExecutor] Strided ALLGATHER '" << node.name << "' via NCCL took " << ms << " ms");
+        }
+        else
+        {
+            LOG_DEBUG("[GraphExecutor] Strided allgather not available for '" << node.name << "'");
         }
 
         return success;

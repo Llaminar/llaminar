@@ -19,6 +19,7 @@
 #include "../../../execution/DeviceWorkspaceManager.h"
 #include "../../../execution/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/CUDAKernelProfiler.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -51,7 +52,7 @@ extern "C"
         const uint16_t *gate, const uint16_t *up, uint16_t *output,
         int size, int device_idx);
 
-    // RoPE
+    // RoPE (legacy - requires position_ids array copy)
     bool cudaOps_rope_fp32(
         float *Q, float *K, const int *position_ids,
         int seq_len, int n_heads, int n_kv_heads, int head_dim,
@@ -63,6 +64,34 @@ extern "C"
     bool cudaOps_rope_fp16(
         uint16_t *Q, uint16_t *K, const int *position_ids,
         int seq_len, int n_heads, int n_kv_heads, int head_dim,
+        float rope_theta, int device_idx);
+
+    // RoPE DECODE (seq_len=1, scalar position - NO MEMCPY)
+    bool cudaOps_rope_fp32_decode(
+        float *Q, float *K, int pos,
+        int n_heads, int n_kv_heads, int head_dim,
+        float rope_theta, int device_idx);
+    bool cudaOps_rope_bf16_decode(
+        uint16_t *Q, uint16_t *K, int pos,
+        int n_heads, int n_kv_heads, int head_dim,
+        float rope_theta, int device_idx);
+    bool cudaOps_rope_fp16_decode(
+        uint16_t *Q, uint16_t *K, int pos,
+        int n_heads, int n_kv_heads, int head_dim,
+        float rope_theta, int device_idx);
+
+    // RoPE CONTIGUOUS (pos computed on GPU - ZERO MEMCPY)
+    bool cudaOps_rope_fp32_contiguous(
+        float *Q, float *K, int pos_offset, int seq_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        float rope_theta, int device_idx);
+    bool cudaOps_rope_bf16_contiguous(
+        uint16_t *Q, uint16_t *K, int pos_offset, int seq_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        float rope_theta, int device_idx);
+    bool cudaOps_rope_fp16_contiguous(
+        uint16_t *Q, uint16_t *K, int pos_offset, int seq_len,
+        int n_heads, int n_kv_heads, int head_dim,
         float rope_theta, int device_idx);
 
     // Embedding lookup
@@ -132,6 +161,7 @@ namespace llaminar2
 
             // Launch kernel asynchronously - no sync needed since all ops are on default stream
             // Stream ordering guarantees subsequent kernels wait for this one
+            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::RMS_NORM);
             return cudaOps_rmsnorm_fp32(d_input, d_weight, d_output, rows, cols, epsilon, dev);
         }
 
@@ -326,6 +356,7 @@ namespace llaminar2
 
             int size = rows * cols;
             // Launch kernel asynchronously - stream ordering handles dependencies
+            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::SWIGLU);
             return cudaOps_swiglu_fp32(d_gate, d_up, d_output, size, dev);
         }
 
@@ -510,10 +541,28 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            int device_idx)
+            int device_idx,
+            int pos_offset)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            // Launch kernel asynchronously
+            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::ROPE);
+
+            // ZERO-COPY PATH: If position_ids is nullptr, use contiguous kernel
+            if (position_ids == nullptr)
+            {
+                return cudaOps_rope_fp32_contiguous(Q, K, pos_offset, seq_len, n_heads, n_kv_heads,
+                                                    head_dim, rope_theta, dev);
+            }
+
+            // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
+            if (seq_len == 1)
+            {
+                int pos = position_ids[0];
+                return cudaOps_rope_fp32_decode(Q, K, pos, n_heads, n_kv_heads,
+                                                head_dim, rope_theta, dev);
+            }
+
+            // NON-CONTIGUOUS PATH: Need to copy position_ids array (legacy path)
             return cudaOps_rope_fp32(Q, K, position_ids, seq_len, n_heads, n_kv_heads,
                                      head_dim, rope_theta, dev);
         }
@@ -543,10 +592,27 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            int device_idx)
+            int device_idx,
+            int pos_offset)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            // No sync needed - GraphExecutor handles async execution via stream ordering
+
+            // ZERO-COPY PATH: If position_ids is nullptr, use contiguous kernel
+            if (position_ids == nullptr)
+            {
+                return cudaOps_rope_bf16_contiguous(Q, K, pos_offset, seq_len, n_heads, n_kv_heads,
+                                                    head_dim, rope_theta, dev);
+            }
+
+            // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
+            if (seq_len == 1)
+            {
+                int pos = position_ids[0];
+                return cudaOps_rope_bf16_decode(Q, K, pos, n_heads, n_kv_heads,
+                                                head_dim, rope_theta, dev);
+            }
+
+            // NON-CONTIGUOUS PATH: Need to copy position_ids array (legacy path)
             return cudaOps_rope_bf16(Q, K, position_ids, seq_len, n_heads, n_kv_heads,
                                      head_dim, rope_theta, dev);
         }
@@ -576,10 +642,27 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            int device_idx)
+            int device_idx,
+            int pos_offset)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            // No sync needed - GraphExecutor handles async execution via stream ordering
+
+            // ZERO-COPY PATH: If position_ids is nullptr, use contiguous kernel
+            if (position_ids == nullptr)
+            {
+                return cudaOps_rope_fp16_contiguous(Q, K, pos_offset, seq_len, n_heads, n_kv_heads,
+                                                    head_dim, rope_theta, dev);
+            }
+
+            // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
+            if (seq_len == 1)
+            {
+                int pos = position_ids[0];
+                return cudaOps_rope_fp16_decode(Q, K, pos, n_heads, n_kv_heads,
+                                                head_dim, rope_theta, dev);
+            }
+
+            // NON-CONTIGUOUS PATH: Need to copy position_ids array (legacy path)
             return cudaOps_rope_fp16(Q, K, position_ids, seq_len, n_heads, n_kv_heads,
                                      head_dim, rope_theta, dev);
         }
@@ -603,6 +686,7 @@ namespace llaminar2
         int dev = (device_idx >= 0) ? device_idx : device_idx_;
         (void)dev; // Device selection handled by caller setting active device
 
+        CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::EMBEDDING_LOOKUP);
         cudaError_t err = launch_embedding_lookup(embed_data, token_ids, output,
                                                   num_tokens, d_model, nullptr);
         if (err != cudaSuccess)
@@ -768,7 +852,7 @@ namespace llaminar2
             // Workspace-cached path: Upload dequantized embedding table once, reuse across calls
             // This is critical for performance with quantized embeddings (Q4_0, etc.)
             // The embedding table (~500MB) should only be uploaded once per model load
-            
+
             // Use pre-allocated workspace buffer (workspace is required)
             d_embed = static_cast<float *>(workspace_->getBuffer(EmbeddingWorkspaceBuffers::EMBED_TABLE));
             if (!d_embed)
@@ -777,7 +861,7 @@ namespace llaminar2
                         EmbeddingWorkspaceBuffers::EMBED_TABLE);
                 return false;
             }
-            
+
             // Check if we need to upload (first call or different embedding table)
             if (s_cached_embed_table_ != embed_table)
             {
@@ -792,11 +876,11 @@ namespace llaminar2
                             cudaGetErrorString(err));
                     return false;
                 }
-                
+
                 // Cache the tensor pointer to avoid re-upload on subsequent calls
                 s_cached_embed_table_ = embed_table;
-                LOG_INFO("[CUDAEmbeddingKernelT] Uploaded dequantized embedding table: " 
-                         << vocab_size << "x" << embed_dim << " (" << embed_bytes / (1024*1024) << " MB)");
+                LOG_INFO("[CUDAEmbeddingKernelT] Uploaded dequantized embedding table: "
+                         << vocab_size << "x" << embed_dim << " (" << embed_bytes / (1024 * 1024) << " MB)");
             }
             // else: embedding already uploaded to workspace buffer, reuse d_embed
         }

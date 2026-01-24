@@ -564,7 +564,7 @@ namespace llaminar2
         return outputs;
     }
 
-    StageDumpInfo KVCacheAppendStage::getDumpInfo() const
+    StageDumpInfo KVCacheAppendStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
 

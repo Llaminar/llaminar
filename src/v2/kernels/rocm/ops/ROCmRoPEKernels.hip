@@ -6,8 +6,12 @@
  * Contains FP32, BF16, and FP16 RoPE kernels with extern "C" wrapper functions.
  * Uses SPLIT-HALF layout matching the CPU implementation.
  *
- * This follows the same pattern as the CUDA RoPE kernels, using HIP for
- * AMD GPU compatibility.
+ * OPTIMIZATIONS (v2 - matching CUDA strategy):
+ * - Pre-computed inverse frequency table passed from host (cached in caller)
+ * - Shared memory for sin/cos table per thread block
+ * - Main rotation is pure FMA (no per-thread transcendentals)
+ * - Fused Q+K kernel to reduce launch overhead by 50%
+ * - Scalar position path for decode (avoids memcpy for seq_len=1)
  */
 
 #include <hip/hip_runtime.h>
@@ -62,265 +66,1323 @@ __device__ __forceinline__ uint16_t float_to_fp16(float f)
 } // anonymous namespace
 
 // =========================================================================
-// RoPE HIP Kernels
+// Decode-Optimized Kernels (scalar position, no position_ids array)
 // =========================================================================
 
 /**
- * @brief FP32 RoPE kernel - applies rotary position embeddings
+ * @brief FP32 RoPE decode kernel - optimized for seq_len=1
  *
- * Each thread handles one pair of dimensions for one head at one position.
- * Layout: [seq_len, n_heads, head_dim] with SPLIT-HALF pairing:
- *   - pair(i) = (data[i], data[i + half_dim]) for i in 0..half_dim-1
- * This matches the CPU implementation in RoPEPrimitives.cpp
+ * Takes a single position value instead of position_ids array, eliminating
+ * the need for device memory allocation and H2D copy during decode.
+ * All heads process the same position.
  */
-__global__ void rocm_rope_fp32_kernel(
+__global__ void rocm_rope_fp32_decode_kernel(
     float *__restrict__ data,
+    const float *__restrict__ inv_freq,
+    int pos,        // Single position value (not array)
+    int n_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    // Each block handles one head
+    int head_idx = blockIdx.x;
+    if (head_idx >= n_heads)
+        return;
+
+    // Shared memory for sin/cos cache
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    // Step 1: Cooperatively compute sin/cos table
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        s_cos[i] = cosf(angle);
+        s_sin[i] = sinf(angle);
+    }
+    __syncthreads();
+
+    // Step 2: Apply rotation (seq_idx=0 for decode)
+    int base_idx = head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = data[i0];
+        float x1 = data[i1];
+
+        data[i0] = x0 * s_cos[i] - x1 * s_sin[i];
+        data[i1] = x0 * s_sin[i] + x1 * s_cos[i];
+    }
+}
+
+/**
+ * @brief BF16 RoPE decode kernel - optimized for seq_len=1
+ */
+__global__ void rocm_rope_bf16_decode_kernel(
+    uint16_t *__restrict__ data,
+    const float *__restrict__ inv_freq,
+    int pos,
+    int n_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    int head_idx = blockIdx.x;
+    if (head_idx >= n_heads)
+        return;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        s_cos[i] = cosf(angle);
+        s_sin[i] = sinf(angle);
+    }
+    __syncthreads();
+
+    int base_idx = head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = bf16_to_float(data[i0]);
+        float x1 = bf16_to_float(data[i1]);
+
+        data[i0] = float_to_bf16(x0 * s_cos[i] - x1 * s_sin[i]);
+        data[i1] = float_to_bf16(x0 * s_sin[i] + x1 * s_cos[i]);
+    }
+}
+
+/**
+ * @brief FP16 RoPE decode kernel - optimized for seq_len=1
+ */
+__global__ void rocm_rope_fp16_decode_kernel(
+    uint16_t *__restrict__ data,
+    const float *__restrict__ inv_freq,
+    int pos,
+    int n_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    int head_idx = blockIdx.x;
+    if (head_idx >= n_heads)
+        return;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        s_cos[i] = cosf(angle);
+        s_sin[i] = sinf(angle);
+    }
+    __syncthreads();
+
+    int base_idx = head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = fp16_to_float(data[i0]);
+        float x1 = fp16_to_float(data[i1]);
+
+        data[i0] = float_to_fp16(x0 * s_cos[i] - x1 * s_sin[i]);
+        data[i1] = float_to_fp16(x0 * s_sin[i] + x1 * s_cos[i]);
+    }
+}
+
+// =========================================================================
+// Contiguous Position Kernels (zero-copy: positions computed on GPU)
+// =========================================================================
+
+/**
+ * @brief FP32 RoPE kernel with contiguous positions computed on-the-fly
+ *
+ * Eliminates host-to-device copy by computing pos = pos_offset + seq_idx on GPU.
+ * This is the optimal path for most inference scenarios.
+ */
+__global__ void rocm_rope_fp32_contiguous_kernel(
+    float *__restrict__ data,
+    const float *__restrict__ inv_freq,
+    int pos_offset,  // Starting position (positions are pos_offset + seq_idx)
+    int seq_len,
+    int n_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    int block_idx = blockIdx.x;
+    int head_idx = block_idx % n_heads;
+    int seq_idx = block_idx / n_heads;
+
+    if (seq_idx >= seq_len)
+        return;
+
+    // Compute position on-the-fly (no memory access!)
+    int pos = pos_offset + seq_idx;
+
+    // Compute sin/cos table
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        s_cos[i] = cosf(angle);
+        s_sin[i] = sinf(angle);
+    }
+    __syncthreads();
+
+    // Apply rotation
+    int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = data[i0];
+        float x1 = data[i1];
+
+        data[i0] = x0 * s_cos[i] - x1 * s_sin[i];
+        data[i1] = x0 * s_sin[i] + x1 * s_cos[i];
+    }
+}
+
+/**
+ * @brief Fused FP32 Q+K RoPE kernel with contiguous positions
+ */
+__global__ void rocm_rope_fp32_fused_qk_contiguous_kernel(
+    float *__restrict__ Q,
+    float *__restrict__ K,
+    const float *__restrict__ inv_freq,
+    int pos_offset,
+    int seq_len,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    int total_q_blocks = seq_len * n_q_heads;
+    int block_idx = blockIdx.x;
+
+    float *data;
+    int n_heads;
+    int local_block_idx;
+
+    if (block_idx < total_q_blocks)
+    {
+        data = Q;
+        n_heads = n_q_heads;
+        local_block_idx = block_idx;
+    }
+    else
+    {
+        if (K == nullptr)
+            return;
+        data = K;
+        n_heads = n_kv_heads;
+        local_block_idx = block_idx - total_q_blocks;
+    }
+
+    int head_idx = local_block_idx % n_heads;
+    int seq_idx = local_block_idx / n_heads;
+
+    if (seq_idx >= seq_len)
+        return;
+
+    int pos = pos_offset + seq_idx;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        s_cos[i] = cosf(angle);
+        s_sin[i] = sinf(angle);
+    }
+    __syncthreads();
+
+    int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = data[i0];
+        float x1 = data[i1];
+
+        data[i0] = x0 * s_cos[i] - x1 * s_sin[i];
+        data[i1] = x0 * s_sin[i] + x1 * s_cos[i];
+    }
+}
+
+/**
+ * @brief BF16 RoPE kernel with contiguous positions
+ */
+__global__ void rocm_rope_bf16_contiguous_kernel(
+    uint16_t *__restrict__ data,
+    const float *__restrict__ inv_freq,
+    int pos_offset,
+    int seq_len,
+    int n_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    int block_idx = blockIdx.x;
+    int head_idx = block_idx % n_heads;
+    int seq_idx = block_idx / n_heads;
+
+    if (seq_idx >= seq_len)
+        return;
+
+    int pos = pos_offset + seq_idx;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        s_cos[i] = cosf(angle);
+        s_sin[i] = sinf(angle);
+    }
+    __syncthreads();
+
+    int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = bf16_to_float(data[i0]);
+        float x1 = bf16_to_float(data[i1]);
+
+        data[i0] = float_to_bf16(x0 * s_cos[i] - x1 * s_sin[i]);
+        data[i1] = float_to_bf16(x0 * s_sin[i] + x1 * s_cos[i]);
+    }
+}
+
+/**
+ * @brief Fused BF16 Q+K RoPE kernel with contiguous positions
+ */
+__global__ void rocm_rope_bf16_fused_qk_contiguous_kernel(
+    uint16_t *__restrict__ Q,
+    uint16_t *__restrict__ K,
+    const float *__restrict__ inv_freq,
+    int pos_offset,
+    int seq_len,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    int total_q_blocks = seq_len * n_q_heads;
+    int block_idx = blockIdx.x;
+
+    uint16_t *data;
+    int n_heads;
+    int local_block_idx;
+
+    if (block_idx < total_q_blocks)
+    {
+        data = Q;
+        n_heads = n_q_heads;
+        local_block_idx = block_idx;
+    }
+    else
+    {
+        if (K == nullptr)
+            return;
+        data = K;
+        n_heads = n_kv_heads;
+        local_block_idx = block_idx - total_q_blocks;
+    }
+
+    int head_idx = local_block_idx % n_heads;
+    int seq_idx = local_block_idx / n_heads;
+
+    if (seq_idx >= seq_len)
+        return;
+
+    int pos = pos_offset + seq_idx;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        s_cos[i] = cosf(angle);
+        s_sin[i] = sinf(angle);
+    }
+    __syncthreads();
+
+    int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = bf16_to_float(data[i0]);
+        float x1 = bf16_to_float(data[i1]);
+
+        data[i0] = float_to_bf16(x0 * s_cos[i] - x1 * s_sin[i]);
+        data[i1] = float_to_bf16(x0 * s_sin[i] + x1 * s_cos[i]);
+    }
+}
+
+/**
+ * @brief FP16 RoPE kernel with contiguous positions
+ */
+__global__ void rocm_rope_fp16_contiguous_kernel(
+    uint16_t *__restrict__ data,
+    const float *__restrict__ inv_freq,
+    int pos_offset,
+    int seq_len,
+    int n_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    int block_idx = blockIdx.x;
+    int head_idx = block_idx % n_heads;
+    int seq_idx = block_idx / n_heads;
+
+    if (seq_idx >= seq_len)
+        return;
+
+    int pos = pos_offset + seq_idx;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        s_cos[i] = cosf(angle);
+        s_sin[i] = sinf(angle);
+    }
+    __syncthreads();
+
+    int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = fp16_to_float(data[i0]);
+        float x1 = fp16_to_float(data[i1]);
+
+        data[i0] = float_to_fp16(x0 * s_cos[i] - x1 * s_sin[i]);
+        data[i1] = float_to_fp16(x0 * s_sin[i] + x1 * s_cos[i]);
+    }
+}
+
+/**
+ * @brief Fused FP16 Q+K RoPE kernel with contiguous positions
+ */
+__global__ void rocm_rope_fp16_fused_qk_contiguous_kernel(
+    uint16_t *__restrict__ Q,
+    uint16_t *__restrict__ K,
+    const float *__restrict__ inv_freq,
+    int pos_offset,
+    int seq_len,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    int total_q_blocks = seq_len * n_q_heads;
+    int block_idx = blockIdx.x;
+
+    uint16_t *data;
+    int n_heads;
+    int local_block_idx;
+
+    if (block_idx < total_q_blocks)
+    {
+        data = Q;
+        n_heads = n_q_heads;
+        local_block_idx = block_idx;
+    }
+    else
+    {
+        if (K == nullptr)
+            return;
+        data = K;
+        n_heads = n_kv_heads;
+        local_block_idx = block_idx - total_q_blocks;
+    }
+
+    int head_idx = local_block_idx % n_heads;
+    int seq_idx = local_block_idx / n_heads;
+
+    if (seq_idx >= seq_len)
+        return;
+
+    int pos = pos_offset + seq_idx;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        s_cos[i] = cosf(angle);
+        s_sin[i] = sinf(angle);
+    }
+    __syncthreads();
+
+    int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = fp16_to_float(data[i0]);
+        float x1 = fp16_to_float(data[i1]);
+
+        data[i0] = float_to_fp16(x0 * s_cos[i] - x1 * s_sin[i]);
+        data[i1] = float_to_fp16(x0 * s_sin[i] + x1 * s_cos[i]);
+    }
+}
+
+// =========================================================================
+// Optimized RoPE HIP Kernels (v2 - with precomputed inv_freq and shared mem)
+// =========================================================================
+
+/**
+ * @brief FP32 RoPE kernel with precomputed inv_freq and shared memory sin/cos
+ *
+ * Strategy (adapted from CUDA v3):
+ * 1. Each thread block processes one (seq_idx, head_idx) pair
+ * 2. Threads cooperatively compute sin/cos table into shared memory
+ * 3. Apply rotation using cached sin/cos (pure FMA, no transcendentals per element)
+ *
+ * @param data Input/output tensor [seq_len, n_heads, head_dim]
+ * @param inv_freq Pre-computed inverse frequencies [half_dim]
+ * @param position_ids Position IDs [seq_len] (device pointer)
+ * @param seq_len Sequence length
+ * @param n_heads Number of heads
+ * @param head_dim Head dimension
+ */
+__global__ void rocm_rope_fp32_kernel_v2(
+    float *__restrict__ data,
+    const float *__restrict__ inv_freq,
     const int *__restrict__ position_ids,
     int seq_len,
     int n_heads,
-    int head_dim,
-    float rope_theta)
+    int head_dim)
 {
-    // Each thread handles one (position, head, dim_pair) triplet
     const int half_dim = head_dim / 2;
-    int total_pairs = seq_len * n_heads * half_dim;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (idx >= total_pairs)
+    // Shared memory for sin/cos cache
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    // Each block handles one (seq_idx, head_idx) pair
+    int block_idx = blockIdx.x;
+    int head_idx = block_idx % n_heads;
+    int seq_idx = block_idx / n_heads;
+
+    if (seq_idx >= seq_len)
         return;
-
-    // Decode indices
-    int pair_idx = idx % half_dim;
-    int head_idx = (idx / half_dim) % n_heads;
-    int seq_idx = idx / (n_heads * half_dim);
 
     // Get actual position
     int pos = position_ids ? position_ids[seq_idx] : seq_idx;
-
-    // Skip padding positions
     if (pos < 0)
         return;
 
-    // Compute frequency: inv_freq[i] = pow(rope_theta, -2*i/head_dim)
-    float freq = powf(rope_theta, -2.0f * pair_idx / head_dim);
-    float angle = pos * freq;
-    float cos_val = cosf(angle);
-    float sin_val = sinf(angle);
+    // Step 1: Cooperatively compute sin/cos table into shared memory
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        s_cos[i] = cosf(angle);
+        s_sin[i] = sinf(angle);
+    }
+    __syncthreads();
 
-    // Get data indices using SPLIT-HALF layout (matching CPU)
-    // First element at pair_idx, second element at pair_idx + half_dim
+    // Step 2: Apply rotation using cached sin/cos (pure FMA)
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
-    int i0 = base_idx + pair_idx;            // First half
-    int i1 = base_idx + pair_idx + half_dim; // Second half
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = data[i0];
+        float x1 = data[i1];
+        float cos_val = s_cos[i];
+        float sin_val = s_sin[i];
+
+        data[i0] = x0 * cos_val - x1 * sin_val;
+        data[i1] = x0 * sin_val + x1 * cos_val;
+    }
+}
+
+/**
+ * @brief Fused FP32 RoPE kernel for Q and K in single launch
+ *
+ * Processes both Q (first n_q_heads blocks) and K (next n_kv_heads blocks)
+ * in a single kernel launch, reducing overhead by 50%.
+ */
+__global__ void rocm_rope_fp32_fused_qk_kernel(
+    float *__restrict__ Q,
+    float *__restrict__ K,
+    const float *__restrict__ inv_freq,
+    const int *__restrict__ position_ids,
+    int seq_len,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    int total_q_blocks = seq_len * n_q_heads;
+    int block_idx = blockIdx.x;
+
+    float *data;
+    int n_heads;
+    int local_block_idx;
+
+    if (block_idx < total_q_blocks)
+    {
+        // This block processes Q
+        data = Q;
+        n_heads = n_q_heads;
+        local_block_idx = block_idx;
+    }
+    else
+    {
+        // This block processes K
+        if (K == nullptr)
+            return;
+        data = K;
+        n_heads = n_kv_heads;
+        local_block_idx = block_idx - total_q_blocks;
+    }
+
+    int head_idx = local_block_idx % n_heads;
+    int seq_idx = local_block_idx / n_heads;
+
+    if (seq_idx >= seq_len)
+        return;
+
+    int pos = position_ids ? position_ids[seq_idx] : seq_idx;
+    if (pos < 0)
+        return;
+
+    // Compute sin/cos table
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        s_cos[i] = cosf(angle);
+        s_sin[i] = sinf(angle);
+    }
+    __syncthreads();
 
     // Apply rotation
-    float x0 = data[i0];
-    float x1 = data[i1];
-    data[i0] = x0 * cos_val - x1 * sin_val;
-    data[i1] = x0 * sin_val + x1 * cos_val;
+    int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = data[i0];
+        float x1 = data[i1];
+
+        data[i0] = x0 * s_cos[i] - x1 * s_sin[i];
+        data[i1] = x0 * s_sin[i] + x1 * s_cos[i];
+    }
 }
 
 /**
- * @brief BF16 RoPE kernel - FP32 computation with BF16 I/O
- * Uses SPLIT-HALF layout matching CPU implementation
+ * @brief BF16 RoPE kernel with precomputed inv_freq and shared memory
  */
-__global__ void rocm_rope_bf16_kernel(
+__global__ void rocm_rope_bf16_kernel_v2(
     uint16_t *__restrict__ data,
+    const float *__restrict__ inv_freq,
     const int *__restrict__ position_ids,
     int seq_len,
     int n_heads,
-    int head_dim,
-    float rope_theta)
+    int head_dim)
 {
     const int half_dim = head_dim / 2;
-    int total_pairs = seq_len * n_heads * half_dim;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (idx >= total_pairs)
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    int block_idx = blockIdx.x;
+    int head_idx = block_idx % n_heads;
+    int seq_idx = block_idx / n_heads;
+
+    if (seq_idx >= seq_len)
         return;
-
-    int pair_idx = idx % half_dim;
-    int head_idx = (idx / half_dim) % n_heads;
-    int seq_idx = idx / (n_heads * half_dim);
 
     int pos = position_ids ? position_ids[seq_idx] : seq_idx;
     if (pos < 0)
         return;
 
-    float freq = powf(rope_theta, -2.0f * pair_idx / head_dim);
-    float angle = pos * freq;
-    float cos_val = cosf(angle);
-    float sin_val = sinf(angle);
+    // Compute sin/cos table
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        s_cos[i] = cosf(angle);
+        s_sin[i] = sinf(angle);
+    }
+    __syncthreads();
 
-    // SPLIT-HALF layout (matching CPU)
+    // Apply rotation
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
-    int i0 = base_idx + pair_idx;            // First half
-    int i1 = base_idx + pair_idx + half_dim; // Second half
 
-    float x0 = bf16_to_float(data[i0]);
-    float x1 = bf16_to_float(data[i1]);
-    data[i0] = float_to_bf16(x0 * cos_val - x1 * sin_val);
-    data[i1] = float_to_bf16(x0 * sin_val + x1 * cos_val);
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = bf16_to_float(data[i0]);
+        float x1 = bf16_to_float(data[i1]);
+        float cos_val = s_cos[i];
+        float sin_val = s_sin[i];
+
+        data[i0] = float_to_bf16(x0 * cos_val - x1 * sin_val);
+        data[i1] = float_to_bf16(x0 * sin_val + x1 * cos_val);
+    }
 }
 
 /**
- * @brief FP16 RoPE kernel - FP32 computation with FP16 I/O
- * Uses SPLIT-HALF layout matching CPU implementation
+ * @brief Fused BF16 RoPE kernel for Q and K
  */
-__global__ void rocm_rope_fp16_kernel(
-    uint16_t *__restrict__ data,
+__global__ void rocm_rope_bf16_fused_qk_kernel(
+    uint16_t *__restrict__ Q,
+    uint16_t *__restrict__ K,
+    const float *__restrict__ inv_freq,
     const int *__restrict__ position_ids,
     int seq_len,
-    int n_heads,
-    int head_dim,
-    float rope_theta)
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim)
 {
     const int half_dim = head_dim / 2;
-    int total_pairs = seq_len * n_heads * half_dim;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (idx >= total_pairs)
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    int total_q_blocks = seq_len * n_q_heads;
+    int block_idx = blockIdx.x;
+
+    uint16_t *data;
+    int n_heads;
+    int local_block_idx;
+
+    if (block_idx < total_q_blocks)
+    {
+        data = Q;
+        n_heads = n_q_heads;
+        local_block_idx = block_idx;
+    }
+    else
+    {
+        if (K == nullptr)
+            return;
+        data = K;
+        n_heads = n_kv_heads;
+        local_block_idx = block_idx - total_q_blocks;
+    }
+
+    int head_idx = local_block_idx % n_heads;
+    int seq_idx = local_block_idx / n_heads;
+
+    if (seq_idx >= seq_len)
         return;
-
-    int pair_idx = idx % half_dim;
-    int head_idx = (idx / half_dim) % n_heads;
-    int seq_idx = idx / (n_heads * half_dim);
 
     int pos = position_ids ? position_ids[seq_idx] : seq_idx;
     if (pos < 0)
         return;
 
-    float freq = powf(rope_theta, -2.0f * pair_idx / head_dim);
-    float angle = pos * freq;
-    float cos_val = cosf(angle);
-    float sin_val = sinf(angle);
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        s_cos[i] = cosf(angle);
+        s_sin[i] = sinf(angle);
+    }
+    __syncthreads();
 
-    // SPLIT-HALF layout (matching CPU)
     int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
-    int i0 = base_idx + pair_idx;            // First half
-    int i1 = base_idx + pair_idx + half_dim; // Second half
 
-    float x0 = fp16_to_float(data[i0]);
-    float x1 = fp16_to_float(data[i1]);
-    data[i0] = float_to_fp16(x0 * cos_val - x1 * sin_val);
-    data[i1] = float_to_fp16(x0 * sin_val + x1 * cos_val);
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = bf16_to_float(data[i0]);
+        float x1 = bf16_to_float(data[i1]);
+
+        data[i0] = float_to_bf16(x0 * s_cos[i] - x1 * s_sin[i]);
+        data[i1] = float_to_bf16(x0 * s_sin[i] + x1 * s_cos[i]);
+    }
+}
+
+/**
+ * @brief FP16 RoPE kernel with precomputed inv_freq and shared memory
+ */
+__global__ void rocm_rope_fp16_kernel_v2(
+    uint16_t *__restrict__ data,
+    const float *__restrict__ inv_freq,
+    const int *__restrict__ position_ids,
+    int seq_len,
+    int n_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    int block_idx = blockIdx.x;
+    int head_idx = block_idx % n_heads;
+    int seq_idx = block_idx / n_heads;
+
+    if (seq_idx >= seq_len)
+        return;
+
+    int pos = position_ids ? position_ids[seq_idx] : seq_idx;
+    if (pos < 0)
+        return;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        s_cos[i] = cosf(angle);
+        s_sin[i] = sinf(angle);
+    }
+    __syncthreads();
+
+    int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = fp16_to_float(data[i0]);
+        float x1 = fp16_to_float(data[i1]);
+        float cos_val = s_cos[i];
+        float sin_val = s_sin[i];
+
+        data[i0] = float_to_fp16(x0 * cos_val - x1 * sin_val);
+        data[i1] = float_to_fp16(x0 * sin_val + x1 * cos_val);
+    }
+}
+
+/**
+ * @brief Fused FP16 RoPE kernel for Q and K
+ */
+__global__ void rocm_rope_fp16_fused_qk_kernel(
+    uint16_t *__restrict__ Q,
+    uint16_t *__restrict__ K,
+    const float *__restrict__ inv_freq,
+    const int *__restrict__ position_ids,
+    int seq_len,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim)
+{
+    const int half_dim = head_dim / 2;
+
+    extern __shared__ float smem[];
+    float *s_cos = smem;
+    float *s_sin = smem + half_dim;
+
+    int total_q_blocks = seq_len * n_q_heads;
+    int block_idx = blockIdx.x;
+
+    uint16_t *data;
+    int n_heads;
+    int local_block_idx;
+
+    if (block_idx < total_q_blocks)
+    {
+        data = Q;
+        n_heads = n_q_heads;
+        local_block_idx = block_idx;
+    }
+    else
+    {
+        if (K == nullptr)
+            return;
+        data = K;
+        n_heads = n_kv_heads;
+        local_block_idx = block_idx - total_q_blocks;
+    }
+
+    int head_idx = local_block_idx % n_heads;
+    int seq_idx = local_block_idx / n_heads;
+
+    if (seq_idx >= seq_len)
+        return;
+
+    int pos = position_ids ? position_ids[seq_idx] : seq_idx;
+    if (pos < 0)
+        return;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        float angle = pos * inv_freq[i];
+        s_cos[i] = cosf(angle);
+        s_sin[i] = sinf(angle);
+    }
+    __syncthreads();
+
+    int base_idx = seq_idx * n_heads * head_dim + head_idx * head_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
+    {
+        int i0 = base_idx + i;
+        int i1 = base_idx + i + half_dim;
+
+        float x0 = fp16_to_float(data[i0]);
+        float x1 = fp16_to_float(data[i1]);
+
+        data[i0] = float_to_fp16(x0 * s_cos[i] - x1 * s_sin[i]);
+        data[i1] = float_to_fp16(x0 * s_sin[i] + x1 * s_cos[i]);
+    }
 }
 
 // =========================================================================
-// Extern "C" Wrapper Functions
+// Extern "C" Wrapper Functions (v2 - with inv_freq parameter)
 // =========================================================================
 
 extern "C"
 {
 
-    bool hipOps_rope_fp32(
+    /**
+     * @brief Optimized FP32 RoPE using precomputed inverse frequencies
+     *
+     * @param Q Q tensor [seq_len, n_heads, head_dim] (device pointer)
+     * @param K K tensor [seq_len, n_kv_heads, head_dim] (device pointer, can be nullptr)
+     * @param inv_freq Pre-computed inverse frequency table [head_dim/2] (device pointer)
+     * @param position_ids Position IDs [seq_len] (device pointer)
+     * @param seq_len Sequence length
+     * @param n_heads Number of Q heads
+     * @param n_kv_heads Number of KV heads
+     * @param head_dim Head dimension
+     * @param device_idx HIP device index
+     */
+    bool hipOps_rope_fp32_v2(
         float *Q,
-        float *K, // Can be nullptr
+        float *K,
+        const float *inv_freq,
         const int *position_ids,
         int seq_len,
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        float rope_theta,
         int device_idx)
     {
         hipSetDevice(device_idx);
 
-        int threads_per_block = 256;
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float); // sin + cos tables
 
-        // Process Q
-        int total_pairs_q = seq_len * n_heads * (head_dim / 2);
-        int num_blocks_q = (total_pairs_q + threads_per_block - 1) / threads_per_block;
-        hipLaunchKernelGGL(rocm_rope_fp32_kernel, dim3(num_blocks_q), dim3(threads_per_block), 0, 0,
-                           Q, position_ids, seq_len, n_heads, head_dim, rope_theta);
-
-        // Process K if provided
         if (K != nullptr)
         {
-            int total_pairs_k = seq_len * n_kv_heads * (head_dim / 2);
-            int num_blocks_k = (total_pairs_k + threads_per_block - 1) / threads_per_block;
-            hipLaunchKernelGGL(rocm_rope_fp32_kernel, dim3(num_blocks_k), dim3(threads_per_block), 0, 0,
-                               K, position_ids, seq_len, n_kv_heads, head_dim, rope_theta);
+            // Fused Q+K kernel
+            int total_blocks = seq_len * (n_heads + n_kv_heads);
+            hipLaunchKernelGGL(rocm_rope_fp32_fused_qk_kernel, 
+                               dim3(total_blocks), dim3(threads_per_block), smem_size, 0,
+                               Q, K, inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
+        }
+        else
+        {
+            // Q only
+            int num_blocks = seq_len * n_heads;
+            hipLaunchKernelGGL(rocm_rope_fp32_kernel_v2, 
+                               dim3(num_blocks), dim3(threads_per_block), smem_size, 0,
+                               Q, inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
-            fprintf(stderr, "HIP RoPE FP32 kernel launch failed: %s\n", hipGetErrorString(err));
+            fprintf(stderr, "HIP RoPE FP32 v2 kernel launch failed: %s\n", hipGetErrorString(err));
             return false;
         }
         return true;
     }
 
-    bool hipOps_rope_bf16(
+    bool hipOps_rope_bf16_v2(
         uint16_t *Q,
-        uint16_t *K, // Can be nullptr
+        uint16_t *K,
+        const float *inv_freq,
         const int *position_ids,
         int seq_len,
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        float rope_theta,
         int device_idx)
     {
         hipSetDevice(device_idx);
 
-        int threads_per_block = 256;
-
-        int total_pairs_q = seq_len * n_heads * (head_dim / 2);
-        int num_blocks_q = (total_pairs_q + threads_per_block - 1) / threads_per_block;
-        hipLaunchKernelGGL(rocm_rope_bf16_kernel, dim3(num_blocks_q), dim3(threads_per_block), 0, 0,
-                           Q, position_ids, seq_len, n_heads, head_dim, rope_theta);
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
 
         if (K != nullptr)
         {
-            int total_pairs_k = seq_len * n_kv_heads * (head_dim / 2);
-            int num_blocks_k = (total_pairs_k + threads_per_block - 1) / threads_per_block;
-            hipLaunchKernelGGL(rocm_rope_bf16_kernel, dim3(num_blocks_k), dim3(threads_per_block), 0, 0,
-                               K, position_ids, seq_len, n_kv_heads, head_dim, rope_theta);
+            int total_blocks = seq_len * (n_heads + n_kv_heads);
+            hipLaunchKernelGGL(rocm_rope_bf16_fused_qk_kernel, 
+                               dim3(total_blocks), dim3(threads_per_block), smem_size, 0,
+                               Q, K, inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
+        }
+        else
+        {
+            int num_blocks = seq_len * n_heads;
+            hipLaunchKernelGGL(rocm_rope_bf16_kernel_v2, 
+                               dim3(num_blocks), dim3(threads_per_block), smem_size, 0,
+                               Q, inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
-            fprintf(stderr, "HIP RoPE BF16 kernel launch failed: %s\n", hipGetErrorString(err));
+            fprintf(stderr, "HIP RoPE BF16 v2 kernel launch failed: %s\n", hipGetErrorString(err));
             return false;
         }
         return true;
     }
 
-    bool hipOps_rope_fp16(
+    bool hipOps_rope_fp16_v2(
         uint16_t *Q,
-        uint16_t *K, // Can be nullptr
+        uint16_t *K,
+        const float *inv_freq,
         const int *position_ids,
         int seq_len,
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        float rope_theta,
         int device_idx)
     {
         hipSetDevice(device_idx);
 
-        int threads_per_block = 256;
-
-        int total_pairs_q = seq_len * n_heads * (head_dim / 2);
-        int num_blocks_q = (total_pairs_q + threads_per_block - 1) / threads_per_block;
-        hipLaunchKernelGGL(rocm_rope_fp16_kernel, dim3(num_blocks_q), dim3(threads_per_block), 0, 0,
-                           Q, position_ids, seq_len, n_heads, head_dim, rope_theta);
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
 
         if (K != nullptr)
         {
-            int total_pairs_k = seq_len * n_kv_heads * (head_dim / 2);
-            int num_blocks_k = (total_pairs_k + threads_per_block - 1) / threads_per_block;
-            hipLaunchKernelGGL(rocm_rope_fp16_kernel, dim3(num_blocks_k), dim3(threads_per_block), 0, 0,
-                               K, position_ids, seq_len, n_kv_heads, head_dim, rope_theta);
+            int total_blocks = seq_len * (n_heads + n_kv_heads);
+            hipLaunchKernelGGL(rocm_rope_fp16_fused_qk_kernel, 
+                               dim3(total_blocks), dim3(threads_per_block), smem_size, 0,
+                               Q, K, inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
+        }
+        else
+        {
+            int num_blocks = seq_len * n_heads;
+            hipLaunchKernelGGL(rocm_rope_fp16_kernel_v2, 
+                               dim3(num_blocks), dim3(threads_per_block), smem_size, 0,
+                               Q, inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
-            fprintf(stderr, "HIP RoPE FP16 kernel launch failed: %s\n", hipGetErrorString(err));
+            fprintf(stderr, "HIP RoPE FP16 v2 kernel launch failed: %s\n", hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    // =========================================================================
+    // Decode-Optimized Wrappers (scalar position, no array copy needed)
+    // =========================================================================
+
+    /**
+     * @brief FP32 RoPE decode - takes scalar position (no H2D copy needed)
+     *
+     * Optimized for decode phase where seq_len=1 and all heads share the same position.
+     * Eliminates the hipMemcpy overhead that dominates decode performance.
+     */
+    bool hipOps_rope_fp32_decode(
+        float *Q,
+        float *K,
+        const float *inv_freq,
+        int pos,           // Single position value (not array!)
+        int n_q_heads,
+        int n_kv_heads,
+        int head_dim,
+        int device_idx)
+    {
+        hipSetDevice(device_idx);
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        // Launch decode kernel for Q
+        hipLaunchKernelGGL(rocm_rope_fp32_decode_kernel, 
+                           dim3(n_q_heads), dim3(threads_per_block), smem_size, 0,
+                           Q, inv_freq, pos, n_q_heads, head_dim);
+
+        // Launch decode kernel for K if provided
+        if (K != nullptr)
+        {
+            hipLaunchKernelGGL(rocm_rope_fp32_decode_kernel, 
+                               dim3(n_kv_heads), dim3(threads_per_block), smem_size, 0,
+                               K, inv_freq, pos, n_kv_heads, head_dim);
+        }
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "HIP RoPE FP32 decode kernel launch failed: %s\n", hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool hipOps_rope_bf16_decode(
+        uint16_t *Q,
+        uint16_t *K,
+        const float *inv_freq,
+        int pos,
+        int n_q_heads,
+        int n_kv_heads,
+        int head_dim,
+        int device_idx)
+    {
+        hipSetDevice(device_idx);
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        hipLaunchKernelGGL(rocm_rope_bf16_decode_kernel, 
+                           dim3(n_q_heads), dim3(threads_per_block), smem_size, 0,
+                           Q, inv_freq, pos, n_q_heads, head_dim);
+
+        if (K != nullptr)
+        {
+            hipLaunchKernelGGL(rocm_rope_bf16_decode_kernel, 
+                               dim3(n_kv_heads), dim3(threads_per_block), smem_size, 0,
+                               K, inv_freq, pos, n_kv_heads, head_dim);
+        }
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "HIP RoPE BF16 decode kernel launch failed: %s\n", hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool hipOps_rope_fp16_decode(
+        uint16_t *Q,
+        uint16_t *K,
+        const float *inv_freq,
+        int pos,
+        int n_q_heads,
+        int n_kv_heads,
+        int head_dim,
+        int device_idx)
+    {
+        hipSetDevice(device_idx);
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        hipLaunchKernelGGL(rocm_rope_fp16_decode_kernel, 
+                           dim3(n_q_heads), dim3(threads_per_block), smem_size, 0,
+                           Q, inv_freq, pos, n_q_heads, head_dim);
+
+        if (K != nullptr)
+        {
+            hipLaunchKernelGGL(rocm_rope_fp16_decode_kernel, 
+                               dim3(n_kv_heads), dim3(threads_per_block), smem_size, 0,
+                               K, inv_freq, pos, n_kv_heads, head_dim);
+        }
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "HIP RoPE FP16 decode kernel launch failed: %s\n", hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    // =========================================================================
+    // Contiguous Position Wrappers (zero-copy: positions computed on GPU)
+    // =========================================================================
+
+    /**
+     * @brief FP32 RoPE with contiguous positions - ZERO memory copy
+     *
+     * Optimal for inference where positions are sequential: [pos_offset, pos_offset+1, ...].
+     * Positions computed on-the-fly by GPU threads (pos = pos_offset + seq_idx).
+     */
+    bool hipOps_rope_fp32_contiguous(
+        float *Q,
+        float *K,
+        const float *inv_freq,
+        int pos_offset,  // Starting position
+        int seq_len,
+        int n_q_heads,
+        int n_kv_heads,
+        int head_dim,
+        int device_idx)
+    {
+        hipSetDevice(device_idx);
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        if (K != nullptr)
+        {
+            int total_blocks = seq_len * (n_q_heads + n_kv_heads);
+            hipLaunchKernelGGL(rocm_rope_fp32_fused_qk_contiguous_kernel, 
+                               dim3(total_blocks), dim3(threads_per_block), smem_size, 0,
+                               Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim);
+        }
+        else
+        {
+            int num_blocks = seq_len * n_q_heads;
+            hipLaunchKernelGGL(rocm_rope_fp32_contiguous_kernel, 
+                               dim3(num_blocks), dim3(threads_per_block), smem_size, 0,
+                               Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim);
+        }
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "HIP RoPE FP32 contiguous kernel launch failed: %s\n", hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool hipOps_rope_bf16_contiguous(
+        uint16_t *Q,
+        uint16_t *K,
+        const float *inv_freq,
+        int pos_offset,
+        int seq_len,
+        int n_q_heads,
+        int n_kv_heads,
+        int head_dim,
+        int device_idx)
+    {
+        hipSetDevice(device_idx);
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        if (K != nullptr)
+        {
+            int total_blocks = seq_len * (n_q_heads + n_kv_heads);
+            hipLaunchKernelGGL(rocm_rope_bf16_fused_qk_contiguous_kernel, 
+                               dim3(total_blocks), dim3(threads_per_block), smem_size, 0,
+                               Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim);
+        }
+        else
+        {
+            int num_blocks = seq_len * n_q_heads;
+            hipLaunchKernelGGL(rocm_rope_bf16_contiguous_kernel, 
+                               dim3(num_blocks), dim3(threads_per_block), smem_size, 0,
+                               Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim);
+        }
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "HIP RoPE BF16 contiguous kernel launch failed: %s\n", hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool hipOps_rope_fp16_contiguous(
+        uint16_t *Q,
+        uint16_t *K,
+        const float *inv_freq,
+        int pos_offset,
+        int seq_len,
+        int n_q_heads,
+        int n_kv_heads,
+        int head_dim,
+        int device_idx)
+    {
+        hipSetDevice(device_idx);
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        if (K != nullptr)
+        {
+            int total_blocks = seq_len * (n_q_heads + n_kv_heads);
+            hipLaunchKernelGGL(rocm_rope_fp16_fused_qk_contiguous_kernel, 
+                               dim3(total_blocks), dim3(threads_per_block), smem_size, 0,
+                               Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim);
+        }
+        else
+        {
+            int num_blocks = seq_len * n_q_heads;
+            hipLaunchKernelGGL(rocm_rope_fp16_contiguous_kernel, 
+                               dim3(num_blocks), dim3(threads_per_block), smem_size, 0,
+                               Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim);
+        }
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "HIP RoPE FP16 contiguous kernel launch failed: %s\n", hipGetErrorString(err));
             return false;
         }
         return true;

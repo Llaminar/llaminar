@@ -47,7 +47,7 @@ protected:
             return reqs_;
         }
 
-        StageDumpInfo getDumpInfo() const override { return {}; }
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
 
     private:
         StageBufferRequirements reqs_;

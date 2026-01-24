@@ -12,6 +12,7 @@
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/StackTrace.h"
+#include "../utils/KernelProfiler.h"
 #include "../backends/BackendManager.h"
 #include "../backends/ComputeBackend.h"
 #include "../backends/DeviceId.h"
@@ -962,8 +963,12 @@ namespace llaminar2
             auto h2d_start = std::chrono::high_resolution_clock::now();
             bool h2d_ok = target_backend->hostToDevice(gpu_data_ptr_, src, bytes, backend_device_id);
             auto h2d_end = std::chrono::high_resolution_clock::now();
-            auto h2d_us = std::chrono::duration_cast<std::chrono::microseconds>(h2d_end - h2d_start).count();
+            auto h2d_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(h2d_end - h2d_start).count();
+            auto h2d_us = h2d_ns / 1000;
             double bandwidth_gbps = (bytes / 1e9) / (h2d_us / 1e6);
+
+            // Record transfer for profiling (when LLAMINAR_PROFILING=1)
+            TransferProfiler::recordH2D(bytes, static_cast<uint64_t>(h2d_ns));
 
             // Record transfer for testing
             if (trace_cfg.enabled)
@@ -1238,11 +1243,19 @@ namespace llaminar2
                 }
             }
 
-            if (!backend->deviceToHost(dst, gpu_data_ptr_, bytes, backend_device_id))
+            auto d2h_start = std::chrono::high_resolution_clock::now();
+            bool d2h_ok = backend->deviceToHost(dst, gpu_data_ptr_, bytes, backend_device_id);
+            auto d2h_end = std::chrono::high_resolution_clock::now();
+            auto d2h_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(d2h_end - d2h_start).count();
+
+            if (!d2h_ok)
             {
                 LOG_ERROR("[TensorBase::ensureOnHost] deviceToHost failed");
                 return false;
             }
+
+            // Record transfer for profiling (when LLAMINAR_PROFILING=1)
+            TransferProfiler::recordD2H(bytes, static_cast<uint64_t>(d2h_ns));
 
             // Record transfer for testing
             if (trace_cfg.enabled)

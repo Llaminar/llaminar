@@ -119,7 +119,7 @@ namespace llaminar2
         }
     }
 
-    StageDumpInfo SwiGLUStage::getDumpInfo() const
+    StageDumpInfo SwiGLUStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
 

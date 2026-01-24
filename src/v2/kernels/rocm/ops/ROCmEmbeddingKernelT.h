@@ -137,11 +137,30 @@ namespace llaminar2
          */
         DeviceWorkspaceManager *getWorkspace() const override;
 
+        /**
+         * @brief Clear the cached embedding table pointer
+         *
+         * Call this if the model changes or the workspace is reset.
+         * The next apply_tensor() call will re-upload the embedding table.
+         */
+        void clearEmbeddingCache() { s_cached_embed_table_ = nullptr; }
+
+        /**
+         * @brief Static method to clear embedding cache (for model unload)
+         */
+        static void clearGlobalEmbeddingCache() { s_cached_embed_table_ = nullptr; }
+
     private:
         int device_idx_;
 
         // IWorkspaceConsumer state
         DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned)
+
+        // Embedding table caching state (STATIC - persists across kernel instances)
+        // This is critical for performance: kernel instances are recreated every forward pass
+        // due to graph rebuild, but the embedding table in GPU workspace is persistent.
+        // Using static ensures we don't re-upload 500+ MB every decode step.
+        static inline const TensorBase *s_cached_embed_table_ = nullptr; ///< Last seen embedding table pointer (for cache validation)
     };
 
 } // namespace llaminar2

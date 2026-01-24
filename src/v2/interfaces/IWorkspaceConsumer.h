@@ -190,4 +190,16 @@ namespace llaminar2
         constexpr const char *EMBED_TABLE = "embed_table_temp"; ///< [vocab_size × d_model] FP32 temp for non-GPU embed tables
     }
 
+    /**
+     * Standard buffer names used by RoPE workspace consumers.
+     *
+     * Using consistent names across CUDA/ROCm kernels enables the workspace
+     * manager to share buffers between different kernel types on the same device.
+     */
+    namespace RoPEWorkspaceBuffers
+    {
+        constexpr const char *POSITION_IDS = "rope_position_ids"; ///< [max_seq_len] INT32 position IDs
+        constexpr const char *INV_FREQ = "rope_inv_freq";         ///< [head_dim/2] FP32 inverse frequency table
+    }
+
 } // namespace llaminar2

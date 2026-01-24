@@ -12,6 +12,7 @@
 #include "../../../execution/DeviceWorkspaceManager.h"
 #include "../../../execution/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/CUDAKernelProfiler.h"
 #include <cstring>
 
 // Extern "C" declarations for CUDA kernel wrappers
@@ -280,14 +281,17 @@ namespace llaminar2
                 LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Using Flash Decoding: kv_len=" << kv_len
                                                                                             << " num_splits=" << num_splits);
 
-                result = cudaFlashAttn_decode_fp32(
-                    Q, K, V, output,
-                    static_cast<float *>(partial_output_buf_),
-                    static_cast<float *>(partial_m_buf_),
-                    static_cast<float *>(partial_l_buf_),
-                    batch_size, kv_len,
-                    n_heads, n_kv_heads, head_dim,
-                    num_splits, stream_);
+                {
+                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_DECODE);
+                    result = cudaFlashAttn_decode_fp32(
+                        Q, K, V, output,
+                        static_cast<float *>(partial_output_buf_),
+                        static_cast<float *>(partial_m_buf_),
+                        static_cast<float *>(partial_l_buf_),
+                        batch_size, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        num_splits, stream_);
+                }
             }
             else
             {
@@ -296,12 +300,15 @@ namespace llaminar2
                 LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Using Flash Attention 3 (pipelined): "
                           << "batch=" << batch_size << " seq_len=" << seq_len << " kv_len=" << kv_len);
 
-                result = cudaFlashAttn_prefill_fa3(
-                    Q, K, V, output,
-                    batch_size, seq_len, kv_len,
-                    n_heads, n_kv_heads, head_dim,
-                    causal, window_size, position_offset,
-                    stream_);
+                {
+                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_PREFILL);
+                    result = cudaFlashAttn_prefill_fa3(
+                        Q, K, V, output,
+                        batch_size, seq_len, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        causal, window_size, position_offset,
+                        stream_);
+                }
             }
 
             // Note: No cudaFlashAttn_synchronize() - rely on CUDA stream ordering

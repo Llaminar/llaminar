@@ -8,8 +8,12 @@
  *
  * Requirements:
  * - AMD GPUs with ROCm support
- * - RCCL library installed (rccl-dev)
+ * - RCCL library installed (librccl.so available)
  * - All participating GPUs must be ROCm devices
+ *
+ * IMPORTANT: Uses dynamic loader (dlopen/dlsym) for RCCL to avoid symbol
+ * conflicts with NCCL, which exports identical symbol names. This allows
+ * both libraries to coexist in the same process.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -21,9 +25,7 @@
 #include "../DeviceGroup.h"
 #include "../../utils/MPIContext.h"
 
-#ifdef HAVE_RCCL
-#include <rccl/rccl.h>
-#endif
+// Note: No longer include rccl.h directly - use dynamic loading via wrappers
 
 #include <memory>
 #include <string>
@@ -178,17 +180,18 @@ namespace llaminar2
         bool is_multi_gpu_single_process_ = false; // True if multi-GPU without MPI
 
 #ifdef HAVE_RCCL
-        ncclComm_t comm_ = nullptr; // RCCL uses same types as NCCL
-        hipStream_t stream_ = nullptr;
+        // Use void* for opaque RCCL types - dynamic loading hides the actual types
+        void *comm_ = nullptr;   // ncclComm_t (opaque pointer)
+        void *stream_ = nullptr; // hipStream_t (opaque pointer)
 
         // For multi-GPU single-process mode: one comm and stream per GPU
-        std::vector<ncclComm_t> all_comms_;
-        std::vector<hipStream_t> all_streams_;
+        std::vector<void *> all_comms_;
+        std::vector<void *> all_streams_;
         std::vector<int> device_ordinals_; // GPU ordinals for each rank
 
-        // Helper to convert our types to RCCL types
-        static ncclDataType_t toRcclDataType(CollectiveDataType dtype);
-        static ncclRedOp_t toRcclRedOp(CollectiveOp op);
+        // Helper to convert our types to integer values for wrapper functions
+        static int toRcclDataTypeInt(CollectiveDataType dtype);
+        static int toRcclRedOpInt(CollectiveOp op);
 #endif
     };
 

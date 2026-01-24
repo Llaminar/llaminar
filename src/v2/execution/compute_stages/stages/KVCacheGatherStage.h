@@ -42,7 +42,7 @@ namespace llaminar2
         ComputeStageType type() const override { return ComputeStageType::COPY; }
         bool supportsBackend(ComputeBackendType backend) const override { return true; }
         StageBufferRequirements getBufferRequirements() const override;
-        StageDumpInfo getDumpInfo() const override;
+        StageDumpInfo buildDumpInfoImpl() const override;
 
         /**
          * @brief Allow zero output because cache may be empty on first token

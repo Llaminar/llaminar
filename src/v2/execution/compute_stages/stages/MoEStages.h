@@ -36,7 +36,7 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
-        StageDumpInfo getDumpInfo() const override;
+        StageDumpInfo buildDumpInfoImpl() const override;
 
     private:
         Params params_;
@@ -74,7 +74,7 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
-        StageDumpInfo getDumpInfo() const override;
+        StageDumpInfo buildDumpInfoImpl() const override;
 
     private:
         Params params_;
@@ -105,7 +105,7 @@ namespace llaminar2
         ComputeStageType type() const override { return ComputeStageType::MOE_COMBINE; }
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
-        StageDumpInfo getDumpInfo() const override;
+        StageDumpInfo buildDumpInfoImpl() const override;
 
     private:
         Params params_;

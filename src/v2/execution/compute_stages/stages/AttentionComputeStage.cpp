@@ -278,7 +278,7 @@ namespace llaminar2
         }
     }
 
-    StageDumpInfo AttentionComputeStage::getDumpInfo() const
+    StageDumpInfo AttentionComputeStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
 

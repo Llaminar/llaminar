@@ -239,15 +239,9 @@ namespace llaminar2
 
         DeviceType device_type = target_device.type;
 
-        // For ROCm devices, set the thread-local ordinal so kernels are created
-        // on the correct device in multi-GPU setups
-        if (target_device.is_rocm())
+        // Helper lambda for GPU preloading - shared by ROCm and CUDA paths
+        auto preload_for_gpu = [&](auto &guard) -> bool
         {
-            LOG_DEBUG("[WeightPreloader] Setting ROCm ordinal " << target_device.ordinal
-                                                                << " for weight preloading");
-            // Create guard - will be active for entire preload operation
-            KernelFactory::ROCmOrdinalGuard guard(target_device.ordinal);
-
             // Now all kernel creation within this call will use the correct ordinal
             auto &cache = weight_manager_->cache_;
             std::vector<std::string> matching_names;
@@ -271,8 +265,8 @@ namespace llaminar2
             if (!placement_map_ && !matching_names.empty())
             {
                 LOG_DEBUG("[WeightPreloader] No placement map - preloading all "
-                          << matching_names.size() << " GEMM weights to ROCm device "
-                          << target_device.ordinal);
+                          << matching_names.size() << " GEMM weights to device "
+                          << target_device.to_string());
                 gemm_success = preloadWithOverrideDevice(matching_names, target_device, progress_callback, release_raw_data);
             }
             else
@@ -284,10 +278,30 @@ namespace llaminar2
             uploadNonGemmWeights(target_device);
 
             return gemm_success;
+        };
+
+        // For ROCm devices, set the thread-local ordinal so kernels are created
+        // on the correct device in multi-GPU setups
+        if (target_device.is_rocm())
+        {
+            LOG_DEBUG("[WeightPreloader] Setting ROCm ordinal " << target_device.ordinal
+                                                                << " for weight preloading");
+            // Create guard - will be active for entire preload operation
+            KernelFactory::ROCmOrdinalGuard guard(target_device.ordinal);
+            return preload_for_gpu(guard);
+        }
+        // For CUDA devices, set the thread-local ordinal similarly
+        else if (target_device.is_cuda())
+        {
+            LOG_DEBUG("[WeightPreloader] Setting CUDA ordinal " << target_device.ordinal
+                                                                << " for weight preloading");
+            // Create guard - will be active for entire preload operation
+            KernelFactory::CUDAOrdinalGuard guard(target_device.ordinal);
+            return preload_for_gpu(guard);
         }
         else
         {
-            // For CPU and CUDA, just delegate to DeviceType version
+            // For CPU, just delegate to DeviceType version
             return preloadForDevice(device_type, progress_callback, release_raw_data);
         }
     }
@@ -419,11 +433,22 @@ namespace llaminar2
                 continue;
             }
 
+            // Skip embedding table - it's handled separately by the embedding kernel
+            // which dequantizes it on GPU (CUDAEmbeddingKernelT/ROCmEmbeddingKernelT)
+            if (name.find("token_embd") != std::string::npos)
+            {
+                LOG_TRACE("[WeightPreloader] Skipping embedding '" << name << "' (handled by embedding kernel)");
+                continue;
+            }
+
             if (!tensor)
             {
                 LOG_WARN("[WeightPreloader] Non-GEMM weight is null: " << name);
                 continue;
             }
+
+            // Set debug name so transfers can be traced
+            tensor->setDebugName(name);
 
             // Upload to GPU using ensureOnDevice (no GEMM packing needed)
             if (tensor->ensureOnDevice(target_device))

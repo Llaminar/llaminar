@@ -292,13 +292,13 @@ TEST_F(Test__TensorSliceCoherence, MarkDeviceDirtyCallsInner)
 }
 
 // =============================================================================
-// Test Category 4: The Problem - Direct Calls Don't Work
+// Test Category 4: TensorSlice Now Delegates to Inner
 // =============================================================================
 
-TEST_F(Test__TensorSliceCoherence, DirectEnsureOnDeviceDoesNotCallInner)
+TEST_F(Test__TensorSliceCoherence, DirectEnsureOnDeviceDelegatesToInner)
 {
-    // This test demonstrates WHY we need to unwrap TensorSlice
-    // Calling ensureOnDevice on TensorSlice directly does NOT call inner's method
+    // This test verifies that TensorSlice::ensureOnDevice properly delegates
+    // to the inner tensor, which is the correct behavior.
 
     auto mock = std::make_unique<MockCoherenceTensor>(512, 256);
     MockCoherenceTensor *mock_ptr = mock.get();
@@ -309,14 +309,12 @@ TEST_F(Test__TensorSliceCoherence, DirectEnsureOnDeviceDoesNotCallInner)
     auto *slice_as_cpu = dynamic_cast<TensorBase *>(slice.get());
     ASSERT_NE(slice_as_cpu, nullptr);
 
-    // This calls TensorSlice's inherited ensureOnDevice, not MockCoherenceTensor's
+    // This calls TensorSlice's ensureOnDevice which delegates to inner
     slice_as_cpu->ensureOnDevice(DeviceId::cuda(0));
 
-    // The mock's method was NOT called because TensorSlice has its own state
-    // This is the problem that StageCoherence.cpp's unwrapping fix addresses
-    EXPECT_EQ(mock_ptr->ensureOnDevice_calls, 0)
-        << "Direct call to TensorSlice::ensureOnDevice does NOT delegate to inner - "
-        << "This is why StageCoherence unwrapping is needed!";
+    // The mock's method WAS called because TensorSlice now correctly delegates
+    EXPECT_EQ(mock_ptr->ensureOnDevice_calls, 1)
+        << "TensorSlice::ensureOnDevice should delegate to inner tensor";
 }
 
 // =============================================================================

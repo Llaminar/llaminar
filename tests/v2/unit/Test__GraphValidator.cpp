@@ -31,7 +31,7 @@ public:
     ComputeStageType type() const override { return ComputeStageType::COPY; }
     bool supportsBackend(ComputeBackendType) const override { return true; }
     size_t estimatedFlops() const override { return 0; }
-    StageDumpInfo getDumpInfo() const override { return {}; }
+    StageDumpInfo buildDumpInfoImpl() const override { return {}; }
 
     StageBufferRequirements getBufferRequirements() const override
     {

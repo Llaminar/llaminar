@@ -32,6 +32,7 @@
 #include "execution/DeviceWorkspaceManager.h"
 #include "execution/WorkspaceDescriptor.h"
 #include "utils/Logger.h"
+#include "utils/CUDAKernelProfiler.h"
 
 #include <stdexcept>
 #include <vector>
@@ -993,15 +994,18 @@ namespace llaminar2
                 }
 
                 // Execute CUTLASS INT8 GEMM using SHARED quantized activations and this kernel's weights
-                if (!cudaQuantGemm_execute(
-                        d_A_int8,                           // SHARED quantized activations (from this kernel's workspace)
-                        cuda_kernel->impl_->d_weights_int8, // This projection's weights
-                        proj_d_C_int32,                     // This projection's INT32 work buffer (from its workspace)
-                        m, n, k, cuda_device_id_))
                 {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] CUTLASS GEMM failed for projection " << i);
-                    all_success = false;
-                    break;
+                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUTLASS);
+                    if (!cudaQuantGemm_execute(
+                            d_A_int8,                           // SHARED quantized activations (from this kernel's workspace)
+                            cuda_kernel->impl_->d_weights_int8, // This projection's weights
+                            proj_d_C_int32,                     // This projection's INT32 work buffer (from its workspace)
+                            m, n, k, cuda_device_id_))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] CUTLASS GEMM failed for projection " << i);
+                        all_success = false;
+                        break;
+                    }
                 }
 
                 // Get bias pointer if present
@@ -1167,12 +1171,15 @@ namespace llaminar2
 #endif
 
             // Step 2: Execute CUTLASS INT8 GEMM
-            if (!cudaQuantGemm_execute(
-                    d_A_int8, impl_->d_weights_int8, d_C_int32,
-                    m, n, k, cuda_device_id_))
             {
-                LOG_ERROR("[CUDAQuantisedGemmKernel] CUTLASS GEMM failed");
-                return false;
+                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUTLASS);
+                if (!cudaQuantGemm_execute(
+                        d_A_int8, impl_->d_weights_int8, d_C_int32,
+                        m, n, k, cuda_device_id_))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] CUTLASS GEMM failed");
+                    return false;
+                }
             }
 
 #ifdef LLAMINAR_DEBUG_GEMM_VALUES
@@ -1252,30 +1259,39 @@ namespace llaminar2
             ensureWeightsConverted();
 
             // Step 1: Quantize activations
-            if (!cudaQuantGemm_quantizeActivations(
-                    d_A, d_A_int8, d_scales_A, m, k, cuda_device_id_))
             {
-                LOG_ERROR("[CUDAQuantisedGemmKernel] Activation quantization failed");
-                return false;
+                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::QUANTIZE_ACTIVATIONS);
+                if (!cudaQuantGemm_quantizeActivations(
+                        d_A, d_A_int8, d_scales_A, m, k, cuda_device_id_))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] Activation quantization failed");
+                    return false;
+                }
             }
 
             // Step 2: Execute CUTLASS INT8 GEMM
-            if (!cudaQuantGemm_execute(
-                    d_A_int8, impl_->d_weights_int8, d_C_int32,
-                    m, n, k, cuda_device_id_))
             {
-                LOG_ERROR("[CUDAQuantisedGemmKernel] CUTLASS GEMM failed");
-                return false;
+                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUTLASS);
+                if (!cudaQuantGemm_execute(
+                        d_A_int8, impl_->d_weights_int8, d_C_int32,
+                        m, n, k, cuda_device_id_))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] CUTLASS GEMM failed");
+                    return false;
+                }
             }
 
             // Step 3: Apply scaling, bias, and output to FP32
             const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
-            if (!cudaQuantGemm_applyScaling(
-                    d_C_int32, d_C, d_scales_A, impl_->d_scales_B,
-                    m, n, alpha, beta, d_C_existing, d_bias, cuda_device_id_))
             {
-                LOG_ERROR("[CUDAQuantisedGemmKernel] Scaling with bias failed");
-                return false;
+                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_SCALE_OUTPUT);
+                if (!cudaQuantGemm_applyScaling(
+                        d_C_int32, d_C, d_scales_A, impl_->d_scales_B,
+                        m, n, alpha, beta, d_C_existing, d_bias, cuda_device_id_))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] Scaling with bias failed");
+                    return false;
+                }
             }
 
             return true;

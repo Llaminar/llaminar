@@ -539,7 +539,7 @@ namespace llaminar2
         return *this;
     }
 
-    void StageDumpInfo::ensureOutputsOnHost()
+    void StageDumpInfo::ensureOutputsOnHost() const
     {
         // Sync all output tensors from GPU to host.
         // Call this BEFORE reading output.data for verification/dumping.

@@ -8,6 +8,7 @@
 #include "BenchmarkRunner.h"
 #include "Logger.h"
 #include "KernelProfiler.h"
+#include "CUDAKernelProfiler.h"
 #include "../execution/IGraphExecutor.h"
 #include <iostream>
 #include <iomanip>
@@ -285,6 +286,7 @@ namespace llaminar2
         if (KernelProfiler::isEnabled())
         {
             KernelProfiler::reset();
+            CUDAKernelProfiler::reset();
         }
 
         // ========================================================================
@@ -455,10 +457,11 @@ namespace llaminar2
         {
             uint64_t total_tokens = result.prefill_tokens + result.decode_tokens;
             KernelProfiler::printSummary(total_tokens);
+            CUDAKernelProfiler::printSummary(total_tokens);
         }
 
-        // Print executor overhead profiling if enabled (LLAMINAR_EXECUTOR_PROFILING=1)
-        if (runner_)
+        // Print executor overhead profiling if enabled (LLAMINAR_PROFILING=1)
+        if (KernelProfiler::isEnabled() && runner_)
         {
             const auto *stats = runner_->executorStats();
             if (stats && stats->total_stages_executed > 0)
