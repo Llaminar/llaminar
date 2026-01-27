@@ -50,11 +50,29 @@ namespace llaminar2
             return true;
         }
 
+        // Resolve count: 0 means use tensor->numel()
+        const size_t effective_count = (params_.count > 0) ? params_.count : params_.tensor->numel();
+
         // Delegate to LOCAL TP context
         LOG_DEBUG("LocalTPAllreduceStage: all-reduce across " << params_.tp_ctx->degree()
-                                                              << " devices using " << collectiveBackendTypeToString(params_.tp_ctx->backend()));
+                                                              << " devices using " << collectiveBackendTypeToString(params_.tp_ctx->backend())
+                                                              << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                                                              << " count=" << effective_count 
+                                                              << " (params_.count=" << params_.count 
+                                                              << ", tensor numel=" << params_.tensor->numel() << ")");
 
-        bool success = params_.tp_ctx->allreduce(params_.tensor);
+        // Use stage_name overload with count parameter
+        // CRITICAL: Pass actual count for decode (seq_len * hidden_dim, not buffer size)
+        bool success;
+        if (!params_.stage_name.empty())
+        {
+            success = params_.tp_ctx->allreduce(params_.tensor, params_.stage_name, effective_count);
+        }
+        else
+        {
+            // Fall back to no-stage-name overload (uses tensor->numel())
+            success = params_.tp_ctx->allreduce(params_.tensor);
+        }
 
         if (!success)
         {

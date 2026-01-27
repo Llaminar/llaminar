@@ -71,6 +71,7 @@ namespace llaminar2
         // =====================================================================
 
         bool allreduce(TensorBase *tensor) override;
+        bool allreduce(TensorBase *tensor, const std::string &stage_name, size_t count = 0) override;
         bool allreduce(const TensorBase *input, TensorBase *output) override;
         bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) override;
         bool gatherFromDevices(
@@ -83,6 +84,72 @@ namespace llaminar2
         // =====================================================================
 
         void synchronize() override;
+
+        // =====================================================================
+        // BAR-Backed Tensor Registry (ILocalTPContext interface + concrete impl)
+        // =====================================================================
+
+        /**
+         * @brief Register a BAR-backed tensor for a stage's output (interface impl)
+         *
+         * Called during graph construction for row-parallel stages (FFN_DOWN, Wo)
+         * when using PCIeBAR backend. The registered tensors are used by
+         * executePCIeBarAllreduce() for zero-copy reduction.
+         *
+         * @param stage_name Stage identifier (e.g., "layer0_ffn_down_allreduce")
+         * @param device Device that owns this tensor (must be in devices())
+         * @param tensor Tensor to register (must be BAR-backed FP32 for PCIeBAR)
+         */
+        void registerBARBackedOutput(
+            const std::string &stage_name,
+            const GlobalDeviceAddress &device,
+            TensorBase *tensor) override;
+
+        /**
+         * @brief Check if a stage has any BAR-backed outputs registered
+         *
+         * @param stage_name Stage identifier
+         * @return true if at least one device has a tensor registered
+         */
+        bool hasBARBackedOutputs(const std::string &stage_name) const override;
+
+        /**
+         * @brief Clear all BAR-backed tensor registrations
+         *
+         * Called when resetting the context or changing buffer sizes.
+         */
+        void clearBARBackedOutputs() override;
+
+        /**
+         * @brief Get DirectP2PEngine for BAR-backed tensor allocation
+         *
+         * For PCIeBAR backend, returns the DirectP2PEngine used for BAR memory
+         * management. This allows TensorFactory to create BAR-backed tensors.
+         *
+         * @return Shared pointer to DirectP2PEngine, or nullptr if not available
+         */
+        std::shared_ptr<DirectP2PEngine> getDirectP2PEngine() const override;
+
+        /**
+         * @brief Reserve temporary buffer capacity for collective operations
+         *
+         * Pre-allocates internal temp buffers to avoid allocation in the hot path.
+         *
+         * @param bytes Minimum buffer capacity in bytes
+         * @return true if reservation succeeded
+         */
+        bool reserveTempBufferBytes(size_t bytes) override;
+
+        /**
+         * @brief Get all BAR-backed tensors for a stage (concrete implementation)
+         *
+         * Returns tensors in device order (index i = tensor for devices()[i]).
+         * May contain nullptr entries for devices without BAR-backed outputs.
+         *
+         * @param stage_name Stage identifier
+         * @return Vector of FP32Tensor pointers (size = degree()), nullptr for missing entries
+         */
+        std::vector<FP32Tensor *> getBARBackedOutputs(const std::string &stage_name) const;
 
         // =====================================================================
         // Device Management (ILocalTPContext)
@@ -154,11 +221,34 @@ namespace llaminar2
         /// Generation counter to prevent spurious wakeups and ensure barrier reusability
         std::atomic<uint64_t> barrier_generation_{0};
 
-        /// Tensor being reduced (set by first arrival, used by executor)
+        /// Tensors being reduced from each device (one per participant)
+        /// Key: arrival order (0, 1, ...), Value: tensor pointer
+        std::vector<TensorBase *> barrier_tensors_;
+
+        /// Tensor being reduced (set by first arrival, used by executor) [DEPRECATED: use barrier_tensors_]
         TensorBase *barrier_tensor_{nullptr};
+
+        /// Stage name for current barrier operation (for BAR-backed tensor lookup)
+        std::string barrier_stage_name_;
+
+        /// Element count for current barrier operation (0 = use tensor->numel())
+        /// CRITICAL: For decode with dynamic seq_len, this must be actual count, not buffer size
+        size_t barrier_element_count_{0};
 
         /// Result of allreduce (set by executor, read by all waiters)
         bool barrier_result_{false};
+
+        // =====================================================================
+        // BAR-Backed Tensor Registry
+        // =====================================================================
+        // For zero-copy allreduce, we need to know which stage outputs are
+        // allocated in BAR memory. When a stage has BAR-backed outputs registered,
+        // executePCIeBarAllreduce() can read directly from BAR instead of
+        // copying through host memory.
+
+        /// Map: stage_name -> (device_index -> BAR-backed FP32 tensor)
+        /// The tensor at index i belongs to devices_[i]
+        std::unordered_map<std::string, std::vector<FP32Tensor*>> bar_output_tensors_;
 
         /**
          * @brief Initialize the collective backend
@@ -227,9 +317,11 @@ namespace llaminar2
          * 3. All devices are released with the same result
          *
          * @param tensor Tensor to allreduce in-place
+         * @param stage_name Stage identifier for BAR-backed tensor lookup (optional)
+         * @param count Number of elements to reduce (0 = use tensor->numel())
          * @return true on success (same result for all participants)
          */
-        bool allreduceWithBarrier(TensorBase *tensor);
+        bool allreduceWithBarrier(TensorBase *tensor, const std::string &stage_name = "", size_t count = 0);
 
         /**
          * @brief Execute the actual PCIeBAR allreduce operation
@@ -238,9 +330,10 @@ namespace llaminar2
          * threads are waiting, so we have exclusive access to the barrier_tensor_.
          *
          * @param tensor Tensor to allreduce in-place
+         * @param count Number of elements to reduce (0 = use tensor->numel())
          * @return true on success
          */
-        bool executePCIeBarAllreduce(TensorBase *tensor);
+        bool executePCIeBarAllreduce(TensorBase *tensor, size_t count = 0);
 
         /**
          * @brief Normalize weights to sum to 1.0

@@ -497,6 +497,7 @@ namespace llaminar2
 
         // Weight category detection helpers for LOCAL TP slicing
         static bool isQKVWeight(const std::string &name);
+        static bool isQKVBias(const std::string &name);
         static bool isFFNGateUpWeight(const std::string &name);
         static bool isFFNDownWeight(const std::string &name);
         static bool isLMHeadWeight(const std::string &name);
@@ -519,6 +520,26 @@ namespace llaminar2
             const std::shared_ptr<TensorBase> &tensor,
             size_t row_start,
             size_t row_count);
+
+        /**
+         * @brief Slice a specific column range from tensor
+         *
+         * Creates a new tensor containing only the specified columns.
+         * Supports FP32 tensors (quantized tensors should use GGUF column slice loading).
+         *
+         * This is used for INPUT_PARALLEL weight slicing where the input dimension
+         * (columns) is split across devices. Different from row slicing because
+         * columns are non-contiguous in row-major memory layout.
+         *
+         * @param tensor Source tensor to slice
+         * @param col_start First column index (0-based)
+         * @param col_count Number of columns to extract
+         * @return New tensor with the specified column range, or nullptr on error
+         */
+        static std::shared_ptr<TensorBase> sliceColumnRange(
+            const std::shared_ptr<TensorBase> &tensor,
+            size_t col_start,
+            size_t col_count);
 
         /**
          * @brief Determine weight category from name

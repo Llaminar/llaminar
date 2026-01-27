@@ -15,6 +15,7 @@
 #include "../loaders/WeightManager.h"
 #include "../loaders/WeightPlacementMap.h"
 #include "../config/TensorParallelConfig.h"
+#include "../collective/ILocalTPContext.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/MPIContext.h"
@@ -304,6 +305,56 @@ namespace llaminar2
         {
             buffer_config.use_mapped_memory = true;
             LOG_INFO("[DeviceGraphOrchestrator] Enabling mapped memory for GPU + snapshot mode (zero-copy host access)");
+        }
+
+        // =====================================================================
+        // Configure BAR-backed allocation for LOCAL TP with PCIeBAR backend
+        // =====================================================================
+        // When LOCAL TP is active with PCIeBAR backend, row-parallel output
+        // buffers (attn_proj, ffn_output) need to be allocated in BAR memory
+        // for efficient cross-vendor allreduce. Each device needs its own buffer:
+        // - CUDA device: standard FP32 tensor
+        // - ROCm device: BAR-backed FP32 tensor accessible by both devices
+        //
+        // The GraphBufferManager checks Qwen2BufferSpec::requiresBARBacked() to
+        // identify which buffers need BAR allocation.
+        // =====================================================================
+        if (config.local_tp_ctx && config.local_tp_ctx->degree() > 1)
+        {
+            buffer_config.tp_degree = config.local_tp_ctx->degree();
+            buffer_config.collective_backend = config.local_tp_ctx->backend();
+            buffer_config.local_tp_ctx = config.local_tp_ctx;
+
+            // For PCIeBAR backend, find CUDA and ROCm devices for BAR allocation
+            if (config.local_tp_ctx->backend() == CollectiveBackendType::PCIE_BAR)
+            {
+                const auto &devices = config.local_tp_ctx->devices();
+                for (const auto &device_addr : devices)
+                {
+                    DeviceId device_id = device_addr.toLocalDeviceId();
+                    if (device_id.is_cuda() && !buffer_config.cuda_device.is_cuda())
+                    {
+                        buffer_config.cuda_device = device_id;
+                    }
+                    else if (device_id.is_rocm() && !buffer_config.rocm_device.is_rocm())
+                    {
+                        buffer_config.rocm_device = device_id;
+                    }
+                }
+
+                if (buffer_config.cuda_device.is_cuda() && buffer_config.rocm_device.is_rocm())
+                {
+                    LOG_INFO("[DeviceGraphOrchestrator] Enabled BAR-backed allocation for LOCAL TP PCIeBAR: "
+                             << "CUDA=" << buffer_config.cuda_device.toString()
+                             << ", ROCm=" << buffer_config.rocm_device.toString());
+                }
+                else
+                {
+                    LOG_WARN("[DeviceGraphOrchestrator] PCIeBAR backend but missing CUDA/ROCm pair: "
+                             << "CUDA=" << (buffer_config.cuda_device.is_cuda() ? buffer_config.cuda_device.toString() : "(none)")
+                             << ", ROCm=" << (buffer_config.rocm_device.is_rocm() ? buffer_config.rocm_device.toString() : "(none)"));
+                }
+            }
         }
 
         // Create buffer manager with TensorFactory
@@ -1156,6 +1207,65 @@ namespace llaminar2
             LOG_DEBUG("[DeviceGraphOrchestrator] Enabling mapped memory for ALL GPU tensors (zero-copy host access)");
         }
 
+        // =====================================================================
+        // BAR-Backed Allocation for LOCAL TP with PCIeBAR Backend
+        // =====================================================================
+        // When using LOCAL TP with PCIeBAR backend, ROCm devices need BAR-backed
+        // tensors for row-parallel outputs (attn_proj, ffn_output). This enables
+        // zero-copy allreduce where CUDA reads directly from ROCm's BAR region.
+        //
+        // Conditions for BAR-backed allocation:
+        // 1. LOCAL TP is active (local_tp_ctx != nullptr && degree > 1)
+        // 2. Backend is PCIeBAR
+        // 3. Current device is ROCm
+        // 4. DirectP2PEngine is available from LocalTPContext
+        // =====================================================================
+        bool use_bar_allocation = false;
+        DeviceId cuda_device_for_bar;  // CUDA device that will read from BAR
+        DeviceId rocm_device_for_bar;  // ROCm device that will own BAR memory
+
+        if (config.local_tp_ctx &&
+            config.local_tp_ctx->degree() > 1 &&
+            config.local_tp_ctx->backend() == CollectiveBackendType::PCIE_BAR &&
+            device.is_rocm())
+        {
+            // Get DirectP2PEngine from LocalTPContext
+            auto p2p_engine = config.local_tp_ctx->getDirectP2PEngine();
+            if (p2p_engine)
+            {
+                factory.setDirectP2P(p2p_engine);
+
+                // Find the CUDA device in the LOCAL TP group
+                for (const auto &dev : config.local_tp_ctx->devices())
+                {
+                    if (dev.toLocalDeviceId().is_cuda())
+                    {
+                        cuda_device_for_bar = dev.toLocalDeviceId();
+                        break;
+                    }
+                }
+
+                rocm_device_for_bar = device;  // Current device is ROCm
+                use_bar_allocation = cuda_device_for_bar.is_cuda();
+
+                if (use_bar_allocation)
+                {
+                    LOG_INFO("[DeviceGraphOrchestrator] Enabled BAR-backed allocation for LOCAL TP PCIeBAR: "
+                             << "ROCm=" << rocm_device_for_bar.toString()
+                             << ", CUDA=" << cuda_device_for_bar.toString());
+                }
+                else
+                {
+                    LOG_WARN("[DeviceGraphOrchestrator] Cannot enable BAR allocation: no CUDA device in LOCAL TP group");
+                }
+            }
+            else
+            {
+                LOG_WARN("[DeviceGraphOrchestrator] PCIeBAR backend but DirectP2PEngine not available - "
+                         << "allreduce will fall back to staged transfers");
+            }
+        }
+
         // Get activation precision from config
         ActivationPrecision act_prec = config.activation_precision;
         LOG_DEBUG("[DeviceGraphOrchestrator] Activation buffer precision: " << activationPrecisionToString(act_prec));
@@ -1299,11 +1409,23 @@ namespace llaminar2
         // attn_proj is the output of Wo projection which feeds into the residual stream
         // HybridQ16 mode: Q8_1 (native add to Q16_1 residual via q16_1_add_q8_1)
         // Other modes: FP32 for numerical stability in residual connections
+        //
+        // For LOCAL TP with PCIeBAR backend: ROCm device uses BAR-backed FP32 tensor
+        // to enable zero-copy allreduce (CUDA reads directly from ROCm BAR region)
         if (act_prec == ActivationPrecision::HybridQ16)
         {
+            // Q8_1 cannot be BAR-backed (BAR allocation is FP32 only)
             state_.attn_proj = factory.createQ8_1(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
                 device);
+        }
+        else if (use_bar_allocation)
+        {
+            // BAR-backed FP32 for PCIeBAR zero-copy allreduce
+            state_.attn_proj = factory.createFP32BARBacked(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                rocm_device_for_bar, cuda_device_for_bar);
+            LOG_INFO("[DeviceGraphOrchestrator] Allocated attn_proj as BAR-backed FP32 for PCIeBAR allreduce");
         }
         else
         {
@@ -1326,11 +1448,23 @@ namespace llaminar2
         // ffn_output is the output of FFN Down projection which feeds into the residual stream
         // HybridQ16 mode: Q8_1 (native add to Q16_1 residual via q16_1_add_q8_1)
         // Other modes: FP32 for numerical stability in residual connections
+        //
+        // For LOCAL TP with PCIeBAR backend: ROCm device uses BAR-backed FP32 tensor
+        // to enable zero-copy allreduce (CUDA reads directly from ROCm BAR region)
         if (act_prec == ActivationPrecision::HybridQ16)
         {
+            // Q8_1 cannot be BAR-backed (BAR allocation is FP32 only)
             state_.ffn_output = factory.createQ8_1(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
                 device);
+        }
+        else if (use_bar_allocation)
+        {
+            // BAR-backed FP32 for PCIeBAR zero-copy allreduce
+            state_.ffn_output = factory.createFP32BARBacked(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                rocm_device_for_bar, cuda_device_for_bar);
+            LOG_INFO("[DeviceGraphOrchestrator] Allocated ffn_output as BAR-backed FP32 for PCIeBAR allreduce");
         }
         else
         {
@@ -1408,16 +1542,39 @@ namespace llaminar2
         kv_config.mpi_ctx = local_mpi_ctx.get();
 
         // Set sharding parameters if needed (tensor parallelism)
+        // Sharding is needed when local_n_kv_heads < n_kv_heads, AND tensor parallelism is active.
+        // TP can be:
+        // - GLOBAL TP: Multiple MPI ranks (mpi_ctx_->world_size() > 1)
+        // - LOCAL TP: Multiple devices within single rank (local_tp_ctx->degree() > 1)
         bool use_sharded_cache = (config.local_n_kv_heads > 0 && config.local_n_kv_heads < n_kv_heads);
-        if (use_sharded_cache && mpi_ctx_ && mpi_ctx_->world_size() > 1)
+        bool is_global_tp = mpi_ctx_ && mpi_ctx_->world_size() > 1;
+        bool is_local_tp = config.local_tp_ctx && config.local_tp_ctx->degree() > 1;
+
+        if (use_sharded_cache && (is_global_tp || is_local_tp))
         {
             kv_config.local_n_kv_heads = config.local_n_kv_heads;
-            kv_config.kv_head_start = mpi_ctx_->rank() * config.local_n_kv_heads;
 
-            LOG_DEBUG("[DeviceGraphOrchestrator] Creating sharded KV cache: "
-                      << n_kv_heads << " total KV heads, "
-                      << config.local_n_kv_heads << " local KV heads (start=" << kv_config.kv_head_start << ")"
-                      << " precision=" << activationPrecisionToString(kv_cache_prec));
+            // Calculate kv_head_start based on TP mode:
+            // - LOCAL TP: Use device index within the LOCAL TP context
+            // - GLOBAL TP: Use MPI rank
+            if (is_local_tp)
+            {
+                kv_config.kv_head_start = config.local_tp_device_idx * config.local_n_kv_heads;
+                LOG_DEBUG("[DeviceGraphOrchestrator] Creating sharded KV cache (LOCAL TP): "
+                          << n_kv_heads << " total KV heads, "
+                          << config.local_n_kv_heads << " local KV heads (device_idx="
+                          << config.local_tp_device_idx << ", start=" << kv_config.kv_head_start << ")"
+                          << " precision=" << activationPrecisionToString(kv_cache_prec));
+            }
+            else
+            {
+                kv_config.kv_head_start = mpi_ctx_->rank() * config.local_n_kv_heads;
+                LOG_DEBUG("[DeviceGraphOrchestrator] Creating sharded KV cache (GLOBAL TP): "
+                          << n_kv_heads << " total KV heads, "
+                          << config.local_n_kv_heads << " local KV heads (rank="
+                          << mpi_ctx_->rank() << ", start=" << kv_config.kv_head_start << ")"
+                          << " precision=" << activationPrecisionToString(kv_cache_prec));
+            }
         }
 
         // Create cache via factory (handles sharded vs non-sharded automatically)

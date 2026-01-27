@@ -625,8 +625,32 @@ namespace llaminar2
             }
 
             // Check if tensors are on GPU
-            const float *d_input = static_cast<const float *>(A_fp32->gpu_data_ptr());
-            float *d_output = static_cast<float *>(C_fp32->gpu_data_ptr());
+            // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr() (HIP pointer) instead of
+            // gpu_data_ptr() (which returns CUDA pointer for BAR-backed). This enables zero-copy
+            // where ROCm kernels write directly to BAR memory that CUDA can then read.
+            const float *d_input = nullptr;
+            float *d_output = nullptr;
+            
+            if (A_fp32->isBARBacked() && A_fp32->rocm_data_ptr() != nullptr)
+            {
+                d_input = static_cast<const float *>(A_fp32->rocm_data_ptr());
+                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using BAR rocm_data_ptr for input A: " << d_input);
+            }
+            else
+            {
+                d_input = static_cast<const float *>(A_fp32->gpu_data_ptr());
+            }
+            
+            if (C_fp32->isBARBacked() && C_fp32->rocm_data_ptr() != nullptr)
+            {
+                d_output = static_cast<float *>(C_fp32->rocm_data_ptr());
+                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using BAR rocm_data_ptr for output C: " << d_output);
+            }
+            else
+            {
+                d_output = static_cast<float *>(C_fp32->gpu_data_ptr());
+            }
+            
             const bool use_gpu_path = (d_input != nullptr) && (d_output != nullptr);
 
             auto phase_start = std::chrono::high_resolution_clock::now();
@@ -635,7 +659,17 @@ namespace llaminar2
             // Fast path: if bias is present and we're on GPU, use multiply_fp32_to_fp32_with_bias
             if (bias && use_gpu_path)
             {
-                const float *d_bias = static_cast<const float *>(bias->gpu_data_ptr());
+                // Get bias device pointer - check BAR-backed status
+                const float *d_bias = nullptr;
+                if (bias->isBARBacked())
+                {
+                    d_bias = static_cast<const float *>(bias->rocm_data_ptr());
+                }
+                else
+                {
+                    d_bias = static_cast<const float *>(bias->gpu_data_ptr());
+                }
+                
                 if (d_bias)
                 {
                     LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using bias path (d_input="
@@ -1128,7 +1162,16 @@ namespace llaminar2
                     return false;
                 }
                 // Coherence handled automatically by GraphExecutor
-                d_input = static_cast<const float *>(fp32_input->gpu_data_ptr());
+                // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr() (HIP pointer)
+                if (fp32_input->isBARBacked() && fp32_input->rocm_data_ptr() != nullptr)
+                {
+                    d_input = static_cast<const float *>(fp32_input->rocm_data_ptr());
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Using BAR rocm_data_ptr for input: " << d_input);
+                }
+                else
+                {
+                    d_input = static_cast<const float *>(fp32_input->gpu_data_ptr());
+                }
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input << " cpu_ptr=" << fp32_input->data());
             }
             else
@@ -1211,7 +1254,17 @@ namespace llaminar2
                 }
 
                 // Coherence handled automatically by GraphExecutor
-                float *d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
+                // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr() (HIP pointer)
+                float *d_output = nullptr;
+                if (fp32_output->isBARBacked() && fp32_output->rocm_data_ptr() != nullptr)
+                {
+                    d_output = static_cast<float *>(fp32_output->rocm_data_ptr());
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Using BAR rocm_data_ptr for output: " << d_output);
+                }
+                else
+                {
+                    d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
+                }
                 if (!d_output)
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Output has no GPU data for projection " << i);
@@ -1288,7 +1341,16 @@ namespace llaminar2
                     if (current_dev.has_value() && current_dev.value() == target_device)
                     {
                         // Already on correct device - use directly
-                        d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
+                        // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr()
+                        if (bias_tensor->isBARBacked() && bias_tensor->rocm_data_ptr() != nullptr)
+                        {
+                            d_bias = static_cast<const float *>(bias_tensor->rocm_data_ptr());
+                            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Using BAR rocm_data_ptr for bias: " << d_bias);
+                        }
+                        else
+                        {
+                            d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
+                        }
                     }
                     else if (current_dev.has_value() && current_dev->is_gpu())
                     {
@@ -1310,7 +1372,15 @@ namespace llaminar2
                             all_success = false;
                             break;
                         }
-                        d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
+                        // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr()
+                        if (bias_tensor->isBARBacked() && bias_tensor->rocm_data_ptr() != nullptr)
+                        {
+                            d_bias = static_cast<const float *>(bias_tensor->rocm_data_ptr());
+                        }
+                        else
+                        {
+                            d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
+                        }
                     }
 
                     if (!d_bias)

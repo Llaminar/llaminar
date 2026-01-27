@@ -224,6 +224,11 @@ namespace llaminar2::test
             return !config_.allreduce_should_fail;
         }
 
+        bool allreduce(TensorBase *tensor, const std::string & /*stage_name*/) override
+        {
+            return allreduce(tensor);
+        }
+
         bool allreduce(const TensorBase * /*input*/, TensorBase * /*output*/) override
         {
             allreduce_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -341,6 +346,23 @@ namespace llaminar2::test
         {
             return rowRangeForDevice(device, total_cols);
         }
+
+        // =====================================================================
+        // ILocalTPContext Implementation - BAR Registry (no-ops for tests)
+        // =====================================================================
+
+        void registerBARBackedOutput(
+            const std::string & /*stage_name*/,
+            const GlobalDeviceAddress & /*device*/,
+            TensorBase * /*tensor*/) override
+        {
+            // No-op for unit tests
+        }
+
+        bool hasBARBackedOutputs(const std::string & /*stage_name*/) const override { return false; }
+        void clearBARBackedOutputs() override {}
+        std::shared_ptr<DirectP2PEngine> getDirectP2PEngine() const override { return nullptr; }
+        bool reserveTempBufferBytes(size_t /*bytes*/) override { return true; }
 
         // =====================================================================
         // Test Utilities - Call Tracking

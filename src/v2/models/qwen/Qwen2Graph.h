@@ -693,6 +693,7 @@ namespace llaminar2
          * @param device Target device
          * @param layer_idx Layer index for domain routing
          * @param is_attention True for attention, false for FFN
+         * @param stage_name Name for the stage (used for BAR-backed tensor lookup)
          * @return Unique pointer to the allreduce stage
          */
         std::unique_ptr<IComputeStage> createTPAllreduceStage(
@@ -700,7 +701,8 @@ namespace llaminar2
             size_t count,
             DeviceId device,
             int layer_idx,
-            bool is_attention) const;
+            bool is_attention,
+            const std::string &stage_name = "") const;
 
     public:
         /**

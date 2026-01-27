@@ -336,23 +336,125 @@ namespace llaminar2
 
         if (bar_backend_)
         {
+            // We own this BAR memory (allocated via initBARBackedMemory)
             bar_backend_->freeBarBuffer(bar_rocm_ptr_);
             LOG_DEBUG("[TensorBase::freeBARBackedMemory] Freed BAR buffer at offset " << bar_offset_);
         }
+        else
+        {
+            // Externally managed BAR memory (initialized via initBARBackedDirect)
+            // Do NOT free - just clear our references
+            LOG_DEBUG("[TensorBase::freeBARBackedMemory] Releasing reference to externally-managed BAR memory");
+        }
+        
+        // Free HIP staging buffer if we own it
+#if defined(HAVE_ROCM)
+        if (hip_staging_ptr_ && owns_hip_staging_)
+        {
+            IBackend *rocm_backend = getBackendForDevice(bar_host_device_);
+            if (rocm_backend)
+            {
+                rocm_backend->setDevice(bar_host_device_.toKernelDeviceIndex());
+                rocm_backend->free(hip_staging_ptr_, bar_host_device_.toKernelDeviceIndex());
+                LOG_DEBUG("[TensorBase::freeBARBackedMemory] Freed HIP staging buffer at " << hip_staging_ptr_);
+            }
+        }
+#endif
+        hip_staging_ptr_ = nullptr;
+        owns_hip_staging_ = false;
 
         // Clear BAR state
-        is_bar_backed_ = false;
+        // IMPORTANT: Keep is_bar_backed_ true until AFTER clearing gpu_data_ptr_
+        // to prevent the destructor from calling cudaFree on BAR memory
         bar_offset_ = 0;
         bar_size_ = 0;
         bar_rocm_ptr_ = nullptr;
-        bar_cuda_device_ptr_ = nullptr;
-        bar_backend_ = nullptr;
-
-        // If gpu_data_ptr_ was pointing to BAR, clear it
+        
+        // If gpu_data_ptr_ was pointing to BAR memory, clear it BEFORE resetting is_bar_backed_
         if (gpu_data_ptr_ == bar_cuda_device_ptr_)
         {
             gpu_data_ptr_ = nullptr;
         }
+        
+        bar_cuda_device_ptr_ = nullptr;
+        bar_backend_ = nullptr;
+        
+        // Now safe to reset is_bar_backed_ since gpu_data_ptr_ is either cleared or was never BAR memory
+        is_bar_backed_ = false;
+    }
+
+    void TensorBase::initBARBackedDirect(void *rocm_ptr, void *cuda_ptr,
+                                         DeviceId rocm_device, DeviceId cuda_device,
+                                         size_t bytes)
+    {
+        // Set up BAR-backed state with pre-obtained pointers
+        // Note: Unlike initBARBackedMemory, this does NOT allocate memory
+        // and does NOT take ownership - no deallocation on destruction
+
+        is_bar_backed_ = true;
+        bar_offset_ = 0;  // No offset tracking for direct initialization
+        bar_size_ = bytes;
+        bar_rocm_ptr_ = rocm_ptr;
+        bar_cuda_device_ptr_ = cuda_ptr;
+        bar_host_device_ = rocm_device;
+        bar_accessor_device_ = cuda_device;
+        bar_backend_ = nullptr;  // No backend - memory managed externally
+
+        // Set up GPU pointer for CUDA kernel dispatch
+        gpu_data_ptr_ = cuda_ptr;
+        gpu_device_ = cuda_device;
+
+        // Both host and device are always "valid" for BAR-backed tensors
+        // since they share the same physical memory
+        host_valid_ = true;
+        device_valid_ = true;
+        
+        // ===== Allocate HIP staging buffer for ROCm kernel writes =====
+        // CRITICAL: HIP kernels CANNOT directly dereference BAR mmap addresses!
+        // We must allocate a real HIP device buffer for kernel writes, then
+        // copy to BAR via hipMemcpy(D2D) which uses the AMD DMA engine.
+#if defined(HAVE_ROCM)
+        // Get ROCm backend for allocation
+        IBackend *rocm_backend = getBackendForDevice(rocm_device);
+        if (rocm_backend)
+        {
+            // Set device context
+            rocm_backend->setDevice(rocm_device.toKernelDeviceIndex());
+            
+            // Allocate HIP staging buffer
+            hip_staging_ptr_ = rocm_backend->allocate(bytes, rocm_device.toKernelDeviceIndex());
+            if (hip_staging_ptr_)
+            {
+                owns_hip_staging_ = true;
+                LOG_DEBUG("[TensorBase::initBARBackedDirect] Allocated HIP staging buffer: "
+                          << bytes << " bytes at " << hip_staging_ptr_
+                          << " on device " << rocm_device.toString());
+            }
+            else
+            {
+                LOG_ERROR("[TensorBase::initBARBackedDirect] Failed to allocate HIP staging buffer "
+                          << "(" << bytes << " bytes) on " << rocm_device.toString());
+            }
+        }
+        else
+        {
+            LOG_ERROR("[TensorBase::initBARBackedDirect] ROCm backend not available for device "
+                      << rocm_device.toString());
+        }
+#else
+        // No ROCm - staging buffer not needed (CUDA-only path)
+        hip_staging_ptr_ = nullptr;
+        owns_hip_staging_ = false;
+        LOG_DEBUG("[TensorBase::initBARBackedDirect] ROCm not available, no HIP staging buffer allocated");
+#endif
+
+        LOG_DEBUG("[TensorBase::initBARBackedDirect] Configured BAR-backed tensor: "
+                  << bytes << " bytes"
+                  << " bar_ptr=" << rocm_ptr
+                  << " cuda_ptr=" << cuda_ptr
+                  << " hip_staging=" << hip_staging_ptr_
+                  << " rocm_device=" << rocm_device.toString()
+                  << " cuda_device=" << cuda_device.toString());
     }
 
     void TensorBase::to_fp32_via_blocks(float *dst) const
@@ -937,6 +1039,59 @@ namespace llaminar2
         const bool trace = debugEnv().rocm.trace_coherence;
         auto overall_start = std::chrono::high_resolution_clock::now();
 
+        // ===== BAR-BACKED TENSOR FAST PATH =====
+        // BAR-backed tensors have memory allocated EXTERNALLY via PCIeBAR and are visible
+        // to both CUDA and ROCm devices via different pointers. They must NEVER go through
+        // the regular allocation path (which would try to allocate new memory).
+        if (is_bar_backed_)
+        {
+            // Set up the correct pointer based on target device type
+            if (target_device.is_cuda())
+            {
+                if (!bar_cuda_device_ptr_)
+                {
+                    LOG_ERROR("[TensorBase::ensureOnDevice] BAR-backed tensor has no CUDA pointer");
+                    return false;
+                }
+                gpu_data_ptr_ = bar_cuda_device_ptr_;
+                if (trace)
+                {
+                    LOG_INFO("[TensorBase::ensureOnDevice] BAR-BACKED CUDA: Using BAR pointer " << bar_cuda_device_ptr_);
+                }
+            }
+            else if (target_device.is_rocm())
+            {
+                // CRITICAL: For ROCm, use HIP staging buffer, NOT the BAR mmap address!
+                // HIP kernels cannot dereference BAR mmap addresses (causes memory fault).
+                if (hip_staging_ptr_)
+                {
+                    gpu_data_ptr_ = hip_staging_ptr_;
+                    if (trace)
+                    {
+                        LOG_INFO("[TensorBase::ensureOnDevice] BAR-BACKED ROCm: Using HIP staging buffer "
+                                 << hip_staging_ptr_ << " (BAR mmap=" << bar_rocm_ptr_ << ")");
+                    }
+                }
+                else
+                {
+                    LOG_ERROR("[TensorBase::ensureOnDevice] BAR-backed ROCm tensor has no HIP staging buffer!");
+                    return false;
+                }
+            }
+            else
+            {
+                LOG_ERROR("[TensorBase::ensureOnDevice] BAR-backed tensor cannot target device type: "
+                          << target_device.toString());
+                return false;
+            }
+            
+            gpu_device_ = target_device;
+            // For BAR-backed tensors, device is always "valid" in the sense that the pointer is set up
+            // The actual data validity depends on when kernels wrote to the buffer
+            device_valid_ = true;
+            return true;
+        }
+
         // ===== ZERO-COPY MAPPED MEMORY FAST PATH =====
         // If tensor uses mapped memory, GPU can access host memory directly.
         // No memcpy needed - just return the device-visible pointer.
@@ -1138,6 +1293,61 @@ namespace llaminar2
         }
 
         const bool trace = debugEnv().rocm.trace_coherence;
+
+        // ===== BAR-BACKED TENSOR FAST PATH =====
+        // BAR-backed tensors have memory allocated EXTERNALLY via PCIeBAR and are visible
+        // to both CUDA and ROCm devices. They must NEVER be reallocated via backend->free/allocate.
+        // The bar_backend_ field is set when the tensor is created as BAR-backed.
+        if (is_bar_backed_)
+        {
+            // BAR memory is accessible from both devices via different pointers:
+            // - bar_cuda_device_ptr_: CUDA-visible pointer to the BAR region
+            // - bar_rocm_ptr_: ROCm-visible pointer to the same memory
+            // We need to use the correct pointer for the target device type.
+            
+            if (target_device.is_cuda())
+            {
+                gpu_data_ptr_ = bar_cuda_device_ptr_;
+            }
+            else if (target_device.is_rocm())
+            {
+                // CRITICAL: For ROCm, use HIP staging buffer, NOT the BAR mmap address!
+                // HIP kernels cannot dereference BAR mmap addresses (causes memory fault).
+                // The staging buffer will be copied to BAR after kernel completes.
+                if (hip_staging_ptr_)
+                {
+                    gpu_data_ptr_ = hip_staging_ptr_;
+                    if (trace)
+                    {
+                        LOG_INFO("[TensorBase::allocateOnDevice] BAR-BACKED ROCm: Using HIP staging buffer "
+                                 << hip_staging_ptr_ << " (BAR mmap=" << bar_rocm_ptr_ << ")");
+                    }
+                }
+                else
+                {
+                    // Fallback to BAR mmap (may crash if used by HIP kernels)
+                    LOG_WARN("[TensorBase::allocateOnDevice] BAR-BACKED ROCm: No HIP staging buffer! "
+                             "Falling back to BAR mmap address (may crash)");
+                    gpu_data_ptr_ = bar_rocm_ptr_;
+                }
+            }
+            else
+            {
+                LOG_ERROR("[TensorBase::allocateOnDevice] BAR-backed tensor cannot target device type: "
+                          << target_device.toString());
+                return false;
+            }
+            
+            gpu_device_ = target_device;
+            // Mark device as invalid - kernel will write to this buffer
+            device_valid_ = false;
+            if (trace)
+            {
+                LOG_INFO("[TensorBase::allocateOnDevice] BAR-BACKED: Switching to "
+                         << target_device.toString() << " ptr=" << gpu_data_ptr_);
+            }
+            return true;
+        }
 
         // ===== ZERO-COPY MAPPED MEMORY FAST PATH =====
         // If tensor uses mapped memory, GPU can access host memory directly.

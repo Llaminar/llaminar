@@ -21,6 +21,7 @@
 #include "../config/OrchestrationConfig.h"
 #include "../tensors/ITensor.h"
 #include <memory>
+#include <string>
 #include <vector>
 #include <utility>
 
@@ -29,6 +30,7 @@ namespace llaminar2
 
     // Forward declarations
     class TensorBase;
+    class DirectP2PEngine;
 
     /**
      * @brief Interface for LOCAL tensor parallelism operations
@@ -99,6 +101,22 @@ namespace llaminar2
          * @return true on success, false on error
          */
         virtual bool allreduce(TensorBase *tensor) = 0;
+
+        /**
+         * @brief All-reduce across LOCAL devices with stage name (in-place)
+         *
+         * Like allreduce(), but with stage name for BAR-backed tensor lookup.
+         * For PCIeBAR backend, if BAR-backed tensors are registered for this stage,
+         * they are used for zero-copy operation.
+         *
+         * @param tensor Tensor to all-reduce (modified in-place)
+         * @param stage_name Stage identifier (e.g., "layer0_wo_allreduce")
+         * @param count Number of elements to reduce (0 = use tensor->numel())
+         *              IMPORTANT: For dynamic sequence lengths (decode), this must be
+         *              set to actual_seq_len * hidden_dim, not the full buffer size.
+         * @return true on success, false on error
+         */
+        virtual bool allreduce(TensorBase *tensor, const std::string &stage_name, size_t count = 0) = 0;
 
         /**
          * @brief All-reduce across LOCAL devices (out-of-place)
@@ -234,6 +252,75 @@ namespace llaminar2
          */
         virtual std::pair<int, int> colRangeForDevice(
             const GlobalDeviceAddress &device, int total_cols) const = 0;
+
+        // =====================================================================
+        // BAR-Backed Tensor Registry (PCIeBAR Backend)
+        // =====================================================================
+
+        /**
+         * @brief Register a BAR-backed tensor for a stage's output
+         *
+         * Called during graph construction for row-parallel stages (FFN_DOWN, Wo)
+         * when using PCIeBAR backend. The registered tensors are used by
+         * executePCIeBarAllreduce() for zero-copy reduction.
+         *
+         * For non-PCIeBAR backends, this is a no-op.
+         *
+         * @param stage_name Stage identifier (e.g., "layer0_wo_allreduce")
+         * @param device Device that owns this tensor (must be in devices())
+         * @param tensor Tensor to register (must be BAR-backed for PCIeBAR backend)
+         */
+        virtual void registerBARBackedOutput(
+            const std::string &stage_name,
+            const GlobalDeviceAddress &device,
+            TensorBase *tensor) = 0;
+
+        /**
+         * @brief Check if a stage has any BAR-backed outputs registered
+         *
+         * @param stage_name Stage identifier
+         * @return true if at least one device has a tensor registered
+         */
+        virtual bool hasBARBackedOutputs(const std::string &stage_name) const = 0;
+
+        /**
+         * @brief Clear all BAR-backed tensor registrations
+         *
+         * Called when resetting the context or changing buffer sizes.
+         */
+        virtual void clearBARBackedOutputs() = 0;
+
+        /**
+         * @brief Get DirectP2PEngine for BAR-backed tensor allocation
+         *
+         * For PCIeBAR backend, returns the DirectP2PEngine used for BAR memory
+         * management. This allows TensorFactory to create BAR-backed tensors
+         * for row-parallel outputs (attn_proj, ffn_output).
+         *
+         * For non-PCIeBAR backends, returns nullptr.
+         *
+         * @return Shared pointer to DirectP2PEngine, or nullptr if not available
+         */
+        virtual std::shared_ptr<DirectP2PEngine> getDirectP2PEngine() const = 0;
+
+        /**
+         * @brief Reserve temporary buffer capacity for collective operations
+         *
+         * Pre-allocates internal temp buffers to avoid allocation in the hot path.
+         * The buffer will grow if needed but never shrink during operation.
+         * Buffer is only freed during shutdown().
+         *
+         * Call this during initialization after model dimensions are known:
+         * @code
+         * size_t max_elements = max_seq_len * hidden_size;
+         * size_t buffer_bytes = activationPrecisionBufferBytes(max_elements, precision);
+         * tp_ctx->reserveTempBufferBytes(buffer_bytes * 1.1);  // 10% margin
+         * @endcode
+         *
+         * @param bytes Minimum buffer capacity in bytes
+         * @return true if reservation succeeded
+         */
+        virtual bool reserveTempBufferBytes(size_t bytes) = 0;
     };
 
     /**

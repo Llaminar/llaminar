@@ -953,7 +953,7 @@ namespace llaminar2
         resolved.alias_group = spec.alias_group;
         resolved.alias_priority = spec.alias_priority;
         resolved.description = spec.description;
-        resolved.device = DeviceId::cpu(); // Default device
+        resolved.device = config.default_device; // Use config's device for proper allocation
 
         // Resolve each shape dimension
         resolved.shape.reserve(spec.shape.size());

@@ -26,6 +26,7 @@
 #include "../backends/DeviceType.h"
 #include <cstddef>
 #include <string>
+#include <sstream>
 #include <vector>
 
 namespace llaminar2
@@ -325,8 +326,41 @@ namespace llaminar2
             return !(*this == other);
         }
 
-        /// String representation
-        std::string toString() const;
+        /// Less-than comparison for use in maps/sets
+        bool operator<(const GlobalDeviceId &other) const
+        {
+            if (rank != other.rank) return rank < other.rank;
+            if (type != other.type) return type < other.type;
+            return local_device_id < other.local_device_id;
+        }
+
+        /// String representation: "rank{N}_{type}{ordinal}"
+        /// Example: "rank0_cuda0", "rank1_rocm0", "rank0_cpu"
+        std::string toString() const
+        {
+            std::ostringstream oss;
+            oss << "rank" << rank << "_";
+            switch (type)
+            {
+            case DeviceType::CUDA:
+                oss << "cuda" << local_device_id;
+                break;
+            case DeviceType::ROCm:
+                oss << "rocm" << local_device_id;
+                break;
+            case DeviceType::Vulkan:
+                oss << "vulkan" << local_device_id;
+                break;
+            case DeviceType::Metal:
+                oss << "metal" << local_device_id;
+                break;
+            case DeviceType::CPU:
+            default:
+                oss << "cpu";
+                break;
+            }
+            return oss.str();
+        }
     };
 
 } // namespace llaminar2

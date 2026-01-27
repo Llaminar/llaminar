@@ -8,8 +8,10 @@
 #include "LocalTPContext.h"
 #include "backends/HostBackend.h"
 #include "../tensors/TensorClasses.h"
+#include "../backends/BackendManager.h"  // For getCUDABackend, getROCmBackend
 #include "../utils/Logger.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -18,18 +20,35 @@
 // Conditionally include GPU-specific backends
 #ifdef HAVE_CUDA
 #include "backends/NCCLBackend.h"
+#include <cuda_runtime.h>  // For cudaMemcpy in zero-copy allreduce
 #endif
 
 #ifdef HAVE_ROCM
 #include "backends/RCCLBackend.h"
+#include "../backends/rocm/ROCmBackend.h"  // For ROCmBackend::deviceToDevice
 #endif
 
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 #include "backends/PCIeBARBackend.h"
 #endif
 
+
 namespace llaminar2
 {
+    // Helper function to get the appropriate backend for a device
+    static IBackend *getBackendForDevice(DeviceId device)
+    {
+        if (device.is_cpu())
+            return nullptr;
+
+        if (device.is_cuda())
+            return getCUDABackend();
+        else if (device.is_rocm())
+            return getROCmBackend();
+
+        LOG_ERROR("[LocalTPContext] Unknown device type: " << device.toString());
+        return nullptr;
+    }
 
     // =========================================================================
     // Construction
@@ -122,11 +141,20 @@ namespace llaminar2
 
     bool LocalTPContext::allreduce(TensorBase *tensor)
     {
+        // Delegate to overload with empty stage name and default count (0 = use numel)
+        return allreduce(tensor, "", 0);
+    }
+
+    bool LocalTPContext::allreduce(TensorBase *tensor, const std::string &stage_name, size_t count)
+    {
         if (!tensor)
         {
             LOG_ERROR("LocalTPContext::allreduce: null tensor");
             return false;
         }
+
+        // Resolve count: 0 means use tensor->numel()
+        const size_t effective_count = (count > 0) ? count : tensor->numel();
 
         std::unique_lock<std::mutex> lock(mutex_);
 
@@ -155,11 +183,12 @@ namespace llaminar2
                 return false;
             }
 
-            size_t count = tensor->numel();
+            size_t count = effective_count;
             CollectiveDataType dtype = tensorDTypeToCollective(tensor);
 
             LOG_DEBUG("LocalTPContext::allreduce: Multi-GPU allreduce with "
-                      << degree() << " devices, " << count << " elements");
+                      << degree() << " devices, " << count << " elements"
+                      << " (tensor numel=" << tensor->numel() << ")");
 
             bool result = backend_impl_->allreduceMulti(
                 buffers, count, dtype, CollectiveOp::ALLREDUCE_SUM);
@@ -189,7 +218,7 @@ namespace llaminar2
                 return false;
             }
 
-            size_t count = tensor->numel();
+            size_t reduce_count = effective_count;
             CollectiveDataType dtype = tensorDTypeToCollective(tensor);
 
             // ================================================================
@@ -205,15 +234,15 @@ namespace llaminar2
                 // Release the main mutex before entering barrier (to avoid deadlock)
                 // The barrier has its own mutex for synchronization
                 lock.unlock();
-                return allreduceWithBarrier(tensor);
+                return allreduceWithBarrier(tensor, stage_name, effective_count);
             }
 #endif
 
             LOG_DEBUG("LocalTPContext::allreduce: Single-buffer allreduce with "
-                      << count << " elements");
+                      << reduce_count << " elements (tensor numel=" << tensor->numel() << ")");
 
             bool result = backend_impl_->allreduce(
-                buffer, count, dtype, CollectiveOp::ALLREDUCE_SUM);
+                buffer, reduce_count, dtype, CollectiveOp::ALLREDUCE_SUM);
 
             if (result)
             {
@@ -385,7 +414,7 @@ namespace llaminar2
     // PCIeBAR Barrier-Synchronized Allreduce
     // =========================================================================
 
-    bool LocalTPContext::allreduceWithBarrier(TensorBase *tensor)
+    bool LocalTPContext::allreduceWithBarrier(TensorBase *tensor, const std::string &stage_name, size_t count)
     {
         const int num_participants = degree();
 
@@ -399,22 +428,53 @@ namespace llaminar2
 
         if (arrival_order == 0)
         {
-            // First arrival: store tensor reference for the executor
-            barrier_tensor_ = tensor;
+            // First arrival: initialize tensor collection vector and store stage name + count
+            barrier_tensors_.clear();
+            barrier_tensors_.resize(num_participants, nullptr);
+            barrier_tensor_ = tensor; // Keep for backward compatibility
+            barrier_stage_name_ = stage_name; // Store stage name for BAR-backed tensor lookup
+            barrier_element_count_ = count; // Store element count (0 = use tensor->numel())
             LOG_DEBUG("LocalTPContext::allreduceWithBarrier: First arrival (device thread), "
-                      << "waiting for " << (num_participants - 1) << " more devices");
+                      << "stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << ", count=" << count << " (0=use numel)"
+                      << ", waiting for " << (num_participants - 1) << " more devices");
         }
-        else
-        {
-            LOG_DEBUG("LocalTPContext::allreduceWithBarrier: Device arrival #" << (arrival_order + 1)
-                                                                               << " of " << num_participants);
-        }
+
+        // Store this device's tensor in the collection
+        // Each device thread stores its own tensor at its arrival slot
+        barrier_tensors_[arrival_order] = tensor;
+
+        LOG_DEBUG("LocalTPContext::allreduceWithBarrier: Device arrival #" << (arrival_order + 1)
+                                                                           << " of " << num_participants
+                                                                           << " (tensor ptr=" << tensor << ")");
 
         if (arrival_order + 1 < num_participants)
         {
-            // Not the last arrival: wait for completion
-            barrier_cv_.wait(lock, [this, my_generation]()
+            // Not the last arrival: wait for completion with timeout
+            constexpr auto BARRIER_TIMEOUT = std::chrono::seconds(30);
+            
+            bool completed = barrier_cv_.wait_for(lock, BARRIER_TIMEOUT, [this, my_generation]()
                              { return barrier_generation_.load() > my_generation; });
+
+            if (!completed)
+            {
+                // Timeout - likely a deadlock or missing participant
+                LOG_ERROR("LocalTPContext::allreduceWithBarrier: TIMEOUT after 30s waiting for barrier! "
+                          << "arrival_order=" << arrival_order << ", expected=" << num_participants
+                          << " devices. Possible causes: missing device thread, kernel crash, or deadlock.");
+                
+                // Reset barrier state to allow recovery
+                barrier_count_.store(0);
+                barrier_generation_.fetch_add(1);
+                barrier_tensors_.clear();
+                barrier_tensor_ = nullptr;
+                barrier_stage_name_.clear();
+                barrier_element_count_ = 0;
+                
+                lock.unlock();
+                barrier_cv_.notify_all();  // Wake any other waiters
+                return false;
+            }
 
             // Woke up - get the shared result
             bool result = barrier_result_;
@@ -425,17 +485,21 @@ namespace llaminar2
         // =====================================================================
         // LAST ARRIVAL: Execute the actual allreduce
         // =====================================================================
-        // All other threads are waiting, so we have exclusive access to barrier_tensor_
+        // All other threads are waiting, so we have exclusive access to barrier_tensors_
 
         LOG_DEBUG("LocalTPContext::allreduceWithBarrier: All " << num_participants
-                                                               << " devices arrived, executing PCIeBAR allreduce");
+                                                               << " devices arrived, executing PCIeBAR allreduce"
+                                                               << " (count=" << barrier_element_count_ << ")");
 
-        // The actual PCIeBAR transfer
-        bool success = executePCIeBarAllreduce(barrier_tensor_);
+        // The actual PCIeBAR transfer using all collected tensors and stored count
+        bool success = executePCIeBarAllreduce(nullptr, barrier_element_count_);
 
         // Store result and signal completion
         barrier_result_ = success;
+        barrier_tensors_.clear();
         barrier_tensor_ = nullptr;
+        barrier_stage_name_.clear();
+        barrier_element_count_ = 0;
         barrier_count_.store(0);
         barrier_generation_.fetch_add(1);
 
@@ -448,79 +512,449 @@ namespace llaminar2
         return success;
     }
 
-    bool LocalTPContext::executePCIeBarAllreduce(TensorBase *tensor)
+    bool LocalTPContext::executePCIeBarAllreduce(TensorBase * /* unused_tensor */, size_t count_param)
     {
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-        if (!tensor)
-        {
-            LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: null tensor");
-            return false;
-        }
+        // ===========================================================================
+        // PHASE 4 IMPLEMENTATION: Zero-Copy Allreduce using BAR-Backed Tensors
+        // ===========================================================================
+        //
+        // For LOCAL TP with PCIeBAR, the key insight is:
+        // - Each device has its OWN output tensor for row-parallel operations
+        // - These tensors were allocated as BAR-backed and registered via registerBARBackedOutput()
+        // - The stage name (stored in barrier_stage_name_) identifies which tensors to use
+        //
+        // Zero-Copy Flow:
+        // 1. Lookup BAR-backed tensors by stage name
+        // 2. CUDA device reads from ROCm's BAR region directly (zero-copy)
+        // 3. Sum: cuda_output = cuda_partial + rocm_partial
+        // 4. Write result back to ROCm via BAR (so both have the reduced value)
+        // ===========================================================================
 
         // Lock the main mutex for backend operations
         std::lock_guard<std::mutex> lock(mutex_);
 
-        // Ensure buffers are allocated in BAR region and registered
-        if (!ensurePCIeBarBuffersRegistered(tensor))
+        // Find which device is CUDA and which is ROCm
+        int cuda_idx = -1;
+        int rocm_idx = -1;
+        for (size_t i = 0; i < devices_.size(); ++i)
         {
-            LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Failed to register PCIeBAR buffers");
+            DeviceId local_id = devices_[i].toLocalDeviceId();
+            if (local_id.is_cuda())
+                cuda_idx = static_cast<int>(i);
+            else if (local_id.is_rocm())
+                rocm_idx = static_cast<int>(i);
+        }
+
+        if (cuda_idx < 0 || rocm_idx < 0)
+        {
+            LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Need exactly one CUDA and one ROCm device");
             return false;
         }
 
-        size_t count = tensor->numel();
-        CollectiveDataType dtype = tensorDTypeToCollective(tensor);
-
-        LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: Using PCIeBAR registered allreduce for "
-                  << count << " elements (collective_id=" << pciebar_collective_id_ << ")");
-
-        // Copy tensor data to the registered BAR buffer on ROCm side
-        auto *pcie_backend = dynamic_cast<PCIeBARBackend *>(backend_impl_.get());
-        if (pcie_backend)
+        // ===========================================================================
+        // PRIMARY PATH: Use registered BAR-backed tensors for zero-copy operation
+        // ===========================================================================
+        if (!barrier_stage_name_.empty() && hasBARBackedOutputs(barrier_stage_name_))
         {
-            // Get the registered ROCm buffer to copy data into it
-            DeviceId rocm_device;
-            for (const auto &device : devices_)
+            auto bar_tensors = getBARBackedOutputs(barrier_stage_name_);
+            
+            FP32Tensor* cuda_tensor = bar_tensors.size() > static_cast<size_t>(cuda_idx) ? 
+                                       bar_tensors[cuda_idx] : nullptr;
+            FP32Tensor* rocm_tensor = bar_tensors.size() > static_cast<size_t>(rocm_idx) ? 
+                                       bar_tensors[rocm_idx] : nullptr;
+
+            if (cuda_tensor && rocm_tensor)
             {
-                DeviceId local_id = device.toLocalDeviceId();
-                if (local_id.is_rocm())
+                LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: Using BAR-backed tensors for stage '"
+                          << barrier_stage_name_ << "' (CUDA tensor=" << cuda_tensor 
+                          << ", ROCm tensor=" << rocm_tensor << ")");
+                
+                // Validate tensors
+                size_t tensor_numel = cuda_tensor->numel();
+                if (rocm_tensor->numel() != tensor_numel)
                 {
-                    rocm_device = local_id;
-                    break;
+                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Tensor size mismatch: CUDA="
+                              << tensor_numel << " ROCm=" << rocm_tensor->numel());
+                    return false;
                 }
-            }
 
-            auto rocm_buf_opt = pcie_backend->getBuffer(pciebar_collective_id_, rocm_device);
-            if (rocm_buf_opt.has_value() && rocm_buf_opt->ptr)
-            {
-                // Copy tensor data (on host) to the BAR-mapped ROCm buffer
-                // This makes the data available for the PCIeBAR transfer
-                const float *host_data = tensor->data();
+                // Use count_param if provided, otherwise use tensor->numel()
+                // CRITICAL: For decode with dynamic seq_len, count_param MUST be set correctly
+                size_t count = (count_param > 0) ? count_param : tensor_numel;
+                
+                if (count > tensor_numel)
+                {
+                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: count (" << count 
+                              << ") exceeds tensor capacity (" << tensor_numel << ")");
+                    return false;
+                }
+                
+                LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: count_param=" << count_param 
+                          << " tensor_numel=" << tensor_numel << " -> effective_count=" << count);
+
+                // Ensure CUDA tensor is on the CUDA device
+                DeviceId cuda_device = devices_[cuda_idx].toLocalDeviceId();
+                if (!cuda_tensor->ensureOnDevice(cuda_device))
+                {
+                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Failed to ensure CUDA tensor on device");
+                    return false;
+                }
+
+                // Ensure ROCm tensor is on the ROCm device (should already be BAR-backed)
+                DeviceId rocm_device = devices_[rocm_idx].toLocalDeviceId();
+                if (!rocm_tensor->ensureOnDevice(rocm_device))
+                {
+                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Failed to ensure ROCm tensor on device");
+                    return false;
+                }
+
+                // Get pointers
+                float* cuda_output = static_cast<float*>(cuda_tensor->gpu_data_ptr());
+                
+                // ===========================================================================
+                // CRITICAL: ROCm kernels wrote to the HIP staging buffer, NOT directly to BAR!
+                // We must copy from HIP staging → BAR so CUDA can read the ROCm partial result.
+                //
+                // Finding from Test__BARBackedHipAllocation exploration:
+                //   - HIP kernels CANNOT dereference BAR mmap addresses (memory fault)
+                //   - hipMemcpy(D2D) with BAR as destination WORKS at ~4+ GB/s (DMA engine)
+                //   - This is the ONLY way for ROCm data to reach BAR
+                // ===========================================================================
+                const float* hip_staging_ptr = static_cast<const float*>(rocm_tensor->rocm_data_ptr());
+                float* bar_ptr = static_cast<float*>(rocm_tensor->bar_address());
+                
+                if (!cuda_output || !hip_staging_ptr)
+                {
+                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Invalid pointers "
+                              << "(cuda=" << cuda_output << ", hip_staging=" << hip_staging_ptr << ")");
+                    return false;
+                }
+                
+                if (!bar_ptr)
+                {
+                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: ROCm tensor has no BAR address "
+                              << "(isBARBacked=" << rocm_tensor->isBARBacked() << ")");
+                    return false;
+                }
+
                 size_t bytes = count * sizeof(float);
-                std::memcpy(rocm_buf_opt->ptr, host_data, bytes);
+                
+                // Step 1: Copy ROCm partial result from HIP staging buffer → BAR via hipMemcpy D2D
+                LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: Copying ROCm staging → BAR: "
+                          << bytes << " bytes, src=" << hip_staging_ptr << " dst=" << bar_ptr);
+                
+                // We need to use hipMemcpy to copy from HIP device memory to BAR
+                // Note: We use the ROCm backend's deviceToDevice which wraps hipMemcpy
+                ROCmBackend* rocm_backend = dynamic_cast<ROCmBackend*>(getBackendForDevice(rocm_device));
+                if (!rocm_backend)
+                {
+                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: ROCm backend not available");
+                    return false;
+                }
+                
+                rocm_backend->setDevice(rocm_device.toKernelDeviceIndex());
+                
+                // hipMemcpy(D2D) from HIP staging to BAR - this uses AMD DMA engine
+                if (!rocm_backend->deviceToDevice(bar_ptr, hip_staging_ptr, bytes, rocm_device.toKernelDeviceIndex()))
+                {
+                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Failed to copy HIP staging → BAR");
+                    return false;
+                }
+                
+                // Synchronize HIP to ensure copy is complete before CUDA reads
+                rocm_backend->synchronize(rocm_device.toKernelDeviceIndex());
+                
+                LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: Reducing " << count << " elements "
+                          << "(cuda_ptr=" << cuda_output << ", bar_ptr=" << bar_ptr 
+                          << ", ROCm BAR-backed=" << rocm_tensor->isBARBacked() << ")");
 
-                LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: Copied " << bytes
-                                                                             << " bytes to BAR buffer at offset " << rocm_buf_opt->bar_offset);
+                // Get PCIeBAR backend for reduction kernel
+                auto* pcie_backend = dynamic_cast<PCIeBARBackend*>(backend_impl_.get());
+                if (!pcie_backend)
+                {
+                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Backend is not PCIeBARBackend");
+                    return false;
+                }
+
+                // Step 2: Perform reduction: cuda_output += bar_ptr (CUDA reads from BAR)
+                CollectiveDataType dtype = tensorDTypeToCollective(cuda_tensor);
+                if (!pcie_backend->reduceOnCUDA(cuda_output, cuda_output, bar_ptr,
+                                                count, dtype, CollectiveOp::ALLREDUCE_SUM))
+                {
+                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: CUDA reduction kernel failed");
+                    return false;
+                }
+
+                // Synchronize CUDA
+                if (!pcie_backend->synchronize())
+                {
+                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: CUDA synchronization failed");
+                    return false;
+                }
+
+                // Step 3: Write result back to ROCm via BAR
+                cudaError_t err = cudaMemcpy(bar_ptr, cuda_output,
+                                             bytes, cudaMemcpyDeviceToDevice);
+                if (err != cudaSuccess)
+                {
+                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Failed to write result to BAR: "
+                              << cudaGetErrorString(err));
+                    return false;
+                }
+                
+                // Step 4: Copy result from BAR back to HIP staging buffer 
+                // so ROCm tensor has the final reduced value
+                if (!rocm_backend->deviceToDevice(const_cast<float*>(hip_staging_ptr), bar_ptr, 
+                                                   bytes, rocm_device.toKernelDeviceIndex()))
+                {
+                    LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Failed to copy result BAR → HIP staging");
+                    return false;
+                }
+                rocm_backend->synchronize(rocm_device.toKernelDeviceIndex());
+
+                // Mark both tensors as having valid device data
+                cuda_tensor->mark_device_dirty();
+                rocm_tensor->mark_device_dirty();
+
+                LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: Zero-copy allreduce completed successfully "
+                          << "for stage '" << barrier_stage_name_ << "'");
+                return true;
+            }
+            else
+            {
+                LOG_WARN("LocalTPContext::executePCIeBarAllreduce: BAR-backed tensors incomplete for stage '"
+                         << barrier_stage_name_ << "' (cuda=" << cuda_tensor << ", rocm=" << rocm_tensor << ")");
+                // Fall through to barrier_tensors_ path
             }
         }
 
-        bool result = backend_impl_->allreduceRegistered(
-            pciebar_collective_id_, count, dtype, CollectiveOp::ALLREDUCE_SUM);
+        // ===========================================================================
+        // FALLBACK PATH: Use barrier_tensors_[] (legacy - may have issues)
+        // ===========================================================================
+        // This path is used when:
+        // - No stage name provided
+        // - BAR-backed tensors not registered for this stage
+        //
+        // WARNING: This path has known issues when both threads pass the same tensor
+        // (both CUDA and ROCm threads have reference to same params_.tensor)
 
-        if (result)
+        LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: Using barrier_tensors_ fallback path "
+                  << "(stage_name=" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_) << ")");
+
+        // Validate we have tensors from barrier
+        if (barrier_tensors_.empty())
         {
-            // After allreduce, the result is in both CUDA and ROCm buffers.
-            // Copy from CUDA buffer back to tensor to update host state
-            tensor->mark_device_dirty();
-        }
-        else
-        {
-            LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: PCIeBAR allreduceRegistered failed: "
-                      << backend_impl_->lastError());
+            LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: No tensors collected from barrier");
+            return false;
         }
 
-        return result;
+        // Identify CUDA and ROCm tensors from the barrier collection
+        // NOTE: cuda_idx and rocm_idx were already determined above
+        FP32Tensor *cuda_tensor = nullptr;
+        FP32Tensor *rocm_tensor = nullptr;
+
+        // The barrier_tensors_ stores by ARRIVAL order, not device order.
+        // Try to identify by checking tensor properties.
+        for (size_t i = 0; i < barrier_tensors_.size() && i < devices_.size(); ++i)
+        {
+            TensorBase *t = barrier_tensors_[i];
+            if (!t)
+            {
+                LOG_WARN("LocalTPContext::executePCIeBarAllreduce: barrier_tensors_[" << i << "] is null");
+                continue;
+            }
+
+            auto *fp32_t = dynamic_cast<FP32Tensor *>(t);
+            if (!fp32_t)
+            {
+                LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Tensor is not FP32Tensor");
+                return false;
+            }
+
+            // Check if this tensor is BAR-backed (indicates ROCm origin for zero-copy)
+            if (fp32_t->isBARBacked() && fp32_t->rocm_data_ptr() != nullptr)
+            {
+                rocm_tensor = fp32_t;
+            }
+            else if (fp32_t->gpu_data_ptr() != nullptr)
+            {
+                cuda_tensor = fp32_t;
+            }
+            else
+            {
+                // Fallback: assign by index matching device order
+                DeviceId local_id = devices_[i].toLocalDeviceId();
+                if (local_id.is_cuda())
+                    cuda_tensor = fp32_t;
+                else if (local_id.is_rocm())
+                    rocm_tensor = fp32_t;
+            }
+        }
+
+        // If we couldn't identify by properties, fall back to device index order
+        if (!cuda_tensor && cuda_idx >= 0 && cuda_idx < static_cast<int>(barrier_tensors_.size()))
+            cuda_tensor = dynamic_cast<FP32Tensor *>(barrier_tensors_[cuda_idx]);
+        if (!rocm_tensor && rocm_idx >= 0 && rocm_idx < static_cast<int>(barrier_tensors_.size()))
+            rocm_tensor = dynamic_cast<FP32Tensor *>(barrier_tensors_[rocm_idx]);
+
+        // Check for shared buffer scenario (both devices passed the same tensor)
+        if (cuda_tensor == rocm_tensor)
+        {
+            LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: ARCHITECTURAL BUG - both devices "
+                      "passed the same tensor pointer (" << cuda_tensor << "). "
+                      "PCIeBAR allreduce requires each device to have its own buffer: "
+                      "CUDA device needs a CUDA-memory tensor, ROCm device needs a BAR-backed tensor. "
+                      "Fix: Ensure GraphBufferManager allocates per-device buffers for row-parallel "
+                      "outputs when using LOCAL TP with PCIeBAR backend.");
+            return false;
+        }
+
+        // Final validation
+        if (!cuda_tensor)
+        {
+            LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Could not identify CUDA tensor");
+            return false;
+        }
+        if (!rocm_tensor)
+        {
+            LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Could not identify ROCm tensor");
+            return false;
+        }
+
+        size_t tensor_numel = cuda_tensor->numel();
+        if (rocm_tensor->numel() != tensor_numel)
+        {
+            LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Tensor size mismatch: CUDA="
+                      << tensor_numel << " ROCm=" << rocm_tensor->numel());
+            return false;
+        }
+
+        // Use count_param if provided, otherwise use tensor->numel()
+        // CRITICAL: For decode with dynamic seq_len, count_param MUST be set correctly
+        size_t count = (count_param > 0) ? count_param : tensor_numel;
+        
+        if (count > tensor_numel)
+        {
+            LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: count (" << count 
+                      << ") exceeds tensor capacity (" << tensor_numel << ")");
+            return false;
+        }
+
+        LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: Reducing " << count << " elements"
+                                                                       << " (CUDA tensor=" << cuda_tensor
+                                                                       << ", ROCm tensor=" << rocm_tensor
+                                                                       << ", ROCm BAR-backed=" << rocm_tensor->isBARBacked()
+                                                                       << ", count_param=" << count_param
+                                                                       << ", tensor_numel=" << tensor_numel << ")");
+
+        // ===========================================================================
+        // ZERO-COPY PATH: If ROCm tensor is BAR-backed
+        // ===========================================================================
+        if (rocm_tensor->isBARBacked() && rocm_tensor->gpu_data_ptr() != nullptr)
+        {
+            // Zero-copy: CUDA reads directly from ROCm's BAR region
+            //
+            // The ROCm tensor's gpu_data_ptr() returns the CUDA-accessible pointer
+            // to the BAR region (set up by initBARBackedDirect with bar_cuda_device_ptr_)
+            //
+            // Algorithm:
+            // 1. Ensure CUDA tensor is on GPU
+            // 2. CUDA kernel: cuda_output += rocm_bar_data
+            // 3. Copy result back to ROCm (via BAR write)
+
+            // Ensure CUDA tensor is on the CUDA device
+            DeviceId cuda_device = devices_[cuda_idx].toLocalDeviceId();
+            if (!cuda_tensor->ensureOnDevice(cuda_device))
+            {
+                LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Failed to ensure CUDA tensor on device");
+                return false;
+            }
+
+            float *cuda_output = static_cast<float *>(cuda_tensor->gpu_data_ptr());
+            const float *rocm_bar_ptr = static_cast<const float *>(rocm_tensor->gpu_data_ptr());
+
+            if (!cuda_output || !rocm_bar_ptr)
+            {
+                LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Invalid GPU pointers "
+                          << "(cuda=" << cuda_output << ", rocm_bar=" << rocm_bar_ptr << ")");
+                return false;
+            }
+
+            LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: Zero-copy path - "
+                      << "CUDA reading from BAR at " << rocm_bar_ptr);
+
+            // Get PCIeBAR backend for reduction kernel
+            auto *pcie_backend = dynamic_cast<PCIeBARBackend *>(backend_impl_.get());
+            if (!pcie_backend)
+            {
+                LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Backend is not PCIeBARBackend");
+                return false;
+            }
+
+            // Use the backend's reduceOnCUDA to perform: cuda_output += rocm_bar_ptr
+            // This uses the CUDA vector add kernel
+            CollectiveDataType dtype = tensorDTypeToCollective(cuda_tensor);
+            if (!pcie_backend->reduceOnCUDA(cuda_output, cuda_output, rocm_bar_ptr,
+                                            count, dtype, CollectiveOp::ALLREDUCE_SUM))
+            {
+                LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: CUDA reduction kernel failed");
+                return false;
+            }
+
+            // Synchronize CUDA
+            if (!pcie_backend->synchronize())
+            {
+                LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: CUDA synchronization failed");
+                return false;
+            }
+
+            // Write result back to ROCm via BAR (so ROCm has the reduced result too)
+            // For BAR-backed tensors, we can write directly through the BAR pointer
+            // Use a CUDA memcpy from cuda_output to rocm_bar_ptr
+            size_t bytes = count * sizeof(float);
+
+            // For BAR-backed memory, the rocm_bar_ptr IS the CUDA-accessible pointer
+            // We can use cudaMemcpy to write to it (CUDA writes through PCIe to AMD VRAM)
+            cudaError_t err = cudaMemcpy(const_cast<float *>(rocm_bar_ptr), cuda_output,
+                                         bytes, cudaMemcpyDeviceToDevice);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Failed to write result to ROCm: "
+                          << cudaGetErrorString(err));
+                return false;
+            }
+
+            // Mark both tensors as having valid device data
+            cuda_tensor->mark_device_dirty();
+            rocm_tensor->mark_device_dirty();
+
+            LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: Zero-copy allreduce completed successfully");
+            return true;
+        }
+
+        // ===========================================================================
+        // ERROR: ROCm tensor is not BAR-backed
+        // ===========================================================================
+        // PCIeBAR allreduce requires BAR-backed tensors for zero-copy operation.
+        // The tensor must be allocated in the BAR region using TensorFactory with
+        // BAR-backed allocation enabled.
+        //
+        // To fix this:
+        // 1. Call TensorFactory::setDirectP2P(p2p_instance) before tensor allocation
+        // 2. Ensure tensors are created with createFP32BARBacked() or similar
+        // 3. Verify LocalTPContext tracks BAR-backed tensors correctly
+
+        LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: ROCm tensor is NOT BAR-backed! "
+                  << "PCIeBAR allreduce requires zero-copy BAR-backed tensors. "
+                  << "(rocm_tensor=" << rocm_tensor
+                  << ", isBARBacked=" << rocm_tensor->isBARBacked()
+                  << ", gpu_data_ptr=" << rocm_tensor->gpu_data_ptr() << ")");
+
+        return false;
 #else
         // Shouldn't be called without CUDA+ROCm
+        (void)unused_tensor;
         LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: PCIeBAR requires both CUDA and ROCm");
         return false;
 #endif
@@ -1349,6 +1783,146 @@ namespace llaminar2
             // (collectives are typically on dequantized activations)
             return CollectiveDataType::FLOAT32;
         }
+    }
+
+    // =========================================================================
+    // BAR-Backed Tensor Registry
+    // =========================================================================
+
+    void LocalTPContext::registerBARBackedOutput(
+        const std::string &stage_name,
+        const GlobalDeviceAddress &device,
+        TensorBase *tensor)
+    {
+        // Validate device is in our context
+        int idx = indexForDevice(device);
+        if (idx < 0)
+        {
+            throw std::invalid_argument(
+                "Device " + device.toString() + " not in LocalTPContext");
+        }
+
+        // Validate tensor is non-null
+        if (!tensor)
+        {
+            throw std::invalid_argument(
+                "Tensor must be non-null");
+        }
+
+        // Cast to FP32Tensor (allreduce outputs are FP32)
+        FP32Tensor *fp32_tensor = dynamic_cast<FP32Tensor *>(tensor);
+        if (!fp32_tensor)
+        {
+            LOG_WARN("[LocalTPContext] registerBARBackedOutput: tensor is not FP32Tensor, skipping");
+            return;
+        }
+
+        // For PCIeBAR backend:
+        // - CUDA device: tensor does NOT need to be BAR-backed (regular CUDA memory)
+        // - ROCm device: tensor MUST be BAR-backed for zero-copy P2P access
+        //
+        // We register ALL tensors here. The actual BAR-backed requirement only
+        // applies to the ROCm device, which is validated during allreduce execution.
+        //
+        // For non-PCIeBAR backends: require BAR-backed for testing consistency
+        if (backend_ != CollectiveBackendType::PCIE_BAR)
+        {
+            // Non-PCIeBAR backends: still require BAR-backed for consistency with existing tests
+            // This maintains backward compatibility with unit tests using HOST backend
+            if (!fp32_tensor->isBARBacked())
+            {
+                throw std::invalid_argument(
+                    "Tensor must be BAR-backed");
+            }
+        }
+        
+        // Log whether tensor is BAR-backed for debugging
+        LOG_TRACE("[LocalTPContext] registerBARBackedOutput: stage='" << stage_name 
+                  << "' device=" << device.toString()
+                  << " is_bar_backed=" << fp32_tensor->isBARBacked());
+
+        // Initialize vector for this stage if needed
+        auto &tensors = bar_output_tensors_[stage_name];
+        if (tensors.empty())
+        {
+            tensors.resize(degree(), nullptr);
+        }
+
+        // Register
+        tensors[idx] = fp32_tensor;
+
+        LOG_DEBUG("[LocalTPContext] Registered BAR-backed output for stage '"
+                  << stage_name << "' device " << device.toString());
+    }
+
+    std::vector<FP32Tensor*> LocalTPContext::getBARBackedOutputs(
+        const std::string& stage_name) const {
+        
+        auto it = bar_output_tensors_.find(stage_name);
+        if (it == bar_output_tensors_.end()) {
+            return std::vector<FP32Tensor*>(degree(), nullptr);
+        }
+        return it->second;
+    }
+
+    bool LocalTPContext::hasBARBackedOutputs(const std::string& stage_name) const {
+        auto it = bar_output_tensors_.find(stage_name);
+        if (it == bar_output_tensors_.end()) {
+            return false;
+        }
+        // Check if at least one entry is non-null
+        for (auto* t : it->second) {
+            if (t != nullptr) return true;
+        }
+        return false;
+    }
+
+    void LocalTPContext::clearBARBackedOutputs() {
+        bar_output_tensors_.clear();
+        LOG_DEBUG("[LocalTPContext] Cleared all BAR-backed output registrations");
+    }
+
+    std::shared_ptr<DirectP2PEngine> LocalTPContext::getDirectP2PEngine() const
+    {
+        // Only available for PCIeBAR backend
+        if (backend_ != CollectiveBackendType::PCIE_BAR)
+        {
+            return nullptr;
+        }
+
+        if (!backend_impl_)
+        {
+            return nullptr;
+        }
+
+        // Cast to PCIeBARBackend and get the engine
+        auto *pcie_backend = dynamic_cast<PCIeBARBackend *>(backend_impl_.get());
+        if (!pcie_backend)
+        {
+            return nullptr;
+        }
+
+        DirectP2PEngine *raw_ptr = pcie_backend->getDirectP2PEngine();
+        if (!raw_ptr)
+        {
+            return nullptr;
+        }
+
+        // Return a shared_ptr that doesn't delete the engine (it's owned by PCIeBARBackend)
+        // We use aliasing constructor with empty shared_ptr to create non-owning shared_ptr
+        return std::shared_ptr<DirectP2PEngine>(std::shared_ptr<void>(), raw_ptr);
+    }
+
+    bool LocalTPContext::reserveTempBufferBytes(size_t bytes)
+    {
+        if (!backend_impl_)
+        {
+            LOG_WARN("[LocalTPContext] Cannot reserve temp buffer: backend not initialized");
+            return false;
+        }
+
+        LOG_DEBUG("[LocalTPContext] Reserving temp buffer: " << bytes << " bytes");
+        return backend_impl_->reserveTempBufferBytes(bytes);
     }
 
     // =========================================================================

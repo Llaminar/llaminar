@@ -194,8 +194,29 @@ namespace llaminar2
             }
 
             // Get device pointers (caller must have data on GPU)
-            const float *d_A = static_cast<const float *>(A->gpu_data_ptr());
-            float *d_C = static_cast<float *>(C->gpu_data_ptr());
+            // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr() (HIP pointer)
+            const float *d_A = nullptr;
+            float *d_C = nullptr;
+            
+            if (A->isBARBacked() && A->rocm_data_ptr() != nullptr)
+            {
+                d_A = static_cast<const float *>(A->rocm_data_ptr());
+                LOG_DEBUG("[ROCmFloatingPointGemmKernel::multiply_tensor] Using BAR rocm_data_ptr for A: " << d_A);
+            }
+            else
+            {
+                d_A = static_cast<const float *>(A->gpu_data_ptr());
+            }
+            
+            if (C->isBARBacked() && C->rocm_data_ptr() != nullptr)
+            {
+                d_C = static_cast<float *>(C->rocm_data_ptr());
+                LOG_DEBUG("[ROCmFloatingPointGemmKernel::multiply_tensor] Using BAR rocm_data_ptr for C: " << d_C);
+            }
+            else
+            {
+                d_C = static_cast<float *>(C->gpu_data_ptr());
+            }
 
             if (!d_A || !d_C)
             {
@@ -213,7 +234,15 @@ namespace llaminar2
                               << static_cast<int>(bias->native_type()));
                     return false;
                 }
-                d_bias = static_cast<const float *>(bias->gpu_data_ptr());
+                // Check BAR-backed status for bias
+                if (bias->isBARBacked() && bias->rocm_data_ptr() != nullptr)
+                {
+                    d_bias = static_cast<const float *>(bias->rocm_data_ptr());
+                }
+                else
+                {
+                    d_bias = static_cast<const float *>(bias->gpu_data_ptr());
+                }
                 if (!d_bias)
                 {
                     LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Bias tensor must be on GPU");

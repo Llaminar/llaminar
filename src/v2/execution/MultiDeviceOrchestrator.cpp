@@ -248,6 +248,59 @@ namespace llaminar2
                          << tp_ctx_->degree() << " devices, "
                          << "heads=" << n_heads << ", kv_heads=" << n_kv_heads
                          << ", d_ff=" << d_ff << ", vocab=" << vocab_size << ")");
+
+                // Print per-device assignments for debugging TP parity issues
+                for (int dev_idx = 0; dev_idx < tp_ctx_->degree(); ++dev_idx)
+                {
+                    const auto &addr = tp_ctx_->devices()[dev_idx];
+                    DeviceId dev_id = addr.toLocalDeviceId();
+                    try
+                    {
+                        const auto &assignment = tp_config->forDevice(dev_id);
+                        LOG_INFO("MultiDeviceOrchestrator: Device " << dev_idx << " (" << dev_id.to_string() << ") assignment:"
+                                                                    << " head_start=" << assignment.head_start
+                                                                    << " head_count=" << assignment.head_count
+                                                                    << " kv_head_start=" << assignment.kv_head_start
+                                                                    << " kv_head_count=" << assignment.kv_head_count
+                                                                    << " d_ff_start=" << assignment.d_ff_start
+                                                                    << " d_ff_count=" << assignment.d_ff_count);
+                    }
+                    catch (const std::out_of_range &e)
+                    {
+                        LOG_WARN("MultiDeviceOrchestrator: Device " << dev_idx << " (" << dev_id.to_string() << ") NOT in TensorParallelConfig!");
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // PRE-RESERVE COLLECTIVE TEMP BUFFER
+        // =====================================================================
+        // Pre-allocate temp buffer for allreduce operations based on model dimensions
+        // and activation precision. This avoids allocation in the hot path.
+        // Buffer uses grow-only semantics (never shrinks during inference).
+        // =====================================================================
+        {
+            size_t hidden_size = model_ctx_->embeddingLength();
+            size_t max_elements = config_.max_seq_len * hidden_size;
+
+            // Calculate buffer bytes based on activation precision (handles block quantization alignment)
+            size_t buffer_bytes = activationPrecisionBufferBytes(max_elements, config_.activation_precision);
+
+            // Add 10% margin for safety
+            size_t buffer_with_margin = static_cast<size_t>(buffer_bytes * 1.1);
+
+            if (tp_ctx_->reserveTempBufferBytes(buffer_with_margin))
+            {
+                LOG_INFO("MultiDeviceOrchestrator: Reserved collective temp buffer: "
+                         << buffer_with_margin << " bytes ("
+                         << "max_seq_len=" << config_.max_seq_len
+                         << ", hidden_size=" << hidden_size
+                         << ", precision=" << activationPrecisionToString(config_.activation_precision) << ")");
+            }
+            else
+            {
+                LOG_WARN("MultiDeviceOrchestrator: Failed to reserve collective temp buffer");
             }
         }
 
@@ -999,6 +1052,172 @@ namespace llaminar2
         }
 
         return std::vector<std::string>(all_keys.begin(), all_keys.end());
+    }
+
+    TPSnapshot MultiDeviceOrchestrator::getTPSnapshot(const std::string &key) const
+    {
+        TPSnapshot result;
+        result.key = key;
+        result.mode = getStageShardingMode(key);
+        result.tp_degree = static_cast<int>(device_runners_.size());
+
+        LOG_DEBUG("MultiDeviceOrchestrator::getTPSnapshot: key=" << key
+                                                                 << " mode=" << shardingModeToString(result.mode)
+                                                                 << " tp_degree=" << result.tp_degree);
+
+        // Special case: LM_HEAD with combined_logits_ already gathered
+        if (key == "LM_HEAD" && device_runners_.size() > 1 && combined_logits_ && tp_ctx_)
+        {
+            bool has_column_parallel_lm_head = false;
+            for (const auto &runner : device_runners_)
+            {
+                if (runner)
+                {
+                    const auto &state = runner->inferenceState();
+                    if (state.logits_local)
+                    {
+                        has_column_parallel_lm_head = true;
+                        break;
+                    }
+                }
+            }
+
+            if (has_column_parallel_lm_head)
+            {
+                // Return the already-gathered combined logits as a single "device"
+                DeviceSnapshotData gathered;
+                gathered.device_id = GlobalDeviceId::gpu(0, 0, config_.devices[0].device_type);
+                gathered.device_index = 0;
+                gathered.rows = 1; // Single position for decode
+                gathered.cols = last_gathered_logits_size_;
+                gathered.global_start_col = 0;
+                gathered.global_total_cols = gathered.cols;
+                gathered.data.assign(combined_logits_->data(),
+                                     combined_logits_->data() + last_gathered_logits_size_);
+
+                result.device_data.push_back(std::move(gathered));
+                result.combined_valid = true;
+                result.combined_data = result.device_data[0].data;
+                result.combined_rows = result.device_data[0].rows;
+                result.combined_cols = result.device_data[0].cols;
+
+                LOG_DEBUG("MultiDeviceOrchestrator::getTPSnapshot: LM_HEAD using combined_logits "
+                          << "size=" << last_gathered_logits_size_);
+                return result;
+            }
+        }
+
+        // Collect snapshots from all device runners
+        size_t global_col_offset = 0;
+        for (size_t i = 0; i < device_runners_.size(); ++i)
+        {
+            if (!device_runners_[i])
+                continue;
+
+            size_t size = 0;
+            const float *data = device_runners_[i]->getSnapshot(key, size);
+
+            if (!data || size == 0)
+            {
+                LOG_DEBUG("MultiDeviceOrchestrator::getTPSnapshot: device " << i
+                                                                            << " has no data for key=" << key);
+                continue;
+            }
+
+            DeviceSnapshotData dev_data;
+            // Use device type from config if available, otherwise default to CUDA
+            DeviceType dev_type = DeviceType::CUDA;
+            if (i < config_.devices.size())
+            {
+                dev_type = config_.devices[i].device_type;
+            }
+            dev_data.device_id = GlobalDeviceId::gpu(0, static_cast<int>(i), dev_type);
+            dev_data.device_index = static_cast<int>(i);
+            dev_data.data.assign(data, data + size);
+
+            // Infer rows and cols from size and TP configuration
+            // For column-parallel stages, we need to compute actual row/col dimensions
+            if (result.mode == SnapshotShardingMode::COLUMN_PARALLEL)
+            {
+                // For column-parallel, each device has shape [seq_len, local_cols]
+                // local_cols = global_cols / tp_degree
+                // We can infer from model config: hidden_size / tp_degree
+                size_t local_cols = 0;
+                if (model_ctx_)
+                {
+                    size_t hidden_size = model_ctx_->embeddingLength();
+                    local_cols = hidden_size / static_cast<size_t>(result.tp_degree);
+                }
+
+                // If we couldn't get from model config, estimate from data size
+                // Assume square-ish data or use global_col_offset pattern
+                if (local_cols == 0 && result.tp_degree > 0)
+                {
+                    // Fallback: assume all devices have equal cols
+                    // This will be validated when we have multiple devices
+                    local_cols = size; // Will be rows=1 in worst case
+                }
+
+                // Compute rows from size and cols
+                size_t rows = (local_cols > 0) ? (size / local_cols) : 1;
+                if (rows * local_cols != size && local_cols > 0)
+                {
+                    // Size doesn't divide evenly - log warning and fallback
+                    LOG_WARN("MultiDeviceOrchestrator::getTPSnapshot: size=" << size
+                                                                             << " doesn't divide evenly by local_cols=" << local_cols
+                                                                             << " for key=" << key);
+                    rows = 1;
+                    local_cols = size;
+                }
+
+                dev_data.rows = rows;
+                dev_data.cols = local_cols;
+                dev_data.global_start_col = global_col_offset;
+                global_col_offset += local_cols;
+            }
+            else
+            {
+                // Replicated or row-parallel - each device has full output
+                dev_data.rows = 1;
+                dev_data.cols = size;
+                dev_data.global_start_col = 0;
+                dev_data.global_total_cols = size;
+            }
+
+            LOG_DEBUG("MultiDeviceOrchestrator::getTPSnapshot: device " << i
+                                                                        << " size=" << size
+                                                                        << " cols=" << dev_data.cols
+                                                                        << " start_col=" << dev_data.global_start_col);
+
+            result.device_data.push_back(std::move(dev_data));
+        }
+
+        // Set global_total_cols for column-parallel stages
+        if (result.mode == SnapshotShardingMode::COLUMN_PARALLEL && !result.device_data.empty())
+        {
+            size_t total_cols = global_col_offset;
+            for (auto &dev : result.device_data)
+            {
+                dev.global_total_cols = total_cols;
+            }
+        }
+
+        return result;
+    }
+
+    std::vector<std::pair<std::string, SnapshotShardingMode>>
+    MultiDeviceOrchestrator::getSnapshotKeysWithSharding() const
+    {
+        auto keys = getSnapshotKeys();
+        std::vector<std::pair<std::string, SnapshotShardingMode>> result;
+        result.reserve(keys.size());
+
+        for (const auto &key : keys)
+        {
+            result.emplace_back(key, getStageShardingMode(key));
+        }
+
+        return result;
     }
 
     // =========================================================================

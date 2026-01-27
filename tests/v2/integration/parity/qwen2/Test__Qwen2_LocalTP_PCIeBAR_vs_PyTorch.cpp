@@ -626,6 +626,11 @@ TEST_F(Test__Qwen2_LocalTP_PCIeBAR_vs_PyTorch, Heterogeneous_LogitsReasonable)
  *
  * Runs full prefill with MultiDeviceOrchestrator and compares
  * layer-by-layer outputs against PyTorch reference.
+ * 
+ * Uses TP-aware snapshot comparison that:
+ * 1. Captures snapshots from each device separately
+ * 2. Compares each device's slice against its portion of PyTorch reference
+ * 3. Shows per-device AND combined comparison results
  *
  * NOTE: Uses relaxed thresholds due to cross-vendor numerical differences.
  */
@@ -639,9 +644,9 @@ TEST_F(Test__Qwen2_LocalTP_PCIeBAR_vs_PyTorch, PrefillParity_LocalTP)
     // Use our LOCAL TP pipeline instead of single-device
     ASSERT_TRUE(setupLocalTPPipeline()) << "LOCAL TP pipeline setup failed";
 
-    // Run standard prefill parity test
-    auto summary = runPrefillParity();
-    assertParity(summary);
+    // Run TP-aware prefill parity test with per-device snapshot comparison
+    auto summary = runTPPrefillParity();
+    assertTPParity(summary);
 }
 
 /**
@@ -724,30 +729,46 @@ TEST_F(Test__Qwen2_LocalTP_PCIeBAR_vs_PyTorch, Heterogeneous_CompareToSingleDevi
     const float *tp_logits = runner_->logits();
     ASSERT_NE(tp_logits, nullptr) << "LOCAL TP logits are null";
     int vocab_size = runner_->vocab_size();
+    size_t seq_len = config_.token_ids.size();
 
-    // Find argmax from LOCAL TP
+    // For prefill, logits are [seq_len, vocab_size] - we want the LAST row
+    size_t last_row_offset = (seq_len - 1) * static_cast<size_t>(vocab_size);
+    const float *last_token_logits = tp_logits + last_row_offset;
+
+    // Find argmax from LOCAL TP (last token position)
     int tp_argmax = 0;
-    float tp_max_logit = tp_logits[0];
+    float tp_max_logit = last_token_logits[0];
     for (int i = 1; i < vocab_size; ++i)
     {
-        if (tp_logits[i] > tp_max_logit)
+        if (last_token_logits[i] > tp_max_logit)
         {
-            tp_max_logit = tp_logits[i];
+            tp_max_logit = last_token_logits[i];
             tp_argmax = i;
         }
     }
 
     // Load PyTorch reference to get expected token
+    // PyTorch snapshot is [batch=1, seq_len, vocab_size] flattened
+    // We want the argmax of the LAST token position (last vocab_size elements)
     auto pytorch_lm_head = loadPyTorchSnapshot("LM_HEAD");
     if (!pytorch_lm_head.empty())
     {
-        int pytorch_argmax = 0;
-        float pytorch_max_logit = pytorch_lm_head[0];
-        for (size_t i = 1; i < pytorch_lm_head.size(); ++i)
+        // Extract last token's logits
+        size_t pytorch_vocab = static_cast<size_t>(vocab_size);
+        size_t offset = 0;
+        if (pytorch_lm_head.size() > pytorch_vocab)
         {
-            if (pytorch_lm_head[i] > pytorch_max_logit)
+            // Multiple token positions - extract last one
+            offset = pytorch_lm_head.size() - pytorch_vocab;
+        }
+        
+        int pytorch_argmax = 0;
+        float pytorch_max_logit = pytorch_lm_head[offset];
+        for (size_t i = 1; i < pytorch_vocab && (offset + i) < pytorch_lm_head.size(); ++i)
+        {
+            if (pytorch_lm_head[offset + i] > pytorch_max_logit)
             {
-                pytorch_max_logit = pytorch_lm_head[i];
+                pytorch_max_logit = pytorch_lm_head[offset + i];
                 pytorch_argmax = static_cast<int>(i);
             }
         }
@@ -755,6 +776,7 @@ TEST_F(Test__Qwen2_LocalTP_PCIeBAR_vs_PyTorch, Heterogeneous_CompareToSingleDevi
         LOG_INFO("[LocalTP PCIeBAR Test] Token comparison:");
         LOG_INFO("  LOCAL TP (CUDA+ROCm) argmax: " << tp_argmax);
         LOG_INFO("  PyTorch reference argmax:    " << pytorch_argmax);
+        LOG_INFO("  (PyTorch snapshot size: " << pytorch_lm_head.size() << ", using last " << pytorch_vocab << " elements)");
 
         // Check if they match (may not due to cross-vendor differences)
         if (tp_argmax == pytorch_argmax)

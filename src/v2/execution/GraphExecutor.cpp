@@ -1306,6 +1306,18 @@ namespace llaminar2
                 auto *base_tensor = dynamic_cast<TensorBase *>(output.tensor);
                 if (base_tensor && base_tensor->isDeviceValid())
                 {
+                    // Skip GPU validation for BAR-backed tensors - they're shared between
+                    // CUDA and ROCm devices. Using current_device() returns CUDA device,
+                    // but validation might be called from ROCm device thread. Fall through
+                    // to host validation which works reliably for mapped/BAR-backed tensors.
+                    if (base_tensor->isBARBacked())
+                    {
+                        LOG_DEBUG("[GraphExecutor] Skipping GPU validation for BAR-backed tensor '"
+                                  << output.name << "' - using host validation instead");
+                        // Fall through to host validation
+                    }
+                    else
+                    {
                     // Get GPU validator for this device type
                     auto device_opt = base_tensor->current_device();
                     if (device_opt.has_value())
@@ -1366,6 +1378,7 @@ namespace llaminar2
                             // Fall through to host validation if GPU validation failed to launch
                         }
                     }
+                    } // End of non-BAR-backed validation
                 }
             }
 

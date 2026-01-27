@@ -176,6 +176,20 @@ namespace llaminar2
                 LOG_ERROR("[packWeightsToCUDA] Failed to get FP32 data from tensor");
                 return false;
             }
+            
+            // TEMP DEBUG: Log first few weight values for K (N=64) case
+            if (N == 64 && K == 896) {
+                LOG_INFO("[packWeightsToCUDA] DEBUG K WEIGHT PACKING: tensor=" << tensor 
+                         << " shape=[" << N << "x" << K << "]");
+                LOG_INFO("[packWeightsToCUDA] First 5 FP32 values row0: " 
+                         << h_weights_fp32[0] << ", " << h_weights_fp32[1] << ", "
+                         << h_weights_fp32[2] << ", " << h_weights_fp32[3] << ", "
+                         << h_weights_fp32[4]);
+                LOG_INFO("[packWeightsToCUDA] First 5 FP32 values row1: " 
+                         << h_weights_fp32[K] << ", " << h_weights_fp32[K+1] << ", "
+                         << h_weights_fp32[K+2] << ", " << h_weights_fp32[K+3] << ", "
+                         << h_weights_fp32[K+4]);
+            }
 
             // Allocate output vectors
             out.int8_data.resize(static_cast<size_t>(K) * N);
@@ -418,6 +432,16 @@ namespace llaminar2
             {
                 throw std::runtime_error(
                     "[CUDAQuantisedGemmKernel] Failed to get FP32 data from weight tensor");
+            }
+
+            // DEBUG: Print first few weight values to verify slicing
+            if (N_ == 64 && K_ == 896) // This is the K weight shape for LOCAL TP
+            {
+                LOG_INFO("[CUDAQuantisedGemmKernel DEBUG] K weight N=" << N_ << " K=" << K_ 
+                         << " device=" << cuda_device_id_
+                         << " first 5 weights[0]: " << h_weights_fp32[0] << ", "
+                         << h_weights_fp32[1] << ", " << h_weights_fp32[2] << ", "
+                         << h_weights_fp32[3] << ", " << h_weights_fp32[4]);
             }
 
             // Per-column symmetric quantization to INT8

@@ -208,6 +208,25 @@ namespace llaminar2
          */
         virtual void shutdown() = 0;
 
+        /**
+         * @brief Reserve temporary buffer capacity for collective operations
+         *
+         * Pre-allocates internal temp buffers to avoid allocation in the hot path.
+         * The buffer will grow if needed but never shrink during operation.
+         * Buffer is only freed during shutdown().
+         *
+         * Call this during initialization after model dimensions are known:
+         * @code
+         * size_t max_elements = max_seq_len * hidden_size;
+         * size_t buffer_bytes = activationPrecisionBufferBytes(max_elements, precision);
+         * backend->reserveTempBufferBytes(buffer_bytes * 1.1);  // 10% margin
+         * @endcode
+         *
+         * @param bytes Minimum buffer capacity in bytes
+         * @return true if reservation succeeded (or no-op for backends that don't need it)
+         */
+        virtual bool reserveTempBufferBytes(size_t bytes) { (void)bytes; return true; }
+
         // =====================================================================
         // Collective Operations
         // =====================================================================

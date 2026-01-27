@@ -9,6 +9,7 @@
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
+#include <unordered_map>
 
 namespace llaminar2
 {
@@ -138,17 +139,23 @@ namespace llaminar2
         DeviceWorkspaceManager *getWorkspace() const override;
 
         /**
-         * @brief Clear the cached embedding table pointer
+         * @brief Clear the cached embedding table pointer for this workspace
          *
          * Call this if the model changes or the workspace is reset.
          * The next apply_tensor() call will re-upload the embedding table.
          */
-        void clearEmbeddingCache() { s_cached_embed_table_ = nullptr; }
+        void clearEmbeddingCache()
+        {
+            if (workspace_)
+            {
+                s_workspace_embed_cache_.erase(workspace_);
+            }
+        }
 
         /**
-         * @brief Static method to clear embedding cache (for model unload)
+         * @brief Static method to clear ALL embedding caches (for model unload)
          */
-        static void clearGlobalEmbeddingCache() { s_cached_embed_table_ = nullptr; }
+        static void clearGlobalEmbeddingCache() { s_workspace_embed_cache_.clear(); }
 
     private:
         int device_idx_;
@@ -156,11 +163,13 @@ namespace llaminar2
         // IWorkspaceConsumer state
         DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned)
 
-        // Embedding table caching state (STATIC - persists across kernel instances)
+        // Embedding table caching state (STATIC MAP - per-workspace cache)
         // This is critical for performance: kernel instances are recreated every forward pass
         // due to graph rebuild, but the embedding table in GPU workspace is persistent.
         // Using static ensures we don't re-upload 500+ MB every decode step.
-        static inline const TensorBase *s_cached_embed_table_ = nullptr; ///< Last seen embedding table pointer (for cache validation)
+        // KEY FIX: Use per-workspace cache to support LOCAL TP with multiple devices.
+        // Each device has its own workspace, so we cache separately per workspace.
+        static inline std::unordered_map<DeviceWorkspaceManager *, const TensorBase *> s_workspace_embed_cache_;
     };
 
 } // namespace llaminar2

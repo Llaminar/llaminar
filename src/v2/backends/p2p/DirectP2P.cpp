@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <iomanip>
 #include <sys/utsname.h>
@@ -359,6 +360,30 @@ namespace llaminar2
             cuda_ctx = nullptr; // Just clear the pointer, don't release
         }
     };
+
+    // Static singleton instance for shared DirectP2PEngine
+    static std::shared_ptr<DirectP2PEngine> s_shared_engine;
+    static std::mutex s_shared_engine_mutex;
+
+    std::shared_ptr<DirectP2PEngine> DirectP2PEngine::getSharedInstance()
+    {
+        std::lock_guard<std::mutex> lock(s_shared_engine_mutex);
+        if (!s_shared_engine)
+        {
+            // Use custom deleter that does nothing to prevent cleanup
+            // The engine lives for the entire process lifetime
+            s_shared_engine = std::shared_ptr<DirectP2PEngine>(
+                new DirectP2PEngine(),
+                [](DirectP2PEngine *) {
+                    // No-op deleter - the singleton persists until process exit
+                    // This is intentional to avoid re-initialization issues with
+                    // CUDA IOMEMORY registrations and BAR mappings
+                    LOG_DEBUG("[DirectP2PEngine] Singleton instance preserved (no-op deleter)");
+                });
+            LOG_INFO("[DirectP2PEngine] Singleton instance created");
+        }
+        return s_shared_engine;
+    }
 
     DirectP2PEngine::DirectP2PEngine()
         : impl_(std::make_unique<Impl>())

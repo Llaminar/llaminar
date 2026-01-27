@@ -1144,6 +1144,7 @@ add_library(llaminar2_core STATIC
     # Qwen2 model and graph configuration
     models/qwen/Qwen2Graph.cpp
     models/qwen/Qwen2GraphConfigBuilder.cpp
+    models/qwen/Qwen2BufferSpec.cpp
     tensors/TensorBase.cpp
     tensors/FP32Tensor.cpp
     tensors/FP16Tensor.cpp

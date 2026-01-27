@@ -97,6 +97,17 @@ namespace llaminar2
         void shutdown() override;
         bool isInitialized() const override { return initialized_; }
 
+        /**
+         * @brief Reserve temp buffer capacity to avoid hot-path allocation
+         *
+         * Pre-allocates the CUDA temp buffer used for allreduce operations.
+         * The buffer will grow if needed but never shrink during operation.
+         *
+         * @param bytes Minimum buffer capacity in bytes
+         * @return true if reservation succeeded
+         */
+        bool reserveTempBufferBytes(size_t bytes) override;
+
         // =====================================================================
         // Collective Operations
         // =====================================================================
@@ -266,8 +277,49 @@ namespace llaminar2
             CollectiveDataType dtype,
             CollectiveOp op) override;
 
+        // =====================================================================
+        // Public CUDA Reduction (for Zero-Copy Allreduce)
+        // =====================================================================
+
+        /**
+         * @brief Perform element-wise reduction on CUDA device
+         *
+         * Used by LocalTPContext::executePCIeBarAllreduce() for zero-copy path
+         * where CUDA reads directly from ROCm's BAR region.
+         *
+         * @param output Output buffer (CUDA device memory)
+         * @param input1 First input buffer (CUDA device memory) - typically same as output
+         * @param input2 Second input buffer (can be BAR-mapped memory readable by CUDA)
+         * @param count Number of elements
+         * @param dtype Data type
+         * @param op Collective operation (SUM supported)
+         * @return true on success
+         */
+        bool reduceOnCUDA(
+            void *output,
+            const void *input1,
+            const void *input2,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op);
+
+        /**
+         * @brief Get DirectP2PEngine for BAR memory management
+         *
+         * Provides access to the engine for BAR-backed tensor allocation.
+         * Returns nullptr if engine is not initialized.
+         *
+         * @return Pointer to DirectP2PEngine, or nullptr if not available
+         */
+        DirectP2PEngine* getDirectP2PEngine() const
+        {
+            return p2p_engine_.get();
+        }
+
     private:
-        std::unique_ptr<DirectP2PEngine> p2p_engine_;
+        // Use shared_ptr to leverage the process-wide singleton
+        // This prevents BAR resource cleanup/re-init issues between tests
+        std::shared_ptr<DirectP2PEngine> p2p_engine_;
         bool initialized_ = false;
 
         // Device group info (set during initialize)
@@ -410,17 +462,6 @@ namespace llaminar2
          * @brief Transfer data from ROCm to CUDA via BAR
          */
         bool transferROCmtoCUDA(size_t offset, void *cuda_dst, size_t bytes);
-
-        /**
-         * @brief Perform element-wise reduction on CUDA device
-         */
-        bool reduceOnCUDA(
-            void *output,
-            const void *input1,
-            const void *input2,
-            size_t count,
-            CollectiveDataType dtype,
-            CollectiveOp op);
 
         /**
          * @brief Pipelined allreduce for large buffers

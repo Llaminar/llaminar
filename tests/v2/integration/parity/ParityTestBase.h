@@ -67,6 +67,8 @@
 #include "loaders/ModelContext.h"
 #include "execution/InferenceRunnerFactory.h"
 #include "execution/IInferenceRunner.h"
+#include "execution/TPSnapshot.h"
+#include "execution/MultiDeviceOrchestrator.h"
 #include "kernels/KernelFactory.h"
 #include "utils/Logger.h"
 #include "utils/MPIContext.h"
@@ -207,6 +209,89 @@ namespace llaminar2::test::parity
         float avg_cosine = 0.0f;
         float avg_kl = 0.0f;
         float top1_accuracy = 0.0f;
+        bool overall_passed = false;
+    };
+
+    // =============================================================================
+    // TP-Aware Result Structures
+    // =============================================================================
+
+    /**
+     * @brief Per-device comparison result for tensor-parallel parity
+     */
+    struct TPDeviceComparisonResult
+    {
+        std::string device_id;          ///< Device identifier (e.g., "rank0_cuda0")
+        int device_index = 0;           ///< Index in TP group
+        float cosine_similarity = 0.0f; ///< Cosine vs corresponding PyTorch slice
+        size_t slice_start = 0;         ///< Start column in PyTorch reference
+        size_t slice_size = 0;          ///< Number of elements compared
+        bool passed = false;
+    };
+
+    /**
+     * @brief TP-aware comparison result for a single stage
+     */
+    struct TPStageComparisonResult
+    {
+        std::string stage_name;
+        SnapshotShardingMode sharding_mode = SnapshotShardingMode::UNKNOWN;
+        
+        // Per-device comparisons (for column-parallel stages)
+        std::vector<TPDeviceComparisonResult> device_results;
+        
+        // Combined result (concatenated partial outputs vs full PyTorch)
+        float combined_cosine = 0.0f;
+        size_t combined_elements = 0;
+        bool combined_passed = false;
+        
+        // Overall for this stage
+        bool passed = false;
+    };
+
+    /**
+     * @brief TP-aware layer statistics
+     */
+    struct TPLayerStats
+    {
+        int layer_idx = 0;
+        int tp_degree = 1;
+        
+        // Per-stage results
+        std::vector<TPStageComparisonResult> stage_results;
+        
+        // Aggregated metrics
+        float avg_combined_cosine = 0.0f;
+        float min_combined_cosine = 1.0f;
+        std::string worst_stage;
+        int stages_compared = 0;
+        bool passed = false;
+    };
+
+    /**
+     * @brief TP-aware parity test summary
+     */
+    struct TPParityTestSummary
+    {
+        int tp_degree = 1;
+        std::vector<std::string> device_names;  ///< Device IDs in TP group
+        
+        // Embedding
+        TPStageComparisonResult embedding_result;
+        
+        // Per-layer stats
+        std::vector<TPLayerStats> layer_stats;
+        
+        // LM_HEAD (always gathered, so single combined result)
+        float lm_head_cosine = 0.0f;
+        float lm_head_kl = 0.0f;
+        float lm_head_top1 = 0.0f;
+        float lm_head_top5 = 0.0f;
+        bool lm_head_passed = false;
+        
+        // Overall
+        int early_layers_passed = 0;
+        int total_layers_passed = 0;
         bool overall_passed = false;
     };
 
@@ -428,6 +513,132 @@ namespace llaminar2::test::parity
         std::cout << "\nLM_HEAD Top-5: " << std::fixed << std::setprecision(1) << (summary.lm_head_top5 * 100.0f) << "%\n";
         std::cout << "Early layers passed: " << summary.early_layers_passed << "/" << config.early_layers_count << "\n";
         std::cout << "LM_HEAD KL divergence: " << summary.lm_head_kl << " (threshold: " << config.kl_threshold << ")\n";
+    }
+
+    /**
+     * @brief Render a TP-aware parity results table to stdout
+     *
+     * For tensor-parallel tests, shows:
+     * - Per-device cosine similarity against PyTorch slices
+     * - Combined (concatenated) result vs full PyTorch
+     * - Sharding mode for each stage
+     */
+    inline void renderTPParityTable(
+        const TPParityTestSummary &summary,
+        const ParityConfig &config,
+        const std::string &backend_name)
+    {
+        std::cout << "\n";
+        std::cout << "╔═══════════════════════════════════════════════════════════════════════════════════════════════════════════════╗\n";
+        std::cout << "║                          " << backend_name << " vs PyTorch TP-AWARE PARITY"
+                  << std::string(std::max(0, 47 - static_cast<int>(backend_name.length())), ' ') << "║\n";
+        std::cout << "║                          (" << summary.tp_degree << "-way LOCAL TP, Threshold: cosine >= "
+                  << std::fixed << std::setprecision(3) << config.cosine_threshold << ")                              ║\n";
+        
+        // Device names header
+        std::cout << "╠═══════════╦═══════════════════════════════════════════════════════════════╦═══════════════╦════════╦══════╣\n";
+        std::cout << "║   Layer   ║                  Per-Device Cosine (vs PyTorch slice)         ║   Combined    ║Sharding║Status║\n";
+        std::cout << "║   Stage   ║";
+        for (size_t i = 0; i < summary.device_names.size() && i < 2; ++i)
+        {
+            std::cout << std::setw(30) << summary.device_names[i] << " ║";
+        }
+        if (summary.device_names.size() < 2)
+        {
+            std::cout << std::setw(31) << "" << "║";
+        }
+        std::cout << "    Cosine    ║  Mode  ║      ║\n";
+        std::cout << "╠═══════════╬═══════════════════════════════════════════════════════════════╬═══════════════╬════════╬══════╣\n";
+
+        // Embedding
+        const auto &emb = summary.embedding_result;
+        std::cout << "║ EMBEDDING ║";
+        for (size_t i = 0; i < 2; ++i)
+        {
+            if (i < emb.device_results.size())
+            {
+                std::cout << std::setw(28) << std::fixed << std::setprecision(6) 
+                          << emb.device_results[i].cosine_similarity << " ║";
+            }
+            else
+            {
+                std::cout << std::setw(30) << "-" << " ║";
+            }
+        }
+        std::cout << std::setw(13) << std::fixed << std::setprecision(6) << emb.combined_cosine << " ║";
+        std::cout << std::setw(7) << shardingModeToString(emb.sharding_mode)[0] << " ║";  // First char only
+        std::cout << (emb.passed ? "  ✓  " : "  ✗  ") << "║\n";
+
+        // Per-layer stats
+        for (const auto &layer : summary.layer_stats)
+        {
+            std::string layer_str = "Layer " + std::to_string(layer.layer_idx);
+            
+            // Layer header
+            std::cout << "╠═══════════╬═══════════════════════════════════════════════════════════════╬═══════════════╬════════╬══════╣\n";
+            std::cout << "║" << std::setw(10) << layer_str << " ║";
+            std::cout << std::setw(63) << "" << "║";
+            std::cout << std::setw(13) << std::fixed << std::setprecision(6) << layer.avg_combined_cosine << " ║";
+            std::cout << std::setw(7) << "" << " ║";
+            std::cout << (layer.passed ? "  ✓  " : "  ✗  ") << "║\n";
+
+            // Per-stage details (show first few stages)
+            int stage_count = 0;
+            for (const auto &stage : layer.stage_results)
+            {
+                if (stage_count++ >= 5) break;  // Limit output verbosity
+                
+                // Truncate stage name to 10 chars
+                std::string stage_short = stage.stage_name.length() > 10 
+                    ? stage.stage_name.substr(0, 10) 
+                    : stage.stage_name;
+                
+                std::cout << "║" << std::setw(10) << stage_short << " ║";
+                for (size_t i = 0; i < 2; ++i)
+                {
+                    if (i < stage.device_results.size())
+                    {
+                        std::cout << std::setw(28) << std::fixed << std::setprecision(6) 
+                                  << stage.device_results[i].cosine_similarity << " ║";
+                    }
+                    else
+                    {
+                        std::cout << std::setw(30) << "-" << " ║";
+                    }
+                }
+                std::cout << std::setw(13) << std::fixed << std::setprecision(6) << stage.combined_cosine << " ║";
+                
+                // Sharding mode indicator
+                char mode_char = 'U';
+                switch (stage.sharding_mode)
+                {
+                case SnapshotShardingMode::REPLICATED: mode_char = 'R'; break;
+                case SnapshotShardingMode::COLUMN_PARALLEL: mode_char = 'C'; break;
+                case SnapshotShardingMode::ROW_PARALLEL: mode_char = 'W'; break;  // 'W' for roW
+                case SnapshotShardingMode::GATHERED: mode_char = 'G'; break;
+                default: mode_char = '?'; break;
+                }
+                std::cout << std::setw(4) << mode_char << "   ║";
+                std::cout << (stage.passed ? "  ✓  " : "  ✗  ") << "║\n";
+            }
+        }
+
+        // LM_HEAD
+        std::cout << "╠═══════════╬═══════════════════════════════════════════════════════════════╬═══════════════╬════════╬══════╣\n";
+        std::cout << "║  LM_HEAD  ║"
+                  << std::setw(45) << "[gathered across TP]" << std::setw(18) << "" << " ║"
+                  << std::setw(13) << std::fixed << std::setprecision(6) << summary.lm_head_cosine << " ║"
+                  << std::setw(4) << "G" << "   ║"
+                  << (summary.lm_head_passed ? "  ✓  " : "  ✗  ") << "║\n";
+
+        std::cout << "╚═══════════╩═══════════════════════════════════════════════════════════════╩═══════════════╩════════╩══════╝\n";
+
+        // Summary
+        std::cout << "\nSharding modes: R=Replicated, C=Column-parallel, W=roW-parallel, G=Gathered\n";
+        std::cout << "LM_HEAD: KL=" << std::fixed << std::setprecision(4) << summary.lm_head_kl
+                  << " Top-1=" << std::setprecision(1) << (summary.lm_head_top1 * 100.0f) << "%"
+                  << " Top-5=" << (summary.lm_head_top5 * 100.0f) << "%\n";
+        std::cout << "Early layers passed: " << summary.early_layers_passed << "/" << config.early_layers_count << "\n";
     }
 
     // =============================================================================
@@ -774,6 +985,179 @@ namespace llaminar2::test::parity
         }
 
         /**
+         * @brief Compare TP snapshot against PyTorch reference with sharding awareness
+         *
+         * For column-parallel stages:
+         * 1. Compare each device's partial output against corresponding PyTorch slice
+         * 2. Concatenate all device outputs and compare against full PyTorch
+         *
+         * For row-parallel/replicated stages:
+         * 1. Verify all devices have consistent data
+         * 2. Compare combined output against full PyTorch
+         *
+         * @param tp_snapshot The TPSnapshot from MultiDeviceOrchestrator::getTPSnapshot()
+         * @param pytorch_data Full PyTorch reference data
+         * @param pytorch_rows Number of rows in PyTorch data (seq_len)
+         * @param pytorch_cols Number of columns in PyTorch data (feature_dim)
+         * @return TPStageComparisonResult with per-device and combined metrics
+         */
+        TPStageComparisonResult compareTPSnapshot(
+            TPSnapshot &tp_snapshot,
+            const std::vector<float> &pytorch_data,
+            size_t pytorch_rows,
+            size_t pytorch_cols)
+        {
+            TPStageComparisonResult result;
+            
+            // Debug: print first few values for layer0 attention to diagnose
+            bool debug_print = (tp_snapshot.key.find("layer0_ATTENTION_CONTEXT") != std::string::npos);
+            result.stage_name = tp_snapshot.key;
+            result.sharding_mode = tp_snapshot.mode;
+
+            if (pytorch_data.empty())
+            {
+                LOG_WARN("[TP Parity] No PyTorch data for stage " << tp_snapshot.key);
+                return result;
+            }
+
+            const int tp_degree = static_cast<int>(tp_snapshot.device_data.size());
+            if (tp_degree == 0)
+            {
+                LOG_WARN("[TP Parity] No device data for stage " << tp_snapshot.key);
+                return result;
+            }
+
+            LOG_DEBUG("[TP Parity] Comparing stage " << tp_snapshot.key 
+                      << " mode=" << shardingModeToString(tp_snapshot.mode)
+                      << " tp_degree=" << tp_degree
+                      << " pytorch_size=" << pytorch_data.size()
+                      << " (" << pytorch_rows << "x" << pytorch_cols << ")");
+
+            // Per-device comparison for column-parallel stages
+            if (tp_snapshot.mode == SnapshotShardingMode::COLUMN_PARALLEL)
+            {
+                for (int dev_idx = 0; dev_idx < tp_degree; ++dev_idx)
+                {
+                    const auto &dev_data = tp_snapshot.device_data[dev_idx];
+                    
+                    // Compute which slice of PyTorch this device should match
+                    size_t slice_start = computeSliceStartCol(dev_idx, tp_degree, pytorch_cols);
+                    size_t slice_cols = computeSliceColCount(dev_idx, tp_degree, pytorch_cols);
+                    
+                    // Extract PyTorch slice
+                    std::vector<float> pytorch_slice = extractColumnSlice(
+                        pytorch_data.data(), pytorch_rows, pytorch_cols, slice_start, slice_cols);
+                    
+                    // Debug: print actual values for diagnosis - VERBOSE for all ATTENTION_CONTEXT stages
+                    bool debug_verbose = (tp_snapshot.key.find("ATTENTION_CONTEXT") != std::string::npos);
+                    if (debug_verbose)
+                    {
+                        LOG_INFO("[TP Debug] " << tp_snapshot.key << " device " << dev_idx
+                                  << " pytorch_rows=" << pytorch_rows
+                                  << " pytorch_cols=" << pytorch_cols
+                                  << " slice_start=" << slice_start
+                                  << " slice_cols=" << slice_cols
+                                  << " pytorch_slice.size=" << pytorch_slice.size()
+                                  << " dev_data.size=" << dev_data.data.size()
+                                  << " dev_data.cols=" << dev_data.cols);
+                        
+                        // Print first 8 values from each
+                        std::stringstream ss_pt, ss_ll;
+                        for (size_t i = 0; i < std::min(size_t(8), pytorch_slice.size()); ++i)
+                            ss_pt << std::setprecision(6) << pytorch_slice[i] << ", ";
+                        for (size_t i = 0; i < std::min(size_t(8), dev_data.data.size()); ++i)
+                            ss_ll << std::setprecision(6) << dev_data.data[i] << ", ";
+                        LOG_INFO("[TP Debug]   Row0 PyTorch: " << ss_pt.str());
+                        LOG_INFO("[TP Debug]   Row0 Llaminar: " << ss_ll.str());
+                        
+                        // Row 1 values (at offset slice_cols for Llaminar, slice_cols for pytorch_slice)
+                        size_t row_stride_ll = dev_data.cols > 0 ? dev_data.cols : slice_cols;
+                        size_t row_stride_pt = slice_cols;
+                        if (pytorch_slice.size() > row_stride_pt + 8 && dev_data.data.size() > row_stride_ll + 8)
+                        {
+                            std::stringstream ss3, ss4;
+                            for (size_t i = 0; i < 8; ++i)
+                                ss3 << std::setprecision(6) << pytorch_slice[row_stride_pt + i] << ", ";
+                            for (size_t i = 0; i < 8; ++i)
+                                ss4 << std::setprecision(6) << dev_data.data[row_stride_ll + i] << ", ";
+                            LOG_INFO("[TP Debug]   Row1 PyTorch (stride=" << row_stride_pt << "): " << ss3.str());
+                            LOG_INFO("[TP Debug]   Row1 Llaminar (stride=" << row_stride_ll << "): " << ss4.str());
+                        }
+                    }
+                    
+                    // Compare device data against slice
+                    size_t compare_size = std::min(dev_data.data.size(), pytorch_slice.size());
+                    float cosine = computeCosineSimilarity(
+                        dev_data.data.data(), pytorch_slice.data(), compare_size);
+                    
+                    TPDeviceComparisonResult dev_result;
+                    dev_result.device_id = dev_data.device_id.toString();
+                    dev_result.device_index = dev_idx;
+                    dev_result.cosine_similarity = cosine;
+                    dev_result.slice_start = slice_start;
+                    dev_result.slice_size = compare_size;
+                    dev_result.passed = (cosine >= config_.cosine_threshold);
+                    
+                    LOG_DEBUG("[TP Parity] Device " << dev_idx << " (" << dev_result.device_id << ")"
+                              << " slice=[" << slice_start << "," << slice_start + slice_cols << ")"
+                              << " cosine=" << cosine
+                              << " device_size=" << dev_data.data.size()
+                              << " slice_size=" << pytorch_slice.size());
+                    
+                    result.device_results.push_back(std::move(dev_result));
+                }
+            }
+            else
+            {
+                // For replicated/row-parallel, each device should match full PyTorch
+                for (int dev_idx = 0; dev_idx < tp_degree; ++dev_idx)
+                {
+                    const auto &dev_data = tp_snapshot.device_data[dev_idx];
+                    
+                    size_t compare_size = std::min(dev_data.data.size(), pytorch_data.size());
+                    float cosine = computeCosineSimilarity(
+                        dev_data.data.data(), pytorch_data.data(), compare_size);
+                    
+                    TPDeviceComparisonResult dev_result;
+                    dev_result.device_id = dev_data.device_id.toString();
+                    dev_result.device_index = dev_idx;
+                    dev_result.cosine_similarity = cosine;
+                    dev_result.slice_start = 0;
+                    dev_result.slice_size = compare_size;
+                    dev_result.passed = (cosine >= config_.cosine_threshold);
+                    
+                    result.device_results.push_back(std::move(dev_result));
+                }
+            }
+
+            // Compute combined result
+            size_t combined_size = 0;
+            const float *combined_ptr = tp_snapshot.getCombinedData(combined_size);
+            
+            if (combined_ptr && combined_size > 0)
+            {
+                size_t compare_size = std::min(combined_size, pytorch_data.size());
+                result.combined_cosine = computeCosineSimilarity(
+                    combined_ptr, pytorch_data.data(), compare_size);
+                result.combined_elements = compare_size;
+                result.combined_passed = (result.combined_cosine >= config_.cosine_threshold);
+                
+                LOG_DEBUG("[TP Parity] Combined: size=" << combined_size 
+                          << " pytorch_size=" << pytorch_data.size()
+                          << " cosine=" << result.combined_cosine);
+            }
+            else
+            {
+                LOG_WARN("[TP Parity] Failed to compute combined data for " << tp_snapshot.key);
+            }
+
+            // Overall pass: combined must pass
+            result.passed = result.combined_passed;
+            
+            return result;
+        }
+
+        /**
          * @brief Setup the inference pipeline
          *
          * MPI-aware: Uses getDevice() which calls getDeviceForRank() for per-rank device selection.
@@ -1083,6 +1467,224 @@ namespace llaminar2::test::parity
                                      summary.lm_head_passed;
 
             return summary;
+        }
+
+        /**
+         * @brief Run TP-aware prefill parity test
+         *
+         * For tensor-parallel tests, this compares:
+         * 1. Per-device partial outputs against corresponding PyTorch slices
+         * 2. Combined (concatenated) outputs against full PyTorch reference
+         *
+         * Requires runner_ to be a MultiDeviceOrchestrator (will cast and check).
+         *
+         * @return TPParityTestSummary with per-device and combined metrics
+         */
+        TPParityTestSummary runTPPrefillParity()
+        {
+            TPParityTestSummary summary;
+
+            // Only setup pipeline if not already configured
+            // (Test may have already called setupLocalTPPipeline() or similar)
+            if (!runner_)
+            {
+                EXPECT_TRUE(setupPipeline()) << "Pipeline setup failed";
+                if (!runner_)
+                    return summary;
+            }
+
+            // Try to cast to MultiDeviceOrchestrator for TP snapshot access
+            auto *multi_device = dynamic_cast<MultiDeviceOrchestrator *>(runner_.get());
+            if (!multi_device)
+            {
+                LOG_ERROR("[TP Parity] runner_ is not a MultiDeviceOrchestrator - "
+                         "ensure test calls setupLocalTPPipeline() or similar before runTPPrefillParity()");
+                return summary;
+            }
+
+            summary.tp_degree = multi_device->device_count();
+            for (int i = 0; i < summary.tp_degree; ++i)
+            {
+                auto *dev_runner = multi_device->deviceRunner(i);
+                if (dev_runner)
+                {
+                    // Use index-based name for simplicity
+                    // MultiDeviceOrchestrator stores device info in config
+                    summary.device_names.push_back("TP_rank_" + std::to_string(i));
+                }
+            }
+
+            LOG_INFO("[TP Parity] Running with " << summary.tp_degree << " devices");
+
+            // Run prefill
+            bool success = runner_->forward(config_.token_ids.data(), config_.token_ids.size());
+            EXPECT_TRUE(success) << "Prefill forward pass failed";
+            if (!success)
+                return summary;
+
+            int n_layers = static_cast<int>(model_ctx_->model().block_count);
+            size_t seq_len = config_.token_ids.size();
+            size_t d_model = model_ctx_->model().embedding_length;
+            size_t n_heads = model_ctx_->headCount();
+            size_t d_ff = model_ctx_->feedForwardLength();
+            size_t vocab_size = model_ctx_->model().vocab_size;
+
+            // Stages to compare per layer with their expected dimensions
+            struct StageInfo {
+                std::string name;
+                size_t cols;  // Expected columns (may be sharded)
+            };
+            std::vector<StageInfo> per_layer_stages = {
+                {"ATTENTION_NORM", d_model},
+                {"ATTENTION_CONTEXT", d_model},  // num_heads * head_dim = d_model
+                {"ATTENTION_OUTPUT", d_model},
+                {"FFN_NORM", d_model},
+                {"FFN_SWIGLU", d_ff},
+                {"FFN_DOWN", d_model},
+                {"FFN_RESIDUAL", d_model}
+            };
+
+            // Get snapshot keys
+            auto snapshot_keys = runner_->getSnapshotKeys();
+            std::set<std::string> available_snapshots(snapshot_keys.begin(), snapshot_keys.end());
+
+            // Compare embedding
+            auto pytorch_embedding = loadPyTorchSnapshot("EMBEDDING");
+            if (available_snapshots.count("EMBEDDING") && !pytorch_embedding.empty())
+            {
+                TPSnapshot tp_snap = multi_device->getTPSnapshot("EMBEDDING");
+                summary.embedding_result = compareTPSnapshot(
+                    tp_snap, pytorch_embedding, seq_len, d_model);
+            }
+
+            // Compare each layer
+            for (int layer_idx = 0; layer_idx < n_layers; ++layer_idx)
+            {
+                TPLayerStats layer_stats;
+                layer_stats.layer_idx = layer_idx;
+                layer_stats.tp_degree = summary.tp_degree;
+
+                float sum_combined_cosine = 0.0f;
+
+                for (const auto &stage_info : per_layer_stages)
+                {
+                    std::string llaminar_key = "layer" + std::to_string(layer_idx) + "_" + stage_info.name;
+                    std::string pytorch_key = llaminar_key;
+
+                    if (!available_snapshots.count(llaminar_key))
+                        continue;
+
+                    auto pytorch_data = loadPyTorchSnapshot(pytorch_key);
+                    if (pytorch_data.empty())
+                        continue;
+
+                    TPSnapshot tp_snap = multi_device->getTPSnapshot(llaminar_key);
+                    auto stage_result = compareTPSnapshot(
+                        tp_snap, pytorch_data, seq_len, stage_info.cols);
+
+                    layer_stats.stage_results.push_back(stage_result);
+                    layer_stats.stages_compared++;
+                    sum_combined_cosine += stage_result.combined_cosine;
+
+                    if (stage_result.combined_cosine < layer_stats.min_combined_cosine)
+                    {
+                        layer_stats.min_combined_cosine = stage_result.combined_cosine;
+                        layer_stats.worst_stage = stage_info.name;
+                    }
+                }
+
+                if (layer_stats.stages_compared > 0)
+                {
+                    layer_stats.avg_combined_cosine = sum_combined_cosine / layer_stats.stages_compared;
+                }
+
+                // Pass criteria based on combined cosine
+                layer_stats.passed = (layer_stats.avg_combined_cosine >= config_.cosine_threshold);
+
+                summary.layer_stats.push_back(layer_stats);
+            }
+
+            // Compare LM_HEAD (always gathered)
+            auto pytorch_lm_head = loadPyTorchSnapshot("LM_HEAD");
+            if (available_snapshots.count("LM_HEAD") && !pytorch_lm_head.empty())
+            {
+                TPSnapshot tp_snap = multi_device->getTPSnapshot("LM_HEAD");
+                
+                size_t combined_size = 0;
+                const float *combined_ptr = tp_snap.getCombinedData(combined_size);
+                
+                if (combined_ptr && combined_size > 0)
+                {
+                    size_t compare_size = std::min(combined_size, pytorch_lm_head.size());
+                    summary.lm_head_cosine = computeCosineSimilarity(
+                        combined_ptr, pytorch_lm_head.data(), compare_size);
+
+                    size_t lm_seq_len = combined_size / vocab_size;
+                    if (lm_seq_len > 0)
+                    {
+                        size_t last_offset = (lm_seq_len - 1) * vocab_size;
+                        summary.lm_head_kl = computeKLDivergence(
+                            combined_ptr + last_offset,
+                            pytorch_lm_head.data() + last_offset,
+                            vocab_size, vocab_size);
+
+                        summary.lm_head_top1 = computeTopKOverlap(
+                            combined_ptr + last_offset,
+                            pytorch_lm_head.data() + last_offset,
+                            vocab_size, vocab_size, 1);
+
+                        summary.lm_head_top5 = computeTopKOverlap(
+                            combined_ptr + last_offset,
+                            pytorch_lm_head.data() + last_offset,
+                            vocab_size, vocab_size, 5);
+                    }
+                }
+            }
+            summary.lm_head_passed = (summary.lm_head_kl < config_.kl_threshold);
+
+            // Count early layers passed
+            summary.early_layers_passed = summary.embedding_result.passed ? 1 : 0;
+            for (int i = 0; i < std::min(config_.early_layers_count, static_cast<int>(summary.layer_stats.size())); ++i)
+            {
+                if (summary.layer_stats[i].passed)
+                    summary.early_layers_passed++;
+            }
+
+            // Count total layers passed
+            summary.total_layers_passed = summary.embedding_result.passed ? 1 : 0;
+            for (const auto &stats : summary.layer_stats)
+            {
+                if (stats.passed)
+                    summary.total_layers_passed++;
+            }
+
+            // Overall pass
+            summary.overall_passed = (summary.early_layers_passed >= config_.min_early_layers_passed) &&
+                                     summary.lm_head_passed;
+
+            return summary;
+        }
+
+        /**
+         * @brief Assert TP parity criteria and render table
+         *
+         * Call this after runTPPrefillParity() to apply assertions.
+         */
+        void assertTPParity(const TPParityTestSummary &summary)
+        {
+            // Render the TP-aware table (rank 0 only)
+            if (isRank0())
+            {
+                renderTPParityTable(summary, config_, getBackendName());
+            }
+
+            // Assertions
+            EXPECT_GE(summary.early_layers_passed, config_.min_early_layers_passed)
+                << "At least " << config_.min_early_layers_passed << " of the first "
+                << config_.early_layers_count << " layers should pass TP parity";
+
+            EXPECT_LT(summary.lm_head_kl, config_.kl_threshold)
+                << "LM_HEAD KL divergence too high: " << summary.lm_head_kl;
         }
 
         /**

@@ -290,8 +290,10 @@ namespace llaminar2
                 return false;
             }
 
-            // Check if we need to upload (first call or different embedding table)
-            if (s_cached_embed_table_ != embed_table)
+            // Check if we need to upload (first call or different embedding table for THIS workspace)
+            auto it = s_workspace_embed_cache_.find(workspace_);
+            bool needs_upload = (it == s_workspace_embed_cache_.end()) || (it->second != embed_table);
+            if (needs_upload)
             {
                 err = hipMemcpy(d_embed, embed_data, embed_bytes, hipMemcpyHostToDevice);
                 if (err != hipSuccess)
@@ -300,10 +302,11 @@ namespace llaminar2
                     return false;
                 }
 
-                // Cache the tensor pointer to avoid re-upload on subsequent calls
-                s_cached_embed_table_ = embed_table;
+                // Cache the tensor pointer for THIS workspace to avoid re-upload on subsequent calls
+                s_workspace_embed_cache_[workspace_] = embed_table;
                 LOG_INFO("[ROCmEmbeddingKernelT] Uploaded dequantized embedding table: "
-                         << vocab_size << "x" << embed_dim << " (" << embed_bytes / (1024 * 1024) << " MB)");
+                         << vocab_size << "x" << embed_dim << " (" << embed_bytes / (1024 * 1024) << " MB)"
+                         << " workspace=" << static_cast<void*>(workspace_));
             }
             // else: embedding already uploaded to workspace buffer, reuse d_embed
         }

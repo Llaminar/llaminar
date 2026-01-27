@@ -1392,6 +1392,136 @@ namespace llaminar2::test
         EXPECT_EQ(backend->type(), CollectiveBackendType::PCIE_BAR);
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Allreduce Count Parameter Test (Regression Test)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @test Verify count parameter correctly limits allreduce to actual data
+     *
+     * Regression test for bug where allreduce reduced the full buffer size
+     * (max_seq_len * hidden_dim = 3670016 elements) instead of actual sequence
+     * length (seq_len * hidden_dim = 896 elements for decode).
+     *
+     * This caused garbage data from unused buffer portions to be summed,
+     * corrupting decode results.
+     */
+    TEST_F(Test__PCIeBARBackendIntegration, Regression_AllreduceCountParameter)
+    {
+        REQUIRE_HARDWARE();
+
+        // Simulate a buffer sized for max_seq_len but only using small portion
+        const size_t max_seq_len = 128;  // Smaller for test
+        const size_t hidden_dim = 64;
+        const size_t actual_seq_len = 1;  // Decode mode: single token
+        const size_t actual_count = actual_seq_len * hidden_dim;
+
+        const size_t num_elements = max_seq_len * hidden_dim;
+        const size_t data_size = num_elements * sizeof(float);
+
+        // Fill the first actual_count elements with valid data
+        // CUDA has pattern [1, 2, 3, ...], ROCm has pattern [10, 20, 30, ...]
+        std::vector<float> cuda_init(num_elements);
+        std::vector<float> rocm_init(num_elements);
+        
+        for (size_t i = 0; i < actual_count; ++i)
+        {
+            cuda_init[i] = static_cast<float>(i + 1);
+            rocm_init[i] = static_cast<float>((i + 1) * 10);
+        }
+
+        // Fill remaining elements with GARBAGE that would corrupt results if reduced
+        const float garbage_value = 999999.0f;
+        for (size_t i = actual_count; i < num_elements; ++i)
+        {
+            cuda_init[i] = garbage_value;
+            rocm_init[i] = garbage_value;
+        }
+
+        // Allocate CUDA buffer
+        void *cuda_buf = allocateCUDA(data_size, 0.0f);
+        ASSERT_NE(cuda_buf, nullptr) << "CUDA allocation failed";
+        cuda_backend_->hostToDevice(cuda_buf, cuda_init.data(), data_size, 0);
+
+        // Allocate ROCm buffer from BAR region (required for buffer registration)
+        auto rocm_alloc = backend_->allocateInBarRegion(data_size);
+        ASSERT_TRUE(rocm_alloc.has_value()) << "Failed to allocate in BAR region";
+        auto [rocm_buf, bar_offset] = *rocm_alloc;
+        
+        // Initialize ROCm BAR-mapped buffer via direct memcpy (BAR memory is host-accessible)
+        std::memcpy(rocm_buf, rocm_init.data(), data_size);
+
+        // Register buffers for collective operation
+        const std::string coll_id = "test_allreduce_count_param";
+        ASSERT_TRUE(backend_->registerBuffer(coll_id, DeviceId::cuda(0), cuda_buf, data_size))
+            << "Failed to register CUDA buffer";
+        ASSERT_TRUE(backend_->registerBuffer(coll_id, DeviceId::rocm(0), rocm_buf, data_size))
+            << "Failed to register ROCm buffer";
+
+        // Perform allreduce with COUNT parameter (only reduce actual_count elements)
+        // This is the key difference from old buggy behavior that reduced num_elements
+        EXPECT_TRUE(backend_->allreduceRegistered(coll_id, actual_count,
+                                                  CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM));
+
+        // Read results
+        auto cuda_result = readFromCUDA(cuda_buf, num_elements);
+        auto rocm_result = readFromBAR(rocm_buf, num_elements);
+
+        // Verify ONLY the first actual_count elements are summed correctly
+        bool all_correct = true;
+        for (size_t i = 0; i < actual_count; ++i)
+        {
+            float expected = cuda_init[i] + rocm_init[i];  // i+1 + (i+1)*10 = 11*(i+1)
+            if (std::abs(cuda_result[i] - expected) > 1e-3f)
+            {
+                LOG_ERROR("CUDA element " << i << ": expected " << expected 
+                          << " but got " << cuda_result[i]);
+                all_correct = false;
+            }
+            if (std::abs(rocm_result[i] - expected) > 1e-3f)
+            {
+                LOG_ERROR("ROCm element " << i << ": expected " << expected 
+                          << " but got " << rocm_result[i]);
+                all_correct = false;
+            }
+        }
+        EXPECT_TRUE(all_correct) << "Reduced elements should be correct sum";
+
+        // Verify garbage elements are NOT included in reduction
+        // Check if garbage values were corrupted (would indicate bug)
+        bool cuda_garbage_ok = true;
+        bool rocm_garbage_ok = true;
+        for (size_t i = actual_count; i < std::min(num_elements, actual_count + 10); ++i)
+        {
+            // After allreduce with limited count, garbage elements should be:
+            // - Unchanged on CUDA side (only first actual_count elements touched)
+            // - Unchanged on ROCm side (only first actual_count elements touched)
+            if (std::abs(cuda_result[i] - garbage_value) > 1e-3f)
+            {
+                LOG_WARN("CUDA garbage element " << i << " was modified: expected " 
+                         << garbage_value << " but got " << cuda_result[i]);
+                cuda_garbage_ok = false;
+            }
+            if (std::abs(rocm_result[i] - garbage_value) > 1e-3f)
+            {
+                LOG_WARN("ROCm garbage element " << i << " was modified: expected " 
+                         << garbage_value << " but got " << rocm_result[i]);
+                rocm_garbage_ok = false;
+            }
+        }
+        EXPECT_TRUE(cuda_garbage_ok) 
+            << "BUG: CUDA garbage elements beyond actual_count were included in allreduce!";
+        EXPECT_TRUE(rocm_garbage_ok) 
+            << "BUG: ROCm garbage elements beyond actual_count were included in allreduce!";
+
+        LOG_INFO("Regression test: allreduce with count=" << actual_count 
+                 << " on buffer sized " << num_elements << " passed");
+
+        // Cleanup
+        freeCUDA(cuda_buf);
+        // Note: ROCm BAR-allocated memory is managed by the backend
+    }
+
 } // namespace llaminar2::test
 
 #else // !HAVE_CUDA || !HAVE_ROCM

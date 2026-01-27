@@ -893,16 +893,55 @@ namespace llaminar2
         bool isBARBacked() const { return is_bar_backed_; }
 
         /**
-         * @brief Get the ROCm-accessible pointer to tensor data
+         * @brief Get the ROCm-accessible pointer to tensor data for HIP kernels
          *
-         * For BAR-backed tensors, this returns a pointer that ROCm kernels can
-         * use to access the buffer as local VRAM. For non-BAR-backed tensors,
-         * returns nullptr.
+         * For BAR-backed tensors, this returns the HIP staging buffer pointer
+         * (allocated via hipMalloc) that ROCm kernels can safely write to.
+         * 
+         * CRITICAL: This does NOT return the BAR mmap address! HIP kernels cannot
+         * directly dereference BAR mmap addresses (causes memory access fault).
+         * The staging buffer is later copied to BAR via hipMemcpy(D2D).
          *
-         * @return void* ROCm device pointer, or nullptr if not BAR-backed
+         * For non-BAR-backed tensors, returns nullptr.
+         *
+         * @return void* HIP device pointer for kernel writes, or nullptr if not BAR-backed
          */
-        void *rocm_data_ptr() { return bar_rocm_ptr_; }
-        const void *rocm_data_ptr() const { return bar_rocm_ptr_; }
+        void *rocm_data_ptr() { return hip_staging_ptr_; }
+        const void *rocm_data_ptr() const { return hip_staging_ptr_; }
+        
+        /**
+         * @brief Get the raw BAR mmap pointer (for hipMemcpy D2D only)
+         *
+         * Returns the BAR mmap address for use with hipMemcpy(D2D).
+         * DO NOT pass this to HIP kernels - they cannot dereference it!
+         *
+         * @return void* BAR mmap address, or nullptr if not BAR-backed
+         */
+        void *bar_address() { return bar_rocm_ptr_; }
+        const void *bar_address() const { return bar_rocm_ptr_; }
+
+        /**
+         * @brief Initialize BAR-backed state with direct pointers
+         *
+         * Sets up BAR-backed memory state using pre-obtained pointers from DirectP2PEngine.
+         * Unlike initBARBackedMemory(), this does NOT allocate - it only configures state.
+         * The caller is responsible for ensuring the pointers are valid and properly aligned.
+         *
+         * This is a PUBLIC method intended for use by TensorFactory::createFP32BARBacked()
+         * when working directly with DirectP2PEngine (without PCIeBARBackend).
+         *
+         * @param rocm_ptr ROCm-accessible pointer (mmap'd BAR = AMD VRAM)
+         * @param cuda_ptr CUDA-accessible pointer (from cuMemHostGetDevicePointer)
+         * @param rocm_device ROCm device whose BAR hosts this buffer
+         * @param cuda_device CUDA device that has registered access
+         * @param bytes Size of the allocation in bytes
+         *
+         * @note Does NOT take ownership of memory - no deallocation on destruction
+         * @note Used by TensorFactory::createFP32BARBacked() with DirectP2PEngine
+         */
+        void initBARBackedDirect(void *rocm_ptr, void *cuda_ptr,
+                                 DeviceId rocm_device, DeviceId cuda_device,
+                                 size_t bytes);
 
         /**
          * @brief Release GPU memory, keeping only host copy
@@ -1463,6 +1502,20 @@ namespace llaminar2
         void *bar_cuda_device_ptr_ = nullptr; // CUDA-accessible pointer (cuMemHostGetDevicePointer)
         DeviceId bar_host_device_;            // ROCm device whose BAR hosts this buffer
         DeviceId bar_accessor_device_;        // CUDA device with registered BAR access
+        
+        // ===== HIP Staging Buffer for BAR-Backed Tensors =====
+        // CRITICAL FINDING: HIP kernels CANNOT directly dereference BAR mmap addresses
+        // (causes memory access fault). However, hipMemcpy(D2D) with BAR as destination
+        // WORKS at ~4+ GB/s using the AMD DMA engine.
+        //
+        // Architecture for BAR-backed ROCm tensors:
+        //   1. ROCm kernel writes to hip_staging_ptr_ (real HIP device memory)
+        //   2. After kernel, copy: hipMemcpy(D2D, bar_rocm_ptr_, hip_staging_ptr_, size)
+        //   3. CUDA reads from bar_cuda_device_ptr_ (BAR)
+        //
+        // This adds ~1-2μs overhead for the D2D copy but uses full DMA bandwidth.
+        void *hip_staging_ptr_ = nullptr;     // HIP device buffer for kernel writes (hipMalloc)
+        bool owns_hip_staging_ = false;       // True if we need to hipFree this
 
         // Forward declaration - PCIeBARBackend manages BAR allocations
         // Pointer stored here for deallocation in destructor

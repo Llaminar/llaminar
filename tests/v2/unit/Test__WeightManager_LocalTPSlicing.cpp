@@ -405,11 +405,102 @@ namespace llaminar2
 
         TEST_F(Test__WeightManager_LocalTPSlicing, CategoryDetection_BiasWeights)
         {
-            // Bias weights should not match any sharding category
-            // (biases are typically replicated, not sharded)
+            // Bias weights should not match any weight sharding category
+            // (biases use isQKVBias, not isQKVWeight)
             EXPECT_FALSE(WeightManager::isQKVWeight("blk.0.attn_q.bias"));
             EXPECT_FALSE(WeightManager::isFFNGateUpWeight("blk.0.ffn_gate.bias"));
             EXPECT_FALSE(WeightManager::isWoWeight("blk.0.attn_output.bias"));
+        }
+
+        // =============================================================================
+        // isQKVBias Tests - Bias Detection for Column-Parallel 1D Tensors
+        // =============================================================================
+
+        TEST_F(Test__WeightManager_LocalTPSlicing, IsQKVBias_MatchesQKVBiases)
+        {
+            // Q, K, V biases should match
+            EXPECT_TRUE(WeightManager::isQKVBias("blk.0.attn_q.bias"));
+            EXPECT_TRUE(WeightManager::isQKVBias("blk.0.attn_k.bias"));
+            EXPECT_TRUE(WeightManager::isQKVBias("blk.0.attn_v.bias"));
+
+            // Other layers should also match
+            EXPECT_TRUE(WeightManager::isQKVBias("blk.15.attn_q.bias"));
+            EXPECT_TRUE(WeightManager::isQKVBias("blk.23.attn_k.bias"));
+            EXPECT_TRUE(WeightManager::isQKVBias("blk.27.attn_v.bias"));
+        }
+
+        TEST_F(Test__WeightManager_LocalTPSlicing, IsQKVBias_DoesNotMatchWeights)
+        {
+            // Weights should NOT match (2D tensors handled differently)
+            EXPECT_FALSE(WeightManager::isQKVBias("blk.0.attn_q.weight"));
+            EXPECT_FALSE(WeightManager::isQKVBias("blk.0.attn_k.weight"));
+            EXPECT_FALSE(WeightManager::isQKVBias("blk.0.attn_v.weight"));
+            EXPECT_FALSE(WeightManager::isQKVBias("blk.0.attn_qkv.weight"));
+        }
+
+        TEST_F(Test__WeightManager_LocalTPSlicing, IsQKVBias_DoesNotMatchOtherBiases)
+        {
+            // Output bias should NOT match (row-parallel, not column-parallel)
+            EXPECT_FALSE(WeightManager::isQKVBias("blk.0.attn_output.bias"));
+
+            // FFN biases should NOT match
+            EXPECT_FALSE(WeightManager::isQKVBias("blk.0.ffn_gate.bias"));
+            EXPECT_FALSE(WeightManager::isQKVBias("blk.0.ffn_up.bias"));
+            EXPECT_FALSE(WeightManager::isQKVBias("blk.0.ffn_down.bias"));
+        }
+
+        TEST_F(Test__WeightManager_LocalTPSlicing, IsQKVBias_DoesNotMatchNorms)
+        {
+            // Norms should NOT match (replicated, not sharded)
+            EXPECT_FALSE(WeightManager::isQKVBias("blk.0.attn_norm.weight"));
+            EXPECT_FALSE(WeightManager::isQKVBias("blk.0.ffn_norm.weight"));
+            EXPECT_FALSE(WeightManager::isQKVBias("output_norm.weight"));
+        }
+
+        TEST_F(Test__WeightManager_LocalTPSlicing, IsQKVBias_DoesNotMatchEmbeddingOrLMHead)
+        {
+            EXPECT_FALSE(WeightManager::isQKVBias("token_embd.weight"));
+            EXPECT_FALSE(WeightManager::isQKVBias("output.weight"));
+        }
+
+        TEST_F(Test__WeightManager_LocalTPSlicing, IsQKVBias_AllLayers)
+        {
+            // Test bias detection across all layer indices
+            for (int layer = 0; layer < 28; ++layer)
+            {
+                std::string q_bias = "blk." + std::to_string(layer) + ".attn_q.bias";
+                std::string k_bias = "blk." + std::to_string(layer) + ".attn_k.bias";
+                std::string v_bias = "blk." + std::to_string(layer) + ".attn_v.bias";
+                std::string wo_bias = "blk." + std::to_string(layer) + ".attn_output.bias";
+                std::string gate_bias = "blk." + std::to_string(layer) + ".ffn_gate.bias";
+
+                EXPECT_TRUE(WeightManager::isQKVBias(q_bias)) << "Layer " << layer << " Q bias";
+                EXPECT_TRUE(WeightManager::isQKVBias(k_bias)) << "Layer " << layer << " K bias";
+                EXPECT_TRUE(WeightManager::isQKVBias(v_bias)) << "Layer " << layer << " V bias";
+
+                // Wo and FFN biases should NOT match
+                EXPECT_FALSE(WeightManager::isQKVBias(wo_bias)) << "Layer " << layer << " Wo bias should NOT match";
+                EXPECT_FALSE(WeightManager::isQKVBias(gate_bias)) << "Layer " << layer << " gate bias should NOT match";
+            }
+        }
+
+        TEST_F(Test__WeightManager_LocalTPSlicing, IsQKVBias_AndIsQKVWeight_AreMutuallyExclusive)
+        {
+            // Biases should ONLY match isQKVBias, not isQKVWeight
+            // Weights should ONLY match isQKVWeight, not isQKVBias
+            for (int layer = 0; layer < 5; ++layer)
+            {
+                std::string q_weight = "blk." + std::to_string(layer) + ".attn_q.weight";
+                std::string q_bias = "blk." + std::to_string(layer) + ".attn_q.bias";
+
+                // Weight: matches isQKVWeight, not isQKVBias
+                EXPECT_TRUE(WeightManager::isQKVWeight(q_weight));
+                EXPECT_FALSE(WeightManager::isQKVBias(q_weight));
+
+                // Bias: matches isQKVBias, not isQKVWeight
+                EXPECT_TRUE(WeightManager::isQKVBias(q_bias));
+                EXPECT_FALSE(WeightManager::isQKVWeight(q_bias));
+            }
         }
 
     } // namespace test

@@ -177,6 +177,19 @@ namespace llaminar2
             }
         }
 
+        // Mark output as device-dirty WITH EVENT immediately after GPU kernel launch.
+        // This ensures any subsequent read (e.g., DEBUG logging below) will properly
+        // sync via event wait rather than reading stale data. The GraphExecutor's
+        // markOutputsDirty() call is too late for reads inside execute().
+        if (params_.device_id.type != DeviceType::CPU)
+        {
+            auto *output_base_tb = dynamic_cast<TensorBase *>(params_.output);
+            if (output_base_tb)
+            {
+                output_base_tb->mark_device_dirty_with_event();
+            }
+        }
+
         // DEBUG: Log embedding output for parity debugging (guard expensive fp32_data() call)
         if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
         {

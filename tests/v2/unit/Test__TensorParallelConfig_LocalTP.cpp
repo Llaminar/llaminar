@@ -70,6 +70,7 @@ namespace llaminar2
             // =====================================================================
 
             bool allreduce(TensorBase * /*tensor*/) override { return true; }
+            bool allreduce(TensorBase *tensor, const std::string & /*stage_name*/, size_t /*count*/ = 0) override { return allreduce(tensor); }
             bool allreduce(const TensorBase * /*input*/, TensorBase * /*output*/) override { return true; }
             bool allgather(const TensorBase * /*local_shard*/, TensorBase * /*global_tensor*/) override { return true; }
             bool gatherFromDevices(const std::vector<const TensorBase *> & /*shards*/, TensorBase * /*output*/) override { return true; }
@@ -139,6 +140,23 @@ namespace llaminar2
             {
                 return rowRangeForDevice(device, total_cols);
             }
+
+            // =====================================================================
+            // ILocalTPContext Implementation - BAR Registry (no-ops for tests)
+            // =====================================================================
+
+            void registerBARBackedOutput(
+                const std::string & /*stage_name*/,
+                const GlobalDeviceAddress & /*device*/,
+                TensorBase * /*tensor*/) override
+            {
+                // No-op for unit tests
+            }
+
+            bool hasBARBackedOutputs(const std::string & /*stage_name*/) const override { return false; }
+            void clearBARBackedOutputs() override {}
+            std::shared_ptr<DirectP2PEngine> getDirectP2PEngine() const override { return nullptr; }
+            bool reserveTempBufferBytes(size_t /*bytes*/) override { return true; }
 
         private:
             std::vector<GlobalDeviceAddress> devices_;

@@ -49,6 +49,7 @@
 #include "../backends/GlobalDeviceAddress.h"
 #include "../config/OrchestrationConfig.h"
 #include "../execution/RuntimeConfig.h"
+#include "../execution/TPSnapshot.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -331,6 +332,24 @@ namespace llaminar2
          * @brief Get all snapshot keys from primary device runner
          */
         std::vector<std::string> getSnapshotKeys() const override;
+
+        /**
+         * @brief Get tensor-parallel aware snapshot for a stage
+         *
+         * Retrieves snapshots from ALL device runners and combines them
+         * according to the stage's sharding mode.
+         *
+         * @param key Snapshot identifier (e.g., "layer0_ATTENTION_CONTEXT")
+         * @return TPSnapshot with per-device data and combined view
+         */
+        TPSnapshot getTPSnapshot(const std::string &key) const;
+
+        /**
+         * @brief Get all snapshot keys with their sharding modes
+         *
+         * @return Vector of (key, sharding_mode) pairs
+         */
+        std::vector<std::pair<std::string, SnapshotShardingMode>> getSnapshotKeysWithSharding() const;
 
         // =====================================================================
         // Profiling API (from IInferenceRunner)

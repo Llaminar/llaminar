@@ -330,6 +330,32 @@ add_v2_test(V2_Unit_BARBackedTensor
     MPI_PROCS 1
 )
 
+# Test: TensorFactory_BARBacked - TensorFactory BAR-backed tensor creation methods
+add_executable(v2_test_tensor_factory_bar_backed unit/Test__TensorFactory_BARBacked.cpp)
+target_link_libraries(v2_test_tensor_factory_bar_backed 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TensorFactory_BARBacked 
+    COMMAND $<TARGET_FILE:v2_test_tensor_factory_bar_backed>
+    LABELS "V2;Unit;TensorOperations;TensorFactory;PCIeBAR;Heterogeneous"
+    MPI_PROCS 1
+)
+
+# Test: Qwen2BufferSpec - Buffer allocation strategy for BAR-backed tensors
+add_executable(v2_test_qwen2_buffer_spec unit/Test__Qwen2BufferSpec.cpp)
+target_link_libraries(v2_test_qwen2_buffer_spec 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Qwen2BufferSpec 
+    COMMAND $<TARGET_FILE:v2_test_qwen2_buffer_spec>
+    LABELS "V2;Unit;BufferAllocation;PCIeBAR;Heterogeneous;TensorParallelism"
+    MPI_PROCS 1
+)
+
 # Test: CacheInfo - CPU cache detection and batch size optimization
 add_executable(v2_test_cache_info unit/Test__CacheInfo.cpp)
 target_link_libraries(v2_test_cache_info 
@@ -449,6 +475,30 @@ if(HAVE_CUDA AND HAVE_ROCM)
     add_v2_test(V2_Integration_PCIeBARBackend 
         COMMAND $<TARGET_FILE:v2_integration_pcie_bar_backend>
         LABELS "V2;Integration;Collective;PCIeBARBackend;P2P;CUDA;ROCm;CrossVendor;TensorParallel;AllReduce"
+        MPI_PROCS 1
+        RESOURCE_LOCK "PCIeBAR_P2P"
+    )
+
+    # Test: BAR-backed HIP allocation - Exploratory test for HIP memory in BAR
+    # DISABLED: This was an exploratory test that exhaustively tested all HIP/HSA/CUDA APIs
+    # for direct kernel access to PCIe BAR memory. Key findings:
+    # - HIP kernels CANNOT directly dereference BAR mmap addresses (memory fault)
+    # - hipMemcpy(D2D) with BAR as destination WORKS at ~4+ GB/s (uses DMA engine)
+    # - All HIP/HSA import APIs reject BAR fd (not a dmabuf)
+    # - AMD dmabuf export → CUDA import FAILS (NVIDIA rejects foreign dmabufs, error 999)
+    # - Dmabuf CPU mmap is slow (~21 MB/s, uncached PCIe access)
+    # Conclusion: Use hipMemcpy(D2D) to stage ROCm kernel output to BAR before CUDA reads.
+    # See: tests/v2/integration/Test__BARBackedHipAllocation.cpp for detailed documentation.
+    add_executable(v2_integration_bar_backed_hip_allocation integration/Test__BARBackedHipAllocation.cpp)
+    target_link_libraries(v2_integration_bar_backed_hip_allocation 
+        llaminar2_core 
+        GTest::gtest
+        GTest::gtest_main
+    )
+    # Disabled from regular CI - run manually via: ctest -R DISABLED_V2_Integration_BARBackedHipAllocation
+    add_v2_test(DISABLED_V2_Integration_BARBackedHipAllocation 
+        COMMAND $<TARGET_FILE:v2_integration_bar_backed_hip_allocation>
+        LABELS "V2;Integration;PCIeBAR;HIP;CUDA;ROCm;CrossVendor;Exploration;DISABLED"
         MPI_PROCS 1
         RESOURCE_LOCK "PCIeBAR_P2P"
     )
@@ -3120,6 +3170,22 @@ add_v2_test(V2_Unit_WeightManagerDecodeShards
     LABELS "V2;Unit;TensorParallelism;WeightSharding;DecodeShards;CPUDecode"
 )
 
+# Test: WeightManager INPUT_PARALLEL Slicing
+# Exhaustive tests for INPUT_PARALLEL weight slicing (attn_output vs ffn_down)
+# Tests the critical distinction between ATTENTION_WO (head-based slicing) and
+# FFN_DOWN (d_ff-based slicing) - regression tests for the bug where d_ff dims
+# were incorrectly used for all INPUT_PARALLEL weights.
+add_executable(v2_test_weight_manager_input_parallel_slicing unit/loaders/Test__WeightManagerInputParallelSlicing.cpp)
+target_include_directories(v2_test_weight_manager_input_parallel_slicing PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes (TestTensorFactory)
+)
+target_link_libraries(v2_test_weight_manager_input_parallel_slicing llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_WeightManagerInputParallelSlicing
+    COMMAND $<TARGET_FILE:v2_test_weight_manager_input_parallel_slicing>
+    LABELS "V2;Unit;TensorParallelism;WeightSharding;InputParallel;AttentionWo;FFNDown;LocalTP"
+    MPI_PROCS 1
+)
+
 # Test: WeightManager Device-Aware Features
 # Tests features folded from WeightPreloader: getWeightForDevice, preloadForDevices,
 # cloneTensorForDevice, packGemmWeights, uploadNonGemmWeights, preloadStats,
@@ -3809,6 +3875,17 @@ add_v2_test(V2_Unit_GraphBufferManager
     MPI_PROCS 1
 )
 
+# Test: GraphBufferManager BAR Allocation (Phase 3: BAR-backed tensor support)
+# Tests integration between GraphBufferManager and TensorFactory for BAR-backed
+# tensor allocation when using PCIeBAR backend with heterogeneous CUDA/ROCm GPUs.
+add_executable(v2_test_graph_buffer_manager_bar_allocation unit/Test__GraphBufferManager_BARAllocation.cpp)
+target_link_libraries(v2_test_graph_buffer_manager_bar_allocation llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GraphBufferManager_BARAllocation
+    COMMAND $<TARGET_FILE:v2_test_graph_buffer_manager_bar_allocation>
+    LABELS "V2;Unit;Execution;GraphBufferManager;BufferManagement;PCIeBAR;Heterogeneous;TensorParallelism"
+    MPI_PROCS 1
+)
+
 # Test: DomainAwareBufferManager (Phase 5.2: Domain-aware buffer allocation)
 # Tests domain-aware buffer allocation based on layer placement configuration.
 # GPU layers get GPU buffers, CPU layers get NUMA-local CPU buffers.
@@ -4466,6 +4543,28 @@ target_link_libraries(v2_test_local_tp_context_barrier PRIVATE llaminar2_core GT
 add_v2_test(V2_Unit_LocalTPContextBarrier
     COMMAND $<TARGET_FILE:v2_test_local_tp_context_barrier>
     LABELS "V2;Unit;LocalTP;Barrier;Synchronization;PCIeBAR;Heterogeneous;Collective"
+    MPI_PROCS 1
+)
+
+# Test: LocalTPContext BAR-backed Tensor Management
+# Tests registration and lookup of BAR-backed tensors for zero-copy allreduce
+# Phase 2 of PCIeBAR zero-copy allreduce implementation
+add_executable(v2_test_local_tp_context_bar_management unit/Test__LocalTPContext_BARManagement.cpp)
+target_link_libraries(v2_test_local_tp_context_bar_management PRIVATE llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_LocalTPContext_BARManagement
+    COMMAND $<TARGET_FILE:v2_test_local_tp_context_bar_management>
+    LABELS "V2;Unit;LocalTP;BARManagement;PCIeBAR;ZeroCopy;TensorTracking"
+    MPI_PROCS 1
+)
+
+# Test: LocalTPContext Zero-Copy Allreduce (executePCIeBarAllreduce)
+# Tests Phase 4 implementation: proper A+B summation (not 2A bug)
+# Validates zero-copy path with BAR-backed tensors and host staging fallback
+add_executable(v2_test_local_tp_context_zero_copy_allreduce unit/Test__LocalTPContext_ZeroCopyAllreduce.cpp)
+target_link_libraries(v2_test_local_tp_context_zero_copy_allreduce PRIVATE llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_LocalTPContext_ZeroCopyAllreduce
+    COMMAND $<TARGET_FILE:v2_test_local_tp_context_zero_copy_allreduce>
+    LABELS "V2;Unit;LocalTP;ZeroCopyAllreduce;PCIeBAR;Allreduce;BugFix"
     MPI_PROCS 1
 )
 

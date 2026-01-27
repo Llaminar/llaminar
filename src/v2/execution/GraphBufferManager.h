@@ -76,6 +76,7 @@ namespace llaminar2
     class IComputeStage;
     class IWorkspaceConsumer;
     class IBackend;
+    class ILocalTPContext;
 
     // =========================================================================
     // Workspace Budget Configuration (Phase 4: Memory Budget Enforcement)
@@ -110,6 +111,63 @@ namespace llaminar2
          * Enable via: LLAMINAR_SNAPSHOT_USE_MAPPED=1 environment variable
          */
         bool use_mapped_memory = false;
+
+        // =====================================================================
+        // BAR-Backed Allocation for LOCAL TP with PCIeBAR (Phase 3)
+        // =====================================================================
+
+        /**
+         * @brief Tensor parallelism degree for LOCAL TP
+         *
+         * When tp_degree > 1 and collective_backend is PCIE_BAR, row-parallel
+         * output buffers (FFN down, attention Wo) will be allocated in BAR
+         * memory for efficient cross-vendor allreduce.
+         *
+         * Used in conjunction with Qwen2BufferSpec::requiresBARBacked() to
+         * automatically identify which buffers need BAR-backed allocation.
+         */
+        int tp_degree = 1;
+
+        /**
+         * @brief Collective backend type for LOCAL TP
+         *
+         * When set to PCIE_BAR and tp_degree > 1, enables automatic BAR-backed
+         * allocation for row-parallel output buffers identified by Qwen2BufferSpec.
+         */
+        CollectiveBackendType collective_backend = CollectiveBackendType::AUTO;
+
+        /**
+         * @brief ROCm device for BAR-backed allocation
+         *
+         * When using PCIeBAR backend with heterogeneous GPUs, this specifies
+         * the ROCm device that owns the BAR memory. The tensor data physically
+         * resides in this device's VRAM.
+         *
+         * Must be set along with cuda_device for createFP32BARBacked() to work.
+         */
+        DeviceId rocm_device;
+
+        /**
+         * @brief CUDA device for BAR-backed allocation
+         *
+         * When using PCIeBAR backend with heterogeneous GPUs, this specifies
+         * the CUDA device that will access the tensor via PCIe BAR.
+         *
+         * Must be set along with rocm_device for createFP32BARBacked() to work.
+         */
+        DeviceId cuda_device;
+
+        /**
+         * @brief LocalTP context for BAR-backed tensor registration
+         *
+         * When set and BAR-backed tensors are allocated, they will be
+         * automatically registered with the LocalTPContext via
+         * registerBARBackedOutput(). This enables executePCIeBarAllreduce()
+         * to look up the correct tensors for each stage.
+         *
+         * This pointer is NOT owned by the config.
+         */
+        ILocalTPContext *local_tp_ctx = nullptr;
     };
 
     /**

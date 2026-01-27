@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 #include "execution/IInferenceRunner.h"
+#include "execution/TPSnapshot.h"
 #include "collective/ILocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "config/OrchestrationConfig.h"
@@ -217,6 +218,11 @@ public:
         return !config_.allreduce_should_fail;
     }
 
+    bool allreduce(TensorBase *tensor, const std::string & /*stage_name*/, size_t /*count*/ = 0) override
+    {
+        return allreduce(tensor);
+    }
+
     bool allreduce(const TensorBase * /*input*/, TensorBase * /*output*/) override
     {
         allreduce_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -334,6 +340,23 @@ public:
     {
         return rowRangeForDevice(device, total_cols);
     }
+
+    // =====================================================================
+    // ILocalTPContext BAR Registry (no-ops for tests)
+    // =====================================================================
+
+    void registerBARBackedOutput(
+        const std::string & /*stage_name*/,
+        const GlobalDeviceAddress & /*device*/,
+        TensorBase * /*tensor*/) override
+    {
+        // No-op for unit tests
+    }
+
+    bool hasBARBackedOutputs(const std::string & /*stage_name*/) const override { return false; }
+    void clearBARBackedOutputs() override {}
+    std::shared_ptr<DirectP2PEngine> getDirectP2PEngine() const override { return nullptr; }
+    bool reserveTempBufferBytes(size_t /*bytes*/) override { return true; }
 
     // =====================================================================
     // Test Utilities
@@ -885,4 +908,292 @@ TEST_F(Test__MultiDeviceOrchestrator, MockTPContextResetCallCountsWorks)
 
     EXPECT_EQ(mock_tp_ctx_->synchronize_call_count(), 0u);
     EXPECT_EQ(mock_tp_ctx_->allreduce_call_count(), 0u);
+}
+
+// =============================================================================
+// TPSnapshot Row/Cols Inference Tests
+// =============================================================================
+// These tests verify that TPSnapshot correctly handles row/cols metadata
+// for column-parallel stages. The fix ensures local_cols is properly computed
+// from hidden_size/tp_degree rather than using flattened size.
+
+TEST_F(Test__MultiDeviceOrchestrator, TPSnapshot_ColumnParallel_CorrectRowsColsForSingleRowData)
+{
+    // Test case: Single-row column-parallel data (typical decode case)
+    // hidden_size=896, tp_degree=2, local_cols=448, seq_len=1
+    // Each device should have [1, 448] shape
+
+    TPSnapshot snapshot;
+    snapshot.key = "layer0_QKV_PROJ";
+    snapshot.mode = SnapshotShardingMode::COLUMN_PARALLEL;
+    snapshot.tp_degree = 2;
+
+    // Device 0: 448 elements -> should be [1, 448]
+    DeviceSnapshotData dev0;
+    dev0.device_index = 0;
+    dev0.rows = 1;   // Correctly set rows
+    dev0.cols = 448; // Correctly set cols (local_cols = 896/2)
+    dev0.global_start_col = 0;
+    dev0.global_total_cols = 896;
+    dev0.data.resize(448, 1.0f);
+
+    // Device 1: 448 elements -> should be [1, 448]
+    DeviceSnapshotData dev1;
+    dev1.device_index = 1;
+    dev1.rows = 1;
+    dev1.cols = 448;
+    dev1.global_start_col = 448;
+    dev1.global_total_cols = 896;
+    dev1.data.resize(448, 2.0f);
+
+    snapshot.device_data.push_back(std::move(dev0));
+    snapshot.device_data.push_back(std::move(dev1));
+
+    // computeCombined should correctly concatenate columns
+    ASSERT_TRUE(snapshot.computeCombined());
+    EXPECT_EQ(snapshot.combined_rows, 1);
+    EXPECT_EQ(snapshot.combined_cols, 896);
+    EXPECT_EQ(snapshot.combined_data.size(), 896);
+
+    // Verify data is correctly concatenated: [1,1,1,...448...,2,2,2,...448...]
+    EXPECT_FLOAT_EQ(snapshot.combined_data[0], 1.0f);   // First from device 0
+    EXPECT_FLOAT_EQ(snapshot.combined_data[447], 1.0f); // Last from device 0
+    EXPECT_FLOAT_EQ(snapshot.combined_data[448], 2.0f); // First from device 1
+    EXPECT_FLOAT_EQ(snapshot.combined_data[895], 2.0f); // Last from device 1
+}
+
+TEST_F(Test__MultiDeviceOrchestrator, TPSnapshot_ColumnParallel_CorrectRowsColsForMultiRowData)
+{
+    // Test case: Multi-row column-parallel data (typical prefill case)
+    // hidden_size=896, tp_degree=2, local_cols=448, seq_len=9
+    // Each device should have [9, 448] shape (total 4032 elements)
+
+    TPSnapshot snapshot;
+    snapshot.key = "layer0_ATTENTION_CONTEXT";
+    snapshot.mode = SnapshotShardingMode::COLUMN_PARALLEL;
+    snapshot.tp_degree = 2;
+
+    const size_t seq_len = 9;
+    const size_t local_cols = 448;
+    const size_t total_elements = seq_len * local_cols;
+
+    // Device 0: [9, 448] = 4032 elements
+    DeviceSnapshotData dev0;
+    dev0.device_index = 0;
+    dev0.rows = seq_len;
+    dev0.cols = local_cols;
+    dev0.global_start_col = 0;
+    dev0.global_total_cols = 896;
+    dev0.data.resize(total_elements);
+    // Fill with row index for verification
+    for (size_t r = 0; r < seq_len; ++r)
+    {
+        for (size_t c = 0; c < local_cols; ++c)
+        {
+            dev0.data[r * local_cols + c] = static_cast<float>(r * 10 + 0); // Row * 10 + device
+        }
+    }
+
+    // Device 1: [9, 448] = 4032 elements
+    DeviceSnapshotData dev1;
+    dev1.device_index = 1;
+    dev1.rows = seq_len;
+    dev1.cols = local_cols;
+    dev1.global_start_col = local_cols;
+    dev1.global_total_cols = 896;
+    dev1.data.resize(total_elements);
+    for (size_t r = 0; r < seq_len; ++r)
+    {
+        for (size_t c = 0; c < local_cols; ++c)
+        {
+            dev1.data[r * local_cols + c] = static_cast<float>(r * 10 + 1);
+        }
+    }
+
+    snapshot.device_data.push_back(std::move(dev0));
+    snapshot.device_data.push_back(std::move(dev1));
+
+    // computeCombined should correctly concatenate columns for each row
+    ASSERT_TRUE(snapshot.computeCombined());
+    EXPECT_EQ(snapshot.combined_rows, seq_len);
+    EXPECT_EQ(snapshot.combined_cols, 896);
+    EXPECT_EQ(snapshot.combined_data.size(), seq_len * 896);
+
+    // Verify row-by-row concatenation
+    // Row 0: [dev0 cols...] [dev1 cols...]
+    // Combined row 0, col 0 = dev0 data
+    EXPECT_FLOAT_EQ(snapshot.combined_data[0], 0.0f); // Row 0, dev0
+    // Combined row 0, col 448 = dev1 data
+    EXPECT_FLOAT_EQ(snapshot.combined_data[448], 1.0f); // Row 0, dev1
+
+    // Row 5: should have value 50 (5*10+0) from dev0, 51 (5*10+1) from dev1
+    size_t row5_offset = 5 * 896;
+    EXPECT_FLOAT_EQ(snapshot.combined_data[row5_offset], 50.0f);       // Row 5, dev0
+    EXPECT_FLOAT_EQ(snapshot.combined_data[row5_offset + 448], 51.0f); // Row 5, dev1
+}
+
+TEST_F(Test__MultiDeviceOrchestrator, TPSnapshot_ColumnParallel_WrongColsBreaksCombine)
+{
+    // Test case: What happens if cols is incorrectly set to flattened size?
+    // This was the BUG: cols=4032 instead of cols=448
+    // With incorrect cols, row stride calculation breaks
+
+    TPSnapshot snapshot;
+    snapshot.key = "layer0_BUG_CASE";
+    snapshot.mode = SnapshotShardingMode::COLUMN_PARALLEL;
+    snapshot.tp_degree = 2;
+
+    const size_t seq_len = 9;
+    const size_t local_cols = 448;
+    const size_t total_elements = seq_len * local_cols;
+
+    // Device 0 with CORRECT metadata
+    DeviceSnapshotData dev0_correct;
+    dev0_correct.device_index = 0;
+    dev0_correct.rows = seq_len;
+    dev0_correct.cols = local_cols; // CORRECT: 448
+    dev0_correct.global_start_col = 0;
+    dev0_correct.global_total_cols = 896;
+    dev0_correct.data.resize(total_elements, 1.0f);
+
+    // Device 1 with CORRECT metadata
+    DeviceSnapshotData dev1_correct;
+    dev1_correct.device_index = 1;
+    dev1_correct.rows = seq_len;
+    dev1_correct.cols = local_cols; // CORRECT: 448
+    dev1_correct.global_start_col = local_cols;
+    dev1_correct.global_total_cols = 896;
+    dev1_correct.data.resize(total_elements, 2.0f);
+
+    snapshot.device_data.push_back(std::move(dev0_correct));
+    snapshot.device_data.push_back(std::move(dev1_correct));
+
+    ASSERT_TRUE(snapshot.computeCombined());
+
+    // With correct metadata, combined should have proper dimensions
+    EXPECT_EQ(snapshot.combined_rows, seq_len);
+    EXPECT_EQ(snapshot.combined_cols, 896);
+
+    // Now test with INCORRECT metadata (the bug case)
+    TPSnapshot buggy_snapshot;
+    buggy_snapshot.key = "layer0_BUG_CASE";
+    buggy_snapshot.mode = SnapshotShardingMode::COLUMN_PARALLEL;
+    buggy_snapshot.tp_degree = 2;
+
+    // Device 0 with BUG: cols = flattened size instead of actual cols
+    DeviceSnapshotData dev0_buggy;
+    dev0_buggy.device_index = 0;
+    dev0_buggy.rows = 1;              // BUG: rows=1 because size/cols gives 1 when cols=4032
+    dev0_buggy.cols = total_elements; // BUG: cols=4032 (flattened size)
+    dev0_buggy.global_start_col = 0;
+    dev0_buggy.global_total_cols = total_elements * 2;
+    dev0_buggy.data.resize(total_elements, 1.0f);
+
+    DeviceSnapshotData dev1_buggy;
+    dev1_buggy.device_index = 1;
+    dev1_buggy.rows = 1;
+    dev1_buggy.cols = total_elements; // BUG: cols=4032
+    dev1_buggy.global_start_col = total_elements;
+    dev1_buggy.global_total_cols = total_elements * 2;
+    dev1_buggy.data.resize(total_elements, 2.0f);
+
+    buggy_snapshot.device_data.push_back(std::move(dev0_buggy));
+    buggy_snapshot.device_data.push_back(std::move(dev1_buggy));
+
+    ASSERT_TRUE(buggy_snapshot.computeCombined());
+
+    // With buggy metadata, combined has WRONG dimensions
+    // This would cause comparison against PyTorch (which has [9, 896]) to fail
+    EXPECT_EQ(buggy_snapshot.combined_rows, 1);                  // WRONG: should be 9
+    EXPECT_EQ(buggy_snapshot.combined_cols, total_elements * 2); // WRONG: should be 896
+
+    // The total data size is the same, but the row/col interpretation is wrong
+    // This demonstrates why correct rows/cols metadata is critical
+    EXPECT_NE(buggy_snapshot.combined_rows, snapshot.combined_rows);
+    EXPECT_NE(buggy_snapshot.combined_cols, snapshot.combined_cols);
+}
+
+TEST_F(Test__MultiDeviceOrchestrator, TPSnapshot_ColumnParallel_ProportionalWeights)
+{
+    // Test case: Proportional TP with 73%/27% split (heterogeneous GPUs)
+    // hidden_size=896, device0 gets 73% = 654 cols, device1 gets 27% = 242 cols
+
+    TPSnapshot snapshot;
+    snapshot.key = "layer0_PROPORTIONAL";
+    snapshot.mode = SnapshotShardingMode::COLUMN_PARALLEL;
+    snapshot.tp_degree = 2;
+
+    const size_t seq_len = 4;
+    const size_t dev0_cols = 654; // 73% of 896
+    const size_t dev1_cols = 242; // 27% of 896
+    const size_t total_cols = dev0_cols + dev1_cols;
+
+    DeviceSnapshotData dev0;
+    dev0.device_index = 0;
+    dev0.rows = seq_len;
+    dev0.cols = dev0_cols;
+    dev0.global_start_col = 0;
+    dev0.global_total_cols = total_cols;
+    dev0.data.resize(seq_len * dev0_cols, 1.0f);
+
+    DeviceSnapshotData dev1;
+    dev1.device_index = 1;
+    dev1.rows = seq_len;
+    dev1.cols = dev1_cols;
+    dev1.global_start_col = dev0_cols;
+    dev1.global_total_cols = total_cols;
+    dev1.data.resize(seq_len * dev1_cols, 2.0f);
+
+    snapshot.device_data.push_back(std::move(dev0));
+    snapshot.device_data.push_back(std::move(dev1));
+
+    ASSERT_TRUE(snapshot.computeCombined());
+    EXPECT_EQ(snapshot.combined_rows, seq_len);
+    EXPECT_EQ(snapshot.combined_cols, total_cols);
+
+    // Verify uneven column concatenation works
+    // Row 0: [654 cols from dev0] [242 cols from dev1]
+    EXPECT_FLOAT_EQ(snapshot.combined_data[0], 1.0f);              // First col from dev0
+    EXPECT_FLOAT_EQ(snapshot.combined_data[653], 1.0f);            // Last col from dev0
+    EXPECT_FLOAT_EQ(snapshot.combined_data[654], 2.0f);            // First col from dev1
+    EXPECT_FLOAT_EQ(snapshot.combined_data[total_cols - 1], 2.0f); // Last col from dev1
+}
+
+TEST_F(Test__MultiDeviceOrchestrator, TPSnapshot_Replicated_SingleRowMultipleDevices)
+{
+    // Test case: Replicated stage (same output on all devices)
+    // Each device has full [1, 896] output
+
+    TPSnapshot snapshot;
+    snapshot.key = "layer0_ATTN_NORM";
+    snapshot.mode = SnapshotShardingMode::REPLICATED;
+    snapshot.tp_degree = 2;
+
+    const size_t total_cols = 896;
+
+    DeviceSnapshotData dev0;
+    dev0.device_index = 0;
+    dev0.rows = 1;
+    dev0.cols = total_cols;
+    dev0.global_start_col = 0;
+    dev0.global_total_cols = total_cols;
+    dev0.data.resize(total_cols, 3.14f);
+
+    DeviceSnapshotData dev1;
+    dev1.device_index = 1;
+    dev1.rows = 1;
+    dev1.cols = total_cols;
+    dev1.global_start_col = 0;
+    dev1.global_total_cols = total_cols;
+    dev1.data.resize(total_cols, 3.14f); // Same data as dev0
+
+    snapshot.device_data.push_back(std::move(dev0));
+    snapshot.device_data.push_back(std::move(dev1));
+
+    ASSERT_TRUE(snapshot.computeCombined());
+    EXPECT_EQ(snapshot.combined_rows, 1);
+    EXPECT_EQ(snapshot.combined_cols, total_cols);
+
+    // For replicated, should just use first device's data
+    EXPECT_FLOAT_EQ(snapshot.combined_data[0], 3.14f);
 }

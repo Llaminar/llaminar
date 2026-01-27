@@ -31,12 +31,22 @@ namespace llaminar2
     // =========================================================================
 
     PCIeBARBackend::PCIeBARBackend(std::unique_ptr<DirectP2PEngine> p2p_engine)
-        : p2p_engine_(std::move(p2p_engine))
     {
-        if (!p2p_engine_)
+        // IMPORTANT: Always use the shared singleton instance
+        // The DirectP2PEngine manages CUDA IOMEMORY registrations that cannot
+        // be reliably re-initialized within a process. Using the singleton
+        // ensures that:
+        // 1. BAR resources are initialized once and shared across all backends
+        // 2. Tests don't conflict by creating/destroying separate engines
+        // 3. The engine lives for the entire process lifetime
+        //
+        // If a custom engine was passed in (for testing), we ignore it and
+        // use the singleton anyway to prevent resource conflicts.
+        if (p2p_engine)
         {
-            p2p_engine_ = std::make_unique<DirectP2PEngine>();
+            LOG_WARN("[PCIeBARBackend] Ignoring custom p2p_engine - using shared singleton");
         }
+        p2p_engine_ = DirectP2PEngine::getSharedInstance();
     }
 
     PCIeBARBackend::~PCIeBARBackend()
@@ -297,8 +307,17 @@ namespace llaminar2
             if (result.success)
             {
                 measured_bandwidth_gbps_ = (result.read_gbps + result.write_gbps) / 2.0;
+                // Cache in the engine for subsequent backends using the singleton
+                p2p_engine_->setCachedBandwidthGBps(measured_bandwidth_gbps_);
                 LOG_INFO("PCIe BAR P2P initialized: " << measured_bandwidth_gbps_ << " GB/s average");
             }
+        }
+        else
+        {
+            // Engine already active (singleton), retrieve cached bandwidth
+            measured_bandwidth_gbps_ = p2p_engine_->getCachedBandwidthGBps();
+            LOG_DEBUG("[PCIeBARBackend] Using cached bandwidth from singleton: "
+                      << measured_bandwidth_gbps_ << " GB/s");
         }
 
         // Initialize BAR allocator state
@@ -536,7 +555,11 @@ namespace llaminar2
         // Clear registered buffers
         registered_collectives_.clear();
 
-        // p2p_engine_ destructor handles BAR cleanup
+        // NOTE: p2p_engine_ is a shared_ptr to the process-wide singleton.
+        // We don't cleanup the engine here - it persists for the process lifetime
+        // to avoid CUDA IOMEMORY re-registration issues. The shared_ptr will
+        // decrement its reference count but the no-op deleter ensures the
+        // singleton is never actually destroyed.
         initialized_ = false;
         has_cuda_ = false;
         has_rocm_ = false;
@@ -939,9 +962,11 @@ namespace llaminar2
             return true;
         }
 
-        freeTempBuffer();
+        LOG_DEBUG("[PCIeBARBackend::ensureTempBuffer] Need " << bytes << " bytes, have " 
+                  << cuda_temp_buffer_size_ << " bytes - GROWING buffer (never shrinks)");
 
-        // Allocate using the backend abstraction
+        // GROW-ONLY: Allocate new larger buffer, free old one
+        // This is called during hot-path if pre-reservation was insufficient
         IBackend *cuda_backend = getCUDABackend();
         if (!cuda_backend)
         {
@@ -949,18 +974,34 @@ namespace llaminar2
             return false;
         }
 
-        void *buffer = cuda_backend->allocate(bytes, cuda_device_.ordinal);
-        if (buffer)
+        // Allocate new buffer before freeing old one
+        void *new_buffer = cuda_backend->allocate(bytes, cuda_device_.ordinal);
+        if (!new_buffer)
         {
-            cuda_temp_buffer_ = buffer;
-            cuda_temp_buffer_size_ = bytes;
-            return true;
+            LOG_ERROR("[PCIeBARBackend::ensureTempBuffer] Failed to allocate " << bytes << " bytes");
+            return false;
         }
 
-        return false;
+        // Free old buffer if it exists
+        if (cuda_temp_buffer_)
+        {
+            cuda_backend->free(cuda_temp_buffer_, cuda_device_.ordinal);
+        }
+
+        cuda_temp_buffer_ = new_buffer;
+        cuda_temp_buffer_size_ = bytes;
+        LOG_DEBUG("[PCIeBARBackend::ensureTempBuffer] Buffer grown to " << bytes << " bytes at ptr=" 
+                  << std::hex << cuda_temp_buffer_ << std::dec);
+        return true;
 #else
         return false;
 #endif
+    }
+
+    bool PCIeBARBackend::reserveTempBufferBytes(size_t bytes)
+    {
+        LOG_INFO("[PCIeBARBackend] Pre-reserving temp buffer: " << bytes << " bytes");
+        return ensureTempBuffer(bytes);
     }
 
     void PCIeBARBackend::freeTempBuffer()
@@ -968,6 +1009,9 @@ namespace llaminar2
 #if defined(HAVE_CUDA)
         if (cuda_temp_buffer_)
         {
+            LOG_DEBUG("[PCIeBARBackend::freeTempBuffer] Freeing temp buffer ptr=" 
+                      << std::hex << cuda_temp_buffer_ << std::dec 
+                      << " size=" << cuda_temp_buffer_size_);
             // Free using the backend abstraction
             IBackend *cuda_backend = getCUDABackend();
             if (cuda_backend)

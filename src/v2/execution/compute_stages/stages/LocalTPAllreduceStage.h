@@ -21,6 +21,7 @@
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
 #include "../../../collective/ILocalTPContext.h"
+#include <string>
 
 namespace llaminar2
 {
@@ -35,6 +36,7 @@ namespace llaminar2
         ILocalTPContext *tp_ctx = nullptr; ///< LOCAL TP context (required)
         TensorBase *tensor = nullptr;      ///< Tensor to all-reduce (in-place)
         size_t count = 0;                  ///< Elements to reduce (0 = use tensor->numel())
+        std::string stage_name;            ///< Stage identifier for BAR-backed tensor lookup (optional)
     };
 
     /**

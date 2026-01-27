@@ -8,11 +8,16 @@
 #include "BlockStructures.h"
 #include "TensorClasses.h" // For FP32Tensor::createMapped()
 #include "../utils/Logger.h"
+#include "../backends/p2p/DirectP2P.h" // For BAR-backed tensor support
 #include <stdexcept>
 #include <sstream>
 
 #include <numa.h>
 #include <numaif.h>
+
+#if defined(HAVE_ROCM)
+#include <hip/hip_runtime.h>
+#endif
 
 namespace llaminar2
 {
@@ -323,6 +328,143 @@ namespace llaminar2
         // Simple round-robin mapping: rank % (max_node + 1)
         // More sophisticated mapping could query actual CPU topology
         return rank % (max_node + 1);
+    }
+
+    // =========================================================================
+    // BAR-Backed Tensor Support
+    // =========================================================================
+
+    void TensorFactory::setDirectP2P(std::shared_ptr<DirectP2PEngine> p2p)
+    {
+        direct_p2p_ = std::move(p2p);
+        if (direct_p2p_)
+        {
+            LOG_DEBUG("TensorFactory: DirectP2PEngine context set for BAR-backed tensor allocation");
+        }
+        else
+        {
+            LOG_DEBUG("TensorFactory: DirectP2PEngine context cleared");
+        }
+    }
+
+    bool TensorFactory::canCreateBARBacked() const
+    {
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+        // Check if DirectP2P is set and has active BAR mapping
+        if (!direct_p2p_)
+        {
+            return false;
+        }
+        return direct_p2p_->isPCIeBarActive();
+#else
+        // BAR-backed tensors require both CUDA and ROCm backends
+        return false;
+#endif
+    }
+
+    std::unique_ptr<FP32Tensor> TensorFactory::createFP32BARBacked(
+        const std::vector<size_t> &shape,
+        DeviceId rocm_device,
+        DeviceId cuda_device)
+    {
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+        // Validate inputs
+        if (!rocm_device.is_rocm())
+        {
+            LOG_ERROR("TensorFactory::createFP32BARBacked: rocm_device must be a ROCm device, got "
+                      << rocm_device.to_string());
+            return nullptr;
+        }
+
+        if (!cuda_device.is_cuda())
+        {
+            LOG_ERROR("TensorFactory::createFP32BARBacked: cuda_device must be a CUDA device, got "
+                      << cuda_device.to_string());
+            return nullptr;
+        }
+
+        if (!direct_p2p_)
+        {
+            LOG_ERROR("TensorFactory::createFP32BARBacked: DirectP2PEngine not set. "
+                      "Call setDirectP2P() first.");
+            throw std::runtime_error("TensorFactory::createFP32BARBacked: DirectP2PEngine not configured");
+        }
+
+        if (!direct_p2p_->isPCIeBarActive())
+        {
+            LOG_ERROR("TensorFactory::createFP32BARBacked: PCIe BAR not active. "
+                      "Call DirectP2PEngine::initializePCIeBar() first.");
+            throw std::runtime_error("TensorFactory::createFP32BARBacked: PCIe BAR not active");
+        }
+
+        // Calculate required size
+        size_t element_count = 1;
+        for (size_t dim : shape)
+        {
+            element_count *= dim;
+        }
+        size_t byte_size = element_count * sizeof(float);
+
+        // Get BAR pointers from DirectP2P engine
+        // The BAR is mapped starting from the host pointer
+        void *bar_host_ptr = direct_p2p_->getBarHostPtr();
+        void *cuda_bar_ptr = direct_p2p_->getCudaBarPointer();
+        size_t bar_mapped_size = direct_p2p_->getBarMappedSize();
+
+        if (!bar_host_ptr || !cuda_bar_ptr)
+        {
+            LOG_ERROR("TensorFactory::createFP32BARBacked: BAR pointers not available");
+            throw std::runtime_error("TensorFactory::createFP32BARBacked: BAR pointers unavailable");
+        }
+
+        if (byte_size > bar_mapped_size)
+        {
+            LOG_ERROR("TensorFactory::createFP32BARBacked: Tensor size (" << byte_size
+                                                                          << " bytes) exceeds BAR mapped size (" << bar_mapped_size << " bytes)");
+            throw std::runtime_error("TensorFactory::createFP32BARBacked: Tensor too large for BAR region");
+        }
+
+        // KEY INSIGHT: The BAR mmap address is AMD GPU VRAM mapped to CPU virtual address space.
+        // We discovered through testing (TestZeroCopyBidirectional) that hipMemcpy(D2D) 
+        // accepts this mmap CPU address directly as a "device" pointer - the ROCm driver
+        // recognizes it as device memory without needing hipHostRegister.
+        //
+        // DO NOT use hipHostRegister here - it fails with "invalid argument" because
+        // the BAR mmap is not normal host memory. Instead, just use the mmap address
+        // directly as the ROCm pointer.
+        void *hip_device_ptr = bar_host_ptr;  // BAR mmap works directly with hipMemcpy D2D
+        
+        LOG_DEBUG("TensorFactory::createFP32BARBacked: Using BAR mmap directly for HIP: "
+                  << "bar_host_ptr=" << bar_host_ptr << " (works with hipMemcpy D2D)");
+
+        // Create BAR-backed FP32 tensor
+        // Note: FP32Tensor::createBARBacked() expects a PCIeBARBackend* for full integration,
+        // but for the TensorFactory API, we use DirectP2PEngine directly.
+        // We'll create the tensor with BAR state populated via initBARBackedDirect.
+        auto tensor = std::make_unique<FP32Tensor>(shape, rocm_device);
+
+        // Configure the tensor for BAR-backed operation using direct pointers
+        // - rocm_ptr: HIP device pointer (from hipHostGetDevicePointer)
+        // - cuda_ptr: CUDA device pointer (from cuMemHostGetDevicePointer)
+        tensor->initBARBackedDirect(
+            hip_device_ptr,         // rocm_ptr - HIP device pointer for ROCm kernels
+            cuda_bar_ptr,           // cuda_ptr - CUDA reads/writes via PCIe
+            rocm_device,            // host device (owns the BAR memory)
+            cuda_device,            // accessor device (reads via PCIe)
+            byte_size               // allocation size
+        );
+
+        LOG_DEBUG("TensorFactory::createFP32BARBacked: Created BAR-backed tensor "
+                  << shape[0] << "x" << (shape.size() > 1 ? shape[1] : 1)
+                  << " (" << byte_size << " bytes)"
+                  << " rocm_ptr=" << hip_device_ptr
+                  << " cuda_ptr=" << cuda_bar_ptr);
+
+        return tensor;
+#else
+        LOG_ERROR("TensorFactory::createFP32BARBacked: Requires both HAVE_CUDA and HAVE_ROCM");
+        throw std::runtime_error("TensorFactory::createFP32BARBacked: Requires HAVE_CUDA and HAVE_ROCM");
+#endif
     }
 
 } // namespace llaminar2

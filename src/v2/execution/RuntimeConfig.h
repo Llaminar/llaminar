@@ -180,6 +180,80 @@ namespace llaminar2
     }
 
     /**
+     * @brief Get bytes per element for ActivationPrecision
+     *
+     * Returns the storage size per logical element:
+     * - FP32: 4.0 bytes
+     * - BF16: 2.0 bytes
+     * - FP16: 2.0 bytes
+     * - Q8_1: 1.125 bytes (36 bytes per 32 elements)
+     * - Q16_1: 2.25 bytes (72 bytes per 32 elements)
+     * - Hybrid/HybridQ16: 4.0 bytes (worst-case FP32 for buffer sizing)
+     *
+     * For buffer allocation, multiply element count by this value.
+     * Note: Q8_1/Q16_1 return average bytes/element; actual allocation
+     * should round up to block boundaries (32 elements).
+     */
+    inline float activationPrecisionBytesPerElement(ActivationPrecision prec)
+    {
+        switch (prec)
+        {
+        case ActivationPrecision::FP32:
+            return 4.0f;
+        case ActivationPrecision::BF16:
+        case ActivationPrecision::FP16:
+            return 2.0f;
+        case ActivationPrecision::Q8_1:
+            return 36.0f / 32.0f; // 1.125 bytes/element
+        case ActivationPrecision::Q16_1:
+            return 72.0f / 32.0f; // 2.25 bytes/element
+        case ActivationPrecision::Hybrid:
+        case ActivationPrecision::HybridQ16:
+        default:
+            // Use FP32 as worst-case for buffer sizing
+            return 4.0f;
+        }
+    }
+
+    /**
+     * @brief Calculate buffer bytes for element count with ActivationPrecision
+     *
+     * Properly handles block quantization alignment for Q8_1 and Q16_1.
+     *
+     * @param element_count Number of logical elements
+     * @param prec Activation precision format
+     * @return Bytes needed for storage (rounded up for block formats)
+     */
+    inline size_t activationPrecisionBufferBytes(size_t element_count, ActivationPrecision prec)
+    {
+        switch (prec)
+        {
+        case ActivationPrecision::FP32:
+            return element_count * 4;
+        case ActivationPrecision::BF16:
+        case ActivationPrecision::FP16:
+            return element_count * 2;
+        case ActivationPrecision::Q8_1:
+        {
+            // Q8_1: 36 bytes per 32 elements, round up to block boundary
+            size_t blocks = (element_count + 31) / 32;
+            return blocks * 36;
+        }
+        case ActivationPrecision::Q16_1:
+        {
+            // Q16_1: 72 bytes per 32 elements, round up to block boundary
+            size_t blocks = (element_count + 31) / 32;
+            return blocks * 72;
+        }
+        case ActivationPrecision::Hybrid:
+        case ActivationPrecision::HybridQ16:
+        default:
+            // Use FP32 as worst-case for buffer sizing
+            return element_count * 4;
+        }
+    }
+
+    /**
      * @brief Runtime configuration for pipeline initialization
      *
      * This struct separates runtime configuration (user-specified parameters)

@@ -73,6 +73,125 @@ namespace llaminar2
             int k,
             int device_id) override;
 
+        // ==== Extended operations (not in IBackend) ====
+        
+        /**
+         * @brief Query pointer attributes to understand address space
+         * @param ptr Pointer to query
+         * @param is_device_ptr Output: true if ptr is a device pointer
+         * @param is_host_ptr Output: true if ptr is a host pointer
+         * @param is_managed Output: true if ptr is managed memory
+         * @param device_id Output: device ID if device pointer
+         * @return true if query succeeded
+         */
+        bool queryPointerAttributes(const void* ptr, bool& is_device_ptr, bool& is_host_ptr, 
+                                    bool& is_managed, int& device_id) const;
+        
+        /**
+         * @brief Copy device-to-device
+         * @param dst Destination device pointer
+         * @param src Source device pointer  
+         * @param bytes Number of bytes
+         * @param device_id Device to use for the copy
+         * @return true on success
+         */
+        bool deviceToDevice(void* dst, const void* src, size_t bytes, int device_id);
+        
+        /**
+         * @brief Register IO memory with HIP using hipHostRegisterIoMemory flag
+         * 
+         * This attempts to register memory-mapped I/O regions (like PCIe BAR)
+         * with HIP so that kernels can access them directly.
+         * 
+         * @param ptr Host pointer to the IO memory (e.g., BAR mmap address)
+         * @param size Size of the region in bytes
+         * @param device_ptr Output: Device pointer that kernels can use
+         * @return true if registration succeeded, false otherwise
+         */
+        bool registerIoMemory(void* ptr, size_t size, void** device_ptr);
+        
+        /**
+         * @brief Unregister previously registered IO memory
+         * @param ptr The host pointer that was registered
+         */
+        void unregisterIoMemory(void* ptr);
+        
+        /**
+         * @brief Get detailed pointer info including device pointer
+         * 
+         * @param ptr Pointer to query
+         * @param device_ptr Output: The device-accessible pointer (may be same or different)
+         * @param host_ptr Output: The host-accessible pointer
+         * @param mem_type Output: Memory type string for debugging
+         * @return true if query succeeded
+         */
+        bool getPointerInfo(const void* ptr, void** device_ptr, void** host_ptr, 
+                            std::string& mem_type) const;
+        
+        /**
+         * @brief Lock host memory with HSA API and get GPU-accessible pointer
+         * 
+         * Uses hsa_amd_memory_lock() to pin host memory and get a pointer
+         * that GPU agents can use. This is a lower-level API than hipHostRegister
+         * and may work for memory regions that hipHostRegister rejects.
+         * 
+         * @param host_ptr Host pointer to lock (can be mmap'd memory)
+         * @param size Size of the region in bytes
+         * @param agent_ptr Output: GPU-accessible pointer
+         * @return true if lock succeeded, false otherwise
+         */
+        bool hsaMemoryLock(void* host_ptr, size_t size, void** agent_ptr);
+        
+        /**
+         * @brief Unlock previously locked memory
+         * @param host_ptr Host pointer that was locked
+         */
+        void hsaMemoryUnlock(void* host_ptr);
+        
+        /**
+         * @brief Map a dmabuf/interop buffer using HSA interop API
+         * 
+         * Uses hsa_amd_interop_map_buffer() to map a dmabuf file descriptor
+         * into the GPU address space. This is the most direct path to get
+         * kernel-accessible pointers for external memory.
+         * 
+         * @param dmabuf_fd File descriptor of the dmabuf (or PCIe BAR resource fd)
+         * @param size Output: Size of the mapped buffer (filled by API)
+         * @param device_ptr Output: GPU-accessible pointer
+         * @return true if mapping succeeded, false otherwise
+         */
+        bool hsaInteropMapBuffer(int dmabuf_fd, size_t* size, void** device_ptr);
+        
+        /**
+         * @brief Unmap a previously mapped interop buffer
+         * @param device_ptr The device pointer that was returned from hsaInteropMapBuffer
+         */
+        void hsaInteropUnmapBuffer(void* device_ptr);
+        
+        /**
+         * @brief Import external memory via HIP external memory API
+         * 
+         * Uses hipImportExternalMemory() to import memory from a file descriptor.
+         * This is the HIP-level API for external memory interop.
+         * 
+         * @param fd File descriptor of the external memory
+         * @param size Size of the external memory region
+         * @param device_ptr Output: Device-accessible pointer
+         * @return true if import succeeded, false otherwise
+         */
+        bool importExternalMemory(int fd, size_t size, void** device_ptr);
+        
+        /**
+         * @brief Get the HSA agent handle for a given device
+         * 
+         * This is needed for low-level HSA operations.
+         * 
+         * @param device_id Device index
+         * @param agent Output: HSA agent handle (as uint64_t to avoid header deps)
+         * @return true if query succeeded
+         */
+        bool getHsaAgent(int device_id, uint64_t* agent);
+
     private:
         int device_count_;
     };

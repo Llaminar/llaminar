@@ -11,9 +11,11 @@
 #include "CollectiveContext.h"
 #include "DeviceWorkspaceManager.h"
 #include "../collective/backends/PCIeBARBackend.h"
+#include "../collective/ILocalTPContext.h"
 #include "../backends/BackendManager.h"
 #include "../interfaces/IWorkspaceConsumer.h"
 #include "../execution/compute_stages/IComputeStage.h"
+#include "../models/qwen/Qwen2BufferSpec.h"
 #include "../tensors/TensorClasses.h"
 #include "../utils/Logger.h"
 
@@ -69,33 +71,71 @@ namespace llaminar2
 
     bool GraphBufferManager::shouldUseBarAllocation(const BufferDescriptor &desc) const
     {
-        // Must be marked as collective buffer
-        if (!desc.participates_in_collective || desc.collective_id.empty())
+        // =====================================================================
+        // Path 1: Explicit collective buffer marking (existing behavior)
+        // =====================================================================
+        // If buffer is explicitly marked as collective, use existing logic
+        if (desc.participates_in_collective && !desc.collective_id.empty())
         {
-            return false;
+            // Must target a ROCm device (BAR allocation is for AMD GPU memory)
+            if (!desc.device.is_rocm())
+            {
+                return false;
+            }
+
+            // Must have a collective context with BAR backend
+            if (!collective_ctx_)
+            {
+                return false;
+            }
+
+            // Check if the context has a PCIeBARBackend
+            PCIeBARBackend *bar_backend = collective_ctx_->getPCIeBarBackend();
+            if (!bar_backend)
+            {
+                return false;
+            }
+
+            // Check if the backend requires registration
+            return bar_backend->requiresBufferRegistration();
         }
 
-        // Must target a ROCm device (BAR allocation is for AMD GPU memory)
-        if (!desc.device.is_rocm())
+        // =====================================================================
+        // Path 2: Automatic detection via Qwen2BufferSpec (Phase 3)
+        // =====================================================================
+        // Check if buffer name matches row-parallel outputs AND config enables
+        // BAR allocation (LOCAL TP with PCIeBAR backend)
+        if (Qwen2BufferSpec::requiresBARBacked(desc.name, config_.collective_backend, config_.tp_degree))
         {
-            return false;
+            // Must target a ROCm device for BAR allocation
+            if (!desc.device.is_rocm())
+            {
+                LOG_TRACE("[GraphBufferManager] Buffer '" << desc.name
+                                                          << "' requires BAR but device is not ROCm ("
+                                                          << desc.device.toString() << ")");
+                return false;
+            }
+
+            // Check if we have a collective context with BAR backend
+            if (collective_ctx_)
+            {
+                PCIeBARBackend *bar_backend = collective_ctx_->getPCIeBarBackend();
+                if (bar_backend && bar_backend->requiresBufferRegistration())
+                {
+                    LOG_DEBUG("[GraphBufferManager] Auto-detected BAR requirement for '"
+                              << desc.name << "' (row-parallel output with PCIeBAR backend)");
+                    return true;
+                }
+            }
+
+            // No collective context yet, but config indicates we need BAR allocation
+            // This can happen if collective context is set after buffer allocation
+            LOG_TRACE("[GraphBufferManager] Buffer '" << desc.name
+                                                      << "' identified as needing BAR by Qwen2BufferSpec, "
+                                                      << "but no CollectiveContext with BAR backend available yet");
         }
 
-        // Must have a collective context with BAR backend
-        if (!collective_ctx_)
-        {
-            return false;
-        }
-
-        // Check if the context has a PCIeBARBackend
-        PCIeBARBackend *bar_backend = collective_ctx_->getPCIeBarBackend();
-        if (!bar_backend)
-        {
-            return false;
-        }
-
-        // Check if the backend requires registration
-        return bar_backend->requiresBufferRegistration();
+        return false;
     }
 
     std::unique_ptr<TensorBase> GraphBufferManager::allocateFromBarRegion(
@@ -668,6 +708,46 @@ namespace llaminar2
         switch (desc.tensor_type)
         {
         case BufferTensorType::FP32:
+        {
+            // =========================================================
+            // BAR-Backed Allocation Path (Phase 3)
+            // =========================================================
+            // Check if this buffer should be BAR-backed for PCIeBAR allreduce
+            // Conditions:
+            // 1. Buffer identified as row-parallel output by Qwen2BufferSpec
+            // 2. TensorFactory can create BAR-backed tensors (P2P configured)
+            // 3. Config has valid ROCm and CUDA device pair
+            // 4. THIS DEVICE is the ROCm device (not CUDA!)
+            //    - CUDA device gets standard FP32Tensor
+            //    - ROCm device gets BAR-backed tensor for cross-device access
+            if (Qwen2BufferSpec::requiresBARBacked(desc.name, config_.collective_backend, config_.tp_degree) &&
+                factory_->canCreateBARBacked() &&
+                config_.rocm_device.is_rocm() && 
+                config_.cuda_device.is_cuda() &&
+                device.is_rocm())  // Only BAR-backed for ROCm device!
+            {
+                try
+                {
+                    auto bar_tensor = factory_->createFP32BARBacked(
+                        shape, config_.rocm_device, config_.cuda_device);
+                    if (bar_tensor)
+                    {
+                        LOG_DEBUG("GraphBufferManager: Created BAR-backed FP32 tensor for '"
+                                  << desc.name << "' (row-parallel output on ROCm device, PCIeBAR allreduce)");
+                        return bar_tensor;
+                    }
+                }
+                catch (const std::exception &e)
+                {
+                    LOG_WARN("GraphBufferManager: BAR-backed allocation failed for '"
+                             << desc.name << "': " << e.what()
+                             << " - falling back to regular allocation");
+                }
+            }
+
+            // =========================================================
+            // Mapped Memory Path (for snapshot/debugging)
+            // =========================================================
             // Use mapped memory for FP32 activation buffers when configured
             // This enables zero-copy GPU↔CPU access for snapshot/debugging mode
             if (config_.use_mapped_memory && device.is_gpu())
@@ -683,7 +763,12 @@ namespace llaminar2
                 LOG_WARN("GraphBufferManager: Mapped allocation failed for '"
                          << desc.name << "', using regular allocation");
             }
+
+            // =========================================================
+            // Standard Allocation Path
+            // =========================================================
             return factory_->createFP32(shape, device);
+        }
 
         case BufferTensorType::FP16:
             return factory_->createFP16(shape);

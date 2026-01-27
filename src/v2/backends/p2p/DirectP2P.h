@@ -181,6 +181,23 @@ namespace llaminar2
         ~DirectP2PEngine();
 
         /**
+         * @brief Get the shared singleton instance of DirectP2PEngine
+         *
+         * The DirectP2PEngine manages CUDA IOMEMORY registrations and BAR mappings
+         * which cannot be reliably re-initialized after cleanup within a process.
+         * Using a singleton ensures that:
+         * 1. BAR resources are initialized once and shared
+         * 2. Tests don't conflict by creating/destroying separate engines
+         * 3. CUDA primary context state remains stable
+         *
+         * The singleton is lazily initialized on first call and lives until
+         * process exit.
+         *
+         * @return Shared pointer to the singleton engine
+         */
+        static std::shared_ptr<DirectP2PEngine> getSharedInstance();
+
+        /**
          * @brief Probe system capabilities for direct P2P
          *
          * Checks driver versions, kernel support, and hardware capabilities.
@@ -360,11 +377,31 @@ namespace llaminar2
          */
         DirectP2PResult benchmarkAllModes(size_t num_bytes, int iterations = 5);
 
+        /**
+         * @brief Get the cached measured bandwidth (GB/s)
+         *
+         * Returns the bandwidth measured during initialization, or 0 if
+         * the engine hasn't been benchmarked yet.
+         *
+         * @return Measured bandwidth in GB/s
+         */
+        double getCachedBandwidthGBps() const { return cached_bandwidth_gbps_; }
+
+        /**
+         * @brief Set the cached measured bandwidth
+         *
+         * Called after benchmarking during initialization.
+         *
+         * @param bandwidth Measured bandwidth in GB/s
+         */
+        void setCachedBandwidthGBps(double bandwidth) { cached_bandwidth_gbps_ = bandwidth; }
+
     private:
         struct Impl;
         std::unique_ptr<Impl> impl_;
 
         bool pcie_bar_active_ = false;
+        double cached_bandwidth_gbps_ = 0.0;
     };
 
 #else

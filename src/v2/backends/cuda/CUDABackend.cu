@@ -308,7 +308,8 @@ namespace llaminar2
         err = cudaFree(ptr);
         if (err != cudaSuccess)
         {
-            LOG_ERROR("[CUDABackend] cudaFree failed: " << cudaGetErrorString(err));
+            LOG_ERROR("[CUDABackend] cudaFree failed for ptr=" << std::hex << ptr << std::dec 
+                      << " on device " << device_id << ": " << cudaGetErrorString(err));
         }
     }
 
