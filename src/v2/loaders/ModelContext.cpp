@@ -84,6 +84,11 @@ namespace llaminar2
         float ropeTheta() const override { return loader_.ropeTheta(); }
         float rmsNormEps() const override { return loader_.rmsNormEps(); }
 
+        std::optional<std::vector<size_t>> getTensorShape(const std::string &name) const override
+        {
+            return loader_.getTensorShape(name);
+        }
+
     private:
         ModelLoader &loader_;
     };

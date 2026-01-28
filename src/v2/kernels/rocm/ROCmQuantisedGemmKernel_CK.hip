@@ -1864,10 +1864,12 @@ extern "C"
     //
     // =========================================================================
 
-    void rocmQuantGemm_freeDevice(void *d_ptr)
+    void rocmQuantGemm_freeDevice(void *d_ptr, int rocm_device_id)
     {
         if (d_ptr)
         {
+            // Set device before freeing - required by HIP/CUDA
+            hipSetDevice(rocm_device_id);
             hipFree(d_ptr);
         }
     }

@@ -358,6 +358,20 @@ namespace llaminar2
         return model_.findTensor(tensor_name) != nullptr;
     }
 
+    std::optional<std::vector<size_t>> ModelLoader::getTensorShape(const std::string &name) const
+    {
+        if (!loaded_)
+        {
+            return std::nullopt;
+        }
+        const GGUFTensorInfo *info = model_.findTensor(name);
+        if (!info)
+        {
+            return std::nullopt;
+        }
+        return info->dimensions;
+    }
+
     std::shared_ptr<TensorBase> ModelLoader::loadTensor(const std::string &tensor_name,
                                                         DeviceId device,
                                                         WeightPrecision weight_precision)

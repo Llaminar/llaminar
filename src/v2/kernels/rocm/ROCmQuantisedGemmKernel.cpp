@@ -201,8 +201,8 @@ namespace llaminar2
             int rocmQuantGemm_getMinN();
             int rocmQuantGemm_getMinK();
 
-            // Free device memory
-            void rocmQuantGemm_freeDevice(void *d_ptr);
+            // Free device memory (must set device before freeing)
+            void rocmQuantGemm_freeDevice(void *d_ptr, int rocm_device_id);
 
             // Memory management helpers
             bool rocmQuantGemm_allocFloat(float **d_ptr, size_t count, int rocm_device_id);
@@ -313,15 +313,18 @@ namespace llaminar2
             // Flag to track if we own weight memory
             bool owns_weight_memory = false;
 
+            // ROCm device ID for proper cleanup
+            int rocm_device_id = 0;
+
             ~Impl()
             {
                 // Only free weight memory if we own it (not from ROCmPackedWeights cache)
                 if (owns_weight_memory)
                 {
                     if (d_weights_int8)
-                        rocmQuantGemm_freeDevice(d_weights_int8);
+                        rocmQuantGemm_freeDevice(d_weights_int8, rocm_device_id);
                     if (d_scales_B)
-                        rocmQuantGemm_freeDevice(d_scales_B);
+                        rocmQuantGemm_freeDevice(d_scales_B, rocm_device_id);
                 }
                 // Work buffers are NOT freed - they are owned by workspace
             }
@@ -341,9 +344,9 @@ namespace llaminar2
                           << " rocm_device_id=" << rocm_device_id);
             }
             if (d_int8_data)
-                rocmQuantGemm_freeDevice(d_int8_data);
+                rocmQuantGemm_freeDevice(d_int8_data, rocm_device_id);
             if (d_scales)
-                rocmQuantGemm_freeDevice(d_scales);
+                rocmQuantGemm_freeDevice(d_scales, rocm_device_id);
         }
 
         // =====================================================================
@@ -500,7 +503,8 @@ namespace llaminar2
                     std::to_string(static_cast<int>(wt)));
             }
 
-            impl_->owns_weight_memory = true; // Legacy constructor owns weight memory
+            impl_->owns_weight_memory = true;        // Legacy constructor owns weight memory
+            impl_->rocm_device_id = rocm_device_id_; // Store device ID for cleanup
 
             LOG_DEBUG("[ROCmQuantisedGemmKernel] Created (legacy) for " << N_ << "x" << K_
                                                                         << " quantized weights (type=" << static_cast<int>(wt)
@@ -525,7 +529,8 @@ namespace llaminar2
             N_ = static_cast<size_t>(packed->N);
             K_ = static_cast<size_t>(packed->K);
 
-            impl_->owns_weight_memory = false; // Pre-packed path doesn't own weight memory
+            impl_->owns_weight_memory = false;       // Pre-packed path doesn't own weight memory
+            impl_->rocm_device_id = rocm_device_id_; // Store device ID for cleanup
 
             LOG_DEBUG("[ROCmQuantisedGemmKernel] Created (pre-packed) for " << N_ << "x" << K_
                                                                             << " INT8 weights on ROCm device " << rocm_device_id_);
@@ -630,7 +635,7 @@ namespace llaminar2
             // where ROCm kernels write directly to BAR memory that CUDA can then read.
             const float *d_input = nullptr;
             float *d_output = nullptr;
-            
+
             if (A_fp32->isBARBacked() && A_fp32->rocm_data_ptr() != nullptr)
             {
                 d_input = static_cast<const float *>(A_fp32->rocm_data_ptr());
@@ -640,7 +645,7 @@ namespace llaminar2
             {
                 d_input = static_cast<const float *>(A_fp32->gpu_data_ptr());
             }
-            
+
             if (C_fp32->isBARBacked() && C_fp32->rocm_data_ptr() != nullptr)
             {
                 d_output = static_cast<float *>(C_fp32->rocm_data_ptr());
@@ -650,7 +655,7 @@ namespace llaminar2
             {
                 d_output = static_cast<float *>(C_fp32->gpu_data_ptr());
             }
-            
+
             const bool use_gpu_path = (d_input != nullptr) && (d_output != nullptr);
 
             auto phase_start = std::chrono::high_resolution_clock::now();
@@ -669,7 +674,7 @@ namespace llaminar2
                 {
                     d_bias = static_cast<const float *>(bias->gpu_data_ptr());
                 }
-                
+
                 if (d_bias)
                 {
                     LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using bias path (d_input="
@@ -1303,7 +1308,7 @@ namespace llaminar2
                 if (ck_int32_size > rocm_kernel->impl_->d_CK_int32_capacity)
                 {
                     if (rocm_kernel->impl_->d_CK_int32)
-                        rocmQuantGemm_freeDevice(rocm_kernel->impl_->d_CK_int32);
+                        rocmQuantGemm_freeDevice(rocm_kernel->impl_->d_CK_int32, rocm_device_id_);
                     rocm_kernel->impl_->d_CK_int32 = nullptr;
                     rocm_kernel->impl_->d_CK_int32_capacity = 0;
 

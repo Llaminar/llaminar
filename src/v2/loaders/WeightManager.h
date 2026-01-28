@@ -19,7 +19,7 @@
 
 #pragma once
 
-#include "ModelLoader.h"
+#include "../interfaces/IModelLoader.h"
 #include "WeightPlacementMap.h"
 #include "../backends/DeviceId.h"
 #include "../config/TensorParallelConfig.h"
@@ -78,13 +78,13 @@ namespace llaminar2
         /**
          * @brief Construct weight manager
          *
-         * @param loader ModelLoader for GGUF tensor loading
+         * @param loader Model loader interface for tensor loading (GGUF, mock, etc.)
          * @param mpi_ctx MPI context for rank coordination (nullptr = single rank)
          * @param placement_map Fine-grained weight→device mapping (nullptr = default to device 0)
          * @param strategy Distribution strategy (default: REPLICATED)
          * @param weight_precision How weights are loaded (NATIVE, CONVERT_TO_FP32, etc.)
          */
-        WeightManager(ModelLoader &loader,
+        WeightManager(IModelLoader &loader,
                       std::shared_ptr<MPIContext> mpi_ctx = nullptr,
                       std::shared_ptr<WeightPlacementMap> placement_map = nullptr,
                       WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED,
@@ -409,7 +409,7 @@ namespace llaminar2
          */
         bool packWeight(TensorBase *tensor, DeviceId target_device, bool release_raw_data);
 
-        ModelLoader &loader_;                                                       ///< GGUF loader
+        IModelLoader &loader_;                                                      ///< Model loader (GGUF, mock, etc.)
         std::shared_ptr<MPIContext> mpi_ctx_;                                       ///< MPI context (nullptr = single rank)
         std::shared_ptr<WeightPlacementMap> placement_map_;                         ///< Fine-grained placement decisions
         std::shared_ptr<TensorParallelConfig> tp_config_;                           ///< Tensor parallelism configuration (optional)
@@ -521,6 +521,82 @@ namespace llaminar2
             size_t row_start,
             size_t row_count);
 
+    private:
+        // ========================================================================
+        // Sharding helper methods (used by getShardedWeightForAssignment)
+        // ========================================================================
+
+        /**
+         * @brief Load a column-parallel 1D bias tensor (e.g., Q/K/V biases)
+         *
+         * Slices a 1D bias tensor based on head assignment.
+         *
+         * @param name Tensor name
+         * @param device Target device
+         * @param assignment Device's sharding assignment
+         * @param dimensions Tensor dimensions
+         * @return Sliced bias tensor, or nullptr on error
+         */
+        std::shared_ptr<TensorBase> loadColumnParallel1DBias(
+            const std::string &name,
+            DeviceId device,
+            const DeviceShardingAssignment &assignment,
+            const std::vector<size_t> &dimensions);
+
+        /**
+         * @brief Load a column-parallel 2D weight tensor (Q/K/V, Gate/Up, LM Head)
+         *
+         * Slices rows based on the weight type (heads, d_ff, or vocab).
+         *
+         * @param name Tensor name
+         * @param device Target device
+         * @param assignment Device's sharding assignment
+         * @param dimensions Tensor dimensions
+         * @return Sliced weight tensor wrapped in TensorSlice, or nullptr on error
+         */
+        std::shared_ptr<TensorBase> loadColumnParallel2DWeight(
+            const std::string &name,
+            DeviceId device,
+            const DeviceShardingAssignment &assignment,
+            const std::vector<size_t> &dimensions);
+
+        /**
+         * @brief Load a row-parallel weight tensor (unused - Wo uses INPUT_PARALLEL)
+         *
+         * Slices rows based on head assignment for weights where output is reduced.
+         *
+         * @param name Tensor name
+         * @param device Target device
+         * @param assignment Device's sharding assignment
+         * @param dimensions Tensor dimensions
+         * @return Sliced weight tensor wrapped in TensorSlice, or nullptr on error
+         */
+        std::shared_ptr<TensorBase> loadRowParallelWeight(
+            const std::string &name,
+            DeviceId device,
+            const DeviceShardingAssignment &assignment,
+            const std::vector<size_t> &dimensions);
+
+        /**
+         * @brief Load an input-parallel weight tensor (Wo, FFN Down)
+         *
+         * Slices columns based on weight type:
+         * - Wo: slices by head assignment (matches Q/K/V output)
+         * - FFN Down: slices by d_ff assignment (matches Gate/Up output)
+         *
+         * @param name Tensor name
+         * @param device Target device
+         * @param assignment Device's sharding assignment
+         * @param dimensions Tensor dimensions
+         * @return Sliced weight tensor wrapped in TensorSlice, or nullptr on error
+         */
+        std::shared_ptr<TensorBase> loadInputParallelWeight(
+            const std::string &name,
+            DeviceId device,
+            const DeviceShardingAssignment &assignment,
+            const std::vector<size_t> &dimensions);
+
+    public:
         /**
          * @brief Slice a specific column range from tensor
          *

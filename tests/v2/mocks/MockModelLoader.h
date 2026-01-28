@@ -138,6 +138,7 @@ namespace llaminar2::test
             WeightPrecision weight_precision = WeightPrecision::NATIVE) override;
 
         bool hasTensor(const std::string &name) const override;
+        std::optional<std::vector<size_t>> getTensorShape(const std::string &name) const override;
         std::vector<std::string> tensorNames() const override;
 
         std::string architecture() const override { return architecture_; }
@@ -377,6 +378,22 @@ namespace llaminar2::test
     inline bool MockModelLoader::hasTensor(const std::string &name) const
     {
         return tensors_.find(name) != tensors_.end();
+    }
+
+    inline std::optional<std::vector<size_t>> MockModelLoader::getTensorShape(const std::string &name) const
+    {
+        auto it = tensor_shapes_.find(name);
+        if (it == tensor_shapes_.end())
+        {
+            // Fall back to getting shape from tensor if it exists
+            auto tensor_it = tensors_.find(name);
+            if (tensor_it == tensors_.end())
+            {
+                return std::nullopt;
+            }
+            return tensor_it->second->shape();
+        }
+        return it->second;
     }
 
     inline std::vector<std::string> MockModelLoader::tensorNames() const

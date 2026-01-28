@@ -3156,6 +3156,9 @@ add_v2_test(V2_Unit_WeightPlacementMap
 # Tests weight sharding for tensor parallelism (Phase 1: row-parallel only)
 add_executable(v2_test_weight_manager_sharding unit/loaders/Test__WeightManagerSharding.cpp)
 target_link_libraries(v2_test_weight_manager_sharding llaminar2_core GTest::gtest_main)
+target_include_directories(v2_test_weight_manager_sharding PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ includes
+)
 add_v2_test(V2_Unit_WeightManagerSharding
     COMMAND $<TARGET_FILE:v2_test_weight_manager_sharding>
     LABELS "V2;Unit;TensorParallelism;WeightSharding;RowParallel"

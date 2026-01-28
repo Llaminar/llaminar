@@ -1141,12 +1141,27 @@ namespace llaminar2
             {
                 // For column-parallel, each device has shape [seq_len, local_cols]
                 // local_cols = global_cols / tp_degree
-                // We can infer from model config: hidden_size / tp_degree
+                // Different stages have different global widths:
+                //   - ATTENTION_CONTEXT: hidden_size (896 for Qwen2.5-0.5B)
+                //   - FFN_SWIGLU: d_ff (4864 for Qwen2.5-0.5B)
+                //   - FFN_RESIDUAL: hidden_size after allreduce (back to 896)
                 size_t local_cols = 0;
                 if (model_ctx_)
                 {
-                    size_t hidden_size = model_ctx_->embeddingLength();
-                    local_cols = hidden_size / static_cast<size_t>(result.tp_degree);
+                    // Check if this is an FFN stage (contains "FFN" but NOT "RESIDUAL")
+                    // FFN_SWIGLU output is [seq_len, d_ff_local] where d_ff_local = d_ff / tp_degree
+                    bool is_ffn_stage =
+                        (key.find("FFN") != std::string::npos && key.find("RESIDUAL") == std::string::npos);
+                    if (is_ffn_stage)
+                    {
+                        size_t d_ff = static_cast<size_t>(model_ctx_->feedForwardLength());
+                        local_cols = d_ff / static_cast<size_t>(result.tp_degree);
+                    }
+                    else
+                    {
+                        size_t hidden_size = model_ctx_->embeddingLength();
+                        local_cols = hidden_size / static_cast<size_t>(result.tp_degree);
+                    }
                 }
 
                 // If we couldn't get from model config, estimate from data size

@@ -244,6 +244,13 @@ namespace llaminar2
         bool hasTensor(const std::string &tensor_name) const override;
 
         /**
+         * @brief Get tensor shape without loading the full tensor
+         * @param name Tensor name
+         * @return Optional vector of dimensions, or std::nullopt if tensor not found
+         */
+        std::optional<std::vector<size_t>> getTensorShape(const std::string &name) const override;
+
+        /**
          * @brief Get parsed model metadata
          */
         const GGUFModel &getModel() const { return model_; }

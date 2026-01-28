@@ -180,7 +180,10 @@ if(HAVE_ROCM)
     # ROCm compile flags - only architectures supporting DL (Deep Learning) instructions
     # CK requires specific arch macros: gfx906, gfx908, gfx90a (MI50/MI100/MI200)
     # NOT supported: gfx900 (no DL), gfx940 (CK expects gfx942), gfx1030/gfx1100 (RDNA)
-    set(CMAKE_HIP_ARCHITECTURES "gfx906;gfx908;gfx90a")
+    # Currently targeting only gfx906 (MI50) for faster compilation
+    set(CMAKE_HIP_ARCHITECTURES "gfx906")
+    # Note: hipcc's -parallel-jobs conflicts with CMake's --parallel, so we rely
+    # on CMake's build parallelism instead (multiple hipcc processes in parallel)
 endif()
 
 # =============================================================================

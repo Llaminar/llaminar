@@ -15,7 +15,7 @@
 #include <stdexcept>
 #include <sstream>
 #include <cstring>
-#include <dlfcn.h>  // For HSA runtime loading
+#include <dlfcn.h> // For HSA runtime loading
 
 namespace llaminar2
 {
@@ -354,15 +354,35 @@ namespace llaminar2
         hipError_t err = hipSetDevice(device_id);
         if (err != hipSuccess)
         {
-            LOG_ERROR("[ROCmBackend] Failed to set device " << device_id << " before hipFree: "
-                                                            << hipGetErrorString(err));
+            // During shutdown, hipSetDevice may fail - this is expected
+            if (err == hipErrorDeinitialized || err == hipErrorContextIsDestroyed)
+            {
+                LOG_DEBUG("[ROCmBackend] hipSetDevice failed during shutdown (expected): "
+                          << hipGetErrorString(err));
+            }
+            else
+            {
+                LOG_ERROR("[ROCmBackend] Failed to set device " << device_id << " before hipFree: "
+                                                                << hipGetErrorString(err));
+            }
             return;
         }
 
         err = hipFree(ptr);
         if (err != hipSuccess)
         {
-            LOG_ERROR("[ROCmBackend] hipFree failed: " << hipGetErrorString(err));
+            // During shutdown, hipFree may fail with "invalid argument" if the memory
+            // was already cleaned up by the HIP runtime or the pointer is stale.
+            // Also handle explicit deinitialization errors.
+            if (err == hipErrorDeinitialized || err == hipErrorContextIsDestroyed ||
+                err == hipErrorInvalidValue)
+            {
+                LOG_DEBUG("[ROCmBackend] hipFree skipped (driver shutting down or memory already freed)");
+            }
+            else
+            {
+                LOG_ERROR("[ROCmBackend] hipFree failed: " << hipGetErrorString(err));
+            }
         }
     }
 
@@ -577,12 +597,12 @@ namespace llaminar2
     // Extended Operations
     // ====================================================================
 
-    bool ROCmBackend::queryPointerAttributes(const void* ptr, bool& is_device_ptr, bool& is_host_ptr,
-                                             bool& is_managed, int& device_id) const
+    bool ROCmBackend::queryPointerAttributes(const void *ptr, bool &is_device_ptr, bool &is_host_ptr,
+                                             bool &is_managed, int &device_id) const
     {
         hipPointerAttribute_t attr;
         hipError_t err = hipPointerGetAttributes(&attr, ptr);
-        
+
         if (err != hipSuccess)
         {
             // Reset outputs
@@ -592,18 +612,18 @@ namespace llaminar2
             device_id = -1;
             return false;
         }
-        
+
         // Interpret the memory type
         // hipMemoryType: hipMemoryTypeHost, hipMemoryTypeDevice, hipMemoryTypeUnified, hipMemoryTypeManaged
         is_host_ptr = (attr.type == hipMemoryTypeHost);
         is_device_ptr = (attr.type == hipMemoryTypeDevice);
         is_managed = (attr.type == hipMemoryTypeManaged || attr.type == hipMemoryTypeUnified);
         device_id = attr.device;
-        
+
         return true;
     }
 
-    bool ROCmBackend::deviceToDevice(void* dst, const void* src, size_t bytes, int device_id)
+    bool ROCmBackend::deviceToDevice(void *dst, const void *src, size_t bytes, int device_id)
     {
         if (device_id >= device_count_ || device_id < 0)
         {
@@ -620,30 +640,30 @@ namespace llaminar2
         return (err == hipSuccess);
     }
 
-    bool ROCmBackend::registerIoMemory(void* ptr, size_t size, void** device_ptr)
+    bool ROCmBackend::registerIoMemory(void *ptr, size_t size, void **device_ptr)
     {
         if (!ptr || size == 0 || !device_ptr)
         {
             return false;
         }
-        
+
         *device_ptr = nullptr;
-        
+
         // Try hipHostRegister with different flag combinations
         // hipHostRegisterIoMemory = 0x4 (maps IO memory to device address space)
         // hipHostRegisterMapped = 0x2 (maps host memory to device address space)
         // hipHostRegisterPortable = 0x1 (memory can be accessed from any context)
-        
+
         hipError_t err;
-        
+
         // Attempt 1: IoMemory flag (most promising for BAR memory)
         LOG_DEBUG("[ROCmBackend::registerIoMemory] Trying hipHostRegisterIoMemory flag");
         err = hipHostRegister(ptr, size, hipHostRegisterIoMemory);
-        
+
         if (err == hipSuccess)
         {
             LOG_INFO("[ROCmBackend::registerIoMemory] hipHostRegisterIoMemory succeeded!");
-            
+
             err = hipHostGetDevicePointer(device_ptr, ptr, 0);
             if (err == hipSuccess && *device_ptr != nullptr)
             {
@@ -652,25 +672,25 @@ namespace llaminar2
             }
             else
             {
-                LOG_WARN("[ROCmBackend::registerIoMemory] hipHostGetDevicePointer failed: " 
+                LOG_WARN("[ROCmBackend::registerIoMemory] hipHostGetDevicePointer failed: "
                          << hipGetErrorString(err));
                 hipHostUnregister(ptr);
             }
         }
         else
         {
-            LOG_DEBUG("[ROCmBackend::registerIoMemory] hipHostRegisterIoMemory failed: " 
-                     << hipGetErrorString(err));
+            LOG_DEBUG("[ROCmBackend::registerIoMemory] hipHostRegisterIoMemory failed: "
+                      << hipGetErrorString(err));
         }
-        
+
         // Attempt 2: Mapped + Portable flags
         LOG_DEBUG("[ROCmBackend::registerIoMemory] Trying hipHostRegisterMapped | hipHostRegisterPortable");
         err = hipHostRegister(ptr, size, hipHostRegisterMapped | hipHostRegisterPortable);
-        
+
         if (err == hipSuccess)
         {
             LOG_INFO("[ROCmBackend::registerIoMemory] hipHostRegisterMapped succeeded!");
-            
+
             err = hipHostGetDevicePointer(device_ptr, ptr, 0);
             if (err == hipSuccess && *device_ptr != nullptr)
             {
@@ -679,25 +699,25 @@ namespace llaminar2
             }
             else
             {
-                LOG_WARN("[ROCmBackend::registerIoMemory] hipHostGetDevicePointer failed: " 
+                LOG_WARN("[ROCmBackend::registerIoMemory] hipHostGetDevicePointer failed: "
                          << hipGetErrorString(err));
                 hipHostUnregister(ptr);
             }
         }
         else
         {
-            LOG_DEBUG("[ROCmBackend::registerIoMemory] hipHostRegisterMapped failed: " 
-                     << hipGetErrorString(err));
+            LOG_DEBUG("[ROCmBackend::registerIoMemory] hipHostRegisterMapped failed: "
+                      << hipGetErrorString(err));
         }
-        
+
         // Attempt 3: Default flags
         LOG_DEBUG("[ROCmBackend::registerIoMemory] Trying hipHostRegisterDefault");
         err = hipHostRegister(ptr, size, hipHostRegisterDefault);
-        
+
         if (err == hipSuccess)
         {
             LOG_INFO("[ROCmBackend::registerIoMemory] hipHostRegisterDefault succeeded!");
-            
+
             err = hipHostGetDevicePointer(device_ptr, ptr, 0);
             if (err == hipSuccess && *device_ptr != nullptr)
             {
@@ -709,111 +729,115 @@ namespace llaminar2
                 hipHostUnregister(ptr);
             }
         }
-        
+
         LOG_WARN("[ROCmBackend::registerIoMemory] All registration attempts failed for ptr=" << ptr);
         return false;
     }
-    
-    void ROCmBackend::unregisterIoMemory(void* ptr)
+
+    void ROCmBackend::unregisterIoMemory(void *ptr)
     {
         if (ptr)
         {
             hipError_t err = hipHostUnregister(ptr);
             if (err != hipSuccess)
             {
-                LOG_WARN("[ROCmBackend::unregisterIoMemory] hipHostUnregister failed: " 
+                LOG_WARN("[ROCmBackend::unregisterIoMemory] hipHostUnregister failed: "
                          << hipGetErrorString(err));
             }
         }
     }
-    
-    bool ROCmBackend::getPointerInfo(const void* ptr, void** device_ptr, void** host_ptr,
-                                     std::string& mem_type) const
+
+    bool ROCmBackend::getPointerInfo(const void *ptr, void **device_ptr, void **host_ptr,
+                                     std::string &mem_type) const
     {
         if (!ptr)
         {
             return false;
         }
-        
+
         hipPointerAttribute_t attr;
         std::memset(&attr, 0, sizeof(attr));
-        
+
         hipError_t err = hipPointerGetAttributes(&attr, ptr);
-        
+
         if (err != hipSuccess)
         {
             mem_type = "unknown (query failed: " + std::string(hipGetErrorString(err)) + ")";
-            if (device_ptr) *device_ptr = nullptr;
-            if (host_ptr) *host_ptr = nullptr;
+            if (device_ptr)
+                *device_ptr = nullptr;
+            if (host_ptr)
+                *host_ptr = nullptr;
             return false;
         }
-        
-        if (device_ptr) *device_ptr = attr.devicePointer;
-        if (host_ptr) *host_ptr = attr.hostPointer;
-        
+
+        if (device_ptr)
+            *device_ptr = attr.devicePointer;
+        if (host_ptr)
+            *host_ptr = attr.hostPointer;
+
         // Decode memory type
         switch (attr.type)
         {
-            case hipMemoryTypeHost:
-                mem_type = "host";
-                break;
-            case hipMemoryTypeDevice:
-                mem_type = "device";
-                break;
-            case hipMemoryTypeManaged:
-                mem_type = "managed";
-                break;
-            case hipMemoryTypeUnified:
-                mem_type = "unified";
-                break;
-            default:
-                mem_type = "unknown(" + std::to_string(static_cast<int>(attr.type)) + ")";
-                break;
+        case hipMemoryTypeHost:
+            mem_type = "host";
+            break;
+        case hipMemoryTypeDevice:
+            mem_type = "device";
+            break;
+        case hipMemoryTypeManaged:
+            mem_type = "managed";
+            break;
+        case hipMemoryTypeUnified:
+            mem_type = "unified";
+            break;
+        default:
+            mem_type = "unknown(" + std::to_string(static_cast<int>(attr.type)) + ")";
+            break;
         }
-        
+
         return true;
     }
-    
+
     // ====================================================================
     // HSA-Level Memory Operations
     // ====================================================================
-    
-    bool ROCmBackend::hsaMemoryLock(void* host_ptr, size_t size, void** agent_ptr)
+
+    bool ROCmBackend::hsaMemoryLock(void *host_ptr, size_t size, void **agent_ptr)
     {
         if (!host_ptr || !agent_ptr || size == 0)
         {
             return false;
         }
-        
-        LOG_INFO("[ROCmBackend::hsaMemoryLock] Attempting to lock " << size 
-                 << " bytes at " << std::hex << host_ptr << std::dec);
-        
+
+        LOG_INFO("[ROCmBackend::hsaMemoryLock] Attempting to lock " << size
+                                                                    << " bytes at " << std::hex << host_ptr << std::dec);
+
         // Use hipExtMallocWithFlags or try hipHostRegister with HSA underneath
         // First, let's try a simple approach: use HIP's internal HSA handle
-        
+
         // Get the HSA agent for the current GPU device
         // HIP wraps HSA, so we can access HSA functions through the hip runtime
-        
+
         // Try hipHostRegister with hipHostRegisterDefault first, then query device pointer
         // The key insight: hipMemcpy(D2D) works, so HIP internally knows how to access BAR
         // Maybe we can get that internal knowledge exposed via hipPointerGetAttributes
-        
+
         // Alternative approach: Use hipExtMallocWithFlags to create a "view" of existing memory
         // But this doesn't exist either...
-        
+
         // Let's try to use HSA directly via dlsym
-        void* hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
+        void *hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
         if (!hsa_handle)
         {
             LOG_ERROR("[ROCmBackend::hsaMemoryLock] Failed to load HSA runtime: " << dlerror());
             return false;
         }
-        
+
         // Type for hsa_amd_memory_lock
-        typedef int (*hsa_amd_memory_lock_fn)(void* host_ptr, size_t size,
-                                              void* agents, int num_agent,
-                                              void** agent_ptr);
-        
+        typedef int (*hsa_amd_memory_lock_fn)(void *host_ptr, size_t size,
+                                              void *agents, int num_agent,
+                                              void **agent_ptr);
+
         auto memory_lock = (hsa_amd_memory_lock_fn)dlsym(hsa_handle, "hsa_amd_memory_lock");
         if (!memory_lock)
         {
@@ -821,18 +845,18 @@ namespace llaminar2
             dlclose(hsa_handle);
             return false;
         }
-        
+
         LOG_INFO("[ROCmBackend::hsaMemoryLock] Found hsa_amd_memory_lock, calling...");
-        
-        // Call hsa_amd_memory_lock with NULL agents (all agents) 
+
+        // Call hsa_amd_memory_lock with NULL agents (all agents)
         // This pins the memory and returns a device-accessible pointer
         int status = memory_lock(host_ptr, size, nullptr, 0, agent_ptr);
-        
+
         dlclose(hsa_handle);
-        
-        if (status == 0)  // HSA_STATUS_SUCCESS = 0
+
+        if (status == 0) // HSA_STATUS_SUCCESS = 0
         {
-            LOG_INFO("[ROCmBackend::hsaMemoryLock] SUCCESS! agent_ptr = " 
+            LOG_INFO("[ROCmBackend::hsaMemoryLock] SUCCESS! agent_ptr = "
                      << std::hex << *agent_ptr << std::dec);
             return true;
         }
@@ -843,24 +867,24 @@ namespace llaminar2
             return false;
         }
     }
-    
-    void ROCmBackend::hsaMemoryUnlock(void* host_ptr)
+
+    void ROCmBackend::hsaMemoryUnlock(void *host_ptr)
     {
         if (!host_ptr)
         {
             return;
         }
-        
-        void* hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
+
+        void *hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
         if (!hsa_handle)
         {
             LOG_WARN("[ROCmBackend::hsaMemoryUnlock] Failed to load HSA runtime");
             return;
         }
-        
-        typedef int (*hsa_amd_memory_unlock_fn)(void* host_ptr);
+
+        typedef int (*hsa_amd_memory_unlock_fn)(void *host_ptr);
         auto memory_unlock = (hsa_amd_memory_unlock_fn)dlsym(hsa_handle, "hsa_amd_memory_unlock");
-        
+
         if (memory_unlock)
         {
             int status = memory_unlock(host_ptr);
@@ -869,41 +893,41 @@ namespace llaminar2
                 LOG_WARN("[ROCmBackend::hsaMemoryUnlock] hsa_amd_memory_unlock failed: " << status);
             }
         }
-        
+
         dlclose(hsa_handle);
     }
-    
+
     // ====================================================================
     // HSA Interop and External Memory Operations
     // ====================================================================
-    
-    bool ROCmBackend::hsaInteropMapBuffer(int dmabuf_fd, size_t* size, void** device_ptr)
+
+    bool ROCmBackend::hsaInteropMapBuffer(int dmabuf_fd, size_t *size, void **device_ptr)
     {
         if (dmabuf_fd < 0 || !device_ptr)
         {
             return false;
         }
-        
+
         LOG_INFO("[ROCmBackend::hsaInteropMapBuffer] Attempting to map dmabuf fd=" << dmabuf_fd);
-        
-        void* hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
+
+        void *hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
         if (!hsa_handle)
         {
             LOG_ERROR("[ROCmBackend::hsaInteropMapBuffer] Failed to load HSA runtime: " << dlerror());
             return false;
         }
-        
+
         // hsa_amd_interop_map_buffer(num_agents, agents, interop_handle, flags, size, ptr, metadata_size, metadata)
         typedef int (*hsa_amd_interop_map_buffer_fn)(
             uint32_t num_agents,
-            void* agents,  // hsa_agent_t*
+            void *agents, // hsa_agent_t*
             int interop_handle,
             uint32_t flags,
-            size_t* size,
-            void** ptr,
-            size_t* metadata_size,
-            const void** metadata);
-        
+            size_t *size,
+            void **ptr,
+            size_t *metadata_size,
+            const void **metadata);
+
         auto interop_map = (hsa_amd_interop_map_buffer_fn)dlsym(hsa_handle, "hsa_amd_interop_map_buffer");
         if (!interop_map)
         {
@@ -911,30 +935,31 @@ namespace llaminar2
             dlclose(hsa_handle);
             return false;
         }
-        
+
         LOG_INFO("[ROCmBackend::hsaInteropMapBuffer] Found hsa_amd_interop_map_buffer, calling...");
-        
+
         // Call with NULL agents to allow access from all agents
         size_t mapped_size = 0;
-        void* mapped_ptr = nullptr;
-        
+        void *mapped_ptr = nullptr;
+
         int status = interop_map(
-            0,          // num_agents (0 = all agents)
-            nullptr,    // agents
-            dmabuf_fd,  // interop_handle (dmabuf fd)
-            0,          // flags (reserved, must be 0)
+            0,         // num_agents (0 = all agents)
+            nullptr,   // agents
+            dmabuf_fd, // interop_handle (dmabuf fd)
+            0,         // flags (reserved, must be 0)
             &mapped_size,
             &mapped_ptr,
-            nullptr,    // metadata_size (optional)
-            nullptr);   // metadata (optional)
-        
+            nullptr,  // metadata_size (optional)
+            nullptr); // metadata (optional)
+
         dlclose(hsa_handle);
-        
-        if (status == 0)  // HSA_STATUS_SUCCESS
+
+        if (status == 0) // HSA_STATUS_SUCCESS
         {
-            LOG_INFO("[ROCmBackend::hsaInteropMapBuffer] SUCCESS! mapped_ptr=" 
+            LOG_INFO("[ROCmBackend::hsaInteropMapBuffer] SUCCESS! mapped_ptr="
                      << std::hex << mapped_ptr << std::dec << ", size=" << mapped_size);
-            if (size) *size = mapped_size;
+            if (size)
+                *size = mapped_size;
             *device_ptr = mapped_ptr;
             return true;
         }
@@ -954,24 +979,24 @@ namespace llaminar2
             return false;
         }
     }
-    
-    void ROCmBackend::hsaInteropUnmapBuffer(void* device_ptr)
+
+    void ROCmBackend::hsaInteropUnmapBuffer(void *device_ptr)
     {
         if (!device_ptr)
         {
             return;
         }
-        
-        void* hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
+
+        void *hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
         if (!hsa_handle)
         {
             LOG_WARN("[ROCmBackend::hsaInteropUnmapBuffer] Failed to load HSA runtime");
             return;
         }
-        
-        typedef int (*hsa_amd_interop_unmap_buffer_fn)(void* ptr);
+
+        typedef int (*hsa_amd_interop_unmap_buffer_fn)(void *ptr);
         auto interop_unmap = (hsa_amd_interop_unmap_buffer_fn)dlsym(hsa_handle, "hsa_amd_interop_unmap_buffer");
-        
+
         if (interop_unmap)
         {
             int status = interop_unmap(device_ptr);
@@ -980,85 +1005,85 @@ namespace llaminar2
                 LOG_WARN("[ROCmBackend::hsaInteropUnmapBuffer] hsa_amd_interop_unmap_buffer failed: " << status);
             }
         }
-        
+
         dlclose(hsa_handle);
     }
-    
-    bool ROCmBackend::importExternalMemory(int fd, size_t size, void** device_ptr)
+
+    bool ROCmBackend::importExternalMemory(int fd, size_t size, void **device_ptr)
     {
         if (fd < 0 || !device_ptr || size == 0)
         {
             return false;
         }
-        
+
         LOG_INFO("[ROCmBackend::importExternalMemory] Attempting to import fd=" << fd << ", size=" << size);
-        
+
         // Use hipImportExternalMemory API
         hipExternalMemoryHandleDesc extMemHandleDesc = {};
         extMemHandleDesc.type = hipExternalMemoryHandleTypeOpaqueFd;
         extMemHandleDesc.handle.fd = fd;
         extMemHandleDesc.size = size;
         extMemHandleDesc.flags = 0;
-        
+
         hipExternalMemory_t extMem = nullptr;
         hipError_t err = hipImportExternalMemory(&extMem, &extMemHandleDesc);
-        
+
         if (err != hipSuccess)
         {
-            LOG_ERROR("[ROCmBackend::importExternalMemory] hipImportExternalMemory failed: " 
+            LOG_ERROR("[ROCmBackend::importExternalMemory] hipImportExternalMemory failed: "
                       << hipGetErrorString(err));
             *device_ptr = nullptr;
             return false;
         }
-        
+
         LOG_INFO("[ROCmBackend::importExternalMemory] hipImportExternalMemory succeeded, getting mapped buffer...");
-        
+
         // Map the external memory to a device pointer
         hipExternalMemoryBufferDesc bufferDesc = {};
         bufferDesc.offset = 0;
         bufferDesc.size = size;
         bufferDesc.flags = 0;
-        
-        void* mappedPtr = nullptr;
+
+        void *mappedPtr = nullptr;
         err = hipExternalMemoryGetMappedBuffer(&mappedPtr, extMem, &bufferDesc);
-        
+
         if (err != hipSuccess)
         {
-            LOG_ERROR("[ROCmBackend::importExternalMemory] hipExternalMemoryGetMappedBuffer failed: " 
+            LOG_ERROR("[ROCmBackend::importExternalMemory] hipExternalMemoryGetMappedBuffer failed: "
                       << hipGetErrorString(err));
             hipDestroyExternalMemory(extMem);
             *device_ptr = nullptr;
             return false;
         }
-        
-        LOG_INFO("[ROCmBackend::importExternalMemory] SUCCESS! mapped_ptr=" 
+
+        LOG_INFO("[ROCmBackend::importExternalMemory] SUCCESS! mapped_ptr="
                  << std::hex << mappedPtr << std::dec);
-        
+
         *device_ptr = mappedPtr;
         // Note: We should store extMem for later cleanup, but for now we're exploring
         return true;
     }
-    
-    bool ROCmBackend::getHsaAgent(int device_id, uint64_t* agent)
+
+    bool ROCmBackend::getHsaAgent(int device_id, uint64_t *agent)
     {
         if (!agent || device_id < 0 || device_id >= device_count_)
         {
             return false;
         }
-        
+
         // HIP exposes hipDeviceGetAttribute for getting the HSA agent
         // But we need to use HSA directly for this
-        
-        void* hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
+
+        void *hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
         if (!hsa_handle)
         {
             LOG_ERROR("[ROCmBackend::getHsaAgent] Failed to load HSA runtime");
             return false;
         }
-        
+
         // We need to iterate agents to find GPU agents
         // This is complex - for now, we'll use hipGetDeviceProperties to get the agent
-        
+
         hipDeviceProp_t prop;
         hipError_t err = hipGetDeviceProperties(&prop, device_id);
         if (err != hipSuccess)
@@ -1066,18 +1091,18 @@ namespace llaminar2
             dlclose(hsa_handle);
             return false;
         }
-        
+
         // The gcnArchName contains arch info but not the HSA agent handle directly
         // For proper implementation, we'd need to iterate HSA agents
-        
-        LOG_INFO("[ROCmBackend::getHsaAgent] Device " << device_id << ": " << prop.name 
-                 << ", arch=" << prop.gcnArchName);
-        
+
+        LOG_INFO("[ROCmBackend::getHsaAgent] Device " << device_id << ": " << prop.name
+                                                      << ", arch=" << prop.gcnArchName);
+
         dlclose(hsa_handle);
-        
+
         // Return placeholder - proper implementation would need HSA agent iteration
         *agent = 0;
-        return false;  // Not fully implemented yet
+        return false; // Not fully implemented yet
     }
 
 } // namespace llaminar2

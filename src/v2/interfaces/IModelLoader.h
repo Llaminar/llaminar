@@ -140,6 +140,17 @@ namespace llaminar2
         virtual bool hasTensor(const std::string &name) const = 0;
 
         /**
+         * @brief Get tensor shape without loading the full tensor
+         *
+         * Returns the dimensions of the tensor for slice calculation without
+         * loading the entire tensor into memory.
+         *
+         * @param name Tensor name
+         * @return Optional vector of dimensions, or std::nullopt if tensor not found
+         */
+        virtual std::optional<std::vector<size_t>> getTensorShape(const std::string &name) const = 0;
+
+        /**
          * @brief Get names of all tensors in the model
          * @return Vector of tensor names
          */

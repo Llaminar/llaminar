@@ -8,8 +8,12 @@
 
 #include "CollectiveContext.h"
 #include "DeviceInventory.h"
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 #include "../collective/backends/PCIeBARBackend.h"
+#endif
+#ifdef HAVE_CUDA
 #include "../collective/backends/NCCLBackend.h"
+#endif
 #include "../config/TPDomain.h"
 #include "../tensors/ITensor.h"
 #include "../tensors/TensorClasses.h" // For TensorBase (MPIStager compatibility)
@@ -300,6 +304,15 @@ namespace llaminar2
         size_t actual_seq_len,
         DeviceId tensor_device)
     {
+#ifndef HAVE_CUDA
+        // Strided allgather requires NCCL which requires CUDA
+        (void)local_input;
+        (void)full_output;
+        (void)actual_seq_len;
+        (void)tensor_device;
+        LOG_ERROR("CollectiveContext: stridedAllgather requires CUDA support");
+        return false;
+#else
         if (!router_)
         {
             LOG_ERROR("CollectiveContext: No router available for stridedAllgather");
@@ -379,6 +392,7 @@ namespace llaminar2
         }
 
         return success;
+#endif // HAVE_CUDA
     }
 
     bool CollectiveContext::executeAllgatherv(
@@ -636,17 +650,23 @@ namespace llaminar2
             return nullptr;
         }
 
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
         return static_cast<PCIeBARBackend *>(backend);
+#else
+        return nullptr;
+#endif
     }
 
     bool CollectiveContext::requiresBufferRegistration() const
     {
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
         // Check if any available backend requires buffer registration
         PCIeBARBackend *bar_backend = getPCIeBarBackend();
         if (bar_backend && bar_backend->requiresBufferRegistration())
         {
             return true;
         }
+#endif
 
         return false;
     }
