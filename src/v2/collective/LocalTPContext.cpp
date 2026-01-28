@@ -245,7 +245,7 @@ namespace llaminar2
 
             if (result)
             {
-                tensor->mark_device_dirty();
+                tensor->mark_device_dirty_with_event();
             }
             else
             {
@@ -392,7 +392,7 @@ namespace llaminar2
 
                 if (result)
                 {
-                    tensor->mark_device_dirty();
+                    tensor->mark_device_dirty_with_event();
                 }
                 return result;
             }
@@ -403,7 +403,7 @@ namespace llaminar2
 
             if (result)
             {
-                tensor->mark_device_dirty();
+                tensor->mark_device_dirty_with_event();
             }
             return result;
         }
@@ -710,9 +710,9 @@ namespace llaminar2
                 }
                 rocm_backend->synchronize(rocm_device.toKernelDeviceIndex());
 
-                // Mark both tensors as having valid device data
-                cuda_tensor->mark_device_dirty();
-                rocm_tensor->mark_device_dirty();
+                // Mark both tensors as having valid device data (with events for fine-grained sync)
+                cuda_tensor->mark_device_dirty_with_event();
+                rocm_tensor->mark_device_dirty_with_event();
 
                 LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: Zero-copy allreduce completed successfully "
                           << "for stage '" << barrier_stage_name_ << "'");
@@ -923,9 +923,9 @@ namespace llaminar2
                 return false;
             }
 
-            // Mark both tensors as having valid device data
-            cuda_tensor->mark_device_dirty();
-            rocm_tensor->mark_device_dirty();
+            // Mark both tensors as having valid device data (with events for fine-grained sync)
+            cuda_tensor->mark_device_dirty_with_event();
+            rocm_tensor->mark_device_dirty_with_event();
 
             LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: Zero-copy allreduce completed successfully");
             return true;
@@ -1038,7 +1038,7 @@ namespace llaminar2
 
             if (result)
             {
-                global_tensor->mark_device_dirty();
+                global_tensor->mark_device_dirty_with_event();
             }
             else
             {
@@ -1082,7 +1082,7 @@ namespace llaminar2
 
             if (result)
             {
-                global_tensor->mark_device_dirty();
+                global_tensor->mark_device_dirty_with_event();
             }
             else
             {
@@ -1234,7 +1234,7 @@ namespace llaminar2
 
         if (result)
         {
-            output_shard->mark_device_dirty();
+            output_shard->mark_device_dirty_with_event();
         }
         else
         {

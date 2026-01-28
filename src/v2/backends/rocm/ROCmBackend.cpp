@@ -306,7 +306,7 @@ namespace llaminar2
                 *device_ptr = nullptr;
                 return nullptr;
             }
-            LOG_DEBUG("[ROCmBackend] allocateMapped: " << bytes << " bytes, host_ptr=" << host_ptr
+            LOG_TRACE("[ROCmBackend] allocateMapped: " << bytes << " bytes, host_ptr=" << host_ptr
                                                        << ", device_ptr=" << *device_ptr);
         }
 
@@ -377,7 +377,7 @@ namespace llaminar2
             if (err == hipErrorDeinitialized || err == hipErrorContextIsDestroyed ||
                 err == hipErrorInvalidValue)
             {
-                LOG_DEBUG("[ROCmBackend] hipFree skipped (driver shutting down or memory already freed)");
+                LOG_TRACE("[ROCmBackend] hipFree skipped (driver shutting down or memory already freed)");
             }
             else
             {

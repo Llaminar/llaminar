@@ -139,8 +139,8 @@ namespace llaminar2
             LOG_DEBUG("[MPIStager] toDevice: GPU tensor (" << home_device.toString() << "), staging " << numel << " elements");
             hostToDevice(gpu_ptr, host_buffer.data(), numel, device_id);
             synchronizeDevice(device_id);
-            // Mark device data as authoritative after H2D transfer
-            tensor->mark_device_dirty();
+            // Mark device data as authoritative after H2D transfer (with event for fine-grained sync)
+            tensor->mark_device_dirty_with_event();
         }
     }
 

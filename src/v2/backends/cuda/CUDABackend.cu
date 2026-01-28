@@ -308,8 +308,8 @@ namespace llaminar2
         err = cudaFree(ptr);
         if (err != cudaSuccess)
         {
-            LOG_ERROR("[CUDABackend] cudaFree failed for ptr=" << std::hex << ptr << std::dec 
-                      << " on device " << device_id << ": " << cudaGetErrorString(err));
+            LOG_ERROR("[CUDABackend] cudaFree failed for ptr=" << std::hex << ptr << std::dec
+                                                               << " on device " << device_id << ": " << cudaGetErrorString(err));
         }
     }
 
@@ -388,7 +388,7 @@ namespace llaminar2
                 *device_ptr = nullptr;
                 return nullptr;
             }
-            LOG_DEBUG("[CUDABackend] allocateMapped: " << bytes << " bytes, host_ptr=" << host_ptr
+            LOG_TRACE("[CUDABackend] allocateMapped: " << bytes << " bytes, host_ptr=" << host_ptr
                                                        << ", device_ptr=" << *device_ptr);
         }
 

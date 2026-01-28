@@ -338,7 +338,7 @@ namespace llaminar2
         {
             if (d_int8_data || d_scales)
             {
-                LOG_DEBUG("[ROCmPackedWeights::~] Freeing device memory: "
+                LOG_TRACE("[ROCmPackedWeights::~] Freeing device memory: "
                           << "d_int8_data=" << (void *)d_int8_data
                           << " d_scales=" << (void *)d_scales
                           << " rocm_device_id=" << rocm_device_id);

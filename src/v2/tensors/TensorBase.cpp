@@ -210,7 +210,7 @@ namespace llaminar2
         host_valid_ = true;
         device_valid_ = true;
 
-        LOG_DEBUG("[TensorBase::initMappedMemory] Allocated " << bytes << " bytes mapped memory"
+        LOG_TRACE("[TensorBase::initMappedMemory] Allocated " << bytes << " bytes mapped memory"
                                                               << " host_ptr=" << host_ptr << " device_ptr=" << device_ptr
                                                               << " on device " << target_device.toString());
 
@@ -231,7 +231,7 @@ namespace llaminar2
             {
                 int backend_device_id = gpu_device_->gpu_ordinal();
                 backend->freeMapped(mapped_host_ptr_, backend_device_id);
-                LOG_DEBUG("[TensorBase::freeMappedMemory] Freed mapped memory");
+                LOG_TRACE("[TensorBase::freeMappedMemory] Freed mapped memory");
             }
         }
 
@@ -338,15 +338,15 @@ namespace llaminar2
         {
             // We own this BAR memory (allocated via initBARBackedMemory)
             bar_backend_->freeBarBuffer(bar_rocm_ptr_);
-            LOG_DEBUG("[TensorBase::freeBARBackedMemory] Freed BAR buffer at offset " << bar_offset_);
+            LOG_TRACE("[TensorBase::freeBARBackedMemory] Freed BAR buffer at offset " << bar_offset_);
         }
         else
         {
             // Externally managed BAR memory (initialized via initBARBackedDirect)
             // Do NOT free - just clear our references
-            LOG_DEBUG("[TensorBase::freeBARBackedMemory] Releasing reference to externally-managed BAR memory");
+            LOG_TRACE("[TensorBase::freeBARBackedMemory] Releasing reference to externally-managed BAR memory");
         }
-        
+
         // Free HIP staging buffer if we own it
 #if defined(HAVE_ROCM)
         if (hip_staging_ptr_ && owns_hip_staging_)
@@ -356,7 +356,7 @@ namespace llaminar2
             {
                 rocm_backend->setDevice(bar_host_device_.toKernelDeviceIndex());
                 rocm_backend->free(hip_staging_ptr_, bar_host_device_.toKernelDeviceIndex());
-                LOG_DEBUG("[TensorBase::freeBARBackedMemory] Freed HIP staging buffer at " << hip_staging_ptr_);
+                LOG_TRACE("[TensorBase::freeBARBackedMemory] Freed HIP staging buffer at " << hip_staging_ptr_);
             }
         }
 #endif
@@ -369,16 +369,16 @@ namespace llaminar2
         bar_offset_ = 0;
         bar_size_ = 0;
         bar_rocm_ptr_ = nullptr;
-        
+
         // If gpu_data_ptr_ was pointing to BAR memory, clear it BEFORE resetting is_bar_backed_
         if (gpu_data_ptr_ == bar_cuda_device_ptr_)
         {
             gpu_data_ptr_ = nullptr;
         }
-        
+
         bar_cuda_device_ptr_ = nullptr;
         bar_backend_ = nullptr;
-        
+
         // Now safe to reset is_bar_backed_ since gpu_data_ptr_ is either cleared or was never BAR memory
         is_bar_backed_ = false;
     }
@@ -392,13 +392,13 @@ namespace llaminar2
         // and does NOT take ownership - no deallocation on destruction
 
         is_bar_backed_ = true;
-        bar_offset_ = 0;  // No offset tracking for direct initialization
+        bar_offset_ = 0; // No offset tracking for direct initialization
         bar_size_ = bytes;
         bar_rocm_ptr_ = rocm_ptr;
         bar_cuda_device_ptr_ = cuda_ptr;
         bar_host_device_ = rocm_device;
         bar_accessor_device_ = cuda_device;
-        bar_backend_ = nullptr;  // No backend - memory managed externally
+        bar_backend_ = nullptr; // No backend - memory managed externally
 
         // Set up GPU pointer for CUDA kernel dispatch
         gpu_data_ptr_ = cuda_ptr;
@@ -408,7 +408,7 @@ namespace llaminar2
         // since they share the same physical memory
         host_valid_ = true;
         device_valid_ = true;
-        
+
         // ===== Allocate HIP staging buffer for ROCm kernel writes =====
         // CRITICAL: HIP kernels CANNOT directly dereference BAR mmap addresses!
         // We must allocate a real HIP device buffer for kernel writes, then
@@ -420,7 +420,7 @@ namespace llaminar2
         {
             // Set device context
             rocm_backend->setDevice(rocm_device.toKernelDeviceIndex());
-            
+
             // Allocate HIP staging buffer
             hip_staging_ptr_ = rocm_backend->allocate(bytes, rocm_device.toKernelDeviceIndex());
             if (hip_staging_ptr_)
@@ -963,7 +963,7 @@ namespace llaminar2
         if (gpu_device_.has_value() && gpu_device_->is_rocm())
         {
             host_backend_detail::hipHostUnregisterBuffer(host_ptr);
-            LOG_DEBUG("[TensorBase::unpinHostMemory] Unpinned " << pinned_bytes_
+            LOG_TRACE("[TensorBase::unpinHostMemory] Unpinned " << pinned_bytes_
                                                                 << " bytes of ROCm host memory");
         }
 #endif
@@ -972,7 +972,7 @@ namespace llaminar2
         if (gpu_device_.has_value() && gpu_device_->is_cuda())
         {
             host_backend_detail::cudaHostUnregisterBuffer(host_ptr);
-            LOG_DEBUG("[TensorBase::unpinHostMemory] Unpinned " << pinned_bytes_
+            LOG_TRACE("[TensorBase::unpinHostMemory] Unpinned " << pinned_bytes_
                                                                 << " bytes of CUDA host memory");
         }
 #endif
@@ -1084,7 +1084,7 @@ namespace llaminar2
                           << target_device.toString());
                 return false;
             }
-            
+
             gpu_device_ = target_device;
             // For BAR-backed tensors, device is always "valid" in the sense that the pointer is set up
             // The actual data validity depends on when kernels wrote to the buffer
@@ -1304,7 +1304,7 @@ namespace llaminar2
             // - bar_cuda_device_ptr_: CUDA-visible pointer to the BAR region
             // - bar_rocm_ptr_: ROCm-visible pointer to the same memory
             // We need to use the correct pointer for the target device type.
-            
+
             if (target_device.is_cuda())
             {
                 gpu_data_ptr_ = bar_cuda_device_ptr_;
@@ -1337,7 +1337,7 @@ namespace llaminar2
                           << target_device.toString());
                 return false;
             }
-            
+
             gpu_device_ = target_device;
             // Mark device as invalid - kernel will write to this buffer
             device_valid_ = false;

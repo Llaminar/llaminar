@@ -803,25 +803,20 @@ namespace llaminar2
         /**
          * @brief Mark tensor as modified on device (requires sync to host before host access)
          * @note Call this after GPU kernels write to the tensor via gpu_data_ptr()
+         * @note This forwards to mark_device_dirty_with_event() for event-based sync
          *
          * After calling this:
          *   - device_valid_ = true (device just got written to)
          *   - host_valid_ = false (host is now stale) -- UNLESS tensor is mapped
+         *   - A completion event is recorded for fine-grained synchronization
          *
          * For mapped tensors, both host and device stay valid since they share memory,
          * but we set mapped_needs_sync_ so ensureOnHost() knows to synchronize.
          */
         virtual void mark_device_dirty()
         {
-            device_valid_ = true; // Device just got written to
-            // For mapped memory, host is ALSO valid since they share the same memory
-            // For non-mapped memory, host is now stale
-            host_valid_ = is_mapped_;
-            // For mapped memory: signal that sync is needed before CPU reads
-            if (is_mapped_)
-            {
-                mapped_needs_sync_ = true;
-            }
+            // Forward to event-based implementation for fine-grained sync
+            mark_device_dirty_with_event();
         }
 
         /**
@@ -897,7 +892,7 @@ namespace llaminar2
          *
          * For BAR-backed tensors, this returns the HIP staging buffer pointer
          * (allocated via hipMalloc) that ROCm kernels can safely write to.
-         * 
+         *
          * CRITICAL: This does NOT return the BAR mmap address! HIP kernels cannot
          * directly dereference BAR mmap addresses (causes memory access fault).
          * The staging buffer is later copied to BAR via hipMemcpy(D2D).
@@ -908,7 +903,7 @@ namespace llaminar2
          */
         void *rocm_data_ptr() { return hip_staging_ptr_; }
         const void *rocm_data_ptr() const { return hip_staging_ptr_; }
-        
+
         /**
          * @brief Get the raw BAR mmap pointer (for hipMemcpy D2D only)
          *
@@ -1502,7 +1497,7 @@ namespace llaminar2
         void *bar_cuda_device_ptr_ = nullptr; // CUDA-accessible pointer (cuMemHostGetDevicePointer)
         DeviceId bar_host_device_;            // ROCm device whose BAR hosts this buffer
         DeviceId bar_accessor_device_;        // CUDA device with registered BAR access
-        
+
         // ===== HIP Staging Buffer for BAR-Backed Tensors =====
         // CRITICAL FINDING: HIP kernels CANNOT directly dereference BAR mmap addresses
         // (causes memory access fault). However, hipMemcpy(D2D) with BAR as destination
@@ -1514,8 +1509,8 @@ namespace llaminar2
         //   3. CUDA reads from bar_cuda_device_ptr_ (BAR)
         //
         // This adds ~1-2μs overhead for the D2D copy but uses full DMA bandwidth.
-        void *hip_staging_ptr_ = nullptr;     // HIP device buffer for kernel writes (hipMalloc)
-        bool owns_hip_staging_ = false;       // True if we need to hipFree this
+        void *hip_staging_ptr_ = nullptr; // HIP device buffer for kernel writes (hipMalloc)
+        bool owns_hip_staging_ = false;   // True if we need to hipFree this
 
         // Forward declaration - PCIeBARBackend manages BAR allocations
         // Pointer stored here for deallocation in destructor

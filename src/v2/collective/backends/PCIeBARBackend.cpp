@@ -962,8 +962,8 @@ namespace llaminar2
             return true;
         }
 
-        LOG_DEBUG("[PCIeBARBackend::ensureTempBuffer] Need " << bytes << " bytes, have " 
-                  << cuda_temp_buffer_size_ << " bytes - GROWING buffer (never shrinks)");
+        LOG_DEBUG("[PCIeBARBackend::ensureTempBuffer] Need " << bytes << " bytes, have "
+                                                             << cuda_temp_buffer_size_ << " bytes - GROWING buffer (never shrinks)");
 
         // GROW-ONLY: Allocate new larger buffer, free old one
         // This is called during hot-path if pre-reservation was insufficient
@@ -990,8 +990,8 @@ namespace llaminar2
 
         cuda_temp_buffer_ = new_buffer;
         cuda_temp_buffer_size_ = bytes;
-        LOG_DEBUG("[PCIeBARBackend::ensureTempBuffer] Buffer grown to " << bytes << " bytes at ptr=" 
-                  << std::hex << cuda_temp_buffer_ << std::dec);
+        LOG_DEBUG("[PCIeBARBackend::ensureTempBuffer] Buffer grown to " << bytes << " bytes at ptr="
+                                                                        << std::hex << cuda_temp_buffer_ << std::dec);
         return true;
 #else
         return false;
@@ -1009,8 +1009,8 @@ namespace llaminar2
 #if defined(HAVE_CUDA)
         if (cuda_temp_buffer_)
         {
-            LOG_DEBUG("[PCIeBARBackend::freeTempBuffer] Freeing temp buffer ptr=" 
-                      << std::hex << cuda_temp_buffer_ << std::dec 
+            LOG_TRACE("[PCIeBARBackend::freeTempBuffer] Freeing temp buffer ptr="
+                      << std::hex << cuda_temp_buffer_ << std::dec
                       << " size=" << cuda_temp_buffer_size_);
             // Free using the backend abstraction
             IBackend *cuda_backend = getCUDABackend();
@@ -1193,7 +1193,7 @@ namespace llaminar2
             cuda_work_cv_.wait(lock, [this]()
                                { return cuda_worker_running_.load(); });
 
-            LOG_DEBUG("[PCIeBARBackend] CUDA worker thread started");
+            LOG_TRACE("[PCIeBARBackend] CUDA worker thread started");
             return true;
         }
         catch (const std::exception &e)
@@ -1224,7 +1224,7 @@ namespace llaminar2
         }
 
         cuda_worker_running_.store(false);
-        LOG_DEBUG("[PCIeBARBackend] CUDA worker thread stopped");
+        LOG_TRACE("[PCIeBARBackend] CUDA worker thread stopped");
     }
 
     std::future<bool> PCIeBARBackend::submitCUDAWork(std::function<bool()> work)
@@ -1269,7 +1269,7 @@ namespace llaminar2
                 cu_err = cuCtxSetCurrent(ctx);
                 if (cu_err == CUDA_SUCCESS)
                 {
-                    LOG_DEBUG("[PCIeBARBackend] CUDA worker thread retained primary context");
+                    LOG_TRACE("[PCIeBARBackend] CUDA worker thread retained primary context");
                 }
                 else
                 {

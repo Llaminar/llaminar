@@ -187,8 +187,8 @@ namespace llaminar2
             return false;
         }
 
-        // Mark destination as having valid GPU data
-        dst_cpu->mark_device_dirty();
+        // Mark destination as having valid GPU data (with event for fine-grained sync)
+        dst_cpu->mark_device_dirty_with_event();
 
         auto end = std::chrono::high_resolution_clock::now();
         double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
