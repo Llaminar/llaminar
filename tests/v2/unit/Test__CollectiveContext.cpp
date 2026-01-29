@@ -132,8 +132,9 @@ TEST_F(Test__CollectiveContext, RankReturnsCorrectValue)
 // Backend Delegation Tests
 // =============================================================================
 
-TEST_F(Test__CollectiveContext, ExecuteAllreduceDelegatesToRouter)
+TEST_F(Test__CollectiveContext, SingleDeviceAllreduceIsNoOp)
 {
+    // Single-device context - allreduce should be a no-op (nothing to reduce)
     auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cpu()});
 
     // Create a buffer
@@ -142,35 +143,53 @@ TEST_F(Test__CollectiveContext, ExecuteAllreduceDelegatesToRouter)
     // Execute allreduce
     bool result = ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu());
 
-    // Verify router was called
-    EXPECT_GE(mock_router_raw_->getBackendCallCount(), 1);
+    // Single-device allreduce should succeed (no-op) without calling backend
     EXPECT_TRUE(result);
+    EXPECT_EQ(mock_backend_raw_->allreduceCallCount(), 0);
 }
 
-TEST_F(Test__CollectiveContext, ExecuteAllreduceDelegatesToBackend)
+TEST_F(Test__CollectiveContext, MultiDeviceAllreduceDelegatesToRouter)
 {
-    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cpu()});
+    // Multi-device context requires actual collective
+    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cuda(0), DeviceId::cuda(1)});
 
     // Create a buffer
     auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
 
     // Execute allreduce
-    ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu());
+    bool result = ctx->executeAllreduce(buffer.get(), 16, DeviceId::cuda(0));
+
+    // Verify router was called
+    EXPECT_GE(mock_router_raw_->getBackendCallCount(), 1);
+    EXPECT_TRUE(result);
+}
+
+TEST_F(Test__CollectiveContext, MultiDeviceAllreduceDelegatesToBackend)
+{
+    // Multi-device context requires actual collective
+    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cuda(0), DeviceId::cuda(1)});
+
+    // Create a buffer
+    auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
+
+    // Execute allreduce
+    ctx->executeAllreduce(buffer.get(), 16, DeviceId::cuda(0));
 
     // Verify backend's allreduce was called
     EXPECT_EQ(mock_backend_raw_->allreduceCallCount(), 1);
     EXPECT_EQ(mock_backend_raw_->lastAllreduceCount(), 16);
 }
 
-TEST_F(Test__CollectiveContext, ExecuteAllreduceUsesBufferNumelWhenCountIsZero)
+TEST_F(Test__CollectiveContext, MultiDeviceAllreduceUsesBufferNumelWhenCountIsZero)
 {
-    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cpu()});
+    // Multi-device context to test actual allreduce behavior
+    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cuda(0), DeviceId::cuda(1)});
 
     // Create a 4x4 buffer (16 elements)
     auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
 
     // Execute allreduce with count=0 (should use buffer->numel())
-    ctx->executeAllreduce(buffer.get(), 0, DeviceId::cpu());
+    ctx->executeAllreduce(buffer.get(), 0, DeviceId::cuda(0));
 
     // Verify count was derived from buffer
     EXPECT_EQ(mock_backend_raw_->lastAllreduceCount(), 16);
@@ -276,16 +295,35 @@ TEST_F(Test__CollectiveContext, BuildDeviceGroupSetsCorrectScope_Local)
 // Error Handling Tests
 // =============================================================================
 
-TEST_F(Test__CollectiveContext, ExecuteAllreduceFailsWithoutRouter)
+TEST_F(Test__CollectiveContext, SingleDeviceAllreduceSucceedsWithoutRouter)
 {
-    // Create context without router
-    CollectiveContext::Config config;
-    auto ctx = std::make_unique<CollectiveContext>(config);
+    // Single-device context without router - allreduce is a no-op
+    // Use the factory method for single-device creation
+    auto ctx = CollectiveContextFactory::createSingleDevice();
 
     auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
 
-    // Should fail gracefully
-    EXPECT_FALSE(ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu()));
+    // Single-device allreduce should succeed (no-op) even without router
+    EXPECT_TRUE(ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu()));
+}
+
+TEST_F(Test__CollectiveContext, MultiDeviceAllreduceFailsWithoutRouter)
+{
+    // Multi-device context without router - need to create via createWithRouter with null router
+    // This is a tricky case - createWithRouter requires a router
+    // Let's test via the factory with a null backend set
+    auto router = std::make_unique<MockBackendRouter>();
+    router->setDefaultBackend(nullptr); // No backend available
+
+    auto ctx = CollectiveContextFactory::createWithRouter(
+        std::move(router),
+        nullptr,
+        {DeviceId::cuda(0), DeviceId::cuda(1)});
+
+    auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
+
+    // Should fail gracefully - backend required for multi-device
+    EXPECT_FALSE(ctx->executeAllreduce(buffer.get(), 16, DeviceId::cuda(0)));
 }
 
 TEST_F(Test__CollectiveContext, ExecuteAllgatherFailsWithoutRouter)
@@ -313,30 +351,32 @@ TEST_F(Test__CollectiveContext, ExecuteBroadcastFailsWithoutRouter)
     EXPECT_FALSE(ctx->executeBroadcast(buffer.get(), 16, 0, DeviceId::cpu()));
 }
 
-TEST_F(Test__CollectiveContext, ExecuteAllreduceFailsWhenBackendReturnsNull)
+TEST_F(Test__CollectiveContext, MultiDeviceAllreduceFailsWhenBackendReturnsNull)
 {
     // Configure router to return null backend
     mock_router_raw_->setDefaultBackend(nullptr);
 
-    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cpu()});
+    // Multi-device context to trigger actual collective
+    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cuda(0), DeviceId::cuda(1)});
 
     auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
 
     // Should fail gracefully when backend is null
-    EXPECT_FALSE(ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu()));
+    EXPECT_FALSE(ctx->executeAllreduce(buffer.get(), 16, DeviceId::cuda(0)));
 }
 
-TEST_F(Test__CollectiveContext, ExecuteAllreduceFailsWhenBackendFails)
+TEST_F(Test__CollectiveContext, MultiDeviceAllreduceFailsWhenBackendFails)
 {
     // Configure backend to fail
     mock_backend_raw_->setAllreduceResult(false);
 
-    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cpu()});
+    // Multi-device context to trigger actual collective
+    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cuda(0), DeviceId::cuda(1)});
 
     auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
 
     // Should propagate backend failure
-    EXPECT_FALSE(ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu()));
+    EXPECT_FALSE(ctx->executeAllreduce(buffer.get(), 16, DeviceId::cuda(0)));
 }
 
 // =============================================================================
@@ -414,16 +454,17 @@ TEST_F(Test__CollectiveContext, MPIContextAccessReturnsNull)
 // Collective Operation Type Tests
 // =============================================================================
 
-TEST_F(Test__CollectiveContext, ExecuteAllreduceUsesCorrectOp)
+TEST_F(Test__CollectiveContext, MultiDeviceAllreduceUsesCorrectOp)
 {
-    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cpu()});
+    // Multi-device context to test operation type forwarding
+    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cuda(0), DeviceId::cuda(1)});
     auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
 
     // Test with different operations
-    ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu(), CollectiveOp::ALLREDUCE_SUM);
+    ctx->executeAllreduce(buffer.get(), 16, DeviceId::cuda(0), CollectiveOp::ALLREDUCE_SUM);
     EXPECT_EQ(mock_backend_raw_->lastAllreduceOp(), CollectiveOp::ALLREDUCE_SUM);
 
-    ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu(), CollectiveOp::ALLREDUCE_MAX);
+    ctx->executeAllreduce(buffer.get(), 16, DeviceId::cuda(0), CollectiveOp::ALLREDUCE_MAX);
     EXPECT_EQ(mock_backend_raw_->lastAllreduceOp(), CollectiveOp::ALLREDUCE_MAX);
 }
 
@@ -431,14 +472,30 @@ TEST_F(Test__CollectiveContext, ExecuteAllreduceUsesCorrectOp)
 // Domain-Aware Collective Operation Tests
 // =============================================================================
 
-TEST_F(Test__CollectiveContext, ExecuteAllreduceInDomainWithNullFallsBack)
+TEST_F(Test__CollectiveContext, SingleDeviceAllreduceInDomainWithNullIsNoOp)
 {
+    // Single-device context - even domain allreduce is a no-op
     auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cpu()});
+    auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
+
+    // Execute with nullptr domain - single-device should be no-op
+    bool result = ctx->executeAllreduceInDomain(
+        buffer.get(), 16, DeviceId::cpu(), CollectiveOp::ALLREDUCE_SUM, nullptr);
+
+    EXPECT_TRUE(result);
+    // Single-device: no backend call expected
+    EXPECT_EQ(mock_backend_raw_->allreduceCallCount(), 0);
+}
+
+TEST_F(Test__CollectiveContext, MultiDeviceAllreduceInDomainWithNullFallsBack)
+{
+    // Multi-device context to test fallback to regular allreduce
+    auto ctx = createContextWithMockRouter(nullptr, {DeviceId::cuda(0), DeviceId::cuda(1)});
     auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
 
     // Execute with nullptr domain - should fall back to regular allreduce
     bool result = ctx->executeAllreduceInDomain(
-        buffer.get(), 16, DeviceId::cpu(), CollectiveOp::ALLREDUCE_SUM, nullptr);
+        buffer.get(), 16, DeviceId::cuda(0), CollectiveOp::ALLREDUCE_SUM, nullptr);
 
     EXPECT_TRUE(result);
     // Regular allreduce should have been called via the router

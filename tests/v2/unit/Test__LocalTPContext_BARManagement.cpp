@@ -401,134 +401,15 @@ namespace llaminar2
         }
 
         // =========================================================================
-        // REGRESSION TESTS - Bugs fixed during PCIeBAR allreduce implementation
+        // REGRESSION TESTS - MIGRATED TO INTEGRATION TESTS
         // =========================================================================
-
-        /**
-         * @test Regression: CUDA (non-BAR-backed) tensors must NOT be skipped
-         *       for PCIeBAR backend registration (Bug #2 fix)
-         *
-         * BUG: registerBARBackedOutput() had an early return that skipped
-         *      non-BAR-backed tensors. Since CUDA tensors are NOT BAR-backed
-         *      (only ROCm tensors in BAR memory are), this caused CUDA device's
-         *      tensor to never be registered.
-         *
-         * FIX: For PCIeBAR backend, register ALL tensors regardless of
-         *      isBARBacked() status. The ROCm device's tensor is BAR-backed,
-         *      CUDA device's tensor is regular - both must be tracked.
-         *
-         * SYMPTOM: getBARBackedOutputs() returned only 1 tensor (ROCm) instead
-         *          of 2 (CUDA + ROCm), causing allreduce to fail.
-         */
-        TEST_F(Test__LocalTPContext_BARManagement, Regression_CUDATensorMustNotBeSkipped_PCIeBAR)
-        {
-            // Create context with PCIeBAR backend
-            auto pciebar_ctx = createLocalTPContext(devices_, weights_, CollectiveBackendType::PCIE_BAR);
-            auto *ctx = dynamic_cast<LocalTPContext *>(pciebar_ctx.get());
-            ASSERT_NE(ctx, nullptr);
-
-            // Create a regular (non-BAR-backed) FP32 tensor simulating CUDA device output
-            auto cuda_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{32, 64});
-            ASSERT_FALSE(cuda_tensor->isBARBacked()); // CUDA tensors are NOT BAR-backed
-
-            // BUG: This would previously silently skip registration due to early return
-            // FIX: Should register without throwing
-            EXPECT_NO_THROW(
-                ctx->registerBARBackedOutput("layer0_wo_allreduce", cuda0_, cuda_tensor.get()));
-
-            // Verify registration succeeded
-            EXPECT_TRUE(ctx->hasBARBackedOutputs("layer0_wo_allreduce"));
-
-            // Verify the tensor is actually registered at the correct index
-            auto outputs = ctx->getBARBackedOutputs("layer0_wo_allreduce");
-            ASSERT_EQ(outputs.size(), static_cast<size_t>(ctx->degree()));
-            EXPECT_EQ(outputs[0], cuda_tensor.get()); // cuda0_ is at index 0
-        }
-
-        /**
-         * @test Regression: Both CUDA and ROCm devices must have registered tensors
-         *       for zero-copy allreduce to work (Bug #2 + Bug #3 fix)
-         *
-         * BUG: Only ROCm tensor was registered, causing allreduce to either:
-         *      1. Use same tensor twice (A + A = 2A instead of A + B)
-         *      2. Fail completely due to missing tensor
-         *
-         * FIX: Both CUDA (non-BAR-backed) and ROCm (BAR-backed) tensors
-         *      are registered for PCIeBAR backend.
-         */
-        TEST_F(Test__LocalTPContext_BARManagement, Regression_BothDevicesMustHaveRegisteredTensors_PCIeBAR)
-        {
-            auto pciebar_ctx = createLocalTPContext(devices_, weights_, CollectiveBackendType::PCIE_BAR);
-            auto *ctx = dynamic_cast<LocalTPContext *>(pciebar_ctx.get());
-            ASSERT_NE(ctx, nullptr);
-
-            // CUDA device: regular FP32 tensor (NOT BAR-backed)
-            auto cuda_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{32, 64});
-
-            // ROCm device: BAR-backed FP32 tensor  
-            auto rocm_tensor = std::make_unique<MockBARBackedTensor>(std::vector<size_t>{32, 64});
-
-            ASSERT_FALSE(cuda_tensor->isBARBacked());
-            ASSERT_TRUE(rocm_tensor->isBARBacked());
-
-            // Register both - NEITHER should throw
-            EXPECT_NO_THROW(ctx->registerBARBackedOutput("layer0_wo_allreduce", cuda0_, cuda_tensor.get()));
-            EXPECT_NO_THROW(ctx->registerBARBackedOutput("layer0_wo_allreduce", rocm0_, rocm_tensor.get()));
-
-            // Both must be registered
-            auto outputs = ctx->getBARBackedOutputs("layer0_wo_allreduce");
-            ASSERT_EQ(outputs.size(), static_cast<size_t>(ctx->degree()));
-
-            // CRITICAL: Both tensors must be non-null and DISTINCT
-            EXPECT_NE(outputs[0], nullptr); // CUDA tensor
-            EXPECT_NE(outputs[1], nullptr); // ROCm tensor
-            EXPECT_NE(outputs[0], outputs[1]); // Must be different tensors!
-
-            // Verify they're the correct tensors
-            EXPECT_EQ(outputs[0], cuda_tensor.get());
-            EXPECT_EQ(outputs[1], rocm_tensor.get());
-        }
-
-        /**
-         * @test Regression: Zero-copy allreduce requires DISTINCT tensor pointers
-         *       for each device - same pointer causes A+A=2A bug (Bug #3)
-         *
-         * BUG: Both CUDA and ROCm device threads were passing the same tensor
-         *      pointer to allreduce, resulting in A + A = 2A instead of A + B.
-         *
-         * FIX: Each device must have its own registered tensor pointer.
-         */
-        TEST_F(Test__LocalTPContext_BARManagement, Regression_DistinctTensorPointersRequired)
-        {
-            auto pciebar_ctx = createLocalTPContext(devices_, weights_, CollectiveBackendType::PCIE_BAR);
-            auto *ctx = dynamic_cast<LocalTPContext *>(pciebar_ctx.get());
-            ASSERT_NE(ctx, nullptr);
-
-            // Create two DIFFERENT tensors with DIFFERENT data
-            auto tensor_a = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 8});
-            auto tensor_b = std::make_unique<MockBARBackedTensor>(std::vector<size_t>{4, 8});
-
-            // Fill with distinct values
-            for (size_t i = 0; i < tensor_a->numel(); ++i)
-            {
-                tensor_a->mutable_data()[i] = 1.0f;  // All 1s
-                tensor_b->mutable_data()[i] = 3.0f;  // All 3s
-            }
-
-            // Register different tensors for different devices
-            ctx->registerBARBackedOutput("layer0_wo_allreduce", cuda0_, tensor_a.get());
-            ctx->registerBARBackedOutput("layer0_wo_allreduce", rocm0_, tensor_b.get());
-
-            auto outputs = ctx->getBARBackedOutputs("layer0_wo_allreduce");
-
-            // Critical assertion: pointers must be different
-            ASSERT_NE(outputs[0], outputs[1]) 
-                << "BUG: Same tensor pointer for both devices would cause A+A=2A!";
-
-            // Verify data is different (1.0 vs 3.0)
-            EXPECT_NE(outputs[0]->data()[0], outputs[1]->data()[0])
-                << "Tensors must contain different data for correct allreduce";
-        }
+        // NOTE: Hardware-dependent PCIeBAR regression tests have been migrated to
+        // integration tests in Test__LocalTPBackendBehavior.cpp:
+        // - Regression_CUDATensorMustNotBeSkipped_PCIeBAR → BAR_CUDATensorMustNotBeSkipped
+        // - Regression_BothDevicesMustHaveRegisteredTensors_PCIeBAR → BAR_BothDevicesMustHaveRegisteredTensors
+        // - Regression_DistinctTensorPointersRequired → BAR_DistinctTensorPointersRequired
+        //
+        // Those tests require actual CUDA+ROCm hardware with PCIe BAR support.
 
     } // namespace test
 } // namespace llaminar2

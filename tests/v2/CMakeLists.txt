@@ -7383,6 +7383,36 @@ if(HAVE_CUDA OR HAVE_ROCM)
 endif()
 
 # =============================================================================
+# LOCAL TP Backend Behavior Integration Tests
+# =============================================================================
+# Tests for LocalTPContext backend auto-detection, PCIeBAR barrier synchronization,
+# and BAR-backed tensor management. Migrated from unit tests that require real hardware.
+
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_integration_local_tp_backend_behavior
+        integration/Test__LocalTPBackendBehavior.cpp
+    )
+    target_link_libraries(v2_integration_local_tp_backend_behavior PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    # Conditionally link GPU libraries
+    if(HAVE_CUDA)
+        target_link_libraries(v2_integration_local_tp_backend_behavior PRIVATE CUDA::cudart)
+    endif()
+    if(HAVE_ROCM)
+        target_link_libraries(v2_integration_local_tp_backend_behavior PRIVATE hip::host)
+    endif()
+    add_v2_test(V2_Integration_LocalTP_BackendBehavior
+        COMMAND $<TARGET_FILE:v2_integration_local_tp_backend_behavior>
+        LABELS "V2;Integration;LocalTP;BackendBehavior;AutoDetection;PCIeBAR;Barrier;BARManagement;CUDA;ROCm;Heterogeneous"
+        MPI_PROCS 1  # LOCAL TP runs within a single MPI rank
+    )
+    message(STATUS "V2 Tests: Added LOCAL TP Backend Behavior integration tests")
+endif()
+
+# =============================================================================
 # PCIeBAR CUDA Event Lifecycle Test
 # =============================================================================
 # Minimal test to reproduce CUDA event "context is destroyed" (error 709)

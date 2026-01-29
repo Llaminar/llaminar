@@ -53,12 +53,23 @@ protected:
         cpu_ctx_ = std::make_unique<CPUDeviceContext>(DeviceId::cpu());
     }
 
-    // Helper to create a CollectiveContext with mock router
+    // Helper to create a CollectiveContext with mock router (multi-device to trigger actual collectives)
     std::unique_ptr<CollectiveContext> createMockCollectiveContext()
     {
         return CollectiveContextFactory::createWithRouter(
             std::move(mock_router_),
-            nullptr, // No MPI
+            nullptr,                                 // No MPI
+            {DeviceId::cuda(0), DeviceId::cuda(1)}); // Multi-device to trigger collectives
+    }
+
+    // Helper to create a single-device CollectiveContext (for no-op tests)
+    std::unique_ptr<CollectiveContext> createSingleDeviceCollectiveContext()
+    {
+        auto router = std::make_unique<MockBackendRouter>();
+        router->setDefaultBackend(mock_backend_raw_);
+        return CollectiveContextFactory::createWithRouter(
+            std::move(router),
+            nullptr,
             {DeviceId::cpu()});
     }
 

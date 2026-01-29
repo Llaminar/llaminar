@@ -79,6 +79,7 @@
     ],
     "postCreateCommand": "bash -c 'sudo chmod 666 /dev/dri/render* 2>/dev/null || true && sudo chown -R vscode:vscode /workspace || true && git config --global --add safe.directory /workspaces/llaminar && bash /workspaces/llaminar/.devcontainer/setup-ccache.sh && bash /workspaces/llaminar/.devcontainer/setup-python-env.sh && bash /workspaces/llaminar/.devcontainer/setup-pcie-bar-caps.sh && git config --global user.name 'David Sanftenberg' && git config --global user.email 'david.sanftenberg@gmail.com' && cmake --version && gcc --version'",
     "postStartCommand": "bash /workspaces/llaminar/.devcontainer/onstart.sh && bash /workspaces/llaminar/.devcontainer/setup-pcie-bar-caps.sh",
+    "postAttachCommand": "bash /workspaces/llaminar/.devcontainer/onstart.sh",
     "remoteUser": "vscode",
     "overrideCommand": false,
     "runArgs": [

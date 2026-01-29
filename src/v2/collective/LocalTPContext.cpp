@@ -1592,6 +1592,7 @@ namespace llaminar2
             LOG_WARN("LocalTPContext: Backend " << collectiveBackendTypeToString(backend_)
                                                 << " not available, falling back to HOST");
             backend_impl_ = std::make_unique<HostBackend>();
+            backend_ = CollectiveBackendType::HOST; // Update to reflect actual backend
         }
 
         // Initialize the backend with device group
