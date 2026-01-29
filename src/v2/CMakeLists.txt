@@ -812,6 +812,8 @@ if(HAVE_CUDA AND HAVE_ROCM)
         backends/p2p/DirectP2P_ROCm.cpp
         # PCIe BAR collective backend for CUDA↔ROCm direct P2P
         collective/backends/PCIeBARBackend.cpp
+        # NOTE: HeterogeneousBackend.cpp is in llaminar2_core (not here) because
+        # it includes NCCLBackend.h/RCCLBackend.h which depend on MPIContext.h
     )
 endif()
 
@@ -1243,6 +1245,7 @@ add_library(llaminar2_core STATIC
     collective/BackendRouter.cpp
     collective/backends/HostBackend.cpp
     collective/backends/MPIBackend.cpp
+    collective/backends/HeterogeneousBackend.cpp
     # NOTE: NCCLBackend.cpp is NOT here - it's in cuda_backend to isolate NCCL symbols
     # from RCCL. Both export the same symbols (ncclCommInitRank, etc.) and would conflict.
     # NOTE: RCCLBackend.cpp is NOT here - it's in rocm_backend to isolate RCCL symbols

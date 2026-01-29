@@ -657,7 +657,7 @@ namespace llaminar2
         hipError_t err;
 
         // Attempt 1: IoMemory flag (most promising for BAR memory)
-        LOG_DEBUG("[ROCmBackend::registerIoMemory] Trying hipHostRegisterIoMemory flag");
+        LOG_INFO("[ROCmBackend::registerIoMemory] Trying hipHostRegisterIoMemory flag (0x4)");
         err = hipHostRegister(ptr, size, hipHostRegisterIoMemory);
 
         if (err == hipSuccess)
@@ -679,12 +679,12 @@ namespace llaminar2
         }
         else
         {
-            LOG_DEBUG("[ROCmBackend::registerIoMemory] hipHostRegisterIoMemory failed: "
-                      << hipGetErrorString(err));
+            LOG_WARN("[ROCmBackend::registerIoMemory] hipHostRegisterIoMemory failed: "
+                     << hipGetErrorString(err) << " (code " << static_cast<int>(err) << ")");
         }
 
         // Attempt 2: Mapped + Portable flags
-        LOG_DEBUG("[ROCmBackend::registerIoMemory] Trying hipHostRegisterMapped | hipHostRegisterPortable");
+        LOG_INFO("[ROCmBackend::registerIoMemory] Trying hipHostRegisterMapped | hipHostRegisterPortable");
         err = hipHostRegister(ptr, size, hipHostRegisterMapped | hipHostRegisterPortable);
 
         if (err == hipSuccess)
@@ -706,12 +706,12 @@ namespace llaminar2
         }
         else
         {
-            LOG_DEBUG("[ROCmBackend::registerIoMemory] hipHostRegisterMapped failed: "
-                      << hipGetErrorString(err));
+            LOG_WARN("[ROCmBackend::registerIoMemory] hipHostRegisterMapped failed: "
+                     << hipGetErrorString(err) << " (code " << static_cast<int>(err) << ")");
         }
 
         // Attempt 3: Default flags
-        LOG_DEBUG("[ROCmBackend::registerIoMemory] Trying hipHostRegisterDefault");
+        LOG_INFO("[ROCmBackend::registerIoMemory] Trying hipHostRegisterDefault");
         err = hipHostRegister(ptr, size, hipHostRegisterDefault);
 
         if (err == hipSuccess)

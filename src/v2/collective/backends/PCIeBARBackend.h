@@ -47,6 +47,24 @@ namespace llaminar2
     // Full implementation when both CUDA and ROCm are available
 
     /**
+     * @brief Represents a CUDA↔ROCm device pair for multi-pair PCIe BAR operations
+     *
+     * Used for GCD-based parallel bridging where multiple CUDA↔ROCm pairs
+     * can perform allreduce operations simultaneously.
+     */
+    struct DevicePair
+    {
+        DeviceId cuda_device; ///< CUDA device in this pair
+        DeviceId rocm_device; ///< ROCm device in this pair
+        int pair_index;       ///< Index into BAR resources (0, 1, 2...)
+
+        bool operator==(const DevicePair &other) const
+        {
+            return cuda_device == other.cuda_device && rocm_device == other.rocm_device;
+        }
+    };
+
+    /**
      * @brief Direct CUDA↔ROCm collective backend via PCIe BAR mapping
      *
      * Algorithm for AllReduce (CUDA + ROCm, 2 devices):
@@ -98,6 +116,28 @@ namespace llaminar2
         bool isInitialized() const override { return initialized_; }
 
         /**
+         * @brief Initialize backend for multiple CUDA↔ROCm device pairs
+         *
+         * Enables GCD-based parallel bridging where multiple device pairs
+         * can perform allreduce operations simultaneously.
+         *
+         * @param pairs Vector of device pairs to initialize
+         * @return true if all pairs initialized successfully
+         */
+        bool initializeMultiPair(const std::vector<DevicePair> &pairs);
+
+        /**
+         * @brief Get the configured device pairs
+         * @return Vector of device pairs (empty if single-pair mode)
+         */
+        const std::vector<DevicePair> &getDevicePairs() const { return device_pairs_; }
+
+        /**
+         * @brief Check if multi-pair mode is active
+         */
+        bool isMultiPairMode() const { return !device_pairs_.empty(); }
+
+        /**
          * @brief Reserve temp buffer capacity to avoid hot-path allocation
          *
          * Pre-allocates the CUDA temp buffer used for allreduce operations.
@@ -144,6 +184,97 @@ namespace llaminar2
             size_t count,
             CollectiveDataType dtype,
             int root) override;
+
+        // =====================================================================
+        // Point-to-Point Operations
+        // =====================================================================
+
+        /**
+         * @brief Send data to a peer device via PCIe BAR
+         *
+         * For PCIeBAR, this performs a direct memory transfer to the peer's
+         * BAR-mapped memory region. Only supports CUDA→ROCm or ROCm→CUDA transfers.
+         *
+         * @param buffer Source buffer on this device
+         * @param count Number of elements
+         * @param dtype Data type
+         * @param peer Target device rank (0=CUDA, 1=ROCm in 2-device mode)
+         * @param tag Message tag (ignored for BAR transfers)
+         * @return true on success
+         */
+        bool send(void *buffer, size_t count, CollectiveDataType dtype,
+                  int peer, int tag = 0) override;
+
+        /**
+         * @brief Receive data from a peer device via PCIe BAR
+         *
+         * For PCIeBAR, this reads data from the peer's BAR-mapped memory region.
+         * Only supports CUDA←ROCm or ROCm←CUDA transfers.
+         *
+         * @param buffer Destination buffer on this device
+         * @param count Number of elements
+         * @param dtype Data type
+         * @param peer Source device rank (0=CUDA, 1=ROCm in 2-device mode)
+         * @param tag Message tag (ignored for BAR transfers)
+         * @return true on success
+         */
+        bool recv(void *buffer, size_t count, CollectiveDataType dtype,
+                  int peer, int tag = 0) override;
+
+        /**
+         * @brief Bidirectional send-receive via PCIe BAR
+         *
+         * Performs simultaneous send and receive with a peer device.
+         * For PCIeBAR, this means one device writes to and reads from the
+         * other device's BAR-mapped memory.
+         *
+         * @param sendbuf Buffer to send from
+         * @param recvbuf Buffer to receive into
+         * @param count Number of elements (same both directions)
+         * @param dtype Data type
+         * @param peer Peer device rank
+         * @return true on success
+         */
+        bool sendrecv(void *sendbuf, void *recvbuf, size_t count,
+                      CollectiveDataType dtype, int peer) override;
+
+        // =====================================================================
+        // Async Point-to-Point Operations
+        // =====================================================================
+
+        /**
+         * @brief Async send via PCIe BAR using caller-provided stream
+         *
+         * Issues an async memcpy to the peer's BAR-mapped region.
+         * For CUDA→ROCm: Uses cudaMemcpyAsync to write to BAR.
+         * For ROCm→CUDA: Uses hipMemcpyAsync (if supported).
+         *
+         * @param buffer Source buffer
+         * @param count Number of elements
+         * @param dtype Data type
+         * @param peer Target device rank (0=CUDA, 1=ROCm typically)
+         * @param stream GPU stream (cudaStream_t or hipStream_t)
+         * @param tag Ignored for BAR transfers
+         * @return true if operation was issued
+         */
+        bool sendAsync(void *buffer, size_t count, CollectiveDataType dtype,
+                       int peer, void *stream, int tag = 0) override;
+
+        /**
+         * @brief Async receive via PCIe BAR using caller-provided stream
+         *
+         * Issues an async memcpy from the peer's BAR-mapped region.
+         */
+        bool recvAsync(void *buffer, size_t count, CollectiveDataType dtype,
+                       int peer, void *stream, int tag = 0) override;
+
+        /**
+         * @brief Async bidirectional send-receive via PCIe BAR
+         *
+         * Issues both send and receive as async memcpy operations.
+         */
+        bool sendrecvAsync(void *sendbuf, void *recvbuf, size_t count,
+                           CollectiveDataType dtype, int peer, void *stream) override;
 
         // =====================================================================
         // Synchronization
@@ -223,6 +354,17 @@ namespace llaminar2
          */
         size_t getBarTotalMappedSize() const { return bar_total_mapped_size_; }
 
+        /**
+         * @brief Get BAR host pointer (mmap'd address accessible by both CPU and ROCm DMA)
+         *
+         * This pointer can be used as a staging area for cross-vendor transfers:
+         * - hipMemcpy(D2D) can write to this address (uses AMD DMA engine)
+         * - cudaMemcpy(D2D) can read from this address (via PCIe)
+         *
+         * @return Pointer to BAR region, or nullptr if not initialized
+         */
+        void *getBarHostPtr() const { return bar_host_ptr_; }
+
         // =====================================================================
         // IBufferRegistration Overrides
         // =====================================================================
@@ -278,6 +420,31 @@ namespace llaminar2
             CollectiveOp op) override;
 
         // =====================================================================
+        // Multi-Pair Collective Operations
+        // =====================================================================
+
+        /**
+         * @brief AllReduce across all device pairs in parallel
+         *
+         * Performs bidirectional exchange for each pair simultaneously:
+         * 1. For each pair: CUDA reads ROCm data via BAR
+         * 2. For each pair: CUDA performs local reduction
+         * 3. For each pair: CUDA writes result back to ROCm via BAR
+         * 4. Synchronize all pairs
+         *
+         * @param cuda_buffers One buffer per pair (on respective CUDA devices)
+         * @param rocm_buffers One buffer per pair (on respective ROCm devices)
+         * @param count_per_pair Number of elements per buffer
+         * @param dtype Data type of elements
+         * @return true if all pair operations succeeded
+         */
+        bool allreduceMultiPair(
+            std::vector<void *> &cuda_buffers,
+            std::vector<void *> &rocm_buffers,
+            size_t count_per_pair,
+            CollectiveDataType dtype);
+
+        // =====================================================================
         // Public CUDA Reduction (for Zero-Copy Allreduce)
         // =====================================================================
 
@@ -311,7 +478,7 @@ namespace llaminar2
          *
          * @return Pointer to DirectP2PEngine, or nullptr if not available
          */
-        DirectP2PEngine* getDirectP2PEngine() const
+        DirectP2PEngine *getDirectP2PEngine() const
         {
             return p2p_engine_.get();
         }
@@ -322,11 +489,14 @@ namespace llaminar2
         std::shared_ptr<DirectP2PEngine> p2p_engine_;
         bool initialized_ = false;
 
-        // Device group info (set during initialize)
+        // Device group info (set during initialize) - single-pair mode
         DeviceId cuda_device_;
         DeviceId rocm_device_;
         bool has_cuda_ = false;
         bool has_rocm_ = false;
+
+        // Multi-pair mode support
+        std::vector<DevicePair> device_pairs_;
 
         // Temp buffer on CUDA side for reduction operations
         void *cuda_temp_buffer_ = nullptr;
@@ -522,6 +692,18 @@ namespace llaminar2
     // Stub implementation when CUDA and ROCm are not both available
 
     /**
+     * @brief Stub DevicePair (requires both CUDA and ROCm)
+     */
+    struct DevicePair
+    {
+        DeviceId cuda_device;
+        DeviceId rocm_device;
+        int pair_index = 0;
+
+        bool operator==(const DevicePair &) const { return false; }
+    };
+
+    /**
      * @brief Stub PCIeBARBackend (requires both CUDA and ROCm)
      *
      * This stub is provided so code can compile without both GPU backends.
@@ -539,6 +721,9 @@ namespace llaminar2
         bool supportsDirectTransfer(DeviceId, DeviceId) const override { return false; }
         bool isAvailable() const override { return false; }
         bool initialize(const DeviceGroup &) override { return false; }
+        bool initializeMultiPair(const std::vector<DevicePair> &) { return false; }
+        const std::vector<DevicePair> &getDevicePairs() const { return device_pairs_; }
+        bool isMultiPairMode() const { return false; }
         void shutdown() override {}
         bool isInitialized() const override { return false; }
 
@@ -546,6 +731,10 @@ namespace llaminar2
         bool allgather(const void *, void *, size_t, CollectiveDataType) override { return false; }
         bool reduceScatter(const void *, void *, size_t, CollectiveDataType, CollectiveOp) override { return false; }
         bool broadcast(void *, size_t, CollectiveDataType, int) override { return false; }
+        bool send(void *, size_t, CollectiveDataType, int, int = 0) override { return false; }
+        bool recv(void *, size_t, CollectiveDataType, int, int = 0) override { return false; }
+        bool sendrecv(void *, void *, size_t, CollectiveDataType, int) override { return false; }
+        bool allreduceMultiPair(std::vector<void *> &, std::vector<void *> &, size_t, CollectiveDataType) { return false; }
         bool synchronize() override { return false; }
 
         double getMeasuredBandwidthGBps() const { return 0.0; }
@@ -557,12 +746,16 @@ namespace llaminar2
         void freeBarBuffer(void *) {}
         size_t getBarAllocOffset() const { return 0; }
         size_t getBarTotalMappedSize() const { return 0; }
+        void *getBarHostPtr() const { return nullptr; }
 
         bool registerBuffer(const std::string &, DeviceId, void *, size_t) override { return false; }
         void unregisterBuffer(const std::string &, DeviceId) override {}
         std::optional<RegisteredBuffer> getBuffer(const std::string &, DeviceId) const override { return std::nullopt; }
         bool requiresBufferRegistration() const override { return false; }
         bool allreduceRegistered(const std::string &, size_t, CollectiveDataType, CollectiveOp) override { return false; }
+
+    private:
+        std::vector<DevicePair> device_pairs_;
     };
 
 #endif // HAVE_CUDA && HAVE_ROCM

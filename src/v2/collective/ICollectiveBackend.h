@@ -225,7 +225,11 @@ namespace llaminar2
          * @param bytes Minimum buffer capacity in bytes
          * @return true if reservation succeeded (or no-op for backends that don't need it)
          */
-        virtual bool reserveTempBufferBytes(size_t bytes) { (void)bytes; return true; }
+        virtual bool reserveTempBufferBytes(size_t bytes)
+        {
+            (void)bytes;
+            return true;
+        }
 
         // =====================================================================
         // Collective Operations
@@ -325,6 +329,172 @@ namespace llaminar2
             int root_rank) = 0;
 
         // =====================================================================
+        // Point-to-Point Operations
+        // =====================================================================
+
+        /**
+         * @brief Point-to-point send to a peer device
+         *
+         * Sends data from this device to a peer device identified by rank
+         * or DeviceId. The peer must have a matching recv() call.
+         *
+         * @param buffer Source buffer on this device
+         * @param count Number of elements to send
+         * @param dtype Data type of elements
+         * @param peer Target device rank to send to
+         * @param tag Message tag for matching (default 0)
+         * @return true on success
+         */
+        virtual bool send(void *buffer, size_t count, CollectiveDataType dtype,
+                          int peer, int tag = 0)
+        {
+            (void)buffer;
+            (void)count;
+            (void)dtype;
+            (void)peer;
+            (void)tag;
+            return false; // Not supported by default
+        }
+
+        /**
+         * @brief Point-to-point receive from a peer device
+         *
+         * Receives data from a peer device. The peer must have a matching
+         * send() call with the same tag.
+         *
+         * @param buffer Destination buffer on this device
+         * @param count Number of elements to receive
+         * @param dtype Data type of elements
+         * @param peer Source device rank to receive from
+         * @param tag Message tag for matching (default 0)
+         * @return true on success
+         */
+        virtual bool recv(void *buffer, size_t count, CollectiveDataType dtype,
+                          int peer, int tag = 0)
+        {
+            (void)buffer;
+            (void)count;
+            (void)dtype;
+            (void)peer;
+            (void)tag;
+            return false; // Not supported by default
+        }
+
+        /**
+         * @brief Bidirectional send-receive with a peer device
+         *
+         * Simultaneously sends data to and receives data from a peer device.
+         * This is more efficient than separate send()+recv() calls as it can
+         * overlap the transfers.
+         *
+         * @param sendbuf Buffer to send from (on this device)
+         * @param recvbuf Buffer to receive into (on this device)
+         * @param count Number of elements (same for both directions)
+         * @param dtype Data type of elements
+         * @param peer Peer device rank for exchange
+         * @return true on success
+         */
+        virtual bool sendrecv(void *sendbuf, void *recvbuf, size_t count,
+                              CollectiveDataType dtype, int peer)
+        {
+            (void)sendbuf;
+            (void)recvbuf;
+            (void)count;
+            (void)dtype;
+            (void)peer;
+            return false; // Not supported by default
+        }
+
+        // =====================================================================
+        // Async Point-to-Point Operations (Stream-Based)
+        // =====================================================================
+        // These methods enable pipelined transfers by issuing operations on
+        // caller-provided streams. Completion is tracked by the stream rather
+        // than blocking on return.
+
+        /**
+         * @brief Async send to a peer device on a specified stream
+         *
+         * Issues a send operation that completes asynchronously. The caller
+         * must synchronize the stream or use events to determine completion.
+         *
+         * For NCCL/RCCL: Uses ncclSend/rcclSend on the provided stream.
+         * For PCIeBAR: Uses async memcpy via the stream.
+         *
+         * @param buffer Source buffer on this device
+         * @param count Number of elements to send
+         * @param dtype Data type of elements
+         * @param peer Target device rank
+         * @param stream GPU stream (cudaStream_t or hipStream_t cast to void*)
+         * @param tag Message tag for matching (default 0)
+         * @return true if operation was issued successfully
+         */
+        virtual bool sendAsync(void *buffer, size_t count, CollectiveDataType dtype,
+                               int peer, void *stream, int tag = 0)
+        {
+            (void)buffer;
+            (void)count;
+            (void)dtype;
+            (void)peer;
+            (void)stream;
+            (void)tag;
+            return false; // Not supported by default
+        }
+
+        /**
+         * @brief Async receive from a peer device on a specified stream
+         *
+         * Issues a receive operation that completes asynchronously. The caller
+         * must synchronize the stream or use events to determine completion.
+         *
+         * @param buffer Destination buffer on this device
+         * @param count Number of elements to receive
+         * @param dtype Data type of elements
+         * @param peer Source device rank
+         * @param stream GPU stream (cudaStream_t or hipStream_t cast to void*)
+         * @param tag Message tag for matching (default 0)
+         * @return true if operation was issued successfully
+         */
+        virtual bool recvAsync(void *buffer, size_t count, CollectiveDataType dtype,
+                               int peer, void *stream, int tag = 0)
+        {
+            (void)buffer;
+            (void)count;
+            (void)dtype;
+            (void)peer;
+            (void)stream;
+            (void)tag;
+            return false; // Not supported by default
+        }
+
+        /**
+         * @brief Async bidirectional send-receive on a specified stream
+         *
+         * Issues both send and receive operations that complete asynchronously.
+         * More efficient than separate sendAsync()+recvAsync() as they can
+         * be batched in the same group call.
+         *
+         * @param sendbuf Buffer to send from
+         * @param recvbuf Buffer to receive into
+         * @param count Number of elements (same both directions)
+         * @param dtype Data type of elements
+         * @param peer Peer device rank
+         * @param stream GPU stream for the operations
+         * @return true if operations were issued successfully
+         */
+        virtual bool sendrecvAsync(void *sendbuf, void *recvbuf, size_t count,
+                                   CollectiveDataType dtype, int peer, void *stream)
+        {
+            (void)sendbuf;
+            (void)recvbuf;
+            (void)count;
+            (void)dtype;
+            (void)peer;
+            (void)stream;
+            return false; // Not supported by default
+        }
+
+        // =====================================================================
         // Multi-GPU Single-Process Collective Operations
         // =====================================================================
         // These methods are for single-process scenarios managing multiple GPUs.
@@ -411,6 +581,112 @@ namespace llaminar2
             (void)count;
             (void)dtype;
             (void)root;
+            return false; // Not supported by default
+        }
+
+        /**
+         * @brief Multi-GPU Reduce (single process)
+         *
+         * Reduces data from all GPU buffers to the root GPU's buffer.
+         * Unlike AllReduce, only the root receives the final result.
+         *
+         * This is used for intra-domain reduction in heterogeneous collectives
+         * where we want to reduce all CUDA buffers to cuda:0 or all ROCm
+         * buffers to rocm:0 before cross-domain bridge transfer.
+         *
+         * @param buffers Array of device buffers (one per GPU)
+         * @param count Elements per buffer
+         * @param dtype Data type
+         * @param op Reduction operation
+         * @param root GPU index (0 to num_gpus-1) that receives the result
+         * @return true on success, false if not supported
+         */
+        virtual bool reduceMulti(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            int root)
+        {
+            (void)buffers;
+            (void)count;
+            (void)dtype;
+            (void)op;
+            (void)root;
+            return false; // Not supported by default
+        }
+
+        /**
+         * @brief Multi-GPU Reduce-Scatter (single process)
+         *
+         * Reduces data from all GPU send_buffers and scatters the result.
+         * Each recv_buffers[i] receives recv_count elements (1/N of the full tensor).
+         *
+         * After this operation:
+         * - recv_buffers[0] has sum of elements [0..recv_count-1] from all GPUs
+         * - recv_buffers[1] has sum of elements [recv_count..2*recv_count-1] from all GPUs
+         * - etc.
+         *
+         * This is used for bandwidth-efficient allreduce patterns where
+         * reduce-scatter + allgather can reduce cross-domain traffic.
+         *
+         * @param send_buffers Array of send buffers (one per GPU, full tensor)
+         * @param recv_buffers Array of receive buffers (one per GPU, 1/N of tensor)
+         * @param recv_count Elements each GPU receives (total_count / num_gpus)
+         * @param dtype Data type
+         * @param op Reduction operation
+         * @return true on success, false if not supported
+         */
+        virtual bool reduceScatterMulti(
+            const std::vector<const void *> &send_buffers,
+            const std::vector<void *> &recv_buffers,
+            size_t recv_count,
+            CollectiveDataType dtype,
+            CollectiveOp op)
+        {
+            (void)send_buffers;
+            (void)recv_buffers;
+            (void)recv_count;
+            (void)dtype;
+            (void)op;
+            return false; // Not supported by default
+        }
+
+        /**
+         * @brief Multi-GPU Point-to-Point Send/Recv (single process)
+         *
+         * Coordinates a P2P transfer between two GPUs in single-process multi-GPU mode.
+         * This is necessary because NCCL/RCCL require BOTH endpoints to participate
+         * simultaneously within a single ncclGroupStart/ncclGroupEnd block.
+         *
+         * In single-process multi-GPU mode, we control all GPUs and must issue
+         * both the send (from src_gpu) and recv (to dst_gpu) within one group.
+         *
+         * @param src_buffer Buffer on source GPU to send from
+         * @param dst_buffer Buffer on destination GPU to receive into
+         * @param count Number of elements to transfer
+         * @param dtype Data type of elements
+         * @param src_gpu Source GPU index (0 to num_gpus-1)
+         * @param dst_gpu Destination GPU index (0 to num_gpus-1)
+         * @return true on success, false if not supported
+         *
+         * @note For NCCL/RCCL this issues ncclSend on src_gpu's comm and ncclRecv
+         *       on dst_gpu's comm within a single group operation.
+         */
+        virtual bool sendrecvMulti(
+            void *src_buffer,
+            void *dst_buffer,
+            size_t count,
+            CollectiveDataType dtype,
+            int src_gpu,
+            int dst_gpu)
+        {
+            (void)src_buffer;
+            (void)dst_buffer;
+            (void)count;
+            (void)dtype;
+            (void)src_gpu;
+            (void)dst_gpu;
             return false; // Not supported by default
         }
 

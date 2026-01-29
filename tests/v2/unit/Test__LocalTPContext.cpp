@@ -201,6 +201,52 @@ TEST_F(Test__LocalTPContext, AutoBackendMixedGpus)
 }
 
 /**
+ * @test AUTO backend with 1 CUDA + 1 ROCm (simple case) -> PCIeBAR
+ */
+TEST_F(Test__LocalTPContext, AutoBackendSelectsPCIeBarFor1Cuda1Rocm)
+{
+    // Exactly 1+1 configuration should use simple PCIeBAR
+    auto ctx = createLocalTPContext({cuda0_, rocm0_}, {}, CollectiveBackendType::AUTO);
+
+    EXPECT_EQ(ctx->backend(), CollectiveBackendType::PCIE_BAR);
+}
+
+/**
+ * @test AUTO backend with 1 CUDA + 2 ROCm (N+M case) -> HETEROGENEOUS
+ */
+TEST_F(Test__LocalTPContext, AutoBackendSelectsHeterogeneousFor1Cuda2Rocm)
+{
+    // >2 mixed devices should use hierarchical HETEROGENEOUS backend
+    auto rocm1 = GlobalDeviceAddress::rocm(1, 0);
+    auto ctx = createLocalTPContext({cuda0_, rocm0_, rocm1}, {}, CollectiveBackendType::AUTO);
+
+    EXPECT_EQ(ctx->backend(), CollectiveBackendType::HETEROGENEOUS);
+}
+
+/**
+ * @test AUTO backend with 2 CUDA + 1 ROCm (N+M case) -> HETEROGENEOUS
+ */
+TEST_F(Test__LocalTPContext, AutoBackendSelectsHeterogeneousFor2Cuda1Rocm)
+{
+    // >2 mixed devices should use hierarchical HETEROGENEOUS backend
+    auto ctx = createLocalTPContext({cuda0_, cuda1_, rocm0_}, {}, CollectiveBackendType::AUTO);
+
+    EXPECT_EQ(ctx->backend(), CollectiveBackendType::HETEROGENEOUS);
+}
+
+/**
+ * @test AUTO backend with 2 CUDA + 2 ROCm (N+M case) -> HETEROGENEOUS
+ */
+TEST_F(Test__LocalTPContext, AutoBackendSelectsHeterogeneousFor2Cuda2Rocm)
+{
+    // >2 mixed devices should use hierarchical HETEROGENEOUS backend
+    auto rocm1 = GlobalDeviceAddress::rocm(1, 0);
+    auto ctx = createLocalTPContext({cuda0_, cuda1_, rocm0_, rocm1}, {}, CollectiveBackendType::AUTO);
+
+    EXPECT_EQ(ctx->backend(), CollectiveBackendType::HETEROGENEOUS);
+}
+
+/**
  * @test AUTO backend with CPU involved -> HOST
  */
 TEST_F(Test__LocalTPContext, AutoBackendWithCpu)

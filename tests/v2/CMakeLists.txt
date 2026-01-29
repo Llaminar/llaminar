@@ -479,6 +479,27 @@ if(HAVE_CUDA AND HAVE_ROCM)
         RESOURCE_LOCK "PCIeBAR_P2P"
     )
 
+    # Test: PCIeBARBackend Multi-Pair - Multi-pair CUDA↔ROCm collective operations
+    # Tests GCD-based parallel bridging where multiple device pairs perform
+    # allreduce operations simultaneously. Requires 2+ CUDA and 2+ ROCm devices
+    # for full multi-pair tests; single-pair tests run with 1 CUDA + 1 ROCm.
+    add_executable(v2_integration_pcie_bar_backend_multi_pair integration/Test__PCIeBarBackend_MultiPair.cpp)
+    target_link_libraries(v2_integration_pcie_bar_backend_multi_pair 
+        llaminar2_core 
+        device_benchmarks
+        GTest::gtest
+        GTest::gtest_main
+    )
+    target_include_directories(v2_integration_pcie_bar_backend_multi_pair PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/utils
+    )
+    add_v2_test(V2_Integration_PCIeBARBackend_MultiPair 
+        COMMAND $<TARGET_FILE:v2_integration_pcie_bar_backend_multi_pair>
+        LABELS "V2;Integration;Collective;PCIeBARBackend;MultiPair;P2P;CUDA;ROCm;CrossVendor;TensorParallel;AllReduce;GCD"
+        MPI_PROCS 1
+        RESOURCE_LOCK "PCIeBAR_P2P"
+    )
+
     # Test: BAR-backed HIP allocation - Exploratory test for HIP memory in BAR
     # DISABLED: This was an exploratory test that exhaustively tested all HIP/HSA/CUDA APIs
     # for direct kernel access to PCIe BAR memory. Key findings:
@@ -499,6 +520,24 @@ if(HAVE_CUDA AND HAVE_ROCM)
     add_v2_test(DISABLED_V2_Integration_BARBackedHipAllocation 
         COMMAND $<TARGET_FILE:v2_integration_bar_backed_hip_allocation>
         LABELS "V2;Integration;PCIeBAR;HIP;CUDA;ROCm;CrossVendor;Exploration;DISABLED"
+        MPI_PROCS 1
+        RESOURCE_LOCK "PCIeBAR_P2P"
+    )
+
+    # Test: AMD PCIe P2P Mapping (tinygrad-style) - Experimental test for AMD-side BAR mapping
+    # This explores mapping NVIDIA GPU BAR memory into AMD GPU's address space using
+    # direct page table manipulation, as implemented by tinygrad for bidirectional P2P.
+    # DISABLED: Requires root access and deep understanding of AMD GPU page table format.
+    # Run manually via: ctest -R DISABLED_V2_Integration_AMD_PCIe_P2P_Mapping
+    add_executable(v2_integration_amd_pcie_p2p_mapping integration/experimental/Test__AMD_PCIe_P2P_Mapping.cpp)
+    target_link_libraries(v2_integration_amd_pcie_p2p_mapping 
+        llaminar2_core 
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(DISABLED_V2_Integration_AMD_PCIe_P2P_Mapping 
+        COMMAND $<TARGET_FILE:v2_integration_amd_pcie_p2p_mapping>
+        LABELS "V2;Integration;PCIeBAR;P2P;CUDA;ROCm;CrossVendor;Exploration;AMD;Tinygrad;DISABLED"
         MPI_PROCS 1
         RESOURCE_LOCK "PCIeBAR_P2P"
     )
@@ -561,6 +600,31 @@ if(HAVE_CUDA AND HAVE_ROCM)
         LABELS "V2;Integration;Collective;SingleRank;AllReduce"
         MPI_PROCS 1
     )
+
+    # Test: CrossBackendP2P - P2P operations across NCCL, RCCL, and PCIeBAR backends
+    # Tests send/recv/sendrecv primitives for cross-device data movement:
+    # - NCCL P2P within CUDA domain
+    # - RCCL P2P within ROCm domain
+    # - PCIeBAR P2P between CUDA and ROCm
+    # - Cross-backend staging patterns
+    add_executable(v2_integration_cross_backend_p2p integration/Test__CrossBackendP2P.cpp)
+    target_link_libraries(v2_integration_cross_backend_p2p 
+        llaminar2_core 
+        GTest::gtest
+        GTest::gtest_main
+    )
+    if(HAVE_CUDA)
+        target_link_libraries(v2_integration_cross_backend_p2p CUDA::cudart)
+    endif()
+    if(HAVE_ROCM)
+        target_link_libraries(v2_integration_cross_backend_p2p hip::host)
+    endif()
+    add_v2_test(V2_Integration_CrossBackendP2P
+        COMMAND $<TARGET_FILE:v2_integration_cross_backend_p2p>
+        LABELS "V2;Integration;Collective;P2P;NCCL;RCCL;PCIeBAR;Send;Recv;Sendrecv;CrossVendor"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added CrossBackendP2P integration tests")
 endif()
 
 # Test: CrossDomainTransferGPU - GPU integration tests for cross-domain activation transfer
@@ -716,6 +780,53 @@ if(HAVE_CUDA AND HAVE_ROCM)
         MPI_PROCS 1
     )
 endif()
+
+# Test: NCCLBackend - NCCL collective backend for NVIDIA GPUs (P2P operations)
+if(HAVE_CUDA)
+    add_executable(v2_unit_nccl_backend unit/Test__NCCLBackend.cpp)
+    target_link_libraries(v2_unit_nccl_backend 
+        llaminar2_core 
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_NCCLBackend 
+        COMMAND $<TARGET_FILE:v2_unit_nccl_backend>
+        LABELS "V2;Unit;Collective;NCCLBackend;P2P;CUDA;NCCL"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added NCCLBackend P2P unit tests")
+endif()
+
+# Test: RCCLBackend - RCCL collective backend for AMD GPUs (P2P operations)
+if(HAVE_ROCM)
+    add_executable(v2_unit_rccl_backend unit/Test__RCCLBackend.cpp)
+    target_link_libraries(v2_unit_rccl_backend 
+        llaminar2_core 
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_RCCLBackend 
+        COMMAND $<TARGET_FILE:v2_unit_rccl_backend>
+        LABELS "V2;Unit;Collective;RCCLBackend;P2P;ROCm;RCCL"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added RCCLBackend P2P unit tests")
+endif()
+
+# Test: HeterogeneousBackend - Heterogeneous multi-GPU collective backend (CUDA + ROCm)
+# NOTE: Unit tests work even without hardware by testing validation logic
+add_executable(v2_unit_heterogeneous_backend unit/Test__HeterogeneousBackend.cpp)
+target_link_libraries(v2_unit_heterogeneous_backend 
+    llaminar2_core 
+    device_benchmarks
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_HeterogeneousBackend 
+    COMMAND $<TARGET_FILE:v2_unit_heterogeneous_backend>
+    LABELS "V2;Unit;Collective;HeterogeneousBackend;CUDA;ROCm;CrossVendor"
+    MPI_PROCS 1
+)
 
 # Test: CollectiveContext - Runtime context for collective operations
 add_executable(v2_unit_collective_context unit/Test__CollectiveContext.cpp)
@@ -3520,6 +3631,137 @@ add_v2_test(V2_Integration_RCCLBackend
     MPI_PROCS 1  # Tests RCCL locally - single rank
 )
 message(STATUS "V2 Tests: Added RCCL backend integration tests")
+endif()
+
+# Test: HeterogeneousBackend Phase 1 - Intra-Domain Reduce
+# Tests parallel NCCL and RCCL reduce operations for heterogeneous GPU configurations
+# Requires both CUDA and ROCm hardware
+if(HAVE_CUDA AND HAVE_ROCM)
+add_executable(v2_integration_heterogeneous_backend_phase1 integration/Test__HeterogeneousBackend_Phase1.cpp)
+target_link_libraries(v2_integration_heterogeneous_backend_phase1 
+    llaminar2_core 
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_HeterogeneousBackend_Phase1
+    COMMAND $<TARGET_FILE:v2_integration_heterogeneous_backend_phase1>
+    LABELS "V2;Integration;CUDA;ROCm;Heterogeneous;Collective;Reduce;Phase1;CrossVendor"
+    MPI_PROCS 1  # Single process with multiple GPUs
+)
+message(STATUS "V2 Tests: Added HeterogeneousBackend Phase 1 integration tests")
+
+# Test: HeterogeneousBackend Phase 2 - Cross-Domain Bridge Exchange
+# Tests PCIeBAR allreduce between CUDA and ROCm bridge devices
+# Requires both CUDA and ROCm hardware
+add_executable(v2_integration_heterogeneous_backend_phase2 integration/Test__HeterogeneousBackend_Phase2.cpp)
+target_link_libraries(v2_integration_heterogeneous_backend_phase2 
+    llaminar2_core 
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_HeterogeneousBackend_Phase2
+    COMMAND $<TARGET_FILE:v2_integration_heterogeneous_backend_phase2>
+    LABELS "V2;Integration;CUDA;ROCm;Heterogeneous;Collective;Allreduce;Phase2;CrossVendor;PCIeBAR"
+    MPI_PROCS 1  # Single process with multiple GPUs
+)
+message(STATUS "V2 Tests: Added HeterogeneousBackend Phase 2 integration tests")
+
+# Test: HeterogeneousBackend Phase 3 - Intra-Domain Broadcast
+# Tests NCCL/RCCL broadcast from bridge devices to all domain devices
+# Requires both CUDA and ROCm hardware
+add_executable(v2_integration_heterogeneous_backend_phase3 integration/Test__HeterogeneousBackend_Phase3.cpp)
+target_link_libraries(v2_integration_heterogeneous_backend_phase3 
+    llaminar2_core 
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_HeterogeneousBackend_Phase3
+    COMMAND $<TARGET_FILE:v2_integration_heterogeneous_backend_phase3>
+    LABELS "V2;Integration;CUDA;ROCm;Heterogeneous;Collective;Broadcast;Phase3;IntraDomain;NCCL;RCCL"
+    MPI_PROCS 1  # Single process with multiple GPUs
+)
+message(STATUS "V2 Tests: Added HeterogeneousBackend Phase 3 integration tests")
+
+# Test: HeterogeneousBackend Full AllReduce - 3-Phase AllReduce
+# Tests complete 3-phase allreduce: intra-domain reduce, bridge exchange, intra-domain broadcast
+# Requires both CUDA and ROCm hardware
+add_executable(v2_integration_heterogeneous_backend_full_allreduce integration/Test__HeterogeneousBackend_FullAllReduce.cpp)
+target_link_libraries(v2_integration_heterogeneous_backend_full_allreduce 
+    llaminar2_core 
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_HeterogeneousBackend_FullAllReduce
+    COMMAND $<TARGET_FILE:v2_integration_heterogeneous_backend_full_allreduce>
+    LABELS "V2;Integration;CUDA;ROCm;Heterogeneous;Collective;AllReduce;FullPipeline;NCCL;RCCL;PCIeBAR"
+    MPI_PROCS 1  # Single process with multiple GPUs
+)
+message(STATUS "V2 Tests: Added HeterogeneousBackend Full AllReduce integration tests")
+
+# Test: HeterogeneousBackend Reduce-Scatter Pattern
+# Tests the reduce-scatter + allgather optimization for large tensors (>=4MB)
+# This pattern reduces cross-vendor PCIe BAR traffic from 100% to 1/max(N,M)
+add_executable(v2_integration_heterogeneous_backend_reduce_scatter integration/Test__HeterogeneousBackend_ReduceScatter.cpp)
+target_link_libraries(v2_integration_heterogeneous_backend_reduce_scatter 
+    llaminar2_core 
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_HeterogeneousBackend_ReduceScatter
+    COMMAND $<TARGET_FILE:v2_integration_heterogeneous_backend_reduce_scatter>
+    LABELS "V2;Integration;CUDA;ROCm;Heterogeneous;Collective;AllReduce;ReduceScatter;NCCL;RCCL;PCIeBAR;BandwidthOptimization"
+    MPI_PROCS 1  # Single process with multiple GPUs
+)
+message(STATUS "V2 Tests: Added HeterogeneousBackend Reduce-Scatter pattern integration tests")
+
+# Test: HeterogeneousBackend Phase 2→3 Pipelining
+# Tests chunk-based pipelining that overlaps PCIe BAR bridge transfer with intra-domain allgather
+# This optimization reduces latency for large tensors by processing chunks in parallel
+add_executable(v2_integration_heterogeneous_backend_pipelining integration/Test__HeterogeneousBackend_Pipelining.cpp)
+target_link_libraries(v2_integration_heterogeneous_backend_pipelining 
+    llaminar2_core 
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_HeterogeneousBackend_Pipelining
+    COMMAND $<TARGET_FILE:v2_integration_heterogeneous_backend_pipelining>
+    LABELS "V2;Integration;CUDA;ROCm;Heterogeneous;Collective;AllReduce;Pipelining;PCIeBAR;NCCL;RCCL;BandwidthOptimization"
+    MPI_PROCS 1  # Single process with multiple GPUs
+)
+message(STATUS "V2 Tests: Added HeterogeneousBackend Pipelining integration tests")
+
+# Test: HeterogeneousBackend GCD Multi-Bridge Pattern
+# Tests the GCD-based multi-bridge pattern for asymmetric GPU configurations
+# where GCD(cuda_count, rocm_count) > 1 (uses parallel PCIeBAR bridges)
+add_executable(v2_integration_heterogeneous_backend_gcd_multi_bridge integration/Test__HeterogeneousBackend_GcdMultiBridge.cpp)
+target_link_libraries(v2_integration_heterogeneous_backend_gcd_multi_bridge 
+    llaminar2_core 
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_HeterogeneousBackend_GcdMultiBridge
+    COMMAND $<TARGET_FILE:v2_integration_heterogeneous_backend_gcd_multi_bridge>
+    LABELS "V2;Integration;CUDA;ROCm;Heterogeneous;Collective;AllReduce;GcdMultiBridge;PCIeBAR;NCCL;RCCL;BandwidthOptimization"
+    MPI_PROCS 1  # Single process with multiple GPUs
+)
+message(STATUS "V2 Tests: Added HeterogeneousBackend GCD Multi-Bridge pattern integration tests")
+
+# Test: HeterogeneousBackend Partial Reduce-Scatter Pattern
+# Tests the partial reduce-scatter pattern for singleton GPU configurations
+# Singleton configs: 1 CUDA + N ROCm (N > 1) or N CUDA + 1 ROCm (N > 1)
+# Our hardware (1 CUDA + 2 ROCm) is perfect for testing this pattern!
+add_executable(v2_integration_heterogeneous_backend_partial_rs integration/Test__HeterogeneousBackend_PartialRS.cpp)
+target_link_libraries(v2_integration_heterogeneous_backend_partial_rs 
+    llaminar2_core 
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_HeterogeneousBackend_PartialRS
+    COMMAND $<TARGET_FILE:v2_integration_heterogeneous_backend_partial_rs>
+    LABELS "V2;Integration;CUDA;ROCm;Heterogeneous;Collective;AllReduce;PartialReduceScatter;PCIeBAR;NCCL;RCCL;Singleton;BandwidthOptimization"
+    MPI_PROCS 1  # Single process with multiple GPUs
+)
+message(STATUS "V2 Tests: Added HeterogeneousBackend Partial Reduce-Scatter pattern integration tests")
 endif()
 
 # Test: CUDA Full Model Inference
@@ -7269,4 +7511,18 @@ add_v2_test(V2_Perf_PCIeBARPipelinedAllreduce
     MPI_PROCS 1
 )
 message(STATUS "V2 Tests: Added PCIeBAR pipelined allreduce performance benchmarks")
+
+# Performance: HeterogeneousBackend Pipeline Benchmark
+# =============================================================================
+# Benchmarks the double-buffered pipeline optimization for singleton configs
+# (1 CUDA + N ROCm or N CUDA + 1 ROCm). Compares pipelined vs non-pipelined
+# partial reduce-scatter at various tensor sizes (8MB, 32MB, 128MB, 512MB).
+add_executable(v2_perf_heterogeneous_pipeline performance/collective/Test__HeterogeneousBackend_PipelineBenchmark.cpp)
+target_link_libraries(v2_perf_heterogeneous_pipeline llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_HeterogeneousBackend_Pipeline
+    COMMAND $<TARGET_FILE:v2_perf_heterogeneous_pipeline>
+    LABELS "V2;Performance;CUDA;ROCm;Heterogeneous;Allreduce;Pipelined;Throughput;CrossVendor;Singleton"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added HeterogeneousBackend pipeline performance benchmarks")
 endif()

@@ -30,6 +30,7 @@
 
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 #include "backends/PCIeBARBackend.h"
+#include "backends/HeterogeneousBackend.h"
 #endif
 
 namespace llaminar2
@@ -1466,10 +1467,28 @@ namespace llaminar2
             return CollectiveBackendType::HOST;
         }
 
-        // Mixed GPU types - use PCIe BAR
+        // Mixed GPU types
         if (has_cuda && has_rocm)
         {
-            return CollectiveBackendType::PCIE_BAR;
+            // Count devices of each type to determine backend
+            int num_cuda = 0;
+            int num_rocm = 0;
+            for (const auto &dev : devices)
+            {
+                if (dev.isCUDA())
+                    num_cuda++;
+                else if (dev.isROCm())
+                    num_rocm++;
+            }
+
+            // Use simple PCIeBAR for exactly 1+1 case (2 devices total)
+            if (num_cuda == 1 && num_rocm == 1)
+            {
+                return CollectiveBackendType::PCIE_BAR;
+            }
+
+            // Use hierarchical backend for N+M case (>2 devices)
+            return CollectiveBackendType::HETEROGENEOUS;
         }
 
         // All CUDA - use NCCL
@@ -1545,6 +1564,16 @@ namespace llaminar2
             backend_impl_ = std::make_unique<PCIeBARBackend>();
 #else
             LOG_WARN("LocalTPContext: PCIE_BAR requested but both CUDA and ROCm not available, falling back to HOST");
+            backend_impl_ = std::make_unique<HostBackend>();
+#endif
+            break;
+
+        case CollectiveBackendType::HETEROGENEOUS:
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+            LOG_DEBUG("LocalTPContext: Creating Heterogeneous backend");
+            backend_impl_ = std::make_unique<HeterogeneousBackend>();
+#else
+            LOG_WARN("LocalTPContext: HETEROGENEOUS requested but both CUDA and ROCm not available, falling back to HOST");
             backend_impl_ = std::make_unique<HostBackend>();
 #endif
             break;

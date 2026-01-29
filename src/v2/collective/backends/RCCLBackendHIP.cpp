@@ -303,6 +303,39 @@ namespace llaminar2
             return true;
         }
 
+        bool rcclReduceInGroupWrapper(const void *sendbuff, void *recvbuff, size_t count,
+                                      int dtype_int, int op_int, int root,
+                                      void *comm, void *stream, std::string &error_out)
+        {
+            rccl::ncclResult_t r = rccl::ncclReduce(sendbuff, recvbuff, count,
+                                                    toRcclDataType(dtype_int), toRcclRedOp(op_int),
+                                                    root,
+                                                    static_cast<rccl::ncclComm_t>(comm),
+                                                    static_cast<hipStream_t>(stream));
+            if (r != rccl::ncclSuccess)
+            {
+                error_out = rccl::ncclGetErrorString(r);
+                return false;
+            }
+            return true;
+        }
+
+        bool rcclReduceScatterInGroupWrapper(const void *sendbuff, void *recvbuff, size_t recvcount,
+                                             int dtype_int, int op_int, void *comm, void *stream,
+                                             std::string &error_out)
+        {
+            rccl::ncclResult_t r = rccl::ncclReduceScatter(sendbuff, recvbuff, recvcount,
+                                                           toRcclDataType(dtype_int), toRcclRedOp(op_int),
+                                                           static_cast<rccl::ncclComm_t>(comm),
+                                                           static_cast<hipStream_t>(stream));
+            if (r != rccl::ncclSuccess)
+            {
+                error_out = rccl::ncclGetErrorString(r);
+                return false;
+            }
+            return true;
+        }
+
         // =========================================================================
         // Point-to-Point Operations
         // =========================================================================

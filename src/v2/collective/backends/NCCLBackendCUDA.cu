@@ -351,6 +351,39 @@ namespace llaminar2
             return true;
         }
 
+        bool ncclReduceInGroupWrapper(const void *sendbuff, void *recvbuff, size_t count,
+                                      int dtype_int, int op_int, int root,
+                                      void *comm, void *stream, std::string &error_out)
+        {
+            nccl::ncclResult_t r = nccl::ncclReduce(sendbuff, recvbuff, count,
+                                                    toNcclDataType(dtype_int), toNcclRedOp(op_int),
+                                                    root,
+                                                    static_cast<nccl::ncclComm_t>(comm),
+                                                    static_cast<cudaStream_t>(stream));
+            if (r != nccl::ncclSuccess)
+            {
+                error_out = nccl::ncclGetErrorString(r);
+                return false;
+            }
+            return true;
+        }
+
+        bool ncclReduceScatterInGroupWrapper(const void *sendbuff, void *recvbuff, size_t recvcount,
+                                             int dtype_int, int op_int, void *comm, void *stream,
+                                             std::string &error_out)
+        {
+            nccl::ncclResult_t r = nccl::ncclReduceScatter(sendbuff, recvbuff, recvcount,
+                                                           toNcclDataType(dtype_int), toNcclRedOp(op_int),
+                                                           static_cast<nccl::ncclComm_t>(comm),
+                                                           static_cast<cudaStream_t>(stream));
+            if (r != nccl::ncclSuccess)
+            {
+                error_out = nccl::ncclGetErrorString(r);
+                return false;
+            }
+            return true;
+        }
+
         // =========================================================================
         // Point-to-Point Operations (for allgatherv emulation)
         // =========================================================================

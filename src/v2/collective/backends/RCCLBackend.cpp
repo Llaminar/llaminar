@@ -60,6 +60,16 @@ namespace llaminar2
         bool rcclGroupStartWrapper(std::string &error_out);
         bool rcclGroupEndWrapper(std::string &error_out);
 
+        // Reduce operations (for heterogeneous intra-domain reduce)
+        bool rcclReduceInGroupWrapper(const void *sendbuff, void *recvbuff, size_t count,
+                                      int dtype_int, int op_int, int root,
+                                      void *comm, void *stream, std::string &error_out);
+
+        // Reduce-scatter operations (for bandwidth-efficient heterogeneous allreduce)
+        bool rcclReduceScatterInGroupWrapper(const void *sendbuff, void *recvbuff, size_t recvcount,
+                                             int dtype_int, int op_int, void *comm, void *stream,
+                                             std::string &error_out);
+
         // Point-to-point operations (for allgatherv emulation)
         bool rcclSendWrapper(const void *sendbuff, size_t count, int dtype_int, int peer,
                              void *comm, void *stream, std::string &error_out);
@@ -582,7 +592,7 @@ namespace llaminar2
         {
             // Send my data to peer
             if (!rccl_backend_detail::rcclSendWrapper(send_buf, send_count, toRcclDataTypeInt(dtype),
-                                                       peer, comm_, stream_, rccl_error))
+                                                      peer, comm_, stream_, rccl_error))
             {
                 rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
                 last_error_ = "rcclSend failed in allgatherv: " + rccl_error;
@@ -592,7 +602,7 @@ namespace llaminar2
             // Receive from peer at their offset
             char *recv_ptr = static_cast<char *>(recv_buf) + displacements[peer] * dtype_size;
             if (!rccl_backend_detail::rcclRecvWrapper(recv_ptr, recv_counts[peer], toRcclDataTypeInt(dtype),
-                                                       peer, comm_, stream_, rccl_error))
+                                                      peer, comm_, stream_, rccl_error))
             {
                 rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
                 last_error_ = "rcclRecv failed in allgatherv: " + rccl_error;
@@ -686,6 +696,399 @@ namespace llaminar2
         (void)dtype;
         (void)root;
         last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    // =========================================================================
+    // Point-to-Point Operations
+    // =========================================================================
+
+    bool RCCLBackend::send(void *buffer, size_t count, CollectiveDataType dtype,
+                           int peer, int tag)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (peer < 0 || peer >= num_ranks_)
+        {
+            last_error_ = "send: Invalid peer rank " + std::to_string(peer) +
+                          " (valid range: 0-" + std::to_string(num_ranks_ - 1) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        (void)tag; // RCCL doesn't support message tags
+
+        std::string rccl_error;
+        int dtype_int = toRcclDataTypeInt(dtype);
+
+        // RCCL send/recv must be paired - use group for safety
+        if (!rccl_backend_detail::rcclGroupStartWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupStart failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!rccl_backend_detail::rcclSendWrapper(buffer, count, dtype_int, peer, comm_, stream_, rccl_error))
+        {
+            rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
+            last_error_ = "rcclSend failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!rccl_backend_detail::rcclGroupEndWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupEnd failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        (void)tag;
+        last_error_ = "RCCL not available";
+        LOG_ERROR(last_error_);
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::recv(void *buffer, size_t count, CollectiveDataType dtype,
+                           int peer, int tag)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (peer < 0 || peer >= num_ranks_)
+        {
+            last_error_ = "recv: Invalid peer rank " + std::to_string(peer) +
+                          " (valid range: 0-" + std::to_string(num_ranks_ - 1) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        (void)tag; // RCCL doesn't support message tags
+
+        std::string rccl_error;
+        int dtype_int = toRcclDataTypeInt(dtype);
+
+        // RCCL send/recv must be paired - use group for safety
+        if (!rccl_backend_detail::rcclGroupStartWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupStart failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!rccl_backend_detail::rcclRecvWrapper(buffer, count, dtype_int, peer, comm_, stream_, rccl_error))
+        {
+            rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
+            last_error_ = "rcclRecv failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!rccl_backend_detail::rcclGroupEndWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupEnd failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        (void)tag;
+        last_error_ = "RCCL not available";
+        LOG_ERROR(last_error_);
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::sendrecv(void *sendbuf, void *recvbuf, size_t count,
+                               CollectiveDataType dtype, int peer)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (peer < 0 || peer >= num_ranks_)
+        {
+            last_error_ = "sendrecv: Invalid peer rank " + std::to_string(peer) +
+                          " (valid range: 0-" + std::to_string(num_ranks_ - 1) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        std::string rccl_error;
+        int dtype_int = toRcclDataTypeInt(dtype);
+
+        // Use rcclGroupStart/End to issue send and recv together
+        if (!rccl_backend_detail::rcclGroupStartWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupStart failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Send to peer
+        if (!rccl_backend_detail::rcclSendWrapper(sendbuf, count, dtype_int, peer, comm_, stream_, rccl_error))
+        {
+            rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
+            last_error_ = "rcclSend failed in sendrecv: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Receive from peer
+        if (!rccl_backend_detail::rcclRecvWrapper(recvbuf, count, dtype_int, peer, comm_, stream_, rccl_error))
+        {
+            rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
+            last_error_ = "rcclRecv failed in sendrecv: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!rccl_backend_detail::rcclGroupEndWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupEnd failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)sendbuf;
+        (void)recvbuf;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        last_error_ = "RCCL not available";
+        LOG_ERROR(last_error_);
+        return false;
+#endif
+    }
+
+    // =========================================================================
+    // Async Point-to-Point Operations
+    // =========================================================================
+
+    bool RCCLBackend::sendAsync(void *buffer, size_t count, CollectiveDataType dtype,
+                                int peer, void *stream, int tag)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (peer < 0 || peer >= num_ranks_)
+        {
+            last_error_ = "sendAsync: Invalid peer rank " + std::to_string(peer) +
+                          " (valid range: 0-" + std::to_string(num_ranks_ - 1) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        (void)tag; // RCCL doesn't support message tags
+
+        std::string rccl_error;
+        int dtype_int = toRcclDataTypeInt(dtype);
+
+        // Use the caller-provided stream for async operation
+        void *target_stream = stream ? stream : stream_;
+
+        if (!rccl_backend_detail::rcclGroupStartWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupStart failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!rccl_backend_detail::rcclSendWrapper(buffer, count, dtype_int, peer, comm_, target_stream, rccl_error))
+        {
+            rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
+            last_error_ = "rcclSend failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!rccl_backend_detail::rcclGroupEndWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupEnd failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        (void)stream;
+        (void)tag;
+        last_error_ = "RCCL not available";
+        LOG_ERROR(last_error_);
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::recvAsync(void *buffer, size_t count, CollectiveDataType dtype,
+                                int peer, void *stream, int tag)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (peer < 0 || peer >= num_ranks_)
+        {
+            last_error_ = "recvAsync: Invalid peer rank " + std::to_string(peer) +
+                          " (valid range: 0-" + std::to_string(num_ranks_ - 1) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        (void)tag; // RCCL doesn't support message tags
+
+        std::string rccl_error;
+        int dtype_int = toRcclDataTypeInt(dtype);
+
+        // Use the caller-provided stream for async operation
+        void *target_stream = stream ? stream : stream_;
+
+        if (!rccl_backend_detail::rcclGroupStartWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupStart failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!rccl_backend_detail::rcclRecvWrapper(buffer, count, dtype_int, peer, comm_, target_stream, rccl_error))
+        {
+            rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
+            last_error_ = "rcclRecv failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!rccl_backend_detail::rcclGroupEndWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupEnd failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        (void)stream;
+        (void)tag;
+        last_error_ = "RCCL not available";
+        LOG_ERROR(last_error_);
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::sendrecvAsync(void *sendbuf, void *recvbuf, size_t count,
+                                    CollectiveDataType dtype, int peer, void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (peer < 0 || peer >= num_ranks_)
+        {
+            last_error_ = "sendrecvAsync: Invalid peer rank " + std::to_string(peer) +
+                          " (valid range: 0-" + std::to_string(num_ranks_ - 1) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        std::string rccl_error;
+        int dtype_int = toRcclDataTypeInt(dtype);
+
+        // Use the caller-provided stream for async operation
+        void *target_stream = stream ? stream : stream_;
+
+        if (!rccl_backend_detail::rcclGroupStartWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupStart failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Send to peer
+        if (!rccl_backend_detail::rcclSendWrapper(sendbuf, count, dtype_int, peer, comm_, target_stream, rccl_error))
+        {
+            rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
+            last_error_ = "rcclSend failed in sendrecvAsync: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Receive from peer
+        if (!rccl_backend_detail::rcclRecvWrapper(recvbuf, count, dtype_int, peer, comm_, target_stream, rccl_error))
+        {
+            rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
+            last_error_ = "rcclRecv failed in sendrecvAsync: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!rccl_backend_detail::rcclGroupEndWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupEnd failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)sendbuf;
+        (void)recvbuf;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        (void)stream;
+        last_error_ = "RCCL not available";
+        LOG_ERROR(last_error_);
         return false;
 #endif
     }
@@ -904,6 +1307,278 @@ namespace llaminar2
         (void)count;
         (void)dtype;
         (void)root;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::reduceMulti(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        int root)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "reduceMulti requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer count (" + std::to_string(buffers.size()) +
+                          ") doesn't match GPU count (" + std::to_string(num_ranks_) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (root < 0 || root >= num_ranks_)
+        {
+            last_error_ = "Invalid root rank: " + std::to_string(root);
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        std::string rccl_error;
+        if (!rccl_backend_detail::rcclGroupStartWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupStart failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        for (int i = 0; i < num_ranks_; ++i)
+        {
+            rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[i]);
+            // Send buffer is each GPU's buffer, receive buffer is root's buffer
+            // For non-root GPUs, recvbuff is ignored by RCCL
+            void *recvbuff = buffers[root];
+            if (!rccl_backend_detail::rcclReduceInGroupWrapper(
+                    buffers[i], recvbuff, count,
+                    toRcclDataTypeInt(dtype), toRcclRedOpInt(op), root,
+                    all_comms_[i], all_streams_[i], rccl_error))
+            {
+                rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
+                last_error_ = "rcclReduce failed on GPU " + std::to_string(i) + ": " + rccl_error;
+                LOG_ERROR(last_error_);
+                return false;
+            }
+        }
+
+        if (!rccl_backend_detail::rcclGroupEndWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupEnd failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)root;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::reduceScatterMulti(
+        const std::vector<const void *> &send_buffers,
+        const std::vector<void *> &recv_buffers,
+        size_t recv_count,
+        CollectiveDataType dtype,
+        CollectiveOp op)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "reduceScatterMulti requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (send_buffers.size() != static_cast<size_t>(num_ranks_) ||
+            recv_buffers.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer count mismatch: send=" + std::to_string(send_buffers.size()) +
+                          ", recv=" + std::to_string(recv_buffers.size()) +
+                          ", expected=" + std::to_string(num_ranks_);
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        std::string rccl_error;
+        if (!rccl_backend_detail::rcclGroupStartWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupStart failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        for (int i = 0; i < num_ranks_; ++i)
+        {
+            rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[i]);
+            if (!rccl_backend_detail::rcclReduceScatterInGroupWrapper(
+                    send_buffers[i], recv_buffers[i], recv_count,
+                    toRcclDataTypeInt(dtype), toRcclRedOpInt(op),
+                    all_comms_[i], all_streams_[i], rccl_error))
+            {
+                rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
+                last_error_ = "rcclReduceScatter failed on GPU " + std::to_string(i) + ": " + rccl_error;
+                LOG_ERROR(last_error_);
+                return false;
+            }
+        }
+
+        if (!rccl_backend_detail::rcclGroupEndWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupEnd failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)send_buffers;
+        (void)recv_buffers;
+        (void)recv_count;
+        (void)dtype;
+        (void)op;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::sendrecvMulti(
+        void *src_buffer,
+        void *dst_buffer,
+        size_t count,
+        CollectiveDataType dtype,
+        int src_gpu,
+        int dst_gpu)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "sendrecvMulti requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (src_gpu < 0 || src_gpu >= num_ranks_ || dst_gpu < 0 || dst_gpu >= num_ranks_)
+        {
+            last_error_ = "sendrecvMulti: Invalid GPU indices src=" + std::to_string(src_gpu) +
+                          ", dst=" + std::to_string(dst_gpu) +
+                          " (valid: 0-" + std::to_string(num_ranks_ - 1) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (src_gpu == dst_gpu)
+        {
+            // Self-transfer: just log and succeed - caller shouldn't do this
+            LOG_DEBUG("sendrecvMulti: src_gpu == dst_gpu (" << src_gpu << "), treating as no-op");
+            return true;
+        }
+
+        std::string rccl_error;
+
+        // CRITICAL: NCCL/RCCL requires BOTH endpoints to participate in a group
+        // The send (on src_gpu) and recv (on dst_gpu) must both be issued before
+        // rcclGroupEnd is called.
+        if (!rccl_backend_detail::rcclGroupStartWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupStart failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Issue send on source GPU's communicator (to dst_gpu rank)
+        rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[src_gpu]);
+        if (!rccl_backend_detail::rcclSendWrapper(
+                src_buffer, count, toRcclDataTypeInt(dtype),
+                dst_gpu, all_comms_[src_gpu], all_streams_[src_gpu], rccl_error))
+        {
+            rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
+            last_error_ = "rcclSend failed on GPU " + std::to_string(src_gpu) + ": " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Issue recv on destination GPU's communicator (from src_gpu rank)
+        rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[dst_gpu]);
+        if (!rccl_backend_detail::rcclRecvWrapper(
+                dst_buffer, count, toRcclDataTypeInt(dtype),
+                src_gpu, all_comms_[dst_gpu], all_streams_[dst_gpu], rccl_error))
+        {
+            rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
+            last_error_ = "rcclRecv failed on GPU " + std::to_string(dst_gpu) + ": " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Now both operations are queued - commit the group
+        if (!rccl_backend_detail::rcclGroupEndWrapper(rccl_error))
+        {
+            last_error_ = "rcclGroupEnd failed: " + rccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Synchronize both streams to ensure transfer completes
+        rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[src_gpu]);
+        if (!rccl_backend_detail::hipSynchronizeStream(all_streams_[src_gpu]))
+        {
+            last_error_ = "hipStreamSynchronize failed on src GPU " + std::to_string(src_gpu);
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[dst_gpu]);
+        if (!rccl_backend_detail::hipSynchronizeStream(all_streams_[dst_gpu]))
+        {
+            last_error_ = "hipStreamSynchronize failed on dst GPU " + std::to_string(dst_gpu);
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        LOG_DEBUG("RCCLBackend::sendrecvMulti: GPU " << src_gpu << " -> GPU " << dst_gpu
+                                                     << ", " << count << " elements");
+
+        return true;
+#else
+        (void)src_buffer;
+        (void)dst_buffer;
+        (void)count;
+        (void)dtype;
+        (void)src_gpu;
+        (void)dst_gpu;
         last_error_ = "RCCL not available";
         return false;
 #endif

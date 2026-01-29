@@ -67,6 +67,16 @@ namespace llaminar2
         bool ncclBroadcastInGroupWrapper(void *buff, size_t count, int dtype_int, int root,
                                          void *comm, void *stream, std::string &error_out);
 
+        // Reduce operations (for heterogeneous intra-domain reduce)
+        bool ncclReduceInGroupWrapper(const void *sendbuff, void *recvbuff, size_t count,
+                                      int dtype_int, int op_int, int root,
+                                      void *comm, void *stream, std::string &error_out);
+
+        // Reduce-scatter operations (for bandwidth-efficient heterogeneous allreduce)
+        bool ncclReduceScatterInGroupWrapper(const void *sendbuff, void *recvbuff, size_t recvcount,
+                                             int dtype_int, int op_int, void *comm, void *stream,
+                                             std::string &error_out);
+
         // Point-to-point operations (for allgatherv emulation)
         bool ncclSendWrapper(const void *sendbuff, size_t count, int dtype_int, int peer,
                              void *comm, void *stream, std::string &error_out);
@@ -724,6 +734,399 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // Point-to-Point Operations
+    // =========================================================================
+
+    bool NCCLBackend::send(void *buffer, size_t count, CollectiveDataType dtype,
+                           int peer, int tag)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (peer < 0 || peer >= num_ranks_)
+        {
+            last_error_ = "send: Invalid peer rank " + std::to_string(peer) +
+                          " (valid range: 0-" + std::to_string(num_ranks_ - 1) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        (void)tag; // NCCL doesn't support message tags
+
+        std::string nccl_error;
+        int dtype_int = toNcclDataTypeInt(dtype);
+
+        // NCCL send/recv must be paired - use group for safety even in single call
+        if (!nccl_backend_detail::ncclGroupStartWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupStart failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!nccl_backend_detail::ncclSendWrapper(buffer, count, dtype_int, peer, comm_, stream_, nccl_error))
+        {
+            nccl_backend_detail::ncclGroupEndWrapper(nccl_error);
+            last_error_ = "ncclSend failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!nccl_backend_detail::ncclGroupEndWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupEnd failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        (void)tag;
+        last_error_ = "NCCL not available";
+        LOG_ERROR(last_error_);
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::recv(void *buffer, size_t count, CollectiveDataType dtype,
+                           int peer, int tag)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (peer < 0 || peer >= num_ranks_)
+        {
+            last_error_ = "recv: Invalid peer rank " + std::to_string(peer) +
+                          " (valid range: 0-" + std::to_string(num_ranks_ - 1) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        (void)tag; // NCCL doesn't support message tags
+
+        std::string nccl_error;
+        int dtype_int = toNcclDataTypeInt(dtype);
+
+        // NCCL send/recv must be paired - use group for safety
+        if (!nccl_backend_detail::ncclGroupStartWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupStart failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!nccl_backend_detail::ncclRecvWrapper(buffer, count, dtype_int, peer, comm_, stream_, nccl_error))
+        {
+            nccl_backend_detail::ncclGroupEndWrapper(nccl_error);
+            last_error_ = "ncclRecv failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!nccl_backend_detail::ncclGroupEndWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupEnd failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        (void)tag;
+        last_error_ = "NCCL not available";
+        LOG_ERROR(last_error_);
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::sendrecv(void *sendbuf, void *recvbuf, size_t count,
+                               CollectiveDataType dtype, int peer)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (peer < 0 || peer >= num_ranks_)
+        {
+            last_error_ = "sendrecv: Invalid peer rank " + std::to_string(peer) +
+                          " (valid range: 0-" + std::to_string(num_ranks_ - 1) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        std::string nccl_error;
+        int dtype_int = toNcclDataTypeInt(dtype);
+
+        // Use ncclGroupStart/End to issue send and recv together
+        if (!nccl_backend_detail::ncclGroupStartWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupStart failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Send to peer
+        if (!nccl_backend_detail::ncclSendWrapper(sendbuf, count, dtype_int, peer, comm_, stream_, nccl_error))
+        {
+            nccl_backend_detail::ncclGroupEndWrapper(nccl_error);
+            last_error_ = "ncclSend failed in sendrecv: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Receive from peer
+        if (!nccl_backend_detail::ncclRecvWrapper(recvbuf, count, dtype_int, peer, comm_, stream_, nccl_error))
+        {
+            nccl_backend_detail::ncclGroupEndWrapper(nccl_error);
+            last_error_ = "ncclRecv failed in sendrecv: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!nccl_backend_detail::ncclGroupEndWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupEnd failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)sendbuf;
+        (void)recvbuf;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        last_error_ = "NCCL not available";
+        LOG_ERROR(last_error_);
+        return false;
+#endif
+    }
+
+    // =========================================================================
+    // Async Point-to-Point Operations
+    // =========================================================================
+
+    bool NCCLBackend::sendAsync(void *buffer, size_t count, CollectiveDataType dtype,
+                                int peer, void *stream, int tag)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (peer < 0 || peer >= num_ranks_)
+        {
+            last_error_ = "sendAsync: Invalid peer rank " + std::to_string(peer) +
+                          " (valid range: 0-" + std::to_string(num_ranks_ - 1) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        (void)tag; // NCCL doesn't support message tags
+
+        std::string nccl_error;
+        int dtype_int = toNcclDataTypeInt(dtype);
+
+        // Use the caller-provided stream for async operation
+        void *target_stream = stream ? stream : stream_;
+
+        if (!nccl_backend_detail::ncclGroupStartWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupStart failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!nccl_backend_detail::ncclSendWrapper(buffer, count, dtype_int, peer, comm_, target_stream, nccl_error))
+        {
+            nccl_backend_detail::ncclGroupEndWrapper(nccl_error);
+            last_error_ = "ncclSend failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!nccl_backend_detail::ncclGroupEndWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupEnd failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        (void)stream;
+        (void)tag;
+        last_error_ = "NCCL not available";
+        LOG_ERROR(last_error_);
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::recvAsync(void *buffer, size_t count, CollectiveDataType dtype,
+                                int peer, void *stream, int tag)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (peer < 0 || peer >= num_ranks_)
+        {
+            last_error_ = "recvAsync: Invalid peer rank " + std::to_string(peer) +
+                          " (valid range: 0-" + std::to_string(num_ranks_ - 1) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        (void)tag; // NCCL doesn't support message tags
+
+        std::string nccl_error;
+        int dtype_int = toNcclDataTypeInt(dtype);
+
+        // Use the caller-provided stream for async operation
+        void *target_stream = stream ? stream : stream_;
+
+        if (!nccl_backend_detail::ncclGroupStartWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupStart failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!nccl_backend_detail::ncclRecvWrapper(buffer, count, dtype_int, peer, comm_, target_stream, nccl_error))
+        {
+            nccl_backend_detail::ncclGroupEndWrapper(nccl_error);
+            last_error_ = "ncclRecv failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!nccl_backend_detail::ncclGroupEndWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupEnd failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        (void)stream;
+        (void)tag;
+        last_error_ = "NCCL not available";
+        LOG_ERROR(last_error_);
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::sendrecvAsync(void *sendbuf, void *recvbuf, size_t count,
+                                    CollectiveDataType dtype, int peer, void *stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (peer < 0 || peer >= num_ranks_)
+        {
+            last_error_ = "sendrecvAsync: Invalid peer rank " + std::to_string(peer) +
+                          " (valid range: 0-" + std::to_string(num_ranks_ - 1) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        std::string nccl_error;
+        int dtype_int = toNcclDataTypeInt(dtype);
+
+        // Use the caller-provided stream for async operation
+        void *target_stream = stream ? stream : stream_;
+
+        if (!nccl_backend_detail::ncclGroupStartWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupStart failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Send to peer
+        if (!nccl_backend_detail::ncclSendWrapper(sendbuf, count, dtype_int, peer, comm_, target_stream, nccl_error))
+        {
+            nccl_backend_detail::ncclGroupEndWrapper(nccl_error);
+            last_error_ = "ncclSend failed in sendrecvAsync: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Receive from peer
+        if (!nccl_backend_detail::ncclRecvWrapper(recvbuf, count, dtype_int, peer, comm_, target_stream, nccl_error))
+        {
+            nccl_backend_detail::ncclGroupEndWrapper(nccl_error);
+            last_error_ = "ncclRecv failed in sendrecvAsync: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!nccl_backend_detail::ncclGroupEndWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupEnd failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)sendbuf;
+        (void)recvbuf;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        (void)stream;
+        last_error_ = "NCCL not available";
+        LOG_ERROR(last_error_);
+        return false;
+#endif
+    }
+
+    // =========================================================================
     // Column-Parallel (Strided) AllGather Implementation
     // =========================================================================
 
@@ -1053,6 +1456,280 @@ namespace llaminar2
         (void)count;
         (void)dtype;
         (void)root;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::reduceMulti(const std::vector<void *> &buffers, size_t count,
+                                  CollectiveDataType dtype, CollectiveOp op, int root)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "reduceMulti requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer count (" + std::to_string(buffers.size()) +
+                          ") does not match GPU count (" + std::to_string(num_ranks_) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (root < 0 || root >= num_ranks_)
+        {
+            last_error_ = "Invalid root rank: " + std::to_string(root);
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        int dtype_int = toNcclDataTypeInt(dtype);
+        int op_int = toNcclRedOpInt(op);
+        std::string nccl_error;
+
+        // Use group API for multi-GPU single-process
+        if (!nccl_backend_detail::ncclGroupStartWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupStart failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        for (int i = 0; i < num_ranks_; ++i)
+        {
+            nccl_backend_detail::cudaSetDeviceOrdinal(device_ordinals_[i]);
+            // Send buffer is each GPU's buffer, receive buffer is root's buffer
+            // For non-root GPUs, recvbuff is ignored by NCCL, but we still pass the root's buffer
+            void *recvbuff = buffers[root];
+            if (!nccl_backend_detail::ncclReduceInGroupWrapper(buffers[i], recvbuff, count,
+                                                               dtype_int, op_int, root,
+                                                               all_comms_[i], all_streams_[i], nccl_error))
+            {
+                last_error_ = "ncclReduce failed for GPU " + std::to_string(i) + ": " + nccl_error;
+                LOG_ERROR(last_error_);
+                nccl_backend_detail::ncclGroupEndWrapper(nccl_error);
+                return false;
+            }
+        }
+
+        if (!nccl_backend_detail::ncclGroupEndWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupEnd failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)root;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::reduceScatterMulti(
+        const std::vector<const void *> &send_buffers,
+        const std::vector<void *> &recv_buffers,
+        size_t recv_count,
+        CollectiveDataType dtype,
+        CollectiveOp op)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "reduceScatterMulti requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (send_buffers.size() != static_cast<size_t>(num_ranks_) ||
+            recv_buffers.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer count mismatch: send=" + std::to_string(send_buffers.size()) +
+                          ", recv=" + std::to_string(recv_buffers.size()) +
+                          ", expected=" + std::to_string(num_ranks_);
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        int dtype_int = toNcclDataTypeInt(dtype);
+        int op_int = toNcclRedOpInt(op);
+        std::string nccl_error;
+
+        // Use group API for multi-GPU single-process
+        if (!nccl_backend_detail::ncclGroupStartWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupStart failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        for (int i = 0; i < num_ranks_; ++i)
+        {
+            nccl_backend_detail::cudaSetDeviceOrdinal(device_ordinals_[i]);
+            if (!nccl_backend_detail::ncclReduceScatterInGroupWrapper(
+                    send_buffers[i], recv_buffers[i], recv_count,
+                    dtype_int, op_int, all_comms_[i], all_streams_[i], nccl_error))
+            {
+                last_error_ = "ncclReduceScatter failed for GPU " + std::to_string(i) + ": " + nccl_error;
+                LOG_ERROR(last_error_);
+                nccl_backend_detail::ncclGroupEndWrapper(nccl_error);
+                return false;
+            }
+        }
+
+        if (!nccl_backend_detail::ncclGroupEndWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupEnd failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)send_buffers;
+        (void)recv_buffers;
+        (void)recv_count;
+        (void)dtype;
+        (void)op;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::sendrecvMulti(
+        void *src_buffer,
+        void *dst_buffer,
+        size_t count,
+        CollectiveDataType dtype,
+        int src_gpu,
+        int dst_gpu)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "sendrecvMulti requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (src_gpu < 0 || src_gpu >= num_ranks_ || dst_gpu < 0 || dst_gpu >= num_ranks_)
+        {
+            last_error_ = "sendrecvMulti: Invalid GPU indices src=" + std::to_string(src_gpu) +
+                          ", dst=" + std::to_string(dst_gpu) +
+                          " (valid: 0-" + std::to_string(num_ranks_ - 1) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (src_gpu == dst_gpu)
+        {
+            // Self-transfer: just log and succeed - caller shouldn't do this
+            LOG_DEBUG("sendrecvMulti: src_gpu == dst_gpu (" << src_gpu << "), treating as no-op");
+            return true;
+        }
+
+        std::string nccl_error;
+
+        // CRITICAL: NCCL requires BOTH endpoints to participate in a group
+        // The send (on src_gpu) and recv (on dst_gpu) must both be issued before
+        // ncclGroupEnd is called.
+        if (!nccl_backend_detail::ncclGroupStartWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupStart failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Issue send on source GPU's communicator (to dst_gpu rank)
+        nccl_backend_detail::cudaSetDeviceOrdinal(device_ordinals_[src_gpu]);
+        if (!nccl_backend_detail::ncclSendWrapper(
+                src_buffer, count, toNcclDataTypeInt(dtype),
+                dst_gpu, all_comms_[src_gpu], all_streams_[src_gpu], nccl_error))
+        {
+            nccl_backend_detail::ncclGroupEndWrapper(nccl_error);
+            last_error_ = "ncclSend failed on GPU " + std::to_string(src_gpu) + ": " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Issue recv on destination GPU's communicator (from src_gpu rank)
+        nccl_backend_detail::cudaSetDeviceOrdinal(device_ordinals_[dst_gpu]);
+        if (!nccl_backend_detail::ncclRecvWrapper(
+                dst_buffer, count, toNcclDataTypeInt(dtype),
+                src_gpu, all_comms_[dst_gpu], all_streams_[dst_gpu], nccl_error))
+        {
+            nccl_backend_detail::ncclGroupEndWrapper(nccl_error);
+            last_error_ = "ncclRecv failed on GPU " + std::to_string(dst_gpu) + ": " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Now both operations are queued - commit the group
+        if (!nccl_backend_detail::ncclGroupEndWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupEnd failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Synchronize both streams to ensure transfer completes
+        nccl_backend_detail::cudaSetDeviceOrdinal(device_ordinals_[src_gpu]);
+        if (!nccl_backend_detail::cudaSynchronizeStream(all_streams_[src_gpu]))
+        {
+            last_error_ = "cudaStreamSynchronize failed on src GPU " + std::to_string(src_gpu);
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        nccl_backend_detail::cudaSetDeviceOrdinal(device_ordinals_[dst_gpu]);
+        if (!nccl_backend_detail::cudaSynchronizeStream(all_streams_[dst_gpu]))
+        {
+            last_error_ = "cudaStreamSynchronize failed on dst GPU " + std::to_string(dst_gpu);
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        LOG_DEBUG("NCCLBackend::sendrecvMulti: GPU " << src_gpu << " -> GPU " << dst_gpu
+                                                     << ", " << count << " elements");
+
+        return true;
+#else
+        (void)src_buffer;
+        (void)dst_buffer;
+        (void)count;
+        (void)dtype;
+        (void)src_gpu;
+        (void)dst_gpu;
         last_error_ = "NCCL not available";
         return false;
 #endif

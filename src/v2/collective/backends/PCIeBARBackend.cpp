@@ -12,6 +12,8 @@
 #include "../../backends/BackendManager.h"
 
 #include <algorithm>
+#include <set>
+#include <future>
 
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 #include <cuda_runtime.h>
@@ -486,6 +488,207 @@ namespace llaminar2
 #endif
     }
 
+    bool PCIeBARBackend::initializeMultiPair(const std::vector<DevicePair> &pairs)
+    {
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+        if (initialized_)
+        {
+            LOG_WARN("[PCIeBARBackend::initializeMultiPair] Already initialized");
+            return true;
+        }
+
+        if (pairs.empty())
+        {
+            LOG_ERROR("[PCIeBARBackend::initializeMultiPair] No device pairs provided");
+            return false;
+        }
+
+        LOG_INFO("[PCIeBARBackend::initializeMultiPair] Initializing " << pairs.size() << " device pairs");
+
+        // Validate all pairs
+        std::set<int> seen_cuda_ordinals;
+        std::set<int> seen_rocm_ordinals;
+
+        for (size_t i = 0; i < pairs.size(); ++i)
+        {
+            const auto &pair = pairs[i];
+
+            // Validate CUDA device
+            if (!pair.cuda_device.is_cuda())
+            {
+                LOG_ERROR("[PCIeBARBackend::initializeMultiPair] Pair " << i
+                                                                        << ": cuda_device is not a CUDA device");
+                return false;
+            }
+
+            // Validate ROCm device
+            if (!pair.rocm_device.is_rocm())
+            {
+                LOG_ERROR("[PCIeBARBackend::initializeMultiPair] Pair " << i
+                                                                        << ": rocm_device is not a ROCm device");
+                return false;
+            }
+
+            // Check for duplicate CUDA devices
+            if (seen_cuda_ordinals.count(pair.cuda_device.ordinal) > 0)
+            {
+                LOG_ERROR("[PCIeBARBackend::initializeMultiPair] Duplicate CUDA device: cuda:"
+                          << pair.cuda_device.ordinal);
+                return false;
+            }
+            seen_cuda_ordinals.insert(pair.cuda_device.ordinal);
+
+            // Check for duplicate ROCm devices
+            if (seen_rocm_ordinals.count(pair.rocm_device.ordinal) > 0)
+            {
+                LOG_ERROR("[PCIeBARBackend::initializeMultiPair] Duplicate ROCm device: rocm:"
+                          << pair.rocm_device.ordinal);
+                return false;
+            }
+            seen_rocm_ordinals.insert(pair.rocm_device.ordinal);
+
+            LOG_DEBUG("[PCIeBARBackend::initializeMultiPair] Validated pair " << i
+                                                                              << ": cuda:" << pair.cuda_device.ordinal
+                                                                              << " <-> rocm:" << pair.rocm_device.ordinal);
+        }
+
+        // Store validated pairs
+        device_pairs_ = pairs;
+
+        // Use first pair as the primary (for backward compatibility with single-pair APIs)
+        cuda_device_ = pairs[0].cuda_device;
+        rocm_device_ = pairs[0].rocm_device;
+        has_cuda_ = true;
+        has_rocm_ = true;
+
+        // Initialize P2P engine if not already done (using primary pair)
+        if (!p2p_engine_->isPCIeBarActive())
+        {
+            // Request 1GB BAR mapping for large transfers
+            constexpr size_t map_size = 1024 * 1024 * 1024;
+            if (!p2p_engine_->initializePCIeBar(cuda_device_, rocm_device_, 0, map_size))
+            {
+                LOG_ERROR("[PCIeBARBackend::initializeMultiPair] Failed to initialize PCIe BAR P2P "
+                          << "between CUDA:" << cuda_device_.ordinal
+                          << " and ROCm:" << rocm_device_.ordinal);
+                device_pairs_.clear();
+                return false;
+            }
+
+            // Benchmark to get measured bandwidth
+            auto result = p2p_engine_->benchmarkPCIeBar(64 * 1024 * 1024, 3);
+            if (result.success)
+            {
+                measured_bandwidth_gbps_ = (result.read_gbps + result.write_gbps) / 2.0;
+                p2p_engine_->setCachedBandwidthGBps(measured_bandwidth_gbps_);
+                LOG_INFO("[PCIeBARBackend::initializeMultiPair] PCIe BAR P2P initialized: "
+                         << measured_bandwidth_gbps_ << " GB/s average");
+            }
+        }
+        else
+        {
+            // Engine already active, retrieve cached bandwidth
+            measured_bandwidth_gbps_ = p2p_engine_->getCachedBandwidthGBps();
+            LOG_DEBUG("[PCIeBARBackend::initializeMultiPair] Using cached bandwidth: "
+                      << measured_bandwidth_gbps_ << " GB/s");
+        }
+
+        // Initialize BAR allocator state
+        bar_host_ptr_ = p2p_engine_->getBarHostPtr();
+        bar_total_mapped_size_ = p2p_engine_->getBarMappedSize();
+        bar_alloc_offset_ = 0;
+
+        // Start CUDA worker thread
+        if (!startCUDAWorker())
+        {
+            LOG_ERROR("[PCIeBARBackend::initializeMultiPair] Failed to start CUDA worker thread");
+            device_pairs_.clear();
+            return false;
+        }
+
+        // Create persistent stream for reduction operations
+        {
+            cudaSetDevice(cuda_device_.ordinal);
+            cudaStream_t stream;
+            cudaError_t err = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+            if (err == cudaSuccess)
+            {
+                cuda_reduction_stream_ = stream;
+            }
+            else
+            {
+                LOG_WARN("[PCIeBARBackend::initializeMultiPair] Failed to create reduction stream");
+                cuda_reduction_stream_ = nullptr;
+            }
+        }
+
+        // Create pipeline streams
+        {
+            cudaStream_t read_stream, write_stream;
+            cudaError_t err1 = cudaStreamCreateWithFlags(&read_stream, cudaStreamNonBlocking);
+            cudaError_t err2 = cudaStreamCreateWithFlags(&write_stream, cudaStreamNonBlocking);
+
+            if (err1 == cudaSuccess && err2 == cudaSuccess)
+            {
+                cuda_read_stream_ = read_stream;
+                cuda_write_stream_ = write_stream;
+            }
+            else
+            {
+                if (err1 == cudaSuccess)
+                    cudaStreamDestroy(read_stream);
+                if (err2 == cudaSuccess)
+                    cudaStreamDestroy(write_stream);
+                cuda_read_stream_ = nullptr;
+                cuda_write_stream_ = nullptr;
+            }
+
+            // Create synchronization events
+            cudaEvent_t read_events[2], compute_events[2];
+            cudaError_t err3 = cudaEventCreateWithFlags(&read_events[0], cudaEventDisableTiming);
+            cudaError_t err4 = cudaEventCreateWithFlags(&read_events[1], cudaEventDisableTiming);
+            cudaError_t err5 = cudaEventCreateWithFlags(&compute_events[0], cudaEventDisableTiming);
+            cudaError_t err6 = cudaEventCreateWithFlags(&compute_events[1], cudaEventDisableTiming);
+
+            if (err3 == cudaSuccess && err4 == cudaSuccess &&
+                err5 == cudaSuccess && err6 == cudaSuccess)
+            {
+                cuda_read_complete_event_[0] = read_events[0];
+                cuda_read_complete_event_[1] = read_events[1];
+                cuda_compute_complete_event_[0] = compute_events[0];
+                cuda_compute_complete_event_[1] = compute_events[1];
+            }
+            else
+            {
+                if (err3 == cudaSuccess)
+                    cudaEventDestroy(read_events[0]);
+                if (err4 == cudaSuccess)
+                    cudaEventDestroy(read_events[1]);
+                if (err5 == cudaSuccess)
+                    cudaEventDestroy(compute_events[0]);
+                if (err6 == cudaSuccess)
+                    cudaEventDestroy(compute_events[1]);
+                cuda_read_complete_event_[0] = nullptr;
+                cuda_read_complete_event_[1] = nullptr;
+                cuda_compute_complete_event_[0] = nullptr;
+                cuda_compute_complete_event_[1] = nullptr;
+            }
+        }
+
+        // Set global instance
+        s_instance_ = this;
+
+        initialized_ = true;
+        LOG_INFO("[PCIeBARBackend::initializeMultiPair] Successfully initialized "
+                 << pairs.size() << " device pairs");
+        return true;
+#else
+        (void)pairs;
+        LOG_ERROR("PCIeBARBackend::initializeMultiPair requires HAVE_CUDA and HAVE_ROCM");
+        return false;
+#endif
+    }
+
     void PCIeBARBackend::shutdown()
     {
         // Clear global instance first
@@ -554,6 +757,9 @@ namespace llaminar2
 
         // Clear registered buffers
         registered_collectives_.clear();
+
+        // Clear multi-pair state
+        device_pairs_.clear();
 
         // NOTE: p2p_engine_ is a shared_ptr to the process-wide singleton.
         // We don't cleanup the engine here - it persists for the process lifetime
@@ -813,6 +1019,328 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // Point-to-Point Operations
+    // =========================================================================
+
+    bool PCIeBARBackend::send(void *buffer, size_t count, CollectiveDataType dtype,
+                              int peer, int tag)
+    {
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+        if (!initialized_)
+        {
+            LOG_ERROR("PCIeBARBackend::send not initialized");
+            return false;
+        }
+
+        (void)tag; // PCIe BAR doesn't use message tags
+
+        // In 2-device mode: rank 0 = CUDA, rank 1 = ROCm
+        // send() transfers data FROM this device TO peer
+        // For PCIe BAR, we're always operating from the CUDA side:
+        // - If we're "CUDA" (rank 0) sending to ROCm (rank 1): write to BAR
+        // - If we're "ROCm" (rank 1) sending to CUDA (rank 0): write via HIP to BAR, CUDA reads
+
+        size_t bytes = count * datatypeSize(dtype);
+
+        if (peer == 1)
+        {
+            // CUDA (rank 0) sending to ROCm (rank 1): write to BAR
+            if (!transferCUDAtoROCm(buffer, 0, bytes))
+            {
+                LOG_ERROR("PCIeBARBackend::send CUDA→ROCm transfer failed");
+                return false;
+            }
+        }
+        else if (peer == 0)
+        {
+            // ROCm (rank 1) sending to CUDA (rank 0)
+            // The ROCm data is already in BAR memory (at offset 0)
+            // This is a no-op from the send side; recv will read it
+            LOG_DEBUG("PCIeBARBackend::send ROCm→CUDA: data should already be in BAR");
+            // Note: For proper send semantics, the ROCm side would need to
+            // hipMemcpy from its buffer to the BAR region. This requires
+            // knowing the BAR offset for this buffer.
+            LOG_ERROR("PCIeBARBackend::send from ROCm side not yet implemented");
+            return false;
+        }
+        else
+        {
+            LOG_ERROR("PCIeBARBackend::send invalid peer " << peer << " (only 0 and 1 supported)");
+            return false;
+        }
+
+        return synchronize();
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        (void)tag;
+        LOG_ERROR("PCIeBARBackend::send requires HAVE_CUDA and HAVE_ROCM");
+        return false;
+#endif
+    }
+
+    bool PCIeBARBackend::recv(void *buffer, size_t count, CollectiveDataType dtype,
+                              int peer, int tag)
+    {
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+        if (!initialized_)
+        {
+            LOG_ERROR("PCIeBARBackend::recv not initialized");
+            return false;
+        }
+
+        (void)tag; // PCIe BAR doesn't use message tags
+
+        // recv() transfers data FROM peer TO this device
+        // In 2-device mode: rank 0 = CUDA, rank 1 = ROCm
+
+        size_t bytes = count * datatypeSize(dtype);
+
+        if (peer == 1)
+        {
+            // CUDA (rank 0) receiving from ROCm (rank 1): read from BAR
+            if (!transferROCmtoCUDA(0, buffer, bytes))
+            {
+                LOG_ERROR("PCIeBARBackend::recv ROCm→CUDA transfer failed");
+                return false;
+            }
+        }
+        else if (peer == 0)
+        {
+            // ROCm (rank 1) receiving from CUDA (rank 0)
+            // CUDA would have written to BAR, ROCm reads from BAR via HIP
+            LOG_ERROR("PCIeBARBackend::recv to ROCm side not yet implemented");
+            return false;
+        }
+        else
+        {
+            LOG_ERROR("PCIeBARBackend::recv invalid peer " << peer << " (only 0 and 1 supported)");
+            return false;
+        }
+
+        return synchronize();
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        (void)tag;
+        LOG_ERROR("PCIeBARBackend::recv requires HAVE_CUDA and HAVE_ROCM");
+        return false;
+#endif
+    }
+
+    bool PCIeBARBackend::sendrecv(void *sendbuf, void *recvbuf, size_t count,
+                                  CollectiveDataType dtype, int peer)
+    {
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+        if (!initialized_)
+        {
+            LOG_ERROR("PCIeBARBackend::sendrecv not initialized");
+            return false;
+        }
+
+        // For PCIe BAR bidirectional exchange with CUDA↔ROCm:
+        // 1. CUDA reads ROCm data from BAR into recvbuf
+        // 2. CUDA writes sendbuf to ROCm via BAR
+        // This happens from CUDA's perspective (CUDA is always the active side)
+
+        size_t bytes = count * datatypeSize(dtype);
+
+        if (peer == 1)
+        {
+            // CUDA (rank 0) exchanging with ROCm (rank 1)
+            // Step 1: Read ROCm's data from BAR
+            if (!transferROCmtoCUDA(0, recvbuf, bytes))
+            {
+                LOG_ERROR("PCIeBARBackend::sendrecv read from ROCm failed");
+                return false;
+            }
+
+            // Step 2: Write our data to ROCm via BAR
+            if (!transferCUDAtoROCm(sendbuf, 0, bytes))
+            {
+                LOG_ERROR("PCIeBARBackend::sendrecv write to ROCm failed");
+                return false;
+            }
+        }
+        else if (peer == 0)
+        {
+            // ROCm (rank 1) exchanging with CUDA (rank 0)
+            // Not directly supported - would need to be called from CUDA side
+            LOG_ERROR("PCIeBARBackend::sendrecv from ROCm side not yet implemented");
+            return false;
+        }
+        else
+        {
+            LOG_ERROR("PCIeBARBackend::sendrecv invalid peer " << peer << " (only 0 and 1 supported)");
+            return false;
+        }
+
+        return synchronize();
+#else
+        (void)sendbuf;
+        (void)recvbuf;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        LOG_ERROR("PCIeBARBackend::sendrecv requires HAVE_CUDA and HAVE_ROCM");
+        return false;
+#endif
+    }
+
+    // =========================================================================
+    // Async Point-to-Point Operations
+    // =========================================================================
+
+    bool PCIeBARBackend::sendAsync(void *buffer, size_t count, CollectiveDataType dtype,
+                                   int peer, void *stream, int tag)
+    {
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+        if (!initialized_)
+        {
+            LOG_ERROR("PCIeBARBackend::sendAsync not initialized");
+            return false;
+        }
+
+        (void)tag; // PCIe BAR doesn't support message tags
+
+        size_t bytes = count * datatypeSize(dtype);
+
+        if (peer == 1)
+        {
+            // CUDA (rank 0) sending to ROCm (rank 1)
+            // Use async write if stream provided
+            if (stream)
+            {
+                return transferCUDAtoROCmAsync(buffer, 0, bytes, stream);
+            }
+            else
+            {
+                return transferCUDAtoROCm(buffer, 0, bytes);
+            }
+        }
+        else
+        {
+            LOG_ERROR("PCIeBARBackend::sendAsync only supports send from CUDA (rank 0) to ROCm (rank 1)");
+            return false;
+        }
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        (void)stream;
+        (void)tag;
+        LOG_ERROR("PCIeBARBackend::sendAsync requires HAVE_CUDA and HAVE_ROCM");
+        return false;
+#endif
+    }
+
+    bool PCIeBARBackend::recvAsync(void *buffer, size_t count, CollectiveDataType dtype,
+                                   int peer, void *stream, int tag)
+    {
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+        if (!initialized_)
+        {
+            LOG_ERROR("PCIeBARBackend::recvAsync not initialized");
+            return false;
+        }
+
+        (void)tag; // PCIe BAR doesn't support message tags
+
+        size_t bytes = count * datatypeSize(dtype);
+
+        if (peer == 1)
+        {
+            // CUDA (rank 0) receiving from ROCm (rank 1)
+            // Use async read if stream provided
+            if (stream)
+            {
+                return transferROCmtoCUDAAsync(0, buffer, bytes, stream);
+            }
+            else
+            {
+                return transferROCmtoCUDA(0, buffer, bytes);
+            }
+        }
+        else
+        {
+            LOG_ERROR("PCIeBARBackend::recvAsync only supports recv on CUDA (rank 0) from ROCm (rank 1)");
+            return false;
+        }
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        (void)stream;
+        (void)tag;
+        LOG_ERROR("PCIeBARBackend::recvAsync requires HAVE_CUDA and HAVE_ROCM");
+        return false;
+#endif
+    }
+
+    bool PCIeBARBackend::sendrecvAsync(void *sendbuf, void *recvbuf, size_t count,
+                                       CollectiveDataType dtype, int peer, void *stream)
+    {
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+        if (!initialized_)
+        {
+            LOG_ERROR("PCIeBARBackend::sendrecvAsync not initialized");
+            return false;
+        }
+
+        size_t bytes = count * datatypeSize(dtype);
+
+        if (peer == 1)
+        {
+            // CUDA (rank 0) exchanging with ROCm (rank 1)
+            // Step 1: Read ROCm's data from BAR (async if stream provided)
+            bool read_ok = stream ? transferROCmtoCUDAAsync(0, recvbuf, bytes, stream)
+                                  : transferROCmtoCUDA(0, recvbuf, bytes);
+            if (!read_ok)
+            {
+                LOG_ERROR("PCIeBARBackend::sendrecvAsync read from ROCm failed");
+                return false;
+            }
+
+            // Step 2: Write our data to ROCm via BAR (async if stream provided)
+            bool write_ok = stream ? transferCUDAtoROCmAsync(sendbuf, 0, bytes, stream)
+                                   : transferCUDAtoROCm(sendbuf, 0, bytes);
+            if (!write_ok)
+            {
+                LOG_ERROR("PCIeBARBackend::sendrecvAsync write to ROCm failed");
+                return false;
+            }
+
+            return true;
+        }
+        else if (peer == 0)
+        {
+            LOG_ERROR("PCIeBARBackend::sendrecvAsync from ROCm side not yet implemented");
+            return false;
+        }
+        else
+        {
+            LOG_ERROR("PCIeBARBackend::sendrecvAsync invalid peer " << peer << " (only 0 and 1 supported)");
+            return false;
+        }
+#else
+        (void)sendbuf;
+        (void)recvbuf;
+        (void)count;
+        (void)dtype;
+        (void)peer;
+        (void)stream;
+        LOG_ERROR("PCIeBARBackend::sendrecvAsync requires HAVE_CUDA and HAVE_ROCM");
+        return false;
+#endif
+    }
+
+    // =========================================================================
     // Registered Buffer AllReduce
     // =========================================================================
 
@@ -916,6 +1444,277 @@ namespace llaminar2
         (void)count;
         (void)dtype;
         (void)op;
+        return false;
+#endif
+    }
+
+    // =========================================================================
+    // Multi-Pair AllReduce Implementation
+    // =========================================================================
+
+    bool PCIeBARBackend::allreduceMultiPair(
+        std::vector<void *> &cuda_buffers,
+        std::vector<void *> &rocm_buffers,
+        size_t count_per_pair,
+        CollectiveDataType dtype)
+    {
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+        if (!initialized_)
+        {
+            LOG_ERROR("[allreduceMultiPair] PCIeBARBackend not initialized");
+            return false;
+        }
+
+        // Validate multi-pair mode or fallback to single-pair
+        size_t num_pairs = device_pairs_.empty() ? 1 : device_pairs_.size();
+
+        if (cuda_buffers.size() != num_pairs)
+        {
+            LOG_ERROR("[allreduceMultiPair] cuda_buffers size (" << cuda_buffers.size()
+                                                                 << ") doesn't match number of pairs (" << num_pairs << ")");
+            return false;
+        }
+
+        if (rocm_buffers.size() != num_pairs)
+        {
+            LOG_ERROR("[allreduceMultiPair] rocm_buffers size (" << rocm_buffers.size()
+                                                                 << ") doesn't match number of pairs (" << num_pairs << ")");
+            return false;
+        }
+
+        size_t bytes_per_pair = count_per_pair * datatypeSize(dtype);
+        LOG_DEBUG("[allreduceMultiPair] Starting " << num_pairs << " pairs, "
+                                                   << count_per_pair << " elements ("
+                                                   << bytes_per_pair << " bytes) per pair");
+
+        // Ensure temp buffer is large enough for one pair's data
+        if (!ensureTempBuffer(bytes_per_pair))
+        {
+            LOG_ERROR("[allreduceMultiPair] Failed to allocate temp buffer");
+            return false;
+        }
+
+        // Get BAR pointer for transfers
+        void *cuda_bar_ptr = p2p_engine_->getCudaBarPointer();
+        if (!cuda_bar_ptr)
+        {
+            LOG_ERROR("[allreduceMultiPair] No CUDA BAR pointer available");
+            return false;
+        }
+
+        // For multi-pair, we launch all pairs in parallel using async operations
+        // Each pair performs:
+        // 1. Read ROCm data via BAR (async)
+        // 2. Perform reduction on CUDA (async)
+        // 3. Write result back to ROCm via BAR (async)
+        //
+        // Note: Currently using the same streams for all pairs (serialized per-stream).
+        // Future optimization: Create per-pair streams for true parallelism.
+
+        cudaStream_t read_stream = cuda_read_stream_
+                                       ? static_cast<cudaStream_t>(cuda_read_stream_)
+                                       : nullptr;
+        cudaStream_t compute_stream = cuda_reduction_stream_
+                                          ? static_cast<cudaStream_t>(cuda_reduction_stream_)
+                                          : nullptr;
+        cudaStream_t write_stream = cuda_write_stream_
+                                        ? static_cast<cudaStream_t>(cuda_write_stream_)
+                                        : nullptr;
+
+        // Use events for synchronization between phases
+        cudaEvent_t read_complete, compute_complete;
+        cudaError_t err = cudaEventCreateWithFlags(&read_complete, cudaEventDisableTiming);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[allreduceMultiPair] Failed to create read_complete event");
+            return false;
+        }
+
+        err = cudaEventCreateWithFlags(&compute_complete, cudaEventDisableTiming);
+        if (err != cudaSuccess)
+        {
+            cudaEventDestroy(read_complete);
+            LOG_ERROR("[allreduceMultiPair] Failed to create compute_complete event");
+            return false;
+        }
+
+        bool success = true;
+
+        // Process all pairs - launching async operations for each
+        for (size_t pair_idx = 0; pair_idx < num_pairs && success; ++pair_idx)
+        {
+            void *cuda_buf = cuda_buffers[pair_idx];
+            void *rocm_buf = rocm_buffers[pair_idx];
+
+            // For multi-pair mode, ROCm buffers should be at specific BAR offsets
+            // Currently assumes all ROCm buffers are allocated via allocateInBarRegion()
+            // and their offsets can be computed from their positions in BAR allocations.
+            //
+            // For now, we use a simple approach: assume all ROCm buffers are at
+            // contiguous offsets starting from 0 (pair 0), bytes_per_pair (pair 1), etc.
+            // This works for the initial implementation where buffers are pre-allocated.
+            size_t rocm_bar_offset = pair_idx * bytes_per_pair;
+
+            // Find actual offset if buffer is registered
+            bool found_offset = false;
+            for (const auto &alloc : bar_allocations_)
+            {
+                if (alloc.ptr == rocm_buf)
+                {
+                    rocm_bar_offset = alloc.offset;
+                    found_offset = true;
+                    break;
+                }
+            }
+
+            if (!found_offset && rocm_buf != nullptr)
+            {
+                LOG_DEBUG("[allreduceMultiPair] Pair " << pair_idx
+                                                       << ": ROCm buffer not in BAR allocations, using computed offset "
+                                                       << rocm_bar_offset);
+            }
+
+            LOG_DEBUG("[allreduceMultiPair] Pair " << pair_idx
+                                                   << ": cuda_buf=" << cuda_buf
+                                                   << ", rocm_offset=" << rocm_bar_offset);
+
+            // Set CUDA device for this pair (use primary device for now)
+            // Future: Each pair could use its own CUDA device
+            cudaSetDevice(cuda_device_.ordinal);
+
+            // Phase 1: Read ROCm data to temp buffer via BAR (async)
+            void *bar_src = static_cast<char *>(cuda_bar_ptr) + rocm_bar_offset;
+            err = cudaMemcpyAsync(cuda_temp_buffer_, bar_src, bytes_per_pair,
+                                  cudaMemcpyDeviceToDevice,
+                                  read_stream ? read_stream : nullptr);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[allreduceMultiPair] Pair " << pair_idx
+                                                       << ": Failed to read from BAR: " << cudaGetErrorString(err));
+                success = false;
+                break;
+            }
+
+            // Record event when read completes
+            if (read_stream)
+            {
+                cudaEventRecord(read_complete, read_stream);
+            }
+
+            // Phase 2: Wait for read, then reduce (async)
+            if (read_stream && compute_stream)
+            {
+                cudaStreamWaitEvent(compute_stream, read_complete, 0);
+            }
+            else if (read_stream)
+            {
+                cudaStreamSynchronize(read_stream);
+            }
+
+            // Launch reduction kernel: cuda_buf = cuda_buf + temp_buffer
+            bool reduce_ok = false;
+            switch (dtype)
+            {
+            case CollectiveDataType::FLOAT32:
+                reduce_ok = cuda::launchVectorAddInplace_f32(
+                    static_cast<float *>(cuda_buf),
+                    static_cast<const float *>(cuda_temp_buffer_),
+                    count_per_pair,
+                    compute_stream);
+                break;
+
+            case CollectiveDataType::FLOAT16:
+                reduce_ok = cuda::launchVectorAddInplace_f16(
+                    cuda_buf, cuda_temp_buffer_, count_per_pair, compute_stream);
+                break;
+
+            case CollectiveDataType::BFLOAT16:
+                reduce_ok = cuda::launchVectorAddInplace_bf16(
+                    cuda_buf, cuda_temp_buffer_, count_per_pair, compute_stream);
+                break;
+
+            case CollectiveDataType::INT8:
+                reduce_ok = cuda::launchVectorAddInplace_i8(
+                    static_cast<int8_t *>(cuda_buf),
+                    static_cast<const int8_t *>(cuda_temp_buffer_),
+                    count_per_pair,
+                    compute_stream);
+                break;
+
+            case CollectiveDataType::INT32:
+                reduce_ok = cuda::launchVectorAddInplace_i32(
+                    static_cast<int32_t *>(cuda_buf),
+                    static_cast<const int32_t *>(cuda_temp_buffer_),
+                    count_per_pair,
+                    compute_stream);
+                break;
+
+            default:
+                LOG_ERROR("[allreduceMultiPair] Unsupported dtype: " << static_cast<int>(dtype));
+                success = false;
+                break;
+            }
+
+            if (!reduce_ok)
+            {
+                LOG_ERROR("[allreduceMultiPair] Pair " << pair_idx << ": Reduction kernel failed");
+                success = false;
+                break;
+            }
+
+            // Record event when compute completes
+            if (compute_stream)
+            {
+                cudaEventRecord(compute_complete, compute_stream);
+            }
+
+            // Phase 3: Wait for compute, then write result back to ROCm (async)
+            if (compute_stream && write_stream)
+            {
+                cudaStreamWaitEvent(write_stream, compute_complete, 0);
+            }
+            else if (compute_stream)
+            {
+                cudaStreamSynchronize(compute_stream);
+            }
+
+            void *bar_dst = static_cast<char *>(cuda_bar_ptr) + rocm_bar_offset;
+            err = cudaMemcpyAsync(bar_dst, cuda_buf, bytes_per_pair,
+                                  cudaMemcpyDeviceToDevice,
+                                  write_stream ? write_stream : nullptr);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[allreduceMultiPair] Pair " << pair_idx
+                                                       << ": Failed to write to BAR: " << cudaGetErrorString(err));
+                success = false;
+                break;
+            }
+        }
+
+        // Synchronize all streams
+        if (read_stream)
+            cudaStreamSynchronize(read_stream);
+        if (compute_stream)
+            cudaStreamSynchronize(compute_stream);
+        if (write_stream)
+            cudaStreamSynchronize(write_stream);
+
+        // Cleanup events
+        cudaEventDestroy(read_complete);
+        cudaEventDestroy(compute_complete);
+
+        if (success)
+        {
+            LOG_DEBUG("[allreduceMultiPair] Completed " << num_pairs << " pairs successfully");
+        }
+
+        return success;
+#else
+        (void)cuda_buffers;
+        (void)rocm_buffers;
+        (void)count_per_pair;
+        (void)dtype;
+        LOG_ERROR("PCIeBARBackend::allreduceMultiPair requires HAVE_CUDA and HAVE_ROCM");
         return false;
 #endif
     }

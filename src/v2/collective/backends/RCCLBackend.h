@@ -126,6 +126,56 @@ namespace llaminar2
             int root) override;
 
         // =====================================================================
+        // Point-to-Point Operations
+        // =====================================================================
+
+        bool send(void *buffer, size_t count, CollectiveDataType dtype,
+                  int peer, int tag = 0) override;
+
+        bool recv(void *buffer, size_t count, CollectiveDataType dtype,
+                  int peer, int tag = 0) override;
+
+        bool sendrecv(void *sendbuf, void *recvbuf, size_t count,
+                      CollectiveDataType dtype, int peer) override;
+
+        // =====================================================================
+        // Async Point-to-Point Operations
+        // =====================================================================
+
+        /**
+         * @brief Async send using caller-provided stream
+         *
+         * Issues rcclSend on the provided stream. Completion is tracked by
+         * the stream, allowing the caller to overlap with other operations.
+         *
+         * @param buffer Source buffer
+         * @param count Number of elements
+         * @param dtype Data type
+         * @param peer Target rank
+         * @param stream HIP stream (hipStream_t cast to void*)
+         * @param tag Ignored for RCCL (uses rank for matching)
+         * @return true if operation was issued
+         */
+        bool sendAsync(void *buffer, size_t count, CollectiveDataType dtype,
+                       int peer, void *stream, int tag = 0) override;
+
+        /**
+         * @brief Async receive using caller-provided stream
+         *
+         * Issues rcclRecv on the provided stream.
+         */
+        bool recvAsync(void *buffer, size_t count, CollectiveDataType dtype,
+                       int peer, void *stream, int tag = 0) override;
+
+        /**
+         * @brief Async bidirectional send-receive using caller-provided stream
+         *
+         * Issues rcclSend and rcclRecv in a group call on the provided stream.
+         */
+        bool sendrecvAsync(void *sendbuf, void *recvbuf, size_t count,
+                           CollectiveDataType dtype, int peer, void *stream) override;
+
+        // =====================================================================
         // Multi-GPU Single-Process Collective Operations
         // =====================================================================
 
@@ -148,6 +198,31 @@ namespace llaminar2
             size_t count,
             CollectiveDataType dtype,
             int root) override;
+
+        /// Multi-GPU Reduce (all buffers reduced to root)
+        bool reduceMulti(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            int root) override;
+
+        /// Multi-GPU Reduce-Scatter (each GPU gets 1/N of reduced result)
+        bool reduceScatterMulti(
+            const std::vector<const void *> &send_buffers,
+            const std::vector<void *> &recv_buffers,
+            size_t recv_count,
+            CollectiveDataType dtype,
+            CollectiveOp op) override;
+
+        /// Multi-GPU P2P Send/Recv (coordinates both endpoints in single group)
+        bool sendrecvMulti(
+            void *src_buffer,
+            void *dst_buffer,
+            size_t count,
+            CollectiveDataType dtype,
+            int src_gpu,
+            int dst_gpu) override;
 
         // =====================================================================
         // Synchronization
