@@ -3417,13 +3417,13 @@ add_v2_test(V2_Unit_CUDAFlashAttention_DecodeKVLen
     MPI_PROCS 1  # Tests GPU attention locally, no MPI needed
 )
 
-# Test: cuBLAS GEMM (Phase 1 - dense GEMM via cuBLAS for FP32/FP16/BF16)
+# Integration Test: cuBLAS GEMM (Phase 1 - dense GEMM via cuBLAS for FP32/FP16/BF16)
 # Tests correctness against CPU reference, various matrix sizes, transpose variants
-add_executable(v2_test_cublas_gemm unit/Test__CuBLASGemm.cpp)
+add_executable(v2_test_cublas_gemm integration/Test__CuBLASGemm.cpp)
 target_link_libraries(v2_test_cublas_gemm llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_CuBLASGemm
+add_v2_test(V2_Integration_CuBLASGemm
     COMMAND $<TARGET_FILE:v2_test_cublas_gemm>
-    LABELS "V2;Unit;CUDA;cuBLAS;GEMM;FP32;FP16;BF16;DenseGEMM;KernelCorrectness"
+    LABELS "V2;Integration;CUDA;cuBLAS;GEMM;FP32;FP16;BF16;DenseGEMM;KernelCorrectness"
     MPI_PROCS 1  # Tests GPU GEMM locally, no MPI needed
 )
 
@@ -3549,6 +3549,17 @@ add_v2_test(V2_Integration_CUDAOpsParity
     MPI_PROCS 1  # Tests GPU vs CPU parity locally, no MPI needed
 )
 
+# Test: CUDA ResidualAdd Parity
+# Tests CUDA ResidualAdd kernels (FP32, BF16, FP16) against CPU reference
+# with cosine similarity and L2 error metrics
+add_executable(v2_integration_cuda_residual_add_parity integration/Test__CUDAResidualAddParity.cpp)
+target_link_libraries(v2_integration_cuda_residual_add_parity llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDAResidualAddParity
+    COMMAND $<TARGET_FILE:v2_integration_cuda_residual_add_parity>
+    LABELS "V2;Integration;CUDA;Parity;ResidualAdd;FP32;BF16;FP16;CosineSimilarity"
+    MPI_PROCS 1  # Tests GPU vs CPU parity locally, no MPI needed
+)
+
 # Test: CUDA Flash Attention Parity
 # Tests Flash Attention 2 (prefill) and Flash Decoding (decode) CUDA kernels
 # against CPU attention reference with cosine similarity metrics
@@ -3582,17 +3593,17 @@ add_v2_test(V2_Integration_CUDARingKVCacheParity
     MPI_PROCS 1  # Tests GPU KV cache locally, no MPI needed
 )
 
-# Test: CUDA Ring Buffer KV Cache Sharding (Tensor Parallelism)
+# Integration Test: CUDA Ring Buffer KV Cache Sharding (Tensor Parallelism)
 # Tests sharded KV cache for tensor-parallel inference: per-rank metadata,
 # local_n_kv_heads, kv_head_start offsets, memory allocation, IKVCache interface.
-add_executable(v2_unit_cuda_ring_kv_cache_sharding unit/Test__CUDARingKVCache_Sharding.cpp)
-target_link_libraries(v2_unit_cuda_ring_kv_cache_sharding llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_CUDARingKVCache_Sharding
-    COMMAND $<TARGET_FILE:v2_unit_cuda_ring_kv_cache_sharding>
-    LABELS "V2;Unit;CUDA;KVCache;RingBuffer;Sharding;TensorParallelism;FP32;FP16;BF16;GQA"
+add_executable(v2_integration_cuda_ring_kv_cache_sharding integration/Test__CUDARingKVCache_Sharding.cpp)
+target_link_libraries(v2_integration_cuda_ring_kv_cache_sharding llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDARingKVCache_Sharding
+    COMMAND $<TARGET_FILE:v2_integration_cuda_ring_kv_cache_sharding>
+    LABELS "V2;Integration;CUDA;KVCache;RingBuffer;Sharding;TensorParallelism;FP32;FP16;BF16;GQA"
     MPI_PROCS 1  # Tests GPU KV cache sharding locally, no MPI needed
 )
-message(STATUS "V2 Tests: Added CUDA Ring KV Cache sharding unit tests")
+message(STATUS "V2 Tests: Added CUDA Ring KV Cache sharding integration tests")
 
 # Test: NCCL Backend Integration
 # Tests NCCL-based collective operations for multi-GPU communication
@@ -3631,6 +3642,21 @@ add_v2_test(V2_Integration_RCCLBackend
     MPI_PROCS 1  # Tests RCCL locally - single rank
 )
 message(STATUS "V2 Tests: Added RCCL backend integration tests")
+
+# Test: RCCLAllreduceAccuracy - Focused numerical accuracy tests for RCCL allreduce
+# Tests allreduce operations with inference-relevant sizes to isolate numerical issues
+add_executable(v2_integration_rccl_allreduce_accuracy integration/Test__RCCLAllreduceAccuracy.cpp)
+target_link_libraries(v2_integration_rccl_allreduce_accuracy 
+    llaminar2_core 
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_RCCLAllreduceAccuracy
+    COMMAND $<TARGET_FILE:v2_integration_rccl_allreduce_accuracy>
+    LABELS "V2;Integration;ROCm;RCCL;Collective;AllReduce;Accuracy;Numerical;Inference"
+    MPI_PROCS 1  # Tests RCCL locally - single rank
+)
+message(STATUS "V2 Tests: Added RCCL allreduce accuracy integration tests")
 endif()
 
 # Test: HeterogeneousBackend Phase 1 - Intra-Domain Reduce
@@ -3795,172 +3821,46 @@ if(ZLIB_FOUND)
     get_filename_component(WORKSPACE_ROOT_PARITY "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 
     # =========================================================================
-    # Qwen2 Parity Tests (integration/parity/qwen2/)
+    # Qwen2 Parity Test Matrix (integration/parity/qwen2/)
+    # =========================================================================
+    # 
+    # Single parameterized test file that covers all configurations:
+    #   - Single device: CPU, CUDA, ROCm
+    #   - LOCAL TP: NCCL (2xCUDA), RCCL (2xROCm, 3xROCm), PCIeBAR (CUDA+ROCm)
+    #
+    # Tests skip at runtime if required hardware/backends are unavailable.
     # =========================================================================
 
-    # Qwen2 CUDA vs PyTorch Parity Test
-    add_executable(v2_integration_parity_qwen2_cuda_vs_pytorch 
-        integration/parity/qwen2/Test__Qwen2_CUDA_vs_PyTorch.cpp
+    add_executable(v2_integration_parity_qwen2_matrix 
+        integration/parity/qwen2/Test__Qwen2_ParityMatrix.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen2_cuda_vs_pytorch 
-        llaminar2_core 
-        GTest::gtest 
-        GTest::gtest_main
-        ZLIB::ZLIB
-    )
-    target_include_directories(v2_integration_parity_qwen2_cuda_vs_pytorch PRIVATE 
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy
-    )
-    add_v2_test(V2_Integration_Parity_Qwen2_CUDA_vs_PyTorch
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_cuda_vs_pytorch>
-        LABELS "V2;Integration;Parity;Qwen2;CUDA;PyTorch;GoldenReference;FullModel;Pipeline"
-        MPI_PROCS 1
-    )
-
-    # Qwen2 CPU vs PyTorch Parity Test
-    add_executable(v2_integration_parity_qwen2_cpu_vs_pytorch 
-        integration/parity/qwen2/Test__Qwen2_CPU_vs_PyTorch.cpp
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-    )
-    target_link_libraries(v2_integration_parity_qwen2_cpu_vs_pytorch 
-        llaminar2_core 
-        GTest::gtest 
-        GTest::gtest_main
-        ZLIB::ZLIB
-    )
-    target_include_directories(v2_integration_parity_qwen2_cpu_vs_pytorch PRIVATE 
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy
-    )
-    add_v2_test(V2_Integration_Parity_Qwen2_CPU_vs_PyTorch
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_cpu_vs_pytorch>
-        LABELS "V2;Integration;Parity;Qwen2;CPU;PyTorch;GoldenReference;FullModel;Pipeline"
-        MPI_PROCS 1
-    )
-
-    # Qwen2 ROCm vs PyTorch Parity Test
-    add_executable(v2_integration_parity_qwen2_rocm_vs_pytorch 
-        integration/parity/qwen2/Test__Qwen2_ROCm_vs_PyTorch.cpp
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-    )
-    target_link_libraries(v2_integration_parity_qwen2_rocm_vs_pytorch 
-        llaminar2_core 
-        GTest::gtest 
-        GTest::gtest_main
-        ZLIB::ZLIB
-    )
-    target_include_directories(v2_integration_parity_qwen2_rocm_vs_pytorch PRIVATE 
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy
-    )
-    add_v2_test(V2_Integration_Parity_Qwen2_ROCm_vs_PyTorch
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_rocm_vs_pytorch>
-        LABELS "V2;Integration;Parity;Qwen2;ROCm;PyTorch;GoldenReference;FullModel;Pipeline"
-        MPI_PROCS 1
-    )
-
-    # Qwen2 Tensor-Parallel MPI Backend (GLOBAL scope, 2+ ranks) vs PyTorch Parity Test
-    # Tests correctness of weight sharding, allreduce/allgather, and cross-vendor TP via MPI
-    add_executable(v2_integration_parity_qwen2_tp_mpi_vs_pytorch 
-        integration/parity/qwen2/Test__Qwen2_TP_MPI_vs_PyTorch.cpp
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-    )
-    target_link_libraries(v2_integration_parity_qwen2_tp_mpi_vs_pytorch 
+    # Note: No gtest_main - test provides custom main() with MPI_Init
+    target_link_libraries(v2_integration_parity_qwen2_matrix 
         llaminar2_core 
         GTest::gtest
         ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen2_tp_mpi_vs_pytorch PRIVATE 
+    target_include_directories(v2_integration_parity_qwen2_matrix PRIVATE 
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
     )
-    add_v2_test(V2_Integration_Parity_Qwen2_TP_MPI_vs_PyTorch
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_tp_mpi_vs_pytorch>
-        LABELS "V2;Integration;Parity;Qwen2;TensorParallel;MPI;GLOBAL;PyTorch;GoldenReference;FullModel;Pipeline;Sharding;Allreduce"
-        MPI_PROCS 2
+    
+    # Set CAP_SYS_ADMIN for PCIeBAR tests (heterogeneous CUDA+ROCm P2P)
+    if(HAVE_CUDA AND HAVE_ROCM)
+        add_custom_command(TARGET v2_integration_parity_qwen2_matrix POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E echo "Setting CAP_SYS_ADMIN on v2_integration_parity_qwen2_matrix for PCIe BAR P2P"
+            COMMAND sudo setcap cap_sys_admin+ep $<TARGET_FILE:v2_integration_parity_qwen2_matrix> || true
+        )
+    endif()
+
+    add_v2_test(V2_Integration_Parity_Qwen2_Matrix
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_matrix>
+        LABELS "V2;Integration;Parity;Qwen2;CPU;CUDA;ROCm;NCCL;RCCL;PCIeBAR;LOCAL;TensorParallel;PyTorch;GoldenReference;FullModel;Pipeline;MultiDevice;Orchestrator"
+        MPI_PROCS 1
+        RESOURCE_LOCK "PCIeBAR_P2P"
     )
 
-    # Qwen2 TRUE LOCAL TP with MultiDeviceOrchestrator (2 CUDA devices via NCCL)
-    # This is the actual LOCAL TP parity test that uses:
-    # - MultiDeviceOrchestrator with per-device DeviceGraphOrchestrator instances
-    # - Real weight sharding with Megatron-style tensor parallelism
-    # - NCCL AllReduce for collective operations
-    if(HAVE_CUDA AND HAVE_NCCL)
-        add_executable(v2_integration_parity_qwen2_localtp_nccl_vs_pytorch 
-            integration/parity/qwen2/Test__Qwen2_LocalTP_NCCL_vs_PyTorch.cpp
-            ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-        )
-        target_link_libraries(v2_integration_parity_qwen2_localtp_nccl_vs_pytorch 
-            llaminar2_core 
-            GTest::gtest
-            ZLIB::ZLIB
-        )
-        target_include_directories(v2_integration_parity_qwen2_localtp_nccl_vs_pytorch PRIVATE 
-            ${WORKSPACE_ROOT_PARITY}/external/cnpy
-        )
-        add_v2_test(V2_Integration_Parity_Qwen2_LocalTP_NCCL_vs_PyTorch
-            COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_localtp_nccl_vs_pytorch>
-            LABELS "V2;Integration;Parity;Qwen2;NCCL;LOCAL;CUDA;TensorParallel;PyTorch;GoldenReference;FullModel;Pipeline;MultiDevice;Orchestrator"
-            MPI_PROCS 1
-        )
-    endif()
-
-    # Qwen2 TRUE LOCAL TP with MultiDeviceOrchestrator (2 ROCm devices via RCCL)
-    # This is the actual LOCAL TP parity test that uses:
-    # - MultiDeviceOrchestrator with per-device DeviceGraphOrchestrator instances
-    # - Real weight sharding with Megatron-style tensor parallelism
-    # - RCCL AllReduce for collective operations
-    if(HAVE_ROCM AND HAVE_RCCL)
-        add_executable(v2_integration_parity_qwen2_localtp_rccl_vs_pytorch 
-            integration/parity/qwen2/Test__Qwen2_LocalTP_RCCL_vs_PyTorch.cpp
-            ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-        )
-        target_link_libraries(v2_integration_parity_qwen2_localtp_rccl_vs_pytorch 
-            llaminar2_core 
-            GTest::gtest
-            ZLIB::ZLIB
-        )
-        target_include_directories(v2_integration_parity_qwen2_localtp_rccl_vs_pytorch PRIVATE 
-            ${WORKSPACE_ROOT_PARITY}/external/cnpy
-        )
-        add_v2_test(V2_Integration_Parity_Qwen2_LocalTP_RCCL_vs_PyTorch
-            COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_localtp_rccl_vs_pytorch>
-            LABELS "V2;Integration;Parity;Qwen2;RCCL;LOCAL;ROCm;TensorParallel;PyTorch;GoldenReference;FullModel;Pipeline;MultiDevice;Orchestrator"
-            MPI_PROCS 1
-        )
-    endif()
-
-    # Qwen2 TRUE LOCAL TP with MultiDeviceOrchestrator (Heterogeneous CUDA+ROCm)
-    # This is the actual LOCAL TP parity test for heterogeneous hardware that uses:
-    # - MultiDeviceOrchestrator with per-device DeviceGraphOrchestrator instances
-    # - Real weight sharding with Megatron-style tensor parallelism
-    # - PCIeBAR for AllReduce (direct CUDA↔ROCm P2P memory mapping)
-    # NOTE: Requires both CUDA and ROCm devices + PCIe BAR P2P support
-    if(HAVE_CUDA AND HAVE_ROCM)
-        add_executable(v2_integration_parity_qwen2_localtp_pciebar_vs_pytorch 
-            integration/parity/qwen2/Test__Qwen2_LocalTP_PCIeBAR_vs_PyTorch.cpp
-            ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-        )
-        target_link_libraries(v2_integration_parity_qwen2_localtp_pciebar_vs_pytorch 
-            llaminar2_core 
-            GTest::gtest
-            ZLIB::ZLIB
-        )
-        target_include_directories(v2_integration_parity_qwen2_localtp_pciebar_vs_pytorch PRIVATE 
-            ${WORKSPACE_ROOT_PARITY}/external/cnpy
-        )
-        # Set CAP_SYS_ADMIN for PCIe BAR access
-        add_custom_command(TARGET v2_integration_parity_qwen2_localtp_pciebar_vs_pytorch POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E echo "Setting CAP_SYS_ADMIN on v2_integration_parity_qwen2_localtp_pciebar_vs_pytorch for PCIe BAR P2P"
-            COMMAND sudo setcap cap_sys_admin+ep $<TARGET_FILE:v2_integration_parity_qwen2_localtp_pciebar_vs_pytorch> || true
-        )
-        add_v2_test(V2_Integration_Parity_Qwen2_LocalTP_PCIeBAR_vs_PyTorch
-            COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_localtp_pciebar_vs_pytorch>
-            LABELS "V2;Integration;Parity;Qwen2;PCIeBAR;LOCAL;CrossVendor;CUDA;ROCm;TensorParallel;PyTorch;GoldenReference;FullModel;Pipeline;MultiDevice;Orchestrator;Heterogeneous"
-            MPI_PROCS 1
-            RESOURCE_LOCK "PCIeBAR_P2P"
-        )
-    endif()
-
-    message(STATUS "V2: Qwen2 parity tests enabled (CUDA, CPU, ROCm, TP vs PyTorch)")
+    message(STATUS "V2: Qwen2 parity test matrix enabled (single file, all configurations)")
 else()
     message(STATUS "V2: Parity tests disabled (ZLIB not found)")
 endif()
@@ -4317,6 +4217,17 @@ target_link_libraries(v2_test_orchestration_config_parser llaminar2_core GTest::
 add_v2_test(V2_Unit_OrchestrationConfigParser
     COMMAND $<TARGET_FILE:v2_test_orchestration_config_parser>
     LABELS "V2;Unit;Config;CLI;YAML;Orchestration;Heterogeneous"
+    MPI_PROCS 1
+)
+
+# Test: TPPPValidator (validates TP/PP configuration against model architecture)
+# Tests head divisibility, dimension divisibility, layer assignment, proportional weights.
+# Part of Phase 0.4: Model-Aware Configuration Validation
+add_executable(v2_test_tppp_validator unit/Test__TPPPValidator.cpp)
+target_link_libraries(v2_test_tppp_validator llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_TPPPValidator
+    COMMAND $<TARGET_FILE:v2_test_tppp_validator>
+    LABELS "V2;Unit;Config;Validation;TP;PP;Orchestration;ModelAware"
     MPI_PROCS 1
 )
 
@@ -7134,39 +7045,39 @@ if(HAVE_ROCM)
     # ROCm Ring Buffer KV Cache Tests
     # =============================================================================
 
-    # Unit Test: ROCm Ring Buffer KV Cache
+    # Integration Test: ROCm Ring Buffer KV Cache
     # Tests append, wrap-around, eviction, linearization, FP32/FP16 precision
-    add_executable(v2_unit_rocm_ring_kv_cache 
-        unit/Test__ROCmRingKVCache.cpp
+    add_executable(v2_integration_rocm_ring_kv_cache 
+        integration/Test__ROCmRingKVCache.cpp
     )
-    target_link_libraries(v2_unit_rocm_ring_kv_cache 
+    target_link_libraries(v2_integration_rocm_ring_kv_cache 
         llaminar2_core 
         GTest::gtest 
         GTest::gtest_main
     )
-    add_v2_test(V2_Unit_ROCmRingKVCache
-        COMMAND $<TARGET_FILE:v2_unit_rocm_ring_kv_cache>
-        LABELS "V2;Unit;ROCm;KVCache;RingBuffer;Eviction;SlidingWindow;FP32;FP16;gfx906"
+    add_v2_test(V2_Integration_ROCmRingKVCache
+        COMMAND $<TARGET_FILE:v2_integration_rocm_ring_kv_cache>
+        LABELS "V2;Integration;ROCm;KVCache;RingBuffer;Eviction;SlidingWindow;FP32;FP16;gfx906"
         MPI_PROCS 1
     )
-    message(STATUS "V2 Tests: Added ROCm Ring KV Cache unit tests")
+    message(STATUS "V2 Tests: Added ROCm Ring KV Cache integration tests")
 
-    # Unit Test: ROCm Ring Buffer KV Cache Sharding
+    # Integration Test: ROCm Ring Buffer KV Cache Sharding
     # Tests sharded KV cache for tensor parallelism (stub tests until sharding implemented)
-    add_executable(v2_unit_rocm_ring_kv_cache_sharding 
-        unit/Test__ROCmRingKVCache_Sharding.cpp
+    add_executable(v2_integration_rocm_ring_kv_cache_sharding 
+        integration/Test__ROCmRingKVCache_Sharding.cpp
     )
-    target_link_libraries(v2_unit_rocm_ring_kv_cache_sharding 
+    target_link_libraries(v2_integration_rocm_ring_kv_cache_sharding 
         llaminar2_core 
         GTest::gtest 
         GTest::gtest_main
     )
-    add_v2_test(V2_Unit_ROCmRingKVCache_Sharding
-        COMMAND $<TARGET_FILE:v2_unit_rocm_ring_kv_cache_sharding>
-        LABELS "V2;Unit;ROCm;KVCache;RingBuffer;Sharding;TensorParallel;gfx906"
+    add_v2_test(V2_Integration_ROCmRingKVCache_Sharding
+        COMMAND $<TARGET_FILE:v2_integration_rocm_ring_kv_cache_sharding>
+        LABELS "V2;Integration;ROCm;KVCache;RingBuffer;Sharding;TensorParallel;gfx906"
         MPI_PROCS 1
     )
-    message(STATUS "V2 Tests: Added ROCm Ring KV Cache sharding unit tests")
+    message(STATUS "V2 Tests: Added ROCm Ring KV Cache sharding integration tests")
 
     # =============================================================================
     # ROCm SwiGLU Parity Tests

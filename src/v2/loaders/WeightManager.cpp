@@ -1277,6 +1277,16 @@ namespace llaminar2
                                                        << (original->shape().size() > 1 ? original->shape()[1] : 1) << "]"
                                                        << " type=" << static_cast<int>(tensor_type));
 
+        // Enhanced logging for non-GEMM weights (biases, norms) to debug multi-GPU pointer issues
+        if (name.find("bias") != std::string::npos || name.find("norm") != std::string::npos)
+        {
+            LOG_DEBUG("[WeightManager] NON-GEMM WEIGHT CLONE: " << name
+                                                                << " original_ptr=" << static_cast<const void *>(original->raw_data())
+                                                                << " clone_ptr=" << static_cast<const void *>(clone->raw_data())
+                                                                << " target_device=" << target_device.to_string()
+                                                                << " size_bytes=" << clone->size_bytes());
+        }
+
         return clone;
     }
 
@@ -1368,7 +1378,16 @@ namespace llaminar2
         // For the first device, return the original tensor
         if (first_device_.value() == device)
         {
-            return ensureWeightLoaded();
+            auto result = ensureWeightLoaded();
+            // Log non-GEMM weights (biases, norms) for multi-GPU debugging
+            if (result && (name.find("bias") != std::string::npos || name.find("norm") != std::string::npos))
+            {
+                LOG_DEBUG("[WeightManager] NON-GEMM WEIGHT (first device): " << name
+                                                                             << " ptr=" << static_cast<const void *>(result->raw_data())
+                                                                             << " device=" << device.to_string()
+                                                                             << " size_bytes=" << result->size_bytes());
+            }
+            return result;
         }
 
         // Check per-device cache for subsequent devices
@@ -1376,6 +1395,14 @@ namespace llaminar2
         auto it = per_device_cache_.find(cache_key);
         if (it != per_device_cache_.end())
         {
+            // Log non-GEMM weights (biases, norms) for multi-GPU debugging
+            if (name.find("bias") != std::string::npos || name.find("norm") != std::string::npos)
+            {
+                LOG_DEBUG("[WeightManager] NON-GEMM WEIGHT (cached clone): " << name
+                                                                             << " ptr=" << static_cast<const void *>(it->second->raw_data())
+                                                                             << " device=" << device.to_string()
+                                                                             << " size_bytes=" << it->second->size_bytes());
+            }
             return it->second;
         }
 

@@ -32,6 +32,7 @@
 #endif
 #ifdef HAVE_ROCM
 #include "backends/rocm/ROCmBackend.h"
+#include <hip/hip_runtime.h>  // For raw HIP API calls
 #endif
 
 #include <fstream>
@@ -3380,6 +3381,865 @@ namespace llaminar2::test::experimental
     }
 
     /**
+     * @brief Test DIRECT AMD-to-AMD P2P via PCIe BAR mapping
+     *
+     * This test explores true direct P2P between AMD GPUs by mapping one GPU's
+     * VRAM BAR and having another GPU write to it directly - the same approach
+     * we use for CUDA↔ROCm in DirectP2P.cpp.
+     *
+     * Approach:
+     * 1. mmap AMD GPU 1's VRAM BAR via sysfs
+     * 2. Use HSA to register that memory for AMD GPU 0 to access
+     * 3. Have GPU 0 write directly to GPU 1's BAR (true P2P over PCIe)
+     *
+     * This bypasses the broken hipDeviceCanAccessPeer() and avoids host staging.
+     */
+    TEST_F(Test__AMD_PCIe_P2P_Mapping, AMD_to_AMD_DirectP2P_via_BAR)
+    {
+        ROCmBackend rocm_backend;
+        int device_count = rocm_backend.deviceCount();
+        
+        if (device_count < 2)
+        {
+            GTEST_SKIP() << "Requires at least 2 ROCm devices (found " << device_count << ")";
+        }
+
+        LOG_INFO("\n╔════════════════════════════════════════════════════════════════════════════════════╗");
+        LOG_INFO("║  AMD-to-AMD DIRECT P2P via PCIe BAR Mapping                                         ║");
+        LOG_INFO("╠════════════════════════════════════════════════════════════════════════════════════╣");
+        LOG_INFO("║  Goal: True direct P2P without host staging                                         ║");
+        LOG_INFO("║  Method: mmap GPU1's BAR, have GPU0 write to it directly                            ║");
+        LOG_INFO("╚════════════════════════════════════════════════════════════════════════════════════╝\n");
+
+        // Find AMD GPUs via sysfs
+        auto amd_gpus = PCIResourceParser::scanPCIBus(0x1002);
+        if (amd_gpus.size() < 2)
+        {
+            GTEST_SKIP() << "Need at least 2 AMD GPUs in sysfs (found " << amd_gpus.size() << ")";
+        }
+
+        // Parse BAR info for first two AMD GPUs
+        PCIeBarInfo gpu0_info = PCIResourceParser::parseResourceFile(amd_gpus[0]);
+        PCIeBarInfo gpu1_info = PCIResourceParser::parseResourceFile(amd_gpus[1]);
+
+        LOG_INFO("=== GPU BAR Information ===");
+        LOG_INFO("GPU 0: " << amd_gpus[0]);
+        LOG_INFO("  VRAM BAR" << gpu0_info.vram_bar_index << ": 0x" << std::hex << gpu0_info.vram_phys_addr
+                              << " size=" << std::dec << (gpu0_info.vram_size / (1024ULL * 1024 * 1024)) << " GB"
+                              << (gpu0_info.resizable_bar ? " (rBAR)" : ""));
+        LOG_INFO("GPU 1: " << amd_gpus[1]);
+        LOG_INFO("  VRAM BAR" << gpu1_info.vram_bar_index << ": 0x" << std::hex << gpu1_info.vram_phys_addr
+                              << " size=" << std::dec << (gpu1_info.vram_size / (1024ULL * 1024 * 1024)) << " GB"
+                              << (gpu1_info.resizable_bar ? " (rBAR)" : ""));
+
+        // Step 1: mmap GPU 1's VRAM BAR
+        LOG_INFO("\n=== Step 1: mmap GPU 1's VRAM BAR ===");
+        const size_t map_size = 64 * 1024 * 1024;  // 64 MB test region
+        void* gpu1_bar = PCIResourceParser::mmapBar(amd_gpus[1], gpu1_info.vram_bar_index, map_size);
+        
+        if (gpu1_bar == nullptr)
+        {
+            LOG_WARN("Cannot mmap GPU 1's BAR - need root access");
+            LOG_INFO("Run with: sudo ./v2_integration_amd_pcie_p2p_mapping");
+            GTEST_SKIP() << "Cannot mmap AMD BAR - need root";
+        }
+        LOG_INFO("  ✓ mmap'd " << (map_size / (1024 * 1024)) << " MB of GPU 1's VRAM at " << gpu1_bar);
+
+        // Step 2: Try to register the BAR memory with HSA for GPU 0 to access
+        LOG_INFO("\n=== Step 2: Register BAR with HSA for GPU 0 access ===");
+        
+        // Load HSA dynamically to avoid header conflicts
+        void* hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
+        if (!hsa_handle)
+        {
+            hsa_handle = dlopen("libhsa-runtime64.so.1", RTLD_NOW | RTLD_GLOBAL);
+        }
+        
+        if (!hsa_handle)
+        {
+            LOG_WARN("Cannot load HSA runtime: " << dlerror());
+            munmap(gpu1_bar, map_size);
+            GTEST_SKIP() << "HSA runtime not available";
+        }
+
+        // Define HSA types and function pointers
+        typedef uint32_t hsa_status_t;
+        typedef struct { uint64_t handle; } hsa_agent_t;
+        
+        typedef hsa_status_t (*hsa_init_fn)();
+        typedef hsa_status_t (*hsa_shut_down_fn)();
+        typedef hsa_status_t (*hsa_iterate_agents_fn)(
+            hsa_status_t (*callback)(hsa_agent_t agent, void* data), void* data);
+        typedef hsa_status_t (*hsa_agent_get_info_fn)(hsa_agent_t agent, int attribute, void* value);
+        typedef hsa_status_t (*hsa_amd_memory_lock_fn)(
+            void* host_ptr, size_t size, hsa_agent_t* agents, int num_agents, void** agent_ptr);
+        typedef hsa_status_t (*hsa_amd_memory_unlock_fn)(void* host_ptr);
+
+        auto hsa_init = (hsa_init_fn)dlsym(hsa_handle, "hsa_init");
+        auto hsa_shut_down = (hsa_shut_down_fn)dlsym(hsa_handle, "hsa_shut_down");
+        auto hsa_iterate_agents = (hsa_iterate_agents_fn)dlsym(hsa_handle, "hsa_iterate_agents");
+        auto hsa_agent_get_info = (hsa_agent_get_info_fn)dlsym(hsa_handle, "hsa_agent_get_info");
+        auto hsa_amd_memory_lock = (hsa_amd_memory_lock_fn)dlsym(hsa_handle, "hsa_amd_memory_lock");
+        auto hsa_amd_memory_unlock = (hsa_amd_memory_unlock_fn)dlsym(hsa_handle, "hsa_amd_memory_unlock");
+
+        if (!hsa_init || !hsa_amd_memory_lock)
+        {
+            LOG_WARN("Cannot find HSA functions");
+            dlclose(hsa_handle);
+            munmap(gpu1_bar, map_size);
+            GTEST_SKIP() << "HSA functions not available";
+        }
+
+        // Initialize HSA
+        hsa_status_t status = hsa_init();
+        if (status != 0)
+        {
+            LOG_WARN("hsa_init failed: " << status);
+            dlclose(hsa_handle);
+            munmap(gpu1_bar, map_size);
+            GTEST_SKIP() << "HSA init failed";
+        }
+        LOG_INFO("  ✓ HSA initialized");
+
+        // Collect GPU agents
+        std::vector<hsa_agent_t> gpu_agents;
+        auto agent_callback = [](hsa_agent_t agent, void* data) -> hsa_status_t {
+            auto* agents = static_cast<std::vector<hsa_agent_t>*>(data);
+            agents->push_back(agent);
+            return 0; // HSA_STATUS_SUCCESS
+        };
+        
+        hsa_iterate_agents(agent_callback, &gpu_agents);
+        LOG_INFO("  Found " << gpu_agents.size() << " HSA agents");
+
+        // Filter to GPU agents only (device_type == 1 is GPU)
+        std::vector<hsa_agent_t> gpus_only;
+        for (const auto& agent : gpu_agents)
+        {
+            uint32_t device_type = 0;
+            hsa_agent_get_info(agent, 17, &device_type); // 17 = HSA_AGENT_INFO_DEVICE
+            if (device_type == 1) // HSA_DEVICE_TYPE_GPU
+            {
+                gpus_only.push_back(agent);
+            }
+        }
+        LOG_INFO("  Found " << gpus_only.size() << " GPU agents");
+
+        if (gpus_only.size() < 2)
+        {
+            hsa_shut_down();
+            dlclose(hsa_handle);
+            munmap(gpu1_bar, map_size);
+            GTEST_SKIP() << "Need at least 2 GPU agents";
+        }
+
+        // Try hsa_amd_memory_lock on the mmap'd BAR
+        // This should pin the memory and return a GPU-accessible pointer
+        LOG_INFO("\n=== Step 3: hsa_amd_memory_lock on mmap'd BAR ===");
+        LOG_INFO("  Attempting to lock " << (map_size / (1024 * 1024)) << " MB for GPU 0 access...");
+        
+        void* gpu0_accessible_ptr = nullptr;
+        hsa_agent_t target_gpu = gpus_only[0];
+        
+        status = hsa_amd_memory_lock(gpu1_bar, map_size, &target_gpu, 1, &gpu0_accessible_ptr);
+        
+        if (status == 0 && gpu0_accessible_ptr != nullptr)
+        {
+            LOG_INFO("  ✓ hsa_amd_memory_lock SUCCEEDED!");
+            LOG_INFO("    GPU 0 accessible pointer: " << gpu0_accessible_ptr);
+            LOG_INFO("    Original BAR pointer: " << gpu1_bar);
+            
+            // Step 4: Try to use this pointer for GPU 0 kernel/memcpy
+            LOG_INFO("\n=== Step 4: Test GPU 0 write to GPU 1's BAR ===");
+            
+            // Allocate source buffer on GPU 0
+            rocm_backend.setDevice(0);
+            const size_t test_size = 4 * 1024 * 1024;  // 4 MB
+            void* gpu0_src = rocm_backend.allocate(test_size, 0);
+            
+            if (gpu0_src)
+            {
+                // Initialize with pattern
+                std::vector<float> pattern(test_size / sizeof(float));
+                for (size_t i = 0; i < pattern.size(); ++i)
+                {
+                    pattern[i] = static_cast<float>(i % 1000) * 0.001f;
+                }
+                rocm_backend.hostToDevice(gpu0_src, pattern.data(), test_size, 0);
+                rocm_backend.synchronize(0);
+                
+                LOG_INFO("  Attempting hipMemcpy from GPU 0 to locked BAR pointer...");
+                
+                // Try device-to-device copy from GPU 0 to the locked BAR pointer
+                auto start = std::chrono::high_resolution_clock::now();
+                bool copy_success = rocm_backend.deviceToDevice(gpu0_accessible_ptr, gpu0_src, test_size, 0);
+                rocm_backend.synchronize(0);
+                auto end = std::chrono::high_resolution_clock::now();
+                
+                if (copy_success)
+                {
+                    double ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    double gbps = (test_size / (1024.0 * 1024.0 * 1024.0)) / (ms / 1000.0);
+                    
+                    LOG_INFO("  ✓ Copy succeeded!");
+                    LOG_INFO("    Time: " << std::fixed << std::setprecision(2) << ms << " ms");
+                    LOG_INFO("    Throughput: " << std::fixed << std::setprecision(2) << gbps << " GB/s");
+                    
+                    // Verify by reading back from BAR
+                    LOG_INFO("\n=== Step 5: Verify data in GPU 1's BAR ===");
+                    std::vector<float> verify(test_size / sizeof(float));
+                    memcpy(verify.data(), gpu1_bar, test_size);  // Direct read from mmap'd BAR
+                    
+                    int mismatches = 0;
+                    for (size_t i = 0; i < verify.size() && mismatches < 10; ++i)
+                    {
+                        if (std::abs(verify[i] - pattern[i]) > 1e-6f)
+                        {
+                            mismatches++;
+                        }
+                    }
+                    
+                    if (mismatches == 0)
+                    {
+                        LOG_INFO("  ✓✓✓ DATA VERIFIED! True direct AMD-to-AMD P2P works!");
+                        LOG_INFO("\n╔══════════════════════════════════════════════════════════════════╗");
+                        LOG_INFO("║  SUCCESS: Direct AMD-to-AMD P2P via BAR mapping!                  ║");
+                        LOG_INFO("║  Throughput: " << std::fixed << std::setprecision(2) << gbps << " GB/s                                        ║");
+                        LOG_INFO("╚══════════════════════════════════════════════════════════════════╝");
+                    }
+                    else
+                    {
+                        LOG_WARN("  Data verification failed: " << mismatches << " mismatches");
+                    }
+                }
+                else
+                {
+                    LOG_WARN("  Copy failed");
+                }
+                
+                rocm_backend.free(gpu0_src, 0);
+            }
+            
+            // Unlock
+            hsa_amd_memory_unlock(gpu1_bar);
+        }
+        else
+        {
+            LOG_WARN("  ✗ hsa_amd_memory_lock FAILED (status=" << status << ")");
+            LOG_INFO("");
+            LOG_INFO("This is EXPECTED for mmap'd PCIe BARs because:");
+            LOG_INFO("  - hsa_amd_memory_lock is for pinning HOST memory, not I/O memory");
+            LOG_INFO("  - mmap'd sysfs BARs are VM_IO regions without backing pages");
+            LOG_INFO("");
+            LOG_INFO("ALTERNATIVE APPROACHES for direct AMD-to-AMD P2P:");
+            LOG_INFO("  1. tinygrad-style: Program AMD GPU page tables directly via MMIO");
+            LOG_INFO("  2. KFD ioctl: Use DRM_AMDGPU_GEM_DGMA for direct GMA mapping");
+            LOG_INFO("  3. Kernel module: Custom driver to set up inter-GPU DMA");
+        }
+
+        // Cleanup
+        hsa_shut_down();
+        dlclose(hsa_handle);
+        munmap(gpu1_bar, map_size);
+        
+        SUCCEED() << "Direct P2P exploration complete";
+    }
+
+    /**
+     * @brief Test AMD-to-AMD DIRECT P2P via KFD MAP_MEMORY_TO_GPU
+     *
+     * This is the CORRECT approach for direct AMD-to-AMD P2P:
+     * 1. Allocate VRAM on GPU 1 via ALLOC_MEMORY_OF_GPU
+     * 2. Map that memory to GPU 0 via MAP_MEMORY_TO_GPU
+     * 3. GPU 0 can now access GPU 1's VRAM directly (true P2P)
+     *
+     * This is what RCCL/ROCm should be using internally, but the standard
+     * hipDeviceCanAccessPeer() check may be returning 0 incorrectly on our
+     * hardware configuration.
+     */
+    TEST_F(Test__AMD_PCIe_P2P_Mapping, AMD_to_AMD_DirectP2P_via_KFD_MapMemory)
+    {
+        ROCmBackend rocm_backend;
+        int device_count = rocm_backend.deviceCount();
+        
+        if (device_count < 2)
+        {
+            GTEST_SKIP() << "Requires at least 2 ROCm devices (found " << device_count << ")";
+        }
+
+        LOG_INFO("\n╔════════════════════════════════════════════════════════════════════════════════════╗");
+        LOG_INFO("║  AMD-to-AMD DIRECT P2P via KFD MAP_MEMORY_TO_GPU                                    ║");
+        LOG_INFO("╠════════════════════════════════════════════════════════════════════════════════════╣");
+        LOG_INFO("║  This test uses the CORRECT approach:                                               ║");
+        LOG_INFO("║  1. Allocate VRAM on GPU 1 via KFD ALLOC_MEMORY_OF_GPU                              ║");
+        LOG_INFO("║  2. Map to GPU 0 via KFD MAP_MEMORY_TO_GPU                                          ║");
+        LOG_INFO("║  3. GPU 0 writes directly to GPU 1's VRAM (true P2P)                                ║");
+        LOG_INFO("╚════════════════════════════════════════════════════════════════════════════════════╝\n");
+
+        // Open KFD
+        int kfd_fd = open("/dev/kfd", O_RDWR);
+        if (kfd_fd < 0)
+        {
+            GTEST_SKIP() << "Cannot open /dev/kfd: " << strerror(errno);
+        }
+        LOG_INFO("Opened /dev/kfd");
+
+        // KFD ioctl definitions (from linux/kfd_ioctl.h)
+        // We define them locally to avoid extern "C" conflicts
+        #define AMDKFD_IOCTL_BASE 'K'
+        #define AMDKFD_IOWR_LOCAL(nr, type) _IOWR(AMDKFD_IOCTL_BASE, nr, type)
+        #define AMDKFD_IOW_LOCAL(nr, type) _IOW(AMDKFD_IOCTL_BASE, nr, type)
+
+        // Memory flags
+        constexpr uint32_t KFD_ALLOC_MEM_FLAGS_VRAM = (1 << 0);
+        constexpr uint32_t KFD_ALLOC_MEM_FLAGS_WRITABLE = (1 << 5);
+        constexpr uint32_t KFD_ALLOC_MEM_FLAGS_PUBLIC = (1 << 7);
+
+        // Local structure definitions (matching kernel kfd_ioctl.h)
+        struct kfd_alloc_mem_args {
+            uint64_t va_addr;
+            uint64_t size;
+            uint64_t handle;
+            uint64_t mmap_offset;
+            uint32_t gpu_id;
+            uint32_t flags;
+        };
+
+        struct kfd_map_mem_args {
+            uint64_t handle;
+            uint64_t device_ids_array_ptr;
+            uint32_t n_devices;
+            uint32_t n_success;
+        };
+
+        struct kfd_free_mem_args {
+            uint64_t handle;
+        };
+
+        // Structure for getting apertures
+        struct kfd_ioctl_get_process_apertures_new_args_local
+        {
+            uint64_t kfd_process_device_apertures_ptr;
+            uint32_t num_of_nodes;
+            uint32_t pad;
+        };
+
+        struct kfd_process_device_apertures_local
+        {
+            uint64_t lds_base;
+            uint64_t lds_limit;
+            uint64_t scratch_base;
+            uint64_t scratch_limit;
+            uint64_t gpuvm_base;
+            uint64_t gpuvm_limit;
+            uint32_t gpu_id;
+            uint32_t pad;
+        };
+
+        // Get GPU IDs via KFD apertures query
+        LOG_INFO("\n=== Step 1: Query KFD GPU IDs ===");
+        
+        kfd_process_device_apertures_local apertures[8] = {};
+        kfd_ioctl_get_process_apertures_new_args_local aperture_args = {};
+        aperture_args.kfd_process_device_apertures_ptr = reinterpret_cast<uint64_t>(apertures);
+        aperture_args.num_of_nodes = 8;
+
+        // ioctl number 0x14 = GET_PROCESS_APERTURES_NEW
+        int ioctl_apertures = _IOWR(AMDKFD_IOCTL_BASE, 0x14, kfd_ioctl_get_process_apertures_new_args_local);
+        int ret = ioctl(kfd_fd, ioctl_apertures, &aperture_args);
+        if (ret != 0)
+        {
+            close(kfd_fd);
+            GTEST_SKIP() << "GET_PROCESS_APERTURES failed: " << strerror(errno);
+        }
+
+        LOG_INFO("Found " << aperture_args.num_of_nodes << " KFD nodes:");
+        for (uint32_t i = 0; i < aperture_args.num_of_nodes && i < 8; ++i)
+        {
+            LOG_INFO("  Node " << i << ": gpu_id=" << apertures[i].gpu_id
+                               << " gpuvm_base=0x" << std::hex << apertures[i].gpuvm_base << std::dec);
+        }
+
+        if (aperture_args.num_of_nodes < 2)
+        {
+            close(kfd_fd);
+            GTEST_SKIP() << "Need at least 2 KFD GPU nodes";
+        }
+
+        uint32_t gpu0_id = apertures[0].gpu_id;
+        uint32_t gpu1_id = apertures[1].gpu_id;
+        LOG_INFO("\nUsing GPU 0 (id=" << gpu0_id << ") and GPU 1 (id=" << gpu1_id << ")");
+
+        // Step 2: Allocate memory on GPU 1
+        LOG_INFO("\n=== Step 2: Allocate VRAM on GPU 1 ===");
+        
+        const size_t alloc_size = 4 * 1024 * 1024;  // 4 MB
+        
+        kfd_alloc_mem_args alloc_args = {};
+        alloc_args.va_addr = 0;  // Let KFD choose
+        alloc_args.size = alloc_size;
+        alloc_args.gpu_id = gpu1_id;
+        alloc_args.flags = KFD_ALLOC_MEM_FLAGS_VRAM | 
+                          KFD_ALLOC_MEM_FLAGS_WRITABLE |
+                          KFD_ALLOC_MEM_FLAGS_PUBLIC;  // PUBLIC allows cross-GPU access
+
+        // ioctl number 0x16 = ALLOC_MEMORY_OF_GPU
+        int ioctl_alloc = _IOWR(AMDKFD_IOCTL_BASE, 0x16, kfd_alloc_mem_args);
+        ret = ioctl(kfd_fd, ioctl_alloc, &alloc_args);
+        if (ret != 0)
+        {
+            LOG_WARN("ALLOC_MEMORY_OF_GPU failed: " << strerror(errno) << " (errno=" << errno << ")");
+            close(kfd_fd);
+            GTEST_SKIP() << "ALLOC_MEMORY_OF_GPU failed";
+        }
+
+        uint64_t handle = alloc_args.handle;
+        uint64_t mmap_offset = alloc_args.mmap_offset;
+        LOG_INFO("  ✓ Allocated " << (alloc_size / (1024 * 1024)) << " MB on GPU 1");
+        LOG_INFO("    handle=0x" << std::hex << handle << std::dec);
+        LOG_INFO("    mmap_offset=0x" << std::hex << mmap_offset << std::dec);
+
+        // Step 3: Map memory to BOTH GPUs (required for P2P)
+        LOG_INFO("\n=== Step 3: Map memory to both GPUs ===");
+        
+        uint32_t device_ids[2] = {gpu0_id, gpu1_id};
+        kfd_map_mem_args map_args = {};
+        map_args.handle = handle;
+        map_args.device_ids_array_ptr = reinterpret_cast<uint64_t>(device_ids);
+        map_args.n_devices = 2;
+        map_args.n_success = 0;
+
+        // ioctl number 0x18 = MAP_MEMORY_TO_GPU
+        int ioctl_map = _IOWR(AMDKFD_IOCTL_BASE, 0x18, kfd_map_mem_args);
+        ret = ioctl(kfd_fd, ioctl_map, &map_args);
+        if (ret != 0)
+        {
+            LOG_WARN("MAP_MEMORY_TO_GPU failed: " << strerror(errno) << " (errno=" << errno << ")");
+            LOG_INFO("n_success=" << map_args.n_success);
+            
+            // Cleanup
+            kfd_free_mem_args free_args = {};
+            free_args.handle = handle;
+            // ioctl number 0x17 = FREE_MEMORY_OF_GPU
+            int ioctl_free = _IOW(AMDKFD_IOCTL_BASE, 0x17, kfd_free_mem_args);
+            ioctl(kfd_fd, ioctl_free, &free_args);
+            close(kfd_fd);
+            
+            LOG_INFO("\nThis failure indicates the kernel doesn't support P2P mapping between these GPUs.");
+            LOG_INFO("Possible causes:");
+            LOG_INFO("  1. GPUs on different PCIe root complexes without P2P support");
+            LOG_INFO("  2. IOMMU blocking cross-device DMA");
+            LOG_INFO("  3. Driver doesn't support P2P for this GPU generation");
+            GTEST_SKIP() << "MAP_MEMORY_TO_GPU failed";
+        }
+
+        LOG_INFO("  ✓ Mapped to " << map_args.n_success << " GPUs");
+
+        // Step 4: mmap the memory for CPU access (to initialize)
+        LOG_INFO("\n=== Step 4: mmap for CPU access ===");
+        
+        // Open render node
+        int render_fd = open("/dev/dri/renderD128", O_RDWR);
+        if (render_fd < 0)
+        {
+            // Try other render nodes
+            for (int i = 129; i < 140; ++i)
+            {
+                char path[32];
+                snprintf(path, sizeof(path), "/dev/dri/renderD%d", i);
+                render_fd = open(path, O_RDWR);
+                if (render_fd >= 0) break;
+            }
+        }
+
+        void* cpu_ptr = nullptr;
+        if (render_fd >= 0)
+        {
+            cpu_ptr = mmap(nullptr, alloc_size, PROT_READ | PROT_WRITE, MAP_SHARED, render_fd, mmap_offset);
+            if (cpu_ptr == MAP_FAILED)
+            {
+                LOG_WARN("mmap failed: " << strerror(errno));
+                cpu_ptr = nullptr;
+            }
+            else
+            {
+                LOG_INFO("  ✓ mmap'd at " << cpu_ptr);
+            }
+            close(render_fd);
+        }
+
+        // Step 5: Test P2P access
+        LOG_INFO("\n=== Step 5: Test P2P access ===");
+        
+        if (cpu_ptr)
+        {
+            // Initialize via CPU
+            float* data = static_cast<float*>(cpu_ptr);
+            for (size_t i = 0; i < alloc_size / sizeof(float); ++i)
+            {
+                data[i] = static_cast<float>(i % 1000) * 0.001f;
+            }
+            LOG_INFO("  Initialized " << (alloc_size / sizeof(float)) << " floats via CPU");
+
+            // Now use HIP to have GPU 0 read from this memory
+            // The va_addr should be accessible from GPU 0 now
+            LOG_INFO("  Virtual address for HIP: 0x" << std::hex << alloc_args.va_addr << std::dec);
+            
+            // Allocate output buffer on GPU 0
+            rocm_backend.setDevice(0);
+            void* gpu0_out = rocm_backend.allocate(alloc_size, 0);
+            
+            if (gpu0_out)
+            {
+                LOG_INFO("\n  Attempting hipMemcpy from mapped address to GPU 0...");
+                
+                // The mapped memory should be accessible at va_addr
+                void* mapped_ptr = reinterpret_cast<void*>(alloc_args.va_addr);
+                
+                auto start = std::chrono::high_resolution_clock::now();
+                bool copy_ok = rocm_backend.deviceToDevice(gpu0_out, mapped_ptr, alloc_size, 0);
+                rocm_backend.synchronize(0);
+                auto end = std::chrono::high_resolution_clock::now();
+                
+                if (copy_ok)
+                {
+                    double ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    double gbps = (alloc_size / (1024.0 * 1024.0 * 1024.0)) / (ms / 1000.0);
+                    
+                    LOG_INFO("  ✓ hipMemcpy succeeded!");
+                    LOG_INFO("    Time: " << std::fixed << std::setprecision(2) << ms << " ms");
+                    LOG_INFO("    Throughput: " << std::fixed << std::setprecision(2) << gbps << " GB/s");
+                    
+                    // Verify
+                    std::vector<float> verify(alloc_size / sizeof(float));
+                    rocm_backend.deviceToHost(verify.data(), gpu0_out, alloc_size, 0);
+                    
+                    int mismatches = 0;
+                    for (size_t i = 0; i < verify.size() && mismatches < 5; ++i)
+                    {
+                        float expected = static_cast<float>(i % 1000) * 0.001f;
+                        if (std::abs(verify[i] - expected) > 1e-6f)
+                        {
+                            mismatches++;
+                        }
+                    }
+                    
+                    if (mismatches == 0)
+                    {
+                        LOG_INFO("\n╔══════════════════════════════════════════════════════════════════╗");
+                        LOG_INFO("║  ✓✓✓ DIRECT AMD-to-AMD P2P WORKS via KFD!                        ║");
+                        LOG_INFO("║  Throughput: " << std::fixed << std::setprecision(2) << gbps << " GB/s");
+                        LOG_INFO("╚══════════════════════════════════════════════════════════════════╝");
+                    }
+                    else
+                    {
+                        LOG_WARN("  Data verification had " << mismatches << " mismatches");
+                    }
+                }
+                else
+                {
+                    LOG_WARN("  hipMemcpy failed - va_addr may not be valid for HIP");
+                }
+                
+                rocm_backend.free(gpu0_out, 0);
+            }
+            
+            munmap(cpu_ptr, alloc_size);
+        }
+
+        // Cleanup
+        LOG_INFO("\n=== Cleanup ===");
+        
+        // Define unmap struct locally (ioctl 0x19)
+        struct kfd_unmap_mem_args
+        {
+            uint64_t handle;
+            uint64_t device_ids_array_ptr;
+            uint32_t n_devices;
+            uint32_t n_success;
+        };
+        
+        kfd_unmap_mem_args unmap_args = {};
+        unmap_args.handle = handle;
+        unmap_args.device_ids_array_ptr = reinterpret_cast<uint64_t>(device_ids);
+        unmap_args.n_devices = 2;
+        int ioctl_unmap = _IOWR(AMDKFD_IOCTL_BASE, 0x19, kfd_unmap_mem_args);
+        ioctl(kfd_fd, ioctl_unmap, &unmap_args);
+
+        kfd_free_mem_args free_args = {};
+        free_args.handle = handle;
+        int ioctl_free_final = _IOW(AMDKFD_IOCTL_BASE, 0x17, kfd_free_mem_args);
+        ioctl(kfd_fd, ioctl_free_final, &free_args);
+
+        close(kfd_fd);
+        
+        LOG_INFO("  Done");
+        SUCCEED() << "KFD P2P exploration complete";
+    }
+
+    /**
+     * @brief Test AMD-to-AMD P2P via RAW BAR MAPPING (tinygrad approach)
+     *
+     * Since HSA/KFD P2P mapping fails, this test uses direct PCIe BAR mapping:
+     * 1. mmap GPU 1's VRAM BAR from CPU (via sysfs resource1)
+     * 2. Use hipHostRegister with hipHostRegisterIoMemory to make it GPU-accessible
+     * 3. GPU 0 writes to the registered pointer → writes directly to GPU 1's VRAM
+     *
+     * This bypasses the HSA/KFD P2P machinery entirely and uses raw PCIe transactions.
+     */
+    TEST_F(Test__AMD_PCIe_P2P_Mapping, AMD_to_AMD_DirectP2P_via_RawBAR)
+    {
+        LOG_INFO("\n╔════════════════════════════════════════════════════════════════════════════════════╗");
+        LOG_INFO("║  AMD-to-AMD DIRECT P2P via RAW BAR MAPPING (tinygrad approach)                      ║");
+        LOG_INFO("╠════════════════════════════════════════════════════════════════════════════════════╣");
+        LOG_INFO("║  This bypasses HSA/KFD entirely:                                                     ║");
+        LOG_INFO("║  1. mmap GPU 1's VRAM BAR (sysfs resource1)                                          ║");
+        LOG_INFO("║  2. hipHostRegister with hipHostRegisterIoMemory                                     ║");
+        LOG_INFO("║  3. GPU 0 writes to the pointer → direct PCIe write to GPU 1 VRAM                   ║");
+        LOG_INFO("╚════════════════════════════════════════════════════════════════════════════════════╝");
+
+        ROCmBackend rocm_backend;
+        int device_count = rocm_backend.deviceCount();
+        
+        if (device_count < 2)
+        {
+            GTEST_SKIP() << "Requires at least 2 ROCm devices (found " << device_count << ")";
+        }
+
+        // Step 1: Find AMD GPU 1's PCIe address and VRAM BAR
+        LOG_INFO("\n=== Step 1: Find GPU 1's PCIe BAR ===");
+        
+        std::string amd_pci_addr;
+        {
+            // Enumerate AMD GPUs via sysfs
+            DIR* gpu_dir = opendir("/sys/class/drm");
+            if (!gpu_dir)
+            {
+                GTEST_SKIP() << "Cannot open /sys/class/drm";
+            }
+            
+            std::vector<std::string> amd_addrs;
+            struct dirent* entry;
+            while ((entry = readdir(gpu_dir)) != nullptr)
+            {
+                std::string name = entry->d_name;
+                if (name.find("card") != 0 || name.find("-") != std::string::npos) continue;
+                
+                std::string path = "/sys/class/drm/" + name + "/device/vendor";
+                std::ifstream vendor_file(path);
+                std::string vendor;
+                if (vendor_file >> vendor && vendor == "0x1002")
+                {  // AMD vendor ID
+                    // Get PCI address from device symlink
+                    char device_path[PATH_MAX];
+                    std::string link_path = "/sys/class/drm/" + name + "/device";
+                    ssize_t len = readlink(link_path.c_str(), device_path, PATH_MAX - 1);
+                    if (len > 0)
+                    {
+                        device_path[len] = '\0';
+                        std::string full_path = device_path;
+                        size_t pos = full_path.rfind('/');
+                        if (pos != std::string::npos)
+                        {
+                            amd_addrs.push_back(full_path.substr(pos + 1));
+                        }
+                    }
+                }
+            }
+            closedir(gpu_dir);
+            
+            if (amd_addrs.size() < 2)
+            {
+                GTEST_SKIP() << "Need at least 2 AMD GPUs (found " << amd_addrs.size() << ")";
+            }
+            
+            // Use second AMD GPU
+            amd_pci_addr = amd_addrs[1];
+            LOG_INFO("  Found AMD GPUs:");
+            for (size_t i = 0; i < amd_addrs.size(); ++i)
+            {
+                LOG_INFO("    GPU " << i << ": " << amd_addrs[i]);
+            }
+            LOG_INFO("  Using GPU 1 (" << amd_pci_addr << ") as target");
+        }
+
+        // Step 2: mmap GPU 1's VRAM BAR
+        LOG_INFO("\n=== Step 2: mmap GPU 1's VRAM BAR ===");
+        
+        // AMD GPUs use BAR0 for VRAM (unlike NVIDIA which uses BAR1)
+        std::string bar_path = "/sys/bus/pci/devices/" + amd_pci_addr + "/resource0_wc";
+        int bar_fd = open(bar_path.c_str(), O_RDWR);
+        if (bar_fd < 0)
+        {
+            LOG_WARN("  Cannot open " << bar_path << ": " << strerror(errno));
+            // Try non-write-combining variant
+            bar_path = "/sys/bus/pci/devices/" + amd_pci_addr + "/resource0";
+            bar_fd = open(bar_path.c_str(), O_RDWR);
+            if (bar_fd < 0)
+            {
+                GTEST_SKIP() << "Cannot open VRAM BAR: " << strerror(errno);
+            }
+        }
+        LOG_INFO("  Opened " << bar_path);
+        
+        // Get BAR size
+        struct stat st;
+        fstat(bar_fd, &st);
+        size_t bar_size = st.st_size;
+        LOG_INFO("  BAR size: " << (bar_size / (1024 * 1024)) << " MB");
+        
+        // Map a portion (4MB for testing)
+        size_t map_size = 4 * 1024 * 1024;
+        void* bar_ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, bar_fd, 0);
+        close(bar_fd);
+        
+        if (bar_ptr == MAP_FAILED)
+        {
+            GTEST_SKIP() << "mmap failed: " << strerror(errno);
+        }
+        LOG_INFO("  ✓ Mapped 4 MB at " << bar_ptr);
+
+        // Step 3: Try hipHostRegister with hipHostRegisterIoMemory
+        LOG_INFO("\n=== Step 3: Register with hipHostRegisterIoMemory ===");
+        
+        rocm_backend.setDevice(0);  // Use GPU 0 as source
+        
+        // hipHostRegisterIoMemory = 0x10 (from HIP headers)
+        constexpr unsigned int HIP_HOST_REGISTER_IO_MEMORY = 0x10;
+        
+        hipError_t err = hipHostRegister(bar_ptr, map_size, 
+                                          hipHostRegisterMapped | HIP_HOST_REGISTER_IO_MEMORY);
+        if (err != hipSuccess)
+        {
+            LOG_WARN("  hipHostRegister(hipHostRegisterIoMemory) failed: " << hipGetErrorString(err));
+            LOG_INFO("\n  This indicates hipHostRegisterIoMemory doesn't support AMD BAR mapping.");
+            
+            // Let's test if the BAR itself works via CPU access
+            LOG_INFO("\n=== Step 3b: Test direct CPU access to BAR ===");
+            LOG_INFO("  Writing pattern via CPU to GPU 1's BAR...");
+            
+            float* cpu_ptr = static_cast<float*>(bar_ptr);
+            // Write a pattern
+            for (size_t i = 0; i < 256; ++i)
+            {
+                cpu_ptr[i] = static_cast<float>(i) * 0.01f;
+            }
+            
+            // Readback
+            bool mismatch = false;
+            for (size_t i = 0; i < 256; ++i)
+            {
+                float expected = static_cast<float>(i) * 0.01f;
+                if (std::abs(cpu_ptr[i] - expected) > 1e-6f)
+                {
+                    LOG_WARN("  CPU BAR access mismatch at " << i << ": wrote " << expected << ", read " << cpu_ptr[i]);
+                    mismatch = true;
+                    break;
+                }
+            }
+            
+            if (!mismatch)
+            {
+                LOG_INFO("  ✓ Direct CPU access to AMD BAR WORKS!");
+                LOG_INFO("  This confirms the BAR mapping is valid, but HIP cannot register it.");
+            }
+            else
+            {
+                LOG_WARN("  CPU BAR access failed - the BAR mapping may not work.");
+            }
+            
+            munmap(bar_ptr, map_size);
+            
+            LOG_INFO("\n  Next step would be to use the AMDPageTableManager approach");
+            LOG_INFO("  (direct GPU page table manipulation) to make GPU 0 access this memory.");
+            
+            GTEST_SKIP() << "hipHostRegister with hipHostRegisterIoMemory failed";
+        }
+        
+        LOG_INFO("  ✓ hipHostRegister succeeded!");
+        
+        // Get device pointer
+        void* dev_ptr = nullptr;
+        err = hipHostGetDevicePointer(&dev_ptr, bar_ptr, 0);
+        if (err != hipSuccess)
+        {
+            hipHostUnregister(bar_ptr);
+            munmap(bar_ptr, map_size);
+            GTEST_SKIP() << "hipHostGetDevicePointer failed: " << hipGetErrorString(err);
+        }
+        LOG_INFO("  Device pointer: " << dev_ptr);
+        
+        // Step 4: Test write from GPU 0 to GPU 1's VRAM via the mapped BAR
+        LOG_INFO("\n=== Step 4: Test P2P write ===");
+        
+        // Initialize with test pattern via CPU
+        float* cpu_ptr = static_cast<float*>(bar_ptr);
+        for (size_t i = 0; i < 1024; ++i)
+        {
+            cpu_ptr[i] = 0.0f;
+        }
+        
+        // Allocate source buffer on GPU 0
+        void* src_ptr = rocm_backend.allocate(4096, 0);
+        if (!src_ptr)
+        {
+            hipHostUnregister(bar_ptr);
+            munmap(bar_ptr, map_size);
+            GTEST_SKIP() << "Failed to allocate source buffer";
+        }
+        
+        // Initialize source with test pattern
+        std::vector<float> src_data(1024);
+        for (size_t i = 0; i < 1024; ++i)
+        {
+            src_data[i] = static_cast<float>(i) * 0.001f;
+        }
+        rocm_backend.hostToDevice(src_ptr, src_data.data(), 4096, 0);
+        
+        // Copy from GPU 0's buffer to GPU 1's VRAM via the registered BAR pointer
+        LOG_INFO("  Copying from GPU 0 buffer to GPU 1 VRAM via registered BAR...");
+        auto start = std::chrono::high_resolution_clock::now();
+        err = hipMemcpy(dev_ptr, src_ptr, 4096, hipMemcpyDeviceToDevice);
+        rocm_backend.synchronize(0);
+        auto end = std::chrono::high_resolution_clock::now();
+        
+        if (err != hipSuccess)
+        {
+            LOG_WARN("  hipMemcpy failed: " << hipGetErrorString(err));
+        }
+        else
+        {
+            double ms = std::chrono::duration<double, std::milli>(end - start).count();
+            LOG_INFO("  hipMemcpy completed in " << std::fixed << std::setprecision(2) << ms << " ms");
+            
+            // Verify via CPU read
+            bool verified = true;
+            for (size_t i = 0; i < 1024 && verified; ++i)
+            {
+                if (std::abs(cpu_ptr[i] - src_data[i]) > 1e-6f)
+                {
+                    LOG_WARN("  Mismatch at " << i << ": expected " << src_data[i] << ", got " << cpu_ptr[i]);
+                    verified = false;
+                }
+            }
+            
+            if (verified)
+            {
+                LOG_INFO("\n╔══════════════════════════════════════════════════════════════════╗");
+                LOG_INFO("║  ✓✓✓ AMD-to-AMD P2P via RAW BAR MAPPING WORKS!                    ║");
+                LOG_INFO("╚══════════════════════════════════════════════════════════════════╝");
+            }
+        }
+        
+        // Cleanup
+        rocm_backend.free(src_ptr, 0);
+        hipHostUnregister(bar_ptr);
+        munmap(bar_ptr, map_size);
+        
+        SUCCEED() << "Raw BAR P2P test complete";
+    }
+
+    /**
      * @brief Final summary and recommendations
      */
     TEST_F(Test__AMD_PCIe_P2P_Mapping, Summary_And_Recommendations)
@@ -3388,8 +4248,38 @@ namespace llaminar2::test::experimental
         LOG_INFO("║                    P2P INVESTIGATION SUMMARY                                         ║");
         LOG_INFO("╠════════════════════════════════════════════════════════════════════════════════════╣");
         LOG_INFO("║                                                                                      ║");
+        LOG_INFO("║  AMD-to-AMD P2P FINDINGS:                                                            ║");
+        LOG_INFO("║                                                                                      ║");
+        LOG_INFO("║  1. hipDeviceCanAccessPeer() returns 0 for all AMD GPU pairs                         ║");
+        LOG_INFO("║     - GPUs are on separate PCIe root complexes                                       ║");
+        LOG_INFO("║     - No hardware P2P fabric (xGMI, Infinity Fabric, etc.)                           ║");
+        LOG_INFO("║                                                                                      ║");
+        LOG_INFO("║  2. hipMemcpyPeer() WORKS but uses HOST STAGING (~0.2 GB/s)                          ║");
+        LOG_INFO("║     - Data goes: GPU0 → Host RAM → GPU1                                              ║");
+        LOG_INFO("║     - This is NOT true P2P                                                           ║");
+        LOG_INFO("║                                                                                      ║");
+        LOG_INFO("║  3. HSA reports P2P access is NEVER ALLOWED                                          ║");
+        LOG_INFO("║     - hsa_amd_agents_allow_access() fails with status 4104                           ║");
+        LOG_INFO("║     - This is a fundamental driver/hardware limitation                               ║");
+        LOG_INFO("║                                                                                      ║");
+        LOG_INFO("║  4. KFD MAP_MEMORY_TO_GPU ioctl fails with EINVAL                                    ║");
+        LOG_INFO("║     - The kernel driver doesn't support P2P mapping between these GPUs               ║");
+        LOG_INFO("║                                                                                      ║");
+        LOG_INFO("║  5. Direct BAR mmap from CPU WORKS ✓                                                 ║");
+        LOG_INFO("║     - Can read/write GPU 1's VRAM via /sys/.../resource0                             ║");
+        LOG_INFO("║     - BUT: hipHostRegisterIoMemory fails to register this for GPU access             ║");
+        LOG_INFO("║                                                                                      ║");
+        LOG_INFO("║  CONCLUSION:                                                                         ║");
+        LOG_INFO("║  True direct AMD-to-AMD P2P is NOT possible on this hardware via standard APIs.      ║");
+        LOG_INFO("║  The ONLY remaining option is:                                                       ║");
+        LOG_INFO("║    - Direct GPU page table manipulation (tinygrad approach)                          ║");
+        LOG_INFO("║    - Map GPU 1's BAR physical address into GPU 0's page tables                       ║");
+        LOG_INFO("║    - This bypasses HSA/KFD entirely but is complex and fragile                       ║");
+        LOG_INFO("║                                                                                      ║");
+        LOG_INFO("╠════════════════════════════════════════════════════════════════════════════════════╣");
+        LOG_INFO("║                                                                                      ║");
         LOG_INFO("║  WORKING DIRECTION: AMD BAR → NVIDIA                                                 ║");
-        LOG_INFO("║    - AMD's amdgpu driver exposes real VRAM via sysfs BAR                            ║");
+        LOG_INFO("║    - AMD's amdgpu driver exposes real VRAM via sysfs BAR                             ║");
         LOG_INFO("║    - NVIDIA can read this memory via standard PCIe transactions                      ║");
         LOG_INFO("║    - hipMemcpy D2D works perfectly                                                   ║");
         LOG_INFO("║                                                                                      ║");

@@ -1423,6 +1423,65 @@ TEST(Test__MyNewKernel, BasicFunctionality) {
 }
 ```
 
+### Formatted ASCII Tables (libfort)
+
+**MANDATORY**: All formatted ASCII/Unicode tables MUST use the **libfort** library instead of manual `std::cout` + `std::setw` formatting. This applies to:
+- Test result tables (parity results, benchmark summaries)
+- Diagnostic output tables (topology, device info)
+- Any tabular data displayed to stdout
+
+**Why libfort**:
+- Automatic column width sizing based on content
+- Consistent Unicode box-drawing borders
+- No manual padding calculations or `setw()` juggling
+- Cleaner, more maintainable code
+
+**Reference Implementation**: See `tests/v2/integration/parity/ParityTestBase.h` for complete examples:
+- `renderParityTable()` - Layer-by-layer parity results
+- `renderTPParityTable()` - Multi-device tensor parallel parity
+- `renderDecodeParityTable()` - Incremental decode parity
+
+**Basic Usage Pattern**:
+
+```cpp
+#include "fort.hpp"
+
+void renderMyTable(const std::vector<Result>& results) {
+    fort::utf8_table table;
+    table.set_border_style(FT_DOUBLE2_STYLE);
+    
+    // Header row
+    table << fort::header << "Name" << "Value" << "Status" << fort::endr;
+    
+    // Set column alignments
+    table.column(0).set_cell_text_align(fort::text_align::left);
+    table.column(1).set_cell_text_align(fort::text_align::right);
+    table.column(2).set_cell_text_align(fort::text_align::center);
+    
+    // Data rows
+    for (const auto& r : results) {
+        table << r.name << r.value << (r.passed ? "✓" : "✗") << fort::endr;
+    }
+    
+    // Optional separator before summary
+    table << fort::separator;
+    table << "TOTAL" << total_value << "" << fort::endr;
+    
+    std::cout << table.to_string();
+}
+```
+
+**Anti-Pattern (DO NOT USE)**:
+
+```cpp
+// ❌ BAD - Manual formatting is error-prone and hard to maintain
+std::cout << "╔═══════════╦═══════════════╦══════╗\n";
+std::cout << "║" << std::setw(10) << "Name" << " ║"
+          << std::setw(13) << "Value" << " ║"
+          << std::setw(5) << "OK" << "║\n";
+// ... more manual box-drawing ...
+```
+
 ---
 
 ## Environment Variables Reference

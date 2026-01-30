@@ -1343,6 +1343,13 @@ namespace llaminar2
                     DeviceId target_device = DeviceId::rocm(rocm_device_id_);
                     auto current_dev = bias_tensor->current_device();
 
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Proj " << i
+                                                                                       << " bias tensor=" << bias_tensor
+                                                                                       << " current_dev=" << (current_dev.has_value() ? current_dev->to_string() : "(none)")
+                                                                                       << " target_device=" << target_device.to_string()
+                                                                                       << " gpu_data_ptr=" << bias_tensor->gpu_data_ptr()
+                                                                                       << " rocm_device_id_=" << rocm_device_id_);
+
                     if (current_dev.has_value() && current_dev.value() == target_device)
                     {
                         // Already on correct device - use directly
@@ -1434,15 +1441,22 @@ namespace llaminar2
                     else
                     {
                         // Non-padded case: use executeNoScale + applyScaling with bias
+                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                                 << " BEFORE executeNoScale m=" << m << " n=" << n << " k=" << k
+                                                                                                 << " device=" << rocm_device_id_);
                         success = rocmQuantGemm_executeNoScale(
                             impl_->d_A_int8,
                             d_weights_int8,
                             rocm_kernel->impl_->d_CK_int32,
                             m, n, k, rocm_device_id_);
+                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                                 << " AFTER executeNoScale success=" << success);
 
                         if (success)
                         {
                             // Apply scaling with bias: output = C_int32 * scale_A * scale_B + bias
+                            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                                     << " BEFORE applyScaling device=" << rocm_device_id_);
                             success = rocmQuantGemm_applyScaling(
                                 rocm_kernel->impl_->d_CK_int32,
                                 d_output,
@@ -1453,6 +1467,8 @@ namespace llaminar2
                                 nullptr, // No existing C
                                 d_bias,  // Add bias
                                 rocm_device_id_);
+                            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                                     << " AFTER applyScaling success=" << success);
                         }
                     }
                 }

@@ -260,6 +260,10 @@ namespace llaminar2
             return nullptr;
         }
 
+        // TRACE: Log allocation with device and pointer for debugging multi-GPU memory issues
+        LOG_TRACE("[ROCmBackend::allocate] ALLOC ptr=" << ptr << " bytes=" << bytes 
+                  << " device_id=" << device_id << " (ROCm ordinal)");
+
         return ptr;
     }
 

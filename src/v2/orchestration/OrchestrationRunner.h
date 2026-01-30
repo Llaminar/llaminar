@@ -164,6 +164,18 @@ namespace llaminar2
         bool loadWeights();
 
         /**
+         * @brief Validate TP/PP configuration against loaded model
+         *
+         * Checks that the requested parallelism configuration is compatible
+         * with the model's architecture (head counts, dimensions, layer count).
+         *
+         * Must be called AFTER loadWeights() (requires model_ctx_).
+         *
+         * @return true if configuration is valid, false with error message if not
+         */
+        bool validateTPPPConfiguration();
+
+        /**
          * @brief Build compute graphs
          */
         bool buildComputeGraph();

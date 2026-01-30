@@ -19,6 +19,7 @@
 #include <thread>
 #include <string>
 #include <cstring>
+#include <cstdlib> // for setenv
 
 // Forward declarations for HIP and RCCL wrappers (implemented in RCCLBackendHIP.cpp)
 namespace llaminar2
@@ -28,11 +29,16 @@ namespace llaminar2
         // HIP runtime wrappers
         bool hipSetDeviceOrdinal(int device_ordinal);
         bool hipGetDeviceCountWrapper(int *count);
+        bool hipCheckP2PAvailable(const std::vector<int> &device_ordinals);
+        bool hipEnablePeerAccessForDevices(const std::vector<int> &device_ordinals, std::string &error_out);
         bool hipCreateStream(void **stream_ptr);
         bool hipDestroyStream(void *stream);
         bool hipSynchronizeStream(void *stream);
         std::string hipGetLastErrorString();
         std::string hipErrorToString(int error_code);
+
+        // RCCL pre-initialization (checks P2P, sets env vars, loads RCCL)
+        bool rcclPreInitialize(const std::vector<int> &device_ordinals, bool &p2p_available_out);
 
         // RCCL unique ID
         size_t rcclUniqueIdSize();
@@ -291,16 +297,6 @@ namespace llaminar2
         {
             // Multi-GPU single process (no MPI context)
             // Use threaded ncclCommInitRank - each GPU gets its own thread
-            std::vector<char> id_buffer(rccl_backend_detail::rcclUniqueIdSize());
-            if (!rccl_backend_detail::rcclGetUniqueIdWrapper(id_buffer.data()))
-            {
-                last_error_ = "rcclGetUniqueId failed";
-                LOG_ERROR(last_error_);
-                rccl_backend_detail::hipDestroyStream(stream_);
-                stream_ = nullptr;
-                return false;
-            }
-
             // Allocate arrays for per-GPU resources
             all_comms_.resize(num_ranks_, nullptr);
             all_streams_.resize(num_ranks_, nullptr);
@@ -312,6 +308,28 @@ namespace llaminar2
             for (int i = 0; i < num_ranks_; ++i)
             {
                 device_ordinals_[i] = group.devices[i].ordinal;
+            }
+
+            // Pre-initialize RCCL: check P2P, set env vars, load library
+            // This MUST happen before any other RCCL call (like rcclGetUniqueId)
+            if (!rccl_backend_detail::rcclPreInitialize(device_ordinals_, p2p_available_))
+            {
+                last_error_ = "RCCL pre-initialization failed";
+                LOG_ERROR(last_error_);
+                rccl_backend_detail::hipDestroyStream(stream_);
+                stream_ = nullptr;
+                return false;
+            }
+
+            // Now get unique ID (RCCL is already loaded with correct env vars)
+            std::vector<char> id_buffer(rccl_backend_detail::rcclUniqueIdSize());
+            if (!rccl_backend_detail::rcclGetUniqueIdWrapper(id_buffer.data()))
+            {
+                last_error_ = "rcclGetUniqueId failed";
+                LOG_ERROR(last_error_);
+                rccl_backend_detail::hipDestroyStream(stream_);
+                stream_ = nullptr;
+                return false;
             }
 
             // Launch threads - each thread initializes one GPU's communicator and stream
@@ -835,6 +853,20 @@ namespace llaminar2
             return false;
         }
 
+        if (sendbuf == nullptr)
+        {
+            last_error_ = "sendrecv: send buffer is null";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (recvbuf == nullptr)
+        {
+            last_error_ = "sendrecv: recv buffer is null";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
         if (peer < 0 || peer >= num_ranks_)
         {
             last_error_ = "sendrecv: Invalid peer rank " + std::to_string(peer) +
@@ -1136,9 +1168,20 @@ namespace llaminar2
             return false;
         }
 
+        // TRACE: Log all buffer pointers and device mappings before issuing allreduce
+        LOG_TRACE("[RCCLBackend::allreduceMulti] Starting group allreduce: count=" << count
+                                                                                   << " num_ranks=" << num_ranks_ << " p2p_available=" << p2p_available_);
+
         // Issue AllReduce on each GPU with its buffer, communicator, and stream
         for (int i = 0; i < num_ranks_; ++i)
         {
+            // TRACE: Log each device's buffer before issuing the allreduce
+            LOG_TRACE("[RCCLBackend::allreduceMulti] RANK[" << i << "] "
+                                                            << "buffer=" << buffers[i]
+                                                            << " device_ordinal=" << device_ordinals_[i]
+                                                            << " comm=" << all_comms_[i]
+                                                            << " stream=" << all_streams_[i]);
+
             // Set device context
             rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[i]);
 
@@ -1160,6 +1203,8 @@ namespace llaminar2
             LOG_ERROR(last_error_);
             return false;
         }
+
+        LOG_TRACE("[RCCLBackend::allreduceMulti] Group allreduce issued successfully");
 
         return true;
 #else

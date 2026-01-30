@@ -110,8 +110,14 @@ namespace llaminar2
         if (params_.tensor)
         {
             // All-reduce is in-place, so tensor is both input and output
-            info.addInput("tensor", params_.tensor, params_.tensor->rows(), params_.tensor->cols());
-            info.addOutput("tensor", params_.tensor, params_.tensor->rows(), params_.tensor->cols());
+            // Use actual count being reduced, not buffer size
+            // For decode: count = seq_len * hidden_dim (not max_seq_len * hidden_dim)
+            const size_t effective_count = (params_.count > 0) ? params_.count : params_.tensor->numel();
+            const size_t cols = params_.tensor->cols();
+            const size_t rows = (cols > 0) ? effective_count / cols : effective_count;
+            
+            info.addInput("tensor", params_.tensor, rows, cols);
+            info.addOutput("tensor", params_.tensor, rows, cols);
         }
 
         if (params_.tp_ctx)

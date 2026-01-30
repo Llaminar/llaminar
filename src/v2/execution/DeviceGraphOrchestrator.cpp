@@ -498,6 +498,10 @@ namespace llaminar2
         const Qwen2ForwardInput &input,
         Qwen2ForwardOutput &output)
     {
+        // Enable device-scoped logging if not already set by caller (e.g., from forward())
+        // This ensures executeForward() can be called directly with proper log attribution
+        ScopedDeviceLog device_log(input.device);
+
         auto start = std::chrono::high_resolution_clock::now();
 
         if (!input.token_ids && !input.batches)
@@ -1600,6 +1604,10 @@ namespace llaminar2
         int seq_len,
         int batch_size)
     {
+        // Enable device-scoped logging for this execution
+        // All LOG_* calls from this thread will include the device ID
+        ScopedDeviceLog device_log(state_.device_id);
+
         if (!state_.isInitialized())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] forward() called without initialized state");
@@ -1758,6 +1766,9 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::forward_batch(const std::vector<std::vector<int>> &token_batches)
     {
+        // Enable device-scoped logging for this execution
+        ScopedDeviceLog device_log(state_.device_id);
+
         if (token_batches.empty())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] forward_batch() called with empty batch");

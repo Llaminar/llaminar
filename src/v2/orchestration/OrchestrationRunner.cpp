@@ -8,6 +8,7 @@
 
 #include "OrchestrationRunner.h"
 #include "config/OrchestrationConfigParser.h"
+#include "config/TPPPValidator.h"
 #include "execution/ExecutionPlanBuilder.h"
 #include "execution/InferenceRunnerFactory.h"
 #include "execution/MultiDeviceOrchestrator.h"
@@ -82,7 +83,13 @@ namespace llaminar2
                 return false;
             }
 
-            // Step 5: Build compute graph
+            // Step 5: Validate TP/PP configuration against model architecture
+            if (!validateTPPPConfiguration())
+            {
+                return false;
+            }
+
+            // Step 6: Build compute graph
             if (!buildComputeGraph())
             {
                 return false;
@@ -559,6 +566,40 @@ namespace llaminar2
         }
 
         LOG_INFO("Model context created from: " << model_path);
+        return true;
+    }
+
+    bool OrchestrationRunner::validateTPPPConfiguration()
+    {
+        // Skip validation if no model loaded (testing mode)
+        if (!model_ctx_)
+        {
+            LOG_DEBUG("No model context, skipping TP/PP validation");
+            return true;
+        }
+
+        // Run validation
+        auto result = TPPPValidator::validate(config_, *model_ctx_);
+
+        // Log warnings (but don't fail)
+        for (const auto &warning : result.warnings)
+        {
+            LOG_WARN("[TP/PP Config] " << warning);
+        }
+
+        // Check for errors
+        if (!result.valid)
+        {
+            std::ostringstream oss;
+            oss << "TP/PP configuration is incompatible with model architecture:\n";
+            for (const auto &error : result.errors)
+            {
+                oss << "  - " << error << "\n";
+            }
+            return setError(oss.str());
+        }
+
+        LOG_INFO("TP/PP configuration validated against model architecture");
         return true;
     }
 

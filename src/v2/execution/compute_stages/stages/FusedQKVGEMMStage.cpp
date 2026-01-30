@@ -30,7 +30,18 @@ namespace llaminar2
     bool FusedQKVGEMMStage::execute(IDeviceContext *ctx)
     {
         LOG_DEBUG("[FusedQKVGEMMStage] Execute: m=" << params_.m << " k=" << params_.k
-                                                    << " n_q=" << params_.n_q << " n_k=" << params_.n_k << " n_v=" << params_.n_v);
+                                                    << " n_q=" << params_.n_q << " n_k=" << params_.n_k << " n_v=" << params_.n_v
+                                                    << " device=" << params_.device_id.to_string());
+
+        // Log bias tensor pointers for multi-GPU debugging
+        if (params_.bias_q || params_.bias_k || params_.bias_v)
+        {
+            LOG_DEBUG("[FusedQKVGEMMStage] BIAS POINTERS:"
+                      << " bias_q=" << static_cast<const void *>(params_.bias_q ? params_.bias_q->raw_data() : nullptr)
+                      << " bias_k=" << static_cast<const void *>(params_.bias_k ? params_.bias_k->raw_data() : nullptr)
+                      << " bias_v=" << static_cast<const void *>(params_.bias_v ? params_.bias_v->raw_data() : nullptr)
+                      << " stage_device=" << params_.device_id.to_string());
+        }
 
         if (!ctx)
         {

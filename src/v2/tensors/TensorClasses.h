@@ -797,8 +797,8 @@ namespace llaminar2
          * @note Use this for CUDA/ROCm kernel dispatch - the pointer is device-side memory
          * @note Virtual to allow tensor types with their own device management to override
          */
-        virtual void *gpu_data_ptr() { return gpu_data_ptr_; }
-        virtual const void *gpu_data_ptr() const { return gpu_data_ptr_; }
+        virtual void *gpu_data_ptr();
+        virtual const void *gpu_data_ptr() const;
 
         /**
          * @brief Mark tensor as modified on device (requires sync to host before host access)

@@ -70,6 +70,36 @@ namespace llaminar2
             return has_rank_ ? rank_ : -1;
         }
 
+        /**
+         * @brief Set a thread-local device prefix for log messages
+         * 
+         * This prefix is automatically included in all log messages from the
+         * calling thread. Use ScopedDeviceLog for RAII-style management.
+         * 
+         * @param prefix The device prefix (e.g., "rocm:0", "cuda:1")
+         */
+        static void setThreadDevicePrefix(const std::string& prefix)
+        {
+            thread_device_prefix() = prefix;
+        }
+
+        /**
+         * @brief Clear the thread-local device prefix
+         */
+        static void clearThreadDevicePrefix()
+        {
+            thread_device_prefix().clear();
+        }
+
+        /**
+         * @brief Get the current thread-local device prefix
+         * @return The device prefix, or empty string if not set
+         */
+        static const std::string& getThreadDevicePrefix()
+        {
+            return thread_device_prefix();
+        }
+
         bool shouldLog(LogLevel level) const
         {
             return static_cast<int>(level) <= static_cast<int>(current_level_);
@@ -100,6 +130,13 @@ namespace llaminar2
             if (has_rank_)
             {
                 full_line += " [" + std::to_string(rank_) + "]";
+            }
+
+            // Add thread-local device prefix if set
+            const std::string& device_prefix = thread_device_prefix();
+            if (!device_prefix.empty())
+            {
+                full_line += " [" + device_prefix + "]";
             }
 
             full_line += location + " " + message;
@@ -192,12 +229,79 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Thread-local storage for device prefix
+         * 
+         * Each thread can have its own device prefix, enabling multi-device
+         * parallel execution with clear log attribution.
+         */
+        static std::string& thread_device_prefix()
+        {
+            thread_local std::string prefix;
+            return prefix;
+        }
+
         LogLevel current_level_;
         int rank_;
         bool has_rank_;
         mutable std::deque<std::string> recent_;
         mutable size_t max_buffer_ = 2048; // keep last N lines
         mutable std::mutex buffer_mutex_;
+    };
+
+    /**
+     * @brief RAII helper for scoped device logging
+     * 
+     * Sets the thread-local device prefix on construction and clears it on destruction.
+     * Use this to automatically tag all log messages within a scope with the device ID.
+     * 
+     * Example:
+     * @code
+     * void executeOnDevice(DeviceId device) {
+     *     ScopedDeviceLog scoped_log(device);
+     *     LOG_INFO("Starting execution");  // Logs as "[rocm:0] Starting execution"
+     *     // ... work ...
+     * }  // Prefix automatically cleared
+     * @endcode
+     */
+    class ScopedDeviceLog
+    {
+    public:
+        /**
+         * @brief Construct with device ID string
+         * @param device_str The device string (e.g., "rocm:0", "cuda:1", "cpu")
+         */
+        explicit ScopedDeviceLog(const std::string& device_str)
+            : previous_prefix_(Logger::getThreadDevicePrefix())
+        {
+            Logger::setThreadDevicePrefix(device_str);
+        }
+
+        /**
+         * @brief Construct with DeviceId object
+         * @param device The DeviceId to use for logging
+         */
+        template<typename DeviceIdType>
+        explicit ScopedDeviceLog(const DeviceIdType& device)
+            : previous_prefix_(Logger::getThreadDevicePrefix())
+        {
+            Logger::setThreadDevicePrefix(device.to_string());
+        }
+
+        ~ScopedDeviceLog()
+        {
+            // Restore previous prefix (supports nesting)
+            Logger::setThreadDevicePrefix(previous_prefix_);
+        }
+
+        // Non-copyable, non-movable
+        ScopedDeviceLog(const ScopedDeviceLog&) = delete;
+        ScopedDeviceLog& operator=(const ScopedDeviceLog&) = delete;
+        ScopedDeviceLog(ScopedDeviceLog&&) = delete;
+        ScopedDeviceLog& operator=(ScopedDeviceLog&&) = delete;
+
+    private:
+        std::string previous_prefix_;
     };
 
 } // namespace llaminar2

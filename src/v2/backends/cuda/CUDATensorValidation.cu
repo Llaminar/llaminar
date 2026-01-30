@@ -13,6 +13,9 @@
 #include <cfloat>
 #include <cmath>
 #include <algorithm>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 
 namespace llaminar2
 {
@@ -295,12 +298,22 @@ namespace llaminar2
     class CUDATensorValidator : public ITensorValidator
     {
     public:
-        CUDATensorValidator()
+        explicit CUDATensorValidator(int device_id) : device_id_(device_id)
         {
-            cudaError_t err = cudaMalloc(&d_result_, sizeof(DeviceValidationResult));
+            // Set device before allocation to ensure buffer is on correct device
+            cudaError_t err = cudaSetDevice(device_id);
             if (err != cudaSuccess)
             {
-                LOG_ERROR("[CUDATensorValidator] Failed to allocate device result buffer");
+                LOG_ERROR("[CUDATensorValidator] Failed to set device " << device_id);
+                d_result_ = nullptr;
+                return;
+            }
+
+            // Allocate device-side result buffer ON THIS DEVICE
+            err = cudaMalloc(&d_result_, sizeof(DeviceValidationResult));
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDATensorValidator] Failed to allocate device result buffer on device " << device_id);
                 d_result_ = nullptr;
             }
         }
@@ -309,6 +322,8 @@ namespace llaminar2
         {
             if (d_result_)
             {
+                // Set device before freeing
+                (void)cudaSetDevice(device_id_);
                 cudaFree(d_result_);
                 d_result_ = nullptr;
             }
@@ -320,6 +335,14 @@ namespace llaminar2
         {
             if (!d_result_ || !device_ptr || num_elements == 0)
                 return false;
+
+            // Verify we're validating on the device this validator was created for
+            if (device_id != device_id_)
+            {
+                LOG_WARN("[CUDATensorValidator] Device mismatch: validator for device " << device_id_
+                         << " but asked to validate on device " << device_id);
+                return false;
+            }
 
             cudaError_t err = cudaSetDevice(device_id);
             if (err != cudaSuccess)
@@ -440,21 +463,40 @@ namespace llaminar2
     private:
         DeviceValidationResult *d_result_ = nullptr;
         size_t last_num_elements_ = 0;
+        int device_id_ = -1;
     };
 
     // =========================================================================
-    // Factory Function
+    // Per-Device Validator Factory (Thread-Safe)
     // =========================================================================
 
-    static CUDATensorValidator *g_cuda_validator = nullptr;
+    static std::mutex g_cuda_validator_mutex;
+    static std::unordered_map<int, std::unique_ptr<CUDATensorValidator>> g_cuda_validators;
 
     ITensorValidator *getCUDATensorValidator()
     {
-        if (!g_cuda_validator)
+        // Get current device
+        int device_id = 0;
+        cudaError_t err = cudaGetDevice(&device_id);
+        if (err != cudaSuccess)
         {
-            g_cuda_validator = new CUDATensorValidator();
+            LOG_ERROR("[getCUDATensorValidator] Failed to get current device");
+            return nullptr;
         }
-        return g_cuda_validator;
+
+        std::lock_guard<std::mutex> lock(g_cuda_validator_mutex);
+
+        auto it = g_cuda_validators.find(device_id);
+        if (it == g_cuda_validators.end())
+        {
+            // Create a new validator for this device
+            auto validator = std::make_unique<CUDATensorValidator>(device_id);
+            auto* ptr = validator.get();
+            g_cuda_validators[device_id] = std::move(validator);
+            LOG_DEBUG("[getCUDATensorValidator] Created validator for device " << device_id);
+            return ptr;
+        }
+        return it->second.get();
     }
 
 } // namespace llaminar2

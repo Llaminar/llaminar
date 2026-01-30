@@ -135,6 +135,9 @@
 #include <chrono>
 #include <iostream>
 #include <streambuf>
+#include <array>
+#include <mutex>
+#include <memory>
 
 // ComposableKernel headers for INT8 GEMM
 
@@ -605,10 +608,15 @@ using DeviceGemmInt8_NoScale_128x128_MNPadding = ck::tensor_operation::device::D
 //     - GPU ISA compatibility checks
 //     - Internal buffer allocation
 //
-//   By using static locals, we:
-//     - Pay construction cost only on first call
-//     - Thread-safe initialization (C++11 guarantees)
+//   By using per-device static arrays, we:
+//     - Pay construction cost only on first call per device
+//     - Ensure thread-safe initialization (C++11 guarantees per element)
+//     - Avoid race conditions when multiple devices call concurrently
 //     - Zero overhead on subsequent calls
+//
+// CRITICAL: CK kernel objects may have internal mutable state (cached streams,
+// workspace buffers) that is NOT thread-safe for concurrent use from different
+// HIP devices. We maintain per-device instances to avoid deadlocks/races.
 //
 // 3-WAY DISPATCH STRATEGY (January 2026):
 //
@@ -630,28 +638,59 @@ using DeviceGemmInt8_NoScale_128x128_MNPadding = ck::tensor_operation::device::D
 //
 // ============================================================================
 
+// Maximum supported devices for per-device kernel caching
+constexpr int MAX_ROCM_DEVICES = 32;
+
+// Per-device kernel caches (each device gets its own CK kernel object)
+// We use lazy initialization with std::call_once for thread-safe construction
+// NOTE: No mutex needed - std::call_once provides all necessary thread safety
+
 // 128×128 kernel (for M >= 128, M % 128 == 0) - peak throughput, no padding
-static DeviceGemmInt8_NoScale& getCachedNoScaleKernel() {
-    static DeviceGemmInt8_NoScale device;
-    return device;
+static DeviceGemmInt8_NoScale& getCachedNoScaleKernel(int device_id = 0) {
+    static std::array<std::unique_ptr<DeviceGemmInt8_NoScale>, MAX_ROCM_DEVICES> devices;
+    static std::array<std::once_flag, MAX_ROCM_DEVICES> init_flags;
+    
+    int idx = std::min(std::max(device_id, 0), MAX_ROCM_DEVICES - 1);
+    std::call_once(init_flags[idx], [idx]() {
+        devices[idx] = std::make_unique<DeviceGemmInt8_NoScale>();
+    });
+    return *devices[idx];
 }
 
 // 128×128 kernel with MN-padding (for M >= 128, M % 128 != 0) - handles irregular M
-static DeviceGemmInt8_NoScale_128x128_MNPadding& getCachedNoScaleKernel128x128MNPadding() {
-    static DeviceGemmInt8_NoScale_128x128_MNPadding device;
-    return device;
+static DeviceGemmInt8_NoScale_128x128_MNPadding& getCachedNoScaleKernel128x128MNPadding(int device_id = 0) {
+    static std::array<std::unique_ptr<DeviceGemmInt8_NoScale_128x128_MNPadding>, MAX_ROCM_DEVICES> devices;
+    static std::array<std::once_flag, MAX_ROCM_DEVICES> init_flags;
+    
+    int idx = std::min(std::max(device_id, 0), MAX_ROCM_DEVICES - 1);
+    std::call_once(init_flags[idx], [idx]() {
+        devices[idx] = std::make_unique<DeviceGemmInt8_NoScale_128x128_MNPadding>();
+    });
+    return *devices[idx];
 }
 
 // 64×64 kernel (for 32 < M < 128) - good balance
-static DeviceGemmInt8_NoScale_64x64& getCachedNoScaleKernel64x64() {
-    static DeviceGemmInt8_NoScale_64x64 device;
-    return device;
+static DeviceGemmInt8_NoScale_64x64& getCachedNoScaleKernel64x64(int device_id = 0) {
+    static std::array<std::unique_ptr<DeviceGemmInt8_NoScale_64x64>, MAX_ROCM_DEVICES> devices;
+    static std::array<std::once_flag, MAX_ROCM_DEVICES> init_flags;
+    
+    int idx = std::min(std::max(device_id, 0), MAX_ROCM_DEVICES - 1);
+    std::call_once(init_flags[idx], [idx]() {
+        devices[idx] = std::make_unique<DeviceGemmInt8_NoScale_64x64>();
+    });
+    return *devices[idx];
 }
 
 // 32×32 kernel (for M <= 32) - optimal for decode
-static DeviceGemmInt8_NoScale_32x32& getCachedNoScaleKernel32x32() {
-    static DeviceGemmInt8_NoScale_32x32 device;
-    return device;
+static DeviceGemmInt8_NoScale_32x32& getCachedNoScaleKernel32x32(int device_id = 0) {
+    static std::array<std::unique_ptr<DeviceGemmInt8_NoScale_32x32>, MAX_ROCM_DEVICES> devices;
+    static std::array<std::once_flag, MAX_ROCM_DEVICES> init_flags;
+    
+    int idx = std::min(std::max(device_id, 0), MAX_ROCM_DEVICES - 1);
+    std::call_once(init_flags[idx], [idx]() {
+        devices[idx] = std::make_unique<DeviceGemmInt8_NoScale_32x32>();
+    });
+    return *devices[idx];
 }
 
 } // anonymous namespace
@@ -1139,12 +1178,14 @@ extern "C"
         // The 128×128 MNPadding kernel handles M >= 128 with irregular M.
         // =====================================================================
 
-        ScopedCoutSilence silence;
+        // NOTE: ScopedCoutSilence removed - was silencing cout during CK execution
+        // which could cause issues if kernel hangs (destructor never runs, cout stays silenced)
+        // CK debug output like "arg.e_grid_desc_m_n_" will now be visible.
         
         if (M <= 32)
         {
             // Small M: Use 32×32 kernel (optimal for decode, M=1-32)
-            auto& device_gemm = getCachedNoScaleKernel32x32();
+            auto& device_gemm = getCachedNoScaleKernel32x32(rocm_device_id);
             auto argument = device_gemm.MakeArgument(
                 d_A_int8, d_weights_int8, p_ds, d_C_int32,
                 M, N, K,
@@ -1165,7 +1206,7 @@ extern "C"
         else if (M < 128)
         {
             // Medium M: Use 64×64 kernel (optimal for M=33-127)
-            auto& device_gemm = getCachedNoScaleKernel64x64();
+            auto& device_gemm = getCachedNoScaleKernel64x64(rocm_device_id);
             auto argument = device_gemm.MakeArgument(
                 d_A_int8, d_weights_int8, p_ds, d_C_int32,
                 M, N, K,
@@ -1186,7 +1227,7 @@ extern "C"
         else if (M % 128 == 0)
         {
             // Large M, multiple of 128: Use 128×128 kernel with GemmDefault (peak throughput)
-            auto& device_gemm = getCachedNoScaleKernel();
+            auto& device_gemm = getCachedNoScaleKernel(rocm_device_id);
             auto argument = device_gemm.MakeArgument(
                 d_A_int8, d_weights_int8, p_ds, d_C_int32,
                 M, N, K,
@@ -1207,7 +1248,7 @@ extern "C"
         else
         {
             // Large M, irregular: Use 128×128 kernel with GemmMNPadding
-            auto& device_gemm = getCachedNoScaleKernel128x128MNPadding();
+            auto& device_gemm = getCachedNoScaleKernel128x128MNPadding(rocm_device_id);
             auto argument = device_gemm.MakeArgument(
                 d_A_int8, d_weights_int8, p_ds, d_C_int32,
                 M, N, K,

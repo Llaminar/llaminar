@@ -253,6 +253,7 @@ namespace llaminar2
         int local_rank_ = 0;
         std::shared_ptr<MPIContext> mpi_ctx_;      // Optional MPI context for multi-process
         bool is_multi_gpu_single_process_ = false; // True if multi-GPU without MPI
+        bool p2p_available_ = false;               // True if P2P available between all devices
 
 #ifdef HAVE_RCCL
         // Use void* for opaque RCCL types - dynamic loading hides the actual types

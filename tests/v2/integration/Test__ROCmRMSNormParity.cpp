@@ -614,6 +614,63 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP16_Large)
     EXPECT_LE(l2_error, 0.02) << "L2 error too high for FP16 (>2%)";
 }
 
+
+// ============================================================================
+// apply_tensor() API Tests
+// ============================================================================
+// These tests exercise the TensorBase* API (apply_tensor) which is what the
+// actual pipeline uses. This is critical because the raw pointer apply() API
+// tests might pass while apply_tensor() has bugs (e.g., using data() instead
+// of gpu_data_ptr() for GPU tensors).
+
+TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_ApplyTensor)
+{
+    SKIP_IF_NO_ROCM();
+
+    constexpr int rows = 4;
+    constexpr int cols = 64;
+    constexpr float epsilon = 1e-6f;
+    const size_t total = rows * cols;
+
+    // Create tensors using TestTensorFactory
+    auto input = TestTensorFactory::createFP32Random({rows, cols}, -1.0f, 1.0f);
+    auto gamma = TestTensorFactory::createFP32Random({1, cols}, 0.5f, 1.5f);
+    auto cpu_output = TestTensorFactory::createFP32({rows, cols});
+    auto rocm_output = TestTensorFactory::createFP32({rows, cols});
+
+    // CPU reference using raw apply()
+    CPURMSNormKernelT<ActivationPrecision::FP32> cpu_kernel;
+    cpu_kernel.apply(input->data(), gamma->data(), cpu_output->mutable_data(),
+                     rows, cols, epsilon, false, nullptr, -1);
+
+    // Upload tensors to GPU
+    DeviceId rocm_device = DeviceId::rocm(0);
+    ASSERT_TRUE(input->ensureOnDevice(rocm_device));
+    ASSERT_TRUE(gamma->ensureOnDevice(rocm_device));
+    ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device));
+
+    // ROCm kernel using apply_tensor() API
+    llaminar2::rocm::ROCmRMSNormKernelT<ActivationPrecision::FP32> rocm_kernel;
+    ASSERT_TRUE(rocm_kernel.apply_tensor(
+        input.get(), gamma.get(), rocm_output.get(),
+        rows, cols, epsilon, nullptr, 0));
+
+    hipDeviceSynchronize();
+    rocm_output->mark_device_dirty();
+    const float* result = rocm_output->data();
+
+    ASSERT_FALSE(hasNaNOrInf(result, total)) << "ROCm output contains NaN/Inf";
+
+    double cosine = cosineSimilarity(result, cpu_output->data(), total);
+    double l2_error = relativeL2Error(result, cpu_output->data(), total);
+
+    std::cout << "  RMSNorm FP32 ApplyTensor: cosine=" << std::setprecision(8) << cosine
+              << ", L2_error=" << (l2_error * 100.0) << "%" << std::endl;
+
+    EXPECT_GE(cosine, 0.9999) << "Cosine similarity too low - apply_tensor() may have pointer issues";
+    EXPECT_LE(l2_error, 0.01) << "L2 error too high";
+}
+
 #else // !HAVE_ROCM
 
 TEST(Test__ROCmRMSNormParity, NotAvailable)

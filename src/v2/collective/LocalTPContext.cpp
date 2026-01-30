@@ -171,34 +171,21 @@ namespace llaminar2
             return true; // Return true to allow pipeline to continue
         }
 
-        // For LOCAL TP, we use the Multi-GPU API if available
-        // Each device has its own buffer that participates in the collective
-        if (backend_impl_->isMultiGpuSingleProcess())
+        // ================================================================
+        // Multi-GPU Backends (NCCL/RCCL): Use barrier-synchronized allreduce
+        // ================================================================
+        // For LOCAL TP with multiple threads (one per device), each thread calls
+        // allreduce() with its OWN tensor. We CANNOT use getDeviceBuffers() on a
+        // single tensor because TensorBase can only be on ONE GPU at a time.
+        // Instead, use the barrier-synchronized approach where all device threads
+        // rendezvous, collect their buffers, then the last arrival executes
+        // allreduceMulti with all buffers.
+        if (backend_impl_->isMultiGpuSingleProcess() && degree() > 1)
         {
-            // Get device buffers for all devices
-            auto buffers = getDeviceBuffers(tensor);
-            if (buffers.size() != static_cast<size_t>(degree()))
-            {
-                LOG_ERROR("LocalTPContext::allreduce: Failed to get device buffers");
-                return false;
-            }
-
-            size_t count = effective_count;
-            CollectiveDataType dtype = tensorDTypeToCollective(tensor);
-
-            LOG_DEBUG("LocalTPContext::allreduce: Multi-GPU allreduce with "
-                      << degree() << " devices, " << count << " elements"
-                      << " (tensor numel=" << tensor->numel() << ")");
-
-            bool result = backend_impl_->allreduceMulti(
-                buffers, count, dtype, CollectiveOp::ALLREDUCE_SUM);
-
-            if (!result)
-            {
-                LOG_ERROR("LocalTPContext::allreduce: Backend allreduceMulti failed: "
-                          << backend_impl_->lastError());
-            }
-            return result;
+            // Release the main mutex before entering barrier (to avoid deadlock)
+            // The barrier has its own mutex for synchronization
+            lock.unlock();
+            return allreduceWithBarrierMultiGpu(tensor, stage_name, effective_count);
         }
         else
         {
@@ -510,6 +497,230 @@ namespace llaminar2
         barrier_cv_.notify_all();
 
         return success;
+    }
+
+    // =========================================================================
+    // Multi-GPU (NCCL/RCCL) Barrier-Synchronized Allreduce
+    // =========================================================================
+    //
+    // For LOCAL TP with NCCL/RCCL, multiple device threads call allreduce()
+    // concurrently, each with its OWN tensor. We need to:
+    // 1. Collect all device buffers via barrier synchronization
+    // 2. Have ONE thread execute allreduceMulti with all buffers
+    // 3. All threads return after the collective completes
+    //
+    // This is necessary because TensorBase can only exist on ONE GPU at a time,
+    // so we cannot use getDeviceBuffers() to gather buffers from a single tensor.
+    // =========================================================================
+
+    bool LocalTPContext::allreduceWithBarrierMultiGpu(TensorBase *tensor, const std::string &stage_name, size_t count)
+    {
+        const int num_participants = degree();
+
+        // Determine which device index this tensor belongs to BEFORE taking the lock
+        // This is critical: buffers must be ordered by device index, NOT arrival order
+        int device_index = -1;
+        auto tensor_device = tensor->current_device();
+        if (tensor_device.has_value())
+        {
+            for (size_t i = 0; i < devices_.size(); ++i)
+            {
+                if (devices_[i].toLocalDeviceId() == *tensor_device)
+                {
+                    device_index = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+
+        if (device_index < 0 || device_index >= num_participants)
+        {
+            LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: tensor device "
+                      << (tensor_device.has_value() ? tensor_device->toString() : "none")
+                      << " not found in LocalTPContext devices list (degree=" << num_participants << ")");
+            return false;
+        }
+
+        std::unique_lock<std::mutex> lock(barrier_mutex_);
+
+        // Capture current generation to detect spurious wakeups
+        uint64_t my_generation = barrier_generation_.load();
+
+        // Increment arrival count
+        int arrival_order = barrier_count_.fetch_add(1);
+
+        if (arrival_order == 0)
+        {
+            // First arrival: initialize tensor collection vector and store count
+            barrier_tensors_.clear();
+            barrier_tensors_.resize(num_participants, nullptr);
+            barrier_element_count_ = count;
+            LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: First arrival (device thread), "
+                      << "stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << ", count=" << count << " (0=use numel)"
+                      << ", waiting for " << (num_participants - 1) << " more devices");
+        }
+
+        // Store this device's tensor at its DEVICE INDEX slot (not arrival order!)
+        // This ensures buffers[i] corresponds to device_ordinals_[i] in RCCL
+        barrier_tensors_[device_index] = tensor;
+
+        LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: Device arrival #" << (arrival_order + 1)
+                                                                                   << " of " << num_participants
+                                                                                   << " (tensor ptr=" << tensor
+                                                                                   << ", device_index=" << device_index << ")");
+
+        if (arrival_order + 1 < num_participants)
+        {
+            // Not the last arrival: wait for completion with timeout
+            constexpr auto BARRIER_TIMEOUT = std::chrono::seconds(30);
+
+            bool completed = barrier_cv_.wait_for(lock, BARRIER_TIMEOUT, [this, my_generation]()
+                                                  { return barrier_generation_.load() > my_generation; });
+
+            if (!completed)
+            {
+                // Timeout - likely a deadlock or missing participant
+                LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: TIMEOUT after 30s waiting for barrier! "
+                          << "arrival_order=" << arrival_order << ", expected=" << num_participants
+                          << " devices. Possible causes: missing device thread, kernel crash, or deadlock.");
+
+                // Reset barrier state to allow recovery
+                barrier_count_.store(0);
+                barrier_generation_.fetch_add(1);
+                barrier_tensors_.clear();
+                barrier_element_count_ = 0;
+
+                lock.unlock();
+                barrier_cv_.notify_all(); // Wake any other waiters
+                return false;
+            }
+
+            // Woke up - get the shared result
+            bool result = barrier_result_;
+            LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: Waiter released with result=" << result);
+            return result;
+        }
+
+        // =====================================================================
+        // LAST ARRIVAL: Execute the actual multi-GPU allreduce
+        // =====================================================================
+        // All other threads are waiting, so we have exclusive access to barrier_tensors_
+
+        LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: All " << num_participants
+                                                                       << " devices arrived, executing multi-GPU allreduce"
+                                                                       << " (count=" << barrier_element_count_ << ")");
+
+        // Collect device buffers from all tensors
+        // CRITICAL: Each tensor must be on its own device, and we need to ensure that
+        std::vector<void *> buffers;
+        buffers.reserve(num_participants);
+
+        // Determine effective count (use first tensor's numel if count is 0)
+        size_t effective_count = barrier_element_count_;
+        if (effective_count == 0 && barrier_tensors_[0] != nullptr)
+        {
+            effective_count = barrier_tensors_[0]->numel();
+        }
+
+        // Get buffer pointer from each tensor (they should already be on their respective devices)
+        for (int i = 0; i < num_participants; ++i)
+        {
+            TensorBase *t = barrier_tensors_[i];
+            if (!t)
+            {
+                LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: null tensor at slot " << i);
+                barrier_result_ = false;
+                goto cleanup;
+            }
+
+            void *ptr = t->gpu_data_ptr();
+            if (!ptr)
+            {
+                LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: tensor at slot " << i
+                                                                                          << " has no GPU buffer");
+                barrier_result_ = false;
+                goto cleanup;
+            }
+
+            // TRACE: Log detailed buffer info including device for debugging memory faults
+            LOG_TRACE("LocalTPContext::allreduceWithBarrierMultiGpu: BUFFER[" << i << "] "
+                                                                              << "ptr=" << ptr << " tensor=" << static_cast<void *>(t)
+                                                                              << " device=" << (t->current_device().has_value() ? t->current_device()->toString() : "none")
+                                                                              << " name=" << (t->debugName().empty() ? "(unnamed)" : t->debugName())
+                                                                              << " numel=" << t->numel());
+
+            LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: Buffer " << i
+                                                                              << " ptr=" << ptr
+                                                                              << " from tensor=" << t);
+            buffers.push_back(ptr);
+        }
+
+        {
+            // Execute the multi-GPU allreduce
+            CollectiveDataType dtype = tensorDTypeToCollective(barrier_tensors_[0]);
+
+            // TRACE: Log all buffer pointers before allreduce
+            LOG_TRACE("LocalTPContext::allreduceWithBarrierMultiGpu: ALLREDUCE START "
+                      << "num_buffers=" << buffers.size() << " count=" << effective_count);
+            for (size_t i = 0; i < buffers.size(); ++i)
+            {
+                LOG_TRACE("  allreduce buffer[" << i << "] = " << buffers[i]);
+            }
+
+            LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: Calling allreduceMulti with "
+                      << buffers.size() << " buffers, " << effective_count << " elements");
+
+            bool success = backend_impl_->allreduceMulti(buffers, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM);
+
+            if (!success)
+            {
+                LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: allreduceMulti failed: "
+                          << backend_impl_->lastError());
+                barrier_result_ = false;
+                goto cleanup;
+            }
+
+            // TRACE: Log after allreduce completes
+            LOG_TRACE("LocalTPContext::allreduceWithBarrierMultiGpu: ALLREDUCE COMPLETE, syncing...");
+
+            // Synchronize all GPU streams
+            if (!backend_impl_->synchronize())
+            {
+                LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: synchronize failed: "
+                          << backend_impl_->lastError());
+                barrier_result_ = false;
+                goto cleanup;
+            }
+
+            // Mark all tensors as device-dirty (data was modified on GPU)
+            for (int i = 0; i < num_participants; ++i)
+            {
+                if (barrier_tensors_[i])
+                {
+                    barrier_tensors_[i]->mark_device_dirty_with_event();
+                }
+            }
+
+            barrier_result_ = true;
+        }
+
+    cleanup:
+        // Clear barrier state and signal completion
+        barrier_tensors_.clear();
+        barrier_element_count_ = 0;
+        barrier_count_.store(0);
+        barrier_generation_.fetch_add(1);
+
+        bool final_result = barrier_result_;
+
+        LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: Multi-GPU allreduce completed with result="
+                  << final_result << ", releasing waiters (generation=" << barrier_generation_.load() << ")");
+
+        lock.unlock();
+        barrier_cv_.notify_all();
+
+        return final_result;
     }
 
     bool LocalTPContext::executePCIeBarAllreduce(TensorBase * /* unused_tensor */, size_t count_param)

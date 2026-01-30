@@ -46,178 +46,178 @@ using namespace llaminar2::test;
 namespace
 {
 
-// ============================================================================
-// ROCm Availability Check
-// ============================================================================
+    // ============================================================================
+    // ROCm Availability Check
+    // ============================================================================
 
-bool hasROCm()
-{
+    bool hasROCm()
+    {
 #ifdef HAVE_ROCM
-    int count = 0;
-    hipError_t err = hipGetDeviceCount(&count);
-    return (err == hipSuccess && count > 0);
+        int count = 0;
+        hipError_t err = hipGetDeviceCount(&count);
+        return (err == hipSuccess && count > 0);
 #else
-    return false;
+        return false;
 #endif
-}
+    }
 
-#define SKIP_IF_NO_ROCM()                                         \
-    do                                                            \
-    {                                                             \
-        if (!hasROCm())                                           \
-        {                                                         \
+#define SKIP_IF_NO_ROCM()                                           \
+    do                                                              \
+    {                                                               \
+        if (!hasROCm())                                             \
+        {                                                           \
             GTEST_SKIP() << "No ROCm GPU available, skipping test"; \
-        }                                                         \
+        }                                                           \
     } while (0)
 
-// ============================================================================
-// Similarity Utilities
-// ============================================================================
+    // ============================================================================
+    // Similarity Utilities
+    // ============================================================================
 
-double cosineSimilarity(const float *a, const float *b, size_t count)
-{
-    double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
-    for (size_t i = 0; i < count; ++i)
+    double cosineSimilarity(const float *a, const float *b, size_t count)
     {
-        dot += static_cast<double>(a[i]) * b[i];
-        norm_a += static_cast<double>(a[i]) * a[i];
-        norm_b += static_cast<double>(b[i]) * b[i];
-    }
-    double denom = std::sqrt(norm_a) * std::sqrt(norm_b);
-    if (denom < 1e-12)
-        return 0.0;
-    return dot / denom;
-}
-
-double relativeL2Error(const float *actual, const float *expected, size_t count)
-{
-    double diff_norm = 0.0, expected_norm = 0.0;
-    for (size_t i = 0; i < count; ++i)
-    {
-        double diff = actual[i] - expected[i];
-        diff_norm += diff * diff;
-        expected_norm += static_cast<double>(expected[i]) * expected[i];
-    }
-    if (expected_norm < 1e-12)
-        return diff_norm > 1e-12 ? 1e9 : 0.0;
-    return std::sqrt(diff_norm / expected_norm);
-}
-
-bool hasNaNOrInf(const float *data, size_t count)
-{
-    for (size_t i = 0; i < count; ++i)
-    {
-        if (std::isnan(data[i]) || std::isinf(data[i]))
-            return true;
-    }
-    return false;
-}
-
-// BF16 conversion helpers (host-side)
-inline uint16_t floatToBF16(float f)
-{
-    uint32_t bits;
-    memcpy(&bits, &f, sizeof(float));
-    return static_cast<uint16_t>(bits >> 16);
-}
-
-inline float bf16ToFloat(uint16_t bf16)
-{
-    uint32_t bits = static_cast<uint32_t>(bf16) << 16;
-    float result;
-    memcpy(&result, &bits, sizeof(float));
-    return result;
-}
-
-// FP16 conversion helpers (simple implementation)
-inline uint16_t floatToFP16(float f)
-{
-    uint32_t bits;
-    memcpy(&bits, &f, sizeof(float));
-    uint32_t sign = (bits >> 16) & 0x8000;
-    int32_t exp = ((bits >> 23) & 0xFF) - 127 + 15;
-    uint32_t mant = (bits >> 13) & 0x3FF;
-
-    if (exp <= 0)
-        return sign;
-    if (exp >= 31)
-        return sign | 0x7C00;
-    return static_cast<uint16_t>(sign | (exp << 10) | mant);
-}
-
-inline float fp16ToFloat(uint16_t fp16)
-{
-    uint32_t sign = (fp16 & 0x8000) << 16;
-    int32_t exp = (fp16 >> 10) & 0x1F;
-    uint32_t mant = fp16 & 0x3FF;
-
-    if (exp == 0)
-    {
-        if (mant == 0)
+        double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
+        for (size_t i = 0; i < count; ++i)
         {
-            uint32_t bits = sign;
-            float result;
-            memcpy(&result, &bits, sizeof(float));
-            return result;
+            dot += static_cast<double>(a[i]) * b[i];
+            norm_a += static_cast<double>(a[i]) * a[i];
+            norm_b += static_cast<double>(b[i]) * b[i];
         }
-        // Denormalized
-        exp = 1;
-        while (!(mant & 0x400))
-        {
-            mant <<= 1;
-            exp--;
-        }
-        mant &= 0x3FF;
+        double denom = std::sqrt(norm_a) * std::sqrt(norm_b);
+        if (denom < 1e-12)
+            return 0.0;
+        return dot / denom;
     }
-    else if (exp == 31)
+
+    double relativeL2Error(const float *actual, const float *expected, size_t count)
     {
-        uint32_t bits = sign | 0x7F800000 | (mant << 13);
+        double diff_norm = 0.0, expected_norm = 0.0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            double diff = actual[i] - expected[i];
+            diff_norm += diff * diff;
+            expected_norm += static_cast<double>(expected[i]) * expected[i];
+        }
+        if (expected_norm < 1e-12)
+            return diff_norm > 1e-12 ? 1e9 : 0.0;
+        return std::sqrt(diff_norm / expected_norm);
+    }
+
+    bool hasNaNOrInf(const float *data, size_t count)
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (std::isnan(data[i]) || std::isinf(data[i]))
+                return true;
+        }
+        return false;
+    }
+
+    // BF16 conversion helpers (host-side)
+    inline uint16_t floatToBF16(float f)
+    {
+        uint32_t bits;
+        memcpy(&bits, &f, sizeof(float));
+        return static_cast<uint16_t>(bits >> 16);
+    }
+
+    inline float bf16ToFloat(uint16_t bf16)
+    {
+        uint32_t bits = static_cast<uint32_t>(bf16) << 16;
         float result;
         memcpy(&result, &bits, sizeof(float));
         return result;
     }
 
-    uint32_t bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-    float result;
-    memcpy(&result, &bits, sizeof(float));
-    return result;
-}
-
-// Dequantize BF16 array to FP32
-void dequantizeBF16(const uint16_t *src, float *dst, size_t count)
-{
-    for (size_t i = 0; i < count; ++i)
+    // FP16 conversion helpers (simple implementation)
+    inline uint16_t floatToFP16(float f)
     {
-        dst[i] = bf16ToFloat(src[i]);
-    }
-}
+        uint32_t bits;
+        memcpy(&bits, &f, sizeof(float));
+        uint32_t sign = (bits >> 16) & 0x8000;
+        int32_t exp = ((bits >> 23) & 0xFF) - 127 + 15;
+        uint32_t mant = (bits >> 13) & 0x3FF;
 
-// Dequantize FP16 array to FP32
-void dequantizeFP16(const uint16_t *src, float *dst, size_t count)
-{
-    for (size_t i = 0; i < count; ++i)
-    {
-        dst[i] = fp16ToFloat(src[i]);
+        if (exp <= 0)
+            return sign;
+        if (exp >= 31)
+            return sign | 0x7C00;
+        return static_cast<uint16_t>(sign | (exp << 10) | mant);
     }
-}
 
-// Quantize FP32 array to BF16
-void quantizeToBF16(const float *src, uint16_t *dst, size_t count)
-{
-    for (size_t i = 0; i < count; ++i)
+    inline float fp16ToFloat(uint16_t fp16)
     {
-        dst[i] = floatToBF16(src[i]);
-    }
-}
+        uint32_t sign = (fp16 & 0x8000) << 16;
+        int32_t exp = (fp16 >> 10) & 0x1F;
+        uint32_t mant = fp16 & 0x3FF;
 
-// Quantize FP32 array to FP16
-void quantizeToFP16(const float *src, uint16_t *dst, size_t count)
-{
-    for (size_t i = 0; i < count; ++i)
-    {
-        dst[i] = floatToFP16(src[i]);
+        if (exp == 0)
+        {
+            if (mant == 0)
+            {
+                uint32_t bits = sign;
+                float result;
+                memcpy(&result, &bits, sizeof(float));
+                return result;
+            }
+            // Denormalized
+            exp = 1;
+            while (!(mant & 0x400))
+            {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x3FF;
+        }
+        else if (exp == 31)
+        {
+            uint32_t bits = sign | 0x7F800000 | (mant << 13);
+            float result;
+            memcpy(&result, &bits, sizeof(float));
+            return result;
+        }
+
+        uint32_t bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+        float result;
+        memcpy(&result, &bits, sizeof(float));
+        return result;
     }
-}
+
+    // Dequantize BF16 array to FP32
+    void dequantizeBF16(const uint16_t *src, float *dst, size_t count)
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            dst[i] = bf16ToFloat(src[i]);
+        }
+    }
+
+    // Dequantize FP16 array to FP32
+    void dequantizeFP16(const uint16_t *src, float *dst, size_t count)
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            dst[i] = fp16ToFloat(src[i]);
+        }
+    }
+
+    // Quantize FP32 array to BF16
+    void quantizeToBF16(const float *src, uint16_t *dst, size_t count)
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            dst[i] = floatToBF16(src[i]);
+        }
+    }
+
+    // Quantize FP32 array to FP16
+    void quantizeToFP16(const float *src, uint16_t *dst, size_t count)
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            dst[i] = floatToFP16(src[i]);
+        }
+    }
 
 } // namespace
 
@@ -595,6 +595,54 @@ TEST_F(Test__ROCmSwiGLUParity, SwiGLU_FP16_Large)
 // above verify kernel correctness. The tensor interface is tested implicitly
 // through full pipeline integration tests.
 // ============================================================================
+
+// ============================================================================
+// apply_tensor() API Tests
+// ============================================================================
+// These tests exercise the TensorBase* API (apply_tensor) which is what the
+// actual pipeline uses.
+
+TEST_F(Test__ROCmSwiGLUParity, SwiGLU_FP32_ApplyTensor)
+{
+    SKIP_IF_NO_ROCM();
+
+    constexpr int rows = 4;
+    constexpr int cols = 64;
+    const size_t total = rows * cols;
+
+    auto gate = TestTensorFactory::createFP32Random({rows, cols}, -1.0f, 1.0f);
+    auto up = TestTensorFactory::createFP32Random({rows, cols}, -1.0f, 1.0f);
+    auto cpu_output = TestTensorFactory::createFP32({rows, cols});
+    auto rocm_output = TestTensorFactory::createFP32({rows, cols});
+
+    CPUSwiGLUKernelT<ActivationPrecision::FP32> cpu_kernel;
+    cpu_kernel.apply(gate->data(), up->data(), cpu_output->mutable_data(),
+                     rows, cols, false, nullptr, -1);
+
+    DeviceId rocm_device = DeviceId::rocm(0);
+    ASSERT_TRUE(gate->ensureOnDevice(rocm_device));
+    ASSERT_TRUE(up->ensureOnDevice(rocm_device));
+    ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device));
+
+    llaminar2::rocm::ROCmSwiGLUKernelT<ActivationPrecision::FP32> rocm_kernel;
+    ASSERT_TRUE(rocm_kernel.apply_tensor(
+        gate.get(), up.get(), rocm_output.get(),
+        rows, cols, false, nullptr, 0));
+
+    hipDeviceSynchronize();
+    rocm_output->mark_device_dirty();
+    const float *result = rocm_output->data();
+
+    ASSERT_FALSE(hasNaNOrInf(result, total));
+
+    double cosine = cosineSimilarity(result, cpu_output->data(), total);
+    double l2_error = relativeL2Error(result, cpu_output->data(), total);
+
+    std::cout << "  SwiGLU FP32 ApplyTensor: cosine=" << cosine << ", L2_error=" << l2_error << std::endl;
+
+    EXPECT_GE(cosine, 0.9999) << "Cosine similarity too low - apply_tensor() may have pointer issues";
+    EXPECT_LE(l2_error, 0.01);
+}
 
 #else // !HAVE_ROCM
 

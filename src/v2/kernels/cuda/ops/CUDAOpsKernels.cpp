@@ -241,16 +241,19 @@ namespace llaminar2
             auto *in_bf16 = const_cast<BF16Tensor *>(dynamic_cast<const BF16Tensor *>(input));
             auto *weight_fp32 = const_cast<FP32Tensor *>(dynamic_cast<const FP32Tensor *>(weight));
             auto *out_bf16 = dynamic_cast<BF16Tensor *>(output);
-            if (!in_bf16 || !out_bf16)
+            if (!in_bf16 || !weight_fp32 || !out_bf16)
+            {
+                LOG_ERROR("[CUDARMSNormKernelT<BF16>] Dynamic cast failed - weight must be FP32");
                 return false;
+            }
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
             // Coherence handled automatically by GraphExecutor
 
-            // Get device pointers
+            // Get device pointers - use gpu_data_ptr() for proper GPU pointer handling
             const uint16_t *d_input = static_cast<const uint16_t *>(in_bf16->gpu_data_ptr());
-            const float *d_weight = weight_fp32 ? static_cast<const float *>(weight_fp32->gpu_data_ptr()) : weight->data();
+            const float *d_weight = static_cast<const float *>(weight_fp32->gpu_data_ptr());
             uint16_t *d_output = static_cast<uint16_t *>(out_bf16->gpu_data_ptr());
 
             // No sync needed - GraphExecutor handles async execution via stream ordering
@@ -302,16 +305,19 @@ namespace llaminar2
             auto *in_fp16 = const_cast<FP16Tensor *>(dynamic_cast<const FP16Tensor *>(input));
             auto *weight_fp32 = const_cast<FP32Tensor *>(dynamic_cast<const FP32Tensor *>(weight));
             auto *out_fp16 = dynamic_cast<FP16Tensor *>(output);
-            if (!in_fp16 || !out_fp16)
+            if (!in_fp16 || !weight_fp32 || !out_fp16)
+            {
+                LOG_ERROR("[CUDARMSNormKernelT<FP16>] Dynamic cast failed - weight must be FP32");
                 return false;
+            }
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
             // Coherence handled automatically by GraphExecutor
 
-            // Get device pointers
+            // Get device pointers - use gpu_data_ptr() for proper GPU pointer handling
             const uint16_t *d_input = static_cast<const uint16_t *>(in_fp16->gpu_data_ptr());
-            const float *d_weight = weight_fp32 ? static_cast<const float *>(weight_fp32->gpu_data_ptr()) : weight->data();
+            const float *d_weight = static_cast<const float *>(weight_fp32->gpu_data_ptr());
             uint16_t *d_output = static_cast<uint16_t *>(out_fp16->gpu_data_ptr());
 
             // No sync needed - GraphExecutor handles async execution via stream ordering

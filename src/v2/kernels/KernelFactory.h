@@ -1217,16 +1217,19 @@ namespace llaminar
 
                 static std::unordered_map<SlicedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, SlicedKeyHash> sliced_cache_;
 
-                // Device-targeted GEMM cache - keyed by (tensor, target_device)
+                // Device-targeted GEMM cache - keyed by (tensor, target_device, ordinal)
                 // Used when caller explicitly specifies target device different from weight tensor's device
+                // IMPORTANT: ordinal is included because each GPU has separate HIP/CUDA memory,
+                // and packed weights must be allocated on the correct device.
                 struct DeviceTargetedCacheKey
                 {
                     const llaminar2::TensorBase *tensor;
                     DeviceType device;
+                    int ordinal{0}; // Device ordinal (e.g., 0 for ROCm:0, 1 for ROCm:1)
 
                     bool operator==(const DeviceTargetedCacheKey &other) const
                     {
-                        return tensor == other.tensor && device == other.device;
+                        return tensor == other.tensor && device == other.device && ordinal == other.ordinal;
                     }
                 };
 
@@ -1235,24 +1238,28 @@ namespace llaminar
                     size_t operator()(const DeviceTargetedCacheKey &k) const
                     {
                         return std::hash<const void *>()(k.tensor) ^
-                               (std::hash<int>()(static_cast<int>(k.device)) << 1);
+                               (std::hash<int>()(static_cast<int>(k.device)) << 1) ^
+                               (std::hash<int>()(k.ordinal) << 8);
                     }
                 };
 
                 static std::unordered_map<DeviceTargetedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, DeviceTargetedKeyHash> device_targeted_cache_;
 
-                // Fused QKV GEMM cache - keyed by (wq, wk, wv, device)
+                // Fused QKV GEMM cache - keyed by (wq, wk, wv, device, ordinal)
+                // IMPORTANT: ordinal is included because each GPU has separate HIP/CUDA memory,
+                // and packed weights must be allocated on the correct device.
                 struct FusedQKVCacheKey
                 {
                     const llaminar2::TensorBase *wq;
                     const llaminar2::TensorBase *wk;
                     const llaminar2::TensorBase *wv;
                     DeviceType device;
+                    int ordinal{0}; // Device ordinal (e.g., 0 for ROCm:0, 1 for ROCm:1)
 
                     bool operator==(const FusedQKVCacheKey &other) const
                     {
                         return wq == other.wq && wk == other.wk &&
-                               wv == other.wv && device == other.device;
+                               wv == other.wv && device == other.device && ordinal == other.ordinal;
                     }
                 };
 
@@ -1263,7 +1270,8 @@ namespace llaminar
                         return std::hash<const void *>()(k.wq) ^
                                (std::hash<const void *>()(k.wk) << 1) ^
                                (std::hash<const void *>()(k.wv) << 2) ^
-                               (std::hash<int>()(static_cast<int>(k.device)) << 3);
+                               (std::hash<int>()(static_cast<int>(k.device)) << 3) ^
+                               (std::hash<int>()(k.ordinal) << 8);
                     }
                 };
 

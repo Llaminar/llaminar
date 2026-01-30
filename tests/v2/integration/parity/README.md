@@ -74,7 +74,8 @@ Located in `tests/v2/integration/parity/ParityTestBase.h`. Provides:
 - Metric computation (cosine similarity, KL divergence, Top-K overlap)
 - PyTorch snapshot loading and regeneration
 - Unicode table rendering
-- Generic `runPrefillParity()` and `assertParity()` methods
+- Generic `runSingleDevicePrefillParity()` and `assertParity()` methods for single-device tests
+- TP-aware `runTPPrefillParity()` and `assertTPParity()` methods for multi-device tests
 
 ### Tier 2: Model-Specific Base (e.g., Qwen2ParityTestBase)
 
@@ -111,7 +112,8 @@ All parity tests ultimately inherit from `ParityTestBase` (located in `tests/v2/
 | `getDevice()` | **Required** - Returns `DeviceId` for inference (e.g., `DeviceId::cpu()`, `DeviceId::cuda(0)`) |
 | `getBackendName()` | **Required** - Returns display name (e.g., `"CUDA"`, `"CPU"`, `"ROCm"`) |
 | `setupDeviceSpecific()` | Optional - Device availability checks, initialization |
-| `runPrefillParity()` | Main test driver - runs inference and compares against PyTorch |
+| `runSingleDevicePrefillParity()` | Main test driver for single-device tests - runs inference and compares against PyTorch |
+| `runTPPrefillParity()` | TP test driver for multi-device tests - compares per-device outputs against PyTorch |
 | `assertParity()` | Standard assertion helper with threshold checks |
 
 ### Model-Specific Base Classes
@@ -406,7 +408,7 @@ protected:
 
 #define INSTANTIATE_LLAMA3_PARITY_TESTS(TestFixture)                                   \
     TEST_F(TestFixture, PrefillParity_LayerByLayer) {                                  \
-        auto summary = runPrefillParity();                                             \
+        auto summary = runSingleDevicePrefillParity();                                 \
         assertParity(summary);                                                         \
     }                                                                                  \
     TEST_F(TestFixture, SnapshotInfrastructure) {                                      \

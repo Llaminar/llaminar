@@ -280,6 +280,7 @@ namespace llaminar2
             return nullptr;
         }
 
+        LOG_TRACE("[CUDABackend::allocate] ALLOC ptr=" << ptr << " bytes=" << bytes << " device_id=" << device_id);
         return ptr;
     }
 

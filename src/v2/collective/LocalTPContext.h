@@ -248,7 +248,7 @@ namespace llaminar2
 
         /// Map: stage_name -> (device_index -> BAR-backed FP32 tensor)
         /// The tensor at index i belongs to devices_[i]
-        std::unordered_map<std::string, std::vector<FP32Tensor*>> bar_output_tensors_;
+        std::unordered_map<std::string, std::vector<FP32Tensor *>> bar_output_tensors_;
 
         /**
          * @brief Initialize the collective backend
@@ -322,6 +322,26 @@ namespace llaminar2
          * @return true on success (same result for all participants)
          */
         bool allreduceWithBarrier(TensorBase *tensor, const std::string &stage_name = "", size_t count = 0);
+
+        /**
+         * @brief Barrier-synchronized allreduce for NCCL/RCCL multi-GPU backends
+         *
+         * Similar to allreduceWithBarrier but for NCCL/RCCL backends where each
+         * device thread has its OWN tensor. We cannot use getDeviceBuffers() because
+         * TensorBase can only exist on ONE GPU at a time.
+         *
+         * The barrier works as follows:
+         * 1. Each device thread arrives with its own tensor
+         * 2. Tensors are collected in barrier_tensors_ at their arrival slot
+         * 3. Last arrival extracts GPU pointers and calls allreduceMulti()
+         * 4. All devices are released with the same result
+         *
+         * @param tensor This device's tensor (must already be on its GPU)
+         * @param stage_name Stage identifier for logging (optional)
+         * @param count Number of elements to reduce (0 = use tensor->numel())
+         * @return true on success (same result for all participants)
+         */
+        bool allreduceWithBarrierMultiGpu(TensorBase *tensor, const std::string &stage_name = "", size_t count = 0);
 
         /**
          * @brief Execute the actual PCIeBAR allreduce operation

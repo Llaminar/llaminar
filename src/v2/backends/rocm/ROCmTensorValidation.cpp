@@ -12,6 +12,9 @@
 #include <hip/hip_runtime.h>
 #include <cmath>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 
 namespace llaminar2
 {
@@ -318,13 +321,22 @@ namespace llaminar2
     class ROCmTensorValidator : public ITensorValidator
     {
     public:
-        ROCmTensorValidator()
+        explicit ROCmTensorValidator(int device_id) : device_id_(device_id)
         {
-            // Allocate device-side result buffer
-            hipError_t err = hipMalloc(&d_result_, sizeof(DeviceValidationResult));
+            // Set device before allocation to ensure buffer is on correct device
+            hipError_t err = hipSetDevice(device_id);
             if (err != hipSuccess)
             {
-                LOG_ERROR("[ROCmTensorValidator] Failed to allocate device result buffer");
+                LOG_ERROR("[ROCmTensorValidator] Failed to set device " << device_id);
+                d_result_ = nullptr;
+                return;
+            }
+
+            // Allocate device-side result buffer ON THIS DEVICE
+            err = hipMalloc(&d_result_, sizeof(DeviceValidationResult));
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmTensorValidator] Failed to allocate device result buffer on device " << device_id);
                 d_result_ = nullptr;
             }
         }
@@ -333,6 +345,8 @@ namespace llaminar2
         {
             if (d_result_)
             {
+                // Set device before freeing
+                (void)hipSetDevice(device_id_);
                 (void)hipFree(d_result_);
                 d_result_ = nullptr;
             }
@@ -344,6 +358,14 @@ namespace llaminar2
         {
             if (!d_result_ || !device_ptr || num_elements == 0)
                 return false;
+
+            // Verify we're validating on the device this validator was created for
+            if (device_id != device_id_)
+            {
+                LOG_WARN("[ROCmTensorValidator] Device mismatch: validator for device " << device_id_
+                         << " but asked to validate on device " << device_id);
+                return false;
+            }
 
             hipError_t err = hipSetDevice(device_id);
             if (err != hipSuccess)
@@ -468,21 +490,40 @@ namespace llaminar2
     private:
         DeviceValidationResult *d_result_ = nullptr;
         size_t last_num_elements_ = 0;
+        int device_id_ = -1;
     };
 
     // =========================================================================
-    // Factory Function
+    // Per-Device Validator Factory (Thread-Safe)
     // =========================================================================
 
-    static ROCmTensorValidator *g_rocm_validator = nullptr;
+    static std::mutex g_rocm_validator_mutex;
+    static std::unordered_map<int, std::unique_ptr<ROCmTensorValidator>> g_rocm_validators;
 
     ITensorValidator *getROCmTensorValidator()
     {
-        if (!g_rocm_validator)
+        // Get current device
+        int device_id = 0;
+        hipError_t err = hipGetDevice(&device_id);
+        if (err != hipSuccess)
         {
-            g_rocm_validator = new ROCmTensorValidator();
+            LOG_ERROR("[getROCmTensorValidator] Failed to get current device");
+            return nullptr;
         }
-        return g_rocm_validator;
+
+        std::lock_guard<std::mutex> lock(g_rocm_validator_mutex);
+
+        auto it = g_rocm_validators.find(device_id);
+        if (it == g_rocm_validators.end())
+        {
+            // Create a new validator for this device
+            auto validator = std::make_unique<ROCmTensorValidator>(device_id);
+            auto* ptr = validator.get();
+            g_rocm_validators[device_id] = std::move(validator);
+            LOG_DEBUG("[getROCmTensorValidator] Created validator for device " << device_id);
+            return ptr;
+        }
+        return it->second.get();
     }
 
 } // namespace llaminar2

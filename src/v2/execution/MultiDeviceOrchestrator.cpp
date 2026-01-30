@@ -891,13 +891,20 @@ namespace llaminar2
 
     int MultiDeviceOrchestrator::vocab_size() const
     {
-        if (!device_runners_.empty() && device_runners_[0])
-        {
-            return device_runners_[0]->vocab_size();
-        }
+        // For tensor-parallel setups, the LM head may be column-sharded across devices.
+        // In that case, each device has logits for vocab_size/tp_degree tokens.
+        // We should return the FULL vocab size (sum of all devices), not just device 0's.
+        //
+        // The model_ctx_ always has the true total vocab size from the model metadata.
         if (model_ctx_)
         {
             return static_cast<int>(model_ctx_->vocabSize());
+        }
+
+        // Fallback: if no model context, use device 0's vocab (may be wrong for TP)
+        if (!device_runners_.empty() && device_runners_[0])
+        {
+            return device_runners_[0]->vocab_size();
         }
         return 0;
     }

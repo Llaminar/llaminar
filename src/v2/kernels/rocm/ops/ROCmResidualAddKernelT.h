@@ -83,10 +83,12 @@ namespace llaminar2
                 if (input->native_type() != TensorType::FP32)
                     return false;
 
+                // Use active_data_ptr() which returns GPU pointer when tensor is on GPU
+                // (consistent with BF16/FP16 specializations and CUDA implementation)
                 return apply(
-                    input->data(),
-                    residual->data(),
-                    output->mutable_data(),
+                    static_cast<const float *>(input->active_data_ptr()),
+                    static_cast<const float *>(residual->active_data_ptr()),
+                    static_cast<float *>(output->active_mutable_data_ptr()),
                     num_elements,
                     mpi_ctx,
                     device_idx);

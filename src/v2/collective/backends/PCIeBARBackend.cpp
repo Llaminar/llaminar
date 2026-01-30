@@ -94,6 +94,13 @@ namespace llaminar2
     std::optional<std::pair<void *, size_t>> PCIeBARBackend::allocateInBarRegion(size_t size)
     {
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+        // Check backend is initialized (must call initialize() first)
+        if (!initialized_)
+        {
+            LOG_ERROR("allocateInBarRegion: PCIeBARBackend not initialized - call initialize() first");
+            return std::nullopt;
+        }
+
         // Check BAR is active
         if (!p2p_engine_ || !p2p_engine_->isPCIeBarActive())
         {

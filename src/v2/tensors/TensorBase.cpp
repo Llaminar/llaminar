@@ -983,6 +983,39 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // GPU Pointer Access with Trace Logging
+    // =========================================================================
+
+    void *TensorBase::gpu_data_ptr()
+    {
+        // TRACE: Log every GPU pointer access for debugging multi-GPU memory issues
+        // Only log when pointer is non-null (i.e., tensor is on GPU)
+        if (gpu_data_ptr_)
+        {
+            LOG_TRACE("[TensorBase::gpu_data_ptr] ACCESS tensor=" << static_cast<void *>(this)
+                                                                  << " name=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
+                                                                  << " ptr=" << gpu_data_ptr_
+                                                                  << " device=" << (gpu_device_.has_value() ? gpu_device_->toString() : "none")
+                                                                  << " device_valid=" << device_valid_);
+        }
+        return gpu_data_ptr_;
+    }
+
+    const void *TensorBase::gpu_data_ptr() const
+    {
+        // TRACE: Log every GPU pointer access for debugging multi-GPU memory issues
+        if (gpu_data_ptr_)
+        {
+            LOG_TRACE("[TensorBase::gpu_data_ptr] CONST ACCESS tensor=" << static_cast<const void *>(this)
+                                                                        << " name=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
+                                                                        << " ptr=" << gpu_data_ptr_
+                                                                        << " device=" << (gpu_device_.has_value() ? gpu_device_->toString() : "none")
+                                                                        << " device_valid=" << device_valid_);
+        }
+        return gpu_data_ptr_;
+    }
+
+    // =========================================================================
     // Lazy Transfer Implementation (Phase 1 GPU Device-Aware Slicing)
     // =========================================================================
 
@@ -1165,6 +1198,13 @@ namespace llaminar2
             {
                 LOG_INFO("[TensorBase::ensureOnDevice] backend->allocate(" << bytes << " bytes) took " << alloc_us << " us");
             }
+
+            // TRACE: Log tensor allocation with identity for debugging multi-GPU memory issues
+            LOG_TRACE("[TensorBase::ensureOnDevice] TENSOR ALLOC: tensor=" << static_cast<void *>(this)
+                                                                           << " name=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
+                                                                           << " gpu_ptr=" << gpu_data_ptr_ << " bytes=" << bytes
+                                                                           << " device=" << target_device.toString()
+                                                                           << " backend_device_id=" << backend_device_id);
 
             if (!gpu_data_ptr_)
             {
@@ -1598,6 +1638,15 @@ namespace llaminar2
                     LOG_WARN(msg.str());
                 }
             }
+
+            // Log full D2H details for debugging multi-GPU memory access faults
+            LOG_DEBUG("[TensorBase::ensureOnHost] ATTEMPTING D2H: "
+                      << "tensor=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
+                      << " gpu_data_ptr=" << static_cast<const void *>(gpu_data_ptr_)
+                      << " dst=" << static_cast<const void *>(dst)
+                      << " bytes=" << bytes
+                      << " device=" << gpu_device_->toString()
+                      << " backend_device_id=" << backend_device_id);
 
             auto d2h_start = std::chrono::high_resolution_clock::now();
             bool d2h_ok = backend->deviceToHost(dst, gpu_data_ptr_, bytes, backend_device_id);

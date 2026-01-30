@@ -1,12 +1,12 @@
 /**
- * @file Test__ROCmResidualAddParity.cpp
- * @brief Parity tests for ROCm ResidualAdd kernel vs CPU reference
+ * @file Test__CUDAResidualAddParity.cpp
+ * @brief Parity tests for CUDA ResidualAdd kernel vs CPU reference
  *
- * **Purpose**: Validate that ROCm ResidualAdd kernels produce numerically equivalent
+ * **Purpose**: Validate that CUDA ResidualAdd kernels produce numerically equivalent
  * results to CPU kernels with high cosine similarity (>= 0.99999).
  *
  * **Tests**:
- * - ROCmResidualAddKernelT vs CPUResidualAddKernelT (FP32, BF16, FP16)
+ * - CUDAResidualAddKernelT vs CPUResidualAddKernelT (FP32, BF16, FP16)
  * - Small (4×64) and large (32×896) tensor sizes
  *
  * **Pass Criteria**:
@@ -14,7 +14,7 @@
  * - No NaN/Inf in outputs
  * - Relative L2 error < 0.1% for FP32, < 1% for BF16/FP16
  *
- * Target Hardware: AMD MI50 (gfx906 / Vega 20)
+ * Target Hardware: NVIDIA RTX 3090 / RTX 4090
  */
 
 #include <gtest/gtest.h>
@@ -22,9 +22,9 @@
 #include "tensors/Tensors.h"
 #include "execution/RuntimeConfig.h"
 
-#ifdef HAVE_ROCM
-#include <hip/hip_runtime.h>
-#include "kernels/rocm/ops/ROCmResidualAddKernelT.h"
+#ifdef HAVE_CUDA
+#include <cuda_runtime.h>
+#include "kernels/cuda/ops/CUDAResidualAddKernelT.h"
 #include "kernels/cpu/ops/CPUResidualAddKernelT.h"
 #endif
 
@@ -43,26 +43,26 @@ namespace
 {
 
     // ============================================================================
-    // ROCm Availability Check
+    // CUDA Availability Check
     // ============================================================================
 
-    bool hasROCm()
+    bool hasCUDA()
     {
-#ifdef HAVE_ROCM
+#ifdef HAVE_CUDA
         int count = 0;
-        hipError_t err = hipGetDeviceCount(&count);
-        return (err == hipSuccess && count > 0);
+        cudaError_t err = cudaGetDeviceCount(&count);
+        return (err == cudaSuccess && count > 0);
 #else
         return false;
 #endif
     }
 
-#define SKIP_IF_NO_ROCM()                                           \
+#define SKIP_IF_NO_CUDA()                                           \
     do                                                              \
     {                                                               \
-        if (!hasROCm())                                             \
+        if (!hasCUDA())                                             \
         {                                                           \
-            GTEST_SKIP() << "No ROCm GPU available, skipping test"; \
+            GTEST_SKIP() << "No CUDA GPU available, skipping test"; \
         }                                                           \
     } while (0)
 
@@ -113,54 +113,54 @@ namespace
     // Test Fixture
     // ============================================================================
 
-    class ROCmResidualAddParityTest : public ::testing::Test
+    class CUDAResidualAddParityTest : public ::testing::Test
     {
     protected:
         void SetUp() override
         {
-            SKIP_IF_NO_ROCM();
+            SKIP_IF_NO_CUDA();
         }
 
-#ifdef HAVE_ROCM
+#ifdef HAVE_CUDA
         // Helper to allocate GPU memory and copy data
         float *allocGpuFloat(size_t count)
         {
             float *d_ptr = nullptr;
-            hipMalloc(&d_ptr, count * sizeof(float));
+            cudaMalloc(&d_ptr, count * sizeof(float));
             return d_ptr;
         }
 
         uint16_t *allocGpuU16(size_t count)
         {
             uint16_t *d_ptr = nullptr;
-            hipMalloc(&d_ptr, count * sizeof(uint16_t));
+            cudaMalloc(&d_ptr, count * sizeof(uint16_t));
             return d_ptr;
         }
 
         void copyToGpu(float *d_dst, const float *h_src, size_t count)
         {
-            hipMemcpy(d_dst, h_src, count * sizeof(float), hipMemcpyHostToDevice);
+            cudaMemcpy(d_dst, h_src, count * sizeof(float), cudaMemcpyHostToDevice);
         }
 
         void copyToGpu(uint16_t *d_dst, const uint16_t *h_src, size_t count)
         {
-            hipMemcpy(d_dst, h_src, count * sizeof(uint16_t), hipMemcpyHostToDevice);
+            cudaMemcpy(d_dst, h_src, count * sizeof(uint16_t), cudaMemcpyHostToDevice);
         }
 
         void copyFromGpu(float *h_dst, const float *d_src, size_t count)
         {
-            hipMemcpy(h_dst, d_src, count * sizeof(float), hipMemcpyDeviceToHost);
+            cudaMemcpy(h_dst, d_src, count * sizeof(float), cudaMemcpyDeviceToHost);
         }
 
         void copyFromGpu(uint16_t *h_dst, const uint16_t *d_src, size_t count)
         {
-            hipMemcpy(h_dst, d_src, count * sizeof(uint16_t), hipMemcpyDeviceToHost);
+            cudaMemcpy(h_dst, d_src, count * sizeof(uint16_t), cudaMemcpyDeviceToHost);
         }
 
         void freeGpu(void *d_ptr)
         {
             if (d_ptr)
-                hipFree(d_ptr);
+                cudaFree(d_ptr);
         }
 #endif
     };
@@ -169,9 +169,9 @@ namespace
     // FP32 Tests
     // ============================================================================
 
-#ifdef HAVE_ROCM
+#ifdef HAVE_CUDA
 
-    TEST_F(ROCmResidualAddParityTest, FP32_SmallTensor)
+    TEST_F(CUDAResidualAddParityTest, FP32_SmallTensor)
     {
         const int rows = 4;
         const int cols = 64;
@@ -181,7 +181,7 @@ namespace
         auto input = TestTensorFactory::createFP32Random({rows, cols}, -1.0f, 1.0f);
         auto residual = TestTensorFactory::createFP32Random({rows, cols}, -1.0f, 1.0f);
         auto cpu_output = TestTensorFactory::createFP32({rows, cols});
-        auto rocm_output = TestTensorFactory::createFP32({rows, cols});
+        auto cuda_output = TestTensorFactory::createFP32({rows, cols});
 
         // CPU reference
         llaminar2::CPUResidualAddKernelT<ActivationPrecision::FP32> cpu_kernel;
@@ -189,7 +189,7 @@ namespace
             input->data(), residual->data(), cpu_output->mutable_data(),
             num_elements, nullptr, -1));
 
-        // ROCm kernel
+        // CUDA kernel
         float *d_input = allocGpuFloat(num_elements);
         float *d_residual = allocGpuFloat(num_elements);
         float *d_output = allocGpuFloat(num_elements);
@@ -197,17 +197,17 @@ namespace
         copyToGpu(d_input, input->data(), num_elements);
         copyToGpu(d_residual, residual->data(), num_elements);
 
-        llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP32> rocm_kernel;
-        ASSERT_TRUE(rocm_kernel.apply(d_input, d_residual, d_output, num_elements, nullptr, 0));
+        llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::FP32> cuda_kernel;
+        ASSERT_TRUE(cuda_kernel.apply(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
-        copyFromGpu(rocm_output->mutable_data(), d_output, num_elements);
+        cudaDeviceSynchronize();
+        copyFromGpu(cuda_output->mutable_data(), d_output, num_elements);
 
         // Validate
-        EXPECT_FALSE(hasNanOrInf(rocm_output->data(), num_elements)) << "ROCm output contains NaN/Inf";
+        EXPECT_FALSE(hasNanOrInf(cuda_output->data(), num_elements)) << "CUDA output contains NaN/Inf";
 
-        double cosine = cosineSimilarity(rocm_output->data(), cpu_output->data(), num_elements);
-        double rel_error = relativeL2Error(rocm_output->data(), cpu_output->data(), num_elements);
+        double cosine = cosineSimilarity(cuda_output->data(), cpu_output->data(), num_elements);
+        double rel_error = relativeL2Error(cuda_output->data(), cpu_output->data(), num_elements);
 
         std::cout << "[FP32_SmallTensor] Cosine similarity: " << std::fixed << std::setprecision(6) << cosine
                   << ", Relative L2 error: " << std::scientific << rel_error << std::endl;
@@ -220,7 +220,7 @@ namespace
         freeGpu(d_output);
     }
 
-    TEST_F(ROCmResidualAddParityTest, FP32_LargeTensor)
+    TEST_F(CUDAResidualAddParityTest, FP32_LargeTensor)
     {
         const int rows = 32;
         const int cols = 896;
@@ -229,7 +229,7 @@ namespace
         auto input = TestTensorFactory::createFP32Random({rows, cols}, -1.0f, 1.0f);
         auto residual = TestTensorFactory::createFP32Random({rows, cols}, -1.0f, 1.0f);
         auto cpu_output = TestTensorFactory::createFP32({rows, cols});
-        auto rocm_output = TestTensorFactory::createFP32({rows, cols});
+        auto cuda_output = TestTensorFactory::createFP32({rows, cols});
 
         // CPU reference
         llaminar2::CPUResidualAddKernelT<ActivationPrecision::FP32> cpu_kernel;
@@ -237,7 +237,7 @@ namespace
             input->data(), residual->data(), cpu_output->mutable_data(),
             num_elements, nullptr, -1));
 
-        // ROCm kernel
+        // CUDA kernel
         float *d_input = allocGpuFloat(num_elements);
         float *d_residual = allocGpuFloat(num_elements);
         float *d_output = allocGpuFloat(num_elements);
@@ -245,16 +245,16 @@ namespace
         copyToGpu(d_input, input->data(), num_elements);
         copyToGpu(d_residual, residual->data(), num_elements);
 
-        llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP32> rocm_kernel;
-        ASSERT_TRUE(rocm_kernel.apply(d_input, d_residual, d_output, num_elements, nullptr, 0));
+        llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::FP32> cuda_kernel;
+        ASSERT_TRUE(cuda_kernel.apply(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
-        copyFromGpu(rocm_output->mutable_data(), d_output, num_elements);
+        cudaDeviceSynchronize();
+        copyFromGpu(cuda_output->mutable_data(), d_output, num_elements);
 
-        EXPECT_FALSE(hasNanOrInf(rocm_output->data(), num_elements)) << "ROCm output contains NaN/Inf";
+        EXPECT_FALSE(hasNanOrInf(cuda_output->data(), num_elements)) << "CUDA output contains NaN/Inf";
 
-        double cosine = cosineSimilarity(rocm_output->data(), cpu_output->data(), num_elements);
-        double rel_error = relativeL2Error(rocm_output->data(), cpu_output->data(), num_elements);
+        double cosine = cosineSimilarity(cuda_output->data(), cpu_output->data(), num_elements);
+        double rel_error = relativeL2Error(cuda_output->data(), cpu_output->data(), num_elements);
 
         std::cout << "[FP32_LargeTensor] Cosine similarity: " << std::fixed << std::setprecision(6) << cosine
                   << ", Relative L2 error: " << std::scientific << rel_error << std::endl;
@@ -271,7 +271,7 @@ namespace
     // BF16 Tests
     // ============================================================================
 
-    TEST_F(ROCmResidualAddParityTest, BF16_SmallTensor)
+    TEST_F(CUDAResidualAddParityTest, BF16_SmallTensor)
     {
         const int rows = 4;
         const int cols = 64;
@@ -281,7 +281,7 @@ namespace
         auto input_bf16 = TestTensorFactory::createBF16Random({rows, cols}, -1.0f, 1.0f);
         auto residual_bf16 = TestTensorFactory::createBF16Random({rows, cols}, -1.0f, 1.0f);
         auto cpu_output_bf16 = TestTensorFactory::createBF16({rows, cols});
-        auto rocm_output_bf16 = TestTensorFactory::createBF16({rows, cols});
+        auto cuda_output_bf16 = TestTensorFactory::createBF16({rows, cols});
 
         // CPU reference
         llaminar2::CPUResidualAddKernelT<ActivationPrecision::BF16> cpu_kernel;
@@ -289,7 +289,7 @@ namespace
             input_bf16->typed_data(), residual_bf16->typed_data(), cpu_output_bf16->mutable_typed_data(),
             num_elements, nullptr, -1));
 
-        // ROCm kernel
+        // CUDA kernel
         uint16_t *d_input = allocGpuU16(num_elements);
         uint16_t *d_residual = allocGpuU16(num_elements);
         uint16_t *d_output = allocGpuU16(num_elements);
@@ -297,25 +297,25 @@ namespace
         copyToGpu(d_input, input_bf16->typed_data(), num_elements);
         copyToGpu(d_residual, residual_bf16->typed_data(), num_elements);
 
-        llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::BF16> rocm_kernel;
-        ASSERT_TRUE(rocm_kernel.apply_bf16(d_input, d_residual, d_output, num_elements, nullptr, 0));
+        llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::BF16> cuda_kernel;
+        ASSERT_TRUE(cuda_kernel.apply_bf16(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
-        copyFromGpu(rocm_output_bf16->mutable_typed_data(), d_output, num_elements);
+        cudaDeviceSynchronize();
+        copyFromGpu(cuda_output_bf16->mutable_typed_data(), d_output, num_elements);
 
         // Dequantize for comparison
         std::vector<float> cpu_fp32(num_elements);
-        std::vector<float> rocm_fp32(num_elements);
+        std::vector<float> cuda_fp32(num_elements);
         for (size_t i = 0; i < num_elements; ++i)
         {
             cpu_fp32[i] = cpu_output_bf16->fp32_data()[i];
-            rocm_fp32[i] = rocm_output_bf16->fp32_data()[i];
+            cuda_fp32[i] = cuda_output_bf16->fp32_data()[i];
         }
 
-        EXPECT_FALSE(hasNanOrInf(rocm_fp32.data(), num_elements)) << "ROCm output contains NaN/Inf";
+        EXPECT_FALSE(hasNanOrInf(cuda_fp32.data(), num_elements)) << "CUDA output contains NaN/Inf";
 
-        double cosine = cosineSimilarity(rocm_fp32.data(), cpu_fp32.data(), num_elements);
-        double rel_error = relativeL2Error(rocm_fp32.data(), cpu_fp32.data(), num_elements);
+        double cosine = cosineSimilarity(cuda_fp32.data(), cpu_fp32.data(), num_elements);
+        double rel_error = relativeL2Error(cuda_fp32.data(), cpu_fp32.data(), num_elements);
 
         std::cout << "[BF16_SmallTensor] Cosine similarity: " << std::fixed << std::setprecision(6) << cosine
                   << ", Relative L2 error: " << std::scientific << rel_error << std::endl;
@@ -328,7 +328,7 @@ namespace
         freeGpu(d_output);
     }
 
-    TEST_F(ROCmResidualAddParityTest, BF16_LargeTensor)
+    TEST_F(CUDAResidualAddParityTest, BF16_LargeTensor)
     {
         const int rows = 32;
         const int cols = 896;
@@ -337,7 +337,7 @@ namespace
         auto input_bf16 = TestTensorFactory::createBF16Random({rows, cols}, -1.0f, 1.0f);
         auto residual_bf16 = TestTensorFactory::createBF16Random({rows, cols}, -1.0f, 1.0f);
         auto cpu_output_bf16 = TestTensorFactory::createBF16({rows, cols});
-        auto rocm_output_bf16 = TestTensorFactory::createBF16({rows, cols});
+        auto cuda_output_bf16 = TestTensorFactory::createBF16({rows, cols});
 
         llaminar2::CPUResidualAddKernelT<ActivationPrecision::BF16> cpu_kernel;
         ASSERT_TRUE(cpu_kernel.apply_bf16(
@@ -351,24 +351,24 @@ namespace
         copyToGpu(d_input, input_bf16->typed_data(), num_elements);
         copyToGpu(d_residual, residual_bf16->typed_data(), num_elements);
 
-        llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::BF16> rocm_kernel;
-        ASSERT_TRUE(rocm_kernel.apply_bf16(d_input, d_residual, d_output, num_elements, nullptr, 0));
+        llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::BF16> cuda_kernel;
+        ASSERT_TRUE(cuda_kernel.apply_bf16(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
-        copyFromGpu(rocm_output_bf16->mutable_typed_data(), d_output, num_elements);
+        cudaDeviceSynchronize();
+        copyFromGpu(cuda_output_bf16->mutable_typed_data(), d_output, num_elements);
 
         std::vector<float> cpu_fp32(num_elements);
-        std::vector<float> rocm_fp32(num_elements);
+        std::vector<float> cuda_fp32(num_elements);
         for (size_t i = 0; i < num_elements; ++i)
         {
             cpu_fp32[i] = cpu_output_bf16->fp32_data()[i];
-            rocm_fp32[i] = rocm_output_bf16->fp32_data()[i];
+            cuda_fp32[i] = cuda_output_bf16->fp32_data()[i];
         }
 
-        EXPECT_FALSE(hasNanOrInf(rocm_fp32.data(), num_elements)) << "ROCm output contains NaN/Inf";
+        EXPECT_FALSE(hasNanOrInf(cuda_fp32.data(), num_elements)) << "CUDA output contains NaN/Inf";
 
-        double cosine = cosineSimilarity(rocm_fp32.data(), cpu_fp32.data(), num_elements);
-        double rel_error = relativeL2Error(rocm_fp32.data(), cpu_fp32.data(), num_elements);
+        double cosine = cosineSimilarity(cuda_fp32.data(), cpu_fp32.data(), num_elements);
+        double rel_error = relativeL2Error(cuda_fp32.data(), cpu_fp32.data(), num_elements);
 
         std::cout << "[BF16_LargeTensor] Cosine similarity: " << std::fixed << std::setprecision(6) << cosine
                   << ", Relative L2 error: " << std::scientific << rel_error << std::endl;
@@ -385,7 +385,7 @@ namespace
     // FP16 Tests
     // ============================================================================
 
-    TEST_F(ROCmResidualAddParityTest, FP16_SmallTensor)
+    TEST_F(CUDAResidualAddParityTest, FP16_SmallTensor)
     {
         const int rows = 4;
         const int cols = 64;
@@ -394,7 +394,7 @@ namespace
         auto input_fp16 = TestTensorFactory::createFP16Random({rows, cols}, -1.0f, 1.0f);
         auto residual_fp16 = TestTensorFactory::createFP16Random({rows, cols}, -1.0f, 1.0f);
         auto cpu_output_fp16 = TestTensorFactory::createFP16({rows, cols});
-        auto rocm_output_fp16 = TestTensorFactory::createFP16({rows, cols});
+        auto cuda_output_fp16 = TestTensorFactory::createFP16({rows, cols});
 
         llaminar2::CPUResidualAddKernelT<ActivationPrecision::FP16> cpu_kernel;
         ASSERT_TRUE(cpu_kernel.apply_fp16(
@@ -408,24 +408,24 @@ namespace
         copyToGpu(d_input, input_fp16->typed_data(), num_elements);
         copyToGpu(d_residual, residual_fp16->typed_data(), num_elements);
 
-        llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP16> rocm_kernel;
-        ASSERT_TRUE(rocm_kernel.apply_fp16(d_input, d_residual, d_output, num_elements, nullptr, 0));
+        llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::FP16> cuda_kernel;
+        ASSERT_TRUE(cuda_kernel.apply_fp16(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
-        copyFromGpu(rocm_output_fp16->mutable_typed_data(), d_output, num_elements);
+        cudaDeviceSynchronize();
+        copyFromGpu(cuda_output_fp16->mutable_typed_data(), d_output, num_elements);
 
         std::vector<float> cpu_fp32(num_elements);
-        std::vector<float> rocm_fp32(num_elements);
+        std::vector<float> cuda_fp32(num_elements);
         for (size_t i = 0; i < num_elements; ++i)
         {
             cpu_fp32[i] = cpu_output_fp16->fp32_data()[i];
-            rocm_fp32[i] = rocm_output_fp16->fp32_data()[i];
+            cuda_fp32[i] = cuda_output_fp16->fp32_data()[i];
         }
 
-        EXPECT_FALSE(hasNanOrInf(rocm_fp32.data(), num_elements)) << "ROCm output contains NaN/Inf";
+        EXPECT_FALSE(hasNanOrInf(cuda_fp32.data(), num_elements)) << "CUDA output contains NaN/Inf";
 
-        double cosine = cosineSimilarity(rocm_fp32.data(), cpu_fp32.data(), num_elements);
-        double rel_error = relativeL2Error(rocm_fp32.data(), cpu_fp32.data(), num_elements);
+        double cosine = cosineSimilarity(cuda_fp32.data(), cpu_fp32.data(), num_elements);
+        double rel_error = relativeL2Error(cuda_fp32.data(), cpu_fp32.data(), num_elements);
 
         std::cout << "[FP16_SmallTensor] Cosine similarity: " << std::fixed << std::setprecision(6) << cosine
                   << ", Relative L2 error: " << std::scientific << rel_error << std::endl;
@@ -438,7 +438,7 @@ namespace
         freeGpu(d_output);
     }
 
-    TEST_F(ROCmResidualAddParityTest, FP16_LargeTensor)
+    TEST_F(CUDAResidualAddParityTest, FP16_LargeTensor)
     {
         const int rows = 32;
         const int cols = 896;
@@ -447,7 +447,7 @@ namespace
         auto input_fp16 = TestTensorFactory::createFP16Random({rows, cols}, -1.0f, 1.0f);
         auto residual_fp16 = TestTensorFactory::createFP16Random({rows, cols}, -1.0f, 1.0f);
         auto cpu_output_fp16 = TestTensorFactory::createFP16({rows, cols});
-        auto rocm_output_fp16 = TestTensorFactory::createFP16({rows, cols});
+        auto cuda_output_fp16 = TestTensorFactory::createFP16({rows, cols});
 
         llaminar2::CPUResidualAddKernelT<ActivationPrecision::FP16> cpu_kernel;
         ASSERT_TRUE(cpu_kernel.apply_fp16(
@@ -461,24 +461,24 @@ namespace
         copyToGpu(d_input, input_fp16->typed_data(), num_elements);
         copyToGpu(d_residual, residual_fp16->typed_data(), num_elements);
 
-        llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP16> rocm_kernel;
-        ASSERT_TRUE(rocm_kernel.apply_fp16(d_input, d_residual, d_output, num_elements, nullptr, 0));
+        llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::FP16> cuda_kernel;
+        ASSERT_TRUE(cuda_kernel.apply_fp16(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
-        copyFromGpu(rocm_output_fp16->mutable_typed_data(), d_output, num_elements);
+        cudaDeviceSynchronize();
+        copyFromGpu(cuda_output_fp16->mutable_typed_data(), d_output, num_elements);
 
         std::vector<float> cpu_fp32(num_elements);
-        std::vector<float> rocm_fp32(num_elements);
+        std::vector<float> cuda_fp32(num_elements);
         for (size_t i = 0; i < num_elements; ++i)
         {
             cpu_fp32[i] = cpu_output_fp16->fp32_data()[i];
-            rocm_fp32[i] = rocm_output_fp16->fp32_data()[i];
+            cuda_fp32[i] = cuda_output_fp16->fp32_data()[i];
         }
 
-        EXPECT_FALSE(hasNanOrInf(rocm_fp32.data(), num_elements)) << "ROCm output contains NaN/Inf";
+        EXPECT_FALSE(hasNanOrInf(cuda_fp32.data(), num_elements)) << "CUDA output contains NaN/Inf";
 
-        double cosine = cosineSimilarity(rocm_fp32.data(), cpu_fp32.data(), num_elements);
-        double rel_error = relativeL2Error(rocm_fp32.data(), cpu_fp32.data(), num_elements);
+        double cosine = cosineSimilarity(cuda_fp32.data(), cpu_fp32.data(), num_elements);
+        double rel_error = relativeL2Error(cuda_fp32.data(), cpu_fp32.data(), num_elements);
 
         std::cout << "[FP16_LargeTensor] Cosine similarity: " << std::fixed << std::setprecision(6) << cosine
                   << ", Relative L2 error: " << std::scientific << rel_error << std::endl;
@@ -499,7 +499,7 @@ namespace
     // tests might pass while apply_tensor() has bugs (e.g., using data() instead
     // of active_data_ptr() for GPU tensors).
 
-    TEST_F(ROCmResidualAddParityTest, FP32_ApplyTensor_SmallTensor)
+    TEST_F(CUDAResidualAddParityTest, FP32_ApplyTensor_SmallTensor)
     {
         const int rows = 4;
         const int cols = 64;
@@ -509,7 +509,7 @@ namespace
         auto input = TestTensorFactory::createFP32Random({rows, cols}, -1.0f, 1.0f);
         auto residual = TestTensorFactory::createFP32Random({rows, cols}, -1.0f, 1.0f);
         auto cpu_output = TestTensorFactory::createFP32({rows, cols});
-        auto rocm_output = TestTensorFactory::createFP32({rows, cols});
+        auto cuda_output = TestTensorFactory::createFP32({rows, cols});
 
         // CPU reference using raw apply()
         llaminar2::CPUResidualAddKernelT<ActivationPrecision::FP32> cpu_kernel;
@@ -518,24 +518,24 @@ namespace
             num_elements, nullptr, -1));
 
         // Upload tensors to GPU using ensureOnDevice (as the pipeline does)
-        DeviceId rocm_device = DeviceId::rocm(0);
-        ASSERT_TRUE(input->ensureOnDevice(rocm_device));
-        ASSERT_TRUE(residual->ensureOnDevice(rocm_device));
-        ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device));
+        DeviceId cuda_device = DeviceId::cuda(0);
+        ASSERT_TRUE(input->ensureOnDevice(cuda_device));
+        ASSERT_TRUE(residual->ensureOnDevice(cuda_device));
+        ASSERT_TRUE(cuda_output->ensureOnDevice(cuda_device));
 
-        // ROCm kernel using apply_tensor() API (what the pipeline actually uses)
-        llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP32> rocm_kernel;
-        ASSERT_TRUE(rocm_kernel.apply_tensor(
-            input.get(), residual.get(), rocm_output.get(),
+        // CUDA kernel using apply_tensor() API (what the pipeline actually uses)
+        llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::FP32> cuda_kernel;
+        ASSERT_TRUE(cuda_kernel.apply_tensor(
+            input.get(), residual.get(), cuda_output.get(),
             num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        cudaDeviceSynchronize();
 
         // Mark output dirty and sync back to host
-        rocm_output->mark_device_dirty();
-        const float *result = rocm_output->data(); // This syncs GPU→host
+        cuda_output->mark_device_dirty();
+        const float *result = cuda_output->data(); // This syncs GPU→host
 
-        EXPECT_FALSE(hasNanOrInf(result, num_elements)) << "ROCm output contains NaN/Inf";
+        EXPECT_FALSE(hasNanOrInf(result, num_elements)) << "CUDA output contains NaN/Inf";
 
         double cosine = cosineSimilarity(result, cpu_output->data(), num_elements);
         double rel_error = relativeL2Error(result, cpu_output->data(), num_elements);
@@ -547,7 +547,7 @@ namespace
         EXPECT_LE(rel_error, 0.001) << "Relative L2 error too high";
     }
 
-    TEST_F(ROCmResidualAddParityTest, FP32_ApplyTensor_LargeTensor)
+    TEST_F(CUDAResidualAddParityTest, FP32_ApplyTensor_LargeTensor)
     {
         const int rows = 32;
         const int cols = 896;
@@ -556,28 +556,28 @@ namespace
         auto input = TestTensorFactory::createFP32Random({rows, cols}, -1.0f, 1.0f);
         auto residual = TestTensorFactory::createFP32Random({rows, cols}, -1.0f, 1.0f);
         auto cpu_output = TestTensorFactory::createFP32({rows, cols});
-        auto rocm_output = TestTensorFactory::createFP32({rows, cols});
+        auto cuda_output = TestTensorFactory::createFP32({rows, cols});
 
         llaminar2::CPUResidualAddKernelT<ActivationPrecision::FP32> cpu_kernel;
         ASSERT_TRUE(cpu_kernel.apply(
             input->data(), residual->data(), cpu_output->mutable_data(),
             num_elements, nullptr, -1));
 
-        DeviceId rocm_device = DeviceId::rocm(0);
-        ASSERT_TRUE(input->ensureOnDevice(rocm_device));
-        ASSERT_TRUE(residual->ensureOnDevice(rocm_device));
-        ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device));
+        DeviceId cuda_device = DeviceId::cuda(0);
+        ASSERT_TRUE(input->ensureOnDevice(cuda_device));
+        ASSERT_TRUE(residual->ensureOnDevice(cuda_device));
+        ASSERT_TRUE(cuda_output->ensureOnDevice(cuda_device));
 
-        llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP32> rocm_kernel;
-        ASSERT_TRUE(rocm_kernel.apply_tensor(
-            input.get(), residual.get(), rocm_output.get(),
+        llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::FP32> cuda_kernel;
+        ASSERT_TRUE(cuda_kernel.apply_tensor(
+            input.get(), residual.get(), cuda_output.get(),
             num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
-        rocm_output->mark_device_dirty();
-        const float *result = rocm_output->data();
+        cudaDeviceSynchronize();
+        cuda_output->mark_device_dirty();
+        const float *result = cuda_output->data();
 
-        EXPECT_FALSE(hasNanOrInf(result, num_elements)) << "ROCm output contains NaN/Inf";
+        EXPECT_FALSE(hasNanOrInf(result, num_elements)) << "CUDA output contains NaN/Inf";
 
         double cosine = cosineSimilarity(result, cpu_output->data(), num_elements);
         double rel_error = relativeL2Error(result, cpu_output->data(), num_elements);
@@ -589,6 +589,6 @@ namespace
         EXPECT_LE(rel_error, 0.001) << "Relative L2 error too high";
     }
 
-#endif // HAVE_ROCM
+#endif // HAVE_CUDA
 
 } // anonymous namespace

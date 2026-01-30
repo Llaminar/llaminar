@@ -2983,22 +2983,49 @@ namespace llaminar
                     return getOrCreateGemm(tensor);
                 }
 
+                // Get the target ordinal from thread-local storage (set by ROCmOrdinalGuard/CUDAOrdinalGuard)
+                // This is critical for multi-GPU correctness: each GPU has separate memory and kernels
+                // packed on one GPU cannot be used on another.
+                int target_ordinal = 0;
+#ifdef HAVE_ROCM
+                if (target_device == DeviceType::ROCm && tl_target_rocm_ordinal.has_value())
+                {
+                    target_ordinal = tl_target_rocm_ordinal.value();
+                }
+#endif
+#ifdef HAVE_CUDA
+                if (target_device == DeviceType::CUDA && tl_target_cuda_ordinal.has_value())
+                {
+                    target_ordinal = tl_target_cuda_ordinal.value();
+                }
+#endif
+                // If ordinal not set via guard, try to get from tensor's current device
+                if (target_ordinal == 0)
+                {
+                    auto current_dev = tensor->current_device();
+                    if (current_dev.has_value() && current_dev->is_gpu())
+                    {
+                        target_ordinal = current_dev->gpu_ordinal();
+                    }
+                }
+
                 std::lock_guard<std::mutex> lock(cache_mutex_);
 
-                // Check device-targeted cache first
-                DeviceTargetedCacheKey key{tensor, target_device};
+                // Check device-targeted cache first (now includes ordinal for per-GPU caching)
+                DeviceTargetedCacheKey key{tensor, target_device, target_ordinal};
                 auto it = device_targeted_cache_.find(key);
                 if (it != device_targeted_cache_.end())
                 {
                     LOG_DEBUG("[KernelFactory::getOrCreateGemm(tensor,device)] Cache hit: tensor="
                               << (void *)tensor << " device=" << static_cast<int>(target_device)
+                              << " ordinal=" << target_ordinal
                               << " returning kernel=" << (void *)it->second.get());
                     return it->second.get();
                 }
 
                 LOG_DEBUG("[KernelFactory::getOrCreateGemm(tensor,device)] Cache miss: tensor="
                           << (void *)tensor << " shape=" << tensor->shape()[0] << "x" << tensor->shape()[1]
-                          << " device=" << static_cast<int>(target_device));
+                          << " device=" << static_cast<int>(target_device) << " ordinal=" << target_ordinal);
 
                 // Get tensor dimensions for validation
                 const auto &shape = tensor->shape();
@@ -3093,7 +3120,8 @@ namespace llaminar
                 auto *raw_ptr = kernel.get();
                 device_targeted_cache_[key] = std::move(kernel);
                 LOG_DEBUG("[KernelFactory] Cached device-targeted kernel: tensor="
-                          << static_cast<const void *>(tensor) << " device=" << static_cast<int>(target_device));
+                          << static_cast<const void *>(tensor) << " device=" << static_cast<int>(target_device)
+                          << " ordinal=" << target_ordinal);
                 return raw_ptr;
             }
 
@@ -3516,7 +3544,22 @@ namespace llaminar
                 const llaminar2::TensorBase *wv,
                 DeviceType dev_type)
             {
-                FusedQKVCacheKey key{wq, wk, wv, dev_type};
+                // Get ordinal from thread-local (for future GPU support) or default to 0 for CPU
+                int target_ordinal = 0;
+#ifdef HAVE_ROCM
+                if (dev_type == DeviceType::ROCm && tl_target_rocm_ordinal.has_value())
+                {
+                    target_ordinal = tl_target_rocm_ordinal.value();
+                }
+#endif
+#ifdef HAVE_CUDA
+                if (dev_type == DeviceType::CUDA && tl_target_cuda_ordinal.has_value())
+                {
+                    target_ordinal = tl_target_cuda_ordinal.value();
+                }
+#endif
+
+                FusedQKVCacheKey key{wq, wk, wv, dev_type, target_ordinal};
 
                 // Check cache with lock held
                 {

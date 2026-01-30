@@ -1048,6 +1048,25 @@ FetchContent_MakeAvailable(ftxui)
 message(STATUS "V2: FTXUI v5.0.0 configured for interactive chat UI")
 
 # =============================================================================
+# libfort Integration (for formatted ASCII/Unicode tables in test output)
+# =============================================================================
+# Set policy compatibility for libfort's older CMakeLists.txt
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+FetchContent_Declare(libfort
+    GIT_REPOSITORY https://github.com/seleznevae/libfort
+    GIT_TAG v0.4.2
+    GIT_SHALLOW TRUE
+)
+
+# Disable libfort tests and examples
+set(FORT_ENABLE_TESTING OFF CACHE BOOL "Disable libfort tests" FORCE)
+
+FetchContent_MakeAvailable(libfort)
+# Reset policy version
+unset(CMAKE_POLICY_VERSION_MINIMUM)
+message(STATUS "V2: libfort v0.4.2 configured for formatted table output")
+
+# =============================================================================
 # Typed Register Enforcement (JIT Code Quality)
 # =============================================================================
 # Enforce that JIT code uses the typed register system (RegisterGuard.h)
@@ -1347,6 +1366,7 @@ target_link_libraries(llaminar2_core PUBLIC
     ftxui::screen
     ftxui::dom
     ftxui::component
+    fort
 )
 
 # OneDNN for INT8 GEMM acceleration

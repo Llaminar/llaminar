@@ -1404,12 +1404,14 @@ namespace llaminar2
                 {"_k_rope", "_K_ROPE"},
                 {"_attention", "_ATTENTION_CONTEXT"}, // Graph uses "attention" not "attn_compute"
                 {"_wo_proj", "_ATTENTION_OUTPUT"},    // Graph uses "wo_proj" not "attn_proj"
+                {"_wo_allreduce", "_ATTENTION_OUTPUT"}, // LOCAL TP: allreduce overwrites partial Wo result
                 {"_attn_residual", "_ATTENTION_RESIDUAL"},
                 {"_ffn_norm", "_FFN_NORM"},
                 {"_ffn_gate", "_FFN_GATE"},
                 {"_ffn_up", "_FFN_UP"},
                 {"_swiglu", "_FFN_SWIGLU"},
                 {"_down_proj", "_FFN_DOWN"}, // Graph uses "down_proj" not "ffn_down"
+                {"_down_allreduce", "_FFN_DOWN"}, // LOCAL TP: allreduce overwrites partial down_proj result
                 {"_ffn_residual", "_FFN_RESIDUAL"},
             };
 
