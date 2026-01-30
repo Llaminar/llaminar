@@ -12,10 +12,10 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
-#include "execution/InferenceRunnerFactory.h"
-#include "execution/MultiDeviceOrchestrator.h"
-#include "execution/DeviceGraphOrchestrator.h"
-#include "interfaces/IMultiDeviceOrchestrator.h"
+#include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "execution/local_execution/orchestrators/IMultiDeviceOrchestrator.h"
 #include "collective/ILocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "mocks/MockModelContext.h"

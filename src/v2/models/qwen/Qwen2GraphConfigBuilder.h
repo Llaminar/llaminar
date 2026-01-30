@@ -16,7 +16,7 @@
 #pragma once
 
 #include "../IGraphConfigBuilder.h"
-#include "../../execution/LayerDevicePlacement.h"
+#include "../../execution/local_execution/device/LayerDevicePlacement.h"
 #include <memory>
 
 namespace llaminar2

@@ -9,7 +9,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/DeviceGraphOrchestrator.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include <vector>
 #include <string>
 #include <algorithm>

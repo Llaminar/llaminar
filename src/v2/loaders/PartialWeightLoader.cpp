@@ -14,7 +14,7 @@
 #include "IPartialWeightLoader.h"
 #include "WeightManager.h"
 #include "ModelContext.h"
-#include "../execution/IExecutionPlanBuilder.h"
+#include "../execution/mpi_orchestration/IExecutionPlanBuilder.h"
 #include "../utils/Logger.h"
 #include <sstream>
 

@@ -15,7 +15,7 @@
 
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
-#include "execution/CollectiveContext.h"
+#include "execution/local_execution/collective/CollectiveContext.h"
 #include "collective/test/CollectiveTestMocks.h"
 #include "config/TPDomain.h"
 #include "tensors/TensorClasses.h"

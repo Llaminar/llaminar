@@ -23,7 +23,7 @@
 
 // Include project headers BEFORE CUDATestUtils.h
 #include "tensors/Tensors.h"
-#include "execution/RuntimeConfig.h"
+#include "execution/config/RuntimeConfig.h"
 
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"

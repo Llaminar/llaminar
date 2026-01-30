@@ -11,7 +11,7 @@
 
 #include <gtest/gtest.h>
 
-#include "execution/CrossDomainTransfer.h"
+#include "execution/local_execution/coherence/CrossDomainTransfer.h"
 #include "tensors/TensorClasses.h"
 #include "backends/DeviceId.h"
 #include "backends/ComputeBackend.h"

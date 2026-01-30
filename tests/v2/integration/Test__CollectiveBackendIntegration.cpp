@@ -28,10 +28,10 @@
 #include <random>
 #include <numeric>
 
-#include "execution/CollectiveContext.h"
-#include "execution/GraphExecutor.h"
-#include "execution/DeviceInventory.h"
-#include "execution/DeviceContext.h"
+#include "execution/local_execution/collective/CollectiveContext.h"
+#include "execution/local_execution/graph/GraphExecutor.h"
+#include "execution/mpi_orchestration/DeviceInventory.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #include "execution/compute_stages/stages/AllreduceStage.h"
 #include "collective/BackendRouter.h"
 #include "collective/ICollectiveBackend.h"

@@ -24,7 +24,7 @@
 #include <hip/hip_bfloat16.h>
 #include "kernels/rocm/kvcache/ROCmRingKVCache.h"
 #include "kernels/rocm/kvcache/ROCmRingKVCacheFactory.h"
-#include "execution/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "backends/DeviceId.h"
 #include "utils/Logger.h"
 

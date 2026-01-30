@@ -18,8 +18,8 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KernelProfiler.h"
-#include "../../../execution/WorkspaceDescriptor.h"
-#include "../../../execution/DeviceWorkspaceManager.h"
+#include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include <hip/hip_runtime.h>
 #include <cmath>
 #include <mutex>

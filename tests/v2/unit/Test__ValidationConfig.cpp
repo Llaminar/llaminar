@@ -15,9 +15,9 @@
 #include <gtest/gtest.h>
 #include "utils/DebugEnv.h"
 #include "utils/Assertions.h" // For LLAMINAR_ASSERTIONS_ACTIVE
-#include "execution/GraphExecutor.h"
+#include "execution/local_execution/graph/GraphExecutor.h"
 #include "execution/compute_stages/ComputeStages.h"
-#include "execution/DeviceContext.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorVerification.h" // For VerificationFailure exception
 #include <cmath>

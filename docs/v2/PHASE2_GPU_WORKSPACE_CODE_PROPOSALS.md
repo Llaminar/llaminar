@@ -317,7 +317,7 @@ Add at the top with other includes (around line 55):
 #include "utils/Logger.h"
 
 // ADD THIS:
-#include "execution/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 ```
 
 ### 3.2 Implement IWorkspaceConsumer Methods
@@ -796,7 +796,7 @@ Add at the top with other includes (around line 35):
 #include "utils/Logger.h"
 
 // ADD THIS:
-#include "execution/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 ```
 
 ### 5.2 Implement IWorkspaceConsumer Methods

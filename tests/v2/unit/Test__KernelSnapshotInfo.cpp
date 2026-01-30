@@ -12,7 +12,7 @@
 #include <gtest/gtest.h>
 #include "tensors/KernelSnapshotInfo.h"
 #include "tensors/TensorKernels.h"
-#include "execution/RuntimeConfig.h"
+#include "execution/config/RuntimeConfig.h"
 
 // Kernel implementations
 #include "kernels/cpu/ops/CPURMSNormKernelT.h"

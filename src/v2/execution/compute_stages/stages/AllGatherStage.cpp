@@ -9,7 +9,7 @@
 
 #include "AllGatherStage.h"
 #include "../ComputeStageUtils.h"
-#include "../../../execution/CollectiveContext.h"
+#include "../../../execution/local_execution/collective/CollectiveContext.h"
 #include "../../../collective/ICollectiveBackend.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"

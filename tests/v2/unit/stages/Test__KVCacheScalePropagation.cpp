@@ -13,9 +13,9 @@
 
 #include <gtest/gtest.h>
 
-#include "execution/GraphSchema.h"
-#include "execution/RuntimeConfig.h"
-#include "execution/InferenceRunnerFactory.h"
+#include "execution/local_execution/graph/GraphSchema.h"
+#include "execution/config/RuntimeConfig.h"
+#include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
 #include "models/qwen/Qwen2Schema.h"
 #include "models/qwen/Qwen2Graph.h"

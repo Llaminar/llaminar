@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
 #include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
-#include "execution/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "backends/DeviceId.h"
 #include <vector>
 #include <random>

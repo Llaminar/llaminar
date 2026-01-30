@@ -14,7 +14,7 @@
 #include <gtest/gtest.h>
 #include "execution/compute_stages/stages/GEMMStage.h"
 #include "execution/compute_stages/IWorkspaceConsumerStage.h"
-#include "execution/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "tensors/Tensors.h"
 #include "backends/DeviceId.h"

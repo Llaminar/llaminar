@@ -25,8 +25,8 @@
 
 #include "../tensors/Tensors.h"
 #include "../tensors/TensorKernels.h"
-#include "../execution/DeviceContext.h"
-#include "../execution/DeviceWorkspaceManager.h"
+#include "../execution/local_execution/device/DeviceContext.h"
+#include "../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../interfaces/IWorkspaceConsumer.h"
 #include "../backends/ComputeBackend.h"
 #include "../utils/Logger.h"

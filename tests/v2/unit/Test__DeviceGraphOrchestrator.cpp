@@ -10,12 +10,12 @@
 
 #include <gtest/gtest.h>
 #include "../../../src/v2/backends/DeviceId.h"
-#include "../../../src/v2/execution/CollectiveContext.h"
-#include "../../../src/v2/execution/DeviceGraphOrchestrator.h"
-#include "../../../src/v2/execution/GraphExecutor.h"
-#include "../../../src/v2/execution/RuntimeConfig.h"
-#include "../../../src/v2/execution/WorkspaceDescriptor.h"
-#include "../../../src/v2/execution/DeviceWorkspaceManager.h"
+#include "../../../src/v2/execution/local_execution/collective/CollectiveContext.h"
+#include "../../../src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "../../../src/v2/execution/local_execution/graph/GraphExecutor.h"
+#include "../../../src/v2/execution/config/RuntimeConfig.h"
+#include "../../../src/v2/execution/local_execution/device/WorkspaceDescriptor.h"
+#include "../../../src/v2/execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../src/v2/execution/compute_stages/IComputeStage.h"
 #include "../../../src/v2/interfaces/IWorkspaceConsumer.h"
 #include "../../../src/v2/models/qwen/Qwen2Graph.h"

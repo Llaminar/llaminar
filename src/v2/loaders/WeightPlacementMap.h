@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include "../interfaces/IWeightPlacementMap.h"
+#include "IWeightPlacementMap.h"
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -271,9 +271,9 @@ namespace llaminar2
         std::unordered_map<std::string, DeviceId> local_expert_to_device_; ///< "layer_X:expert_Y" → device
 
         // Phase-aware decode placement (CPU participation)
-        std::vector<std::vector<DeviceId>> layer_decode_devices_;     ///< Layer index → decode devices
-        std::vector<std::vector<float>> layer_decode_fractions_;      ///< Layer index → decode fractions
-        std::vector<bool> layer_cpu_participates_;                    ///< Layer index → CPU participates in decode
+        std::vector<std::vector<DeviceId>> layer_decode_devices_; ///< Layer index → decode devices
+        std::vector<std::vector<float>> layer_decode_fractions_;  ///< Layer index → decode fractions
+        std::vector<bool> layer_cpu_participates_;                ///< Layer index → CPU participates in decode
 
         // PlacementPlan tracking
         bool plan_applied_ = false;         ///< Whether applyPlan() has been called

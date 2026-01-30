@@ -34,7 +34,7 @@
 
 #include "ICollectiveBackend.h"
 #include "DeviceGroup.h"
-#include "../execution/DeviceInventory.h"
+#include "../execution/mpi_orchestration/DeviceInventory.h"
 #include "../utils/MPIContext.h"
 #include <algorithm>
 #include <memory>

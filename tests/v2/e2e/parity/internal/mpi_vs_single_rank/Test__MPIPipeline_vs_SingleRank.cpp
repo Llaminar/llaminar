@@ -38,8 +38,8 @@
 #include <cstring>
 
 #include "../../../../src/v2/loaders/ModelContext.h"
-#include "../../../../src/v2/execution/InferenceRunnerFactory.h"
-#include "../../../../src/v2/execution/IInferenceRunner.h"
+#include "../../../../src/v2/execution/factory/InferenceRunnerFactory.h"
+#include "../../../../src/v2/execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "../../../../src/v2/backends/ComputeBackend.h"
 #include "../../../../src/v2/backends/DeviceId.h"
 #include "../../../../src/v2/utils/MPIContext.h"

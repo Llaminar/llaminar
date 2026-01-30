@@ -10,7 +10,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/DeviceGraphOrchestrator.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "config/TPDomain.h"
 #include "backends/DeviceId.h"
 #include "utils/MPIContext.h"

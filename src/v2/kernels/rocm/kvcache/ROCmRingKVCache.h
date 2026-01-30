@@ -33,9 +33,9 @@
 #pragma once
 
 // Minimal includes - avoid MPI headers for hipcc compatibility
-#include "../../IKVCache.h"                         // Unified KVCache interface (src/v2/kernels/IKVCache.h)
-#include "../../../execution/RuntimeConfig.h"       // For ActivationPrecision
-#include "../../../interfaces/IWorkspaceConsumer.h" // Workspace management
+#include "../../IKVCache.h"                          // Unified KVCache interface (src/v2/kernels/IKVCache.h)
+#include "../../../execution/config/RuntimeConfig.h" // For ActivationPrecision
+#include "../../../interfaces/IWorkspaceConsumer.h"  // Workspace management
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>

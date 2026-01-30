@@ -24,10 +24,10 @@
 
 #pragma once
 
-#include "../interfaces/IModelLoader.h" // Interface
+#include "IModelLoader.h" // Interface
 #include "../backends/DeviceId.h"
-#include "../execution/RuntimeConfig.h" // for WeightPrecision
-#include "../tensors/TensorFactory.h"   // for owned_factory_
+#include "../execution/config/RuntimeConfig.h" // for WeightPrecision
+#include "../tensors/TensorFactory.h"          // for owned_factory_
 #include <cstdint>
 #include <fstream>
 #include <map>

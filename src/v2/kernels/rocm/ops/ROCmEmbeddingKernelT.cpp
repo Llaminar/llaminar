@@ -7,7 +7,7 @@
 #include "utils/Logger.h"
 #include "utils/KernelProfiler.h"
 #include "../../../tensors/TensorClasses.h"
-#include "../../../execution/DeviceWorkspaceManager.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 
 #include <hip/hip_runtime.h>
 
@@ -306,7 +306,7 @@ namespace llaminar2
                 s_workspace_embed_cache_[workspace_] = embed_table;
                 LOG_INFO("[ROCmEmbeddingKernelT] Uploaded dequantized embedding table: "
                          << vocab_size << "x" << embed_dim << " (" << embed_bytes / (1024 * 1024) << " MB)"
-                         << " workspace=" << static_cast<void*>(workspace_));
+                         << " workspace=" << static_cast<void *>(workspace_));
             }
             // else: embedding already uploaded to workspace buffer, reuse d_embed
         }

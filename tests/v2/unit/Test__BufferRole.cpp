@@ -6,7 +6,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/BufferRole.h"
+#include "execution/debug/BufferRole.h"
 #include "backends/DeviceId.h"
 
 using namespace llaminar2;

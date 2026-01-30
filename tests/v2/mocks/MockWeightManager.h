@@ -14,10 +14,10 @@
 
 #pragma once
 
-#include "interfaces/IWeightManager.h"
-#include "loaders/WeightManager.h"       // For ShardingMode and WeightDistributionStrategy enums
-#include "execution/GraphSchema.h"       // For WeightShardingConfig
-#include "config/TensorParallelConfig.h" // For TensorParallelConfig (LOCAL TP support)
+#include "loaders/IWeightManager.h"
+#include "loaders/WeightManager.h"                       // For ShardingMode and WeightDistributionStrategy enums
+#include "execution/local_execution/graph/GraphSchema.h" // For WeightShardingConfig
+#include "config/TensorParallelConfig.h"                 // For TensorParallelConfig (LOCAL TP support)
 #include "tensors/Tensors.h"
 #include "tensors/FP16Utils.h" // For fp32_to_fp16
 #include "backends/DeviceId.h"

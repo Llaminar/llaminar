@@ -9,7 +9,7 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../tensors/SIMDHelpers.h"
-#include "../../../execution/DeviceContext.h"
+#include "../../local_execution/device/DeviceContext.h"
 #include "../../../kernels/KernelFactory.h"
 
 namespace llaminar2

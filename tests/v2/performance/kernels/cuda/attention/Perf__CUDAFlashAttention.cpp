@@ -28,7 +28,7 @@
 
 // Include project headers BEFORE CUDATestUtils.h
 #include "tensors/Tensors.h"
-#include "execution/RuntimeConfig.h"
+#include "execution/config/RuntimeConfig.h"
 #include "utils/MPIContext.h"
 #include "backends/cuda/CUDABackend.h"
 #include "kernels/cuda/attention/CUDAFlashAttentionKernelT.h"

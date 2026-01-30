@@ -9,7 +9,7 @@
 #include "Tensors.h"
 #include "../backends/DeviceId.h"
 #include "../utils/MPIContext.h"
-#include "../execution/RuntimeConfig.h"
+#include "../execution/config/RuntimeConfig.h"
 #include <memory>
 #include <vector>
 #include <cstddef>
@@ -270,9 +270,9 @@ namespace llaminar2
 
     private:
         int mpi_rank_;
-        int numa_node_;                          // NUMA node for this rank
-        bool use_mapped_memory_for_gpu_ = false; // When true, FP32 GPU tensors use zero-copy mapped memory
-        std::shared_ptr<DirectP2PEngine> direct_p2p_;  // For BAR-backed tensor allocation
+        int numa_node_;                               // NUMA node for this rank
+        bool use_mapped_memory_for_gpu_ = false;      // When true, FP32 GPU tensors use zero-copy mapped memory
+        std::shared_ptr<DirectP2PEngine> direct_p2p_; // For BAR-backed tensor allocation
 
         /**
          * @brief Bind current thread to NUMA node

@@ -19,8 +19,8 @@
 #include "utils/MPITopology.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
-#include "execution/PlacementStrategy.h"
-#include "execution/PlacementPlan.h"
+#include "execution/mpi_orchestration/PlacementStrategy.h"
+#include "execution/mpi_orchestration/PlacementPlan.h"
 #include "tensors/TensorSlice.h"
 
 using namespace llaminar2;

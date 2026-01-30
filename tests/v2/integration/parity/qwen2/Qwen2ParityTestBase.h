@@ -26,7 +26,7 @@
 
 #include "../ParityTestBase.h"
 #include "models/qwen/Qwen2Schema.h"
-#include "execution/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
 #include "collective/ILocalTPContext.h"
 #include "collective/LocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"

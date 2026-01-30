@@ -25,7 +25,7 @@
 
 #include "kernels/rocm/ROCmQuantisedGemmKernel.h"
 #include "kernels/KernelFactory.h"
-#include "execution/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
 #include "../utils/TestTensorFactory.h"
 #include "utils/Logger.h"

@@ -9,9 +9,9 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../src/v2/execution/GraphBufferManager.h"
-#include "../../../src/v2/execution/GraphExecutor.h"
-#include "../../../src/v2/execution/CollectiveContext.h"
+#include "../../../src/v2/execution/local_execution/graph/GraphBufferManager.h"
+#include "../../../src/v2/execution/local_execution/graph/GraphExecutor.h"
+#include "../../../src/v2/execution/local_execution/collective/CollectiveContext.h"
 #include "../../../src/v2/backends/BackendManager.h"
 #include "execution/compute_stages/ComputeStages.h"
 #include "../../../src/v2/tensors/TensorFactory.h"

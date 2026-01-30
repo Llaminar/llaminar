@@ -19,8 +19,8 @@
 
 #pragma once
 
-#include "../../../execution/DeviceWorkspaceManager.h"
-#include "../../../execution/RuntimeConfig.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../../execution/config/RuntimeConfig.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h" // For FP32Tensor, BF16Tensor, FP16Tensor

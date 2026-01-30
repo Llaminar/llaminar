@@ -69,9 +69,9 @@
 
 #pragma once
 
-#include "../backends/DeviceType.h"     // Shared DeviceType enum
-#include "../backends/DeviceId.h"       // Type-safe device identification
-#include "../execution/RuntimeConfig.h" // ActivationPrecision
+#include "../backends/DeviceType.h"            // Shared DeviceType enum
+#include "../backends/DeviceId.h"              // Type-safe device identification
+#include "../execution/config/RuntimeConfig.h" // ActivationPrecision
 #include <memory>
 #include <stdexcept>
 #include <string>

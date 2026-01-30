@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include "interfaces/IMultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/IMultiDeviceOrchestrator.h"
 #include "collective/ILocalTPContext.h"
 #include <vector>
 #include <memory>

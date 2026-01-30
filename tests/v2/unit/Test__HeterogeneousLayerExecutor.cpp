@@ -11,8 +11,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/HeterogeneousLayerExecutor.h"
-#include "execution/GraphExecutor.h"
+#include "execution/local_execution/model/HeterogeneousLayerExecutor.h"
+#include "execution/local_execution/graph/GraphExecutor.h"
 #include "config/LayerPlacementConfig.h"
 #include "config/TPDomain.h"
 

@@ -18,7 +18,7 @@
 
 // Include project headers BEFORE CUDATestUtils.h (provides include paths)
 #include "backends/ComputeBackend.h" // DeviceManager
-#include "execution/DeviceContext.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
 #include "kernels/cuda/CuBLASGemmKernel.h"

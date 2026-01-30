@@ -29,7 +29,7 @@
 #include <memory>
 #include <functional>
 #include "../interfaces/IMPITopology.h"
-#include "../execution/DeviceInventory.h"
+#include "../execution/mpi_orchestration/DeviceInventory.h"
 
 namespace llaminar2
 {

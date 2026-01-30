@@ -12,8 +12,8 @@
 #include <gtest/gtest.h>
 #include <cstring>
 
-#include "execution/DeviceWorkspaceManager.h"
-#include "execution/WorkspaceDescriptor.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "backends/BackendManager.h"
 

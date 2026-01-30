@@ -18,7 +18,7 @@
 
 #pragma once
 
-#include "../../../execution/RuntimeConfig.h"
+#include "../../../execution/config/RuntimeConfig.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"

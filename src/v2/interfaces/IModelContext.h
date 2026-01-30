@@ -13,8 +13,8 @@
 
 #pragma once
 
-#include "IModelLoader.h"
-#include "IWeightManager.h"
+#include "../loaders/IModelLoader.h"
+#include "../loaders/IWeightManager.h"
 #include <memory>
 #include <string>
 

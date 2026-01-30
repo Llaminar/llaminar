@@ -13,7 +13,7 @@
 #include "ChatTemplate.h"
 #include "Tokenizer.h"
 #include "Sampler.h"
-#include "../execution/IInferenceRunner.h"
+#include "../execution/local_execution/orchestrators/IInferenceRunner.h"
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>

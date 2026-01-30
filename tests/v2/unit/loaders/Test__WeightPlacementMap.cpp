@@ -7,7 +7,7 @@
 
 #include "../../../../src/v2/loaders/WeightPlacementMap.h"
 #include "../../../../src/v2/backends/DeviceId.h"
-#include "../../../../src/v2/execution/PlacementPlan.h"
+#include "../../../../src/v2/execution/mpi_orchestration/PlacementPlan.h"
 #include <gtest/gtest.h>
 #include <memory>
 

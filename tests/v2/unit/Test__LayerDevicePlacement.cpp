@@ -14,7 +14,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/LayerDevicePlacement.h"
+#include "execution/local_execution/device/LayerDevicePlacement.h"
 #include "backends/GlobalDeviceAddress.h"
 
 using namespace llaminar2;

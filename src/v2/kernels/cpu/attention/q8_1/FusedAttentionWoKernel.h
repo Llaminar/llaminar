@@ -33,7 +33,7 @@
 #include <cmath>
 #include <array>
 #include <mutex>
-#include "execution/RuntimeConfig.h" // For FusedAttentionBackend enum
+#include "execution/config/RuntimeConfig.h" // For FusedAttentionBackend enum
 
 namespace llaminar2
 {

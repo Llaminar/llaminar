@@ -20,7 +20,7 @@
 
 #include "execution/compute_stages/stages/AllreduceStage.h"
 #include "execution/compute_stages/stages/AllGatherStage.h"
-#include "execution/CollectiveContext.h"
+#include "execution/local_execution/collective/CollectiveContext.h"
 #include "collective/test/CollectiveTestMocks.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"

@@ -6,8 +6,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/LayerExecutor.h"
-#include "execution/DeviceContext.h"
+#include "execution/local_execution/model/LayerExecutor.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #include "tensors/Tensors.h"
 #include <cmath>
 #include <vector>

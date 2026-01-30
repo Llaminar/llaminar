@@ -20,7 +20,7 @@
 // Include project headers BEFORE CUDATestUtils.h (provides include paths)
 #include "tensors/Tensors.h"
 #include "backends/ComputeBackend.h" // DeviceManager
-#include "execution/DeviceContext.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
 #endif

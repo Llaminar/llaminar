@@ -6,8 +6,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/HybridPrecisionConfig.h"
-#include "execution/RuntimeConfig.h"
+#include "execution/config/HybridPrecisionConfig.h"
+#include "execution/config/RuntimeConfig.h"
 
 namespace llaminar2
 {

@@ -19,7 +19,7 @@
 #include <random>
 
 #include "execution/compute_stages/stages/ResidualAddStage.h"
-#include "execution/DeviceContext.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #include "tensors/Tensors.h"
 
 namespace llaminar2::test

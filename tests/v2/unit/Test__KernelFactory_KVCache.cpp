@@ -14,7 +14,7 @@
 #include "../../../src/v2/kernels/cpu/CPUKVCache.h"
 #include "../../../src/v2/utils/MPIContext.h"
 #include "../../../src/v2/backends/DeviceId.h"
-#include "../../../src/v2/execution/RuntimeConfig.h"
+#include "../../../src/v2/execution/config/RuntimeConfig.h"
 
 using namespace llaminar::v2::kernels;
 using namespace llaminar2;

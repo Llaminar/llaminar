@@ -13,7 +13,7 @@
 #include <set>
 #include <cstring>
 
-#include "execution/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "backends/BackendManager.h"
 
 using namespace llaminar2;
@@ -430,10 +430,10 @@ TEST_F(Test__DeviceWorkspaceManager, MixedRequiredOptional)
     DeviceWorkspaceManager mgr(device, budget);
 
     WorkspaceRequirements reqs;
-    reqs.buffers.push_back({"req1", 512, 256, true});      // Required, fits
-    reqs.buffers.push_back({"opt1", 512, 256, false});     // Optional, fits
-    reqs.buffers.push_back({"req2", 256, 256, true});      // Required, fits
-    reqs.buffers.push_back({"opt2", 10000, 256, false});   // Optional, too big
+    reqs.buffers.push_back({"req1", 512, 256, true});    // Required, fits
+    reqs.buffers.push_back({"opt1", 512, 256, false});   // Optional, fits
+    reqs.buffers.push_back({"req2", 256, 256, true});    // Required, fits
+    reqs.buffers.push_back({"opt2", 10000, 256, false}); // Optional, too big
 
     ASSERT_TRUE(mgr.allocate(reqs));
     EXPECT_TRUE(mgr.hasBuffer("req1"));
@@ -457,7 +457,7 @@ TEST_F(Test__DeviceWorkspaceManager, DoubleAllocateWithoutReleaseFails)
     reqs2.buffers.push_back({"second", 2048, 256, true});
 
     EXPECT_FALSE(mgr.allocate(reqs2));
-    
+
     // Original allocation should still be intact
     EXPECT_TRUE(mgr.hasBuffer("first"));
     EXPECT_FALSE(mgr.hasBuffer("second"));
@@ -502,7 +502,7 @@ TEST_F(Test__DeviceWorkspaceManager, DeviceReturnsCorrectValue)
         DeviceWorkspaceManager mgr(DeviceId::cpu(), budget);
         EXPECT_TRUE(mgr.device().is_cpu());
     }
-    
+
     // Note: CUDA/ROCm device tests would require actual GPU
     // These test just the DeviceId storage, not actual allocation
     {
@@ -510,7 +510,7 @@ TEST_F(Test__DeviceWorkspaceManager, DeviceReturnsCorrectValue)
         EXPECT_TRUE(mgr.device().is_cuda());
         EXPECT_EQ(mgr.device().ordinal, 0);
     }
-    
+
     {
         DeviceWorkspaceManager mgr(DeviceId::rocm(1), budget);
         EXPECT_TRUE(mgr.device().is_rocm());

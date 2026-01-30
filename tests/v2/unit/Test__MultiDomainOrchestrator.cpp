@@ -9,9 +9,9 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/MultiDomainOrchestrator.h"
-#include "execution/DeviceGraphOrchestrator.h"
-#include "execution/IInferenceRunner.h"
+#include "execution/local_execution/orchestrators/MultiDomainOrchestrator.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "config/TPDomain.h"
 #include "backends/DeviceId.h"
 

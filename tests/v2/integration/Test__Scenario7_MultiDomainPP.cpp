@@ -23,14 +23,14 @@
 #include "config/OrchestrationConfig.h"
 #include "config/OrchestrationConfigParser.h"
 #include "config/IOrchestrationConfigParser.h"
-#include "execution/RankExecutionPlan.h"
-#include "execution/IExecutionPlanBuilder.h"
-#include "execution/ExecutionPlanBuilder.h"
-#include "execution/DeviceInventory.h"
+#include "execution/mpi_orchestration/RankExecutionPlan.h"
+#include "execution/mpi_orchestration/IExecutionPlanBuilder.h"
+#include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
+#include "execution/mpi_orchestration/DeviceInventory.h"
 #include "backends/GlobalDeviceAddress.h"
-#include "orchestration/IOrchestrationRunner.h"
-#include "orchestration/IOrchestrationRunnerFactory.h"
-#include "orchestration/OrchestrationRunner.h"
+#include "execution/runner/IOrchestrationRunner.h"
+#include "execution/runner/IOrchestrationRunnerFactory.h"
+#include "execution/runner/OrchestrationRunner.h"
 
 using namespace llaminar2;
 using namespace testing;

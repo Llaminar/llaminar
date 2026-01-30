@@ -7,7 +7,7 @@
  */
 
 #include "SlabGemmConfig.h"
-#include "execution/WorkspaceDescriptor.h"
+#include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "utils/Logger.h"
 
 #include <algorithm>

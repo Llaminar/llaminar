@@ -15,12 +15,12 @@
 #pragma once
 
 #include "interfaces/IMPITopology.h"
-#include "utils/MPITopology.h"           // For RankPlacement, WorkRange, DeviceCapability
-#include "execution/DeviceInventory.h"   // For ClusterInventory, RankInventory
-#include "execution/PlacementStrategy.h" // For PlacementInput, PlacementStrategyFactory
-#include "execution/PlacementPlan.h"     // For PlacementPlan
-#include "config/TPDomain.h"             // For TPDomain, MultiDomainTPConfig
-#include "tensors/TensorSlice.h"         // For SliceMetadata
+#include "utils/MPITopology.h"                             // For RankPlacement, WorkRange, DeviceCapability
+#include "execution/mpi_orchestration/DeviceInventory.h"   // For ClusterInventory, RankInventory
+#include "execution/mpi_orchestration/PlacementStrategy.h" // For PlacementInput, PlacementStrategyFactory
+#include "execution/mpi_orchestration/PlacementPlan.h"     // For PlacementPlan
+#include "config/TPDomain.h"                               // For TPDomain, MultiDomainTPConfig
+#include "tensors/TensorSlice.h"                           // For SliceMetadata
 #include <vector>
 #include <string>
 #include <sstream>

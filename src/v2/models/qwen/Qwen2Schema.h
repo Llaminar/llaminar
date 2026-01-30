@@ -25,7 +25,7 @@
 
 #pragma once
 
-#include "../../execution/GraphSchema.h"
+#include "../../execution/local_execution/graph/GraphSchema.h"
 #include <string>
 
 namespace llaminar2

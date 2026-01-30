@@ -12,8 +12,8 @@
 
 #include <gtest/gtest.h>
 #include "../../../src/v2/backends/DeviceId.h"
-#include "../../../src/v2/execution/DeviceGraphOrchestrator.h"
-#include "../../../src/v2/execution/PlacementStrategy.h"
+#include "../../../src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "../../../src/v2/execution/mpi_orchestration/PlacementStrategy.h"
 #include "../../../src/v2/loaders/WeightManager.h"
 #include "../../../src/v2/loaders/WeightPlacementMap.h"
 #include "../../../src/v2/loaders/ModelLoader.h"

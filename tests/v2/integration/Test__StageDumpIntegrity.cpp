@@ -24,9 +24,9 @@
 #include <cuda_runtime.h>
 #endif
 
-#include "execution/InferenceRunnerFactory.h"
-#include "execution/IInferenceRunner.h"
-#include "execution/StageDumper.h"
+#include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/local_execution/orchestrators/IInferenceRunner.h"
+#include "execution/debug/StageDumper.h"
 #include "execution/compute_stages/IComputeStage.h"
 #include "loaders/ModelContext.h"
 #include "backends/ComputeBackend.h"

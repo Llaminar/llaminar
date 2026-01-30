@@ -7,8 +7,8 @@
 
 #include <gtest/gtest.h>
 
-#include "../../src/v2/execution/PlacementPlan.h"
-#include "../../src/v2/execution/PlacementStrategy.h"
+#include "../../src/v2/execution/mpi_orchestration/PlacementPlan.h"
+#include "../../src/v2/execution/mpi_orchestration/PlacementStrategy.h"
 
 using namespace llaminar2;
 

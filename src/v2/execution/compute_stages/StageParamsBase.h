@@ -30,13 +30,13 @@
  *         // REQUIRED - validated by StageParamsRequired concept
  *         DeviceId device_id = DeviceId::cpu();
  *         const MPIContext* mpi_ctx = nullptr;
- *         
+ *
  *         // Stage-specific fields
  *         ITensor* input = nullptr;
  *         ITensor* output = nullptr;
  *     };
  *     static_assert(StageParamsRequired<Params>);  // Compile-time check
- *     
+ *
  *     explicit MyStage(Params params) : params_(std::move(params))
  *     {
  *         setDevice(params_.device_id);  // REQUIRED - sets base class device
@@ -48,7 +48,7 @@
 
 #pragma once
 
-#include "backends/DeviceId.h"
+#include "../../backends/DeviceId.h"
 #include <concepts>
 
 namespace llaminar2

@@ -8,190 +8,191 @@
 
 #pragma once
 
-#include "../../../execution/RuntimeConfig.h"
+#include "../../../execution/config/RuntimeConfig.h"
 #include "../../../tensors/TensorKernels.h"
-#include "../../../tensors/Tensors.h"  // For FP32Tensor, BF16Tensor, FP16Tensor (apply_tensor)
+#include "../../../tensors/Tensors.h" // For FP32Tensor, BF16Tensor, FP16Tensor (apply_tensor)
 #include <cstdint>
 
-namespace llaminar2 {
-namespace rocm {
-
-// ============================================================================
-// Primary Template (static_assert for unsupported precisions)
-// ============================================================================
-
-template <ActivationPrecision Precision>
-class ROCmRMSNormKernelT
+namespace llaminar2
 {
-    static_assert(
-        Precision == ActivationPrecision::FP32 ||
-        Precision == ActivationPrecision::BF16 ||
-        Precision == ActivationPrecision::FP16,
-        "ROCmRMSNormKernelT only supports FP32, BF16, and FP16 precisions"
-    );
-};
+    namespace rocm
+    {
 
-// ============================================================================
-// FP32 Specialization
-// ============================================================================
+        // ============================================================================
+        // Primary Template (static_assert for unsupported precisions)
+        // ============================================================================
 
-template <>
-class ROCmRMSNormKernelT<ActivationPrecision::FP32> : public ITensorRMSNorm
-{
-public:
-    using StorageType = float;
+        template <ActivationPrecision Precision>
+        class ROCmRMSNormKernelT
+        {
+            static_assert(
+                Precision == ActivationPrecision::FP32 ||
+                    Precision == ActivationPrecision::BF16 ||
+                    Precision == ActivationPrecision::FP16,
+                "ROCmRMSNormKernelT only supports FP32, BF16, and FP16 precisions");
+        };
 
-    static constexpr ActivationPrecision precision() { return ActivationPrecision::FP32; }
-    static const char* precision_name() { return "FP32"; }
+        // ============================================================================
+        // FP32 Specialization
+        // ============================================================================
 
-    // ITensorRMSNorm interface
-    bool apply(
-        const float* input,
-        const float* weight,
-        float* output,
-        int rows,
-        int cols,
-        float epsilon = 1e-6f,
-        bool use_bf16 = false,
-        const MPIContext* mpi_ctx = nullptr,
-        int device_idx = -1) override;
+        template <>
+        class ROCmRMSNormKernelT<ActivationPrecision::FP32> : public ITensorRMSNorm
+        {
+        public:
+            using StorageType = float;
 
-    // Tensor-based API with automatic GPU pointer handling
-    bool apply_tensor(
-        const TensorBase* input,
-        const TensorBase* weight,
-        TensorBase* output,
-        int rows, int cols,
-        float epsilon = 1e-6f,
-        const MPIContext* mpi_ctx = nullptr,
-        int device_idx = -1) override;
+            static constexpr ActivationPrecision precision() { return ActivationPrecision::FP32; }
+            static const char *precision_name() { return "FP32"; }
 
-    bool supports_device(int device_idx) const override { return device_idx >= 0; }
+            // ITensorRMSNorm interface
+            bool apply(
+                const float *input,
+                const float *weight,
+                float *output,
+                int rows,
+                int cols,
+                float epsilon = 1e-6f,
+                bool use_bf16 = false,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override;
 
-    // Typed API for direct device pointer access
-    bool apply_typed(
-        const float* d_input,
-        const float* d_gamma,
-        float* d_output,
-        int rows,
-        int cols,
-        float epsilon,
-        int device_idx);
-};
+            // Tensor-based API with automatic GPU pointer handling
+            bool apply_tensor(
+                const TensorBase *input,
+                const TensorBase *weight,
+                TensorBase *output,
+                int rows, int cols,
+                float epsilon = 1e-6f,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override;
 
-// ============================================================================
-// BF16 Specialization
-// ============================================================================
+            bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-template <>
-class ROCmRMSNormKernelT<ActivationPrecision::BF16> : public ITensorRMSNorm
-{
-public:
-    using StorageType = uint16_t;
+            // Typed API for direct device pointer access
+            bool apply_typed(
+                const float *d_input,
+                const float *d_gamma,
+                float *d_output,
+                int rows,
+                int cols,
+                float epsilon,
+                int device_idx);
+        };
 
-    static constexpr ActivationPrecision precision() { return ActivationPrecision::BF16; }
-    static const char* precision_name() { return "BF16"; }
+        // ============================================================================
+        // BF16 Specialization
+        // ============================================================================
 
-    // ITensorRMSNorm interface
-    bool apply(
-        const float* input,
-        const float* weight,
-        float* output,
-        int rows,
-        int cols,
-        float epsilon = 1e-6f,
-        bool use_bf16 = false,
-        const MPIContext* mpi_ctx = nullptr,
-        int device_idx = -1) override;
+        template <>
+        class ROCmRMSNormKernelT<ActivationPrecision::BF16> : public ITensorRMSNorm
+        {
+        public:
+            using StorageType = uint16_t;
 
-    bool apply_bf16(
-        const uint16_t* input,
-        const float* weight,
-        uint16_t* output,
-        int rows,
-        int cols,
-        float epsilon = 1e-6f,
-        int device_idx = -1) override;
+            static constexpr ActivationPrecision precision() { return ActivationPrecision::BF16; }
+            static const char *precision_name() { return "BF16"; }
 
-    // Tensor-based API with automatic GPU pointer handling
-    bool apply_tensor(
-        const TensorBase* input,
-        const TensorBase* weight,
-        TensorBase* output,
-        int rows, int cols,
-        float epsilon = 1e-6f,
-        const MPIContext* mpi_ctx = nullptr,
-        int device_idx = -1) override;
+            // ITensorRMSNorm interface
+            bool apply(
+                const float *input,
+                const float *weight,
+                float *output,
+                int rows,
+                int cols,
+                float epsilon = 1e-6f,
+                bool use_bf16 = false,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override;
 
-    bool supports_device(int device_idx) const override { return device_idx >= 0; }
+            bool apply_bf16(
+                const uint16_t *input,
+                const float *weight,
+                uint16_t *output,
+                int rows,
+                int cols,
+                float epsilon = 1e-6f,
+                int device_idx = -1) override;
 
-    // Typed API for direct device pointer access
-    bool apply_typed(
-        const uint16_t* d_input,
-        const float* d_gamma,
-        uint16_t* d_output,
-        int rows,
-        int cols,
-        float epsilon,
-        int device_idx);
-};
+            // Tensor-based API with automatic GPU pointer handling
+            bool apply_tensor(
+                const TensorBase *input,
+                const TensorBase *weight,
+                TensorBase *output,
+                int rows, int cols,
+                float epsilon = 1e-6f,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override;
 
-// ============================================================================
-// FP16 Specialization
-// ============================================================================
+            bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-template <>
-class ROCmRMSNormKernelT<ActivationPrecision::FP16> : public ITensorRMSNorm
-{
-public:
-    using StorageType = uint16_t;
+            // Typed API for direct device pointer access
+            bool apply_typed(
+                const uint16_t *d_input,
+                const float *d_gamma,
+                uint16_t *d_output,
+                int rows,
+                int cols,
+                float epsilon,
+                int device_idx);
+        };
 
-    static constexpr ActivationPrecision precision() { return ActivationPrecision::FP16; }
-    static const char* precision_name() { return "FP16"; }
+        // ============================================================================
+        // FP16 Specialization
+        // ============================================================================
 
-    // ITensorRMSNorm interface
-    bool apply(
-        const float* input,
-        const float* weight,
-        float* output,
-        int rows,
-        int cols,
-        float epsilon = 1e-6f,
-        bool use_bf16 = false,
-        const MPIContext* mpi_ctx = nullptr,
-        int device_idx = -1) override;
+        template <>
+        class ROCmRMSNormKernelT<ActivationPrecision::FP16> : public ITensorRMSNorm
+        {
+        public:
+            using StorageType = uint16_t;
 
-    bool apply_fp16(
-        const uint16_t* input,
-        const float* weight,
-        uint16_t* output,
-        int rows,
-        int cols,
-        float epsilon = 1e-6f,
-        int device_idx = -1) override;
+            static constexpr ActivationPrecision precision() { return ActivationPrecision::FP16; }
+            static const char *precision_name() { return "FP16"; }
 
-    // Tensor-based API with automatic GPU pointer handling
-    bool apply_tensor(
-        const TensorBase* input,
-        const TensorBase* weight,
-        TensorBase* output,
-        int rows, int cols,
-        float epsilon = 1e-6f,
-        const MPIContext* mpi_ctx = nullptr,
-        int device_idx = -1) override;
+            // ITensorRMSNorm interface
+            bool apply(
+                const float *input,
+                const float *weight,
+                float *output,
+                int rows,
+                int cols,
+                float epsilon = 1e-6f,
+                bool use_bf16 = false,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override;
 
-    bool supports_device(int device_idx) const override { return device_idx >= 0; }
+            bool apply_fp16(
+                const uint16_t *input,
+                const float *weight,
+                uint16_t *output,
+                int rows,
+                int cols,
+                float epsilon = 1e-6f,
+                int device_idx = -1) override;
 
-    // Typed API for direct device pointer access
-    bool apply_typed(
-        const uint16_t* d_input,
-        const float* d_gamma,
-        uint16_t* d_output,
-        int rows,
-        int cols,
-        float epsilon,
-        int device_idx);
-};
+            // Tensor-based API with automatic GPU pointer handling
+            bool apply_tensor(
+                const TensorBase *input,
+                const TensorBase *weight,
+                TensorBase *output,
+                int rows, int cols,
+                float epsilon = 1e-6f,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override;
 
-} // namespace rocm
+            bool supports_device(int device_idx) const override { return device_idx >= 0; }
+
+            // Typed API for direct device pointer access
+            bool apply_typed(
+                const uint16_t *d_input,
+                const float *d_gamma,
+                uint16_t *d_output,
+                int rows,
+                int cols,
+                float epsilon,
+                int device_idx);
+        };
+
+    } // namespace rocm
 } // namespace llaminar2

@@ -17,11 +17,11 @@
 #include "models/qwen/Qwen2GraphConfigBuilder.h"
 #include "models/qwen/Qwen2Graph.h" // For Qwen2GraphConfig
 #include "models/IGraphConfigBuilder.h"
-#include "execution/RankExecutionPlan.h"
+#include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "config/OrchestrationConfig.h"
 #include "config/TensorParallelConfig.h" // For setTensorParallelConfig stub
 #include "backends/GlobalDeviceAddress.h"
-#include "interfaces/IWeightManager.h"
+#include "loaders/IWeightManager.h"
 
 using namespace llaminar2;
 

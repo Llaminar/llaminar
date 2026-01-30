@@ -22,10 +22,10 @@
 #include <memory>
 
 #include "mocks/MockMPITopology.h" // Use the existing mock with tracking
-#include "execution/PlacementStrategy.h"
-#include "execution/PlacementPlan.h"
-#include "execution/placement/HeterogeneousMultiDomainStrategy.h"
-#include "execution/DeviceGraphOrchestrator.h"
+#include "execution/mpi_orchestration/PlacementStrategy.h"
+#include "execution/mpi_orchestration/PlacementPlan.h"
+#include "execution/mpi_orchestration/placement/HeterogeneousMultiDomainStrategy.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
 

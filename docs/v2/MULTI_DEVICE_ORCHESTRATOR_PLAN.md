@@ -947,7 +947,7 @@ std::unordered_map<DeviceId, void*> device_buffers_;
  */
 
 #include <gtest/gtest.h>
-#include "execution/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
 #include "utils/MockModelContext.h"
 #include "utils/TestTensorFactory.h"
 
@@ -1126,7 +1126,7 @@ REGISTER_PARITY_TESTS(Test__Qwen2_LocalTP_NCCL_vs_PyTorch)
 
 Update `OrchestrationRunner` to use `MultiDeviceOrchestrator` when LOCAL TP is configured:
 
-**Location**: `src/v2/orchestration/OrchestrationRunner.cpp`
+**Location**: `src/v2/execution/runner/OrchestrationRunner.cpp`
 
 ```cpp
 std::unique_ptr<IInferenceRunner> OrchestrationRunner::createRunner()
@@ -1220,7 +1220,7 @@ The existing CLI flags should work with `MultiDeviceOrchestrator`:
 
 | File | Change |
 |------|--------|
-| `src/v2/orchestration/OrchestrationRunner.cpp` | Use MultiDeviceOrchestrator |
+| `src/v2/execution/runner/OrchestrationRunner.cpp` | Use MultiDeviceOrchestrator |
 | `src/v2/execution/InferenceRunnerFactory.cpp` | Add factory function |
 
 ---

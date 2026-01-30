@@ -16,7 +16,7 @@
 #include "ROCmRingKVCache.h"
 #include "../../../utils/Logger.h"
 #include "../../../tensors/GpuTensorView.h"
-#include "../../../execution/DeviceWorkspaceManager.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 
 #include <algorithm>
 

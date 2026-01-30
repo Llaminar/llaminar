@@ -26,7 +26,7 @@
 #include "kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
 #include "tensors/Tensors.h"
 #include "tensors/FP16Utils.h"
-#include "execution/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "backends/DeviceId.h"
 #include "utils/Logger.h"
 

@@ -17,7 +17,7 @@
 #include "v2/tensors/TensorFactory.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/utils/MPIContext.h"
-#include "v2/execution/RuntimeConfig.h"
+#include "v2/execution/config/RuntimeConfig.h"
 #include "v2/backends/DeviceId.h"
 
 using namespace llaminar2;

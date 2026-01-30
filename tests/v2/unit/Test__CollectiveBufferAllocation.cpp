@@ -11,8 +11,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "v2/execution/GraphBufferManager.h"
-#include "v2/execution/CollectiveContext.h"
+#include "v2/execution/local_execution/graph/GraphBufferManager.h"
+#include "v2/execution/local_execution/collective/CollectiveContext.h"
 #include "v2/collective/backends/PCIeBARBackend.h"
 #include "v2/collective/BackendRouter.h"
 #include "v2/collective/ICollectiveBackend.h"

@@ -13,7 +13,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/StageCoherence.h"
+#include "execution/local_execution/coherence/StageCoherence.h"
 #include "execution/compute_stages/IComputeStage.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
 #include "execution/compute_stages/stages/AllreduceStage.h"

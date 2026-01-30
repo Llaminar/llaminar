@@ -9,7 +9,7 @@
 #include "Logger.h"
 #include "KernelProfiler.h"
 #include "CUDAKernelProfiler.h"
-#include "../execution/IGraphExecutor.h"
+#include "../execution/local_execution/graph/IGraphExecutor.h"
 #include <iostream>
 #include <iomanip>
 #include <sstream>

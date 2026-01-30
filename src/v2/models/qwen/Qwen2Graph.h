@@ -23,14 +23,14 @@
 
 #pragma once
 
-#include "../../execution/GraphExecutor.h"
-#include "../../execution/GraphBufferManager.h"
+#include "../../execution/local_execution/graph/GraphExecutor.h"
+#include "../../execution/local_execution/graph/GraphBufferManager.h"
 #include "../../execution/compute_stages/ComputeStages.h"
-#include "../../execution/DeviceContext.h"
-#include "../../execution/ExecutionPolicy.h"
-#include "../../execution/IGraphBuilder.h"
-#include "../../execution/RuntimeConfig.h"
-#include "../../execution/GraphResolver.h"
+#include "../../execution/local_execution/device/DeviceContext.h"
+#include "../../execution/config/ExecutionPolicy.h"
+#include "../../execution/local_execution/graph/IGraphBuilder.h"
+#include "../../execution/config/RuntimeConfig.h"
+#include "../../execution/local_execution/graph/GraphResolver.h"
 #include "../../backends/DeviceId.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/TensorFactory.h"

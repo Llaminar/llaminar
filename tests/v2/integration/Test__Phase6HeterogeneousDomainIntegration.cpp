@@ -29,9 +29,9 @@
 #include <cstring>
 #include <set>
 
-#include "execution/placement/HeterogeneousMultiDomainStrategy.h"
-#include "execution/PlacementStrategy.h"
-#include "execution/DeviceInventory.h"
+#include "execution/mpi_orchestration/placement/HeterogeneousMultiDomainStrategy.h"
+#include "execution/mpi_orchestration/PlacementStrategy.h"
+#include "execution/mpi_orchestration/DeviceInventory.h"
 #include "config/TPDomain.h"
 #include "utils/MPITopology.h"
 #include "utils/MPIContext.h"

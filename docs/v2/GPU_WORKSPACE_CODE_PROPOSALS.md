@@ -256,7 +256,7 @@ Add the virtual method to the base class:
 
 ```cpp
 // In IComputeStage.h, add include:
-#include "execution/WorkspaceDescriptor.h"
+#include "execution/local_execution/device/WorkspaceDescriptor.h"
 
 // In the IComputeStage class, add:
 class IComputeStage {

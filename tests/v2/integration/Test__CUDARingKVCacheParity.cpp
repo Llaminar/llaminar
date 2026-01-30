@@ -20,7 +20,7 @@
 #include <cmath>
 #include "kernels/cuda/kvcache/CUDARingKVCache.h"
 #include "interfaces/IWorkspaceConsumer.h"
-#include "execution/WorkspaceDescriptor.h"
+#include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "utils/Logger.h"
 
 using namespace llaminar2;

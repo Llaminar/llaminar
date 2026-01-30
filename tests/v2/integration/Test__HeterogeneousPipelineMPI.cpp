@@ -25,10 +25,10 @@
 #include <cstring>
 #include <cmath>
 
-#include "execution/HeterogeneousLayerExecutor.h"
-#include "execution/DomainAwareBufferManager.h"
-#include "execution/CrossDomainTransfer.h"
-#include "execution/GraphExecutor.h" // Contains ComputeGraph definition
+#include "execution/local_execution/model/HeterogeneousLayerExecutor.h"
+#include "execution/local_execution/device/DomainAwareBufferManager.h"
+#include "execution/local_execution/coherence/CrossDomainTransfer.h"
+#include "execution/local_execution/graph/GraphExecutor.h" // Contains ComputeGraph definition
 #include "config/LayerPlacementConfig.h"
 #include "config/TPDomain.h"
 #include "backends/DeviceId.h"

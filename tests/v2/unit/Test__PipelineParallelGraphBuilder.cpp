@@ -19,9 +19,9 @@
 #include <gtest/gtest.h>
 #include <memory>
 
-#include "execution/IPipelineParallelGraphBuilder.h"
-#include "execution/GraphExecutor.h"
-#include "execution/RankExecutionPlan.h"
+#include "execution/local_execution/graph/IPipelineParallelGraphBuilder.h"
+#include "execution/local_execution/graph/GraphExecutor.h"
+#include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "execution/compute_stages/ComputeStageFactory.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"

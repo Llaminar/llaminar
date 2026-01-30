@@ -46,8 +46,8 @@
 #include <set>
 
 #include "loaders/ModelContext.h"
-#include "execution/InferenceRunnerFactory.h"
-#include "execution/IInferenceRunner.h"
+#include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "kernels/KernelFactory.h"
 #include "utils/Logger.h"
 #include "backends/DeviceId.h"

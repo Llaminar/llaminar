@@ -22,11 +22,11 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/CollectiveContext.h"
+#include "execution/local_execution/collective/CollectiveContext.h"
 #include "collective/BackendRouter.h"
 #include "collective/ICollectiveBackend.h"
 #include "tensors/TensorClasses.h"
-#include "execution/DeviceInventory.h"
+#include "execution/mpi_orchestration/DeviceInventory.h"
 #include "backends/DeviceId.h"
 #include "backends/BackendManager.h"
 #include "utils/Logger.h"

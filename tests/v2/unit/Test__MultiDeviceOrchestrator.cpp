@@ -13,8 +13,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/IInferenceRunner.h"
-#include "execution/TPSnapshot.h"
+#include "execution/local_execution/orchestrators/IInferenceRunner.h"
+#include "execution/debug/TPSnapshot.h"
 #include "collective/ILocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "config/OrchestrationConfig.h"

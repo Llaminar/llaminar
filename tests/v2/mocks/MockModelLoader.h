@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include "interfaces/IModelLoader.h"
+#include "loaders/IModelLoader.h"
 #include "tensors/Tensors.h"
 #include "backends/DeviceId.h"
 #include <vector>

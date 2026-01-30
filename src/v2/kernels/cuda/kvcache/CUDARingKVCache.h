@@ -31,9 +31,9 @@
 #pragma once
 
 // Minimal includes - avoid MPI headers for nvcc compatibility
-#include "../../IKVCache.h"                         // Unified KVCache interface
-#include "../../../execution/RuntimeConfig.h"       // For ActivationPrecision
-#include "../../../interfaces/IWorkspaceConsumer.h" // Workspace management
+#include "../../IKVCache.h"                          // Unified KVCache interface
+#include "../../../execution/config/RuntimeConfig.h" // For ActivationPrecision
+#include "../../../interfaces/IWorkspaceConsumer.h"  // Workspace management
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -503,9 +503,9 @@ namespace llaminar2
         int local_n_kv_heads_; // Local KV heads (this rank), == n_kv_heads_ if not sharded
         int kv_head_start_;    // Starting KV head index (0 if not sharded)
         int head_dim_;
-        int kv_dim_;           // local_n_kv_heads * head_dim (storage dimension)
+        int kv_dim_; // local_n_kv_heads * head_dim (storage dimension)
         int device_id_;
-        bool is_sharded_;      // True if using local KV heads (TP enabled)
+        bool is_sharded_; // True if using local KV heads (TP enabled)
 
         // Workspace manager for batched gather operations
         // When bound, launch_gather_kernel() uses pre-allocated buffers instead of cudaMalloc/cudaFree

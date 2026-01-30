@@ -9,8 +9,8 @@
 
 #pragma once
 
-#include "../execution/RuntimeConfig.h" // ActivationPrecision
-#include "../tensors/ITensor.h"         // Lightweight interface (no MPI)
+#include "../execution/config/RuntimeConfig.h" // ActivationPrecision
+#include "../tensors/ITensor.h"                // Lightweight interface (no MPI)
 #include "../tensors/TensorLayout.h"
 #include <vector>
 

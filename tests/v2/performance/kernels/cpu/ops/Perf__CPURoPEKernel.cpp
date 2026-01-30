@@ -36,7 +36,7 @@
 #include "tensors/Tensors.h"
 #include "tensors/SIMDHelpers.h"
 #include "tensors/BlockStructures.h"
-#include "execution/RuntimeConfig.h"
+#include "execution/config/RuntimeConfig.h"
 
 using namespace llaminar2;
 

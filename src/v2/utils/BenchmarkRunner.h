@@ -21,7 +21,7 @@
 #include "MPIContext.h"
 #include "Tokenizer.h"
 #include "Sampler.h"
-#include "../execution/IInferenceRunner.h"
+#include "../execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "ArgParser.h"
 #include <memory>
 #include <string>

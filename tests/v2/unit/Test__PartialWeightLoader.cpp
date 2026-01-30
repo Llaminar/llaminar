@@ -20,8 +20,8 @@
 #include <algorithm>
 
 #include "loaders/IPartialWeightLoader.h"
-#include "execution/RankExecutionPlan.h"
-#include "execution/IExecutionPlanBuilder.h"
+#include "execution/mpi_orchestration/RankExecutionPlan.h"
+#include "execution/mpi_orchestration/IExecutionPlanBuilder.h"
 
 using namespace llaminar2;
 

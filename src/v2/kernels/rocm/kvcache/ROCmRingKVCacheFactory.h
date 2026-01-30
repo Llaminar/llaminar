@@ -14,8 +14,8 @@
 #pragma once
 
 #include <memory>
-#include "../../IKVCache.h"                   // For IKVCache base class
-#include "../../../execution/RuntimeConfig.h" // For ActivationPrecision
+#include "../../IKVCache.h"                          // For IKVCache base class
+#include "../../../execution/config/RuntimeConfig.h" // For ActivationPrecision
 
 namespace llaminar2
 {

@@ -14,11 +14,11 @@
 
 #pragma once
 
-#include "interfaces/IGraphBufferManager.h"
-#include "execution/BufferRole.h"
-#include "execution/LivenessAnalyzer.h"  // For AliasingGroup
-#include "execution/GraphExecutor.h"     // For ComputeGraph
-#include "execution/CollectiveContext.h" // For CollectiveContext (Phase 3)
+#include "execution/local_execution/graph/IGraphBufferManager.h"
+#include "execution/debug/BufferRole.h"
+#include "execution/local_execution/graph/LivenessAnalyzer.h"       // For AliasingGroup
+#include "execution/local_execution/graph/GraphExecutor.h"          // For ComputeGraph
+#include "execution/local_execution/collective/CollectiveContext.h" // For CollectiveContext (Phase 3)
 #include "tensors/Tensors.h"
 #include <memory>
 #include <string>

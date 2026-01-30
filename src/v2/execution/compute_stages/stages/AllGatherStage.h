@@ -15,7 +15,7 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
-#include "config/TPDomain.h"
+#include "../../../config/TPDomain.h"
 
 namespace llaminar2
 {

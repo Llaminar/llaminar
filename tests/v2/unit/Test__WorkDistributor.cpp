@@ -6,7 +6,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/WorkDistributor.h"
+#include "execution/mpi_orchestration/WorkDistributor.h"
 #include "backends/DeviceId.h"
 
 using namespace llaminar2;

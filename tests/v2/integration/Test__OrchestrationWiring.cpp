@@ -17,10 +17,10 @@
 
 #include <gtest/gtest.h>
 
-#include "execution/InferenceRunnerFactory.h"
-#include "execution/PlacementPlan.h"
-#include "execution/PlacementStrategy.h"
-#include "execution/RuntimeConfig.h"
+#include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/mpi_orchestration/PlacementPlan.h"
+#include "execution/mpi_orchestration/PlacementStrategy.h"
+#include "execution/config/RuntimeConfig.h"
 #include "utils/MPIContext.h"
 #include "utils/MPITopology.h"
 #include "mocks/MockModelContext.h"

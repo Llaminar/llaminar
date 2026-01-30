@@ -19,12 +19,12 @@
 
 #pragma once
 
-#include "../interfaces/IModelLoader.h"
+#include "IModelLoader.h"
 #include "WeightPlacementMap.h"
 #include "../backends/DeviceId.h"
 #include "../config/TensorParallelConfig.h"
-#include "../execution/GraphSchema.h"
-#include "../interfaces/IWeightManager.h"
+#include "../execution/local_execution/graph/GraphSchema.h"
+#include "IWeightManager.h"
 #include "../utils/MPIContext.h"
 #include "../tensors/Tensors.h"
 #include <memory>

@@ -7,9 +7,9 @@
 
 #include <gtest/gtest.h>
 
-#include "../../src/v2/execution/placement/HeterogeneousMultiDomainStrategy.h"
-#include "../../src/v2/execution/PlacementStrategy.h"
-#include "../../src/v2/execution/DeviceInventory.h"
+#include "../../src/v2/execution/mpi_orchestration/placement/HeterogeneousMultiDomainStrategy.h"
+#include "../../src/v2/execution/mpi_orchestration/PlacementStrategy.h"
+#include "../../src/v2/execution/mpi_orchestration/DeviceInventory.h"
 
 using namespace llaminar2;
 

@@ -13,9 +13,9 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/GraphExecutor.h"
-#include "execution/CollectiveContext.h"
-#include "execution/DeviceContext.h"
+#include "execution/local_execution/graph/GraphExecutor.h"
+#include "execution/local_execution/collective/CollectiveContext.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #include "execution/compute_stages/stages/AllreduceStage.h"
 #include "execution/compute_stages/stages/AllGatherStage.h"
 #include "collective/test/CollectiveTestMocks.h"

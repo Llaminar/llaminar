@@ -68,10 +68,10 @@
 #include "fort.hpp"
 
 #include "loaders/ModelContext.h"
-#include "execution/InferenceRunnerFactory.h"
-#include "execution/IInferenceRunner.h"
-#include "execution/TPSnapshot.h"
-#include "execution/MultiDeviceOrchestrator.h"
+#include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/local_execution/orchestrators/IInferenceRunner.h"
+#include "execution/debug/TPSnapshot.h"
+#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
 #include "kernels/KernelFactory.h"
 #include "backends/BackendManager.h"
 #ifdef HAVE_CUDA

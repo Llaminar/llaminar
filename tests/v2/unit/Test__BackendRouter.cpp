@@ -11,7 +11,7 @@
 #include "v2/collective/test/CollectiveTestMocks.h"
 #include "v2/collective/backends/UPIBackend.h"
 #include "v2/config/TPDomain.h"
-#include "v2/execution/DeviceInventory.h"
+#include "v2/execution/mpi_orchestration/DeviceInventory.h"
 #include "v2/backends/DeviceId.h"
 
 namespace llaminar2::test

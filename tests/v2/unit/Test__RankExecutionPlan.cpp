@@ -14,7 +14,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/RankExecutionPlan.h"
+#include "execution/mpi_orchestration/RankExecutionPlan.h"
 
 using namespace llaminar2;
 

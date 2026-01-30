@@ -13,7 +13,7 @@
 
 #pragma once
 
-#include "../execution/BufferRole.h"
+#include "../execution/debug/BufferRole.h"
 #include <cstddef>
 #include <memory>
 #include <string>

@@ -31,7 +31,7 @@
 // Include project headers BEFORE CUDATestUtils.h
 #include "tensors/Tensors.h"
 #include "backends/ComputeBackend.h"
-#include "execution/DeviceContext.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #include "utils/DebugEnv.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"

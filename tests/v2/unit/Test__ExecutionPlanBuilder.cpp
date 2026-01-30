@@ -16,8 +16,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/ExecutionPlanBuilder.h"
-#include "execution/IExecutionPlanBuilder.h"
+#include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
+#include "execution/mpi_orchestration/IExecutionPlanBuilder.h"
 
 using namespace llaminar2;
 

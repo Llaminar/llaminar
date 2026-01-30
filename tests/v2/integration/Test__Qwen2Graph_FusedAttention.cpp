@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include "../../../src/v2/models/qwen/Qwen2Graph.h"
-#include "../../../src/v2/execution/GraphExecutor.h"
+#include "../../../src/v2/execution/local_execution/graph/GraphExecutor.h"
 #include "../../../src/v2/backends/ComputeBackend.h"
 #include "../../../src/v2/utils/DebugEnv.h"
 #include "../../../src/v2/utils/MPIContext.h"

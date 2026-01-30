@@ -15,7 +15,7 @@
 #include "NUMATopology.h"
 #include "Logger.h"
 #include "../tensors/TensorSlice.h"
-#include "../execution/PlacementStrategy.h"
+#include "../execution/mpi_orchestration/PlacementStrategy.h"
 
 #include <sstream>
 #include <algorithm>

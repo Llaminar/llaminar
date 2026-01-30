@@ -15,7 +15,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/GraphBufferManager.h"
+#include "execution/local_execution/graph/GraphBufferManager.h"
 #include "tensors/TensorFactory.h"
 #include "models/qwen/Qwen2BufferSpec.h"
 #include "config/OrchestrationConfig.h"
@@ -38,7 +38,7 @@ namespace llaminar2
             {
                 // Create MPIContext for TensorFactory (rank=0, world_size=1)
                 mpi_ctx_ = std::make_unique<MPIContext>(0, 1);
-                
+
                 // Create TensorFactory for CPU-only tests
                 factory_ = std::make_unique<TensorFactory>(*mpi_ctx_);
             }
@@ -64,8 +64,8 @@ namespace llaminar2
             }
 
             // Helper to create a buffer descriptor
-            BufferDescriptor createBufferDesc(const std::string& name, 
-                                               BufferRole role = BufferRole::OUTPUT)
+            BufferDescriptor createBufferDesc(const std::string &name,
+                                              BufferRole role = BufferRole::OUTPUT)
             {
                 BufferDescriptor desc;
                 desc.name = name;
@@ -84,14 +84,14 @@ namespace llaminar2
         TEST_F(Test__GraphBufferManager_BARAllocation, DefaultConfig_StandardAllocation)
         {
             // Default config should not trigger BAR allocation
-            GraphBufferManagerConfig config;  // All defaults
-            
+            GraphBufferManagerConfig config; // All defaults
+
             // Verify default config doesn't enable BAR allocation
             EXPECT_EQ(1, config.tp_degree);
             EXPECT_EQ(CollectiveBackendType::AUTO, config.collective_backend);
             EXPECT_FALSE(config.rocm_device.is_rocm());
             EXPECT_FALSE(config.cuda_device.is_cuda());
-            
+
             // With default config, even row-parallel buffers shouldn't need BAR
             EXPECT_FALSE(Qwen2BufferSpec::requiresBARBacked(
                 "ffn_down_output", config.collective_backend, config.tp_degree));
@@ -104,17 +104,17 @@ namespace llaminar2
         TEST_F(Test__GraphBufferManager_BARAllocation, PCIeBarConfig_EnablesBAR_ForRowParallel)
         {
             auto config = createPCIeBarConfig();
-            
+
             // Verify config enables BAR allocation checks
             EXPECT_EQ(2, config.tp_degree);
             EXPECT_EQ(CollectiveBackendType::PCIE_BAR, config.collective_backend);
             EXPECT_TRUE(config.rocm_device.is_rocm());
             EXPECT_TRUE(config.cuda_device.is_cuda());
-            
+
             // Row-parallel outputs should need BAR with this config
             EXPECT_TRUE(Qwen2BufferSpec::requiresBARBacked(
                 "ffn_down_output", config.collective_backend, config.tp_degree));
-            
+
             EXPECT_TRUE(Qwen2BufferSpec::requiresBARBacked(
                 "attn_wo_output", config.collective_backend, config.tp_degree));
         }
@@ -126,17 +126,17 @@ namespace llaminar2
         TEST_F(Test__GraphBufferManager_BARAllocation, NonRowParallel_StandardAllocation)
         {
             auto config = createPCIeBarConfig();
-            
+
             // Non-row-parallel outputs should NOT need BAR even with PCIeBAR config
             EXPECT_FALSE(Qwen2BufferSpec::requiresBARBacked(
                 "residual", config.collective_backend, config.tp_degree));
-            
+
             EXPECT_FALSE(Qwen2BufferSpec::requiresBARBacked(
                 "Q", config.collective_backend, config.tp_degree));
-            
+
             EXPECT_FALSE(Qwen2BufferSpec::requiresBARBacked(
                 "K", config.collective_backend, config.tp_degree));
-            
+
             EXPECT_FALSE(Qwen2BufferSpec::requiresBARBacked(
                 "logits", config.collective_backend, config.tp_degree));
         }
@@ -150,17 +150,17 @@ namespace llaminar2
             // Create manager with default config (no BAR)
             GraphBufferManagerConfig config;
             GraphBufferManager manager(factory_.get(), nullptr, config);
-            
+
             // Allocate a buffer
             auto desc = createBufferDesc("residual");
             EXPECT_TRUE(manager.allocateBuffer("layer0", desc));
-            
+
             // Buffer should exist
             EXPECT_TRUE(manager.hasBuffer("layer0", "residual"));
-            
-            auto* tensor = manager.getBuffer("layer0", "residual");
+
+            auto *tensor = manager.getBuffer("layer0", "residual");
             ASSERT_NE(nullptr, tensor);
-            
+
             // Should be regular allocation (not BAR-backed)
             // Note: We can't directly check isBARBacked() without a BAR-backed tensor,
             // but we verify the tensor exists and has correct shape
@@ -177,18 +177,18 @@ namespace llaminar2
             // This simulates the case where BAR is requested but not available
             auto config = createPCIeBarConfig();
             GraphBufferManager manager(factory_.get(), nullptr, config);
-            
+
             // Factory should NOT be able to create BAR-backed tensors without P2P
             EXPECT_FALSE(factory_->canCreateBARBacked());
-            
+
             // Allocate a row-parallel buffer (would normally want BAR)
             auto desc = createBufferDesc("ffn_down_output");
             EXPECT_TRUE(manager.allocateBuffer("layer0", desc));
-            
+
             // Buffer should still be allocated (fallback to standard)
             EXPECT_TRUE(manager.hasBuffer("layer0", "ffn_down_output"));
-            
-            auto* tensor = manager.getBuffer("layer0", "ffn_down_output");
+
+            auto *tensor = manager.getBuffer("layer0", "ffn_down_output");
             ASSERT_NE(nullptr, tensor);
             EXPECT_EQ(32 * 64, tensor->numel());
         }
@@ -203,7 +203,7 @@ namespace llaminar2
             AllocationStrategy standard = AllocationStrategy::STANDARD;
             AllocationStrategy bar_backed = AllocationStrategy::BAR_BACKED;
             AllocationStrategy pinned = AllocationStrategy::PINNED_HOST;
-            
+
             EXPECT_NE(standard, bar_backed);
             EXPECT_NE(standard, pinned);
             EXPECT_NE(bar_backed, pinned);
@@ -216,21 +216,21 @@ namespace llaminar2
         TEST_F(Test__GraphBufferManager_BARAllocation, GetAllocationStrategy_Correct)
         {
             auto config = createPCIeBarConfig();
-            
+
             // Row-parallel with PCIeBAR -> BAR_BACKED
             EXPECT_EQ(AllocationStrategy::BAR_BACKED,
-                Qwen2BufferSpec::getAllocationStrategy(
-                    "ffn_down_output", config.collective_backend, config.tp_degree));
-            
+                      Qwen2BufferSpec::getAllocationStrategy(
+                          "ffn_down_output", config.collective_backend, config.tp_degree));
+
             // Non-row-parallel -> STANDARD
             EXPECT_EQ(AllocationStrategy::STANDARD,
-                Qwen2BufferSpec::getAllocationStrategy(
-                    "residual", config.collective_backend, config.tp_degree));
-            
+                      Qwen2BufferSpec::getAllocationStrategy(
+                          "residual", config.collective_backend, config.tp_degree));
+
             // Row-parallel with NCCL -> STANDARD (not PCIeBAR)
             EXPECT_EQ(AllocationStrategy::STANDARD,
-                Qwen2BufferSpec::getAllocationStrategy(
-                    "ffn_down_output", CollectiveBackendType::NCCL, config.tp_degree));
+                      Qwen2BufferSpec::getAllocationStrategy(
+                          "ffn_down_output", CollectiveBackendType::NCCL, config.tp_degree));
         }
 
         // =========================================================================
@@ -240,14 +240,14 @@ namespace llaminar2
         TEST_F(Test__GraphBufferManager_BARAllocation, LayerPrefixed_BufferNames)
         {
             auto config = createPCIeBarConfig();
-            
+
             // Layer-prefixed row-parallel outputs should need BAR
             EXPECT_TRUE(Qwen2BufferSpec::requiresBARBacked(
                 "layer0_ffn_down_output", config.collective_backend, config.tp_degree));
-            
+
             EXPECT_TRUE(Qwen2BufferSpec::requiresBARBacked(
                 "layer15_attn_wo_allreduce", config.collective_backend, config.tp_degree));
-            
+
             // Layer-prefixed non-row-parallel should NOT need BAR
             EXPECT_FALSE(Qwen2BufferSpec::requiresBARBacked(
                 "layer0_Q", config.collective_backend, config.tp_degree));

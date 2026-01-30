@@ -1053,12 +1053,12 @@ void GraphExecutor::executeStage(const ComputeNode& node) {
 
 ### Manual Coherence (Tests and Direct Kernel Calls)
 
-When calling kernels **directly** (bypassing GraphExecutor), you must handle coherence manually. Use the utilities in `execution/GpuCoherence.h`:
+When calling kernels **directly** (bypassing GraphExecutor), you must handle coherence manually. Use the utilities in `execution/local_execution/coherence/GpuCoherence.h`:
 
 #### Preferred Pattern: `with_gpu_coherence()`
 
 ```cpp
-#include "execution/GpuCoherence.h"
+#include "execution/local_execution/coherence/GpuCoherence.h"
 
 // Clean, self-documenting pattern for kernel calls
 ASSERT_TRUE(with_gpu_coherence(

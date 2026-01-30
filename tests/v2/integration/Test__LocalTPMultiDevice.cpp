@@ -25,9 +25,9 @@
 #include <fstream>
 #include <iostream>
 
-#include "execution/MultiDeviceOrchestrator.h"
-#include "execution/InferenceRunnerFactory.h"
-#include "execution/DeviceGraphOrchestrator.h"
+#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "collective/ILocalTPContext.h"
 #include "collective/LocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"

@@ -9,7 +9,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../src/v2/execution/InferenceMode.h"
+#include "../../../src/v2/execution/config/InferenceMode.h"
 #include "../../../src/v2/models/qwen/Qwen2Graph.h"
 #include "../../../src/v2/tensors/Tensors.h"
 

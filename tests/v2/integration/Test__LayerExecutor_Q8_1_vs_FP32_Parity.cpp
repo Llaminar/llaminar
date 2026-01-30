@@ -28,7 +28,7 @@
 
 #include "v2/models/qwen/Qwen2Graph.h"
 #include "v2/backends/DeviceId.h"
-#include "v2/execution/DeviceGraphOrchestrator.h"
+#include "v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/TensorFactory.h"
 #include "v2/kernels/cpu/CPUKVCache.h"

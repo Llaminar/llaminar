@@ -36,7 +36,7 @@
 #pragma once
 
 #include "../../interfaces/IWorkspaceConsumer.h"
-#include "../../execution/WorkspaceDescriptor.h"
+#include "../../execution/local_execution/device/WorkspaceDescriptor.h"
 
 namespace llaminar2
 {

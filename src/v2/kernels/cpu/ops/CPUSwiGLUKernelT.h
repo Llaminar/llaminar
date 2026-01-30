@@ -25,7 +25,7 @@
 #pragma once
 
 #include "../CPUKernelBase.h"
-#include "../../../execution/RuntimeConfig.h"
+#include "../../../execution/config/RuntimeConfig.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../tensors/TensorKernels.h"
 

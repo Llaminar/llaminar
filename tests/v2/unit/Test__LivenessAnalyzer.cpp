@@ -6,8 +6,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/LivenessAnalyzer.h"
-#include "execution/GraphExecutor.h"
+#include "execution/local_execution/graph/LivenessAnalyzer.h"
+#include "execution/local_execution/graph/GraphExecutor.h"
 #include "execution/compute_stages/ComputeStages.h"
 
 using namespace llaminar2;

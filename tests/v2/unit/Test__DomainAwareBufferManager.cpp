@@ -10,8 +10,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/DomainAwareBufferManager.h"
-#include "execution/BufferRole.h" // For BufferTensorType
+#include "execution/local_execution/device/DomainAwareBufferManager.h"
+#include "execution/debug/BufferRole.h" // For BufferTensorType
 #include "config/LayerPlacementConfig.h"
 #include "memory/NUMAAllocator.h"
 #include "backends/DeviceId.h"

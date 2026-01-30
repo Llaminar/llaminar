@@ -17,10 +17,10 @@
 
 #pragma once
 
-#include "../execution/RankExecutionPlan.h"
-#include "../execution/LayerDevicePlacement.h"
-#include "../execution/IExecutionPlanBuilder.h" // For ModelConfig
-#include "../interfaces/IWeightManager.h"       // For IWeightManager interface
+#include "../execution/mpi_orchestration/RankExecutionPlan.h"
+#include "../execution/local_execution/device/LayerDevicePlacement.h"
+#include "../execution/mpi_orchestration/IExecutionPlanBuilder.h" // For ModelConfig
+#include "../loaders/IWeightManager.h"                            // For IWeightManager interface
 #include <memory>
 
 namespace llaminar2

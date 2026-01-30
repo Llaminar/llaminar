@@ -6,7 +6,7 @@
  */
 
 #include "WeightPlacementMap.h"
-#include "../execution/PlacementPlan.h"
+#include "../execution/mpi_orchestration/PlacementPlan.h"
 #include <regex>
 #include <sstream>
 
@@ -343,8 +343,8 @@ namespace llaminar2
             {
                 // No explicit decode devices - use prefill device for decode too
                 DeviceId prefill_device = layer.split_attention_ffn
-                    ? layer.getAttentionDevice()  // Use attention device as representative
-                    : toDeviceId(layer.device);
+                                              ? layer.getAttentionDevice() // Use attention device as representative
+                                              : toDeviceId(layer.device);
                 layer_decode_devices_[layer_idx] = {prefill_device};
                 layer_decode_fractions_[layer_idx] = {1.0f};
                 layer_cpu_participates_[layer_idx] = prefill_device.is_cpu();

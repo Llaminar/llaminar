@@ -17,9 +17,9 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
-#include "execution/DeviceGraphOrchestrator.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "loaders/IWeightStreamer.h"
-#include "execution/PlacementStrategy.h"
+#include "execution/mpi_orchestration/PlacementStrategy.h"
 #include "backends/DeviceId.h"
 
 namespace llaminar2

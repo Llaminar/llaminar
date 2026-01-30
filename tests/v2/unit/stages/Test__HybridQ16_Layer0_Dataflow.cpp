@@ -20,7 +20,7 @@
 
 #include "backends/DeviceId.h"
 #include "execution/compute_stages/ComputeStages.h"
-#include "execution/DeviceContext.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #include "backends/ComputeBackend.h"
 #include "tensors/Tensors.h"
 #include "kernels/KernelFactory.h"

@@ -12,7 +12,7 @@
  *
  * IMPORTANT: Include project headers BEFORE this file:
  *   #include "devices/DeviceManager.h"
- *   #include "execution/DeviceContext.h"
+ *   #include "execution/local_execution/device/DeviceContext.h"
  *   #ifdef HAVE_CUDA
  *   #include "backends/cuda/CUDABackend.h"
  *   #endif

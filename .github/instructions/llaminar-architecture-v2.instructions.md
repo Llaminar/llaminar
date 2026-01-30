@@ -15,7 +15,7 @@ This document provides an architecture-level reference for agents working with *
 V2 is a **kernel-centric, operator-free** architecture:
 
 1. **Per-tensor device affinity** – each tensor knows which device it lives on (CPU, CUDA:0, ROCm:1)
-2. **Declarative graph execution** – `GraphOrchestrator` executes DAGs of compute stages
+2. **Declarative graph execution** – `DeviceGraphOrchestrator` executes DAGs of compute stages
 3. **Heterogeneous execution** – CPU / CUDA / ROCm backends can be mixed in one inference run
 4. **Quantization-aware kernels** – unified GEMM/attention interfaces for FP32/BF16 and quantized formats
 5. **MPI-aware orchestration** – multi-rank tensor parallelism lives in orchestrators, not kernels
@@ -33,34 +33,57 @@ V2 is a **kernel-centric, operator-free** architecture:
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          APPLICATION LAYER                                   │
 │                                                                              │
-│   llaminar2 CLI  ──→  InferenceRunnerFactory::createInferenceRunner()       │
+│   llaminar2 CLI  ──→  IOrchestrationRunnerFactory::createFromArgs()         │
 │                              │                                               │
 │                              ▼                                               │
 │   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  IInferenceRunner (GraphOrchestrator implements)                    │   │
-│   │    • forward(tokens, seq_len) → logits                             │   │
-│   │    • enableSnapshotCapture() → parity testing                      │   │
-│   │    • getSnapshot(key) → per-stage tensor data                      │   │
+│   │  IOrchestrationRunner (OrchestrationRunner implements)              │   │
+│   │    • initialize() → load model, build graphs, configure devices     │   │
+│   │    • prefill(tokens) → process prompt                              │   │
+│   │    • decodeStep() → generate next token                            │   │
+│   │    • generate(prompt, max_tokens) → full generation                │   │
 │   └─────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                        ORCHESTRATION LAYER                                   │
+│                      MPI PLANNING LAYER                                      │
 │                                                                              │
 │   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  GraphOrchestrator                                                  │   │
-│   │    • InferenceState (hidden, logits, kv_cache, activations)        │   │
-│   │    • LayerGraphCache (decode-mode graph reuse)                     │   │
-│   │    • Qwen2Graph (IGraphBuilder - declarative graph construction)   │   │
-│   │    • CollectiveContext (ICollectiveContext - MPI backend routing)  │   │
+│   │  OrchestrationRunner                                                │   │
+│   │    • initializeMPI() → setup MPI context                           │   │
+│   │    • gatherClusterInventory() → discover all devices               │   │
+│   │    • ExecutionPlanBuilder → build RankExecutionPlan                │   │
+│   │    • setupLocalTPContext() → configure ILocalTPContext             │   │
+│   │    • loadWeights() → create ModelContext                           │   │
+│   │    • buildComputeGraph() → Qwen2Graph                              │   │
 │   └─────────────────────────────────────────────────────────────────────┘   │
 │                                      │                                       │
 │         ┌────────────────────────────┼────────────────────────────┐          │
 │         ▼                            ▼                            ▼          │
 │   ┌──────────────────┐   ┌─────────────────────────┐   ┌──────────────────┐ │
-│   │   MPITopology    │   │   PlacementStrategy     │   │   BackendRouter  │ │
-│   │ (IMPITopology)   │   │ (device→stage mapping)  │   │ (NCCL/RCCL/MPI)  │ │
+│   │ RankExecutionPlan│   │   PlacementStrategy     │   │   BackendRouter  │ │
+│   │ (PP/TP contract) │   │ (device→stage mapping)  │   │ (NCCL/RCCL/MPI)  │ │
+│   └──────────────────┘   └─────────────────────────┘   └──────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      LOCAL EXECUTION LAYER                                   │
+│                                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  DeviceGraphOrchestrator (single-device orchestration)              │   │
+│   │    • InferenceState (hidden, logits, kv_cache, activations)        │   │
+│   │    • LayerGraphCache (decode-mode graph reuse)                     │   │
+│   │    • Qwen2Graph (IGraphBuilder - declarative graph construction)   │   │
+│   │    • CollectiveContext (collective backend routing)                │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                      │                                       │
+│         ┌────────────────────────────┼────────────────────────────┐          │
+│         ▼                            ▼                            ▼          │
+│   ┌──────────────────┐   ┌─────────────────────────┐   ┌──────────────────┐ │
+│   │MultiDeviceOrchest│   │   ILocalTPContext       │   │   BackendRouter  │ │
+│   │(multi-GPU local) │   │ (intra-rank collectives)│   │ (NCCL/RCCL/MPI)  │ │
 │   └──────────────────┘   └─────────────────────────┘   └──────────────────┘ │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
@@ -196,7 +219,7 @@ V2 is a **kernel-centric, operator-free** architecture:
 
 ### 2.1 IInferenceRunner
 
-Location: `src/v2/inference/IInferenceRunner.h`
+Location: `src/v2/execution/local_execution/orchestrators/IInferenceRunner.h`
 
 The `IInferenceRunner` interface provides the public API for inference execution:
 
@@ -226,10 +249,10 @@ public:
 
 ### 2.2 Factory Functions
 
-Location: `src/v2/execution/InferenceRunnerFactory.h`
+Location: `src/v2/execution/factory/InferenceRunnerFactory.h`
 
 ```cpp
-// Standard factory - creates GraphOrchestrator with full model context
+// Standard factory - creates DeviceGraphOrchestrator with full model context
 std::unique_ptr<IInferenceRunner> createInferenceRunner(
     std::shared_ptr<IModelContext> model_ctx,
     std::shared_ptr<MPIContext> mpi_ctx,
@@ -302,11 +325,11 @@ runner->clear_cache();
 
 ---
 
-## 3. GraphOrchestrator System
+## 3. DeviceGraphOrchestrator System
 
 ### 3.1 Architecture Overview
 
-The **GraphOrchestrator** is the graph-based execution system for transformer inference. It orchestrates declarative compute graphs for high-performance execution with:
+The **DeviceGraphOrchestrator** is the single-device graph-based execution system for transformer inference. It orchestrates declarative compute graphs for high-performance execution with:
 
 - **Declarative graph construction** – Build computation as a DAG of stages
 - **Automatic dependency tracking** – Stages execute in topological order
@@ -315,9 +338,11 @@ The **GraphOrchestrator** is the graph-based execution system for transformer in
 - **State management** – Owns KV cache, position tracking, and activation buffers
 - **Collective context** – Routes MPI operations to appropriate backends (NCCL/RCCL/MPI/Host)
 
+**Relationship to OrchestrationRunner**: The `OrchestrationRunner` creates and manages one or more `DeviceGraphOrchestrator` instances (one per device). For single-device scenarios, `DeviceGraphOrchestrator` handles all inference directly. For multi-device LOCAL TP, `MultiDeviceOrchestrator` coordinates multiple `DeviceGraphOrchestrator` instances.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                        GraphOrchestrator                                     │
+│                        DeviceGraphOrchestrator                              │
 │                                                                              │
 │   ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────────────┐   │
 │   │  InferenceState │   │  GraphExecutor  │   │   LayerGraphCache       │   │
@@ -348,7 +373,7 @@ The **GraphOrchestrator** is the graph-based execution system for transformer in
 
 ### 3.2 InferenceState
 
-Location: `src/v2/execution/GraphOrchestrator.h`
+Location: `src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h`
 
 The **InferenceState** struct holds all buffers for inference:
 
@@ -388,7 +413,7 @@ struct InferenceState {
 
 ### 3.3 ComputeGraph and ComputeNode
 
-Location: `src/v2/execution/GraphExecutor.h`
+Location: `src/v2/execution/local_execution/graph/GraphExecutor.h`
 
 A **ComputeGraph** is a DAG of `ComputeNode` structures:
 
@@ -571,13 +596,13 @@ forward(tokens, seq_len)
 
 ### 3.4 MPI Tensor Parallelism
 
-The GraphOrchestrator implements **Megatron-style tensor parallelism** where weight matrices are split across MPI ranks:
+The DeviceGraphOrchestrator implements **Megatron-style tensor parallelism** where weight matrices are split across MPI ranks:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           RANK 0                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  GraphOrchestrator (owns InferenceState, GraphExecutor)              │    │
+│  │  DeviceGraphOrchestrator (owns InferenceState, GraphExecutor)        │    │
 │  │  ┌──────────────────────────────────────────────────────────────┐   │    │
 │  │  │  ComputeGraph (FFN layer)                                     │   │    │
 │  │  │  ┌────────┐ ┌────────┐ ┌────────┐ ┌──────────────┐ ┌───────┐ │   │    │
@@ -597,7 +622,7 @@ The GraphOrchestrator implements **Megatron-style tensor parallelism** where wei
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           RANK 1                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  GraphOrchestrator ← SEPARATE INSTANCE, IDENTICAL GRAPH STRUCTURE    │    │
+│  │  DeviceGraphOrchestrator ← SEPARATE INSTANCE, IDENTICAL GRAPH        │    │
 │  │  ┌──────────────────────────────────────────────────────────────┐   │    │
 │  │  │  ComputeGraph (structurally identical)                        │   │    │
 │  │  │  ┌────────┐ ┌────────┐ ┌────────┐ ┌──────────────┐ ┌───────┐ │   │    │
@@ -614,7 +639,7 @@ The GraphOrchestrator implements **Megatron-style tensor parallelism** where wei
 ```
 
 **Key Points:**
-- Each rank has its own `GraphOrchestrator` instance
+- Each rank has its own `DeviceGraphOrchestrator` instance
 - Graphs are structurally identical across ranks
 - Weight tensors point to different shards
 - `AllreduceStage` / `AllGatherStage` synchronize partial results
@@ -624,7 +649,7 @@ The GraphOrchestrator implements **Megatron-style tensor parallelism** where wei
 For decode mode (seq_len=1), graphs are cached and reused:
 
 ```cpp
-bool GraphOrchestrator::executeAttention(...) {
+bool DeviceGraphOrchestrator::executeAttention(...) {
     if (graph_caching_enabled_ && seq_len == 1) {
         auto& cache = layer_graph_cache_[layer_idx];
         
@@ -658,7 +683,7 @@ bool GraphOrchestrator::executeAttention(...) {
 
 ### 4.1 CollectiveContext
 
-Location: `src/v2/execution/CollectiveContext.h`
+Location: `src/v2/execution/local_execution/collective/CollectiveContext.h`
 
 The **CollectiveContext** bridges compute stages to MPI backends:
 
@@ -741,7 +766,7 @@ enum class CollectiveBackendType {
 
 ### 5.1 GraphBufferManager
 
-Location: `src/v2/execution/GraphBufferManager.h`
+Location: `src/v2/execution/local_execution/graph/GraphBufferManager.h`
 
 Manages memory allocation with buffer aliasing for reduced footprint:
 
@@ -763,7 +788,7 @@ public:
 
 ### 5.2 LivenessAnalyzer
 
-Location: `src/v2/execution/LivenessAnalyzer.h`
+Location: `src/v2/execution/local_execution/graph/LivenessAnalyzer.h`
 
 Analyzes buffer lifetimes to enable SCRATCH buffer aliasing:
 
@@ -793,7 +818,7 @@ Stage 3: gate = GEMM(hidden)        gate live [3, 4] ← can reuse Q's memory!
 
 ### 5.3 DeviceWorkspaceManager
 
-Location: `src/v2/execution/DeviceWorkspaceManager.h`
+Location: `src/v2/execution/local_execution/device/DeviceWorkspaceManager.h`
 
 Per-device workspace allocation with zero-allocation hot path:
 
@@ -1033,12 +1058,12 @@ enum class KVCacheLayoutMode : uint8_t {
 | `POSITION_MAJOR` | Append is contiguous | FP32/BF16 attention (standard) |
 | `HEAD_MAJOR` | Per-head iteration is contiguous | Q16_INTEGER attention |
 
-**GraphOrchestrator Auto-Selection:**
+**DeviceGraphOrchestrator Auto-Selection:**
 
-The `GraphOrchestrator` automatically selects the optimal layout based on KV cache precision:
+The `DeviceGraphOrchestrator` automatically selects the optimal layout based on KV cache precision:
 
 ```cpp
-// In GraphOrchestrator::createKVCache()
+// In DeviceGraphOrchestrator::createKVCache()
 KVCacheLayoutMode layout_mode = (kv_precision == ActivationPrecision::Q16_1)
     ? KVCacheLayoutMode::HEAD_MAJOR   // Optimal for Q16IntegerAttention
     : KVCacheLayoutMode::POSITION_MAJOR;  // Default for FP32/BF16
@@ -1080,7 +1105,7 @@ class IUnifiedKVCache {
 
 ### 4.6 Device Coherence Protocol
 
-Location: `src/v2/tensors/TensorClasses.h`, `src/v2/execution/StageCoherence.h`, `src/v2/execution/GpuCoherence.h`
+Location: `src/v2/tensors/TensorClasses.h`, `src/v2/execution/local_execution/coherence/StageCoherence.h`, `src/v2/execution/local_execution/coherence/GpuCoherence.h`
 
 Llaminar uses a **dual-validity coherence protocol** to manage tensor data movement between host (CPU) and device (GPU) memory. Each `TensorBase` tracks two independent validity flags: `host_valid_` and `device_valid_`.
 
@@ -1210,7 +1235,7 @@ public:
 
 #### Automatic Coherence via GraphExecutor
 
-Location: `src/v2/execution/GraphExecutor.cpp`, `src/v2/execution/StageCoherence.h`
+Location: `src/v2/execution/local_execution/graph/GraphExecutor.cpp`, `src/v2/execution/local_execution/coherence/StageCoherence.h`
 
 The `GraphExecutor` handles coherence **automatically** at stage boundaries using the stage's `coherencePolicy()`:
 
@@ -1337,12 +1362,12 @@ bool initMappedMemory(size_t bytes, DeviceId target_device);
 
 #### Manual Coherence Utilities
 
-Location: `src/v2/execution/GpuCoherence.h`
+Location: `src/v2/execution/local_execution/coherence/GpuCoherence.h`
 
 For tests and custom pipelines that bypass GraphExecutor, use RAII utilities:
 
 ```cpp
-#include "execution/GpuCoherence.h"
+#include "execution/local_execution/coherence/GpuCoherence.h"
 
 // Pattern 1: Lambda wrapper (preferred - handles both inputs and outputs)
 bool ok = with_gpu_coherence(
@@ -1714,64 +1739,73 @@ void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
 
 | Component | Location |
 |-----------|----------|
-| **Application Layer** | |
-| Inference interface | `src/v2/execution/IInferenceRunner.h` |
-| Inference factory | `src/v2/execution/InferenceRunnerFactory.h` |
+| **Runner Layer** | |
+| IOrchestrationRunner | `src/v2/execution/runner/IOrchestrationRunner.h` |
+| OrchestrationRunner | `src/v2/execution/runner/OrchestrationRunner.h` |
+| IOrchestrationRunnerFactory | `src/v2/execution/runner/IOrchestrationRunnerFactory.h` |
+| OrchestrationRunnerFactory | `src/v2/execution/runner/OrchestrationRunnerFactory.cpp` |
+| **MPI Planning Layer** | |
+| RankExecutionPlan | `src/v2/execution/mpi_orchestration/RankExecutionPlan.h` |
+| ExecutionPlanBuilder | `src/v2/execution/mpi_orchestration/ExecutionPlanBuilder.h` |
+| IExecutionPlanBuilder | `src/v2/execution/mpi_orchestration/IExecutionPlanBuilder.h` |
+| DeviceInventory | `src/v2/execution/mpi_orchestration/DeviceInventory.h` |
+| ClusterInventory | `src/v2/execution/mpi_orchestration/DeviceInventory.h` |
+| PlacementStrategy | `src/v2/execution/mpi_orchestration/PlacementStrategy.h` |
+| WorkDistributor | `src/v2/execution/mpi_orchestration/WorkDistributor.h` |
+| **Local Execution Layer** | |
+| DeviceGraphOrchestrator | `src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h` |
+| MultiDeviceOrchestrator | `src/v2/execution/local_execution/orchestrators/MultiDeviceOrchestrator.h` |
+| MultiDomainOrchestrator | `src/v2/execution/local_execution/orchestrators/MultiDomainOrchestrator.h` |
+| IInferenceRunner | `src/v2/execution/local_execution/orchestrators/IInferenceRunner.h` |
+| InferenceRunnerFactory | `src/v2/execution/factory/InferenceRunnerFactory.h` |
 | Model context interface | `src/v2/interfaces/IModelContext.h` |
-| **Orchestration Layer (Phase 5)** | |
-| IOrchestrationRunner | `src/v2/orchestration/IOrchestrationRunner.h` |
-| OrchestrationRunner | `src/v2/orchestration/OrchestrationRunner.h` |
-| OrchestrationRunnerFactory | `src/v2/orchestration/OrchestrationRunnerFactory.cpp` |
-| OrchestrationConfig | `src/v2/config/OrchestrationConfig.h` |
-| RankExecutionPlan | `src/v2/execution/RankExecutionPlan.h` |
-| ExecutionPlanBuilder | `src/v2/execution/ExecutionPlanBuilder.h` |
-| **Device Management (Phase 6)** | |
+| **Local Execution / Graph** | |
+| GraphExecutor | `src/v2/execution/local_execution/graph/GraphExecutor.h` |
+| IGraphBuilder | `src/v2/execution/local_execution/graph/IGraphBuilder.h` |
+| GraphBufferManager | `src/v2/execution/local_execution/graph/GraphBufferManager.h` |
+| LivenessAnalyzer | `src/v2/execution/local_execution/graph/LivenessAnalyzer.h` |
+| **Local Execution / Device** | |
+| DeviceContext | `src/v2/execution/local_execution/device/DeviceContext.h` |
+| DeviceWorkspaceManager | `src/v2/execution/local_execution/device/DeviceWorkspaceManager.h` |
+| **Local Execution / Coherence** | |
+| StageCoherence | `src/v2/execution/local_execution/coherence/StageCoherence.h` |
+| GpuCoherence | `src/v2/execution/local_execution/coherence/GpuCoherence.h` |
+| **Local Execution / Collective** | |
+| CollectiveContext | `src/v2/execution/local_execution/collective/CollectiveContext.h` |
+| **Local Execution / Model** | |
+| ModelExecutor | `src/v2/execution/local_execution/model/ModelExecutor.h` |
+| LayerExecutor | `src/v2/execution/local_execution/model/LayerExecutor.h` |
+| **Device Management** | |
 | GlobalDeviceAddress | `src/v2/backends/GlobalDeviceAddress.h` |
 | DeviceRegistry | `src/v2/backends/DeviceRegistry.h` |
 | DeviceAddressAdapter | `src/v2/backends/DeviceAddressAdapter.h` |
-| **Graph Orchestration** | |
-| GraphOrchestrator | `src/v2/execution/GraphOrchestrator.h` |
-| Graph builder interface | `src/v2/execution/IGraphBuilder.h` |
+| **Graph Building** | |
 | Qwen2 graph builder | `src/v2/models/qwen/Qwen2Graph.h` |
-| **Graph Layer** | |
-| Graph executor | `src/v2/execution/GraphExecutor.h` |
-| Compute stages | `src/v2/execution/compute_stages/` |
-| Stage base interface | `src/v2/execution/compute_stages/IComputeStage.h` |
-| **Buffer Management** | |
-| Graph buffer manager | `src/v2/execution/GraphBufferManager.h` |
-| Liveness analyzer | `src/v2/execution/LivenessAnalyzer.h` |
-| Workspace manager | `src/v2/execution/DeviceWorkspaceManager.h` |
+| Qwen2BufferSpec | `src/v2/models/qwen/Qwen2BufferSpec.h` |
+| **Compute Stages** | |
+| IComputeStage | `src/v2/execution/compute_stages/IComputeStage.h` |
+| Stage implementations | `src/v2/execution/compute_stages/stages/` |
 | **Collective Layer** | |
-| Collective context | `src/v2/execution/CollectiveContext.h` |
-| Backend router | `src/v2/collective/BackendRouter.h` |
-| Backend interface | `src/v2/collective/ICollectiveBackend.h` |
-| NCCL/RCCL/MPI backends | `src/v2/collective/backends/` |
-| PCIeBAR backend | `src/v2/collective/backends/PCIeBARBackend.h` |
-| **LOCAL Tensor Parallelism (Phase 4)** | |
+| BackendRouter | `src/v2/collective/BackendRouter.h` |
+| ICollectiveBackend | `src/v2/collective/ICollectiveBackend.h` |
 | ILocalTPContext | `src/v2/collective/ILocalTPContext.h` |
 | LocalTPContext | `src/v2/collective/LocalTPContext.h` |
-| LocalTPWeightSharder | `src/v2/collective/LocalTPWeightSharder.h` |
-| LocalTPAllreduceStage | `src/v2/execution/compute_stages/stages/LocalTPAllreduceStage.h` |
-| **Hybrid Parallelism** | |
+| NCCL/RCCL/MPI backends | `src/v2/collective/backends/` |
+| PCIeBAR backend | `src/v2/collective/backends/PCIeBARBackend.h` |
+| **Config** | |
+| OrchestrationConfig | `src/v2/config/OrchestrationConfig.h` |
 | TensorParallelConfig | `src/v2/config/TensorParallelConfig.h` |
 | PipelineParallelConfig | `src/v2/config/PipelineParallelConfig.h` |
 | LayerPlacementConfig | `src/v2/config/LayerPlacementConfig.h` |
-| SendActivationsStage | `src/v2/execution/compute_stages/stages/SendActivationsStage.h` |
-| ReceiveActivationsStage | `src/v2/execution/compute_stages/stages/ReceiveActivationsStage.h` |
-| AllGatherVStage | `src/v2/execution/compute_stages/stages/AllGatherVStage.h` |
-| MPI tags | `src/v2/utils/MPITags.h` |
-| **Coherence** | |
-| Stage coherence | `src/v2/execution/StageCoherence.h` |
-| GPU coherence utilities | `src/v2/execution/GpuCoherence.h` |
 | **Kernel Layer** | |
 | KernelFactory | `src/v2/kernels/KernelFactory.h` |
 | CPU kernels | `src/v2/kernels/cpu/` |
 | CUDA kernels | `src/v2/kernels/cuda/` |
 | ROCm kernels | `src/v2/kernels/rocm/` |
 | **Backend Layer** | |
-| Backend manager | `src/v2/backends/BackendManager.h` |
-| Backend interface | `src/v2/backends/IBackend.h` |
-| DeviceId (legacy) | `src/v2/backends/DeviceId.h` |
+| BackendManager | `src/v2/backends/BackendManager.h` |
+| IBackend | `src/v2/backends/IBackend.h` |
+| DeviceId | `src/v2/backends/DeviceId.h` |
 | **Tensor Layer** | |
 | ITensor interface | `src/v2/tensors/ITensor.h` |
 | CPU tensors | `src/v2/tensors/TensorClasses.h` |
@@ -1786,17 +1820,17 @@ void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
 ### 9.2 Key Design Rules
 
 1. **Use `IOrchestrationRunner`** for complex multi-device scenarios – Handles TP/PP/heterogeneous automatically
-2. **Use `IInferenceRunner`** for simple single-device inference – Don't call `GraphOrchestrator` directly from Main/ChatUI
+2. **Use `IInferenceRunner`** for simple single-device inference – Don't call `DeviceGraphOrchestrator` directly from Main/ChatUI
 3. **Keep MPI out of kernels** – MPI sync lives in `AllreduceStage` and `AllGatherStage`
 4. **Use KernelFactory** – Prefer `getOrCreateGemm()` for cached kernel access
 5. **Declarative graphs** – Build computation as DAGs of `ComputeStage` nodes
-5. **Graph caching** – Reuse cached graphs in decode mode for performance
-6. **Use StageCoherence** – Let GraphExecutor handle GPU↔CPU sync automatically
-7. **Implement getDumpInfo()** – All stages must support introspection
-8. **DeviceId not int** – Use typed `DeviceId` for device identification
-9. **Collective via BackendRouter** – Let the router select optimal MPI backend
-10. **Configure parallelism via Config classes** – Use `TensorParallelConfig`, `PipelineParallelConfig`, `LayerPlacementConfig`
-11. **Use PCIeBAR for heterogeneous TP** – Direct BAR mapping is 8× faster than host staging
+6. **Graph caching** – Reuse cached graphs in decode mode for performance
+7. **Use StageCoherence** – Let GraphExecutor handle GPU↔CPU sync automatically
+8. **Implement getDumpInfo()** – All stages must support introspection
+9. **DeviceId not int** – Use typed `DeviceId` for device identification
+10. **Collective via BackendRouter** – Let the router select optimal MPI backend
+11. **Configure parallelism via Config classes** – Use `TensorParallelConfig`, `PipelineParallelConfig`, `LayerPlacementConfig`
+12. **Use PCIeBAR for heterogeneous TP** – Direct BAR mapping is 8× faster than host staging
 
 ### 9.3 Environment Variables
 
@@ -2451,7 +2485,7 @@ public:
 
 ```cpp
 #include "config/TensorParallelConfig.h"
-#include "execution/CollectiveContext.h"
+#include "execution/local_execution/collective/CollectiveContext.h"
 
 // Configure proportional tensor parallelism
 auto tp_config = TensorParallelConfig::proportionalSplit(
@@ -2851,7 +2885,7 @@ public:
 
 ### 12.6 IOrchestrationRunner
 
-Location: `src/v2/orchestration/IOrchestrationRunner.h`
+Location: `src/v2/execution/runner/IOrchestrationRunner.h`
 
 The **end-to-end interface** for orchestrated inference:
 
@@ -2896,7 +2930,7 @@ public:
 
 ### 12.7 OrchestrationRunnerFactory
 
-Location: `src/v2/orchestration/IOrchestrationRunnerFactory.h`, `OrchestrationRunnerFactory.cpp`
+Location: `src/v2/execution/runner/IOrchestrationRunnerFactory.h`, `OrchestrationRunnerFactory.cpp`
 
 Factory for creating `IOrchestrationRunner` instances:
 
@@ -2950,7 +2984,7 @@ runner->shutdown();
 
 ### 12.8 CollectiveContext Single-Device Optimization
 
-Location: `src/v2/execution/CollectiveContext.cpp`
+Location: `src/v2/execution/local_execution/collective/CollectiveContext.cpp`
 
 The `CollectiveContext` now handles single-device scenarios efficiently:
 
@@ -2992,19 +3026,20 @@ This optimization ensures that single-rank unit tests work correctly without req
 | **Configuration** | |
 | OrchestrationConfig | `src/v2/config/OrchestrationConfig.h` |
 | ConfigParser | `src/v2/config/ConfigParser.h` |
-| **Execution Planning** | |
-| RankExecutionPlan | `src/v2/execution/RankExecutionPlan.h` |
-| ExecutionPlanBuilder | `src/v2/execution/ExecutionPlanBuilder.h` |
+| **MPI Planning** | |
+| RankExecutionPlan | `src/v2/execution/mpi_orchestration/RankExecutionPlan.h` |
+| ExecutionPlanBuilder | `src/v2/execution/mpi_orchestration/ExecutionPlanBuilder.h` |
+| DeviceInventory | `src/v2/execution/mpi_orchestration/DeviceInventory.h` |
+| PlacementStrategy | `src/v2/execution/mpi_orchestration/PlacementStrategy.h` |
+| WorkDistributor | `src/v2/execution/mpi_orchestration/WorkDistributor.h` |
 | **LOCAL TP** | |
 | ILocalTPContext | `src/v2/collective/ILocalTPContext.h` |
 | LocalTPContext | `src/v2/collective/LocalTPContext.h` |
-| LocalTPWeightSharder | `src/v2/collective/LocalTPWeightSharder.h` |
-| LocalTPAllreduceStage | `src/v2/execution/compute_stages/stages/LocalTPAllreduceStage.h` |
 | **Orchestration Runner** | |
-| IOrchestrationRunner | `src/v2/orchestration/IOrchestrationRunner.h` |
-| OrchestrationRunner | `src/v2/orchestration/OrchestrationRunner.h` |
-| IOrchestrationRunnerFactory | `src/v2/orchestration/IOrchestrationRunnerFactory.h` |
-| OrchestrationRunnerFactory | `src/v2/orchestration/OrchestrationRunnerFactory.cpp` |
+| IOrchestrationRunner | `src/v2/execution/runner/IOrchestrationRunner.h` |
+| OrchestrationRunner | `src/v2/execution/runner/OrchestrationRunner.h` |
+| IOrchestrationRunnerFactory | `src/v2/execution/runner/IOrchestrationRunnerFactory.h` |
+| OrchestrationRunnerFactory | `src/v2/execution/runner/OrchestrationRunnerFactory.cpp` |
 
 ---
 
@@ -3014,10 +3049,11 @@ This architecture is intentionally modular: small, focused abstractions connecte
 
 | Layer | Interface | Purpose |
 |-------|-----------|---------|
-| **Application** | `IOrchestrationRunner` | Complex multi-device scenarios |
-| **Inference** | `IInferenceRunner` | Simple single-device inference |
-| **Orchestration** | `GraphOrchestrator` | Graph building and execution |
-| **Collective** | `ILocalTPContext` | LOCAL tensor parallelism |
+| **Runner** | `IOrchestrationRunner` | Top-level inference lifecycle |
+| **MPI Planning** | `RankExecutionPlan` | Cross-rank work distribution |
+| **Local Execution** | `DeviceGraphOrchestrator` | Single-device graph execution |
+| **Multi-Device** | `MultiDeviceOrchestrator` | Multi-GPU LOCAL TP |
+| **Collective** | `ILocalTPContext` | Intra-rank collective operations |
 | **Backend** | `IDeviceRegistry` | Device discovery and management |
 
 Callers (Main.cpp, ChatUI, tests) can choose the appropriate abstraction level for their use case, while implementation details remain encapsulated.

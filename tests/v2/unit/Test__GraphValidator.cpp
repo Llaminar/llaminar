@@ -8,8 +8,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../src/v2/execution/GraphValidator.h"
-#include "../../../src/v2/execution/GraphExecutor.h"
+#include "../../../src/v2/execution/local_execution/graph/GraphValidator.h"
+#include "../../../src/v2/execution/local_execution/graph/GraphExecutor.h"
 #include "execution/compute_stages/ComputeStages.h"
 
 using namespace llaminar2;

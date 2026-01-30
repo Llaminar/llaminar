@@ -13,7 +13,7 @@
 
 #include <gtest/gtest.h>
 #include "execution/compute_stages/ComputeStages.h"
-#include "execution/RuntimeConfig.h"
+#include "execution/config/RuntimeConfig.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
 #include "kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h" // For complete type

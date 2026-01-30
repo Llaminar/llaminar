@@ -13,8 +13,8 @@
  */
 
 #include "CUDARingKVCache.h"
-#include "../../../execution/DeviceWorkspaceManager.h"
-#include "../../../execution/WorkspaceDescriptor.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>

@@ -15,11 +15,11 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
-#include "orchestration/IOrchestrationRunner.h"
-#include "orchestration/IOrchestrationRunnerFactory.h"
-#include "orchestration/OrchestrationRunner.h"
+#include "execution/runner/IOrchestrationRunner.h"
+#include "execution/runner/IOrchestrationRunnerFactory.h"
+#include "execution/runner/OrchestrationRunner.h"
 #include "config/OrchestrationConfig.h"
-#include "execution/RankExecutionPlan.h"
+#include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "backends/GlobalDeviceAddress.h"
 
 using namespace llaminar2;

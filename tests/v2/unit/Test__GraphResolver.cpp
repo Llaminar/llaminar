@@ -6,9 +6,9 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../src/v2/execution/GraphResolver.h"
-#include "../../../src/v2/execution/GraphSchema.h"
-#include "../../../src/v2/execution/GraphExecutor.h"
+#include "../../../src/v2/execution/local_execution/graph/GraphResolver.h"
+#include "../../../src/v2/execution/local_execution/graph/GraphSchema.h"
+#include "../../../src/v2/execution/local_execution/graph/GraphExecutor.h"
 #include "../../../src/v2/models/qwen/Qwen2Schema.h"
 #include "../../../src/v2/tensors/Tensors.h"
 

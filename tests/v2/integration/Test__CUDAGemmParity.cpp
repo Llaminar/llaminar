@@ -27,9 +27,9 @@
 #include "tensors/TensorKernels.h" // For TensorProjectionDesc
 #include "kernels/KernelFactory.h"
 #include "backends/ComputeBackend.h"
-#include "execution/DeviceContext.h"
-#include "execution/GpuCoherence.h"           // For gpu_output(), with_gpu_coherence()
-#include "execution/DeviceWorkspaceManager.h" // For workspace binding
+#include "execution/local_execution/device/DeviceContext.h"
+#include "execution/local_execution/coherence/GpuCoherence.h"        // For gpu_output(), with_gpu_coherence()
+#include "execution/local_execution/device/DeviceWorkspaceManager.h" // For workspace binding
 #include "loaders/ModelLoader.h"
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"

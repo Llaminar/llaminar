@@ -12,7 +12,7 @@
 #include <gtest/gtest.h>
 
 #include "../../src/v2/utils/MPITopology.h"
-#include "../../src/v2/execution/DeviceInventory.h"
+#include "../../src/v2/execution/mpi_orchestration/DeviceInventory.h"
 
 using namespace llaminar2;
 

@@ -20,7 +20,7 @@
 #include <gtest/gtest.h>
 
 #include "tensors/Tensors.h"
-#include "execution/RuntimeConfig.h"
+#include "execution/config/RuntimeConfig.h"
 
 #ifdef HAVE_CUDA
 #include <cuda_runtime.h>

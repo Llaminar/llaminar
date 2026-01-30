@@ -14,8 +14,8 @@
 
 #include "../mocks/MockComputeStage.h"
 #include "backends/DeviceId.h"
-#include "execution/ILayerExecutor.h"
-#include "execution/LayerExecutor.h"
+#include "execution/local_execution/model/ILayerExecutor.h"
+#include "execution/local_execution/model/LayerExecutor.h"
 #include "execution/compute_stages/ComputeStages.h"
 
 using namespace llaminar2;

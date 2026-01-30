@@ -1,0 +1,2175 @@
+/**
+ * @file DeviceGraphOrchestrator.cpp
+ * @brief Implementation of Qwen2 compute graph orchestrator
+ * @author David Sanftenberg
+ * @date December 2025
+ *
+ * This file implements the execution layer for Qwen2 models, managing
+ * graph execution, device contexts, and caching.
+ */
+
+#include "DeviceGraphOrchestrator.h"
+#include "../../config/HybridPrecisionConfig.h"
+#include "../device/DeviceWorkspaceManager.h"
+#include "../device/WorkspaceDescriptor.h"
+#include "../../../loaders/WeightManager.h"
+#include "../../../loaders/WeightPlacementMap.h"
+#include "../../../config/TensorParallelConfig.h"
+#include "../../../collective/ILocalTPContext.h"
+#include "../../../utils/Logger.h"
+#include "../../../utils/DebugEnv.h"
+#include "../../../utils/MPIContext.h"
+#include "../../../tensors/TensorFactory.h"
+#include "../../../tensors/TensorClasses.h" // For FP32Tensor::createMapped()
+#include "../../../kernels/cpu/CPUKVCache.h"
+#include "../../../kernels/KernelFactory.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
+#include <chrono>
+#include <algorithm>
+
+namespace llaminar2
+{
+
+    // =========================================================================
+    // Constructors
+    // =========================================================================
+
+    DeviceGraphOrchestrator::DeviceGraphOrchestrator(
+        Dependencies deps,
+        const Qwen2GraphConfig &graph_config,
+        const GraphCacheConfig &cache_config)
+        : graph_builder_(std::make_shared<Qwen2Graph>(graph_config, nullptr)), // Create graph without MPI (uses topology)
+          mpi_ctx_(nullptr),                                                   // No direct MPI context - use injected topology
+          cache_config_(cache_config),
+          injected_model_ctx_(std::move(deps.model_ctx)),
+          injected_topology_(std::move(deps.topology)),
+          injected_collective_ctx_(std::move(deps.collective_ctx))
+    {
+        if (!injected_model_ctx_)
+        {
+            throw std::invalid_argument("DeviceGraphOrchestrator Dependencies requires a valid model_ctx");
+        }
+
+        if (!graph_builder_)
+        {
+            throw std::invalid_argument("DeviceGraphOrchestrator failed to create graph builder");
+        }
+
+        // Configure executor from graph builder's config
+        GraphExecutorConfig exec_config;
+        exec_config.default_device = graph_builder_->config().default_device;
+
+        // Parse execution mode and profiling from environment
+        const auto &env = debugEnv();
+
+        // Enable profiling from either graph config or env variable
+        exec_config.enable_profiling = graph_builder_->config().enable_profiling || env.execution.executor_profiling;
+        exec_config.enable_validation = graph_builder_->config().enable_validation;
+
+        if (env.execution.execution_mode == "parallel")
+        {
+            exec_config.mode = ExecutionMode::PARALLEL;
+        }
+        else if (env.execution.execution_mode == "pipelined")
+        {
+            exec_config.mode = ExecutionMode::PIPELINED;
+        }
+        else
+        {
+            exec_config.mode = ExecutionMode::SEQUENTIAL;
+        }
+
+        executor_ = GraphExecutor(exec_config);
+
+        // Propagate MPI rank to executor for stage dumping (from injected topology)
+        if (injected_topology_)
+        {
+            executor_.setMPIRank(injected_topology_->rank());
+        }
+
+        // Wire CollectiveContext to executor for GPU-native collectives (RCCL/NCCL/PCIeBAR)
+        if (injected_collective_ctx_)
+        {
+            executor_.setCollectiveContext(injected_collective_ctx_.get());
+            LOG_INFO("[DeviceGraphOrchestrator] Wired CollectiveContext to GraphExecutor");
+        }
+
+        LOG_INFO("[DeviceGraphOrchestrator] Initialized with injected dependencies, caching="
+                 << (cache_config_.enabled ? "enabled" : "disabled")
+                 << ", topology=" << (injected_topology_ ? "provided" : "none")
+                 << ", collective=" << (injected_collective_ctx_ ? "provided" : "none"));
+    }
+
+    DeviceGraphOrchestrator::DeviceGraphOrchestrator(
+        std::shared_ptr<Qwen2Graph> graph_builder,
+        std::shared_ptr<MPIContext> mpi_ctx,
+        const GraphCacheConfig &cache_config)
+        : graph_builder_(std::move(graph_builder)),
+          mpi_ctx_(std::move(mpi_ctx)),
+          cache_config_(cache_config)
+    {
+        if (!graph_builder_)
+        {
+            throw std::invalid_argument("DeviceGraphOrchestrator requires a valid graph builder");
+        }
+
+        // Configure executor from graph builder's config
+        GraphExecutorConfig exec_config;
+        exec_config.default_device = graph_builder_->config().default_device;
+
+        // Parse execution mode and profiling from environment
+        const auto &env = debugEnv();
+
+        // Enable profiling from either graph config or env variable
+        exec_config.enable_profiling = graph_builder_->config().enable_profiling || env.execution.executor_profiling;
+        exec_config.enable_validation = graph_builder_->config().enable_validation;
+
+        if (env.execution.execution_mode == "parallel")
+        {
+            exec_config.mode = ExecutionMode::PARALLEL;
+        }
+        else if (env.execution.execution_mode == "pipelined")
+        {
+            exec_config.mode = ExecutionMode::PIPELINED;
+        }
+        else
+        {
+            exec_config.mode = ExecutionMode::SEQUENTIAL;
+        }
+
+        executor_ = GraphExecutor(exec_config);
+
+        // Propagate MPI rank to executor for stage dumping
+        if (mpi_ctx_)
+        {
+            executor_.setMPIRank(mpi_ctx_->rank());
+        }
+
+        LOG_INFO("[DeviceGraphOrchestrator] Initialized with graph builder, caching="
+                 << (cache_config_.enabled ? "enabled" : "disabled"));
+    }
+
+    DeviceGraphOrchestrator::DeviceGraphOrchestrator(
+        const Qwen2GraphConfig &graph_config,
+        std::shared_ptr<MPIContext> mpi_ctx,
+        const GraphCacheConfig &cache_config)
+        // Create Qwen2Graph with MPI context FIRST (before any move)
+        : graph_builder_(std::make_shared<Qwen2Graph>(graph_config, mpi_ctx)),
+          mpi_ctx_(std::move(mpi_ctx)),
+          cache_config_(cache_config)
+    {
+        // Duplicate initialization logic from the other constructor
+        if (!graph_builder_)
+        {
+            throw std::invalid_argument("DeviceGraphOrchestrator requires a valid graph builder");
+        }
+
+        // Configure executor from graph builder's config
+        GraphExecutorConfig exec_config;
+        exec_config.default_device = graph_builder_->config().default_device;
+
+        // Parse execution mode and profiling from environment
+        const auto &env = debugEnv();
+
+        // Enable profiling from either graph config or env variable
+        exec_config.enable_profiling = graph_builder_->config().enable_profiling || env.execution.executor_profiling;
+        exec_config.enable_validation = graph_builder_->config().enable_validation;
+        if (env.execution.execution_mode == "parallel")
+        {
+            exec_config.mode = ExecutionMode::PARALLEL;
+        }
+        else if (env.execution.execution_mode == "pipelined")
+        {
+            exec_config.mode = ExecutionMode::PIPELINED;
+        }
+        else
+        {
+            exec_config.mode = ExecutionMode::SEQUENTIAL;
+        }
+
+        executor_ = GraphExecutor(exec_config);
+
+        // Propagate MPI rank to executor for stage dumping
+        if (mpi_ctx_)
+        {
+            executor_.setMPIRank(mpi_ctx_->rank());
+        }
+
+        LOG_INFO("[DeviceGraphOrchestrator] Initialized with graph builder, caching="
+                 << (cache_config_.enabled ? "enabled" : "disabled"));
+    }
+
+    // =========================================================================
+    // Device Context Management
+    // =========================================================================
+
+    IDeviceContext *DeviceGraphOrchestrator::getDeviceContext(DeviceId device)
+    {
+        auto it = device_contexts_.find(device);
+        if (it != device_contexts_.end())
+        {
+            return it->second.get();
+        }
+
+        // Create new context using DeviceId
+        auto ctx = IDeviceContext::create(device);
+        if (!ctx)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to create device context for device " << device.toString());
+            return nullptr;
+        }
+
+        IDeviceContext *raw_ptr = ctx.get();
+        device_contexts_[device] = std::move(ctx);
+
+        LOG_DEBUG("[DeviceGraphOrchestrator] Created device context for device " << device.to_string());
+        return raw_ptr;
+    }
+
+    // =========================================================================
+    // Weight and Buffer Configuration
+    // =========================================================================
+
+    void DeviceGraphOrchestrator::setWeights(const Qwen2ModelWeights &weights)
+    {
+        if (!graph_builder_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot set weights: graph builder not initialized");
+            return;
+        }
+        graph_builder_->setWeights(weights);
+        LOG_DEBUG("[DeviceGraphOrchestrator] Model weights configured for full forward pass");
+    }
+
+    void DeviceGraphOrchestrator::setBuffers(const Qwen2ModelBuffers &buffers)
+    {
+        if (!graph_builder_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot set buffers: graph builder not initialized");
+            return;
+        }
+        graph_builder_->setBuffers(buffers);
+        LOG_DEBUG("[DeviceGraphOrchestrator] Model buffers configured for full forward pass");
+    }
+
+    bool DeviceGraphOrchestrator::hasGlobalWeights() const
+    {
+        if (!graph_builder_)
+        {
+            return false;
+        }
+        // Check if the builder's isInitialized returns true AND we have global weights
+        // isInitialized() checks get_layer_weights, but we also need embedding_table etc.
+        // For now, rely on the graph builder's internal state
+        return graph_builder_->isInitialized();
+    }
+
+    // =========================================================================
+    // Graph Buffer Management (Phase 3 - moved from Qwen2Graph)
+    // =========================================================================
+
+    bool DeviceGraphOrchestrator::initializeBuffers(int seq_len)
+    {
+        if (!graph_builder_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] initializeBuffers called but graph_builder not set");
+            return false;
+        }
+
+        const auto &config = graph_builder_->config();
+        if (!config.use_graph_buffer_management)
+        {
+            LOG_WARN("[DeviceGraphOrchestrator] initializeBuffers called but use_graph_buffer_management=false");
+            return false;
+        }
+
+        LOG_INFO("[DeviceGraphOrchestrator] Initializing buffers with graph management, seq_len=" << seq_len);
+
+        // Get schema and resolver config from graph builder
+        GraphSchema schema = graph_builder_->getSchema();
+        GraphResolverConfig resolver_config = graph_builder_->getResolverConfig(seq_len);
+
+        // Verify TensorFactory is set
+        if (!tensor_factory_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] TensorFactory not set. Call setTensorFactory() before initializeBuffers()");
+            return false;
+        }
+
+        // Configure buffer manager with mapped memory for GPU + snapshot scenarios
+        // Mapped memory enables zero-copy host access (avoids slow hipMemcpy/cudaMemcpy syncs)
+        // This benefits both CUDA and ROCm backends equally
+        GraphBufferManagerConfig buffer_config;
+        bool use_mapped = state_.device_id.is_gpu() && snapshot_enabled_;
+        if (use_mapped)
+        {
+            buffer_config.use_mapped_memory = true;
+            LOG_INFO("[DeviceGraphOrchestrator] Enabling mapped memory for GPU + snapshot mode (zero-copy host access)");
+        }
+
+        // =====================================================================
+        // Configure BAR-backed allocation for LOCAL TP with PCIeBAR backend
+        // =====================================================================
+        // When LOCAL TP is active with PCIeBAR backend, row-parallel output
+        // buffers (attn_proj, ffn_output) need to be allocated in BAR memory
+        // for efficient cross-vendor allreduce. Each device needs its own buffer:
+        // - CUDA device: standard FP32 tensor
+        // - ROCm device: BAR-backed FP32 tensor accessible by both devices
+        //
+        // The GraphBufferManager checks Qwen2BufferSpec::requiresBARBacked() to
+        // identify which buffers need BAR allocation.
+        // =====================================================================
+        if (config.local_tp_ctx && config.local_tp_ctx->degree() > 1)
+        {
+            buffer_config.tp_degree = config.local_tp_ctx->degree();
+            buffer_config.collective_backend = config.local_tp_ctx->backend();
+            buffer_config.local_tp_ctx = config.local_tp_ctx;
+
+            // For PCIeBAR backend, find CUDA and ROCm devices for BAR allocation
+            if (config.local_tp_ctx->backend() == CollectiveBackendType::PCIE_BAR)
+            {
+                const auto &devices = config.local_tp_ctx->devices();
+                for (const auto &device_addr : devices)
+                {
+                    DeviceId device_id = device_addr.toLocalDeviceId();
+                    if (device_id.is_cuda() && !buffer_config.cuda_device.is_cuda())
+                    {
+                        buffer_config.cuda_device = device_id;
+                    }
+                    else if (device_id.is_rocm() && !buffer_config.rocm_device.is_rocm())
+                    {
+                        buffer_config.rocm_device = device_id;
+                    }
+                }
+
+                if (buffer_config.cuda_device.is_cuda() && buffer_config.rocm_device.is_rocm())
+                {
+                    LOG_INFO("[DeviceGraphOrchestrator] Enabled BAR-backed allocation for LOCAL TP PCIeBAR: "
+                             << "CUDA=" << buffer_config.cuda_device.toString()
+                             << ", ROCm=" << buffer_config.rocm_device.toString());
+                }
+                else
+                {
+                    LOG_WARN("[DeviceGraphOrchestrator] PCIeBAR backend but missing CUDA/ROCm pair: "
+                             << "CUDA=" << (buffer_config.cuda_device.is_cuda() ? buffer_config.cuda_device.toString() : "(none)")
+                             << ", ROCm=" << (buffer_config.rocm_device.is_rocm() ? buffer_config.rocm_device.toString() : "(none)"));
+                }
+            }
+        }
+
+        // Create buffer manager with TensorFactory
+        buffer_manager_ = std::make_unique<GraphBufferManager>(
+            tensor_factory_, mpi_ctx_.get(), buffer_config);
+
+        // Build layer buffer specifications using BufferAllocator
+        auto layer_reqs = BufferAllocator::resolveLayerBuffers(schema, resolver_config);
+
+        // Allocate layer buffers (iterate over vector)
+        for (const auto &desc : layer_reqs.buffers)
+        {
+            if (!buffer_manager_->allocateBuffer("layer", desc))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate layer buffer: " << desc.name);
+                return false;
+            }
+        }
+
+        // Build model-level buffer specifications (current_hidden, logits)
+        auto model_reqs = BufferAllocator::resolveModelBuffers(schema, resolver_config);
+
+        for (const auto &desc : model_reqs.buffers)
+        {
+            if (!buffer_manager_->allocateBuffer("model", desc))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate model buffer: " << desc.name);
+                return false;
+            }
+        }
+
+        // Bind allocated buffers to managed_buffers_ struct
+        bindGraphManagedBuffers(seq_len);
+
+        auto &stats = buffer_manager_->stats();
+        LOG_INFO("[DeviceGraphOrchestrator] Buffer initialization complete: "
+                 << "total=" << (stats.total_bytes / (1024.0 * 1024.0)) << " MB, "
+                 << "scratch=" << (stats.scratch_bytes / (1024.0 * 1024.0)) << " MB, "
+                 << "output=" << (stats.output_bytes / (1024.0 * 1024.0)) << " MB");
+
+        // Log theoretical aliasing savings
+        auto [original, optimized] = BufferAllocator::estimateMemorySavings(schema, resolver_config);
+        double savings = (original > 0) ? 100.0 * (original - optimized) / original : 0.0;
+        LOG_INFO("[DeviceGraphOrchestrator] Theoretical aliasing savings: "
+                 << (original / 1024.0) << " KB -> " << (optimized / 1024.0) << " KB"
+                 << " (" << savings << "% reduction)");
+
+        // Also update the graph builder's buffers reference
+        graph_builder_->setBuffers(managed_buffers_);
+
+        return true;
+    }
+
+    void DeviceGraphOrchestrator::releaseBuffers()
+    {
+        if (buffer_manager_)
+        {
+            buffer_manager_->releaseAll();
+            buffer_manager_.reset();
+            LOG_INFO("[DeviceGraphOrchestrator] Buffers released");
+        }
+
+        owned_buffers_.clear();
+
+        // Clear buffer pointers
+        managed_buffers_ = Qwen2ModelBuffers{};
+    }
+
+    Qwen2ActivationBuffers &DeviceGraphOrchestrator::getInternalBuffers()
+    {
+        return managed_buffers_.layer_buffers;
+    }
+
+    const Qwen2ActivationBuffers &DeviceGraphOrchestrator::getInternalBuffers() const
+    {
+        return managed_buffers_.layer_buffers;
+    }
+
+    const Qwen2ModelBuffers &DeviceGraphOrchestrator::getModelBuffers() const
+    {
+        return managed_buffers_;
+    }
+
+    const BufferAllocationStats *DeviceGraphOrchestrator::bufferStats() const
+    {
+        if (!buffer_manager_)
+        {
+            return nullptr;
+        }
+        return &buffer_manager_->stats();
+    }
+
+    void DeviceGraphOrchestrator::bindGraphManagedBuffers(int seq_len)
+    {
+        (void)seq_len; // May be used for validation in the future
+
+        if (!buffer_manager_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] bindGraphManagedBuffers: buffer_manager_ is null");
+            return;
+        }
+
+        // Bind layer buffers
+        auto &lb = managed_buffers_.layer_buffers;
+
+        lb.residual = buffer_manager_->getBuffer("layer", BufferNames::RESIDUAL);
+        lb.normalized = buffer_manager_->getBuffer("layer", BufferNames::NORMALIZED);
+
+        // Attention buffers
+        lb.Q = buffer_manager_->getBuffer("layer", BufferNames::Q);
+        lb.K = buffer_manager_->getBuffer("layer", BufferNames::K);
+        lb.V = buffer_manager_->getBuffer("layer", BufferNames::V);
+        lb.attn_output = buffer_manager_->getBuffer("layer", BufferNames::ATTN_OUTPUT);
+        lb.attn_proj = buffer_manager_->getBuffer("layer", BufferNames::ATTN_PROJ);
+        lb.workspace_scores = buffer_manager_->getBuffer("layer", BufferNames::WORKSPACE_SCORES);
+        lb.workspace_context = buffer_manager_->getBuffer("layer", BufferNames::WORKSPACE_CONTEXT);
+        lb.workspace_mask = buffer_manager_->getBuffer("layer", BufferNames::WORKSPACE_MASK);
+
+        // FFN buffers
+        lb.gate = buffer_manager_->getBuffer("layer", BufferNames::GATE);
+        lb.up = buffer_manager_->getBuffer("layer", BufferNames::UP);
+        lb.ffn_output = buffer_manager_->getBuffer("layer", BufferNames::FFN_OUTPUT);
+
+        // Model-level buffers
+        managed_buffers_.current_hidden = buffer_manager_->getBuffer("model", BufferNames::CURRENT_HIDDEN);
+        managed_buffers_.logits = buffer_manager_->getBuffer("model", BufferNames::LOGITS);
+
+        LOG_DEBUG("[DeviceGraphOrchestrator] Bound graph-managed buffers: "
+                  << "residual=" << lb.residual
+                  << " Q=" << lb.Q
+                  << " gate=" << lb.gate
+                  << " current_hidden=" << managed_buffers_.current_hidden
+                  << " logits=" << managed_buffers_.logits);
+    }
+
+    // =========================================================================
+    // Execution Methods
+    // =========================================================================
+
+    bool DeviceGraphOrchestrator::executeForward(
+        const Qwen2ForwardInput &input,
+        Qwen2ForwardOutput &output)
+    {
+        // Enable device-scoped logging if not already set by caller (e.g., from forward())
+        // This ensures executeForward() can be called directly with proper log attribution
+        ScopedDeviceLog device_log(input.device);
+
+        auto start = std::chrono::high_resolution_clock::now();
+
+        if (!input.token_ids && !input.batches)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] No token input provided");
+            return false;
+        }
+
+        if (input.seq_len <= 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Invalid sequence length: " << input.seq_len);
+            return false;
+        }
+
+        LOG_TRACE("[DeviceGraphOrchestrator] executeForward: batch_size=" << input.batch_size
+                                                                          << ", seq_len=" << input.seq_len
+                                                                          << ", device=" << input.device);
+
+        // Build position IDs if not provided externally
+        std::vector<int> position_ids_storage;
+        Qwen2ForwardInput effective_input = input;
+
+        if (!input.position_ids)
+        {
+            position_ids_storage = Qwen2Graph::buildPositionIds(
+                input.seq_len, input.batch_size, input.position_offset);
+            effective_input.position_ids = position_ids_storage.data();
+        }
+
+        // Build forward graph via declarative builder
+        LOG_DEBUG("[DeviceGraphOrchestrator] Building forward graph...");
+        ComputeGraph graph = graph_builder_->buildFullForwardGraph(effective_input, output);
+        LOG_DEBUG("[DeviceGraphOrchestrator] Forward graph built with " << graph.size() << " stages");
+
+        if (graph.size() == 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Empty forward graph");
+            return false;
+        }
+
+        // Get device context
+        LOG_DEBUG("[DeviceGraphOrchestrator] Getting device context for " << input.device << "...");
+        IDeviceContext *ctx = getDeviceContext(input.device);
+        if (!ctx)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to get device context");
+            return false;
+        }
+        LOG_DEBUG("[DeviceGraphOrchestrator] Got device context, starting execution...");
+
+        // Ensure GPU workspace is allocated for GEMM kernels (lazy initialization)
+        ensureDeviceWorkspaceAllocated(graph);
+
+        // Execute
+        bool success = executor_.execute(graph, ctx);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+
+        LOG_DEBUG("[DeviceGraphOrchestrator] Forward completed in " << ms << "ms, success=" << success);
+
+        return success;
+    }
+
+    bool DeviceGraphOrchestrator::execute(ComputeGraph &graph, IDeviceContext *ctx)
+    {
+        // Ensure GPU workspace is allocated for GEMM kernels
+        ensureDeviceWorkspaceAllocated(graph);
+        return executor_.execute(graph, ctx);
+    }
+
+    bool DeviceGraphOrchestrator::ensureDeviceWorkspaceAllocated(const ComputeGraph &graph)
+    {
+        // This function has two responsibilities:
+        // 1. Allocate workspace memory on GPU (one-time, expensive)
+        // 2. Bind workspace to stages in the current graph (every forward call)
+        //
+        // The graph is rebuilt for each forward() call with new stage objects,
+        // so we MUST bind workspace to every new graph's consumers.
+
+        LOG_DEBUG("[DeviceGraphOrchestrator] Ensuring device workspace for " << graph.size() << " stage graph");
+
+        // Get actual model dimensions from config (instead of hardcoded defaults)
+        // This ensures workspace is sized appropriately for the loaded model
+        const auto &config = graph_builder_->config();
+        const int actual_max_seq_len = config.max_seq_len > 0 ? config.max_seq_len : 4096;
+        const int actual_n_heads = config.n_heads > 0 ? config.n_heads : 128;
+        const int actual_head_dim = config.d_model > 0 && config.n_heads > 0
+                                        ? config.d_model / config.n_heads
+                                        : 128;
+        const int actual_d_model = config.d_model > 0 ? config.d_model : 896;
+        const int actual_batch_size = state_.batch_size > 0 ? state_.batch_size : 1;
+        const int actual_vocab_size = config.vocab_size > 0 ? config.vocab_size : 151936;
+
+        // Dynamic workspace budget calculation:
+        // The LM head stage dominates workspace requirements because it has the largest N dimension
+        // (vocab_size, typically ~150K) vs FFN's ~5K or attention's ~1K.
+        //
+        // ROCm INT8 GEMM requires 3 buffers scaled by M × N:
+        //   1. ACC_INT32:    M × N × sizeof(int32_t)  - main INT32 accumulator
+        //   2. TEMP_C_FP32:  M × N × sizeof(float)    - FP32 output copy for host transfer
+        //   3. ROCM_CK_INT32: M × N × sizeof(int32_t) - CK library accumulator
+        //
+        // Plus smaller buffers:
+        //   - QUANT_A:       M × K × sizeof(int8_t)   - quantized activations
+        //   - SCALES_A:      M × sizeof(float)        - per-row scales
+        //   - TEMP_A_FP32:   M × K × sizeof(float)    - FP32 input copy
+        //   - ROCM_E_PADDED: 8 × N × sizeof(float)    - padded FP32 output for M < 8
+        //   - ROCM_A_PADDED: 8 × K × sizeof(int8_t)   - padded activations for M < 8
+        //   - ROCM_SCALE_A_PADDED: 8 × sizeof(float)  - padded scales
+        //
+        // Embedding kernel requires (when table not on GPU):
+        //   - EMBED_TABLE_TEMP: vocab_size × d_model × sizeof(float) - dequantized embedding table
+        //
+        // Formula: 3 × (M × N × 4) + M×K buffers + embedding table + 10% safety margin
+        const size_t mn_buffer_size = static_cast<size_t>(actual_max_seq_len) * actual_vocab_size * sizeof(float);
+        const size_t lm_head_workspace = 3 * mn_buffer_size; // 3 M×N-sized buffers
+        const size_t mk_overhead = static_cast<size_t>(actual_max_seq_len) * actual_d_model * sizeof(float) * 2;
+        const size_t padded_n_buffer = 8ULL * actual_vocab_size * sizeof(float);                                 // ROCM_E_PADDED
+        const size_t embed_table_temp = static_cast<size_t>(actual_vocab_size) * actual_d_model * sizeof(float); // Embedding table temp
+        const size_t base_workspace = lm_head_workspace + mk_overhead + padded_n_buffer + embed_table_temp;
+        const size_t safety_margin = base_workspace / 10; // 10% safety
+        const size_t min_budget = 768ULL * 1024 * 1024;   // Floor at 768 MB for small models
+        const size_t workspace_budget = std::max(min_budget, base_workspace + safety_margin);
+
+        LOG_DEBUG("[DeviceGraphOrchestrator] Workspace sizing: max_seq_len=" << actual_max_seq_len
+                                                                             << " n_heads=" << actual_n_heads << " head_dim=" << actual_head_dim
+                                                                             << " d_model=" << config.d_model << " vocab_size=" << actual_vocab_size
+                                                                             << " batch_size=" << actual_batch_size);
+        LOG_DEBUG("[DeviceGraphOrchestrator] Workspace budget: " << (workspace_budget / (1024 * 1024)) << " MB"
+                                                                 << " (LM head: 3×" << (mn_buffer_size / (1024 * 1024)) << "MB M×N buffers"
+                                                                 << ", embed_table_temp: " << (embed_table_temp / (1024 * 1024)) << "MB"
+                                                                 << " @ max_seq_len=" << actual_max_seq_len << " × vocab_size=" << actual_vocab_size << ")");
+
+        // Collect all workspace-consuming stages by device
+        // Track extra info for each consumer to customize workspace sizing
+        struct ConsumerInfo
+        {
+            IWorkspaceConsumer *consumer;
+            bool is_kv_cache = false;
+            bool is_embedding = false;
+            bool is_attention = false;
+        };
+        std::unordered_map<DeviceId, std::vector<ConsumerInfo>> consumers_by_device;
+
+        // Iterate all nodes in the graph
+        for (const auto &node_name : graph.getExecutionOrder())
+        {
+            const ComputeNode *node = graph.getNode(node_name);
+            if (!node || !node->stage)
+                continue;
+
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(node->stage.get());
+
+            // Debug: log which nodes are workspace consumers
+            LOG_DEBUG("[DeviceGraphOrchestrator] Checking node '" << node_name
+                                                                  << "' for workspace: consumer=" << (consumer ? "yes" : "no")
+                                                                  << " device=" << node->device.toString());
+
+            if (!consumer)
+                continue;
+
+            DeviceId device = node->device;
+            if (!device.is_gpu())
+                continue; // Only GPU stages need workspace management
+
+            ConsumerInfo info;
+            info.consumer = consumer;
+            info.is_embedding = (node_name == "embedding" || node_name.find("embed") != std::string::npos);
+            info.is_attention = (node_name.find("attention") != std::string::npos);
+            consumers_by_device[device].push_back(info);
+        }
+
+        // Also check if KV cache implements IWorkspaceConsumer (ROCm KV cache does)
+        // This eliminates hipMalloc/hipFree overhead in gather operations
+        if (state_.kv_cache)
+        {
+            auto *kv_consumer = dynamic_cast<IWorkspaceConsumer *>(state_.kv_cache.get());
+            if (kv_consumer)
+            {
+                // KV cache is on the same device as inference
+                DeviceId kv_device = state_.device_id;
+                if (kv_device.is_gpu())
+                {
+                    ConsumerInfo kv_info;
+                    kv_info.consumer = kv_consumer;
+                    kv_info.is_kv_cache = true;
+                    consumers_by_device[kv_device].push_back(kv_info);
+                    LOG_DEBUG("[DeviceGraphOrchestrator] KV cache registered as workspace consumer on device "
+                              << kv_device.toString());
+                }
+            }
+        }
+
+        if (consumers_by_device.empty())
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] No GPU workspace consumers found in graph");
+            return true;
+        }
+
+        // For each device with consumers
+        for (auto &[device, consumers] : consumers_by_device)
+        {
+            // Check if workspace already exists for this device
+            auto ws_it = device_workspaces_.find(device);
+
+            if (ws_it != device_workspaces_.end() && ws_it->second)
+            {
+                // Workspace already allocated - just bind to new consumers
+                LOG_DEBUG("[DeviceGraphOrchestrator] Binding existing workspace on " << device.toString()
+                                                                                     << " to " << consumers.size() << " consumers");
+                for (const auto &info : consumers)
+                {
+                    info.consumer->bindWorkspace(ws_it->second.get());
+                }
+                continue;
+            }
+
+            // Need to allocate workspace for this device
+            // Merge requirements from all consumers on this device
+            WorkspaceRequirements merged;
+            for (const auto &info : consumers)
+            {
+                // Different consumers need different dimension hints:
+                // - GEMM kernels: m=max_seq_len, n=0 (use kernel's N), k=0 (use kernel's K)
+                //   The kernel knows its actual dimensions (N_, K_) better than us
+                //   CRITICAL: Pass n=0 for GEMM so LM head uses N_=vocab_size, not n_heads!
+                // - Attention kernels: m=batch_size (1), n=n_heads, k=head_dim
+                //   Attention workspace is tiny compared to GEMM (just split buffers)
+                // - KV cache: m=batch_size (number of sequences in gather)
+                // - Embedding: k=d_model (passed via k hint)
+
+                int workspace_m, workspace_n, workspace_k;
+
+                if (info.is_attention)
+                {
+                    // Attention kernel: expects (batch_size, n_heads, head_dim)
+                    // Workspace is small: ~num_splits * n_heads * head_dim per batch
+                    workspace_m = actual_batch_size; // Typically 1
+                    workspace_n = actual_n_heads;    // e.g., 14 for Qwen2-0.5B
+                    workspace_k = actual_head_dim;   // e.g., 64 for Qwen2
+                }
+                else if (info.is_kv_cache)
+                {
+                    workspace_m = actual_batch_size;
+                    workspace_n = 0;
+                    workspace_k = 0;
+                }
+                else if (info.is_embedding)
+                {
+                    workspace_m = actual_max_seq_len;
+                    workspace_n = 0;
+                    workspace_k = actual_d_model;
+                }
+                else
+                {
+                    // GEMM kernels: use max_seq_len for M, let kernel determine N/K
+                    workspace_m = actual_max_seq_len;
+                    workspace_n = 0;
+                    workspace_k = 0;
+                }
+
+                LOG_DEBUG("[DeviceGraphOrchestrator] Consumer workspace params: is_kv=" << info.is_kv_cache
+                                                                                        << " is_embed=" << info.is_embedding
+                                                                                        << " is_attn=" << info.is_attention
+                                                                                        << " m=" << workspace_m << " n=" << workspace_n << " k=" << workspace_k);
+
+                auto reqs = info.consumer->getWorkspaceRequirements(workspace_m, workspace_n, workspace_k);
+                merged.merge(reqs);
+            }
+
+            if (merged.buffers.empty())
+            {
+                LOG_DEBUG("[DeviceGraphOrchestrator] No workspace buffers needed for device " << device.toString());
+                continue;
+            }
+
+            // Create workspace manager for this device
+            auto workspace = std::make_unique<DeviceWorkspaceManager>(device, workspace_budget);
+            if (!workspace->allocate(merged))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate workspace for device " << device.toString()
+                                                                                               << " (needed=" << merged.total_bytes_with_alignment()
+                                                                                               << ", budget=" << workspace_budget << ")");
+                return false;
+            }
+
+            LOG_INFO("[DeviceGraphOrchestrator] Allocated " << (workspace->used() / (1024 * 1024)) << "MB workspace on "
+                                                            << device.toString() << " (" << merged.buffers.size() << " buffers)");
+
+            // Bind workspace to all consumers on this device
+            for (const auto &info : consumers)
+            {
+                info.consumer->bindWorkspace(workspace.get());
+            }
+
+            // Store workspace (keeps it alive)
+            device_workspaces_[device] = std::move(workspace);
+        }
+
+        device_workspace_allocated_ = true;
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::executeAttention(
+        const Qwen2LayerWeights &layer,
+        Qwen2ActivationBuffers &buffers,
+        int layer_idx,
+        int seq_len,
+        IKVCache *kv_cache,
+        const int *position_ids,
+        DeviceId device)
+    {
+        // Debug: dump input to attention (for layer 0 only)
+        if (layer_idx == 0)
+        {
+            const float *input = buffers.current_hidden->fp32_data();
+            LOG_INFO("[ORCH_ATTN_INPUT] layer=" << layer_idx << " seq_len=" << seq_len
+                                                << " input[0:4]=" << input[0] << "," << input[1]
+                                                << "," << input[2] << "," << input[3]);
+        }
+
+        // Get device context
+        IDeviceContext *ctx = getDeviceContext(device);
+        if (!ctx)
+        {
+            return false;
+        }
+
+        int pos_offset = position_ids ? position_ids[0] : 0;
+
+        // =============================================================================
+        // Graph Caching for Decode Mode (Phase 10)
+        // =============================================================================
+        if (cache_config_.enabled && cache_config_.cache_attention &&
+            seq_len == cache_config_.decode_seq_len &&
+            layer_idx >= 0 && static_cast<size_t>(layer_idx) < layer_graph_cache_.size())
+        {
+            auto &cache = layer_graph_cache_[layer_idx];
+
+            // Check if we have a valid cached graph
+            if (cache.attention_decode && cache.cached_seq_len == seq_len && cache.valid)
+            {
+                LOG_DEBUG("[DeviceGraphOrchestrator] Reusing cached attention graph for layer "
+                          << layer_idx << " (pos_offset=" << pos_offset << ")");
+
+                // Update dynamic parameters (position offset)
+                updateCachedGraphParams(*cache.attention_decode, pos_offset, seq_len);
+
+                // Execute cached graph
+                bool success = executor_.execute(*cache.attention_decode, ctx);
+                if (!success)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Cached attention graph failed at layer " << layer_idx);
+                }
+
+                cache.attention_decode->reset();
+                cache_stats_.attention_cache_hits++;
+                return success;
+            }
+
+            // Build and cache the graph
+            LOG_DEBUG("[DeviceGraphOrchestrator] Building and caching attention graph for layer "
+                      << layer_idx << " (decode mode)");
+
+            cache.attention_decode = std::make_unique<ComputeGraph>(
+                graph_builder_->buildAttentionGraph(layer, buffers, layer_idx, seq_len,
+                                                    1, kv_cache, position_ids, device, nullptr));
+            cache.cached_seq_len = seq_len;
+            cache.valid = true;
+            cache_stats_.attention_cache_misses++;
+
+            // Execute the newly built graph
+            bool success = executor_.execute(*cache.attention_decode, ctx);
+            if (!success)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Attention block failed at layer " << layer_idx);
+            }
+
+            cache.attention_decode->reset();
+            return success;
+        }
+
+        // =============================================================================
+        // Non-cached path (prefill or caching disabled)
+        // =============================================================================
+        cache_stats_.attention_cache_misses++;
+
+        ComputeGraph graph = graph_builder_->buildAttentionGraph(
+            layer, buffers, layer_idx, seq_len, 1, kv_cache, position_ids, device, nullptr);
+
+        // Debug: log graph structure
+        if (layer_idx == 0)
+        {
+            auto order = graph.getExecutionOrder();
+            LOG_INFO("[ORCH_ATTN] Graph has " << graph.size() << " nodes, execution order:");
+            for (const auto &name : order)
+            {
+                LOG_INFO("[ORCH_ATTN]   - " << name);
+            }
+        }
+
+        bool success = executor_.execute(graph, ctx);
+
+        // Debug: dump intermediate buffers (for layer 0 only)
+        if (layer_idx == 0 && buffers.normalized && buffers.Q &&
+            buffers.attn_output && buffers.attn_proj)
+        {
+            const float *output = buffers.current_hidden->fp32_data();
+            LOG_INFO("[ORCH_ATTN_OUTPUT] layer=" << layer_idx << " seq_len=" << seq_len
+                                                 << " output[0:4]=" << output[0] << "," << output[1]
+                                                 << "," << output[2] << "," << output[3]);
+        }
+
+        if (!success)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Attention block failed at layer " << layer_idx);
+        }
+
+        return success;
+    }
+
+    bool DeviceGraphOrchestrator::executeFFN(
+        const Qwen2LayerWeights &layer,
+        Qwen2ActivationBuffers &buffers,
+        int layer_idx,
+        int seq_len,
+        DeviceId device)
+    {
+        // Get device context
+        IDeviceContext *ctx = getDeviceContext(device);
+        if (!ctx)
+        {
+            return false;
+        }
+
+        // =============================================================================
+        // Graph Caching for Decode Mode (Phase 10)
+        // =============================================================================
+        if (cache_config_.enabled && cache_config_.cache_ffn &&
+            seq_len == cache_config_.decode_seq_len &&
+            layer_idx >= 0 && static_cast<size_t>(layer_idx) < layer_graph_cache_.size())
+        {
+            auto &cache = layer_graph_cache_[layer_idx];
+
+            // Check if we have a valid cached FFN graph
+            if (cache.ffn_decode && cache.valid)
+            {
+                LOG_DEBUG("[DeviceGraphOrchestrator] Reusing cached FFN graph for layer " << layer_idx);
+
+                // Execute cached graph (no params to update for FFN)
+                bool success = executor_.execute(*cache.ffn_decode, ctx);
+                if (!success)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Cached FFN graph failed at layer " << layer_idx);
+                }
+
+                cache.ffn_decode->reset();
+                cache_stats_.ffn_cache_hits++;
+                return success;
+            }
+
+            // Build and cache the graph
+            LOG_DEBUG("[DeviceGraphOrchestrator] Building and caching FFN graph for layer "
+                      << layer_idx << " (decode mode)");
+
+            cache.ffn_decode = std::make_unique<ComputeGraph>(
+                graph_builder_->buildFFNGraph(layer, buffers, layer_idx, seq_len, 1, device)); // batch_size=1 for decode
+            cache_stats_.ffn_cache_misses++;
+
+            // Execute the newly built graph
+            bool success = executor_.execute(*cache.ffn_decode, ctx);
+            if (!success)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] FFN block failed at layer " << layer_idx);
+            }
+
+            cache.ffn_decode->reset();
+            return success;
+        }
+
+        // =============================================================================
+        // Non-cached path (prefill or caching disabled)
+        // =============================================================================
+        cache_stats_.ffn_cache_misses++;
+
+        ComputeGraph graph = graph_builder_->buildFFNGraph(layer, buffers, layer_idx, seq_len, 1, device); // batch_size=1 for deprecated path
+
+        bool success = executor_.execute(graph, ctx);
+
+        if (!success)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] FFN block failed at layer " << layer_idx);
+        }
+
+        return success;
+    }
+
+    bool DeviceGraphOrchestrator::executeLayer(
+        const Qwen2LayerWeights &layer,
+        Qwen2ActivationBuffers &buffers,
+        int layer_idx,
+        int seq_len,
+        IKVCache *kv_cache,
+        const int *position_ids,
+        DeviceId device)
+    {
+        LOG_INFO("[DeviceGraphOrchestrator::executeLayer] LAYER_EXEC_ENTERED layer_idx="
+                 << layer_idx << " seq_len=" << seq_len);
+
+        // =====================================================================
+        // Weight Streaming Hooks (Option B)
+        // =====================================================================
+        // Before layer execution: Ensure weights are on device
+        // After layer execution: Release layer and prefetch next
+        // =====================================================================
+        if (weight_streamer_)
+        {
+            // Ensure this layer's weights are on the target device
+            if (!weight_streamer_->ensureLayerOnDevice(layer_idx, device))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator::executeLayer] Failed to stream layer "
+                          << layer_idx << " to device " << device.toString());
+                return false;
+            }
+
+            // Prefetch next layer(s) asynchronously to overlap with compute
+            int n_layers = graph_builder_ ? graph_builder_->config().n_layers : 0;
+            if (layer_idx + 1 < n_layers)
+            {
+                weight_streamer_->prefetchLayer(layer_idx + 1, device);
+                LOG_TRACE("[DeviceGraphOrchestrator::executeLayer] Prefetching layer " << (layer_idx + 1));
+            }
+        }
+
+        // Execute attention block
+        if (!executeAttention(layer, buffers, layer_idx, seq_len, kv_cache, position_ids, device))
+        {
+            // Release layer on failure if streaming
+            if (weight_streamer_)
+            {
+                weight_streamer_->releaseLayer(layer_idx);
+            }
+            return false;
+        }
+
+        // Execute FFN block
+        if (!executeFFN(layer, buffers, layer_idx, seq_len, device))
+        {
+            // Release layer on failure if streaming
+            if (weight_streamer_)
+            {
+                weight_streamer_->releaseLayer(layer_idx);
+            }
+            return false;
+        }
+
+        // After layer execution: Release layer (marks as eligible for eviction)
+        if (weight_streamer_)
+        {
+            weight_streamer_->releaseLayer(layer_idx);
+            LOG_TRACE("[DeviceGraphOrchestrator::executeLayer] Released layer " << layer_idx);
+        }
+
+        return true;
+    }
+
+    // =========================================================================
+    // Cache Management
+    // =========================================================================
+
+    void DeviceGraphOrchestrator::clearCache()
+    {
+        // Clear graph caches
+        for (auto &cache : layer_graph_cache_)
+        {
+            cache.invalidate();
+        }
+
+        // Clear device contexts
+        device_contexts_.clear();
+
+        // Reset state
+        last_pos_offset_ = -1;
+
+        // Reset stats
+        cache_stats_ = CacheStats{};
+
+        LOG_DEBUG("[DeviceGraphOrchestrator] All caches cleared");
+    }
+
+    void DeviceGraphOrchestrator::invalidateGraphCache(int layer_idx)
+    {
+        if (layer_idx < 0)
+        {
+            // Invalidate all layers
+            for (auto &cache : layer_graph_cache_)
+            {
+                cache.invalidate();
+            }
+            cache_stats_.cached_layers = 0;
+            LOG_DEBUG("[DeviceGraphOrchestrator] All layer graph caches invalidated");
+        }
+        else if (static_cast<size_t>(layer_idx) < layer_graph_cache_.size())
+        {
+            layer_graph_cache_[layer_idx].invalidate();
+            LOG_DEBUG("[DeviceGraphOrchestrator] Layer " << layer_idx << " graph cache invalidated");
+        }
+    }
+
+    bool DeviceGraphOrchestrator::hasValidCachedGraph(int layer_idx, bool is_attention) const
+    {
+        if (!cache_config_.enabled)
+            return false;
+        if (layer_idx < 0 || static_cast<size_t>(layer_idx) >= layer_graph_cache_.size())
+            return false;
+
+        const auto &cache = layer_graph_cache_[layer_idx];
+        if (!cache.valid)
+            return false;
+
+        return is_attention ? (cache.attention_decode != nullptr) : (cache.ffn_decode != nullptr);
+    }
+
+    void DeviceGraphOrchestrator::setGraphCachingEnabled(bool enabled)
+    {
+        if (cache_config_.enabled != enabled)
+        {
+            cache_config_.enabled = enabled;
+            if (!enabled)
+            {
+                invalidateGraphCache(-1);
+            }
+            LOG_INFO("[DeviceGraphOrchestrator] Graph caching "
+                     << (enabled ? "enabled" : "disabled"));
+        }
+    }
+
+    void DeviceGraphOrchestrator::initializeGraphCache(int n_layers)
+    {
+        layer_graph_cache_.resize(n_layers);
+        cache_stats_.cached_layers = n_layers;
+        LOG_DEBUG("[DeviceGraphOrchestrator] Graph cache initialized for " << n_layers << " layers");
+    }
+
+    // =========================================================================
+    // Inference State Management (Phase 5)
+    // =========================================================================
+
+    bool DeviceGraphOrchestrator::initializeInferenceState(
+        int batch_size,
+        int max_seq_len,
+        DeviceId device,
+        const InferenceStateInitConfig &init_config)
+    {
+        if (!graph_builder_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot initialize state: no graph builder");
+            return false;
+        }
+
+        const auto &config = graph_builder_->config();
+        int d_model = config.d_model;
+        int vocab_size = config.vocab_size;
+        int n_layers = config.n_layers;
+        int n_heads = config.n_heads;
+        int n_kv_heads = config.n_kv_heads;
+        int head_dim = config.head_dim;
+        int d_ff = config.d_ff;
+
+        // For tensor parallelism, use local head counts for buffer allocation
+        // When qkv_column_parallel is enabled, each rank processes only its subset of heads
+        int buffer_n_heads = config.qkv_column_parallel ? config.local_n_heads : n_heads;
+        int buffer_n_kv_heads = config.qkv_column_parallel ? config.local_n_kv_heads : n_kv_heads;
+        int buffer_d_ff = config.ffn_column_parallel ? config.d_ff_local : d_ff;
+
+        LOG_DEBUG("[DeviceGraphOrchestrator] Initializing inference state: batch_size=" << batch_size
+                                                                                        << " max_seq_len=" << max_seq_len
+                                                                                        << " d_model=" << d_model
+                                                                                        << " vocab_size=" << vocab_size);
+
+        if (config.qkv_column_parallel)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Using local buffer sizes for TP: n_heads=" << buffer_n_heads
+                                                                                            << "/" << n_heads << " n_kv_heads=" << buffer_n_kv_heads << "/" << n_kv_heads
+                                                                                            << " d_ff=" << buffer_d_ff << "/" << d_ff);
+        }
+
+        // Create a default MPI context if none was provided
+        std::shared_ptr<MPIContext> local_mpi_ctx = mpi_ctx_;
+        if (!local_mpi_ctx)
+        {
+            // Create a single-rank MPI context for non-MPI usage
+            local_mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
+            LOG_DEBUG("[DeviceGraphOrchestrator] Created default single-rank MPI context");
+        }
+
+        // Create tensor factory
+        TensorFactory factory(*local_mpi_ctx);
+
+        // Enable mapped memory allocation for GPU tensors when requested
+        // This enables zero-copy host access for all FP32 GPU tensors, avoiding slow memcpy syncs
+        // Works for both CUDA and ROCm backends (cudaHostAllocMapped / hipHostMallocMapped)
+        if (init_config.use_mapped_memory && device.is_gpu())
+        {
+            factory.setUseMappedMemoryForGPU(true);
+            LOG_DEBUG("[DeviceGraphOrchestrator] Enabling mapped memory for ALL GPU tensors (zero-copy host access)");
+        }
+
+        // =====================================================================
+        // BAR-Backed Allocation for LOCAL TP with PCIeBAR Backend
+        // =====================================================================
+        // When using LOCAL TP with PCIeBAR backend, ROCm devices need BAR-backed
+        // tensors for row-parallel outputs (attn_proj, ffn_output). This enables
+        // zero-copy allreduce where CUDA reads directly from ROCm's BAR region.
+        //
+        // Conditions for BAR-backed allocation:
+        // 1. LOCAL TP is active (local_tp_ctx != nullptr && degree > 1)
+        // 2. Backend is PCIeBAR
+        // 3. Current device is ROCm
+        // 4. DirectP2PEngine is available from LocalTPContext
+        // =====================================================================
+        bool use_bar_allocation = false;
+        DeviceId cuda_device_for_bar; // CUDA device that will read from BAR
+        DeviceId rocm_device_for_bar; // ROCm device that will own BAR memory
+
+        if (config.local_tp_ctx &&
+            config.local_tp_ctx->degree() > 1 &&
+            config.local_tp_ctx->backend() == CollectiveBackendType::PCIE_BAR &&
+            device.is_rocm())
+        {
+            // Get DirectP2PEngine from LocalTPContext
+            auto p2p_engine = config.local_tp_ctx->getDirectP2PEngine();
+            if (p2p_engine)
+            {
+                factory.setDirectP2P(p2p_engine);
+
+                // Find the CUDA device in the LOCAL TP group
+                for (const auto &dev : config.local_tp_ctx->devices())
+                {
+                    if (dev.toLocalDeviceId().is_cuda())
+                    {
+                        cuda_device_for_bar = dev.toLocalDeviceId();
+                        break;
+                    }
+                }
+
+                rocm_device_for_bar = device; // Current device is ROCm
+                use_bar_allocation = cuda_device_for_bar.is_cuda();
+
+                if (use_bar_allocation)
+                {
+                    LOG_INFO("[DeviceGraphOrchestrator] Enabled BAR-backed allocation for LOCAL TP PCIeBAR: "
+                             << "ROCm=" << rocm_device_for_bar.toString()
+                             << ", CUDA=" << cuda_device_for_bar.toString());
+                }
+                else
+                {
+                    LOG_WARN("[DeviceGraphOrchestrator] Cannot enable BAR allocation: no CUDA device in LOCAL TP group");
+                }
+            }
+            else
+            {
+                LOG_WARN("[DeviceGraphOrchestrator] PCIeBAR backend but DirectP2PEngine not available - "
+                         << "allreduce will fall back to staged transfers");
+            }
+        }
+
+        // Get activation precision from config
+        ActivationPrecision act_prec = config.activation_precision;
+        LOG_DEBUG("[DeviceGraphOrchestrator] Activation buffer precision: " << activationPrecisionToString(act_prec));
+
+        // Allocate core buffers (always FP32 - interface with embeddings/softmax)
+        state_.hidden = factory.createFP32(
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+            device);
+
+        // Logits ALWAYS use mapped memory on GPU devices (regardless of init_config)
+        // because logits are returned to the caller for sampling - they must be host-accessible.
+        // Mapped memory avoids the slow synchronous hipMemcpy/cudaMemcpy in ensureOnHost().
+        if (device.is_gpu())
+        {
+            state_.logits = FP32Tensor::createMapped(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(vocab_size)},
+                device);
+            LOG_INFO("[DeviceGraphOrchestrator] Allocated logits with mapped memory (zero-copy for sampling)");
+        }
+        else
+        {
+            state_.logits = factory.createFP32(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(vocab_size)},
+                device);
+        }
+
+        // Phase 5: Allocate local logits buffer for column-parallel LM head
+        if (config.lm_head_column_parallel && config.vocab_local > 0)
+        {
+            state_.logits_local = factory.createFP32(
+                std::vector<size_t>{static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(config.vocab_local)},
+                device);
+            LOG_DEBUG("[DeviceGraphOrchestrator] Allocated logits_local buffer: ["
+                      << batch_size * max_seq_len << ", " << config.vocab_local << "]");
+        }
+
+        // Allocate norm buffer (FP32 - output of RMSNorm for GEMM input)
+        state_.normalized = factory.createFP32(
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+            device);
+
+        // Allocate residual buffer based on activation precision mode
+        // HybridQ16 uses Q16_1 for 266× better precision than Q8_1 in the residual stream
+        if (act_prec == ActivationPrecision::HybridQ16)
+        {
+            LOG_INFO("[DeviceGraphOrchestrator] Using Q16_1 residual stream for HybridQ16 mode");
+            state_.residual = factory.createQ16_1(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                device);
+        }
+        else
+        {
+            state_.residual = factory.createFP32(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                device);
+        }
+
+        // QKV buffers - use per-projection precision for HybridQ16 mode
+        // HybridQ16: K is Q16_1 (256× better precision), Q and V are Q8_1
+        // This fixes the K precision loss where Q8_1 zeros out small values
+        ActivationPrecision q_prec = resolveBufferPrecision(
+            act_prec, HybridBufferType::Q_GEMM_Output, nullptr);
+        ActivationPrecision k_prec = resolveBufferPrecision(
+            act_prec, HybridBufferType::K_GEMM_Output, nullptr);
+        ActivationPrecision v_prec = resolveBufferPrecision(
+            act_prec, HybridBufferType::V_GEMM_Output, nullptr);
+
+        LOG_DEBUG("[DeviceGraphOrchestrator] QKV GEMM output precision: Q=" << activationPrecisionToString(q_prec)
+                                                                            << " K=" << activationPrecisionToString(k_prec)
+                                                                            << " V=" << activationPrecisionToString(v_prec));
+
+        state_.Q = factory.createActivation(
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
+            q_prec, device);
+        // K buffer: Q16_1 for HybridQ16 mode to preserve small values
+        // Pass head_dim for optimal Q16 block size (1 block per head)
+        state_.K = factory.createActivation(
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
+            k_prec, head_dim, device);
+        state_.V = factory.createActivation(
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
+            v_prec, device);
+
+        // Hybrid/HybridQ16 mode: Allocate separate FP32 buffers for Q/K after RoPE
+        // This eliminates the requantization step in RoPE
+        // Also allocate V_dequant buffer for KV cache append (V doesn't go through RoPE
+        // but needs to be converted to KV cache precision for storage)
+        if (act_prec == ActivationPrecision::Hybrid || act_prec == ActivationPrecision::HybridQ16)
+        {
+            // Use resolveBufferPrecision to get the correct precision for Q/K after RoPE
+            // Hybrid: FP32, HybridQ16: Q16_1
+            ActivationPrecision q_rope_prec = resolveBufferPrecision(
+                act_prec, HybridBufferType::Q_After_RoPE, nullptr);
+            ActivationPrecision k_rope_prec = resolveBufferPrecision(
+                act_prec, HybridBufferType::K_After_RoPE, nullptr);
+            LOG_DEBUG("[DeviceGraphOrchestrator] " << activationPrecisionToString(act_prec)
+                                                   << " mode: allocating Q_rope buffer ("
+                                                   << activationPrecisionToString(q_rope_prec) << ")");
+            // Pass head_dim for Q16 block size selection (must match KV cache block size)
+            state_.Q_rope = factory.createActivation(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
+                q_rope_prec, head_dim, device);
+            LOG_DEBUG("[DeviceGraphOrchestrator] " << activationPrecisionToString(act_prec)
+                                                   << " mode: allocating K_rope buffer ("
+                                                   << activationPrecisionToString(k_rope_prec) << ")");
+            state_.K_rope = factory.createActivation(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
+                k_rope_prec, head_dim, device);
+
+            // V_dequant: buffer for V before KV cache append
+            // V is Q8_1 from GEMM, needs to match KV cache precision (FP32 for Hybrid, Q16_1 for HybridQ16)
+            ActivationPrecision kv_cache_prec = resolveBufferPrecision(
+                act_prec, HybridBufferType::KV_Cache, nullptr);
+            state_.V_dequant = factory.createActivation(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
+                kv_cache_prec, head_dim, device);
+            LOG_DEBUG("[DeviceGraphOrchestrator] " << activationPrecisionToString(act_prec)
+                                                   << " mode: allocating V_dequant buffer ("
+                                                   << activationPrecisionToString(kv_cache_prec) << ")");
+
+            // HybridQ16 K precision fix: allocate per-head K scales buffer
+            // This stores dynamic scales from RoPE Q16→Q16 path for attention kernel
+            if (act_prec == ActivationPrecision::HybridQ16)
+            {
+                const size_t k_head_scales_size = static_cast<size_t>(batch_size * max_seq_len * buffer_n_kv_heads);
+                state_.K_head_scales.resize(k_head_scales_size, 1.0f);
+                LOG_DEBUG("[DeviceGraphOrchestrator] HybridQ16 K precision fix: allocating K_head_scales buffer ("
+                          << k_head_scales_size << " floats, "
+                          << k_head_scales_size * sizeof(float) / 1024 << " KB)");
+            }
+        }
+
+        // Attention output buffer
+        // For Hybrid mode: attention context is FP32 (from softmax × V)
+        ActivationPrecision attn_ctx_prec = resolveBufferPrecision(
+            act_prec, HybridBufferType::Attention_Context, nullptr);
+        state_.attn_output = factory.createActivation(
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
+            attn_ctx_prec, device);
+
+        // attn_proj is the output of Wo projection which feeds into the residual stream
+        // HybridQ16 mode: Q8_1 (native add to Q16_1 residual via q16_1_add_q8_1)
+        // Other modes: FP32 for numerical stability in residual connections
+        //
+        // For LOCAL TP with PCIeBAR backend: ROCm device uses BAR-backed FP32 tensor
+        // to enable zero-copy allreduce (CUDA reads directly from ROCm BAR region)
+        if (act_prec == ActivationPrecision::HybridQ16)
+        {
+            // Q8_1 cannot be BAR-backed (BAR allocation is FP32 only)
+            state_.attn_proj = factory.createQ8_1(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                device);
+        }
+        else if (use_bar_allocation)
+        {
+            // BAR-backed FP32 for PCIeBAR zero-copy allreduce
+            state_.attn_proj = factory.createFP32BARBacked(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                rocm_device_for_bar, cuda_device_for_bar);
+            LOG_INFO("[DeviceGraphOrchestrator] Allocated attn_proj as BAR-backed FP32 for PCIeBAR allreduce");
+        }
+        else
+        {
+            state_.attn_proj = factory.createFP32(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                device);
+        }
+
+        // FFN buffers - gate and up are kept FP32 to avoid triple quantization in SwiGLU
+        ActivationPrecision gate_prec = resolveBufferPrecision(
+            act_prec, HybridBufferType::FFN_Gate, nullptr);
+        state_.gate = factory.createActivation(
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
+            gate_prec, device);
+        ActivationPrecision up_prec = resolveBufferPrecision(
+            act_prec, HybridBufferType::FFN_Up, nullptr);
+        state_.up = factory.createActivation(
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
+            up_prec, device);
+        // ffn_output is the output of FFN Down projection which feeds into the residual stream
+        // HybridQ16 mode: Q8_1 (native add to Q16_1 residual via q16_1_add_q8_1)
+        // Other modes: FP32 for numerical stability in residual connections
+        //
+        // For LOCAL TP with PCIeBAR backend: ROCm device uses BAR-backed FP32 tensor
+        // to enable zero-copy allreduce (CUDA reads directly from ROCm BAR region)
+        if (act_prec == ActivationPrecision::HybridQ16)
+        {
+            // Q8_1 cannot be BAR-backed (BAR allocation is FP32 only)
+            state_.ffn_output = factory.createQ8_1(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                device);
+        }
+        else if (use_bar_allocation)
+        {
+            // BAR-backed FP32 for PCIeBAR zero-copy allreduce
+            state_.ffn_output = factory.createFP32BARBacked(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                rocm_device_for_bar, cuda_device_for_bar);
+            LOG_INFO("[DeviceGraphOrchestrator] Allocated ffn_output as BAR-backed FP32 for PCIeBAR allreduce");
+        }
+        else
+        {
+            state_.ffn_output = factory.createFP32(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                device);
+        }
+
+        // Attention workspace - use local head counts for tensor parallelism
+        // scores: [batch_size * buffer_n_heads, max_seq_len, max_seq_len]
+        state_.workspace_scores = factory.createFP32(
+            {static_cast<size_t>(batch_size * buffer_n_heads * max_seq_len), static_cast<size_t>(max_seq_len)},
+            device);
+        // context: [batch_size * buffer_n_heads, max_seq_len, head_dim]
+        state_.workspace_context = factory.createFP32(
+            {static_cast<size_t>(batch_size * buffer_n_heads * max_seq_len), static_cast<size_t>(head_dim)},
+            device);
+        // mask: [batch_size, max_seq_len, max_seq_len]
+        state_.workspace_mask = factory.createFP32(
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(max_seq_len)},
+            device);
+
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
+        // Allocate context snapshot buffer for debugging attention
+        // Shape: [batch_size * max_seq_len, buffer_n_heads * head_dim]
+        state_.context_snapshot = factory.createFP32(
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
+            device);
+        LOG_DEBUG("[DeviceGraphOrchestrator] Allocated context_snapshot buffer: ["
+                  << batch_size * max_seq_len << ", " << buffer_n_heads * head_dim << "]");
+
+        // Allocate attention output snapshot buffer (Wo projection result, before residual)
+        // Shape: [batch_size * max_seq_len, d_model]
+        state_.attention_output_snapshot = factory.createFP32(
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+            device);
+        LOG_DEBUG("[DeviceGraphOrchestrator] Allocated attention_output_snapshot buffer: ["
+                  << batch_size * max_seq_len << ", " << d_model << "]");
+
+        // Allocate attention residual snapshot buffer (after residual add)
+        // Shape: [batch_size * max_seq_len, d_model]
+        state_.attention_residual_snapshot = factory.createFP32(
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+            device);
+        LOG_DEBUG("[DeviceGraphOrchestrator] Allocated attention_residual_snapshot buffer: ["
+                  << batch_size * max_seq_len << ", " << d_model << "]");
+#endif
+
+        // Create KV cache - use sharded cache for tensor parallelism
+        // Check if tensor parallelism is enabled (indicated by local_n_kv_heads set)
+        // For Hybrid mode: KV cache uses BF16 (better than Q8_1, 2x compression)
+        ActivationPrecision kv_cache_prec = resolveBufferPrecision(
+            act_prec, HybridBufferType::KV_Cache, nullptr);
+        LOG_DEBUG("[DeviceGraphOrchestrator] KV cache precision: " << activationPrecisionToString(kv_cache_prec));
+
+        // Determine KV cache layout mode:
+        // - Q16_1 precision requires HEAD_MAJOR layout for Q16IntegerAttention kernel
+        // - Other precisions use POSITION_MAJOR (legacy layout)
+        KVCacheLayoutMode kv_layout_mode = (kv_cache_prec == ActivationPrecision::Q16_1)
+                                               ? KVCacheLayoutMode::HEAD_MAJOR
+                                               : KVCacheLayoutMode::POSITION_MAJOR;
+        LOG_DEBUG("[DeviceGraphOrchestrator] KV cache layout mode: "
+                  << (kv_layout_mode == KVCacheLayoutMode::HEAD_MAJOR ? "HEAD_MAJOR" : "POSITION_MAJOR"));
+
+        // Build KVCacheConfig for factory
+        llaminar::v2::kernels::KVCacheConfig kv_config;
+        kv_config.precision = kv_cache_prec;
+        kv_config.device = device;
+        kv_config.num_layers = n_layers;
+        kv_config.batch_size = batch_size;
+        kv_config.max_seq_len = max_seq_len;
+        kv_config.n_kv_heads = n_kv_heads;
+        kv_config.head_dim = head_dim;
+        kv_config.layout_mode = kv_layout_mode;
+        kv_config.mpi_ctx = local_mpi_ctx.get();
+
+        // Set sharding parameters if needed (tensor parallelism)
+        // Sharding is needed when local_n_kv_heads < n_kv_heads, AND tensor parallelism is active.
+        // TP can be:
+        // - GLOBAL TP: Multiple MPI ranks (mpi_ctx_->world_size() > 1)
+        // - LOCAL TP: Multiple devices within single rank (local_tp_ctx->degree() > 1)
+        bool use_sharded_cache = (config.local_n_kv_heads > 0 && config.local_n_kv_heads < n_kv_heads);
+        bool is_global_tp = mpi_ctx_ && mpi_ctx_->world_size() > 1;
+        bool is_local_tp = config.local_tp_ctx && config.local_tp_ctx->degree() > 1;
+
+        if (use_sharded_cache && (is_global_tp || is_local_tp))
+        {
+            kv_config.local_n_kv_heads = config.local_n_kv_heads;
+
+            // Calculate kv_head_start based on TP mode:
+            // - LOCAL TP: Use device index within the LOCAL TP context
+            // - GLOBAL TP: Use MPI rank
+            if (is_local_tp)
+            {
+                kv_config.kv_head_start = config.local_tp_device_idx * config.local_n_kv_heads;
+                LOG_DEBUG("[DeviceGraphOrchestrator] Creating sharded KV cache (LOCAL TP): "
+                          << n_kv_heads << " total KV heads, "
+                          << config.local_n_kv_heads << " local KV heads (device_idx="
+                          << config.local_tp_device_idx << ", start=" << kv_config.kv_head_start << ")"
+                          << " precision=" << activationPrecisionToString(kv_cache_prec));
+            }
+            else
+            {
+                kv_config.kv_head_start = mpi_ctx_->rank() * config.local_n_kv_heads;
+                LOG_DEBUG("[DeviceGraphOrchestrator] Creating sharded KV cache (GLOBAL TP): "
+                          << n_kv_heads << " total KV heads, "
+                          << config.local_n_kv_heads << " local KV heads (rank="
+                          << mpi_ctx_->rank() << ", start=" << kv_config.kv_head_start << ")"
+                          << " precision=" << activationPrecisionToString(kv_cache_prec));
+            }
+        }
+
+        // Create cache via factory (handles sharded vs non-sharded automatically)
+        state_.kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(kv_config);
+
+        // Initialize position tracking
+        state_.positions.assign(batch_size, 0);
+        state_.sequence_lengths.assign(batch_size, 0);
+
+        // Store config
+        state_.batch_size = batch_size;
+        state_.max_seq_len = max_seq_len;
+        state_.d_model = d_model;
+        state_.vocab_size = vocab_size;
+        state_.device_id = device;
+
+        LOG_DEBUG("[DeviceGraphOrchestrator] Inference state initialized successfully");
+        return true;
+    }
+
+    const float *DeviceGraphOrchestrator::forward(
+        const int *tokens,
+        int seq_len,
+        int batch_size)
+    {
+        // Enable device-scoped logging for this execution
+        // All LOG_* calls from this thread will include the device ID
+        ScopedDeviceLog device_log(state_.device_id);
+
+        if (!state_.isInitialized())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] forward() called without initialized state");
+            return nullptr;
+        }
+
+        if (!hasGlobalWeights())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] forward() called without global weights set");
+            return nullptr;
+        }
+
+        if (batch_size > state_.batch_size)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Batch size " << batch_size
+                                                              << " exceeds initialized batch size " << state_.batch_size);
+            return nullptr;
+        }
+
+        int total_tokens = batch_size * seq_len;
+        if (total_tokens > state_.batch_size * state_.max_seq_len)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Total tokens " << total_tokens
+                                                                << " exceeds buffer capacity "
+                                                                << state_.batch_size * state_.max_seq_len);
+            return nullptr;
+        }
+
+        // =====================================================================
+        // Gap 4: Automatic phase transition based on sequence length
+        // =====================================================================
+        // - seq_len > 1: PREFILL phase (processing prompt, compute-bound)
+        // - seq_len == 1: DECODE phase (generating tokens, bandwidth-bound)
+        //
+        // This affects weight selection via getPhaseAwareWeight():
+        // - PREFILL: Full weights on GPU (compute-bound - all weights needed)
+        // - DECODE: May use CPU decode shards for parallel execution
+        // =====================================================================
+        InferencePhase new_phase = (seq_len > 1) ? InferencePhase::PREFILL : InferencePhase::DECODE;
+        transitionToPhase(new_phase);
+
+        // Build position IDs
+        std::vector<int> position_ids;
+        position_ids.reserve(total_tokens);
+        for (int b = 0; b < batch_size; ++b)
+        {
+            int pos_offset = state_.positions[b];
+            for (int s = 0; s < seq_len; ++s)
+            {
+                position_ids.push_back(pos_offset + s);
+            }
+        }
+
+        // Prepare model buffers from state
+        Qwen2ModelBuffers model_buffers;
+        model_buffers.current_hidden = state_.hidden.get();
+        model_buffers.logits = state_.logits.get();
+
+        // Phase 5: Set local logits buffer for column-parallel LM head
+        if (state_.logits_local)
+        {
+            model_buffers.logits_local = state_.logits_local.get();
+        }
+
+        // Populate layer buffers
+        model_buffers.layer_buffers.current_hidden = state_.hidden.get();
+        model_buffers.layer_buffers.normalized = state_.normalized.get();
+        model_buffers.layer_buffers.residual = state_.residual.get();
+        model_buffers.layer_buffers.Q = state_.Q.get();
+        model_buffers.layer_buffers.K = state_.K.get();
+        model_buffers.layer_buffers.V = state_.V.get();
+        model_buffers.layer_buffers.attn_output = state_.attn_output.get();
+        model_buffers.layer_buffers.attn_proj = state_.attn_proj.get();
+        model_buffers.layer_buffers.gate = state_.gate.get();
+        model_buffers.layer_buffers.up = state_.up.get();
+        model_buffers.layer_buffers.ffn_output = state_.ffn_output.get();
+        model_buffers.layer_buffers.workspace_scores = state_.workspace_scores.get();
+        model_buffers.layer_buffers.workspace_context = state_.workspace_context.get();
+        model_buffers.layer_buffers.workspace_mask = state_.workspace_mask.get();
+
+        // Hybrid mode buffers: FP32 Q/K after RoPE, V_dequant for KV cache
+        model_buffers.layer_buffers.Q_rope = state_.Q_rope.get();
+        model_buffers.layer_buffers.K_rope = state_.K_rope.get();
+        model_buffers.layer_buffers.V_dequant = state_.V_dequant.get();
+
+        // HybridQ16 K precision fix: per-head K scales from RoPE Q16→Q16
+        if (!state_.K_head_scales.empty())
+        {
+            model_buffers.layer_buffers.K_head_scales = state_.K_head_scales.data();
+            model_buffers.layer_buffers.K_head_scales_capacity = state_.K_head_scales.size();
+        }
+
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
+        // Pass context snapshot buffer for attention debugging
+        model_buffers.layer_buffers.context_snapshot = state_.context_snapshot.get();
+        // Pass attention output snapshot buffer (Wo projection, before residual)
+        model_buffers.layer_buffers.attention_output_snapshot = state_.attention_output_snapshot.get();
+        // Pass attention residual snapshot buffer (after residual add)
+        model_buffers.layer_buffers.attention_residual_snapshot = state_.attention_residual_snapshot.get();
+#endif
+
+        setBuffers(model_buffers);
+
+        // Build forward input
+        Qwen2ForwardInput input;
+        input.token_ids = tokens;
+        input.position_ids = position_ids.data();
+        input.batch_size = batch_size;
+        input.seq_len = seq_len;
+        input.position_offset = state_.positions[0]; // Legacy compat
+        input.device = state_.device_id;
+        input.kv_cache = state_.kv_cache.get();
+        // Pass sequence_lengths for batch-aware attention masking
+        // This enables proper separation of sequences in batched execution
+        input.sequence_lengths = (batch_size > 1 && !state_.sequence_lengths.empty())
+                                     ? &state_.sequence_lengths
+                                     : nullptr;
+
+        // Build forward output
+        Qwen2ForwardOutput output;
+        output.logits = state_.logits.get();
+        output.hidden = state_.hidden.get();
+
+        // Execute forward pass
+        bool success = executeForward(input, output);
+
+        if (!success)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] forward() execution failed");
+            return nullptr;
+        }
+
+        // Update positions
+        for (int b = 0; b < batch_size; ++b)
+        {
+            state_.positions[b] += seq_len;
+            state_.sequence_lengths[b] += seq_len;
+        }
+
+        // Return logits pointer
+        return state_.logits->fp32_data();
+    }
+
+    const float *DeviceGraphOrchestrator::logits() const
+    {
+        if (!state_.logits)
+        {
+            return nullptr;
+        }
+        return state_.logits->fp32_data();
+    }
+
+    // =========================================================================
+    // Batch Interface Implementation
+    // =========================================================================
+
+    bool DeviceGraphOrchestrator::forward_batch(const std::vector<std::vector<int>> &token_batches)
+    {
+        // Enable device-scoped logging for this execution
+        ScopedDeviceLog device_log(state_.device_id);
+
+        if (token_batches.empty())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] forward_batch() called with empty batch");
+            return false;
+        }
+
+        int batch_size = static_cast<int>(token_batches.size());
+        if (batch_size > state_.batch_size)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Batch size " << batch_size
+                                                              << " exceeds initialized batch size " << state_.batch_size);
+            return false;
+        }
+
+        // Find max sequence length (for padding)
+        int max_len = 0;
+        for (const auto &seq : token_batches)
+        {
+            max_len = std::max(max_len, static_cast<int>(seq.size()));
+        }
+        padded_seq_len_ = max_len;
+
+        // Store actual lengths BEFORE calling forward (forward() will overwrite with padded len)
+        std::vector<int> actual_lengths(batch_size);
+        for (int i = 0; i < batch_size; ++i)
+        {
+            actual_lengths[i] = static_cast<int>(token_batches[i].size());
+        }
+
+        // Create flattened, padded token array [batch_size * padded_seq_len]
+        std::vector<int> flat_tokens(batch_size * padded_seq_len_, 0); // pad with 0
+        for (int b = 0; b < batch_size; ++b)
+        {
+            const auto &seq = token_batches[b];
+            for (size_t s = 0; s < seq.size(); ++s)
+            {
+                flat_tokens[b * padded_seq_len_ + s] = seq[s];
+            }
+        }
+
+        // Call the 3-parameter forward() with padded tokens
+        // Note: forward() will set sequence_lengths[b] = padded_seq_len for all b
+        const float *result = forward(flat_tokens.data(), padded_seq_len_, batch_size);
+
+        // Restore actual sequence lengths (forward() set them to padded_seq_len)
+        // This is important for:
+        // 1. Proper logits extraction (only extract non-padded logits)
+        // 2. Snapshot comparison (shapes should match actual token count)
+        // 3. KV cache position tracking (only actual tokens contribute to cache)
+        state_.sequence_lengths.resize(batch_size);
+        for (int i = 0; i < batch_size; ++i)
+        {
+            state_.sequence_lengths[i] = actual_lengths[i];
+        }
+
+        return result != nullptr;
+    }
+
+    const float *DeviceGraphOrchestrator::getLogits(int seq_idx) const
+    {
+        if (!state_.logits)
+        {
+            return nullptr;
+        }
+
+        if (seq_idx < 0 || seq_idx >= state_.batch_size)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Invalid sequence index " << seq_idx
+                                                                          << " (batch_size=" << state_.batch_size << ")");
+            return nullptr;
+        }
+
+        // Return pointer to logits for requested sequence
+        // Layout: [batch_size * padded_seq_len, vocab_size]
+        // For sequence seq_idx, logits start at row (seq_idx * padded_seq_len_)
+        const float *base = state_.logits->fp32_data();
+        if (!base)
+        {
+            return nullptr;
+        }
+
+        return base + (seq_idx * padded_seq_len_ * state_.vocab_size);
+    }
+
+    int DeviceGraphOrchestrator::getPosition(int seq_idx) const
+    {
+        if (seq_idx < 0 || static_cast<size_t>(seq_idx) >= state_.positions.size())
+        {
+            return 0;
+        }
+        return state_.positions[seq_idx];
+    }
+
+    void DeviceGraphOrchestrator::clearInferenceState()
+    {
+        state_.clear();
+        LOG_DEBUG("[DeviceGraphOrchestrator] Inference state cleared");
+    }
+
+    // =========================================================================
+    // Private Helpers
+    // =========================================================================
+
+    void DeviceGraphOrchestrator::updateCachedGraphParams(ComputeGraph &graph, int pos_offset, int seq_len)
+    {
+        // Update all stages in the graph that have dynamic parameters
+        auto order = graph.getExecutionOrder();
+
+        for (const auto &node_name : order)
+        {
+            ComputeNode *node = graph.getNode(node_name);
+            if (!node || !node->stage)
+                continue;
+
+            // Update dynamic params (pos_offset, seq_len)
+            // Only stages that override updateDynamicParams will actually do anything
+            node->stage->updateDynamicParams(pos_offset, seq_len);
+        }
+
+        LOG_TRACE("[DeviceGraphOrchestrator] Updated cached graph params: pos_offset="
+                  << pos_offset << " seq_len=" << seq_len);
+    }
+
+    bool DeviceGraphOrchestrator::canUseCachedGraph(int layer_idx, int seq_len) const
+    {
+        if (!cache_config_.enabled)
+            return false;
+        if (layer_idx < 0 || static_cast<size_t>(layer_idx) >= layer_graph_cache_.size())
+            return false;
+
+        const auto &cache = layer_graph_cache_[layer_idx];
+        return cache.valid && cache.cached_seq_len == seq_len;
+    }
+
+    // =========================================================================
+    // Phase-Aware Weight Access (Gap 3 - CPU Decode Participation)
+    // =========================================================================
+
+    void DeviceGraphOrchestrator::setWeightManager(std::shared_ptr<WeightManager> weight_manager)
+    {
+        weight_manager_ = std::move(weight_manager);
+        LOG_DEBUG("[DeviceGraphOrchestrator] WeightManager set");
+    }
+
+    void DeviceGraphOrchestrator::setWeightPlacementMap(std::shared_ptr<WeightPlacementMap> placement_map)
+    {
+        weight_placement_map_ = std::move(placement_map);
+        LOG_DEBUG("[DeviceGraphOrchestrator] WeightPlacementMap set");
+    }
+
+    // =========================================================================
+    // Tensor Parallel Configuration (Phase 1c: Proportional TP)
+    // =========================================================================
+
+    void DeviceGraphOrchestrator::setTensorParallelConfig(std::shared_ptr<TensorParallelConfig> config)
+    {
+        tp_config_ = std::move(config);
+
+        if (tp_config_)
+        {
+            LOG_INFO("[DeviceGraphOrchestrator] TensorParallelConfig set: "
+                     << "world_size=" << tp_config_->worldSize()
+                     << ", proportional=" << (tp_config_->isProportional() ? "yes" : "no"));
+
+            // If we have a graph builder, propagate the config to it
+            if (graph_builder_)
+            {
+                // Note: The graph builder's config is read-only after construction,
+                // but we store the tp_config for use in buffer allocation and KV cache creation
+                LOG_DEBUG("[DeviceGraphOrchestrator] TensorParallelConfig will be used for buffer sizing");
+            }
+        }
+        else
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] TensorParallelConfig cleared");
+        }
+    }
+
+    // =========================================================================
+    // Multi-Domain Tensor Parallel Configuration (Phase 6.3: Heterogeneous TP)
+    // =========================================================================
+
+    void DeviceGraphOrchestrator::setDomainConfig(std::shared_ptr<MultiDomainTPConfig> config)
+    {
+        domain_config_ = std::move(config);
+
+        if (domain_config_)
+        {
+            LOG_INFO("[DeviceGraphOrchestrator] MultiDomainTPConfig set: "
+                     << "domains=" << domain_config_->domains().size()
+                     << ", has_gpu=" << (domain_config_->gpuDomain() ? "yes" : "no")
+                     << ", has_cpu=" << (domain_config_->cpuDomain() ? "yes" : "no")
+                     << ", cross_rank=" << (domain_config_->hasCrossRankTP() ? "yes" : "no"));
+
+            // Propagate domain config to graph builder if present
+            if (graph_builder_)
+            {
+                // Graph builder can access domain config through config_.multi_domain_tp_config
+                // Note: The graph builder uses getDomainForLayer() which delegates to this config
+                LOG_DEBUG("[DeviceGraphOrchestrator] Domain config available for AllreduceStage routing");
+            }
+        }
+        else
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] MultiDomainTPConfig cleared (legacy MPI path)");
+        }
+    }
+
+    const TPDomain *DeviceGraphOrchestrator::getDomainForLayer(int layer_idx, bool is_attention) const
+    {
+        if (!domain_config_)
+        {
+            return nullptr; // No domain config - use legacy MPI path
+        }
+
+        const TPDomain *domain = domain_config_->domainForLayer(layer_idx, is_attention);
+
+        LOG_DEBUG("[DeviceGraphOrchestrator] getDomainForLayer: layer=" << layer_idx
+                                                                        << ", is_attention=" << (is_attention ? "true" : "false")
+                                                                        << " -> domain=" << (domain ? domain->name : "nullptr"));
+
+        return domain;
+    }
+
+    void DeviceGraphOrchestrator::transitionToPhase(InferencePhase phase)
+    {
+        if (current_phase_ != phase)
+        {
+            InferencePhase old_phase = current_phase_;
+            current_phase_ = phase;
+
+            LOG_DEBUG("[DeviceGraphOrchestrator] Phase transition: " << toString(old_phase)
+                                                                     << " -> " << toString(phase));
+
+            // Notify weight streamer of phase transition (if streaming is enabled)
+            if (weight_streamer_)
+            {
+                weight_streamer_->onPhaseTransition(old_phase, phase);
+                LOG_DEBUG("[DeviceGraphOrchestrator] Weight streamer notified of phase transition");
+            }
+        }
+    }
+
+    // =========================================================================
+    // Weight Streaming (Option B)
+    // =========================================================================
+
+    void DeviceGraphOrchestrator::setWeightStreamer(std::shared_ptr<IWeightStreamer> streamer)
+    {
+        weight_streamer_ = std::move(streamer);
+        if (weight_streamer_)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Weight streaming enabled");
+        }
+        else
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Weight streaming disabled");
+        }
+    }
+
+    bool DeviceGraphOrchestrator::isWeightStreamingEnabled() const
+    {
+        return weight_streamer_ != nullptr;
+    }
+
+    void DeviceGraphOrchestrator::setCollectiveContext(std::shared_ptr<ICollectiveContext> collective_ctx)
+    {
+        injected_collective_ctx_ = std::move(collective_ctx);
+        if (injected_collective_ctx_)
+        {
+            // Wire to executor for GPU-native collective interception
+            executor_.setCollectiveContext(injected_collective_ctx_.get());
+            LOG_INFO("[DeviceGraphOrchestrator] GPU-native collectives enabled via CollectiveContext");
+        }
+        else
+        {
+            executor_.setCollectiveContext(nullptr);
+            LOG_DEBUG("[DeviceGraphOrchestrator] CollectiveContext cleared - using CPU MPI fallback");
+        }
+    }
+
+    std::shared_ptr<TensorBase> DeviceGraphOrchestrator::getPhaseAwareWeight(
+        const std::string &name,
+        int layer_idx,
+        InferencePhase phase) const
+    {
+        if (!weight_manager_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator::getPhaseAwareWeight] WeightManager not set");
+            return nullptr;
+        }
+
+        // PREFILL phase: Always use full weight (GPU is primary, compute-bound)
+        if (phase == InferencePhase::PREFILL)
+        {
+            LOG_TRACE("[DeviceGraphOrchestrator::getPhaseAwareWeight] PREFILL phase - returning full weight for " << name);
+            auto weight = weight_manager_->getWeight(name);
+            if (!weight)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator::getPhaseAwareWeight] Failed to load weight: " << name);
+            }
+            return weight;
+        }
+
+        // DECODE phase: Check if CPU should participate
+        if (!shouldUseCPUDecodeWeight(name, layer_idx))
+        {
+            // No CPU participation - use full weight (GPU handles it)
+            LOG_TRACE("[DeviceGraphOrchestrator::getPhaseAwareWeight] DECODE phase, no CPU participation - returning full weight for " << name);
+            return weight_manager_->getWeight(name);
+        }
+
+        // CPU decode participation enabled - get decode shard
+        if (!weight_placement_map_)
+        {
+            // No placement map - fall back to full weight
+            LOG_WARN("[DeviceGraphOrchestrator::getPhaseAwareWeight] CPU decode participation but no placement map - using full weight for " << name);
+            return weight_manager_->getWeight(name);
+        }
+
+        // Get device info from placement map
+        WeightDeviceInfo device_info = weight_placement_map_->getDeviceInfoForWeight(name, layer_idx);
+
+        if (!device_info.cpu_decode_participation)
+        {
+            // This weight doesn't have CPU decode participation
+            LOG_TRACE("[DeviceGraphOrchestrator::getPhaseAwareWeight] DECODE phase, weight " << name << " has no CPU participation - returning full weight");
+            return weight_manager_->getWeight(name);
+        }
+
+        // Find the CPU device in decode_devices and get its fraction
+        for (size_t i = 0; i < device_info.decode_devices.size(); ++i)
+        {
+            if (device_info.decode_devices[i].is_cpu())
+            {
+                float fraction = device_info.decode_fractions[i];
+                LOG_DEBUG("[DeviceGraphOrchestrator::getPhaseAwareWeight] DECODE phase - returning CPU decode shard for "
+                          << name << " (fraction=" << fraction << ")");
+                return weight_manager_->getDecodeWeight(name, DeviceId::cpu(), fraction, layer_idx);
+            }
+        }
+
+        // No CPU in decode devices - use full weight
+        LOG_TRACE("[DeviceGraphOrchestrator::getPhaseAwareWeight] DECODE phase, CPU not in decode devices - returning full weight for " << name);
+        return weight_manager_->getWeight(name);
+    }
+
+    bool DeviceGraphOrchestrator::shouldUseCPUDecodeWeight(const std::string &name, int layer_idx) const
+    {
+        // Check phase constraint:
+        // - Default (cpu_prefill_participate=false): CPU only participates in DECODE phase
+        // - With cpu_prefill_participate=true: CPU participates in BOTH phases (Option C fallback)
+        if (current_phase_ == InferencePhase::PREFILL)
+        {
+            // Check if CPU prefill participation is enabled (Option C: memory-constrained systems)
+            if (!debugEnv().execution.cpu_prefill_participate)
+            {
+                return false;
+            }
+            // If cpu_prefill_participate is true, continue with the rest of the checks
+        }
+        // DECODE phase always allows CPU participation if configured
+
+        // Must have placement map
+        if (!weight_placement_map_)
+        {
+            return false;
+        }
+
+        // Get device info
+        WeightDeviceInfo device_info = weight_placement_map_->getDeviceInfoForWeight(name, layer_idx);
+
+        // Check if CPU decode participation is enabled for this weight
+        if (!device_info.cpu_decode_participation)
+        {
+            return false;
+        }
+
+        // Check if this MPI rank should handle CPU decode
+        // For now, rank 0 is the designated CPU decode participant
+        // This could be made configurable in the future
+        int my_rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+
+        // The CPU decode participant is typically the first rank (rank 0)
+        // In future, could look at device_info.decode_devices to find which
+        // ranks have CPUs and distribute work accordingly
+        bool is_cpu_decode_rank = (my_rank == 0);
+
+        if (is_cpu_decode_rank)
+        {
+            // Verify that CPU is actually in the decode devices
+            for (const auto &dev : device_info.decode_devices)
+            {
+                if (dev.is_cpu())
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+} // namespace llaminar2

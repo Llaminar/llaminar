@@ -15,9 +15,9 @@
 #pragma once
 
 #include "execution/compute_stages/ComputeStages.h"
-#include "execution/DeviceContext.h"
-#include "execution/ILayerExecutor.h" // For ILayerExecutor interface
-#include "execution/LayerExecutor.h"  // For ComputeGraph
+#include "execution/local_execution/device/DeviceContext.h"
+#include "execution/local_execution/model/ILayerExecutor.h" // For ILayerExecutor interface
+#include "execution/local_execution/model/LayerExecutor.h"  // For ComputeGraph
 #include "backends/DeviceId.h"
 #include <vector>
 #include <string>

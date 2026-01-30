@@ -17,8 +17,8 @@
 #include <vector>
 #include <functional>
 
-#include "execution/PlacementStrategy.h"
-#include "execution/PlacementPlan.h"
+#include "execution/mpi_orchestration/PlacementStrategy.h"
+#include "execution/mpi_orchestration/PlacementPlan.h"
 #include "utils/MPITopology.h"
 #include "utils/MPIContext.h"
 #include "loaders/WeightManager.h"
@@ -78,7 +78,7 @@ protected:
 
     // Hash a PlacementPlan for comparison
     // Hash a PlacementDevice into an integer for comparison
-    static uint64_t hashDevice(const PlacementDevice& device)
+    static uint64_t hashDevice(const PlacementDevice &device)
     {
         return (static_cast<uint64_t>(device.type) << 8) | static_cast<uint64_t>(device.gpu_index);
     }

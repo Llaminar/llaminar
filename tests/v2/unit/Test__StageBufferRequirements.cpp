@@ -10,7 +10,7 @@
 
 #include <gtest/gtest.h>
 #include "execution/compute_stages/ComputeStages.h"
-#include "../../src/v2/execution/BufferRole.h"
+#include "../../src/v2/execution/debug/BufferRole.h"
 #include "../../src/v2/tensors/Tensors.h"
 
 using namespace llaminar2;

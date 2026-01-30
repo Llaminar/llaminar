@@ -6,7 +6,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/DeviceContext.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #include <vector>
 #include <atomic>
 #include <cmath>

@@ -50,7 +50,7 @@
 #pragma once
 
 #include "../../interfaces/IWorkspaceConsumer.h"
-#include "../../execution/DeviceWorkspaceManager.h"
+#include "../local_execution/device/DeviceWorkspaceManager.h"
 #include "../../utils/Logger.h"
 
 namespace llaminar2

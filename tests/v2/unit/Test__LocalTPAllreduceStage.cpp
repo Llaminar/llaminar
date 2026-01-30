@@ -19,7 +19,7 @@
 
 #include "execution/compute_stages/stages/LocalTPAllreduceStage.h"
 #include "collective/LocalTPContext.h"
-#include "execution/DeviceContext.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #include "tensors/TensorFactory.h"
 #include "tensors/Tensors.h"
 #include "backends/GlobalDeviceAddress.h"
@@ -291,12 +291,16 @@ TEST_F(Test__LocalTPAllreduceStage, ExecuteSucceedsSingleDevice)
 }
 
 /**
- * @test Execute with multi-device context (placeholder behavior)
+ * @test Execute with multi-device context fails when tensor not on any TP device
+ *
+ * The tensor is on CPU but the LocalTPContext has CUDA devices, so the
+ * allreduce correctly fails because the tensor's device isn't in the TP context.
+ * Full collective testing with proper device placement requires integration tests.
  */
-TEST_F(Test__LocalTPAllreduceStage, ExecuteMultiDevicePlaceholder)
+TEST_F(Test__LocalTPAllreduceStage, ExecuteMultiDeviceFailsWhenTensorNotOnTPDevice)
 {
     auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
-    auto *tensor = test_tensor_.get();
+    auto *tensor = test_tensor_.get(); // tensor is on CPU, not cuda0_ or cuda1_
 
     LocalTPAllreduceStage::Params params;
     params.tp_ctx = tp_ctx.get();
@@ -304,9 +308,8 @@ TEST_F(Test__LocalTPAllreduceStage, ExecuteMultiDevicePlaceholder)
 
     auto stage = std::make_unique<LocalTPAllreduceStage>(params);
 
-    // Multi-device - currently returns true (placeholder)
-    // Full collective testing requires integration tests
-    EXPECT_TRUE(stage->execute(ctx_.get()));
+    // Should fail: tensor device (CPU) not found in LocalTPContext devices (cuda0_, cuda1_)
+    EXPECT_FALSE(stage->execute(ctx_.get()));
 }
 
 // =============================================================================

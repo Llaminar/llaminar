@@ -28,7 +28,7 @@
 #include "../../tensors/TensorLayout.h"
 #include "../../backends/DeviceId.h"
 #include "../../utils/MPIContext.h"
-#include "../../execution/RuntimeConfig.h"
+#include "../../execution/config/RuntimeConfig.h"
 #include <vector>
 #include <memory>
 

@@ -44,9 +44,9 @@
 #include <map>
 #include <algorithm>
 
-#include "execution/InferenceRunnerFactory.h"
-#include "execution/IInferenceRunner.h"
-#include "execution/RuntimeConfig.h"
+#include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/local_execution/orchestrators/IInferenceRunner.h"
+#include "execution/config/RuntimeConfig.h"
 #include "loaders/ModelContext.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"

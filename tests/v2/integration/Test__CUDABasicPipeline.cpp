@@ -23,7 +23,7 @@
 #include "tensors/Tensors.h"
 #include "kernels/KernelFactory.h"
 #include "backends/ComputeBackend.h"
-#include "execution/DeviceContext.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
 #endif

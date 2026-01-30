@@ -1083,8 +1083,8 @@ add_library(llaminar2_core STATIC
     backends/BackendManager.cpp
     backends/CPUBackend.cpp
     # Execution framework (hierarchical work distribution)
-    execution/WorkDistributor.cpp
-    execution/DeviceContext.cpp
+    execution/mpi_orchestration/WorkDistributor.cpp
+    execution/local_execution/device/DeviceContext.cpp
     # ComputeStage base classes and factory in compute_stages/
     execution/compute_stages/ComputeStageBase.cpp
     execution/compute_stages/ComputeStageFactory.cpp
@@ -1109,22 +1109,22 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/FusedAttentionWoStage.cpp
     execution/compute_stages/stages/EmbeddingStage.cpp
     execution/compute_stages/stages/LMHeadStage.cpp
-    execution/GraphExecutor.cpp
-    execution/GraphBufferManager.cpp
-    execution/DomainAwareBufferManager.cpp
-    execution/GraphResolver.cpp
-    execution/LivenessAnalyzer.cpp
-    execution/LayerExecutor.cpp
-    execution/ModelExecutor.cpp
-    execution/DeviceGraphOrchestrator.cpp
-    execution/MultiDomainOrchestrator.cpp
-    execution/MultiDeviceOrchestrator.cpp
-    execution/HeterogeneousLayerExecutor.cpp
-    execution/CrossDomainTransfer.cpp
-    execution/HybridPrecisionConfig.cpp
-    execution/InferenceMode.cpp
-    execution/StageCoherence.cpp
-    execution/DeviceWorkspaceManager.cpp
+    execution/local_execution/graph/GraphExecutor.cpp
+    execution/local_execution/graph/GraphBufferManager.cpp
+    execution/local_execution/device/DomainAwareBufferManager.cpp
+    execution/local_execution/graph/GraphResolver.cpp
+    execution/local_execution/graph/LivenessAnalyzer.cpp
+    execution/local_execution/model/LayerExecutor.cpp
+    execution/local_execution/model/ModelExecutor.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp
+    execution/local_execution/orchestrators/MultiDomainOrchestrator.cpp
+    execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp
+    execution/local_execution/model/HeterogeneousLayerExecutor.cpp
+    execution/local_execution/coherence/CrossDomainTransfer.cpp
+    execution/config/HybridPrecisionConfig.cpp
+    execution/config/InferenceMode.cpp
+    execution/local_execution/coherence/StageCoherence.cpp
+    execution/local_execution/device/DeviceWorkspaceManager.cpp
     # Tensor parallelism configuration (proportional sharding for heterogeneous TP)
     config/TensorParallelConfig.cpp
     # Pipeline parallelism configuration (layer range assignment for PP)
@@ -1144,15 +1144,15 @@ add_library(llaminar2_core STATIC
     # Slab GEMM configuration (for chunked FP16 GEMM workspace management)
     kernels/SlabGemmConfig.cpp
     # Placement strategy (weight/compute distribution)
-    execution/PlacementPlan.cpp
-    execution/PlacementStrategy.cpp
-    execution/placement/HeterogeneousMultiDomainStrategy.cpp
+    execution/mpi_orchestration/PlacementPlan.cpp
+    execution/mpi_orchestration/PlacementStrategy.cpp
+    execution/mpi_orchestration/placement/HeterogeneousMultiDomainStrategy.cpp
     # Execution plan builder (Phase 1 - Plan-to-Graph translation)
-    execution/ExecutionPlanBuilder.cpp
+    execution/mpi_orchestration/ExecutionPlanBuilder.cpp
     # Pipeline parallel graph builder (Phase 3 - PP stage insertion)
-    execution/PipelineParallelGraphBuilder.cpp
+    execution/local_execution/graph/PipelineParallelGraphBuilder.cpp
     # Inference dispatch (InferenceRunner decouples pipeline vs graph paths)
-    execution/InferenceRunnerFactory.cpp
+    execution/factory/InferenceRunnerFactory.cpp
     loaders/ModelLoader.cpp
     loaders/ModelContext.cpp
     loaders/WeightManager.cpp
@@ -1164,7 +1164,7 @@ add_library(llaminar2_core STATIC
     # Partial weight loader (Phase 3 - PP partial weight loading)
     loaders/PartialWeightLoader.cpp
     # Layer device placement (Phase 2 - multi-device graph building)
-    execution/LayerDevicePlacement.cpp
+    execution/local_execution/device/LayerDevicePlacement.cpp
     # Qwen2 model and graph configuration
     models/qwen/Qwen2Graph.cpp
     models/qwen/Qwen2GraphConfigBuilder.cpp
@@ -1270,7 +1270,7 @@ add_library(llaminar2_core STATIC
     # NOTE: RCCLBackend.cpp is NOT here - it's in rocm_backend to isolate RCCL symbols
     # from NCCL. Both export the same symbols (ncclCommInitRank, etc.) and would conflict.
     collective/backends/UPIBackend.cpp
-    execution/CollectiveContext.cpp
+    execution/local_execution/collective/CollectiveContext.cpp
     # NUMA-aware memory allocation
     memory/NUMAAllocator.cpp
     # LOCAL tensor parallelism (Phase 4: multi-device within single MPI rank)
@@ -1278,8 +1278,8 @@ add_library(llaminar2_core STATIC
     loaders/LocalTPWeightSharder.cpp
     execution/compute_stages/stages/LocalTPAllreduceStage.cpp
     # Orchestration runner (Phase 5: end-to-end integration)
-    orchestration/OrchestrationRunner.cpp
-    orchestration/OrchestrationRunnerFactory.cpp
+    execution/runner/OrchestrationRunner.cpp
+    execution/runner/OrchestrationRunnerFactory.cpp
     # NOTE: Legacy GEMM microkernel and instantiation systems removed (gemm v1/v2/v3)
     # GemmMicroKernelInit.cpp, Q8_1/VNNI instantiation sources - REMOVED
 )

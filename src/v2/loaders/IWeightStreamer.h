@@ -32,7 +32,7 @@
 #pragma once
 
 #include "../backends/DeviceId.h"
-#include "../execution/PlacementStrategy.h" // For InferencePhase
+#include "../execution/mpi_orchestration/PlacementStrategy.h" // For InferencePhase
 
 #include <cstddef>
 #include <cstdint>

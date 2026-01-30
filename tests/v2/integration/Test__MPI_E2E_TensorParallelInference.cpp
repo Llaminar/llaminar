@@ -38,9 +38,9 @@
 #include <iomanip>
 #include <sstream>
 
-#include "execution/InferenceRunnerFactory.h"
-#include "execution/IInferenceRunner.h"
-#include "execution/DeviceGraphOrchestrator.h"
+#include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/local_execution/orchestrators/IInferenceRunner.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "models/qwen/Qwen2Graph.h"
 #include "models/qwen/Qwen2Schema.h"
 #include "loaders/ModelContext.h"

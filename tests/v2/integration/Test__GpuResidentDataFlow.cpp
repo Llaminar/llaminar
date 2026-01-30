@@ -26,7 +26,7 @@
 // Project headers
 #include "tensors/Tensors.h"
 #include "backends/DeviceId.h"
-#include "execution/StageCoherence.h"
+#include "execution/local_execution/coherence/StageCoherence.h"
 #include "execution/compute_stages/IComputeStage.h"
 
 // Test utilities

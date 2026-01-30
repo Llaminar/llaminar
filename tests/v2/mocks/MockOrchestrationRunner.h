@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include "orchestration/IOrchestrationRunner.h"
+#include "execution/runner/IOrchestrationRunner.h"
 #include <gmock/gmock.h>
 
 namespace llaminar2::test

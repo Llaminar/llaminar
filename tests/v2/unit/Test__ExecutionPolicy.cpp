@@ -12,7 +12,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/ExecutionPolicy.h"
+#include "execution/config/ExecutionPolicy.h"
 #include "utils/DebugEnv.h"
 #include <cstdlib>
 

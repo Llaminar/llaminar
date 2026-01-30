@@ -23,10 +23,10 @@
 #include <string>
 #include <vector>
 #include <functional>
-#include "../DeviceContext.h"
-#include "../BufferRole.h"
-#include "../RuntimeConfig.h"
-#include "../StageCoherence.h"
+#include "../local_execution/device/DeviceContext.h"
+#include "../debug/BufferRole.h"
+#include "../config/RuntimeConfig.h"
+#include "../local_execution/coherence/StageCoherence.h"
 #include "../../tensors/BlockStructures.h"
 #include "../../tensors/TensorKernels.h"
 #include "../../utils/MPITopology.h"
@@ -186,7 +186,7 @@ namespace llaminar2
         };
 
         std::vector<InputBuffer> inputs;
-        mutable std::vector<OutputBuffer> outputs;  // mutable for ensureOutputsOnHost() const
+        mutable std::vector<OutputBuffer> outputs; // mutable for ensureOutputsOnHost() const
         std::vector<WeightBuffer> weights;
         std::vector<ScalarParam> scalars;
 
@@ -402,9 +402,10 @@ namespace llaminar2
          *
          * @note Performance: First call builds info, subsequent calls return cached.
          */
-        const StageDumpInfo& getDumpInfo() const
+        const StageDumpInfo &getDumpInfo() const
         {
-            if (!dump_info_cached_) {
+            if (!dump_info_cached_)
+            {
                 cached_dump_info_ = buildDumpInfoImpl();
                 dump_info_cached_ = true;
             }

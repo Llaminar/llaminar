@@ -11,8 +11,8 @@
  */
 
 #include "ROCmFlashAttentionKernelT.h"
-#include "../../../execution/DeviceWorkspaceManager.h"
-#include "../../../execution/WorkspaceDescriptor.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KernelProfiler.h"
 #include <cstring>

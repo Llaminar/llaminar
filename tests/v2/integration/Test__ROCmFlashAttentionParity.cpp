@@ -25,8 +25,8 @@
 #include <gtest/gtest.h>
 
 #include "tensors/Tensors.h"
-#include "execution/RuntimeConfig.h"
-#include "execution/DeviceWorkspaceManager.h"
+#include "execution/config/RuntimeConfig.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
 

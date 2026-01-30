@@ -24,10 +24,10 @@
 #include <algorithm>
 
 // Core execution components
-#include "execution/GraphExecutor.h"
+#include "execution/local_execution/graph/GraphExecutor.h"
 #include "execution/compute_stages/ComputeStages.h"
-#include "execution/IGraphExecutor.h"
-#include "execution/DeviceContext.h"
+#include "execution/local_execution/graph/IGraphExecutor.h"
+#include "execution/local_execution/device/DeviceContext.h"
 
 // Tensors and utilities
 #include "tensors/Tensors.h"

@@ -8,8 +8,8 @@
 
 #include <gtest/gtest.h>
 #include "v2/execution/compute_stages/IWorkspaceConsumerStage.h"
-#include "v2/execution/DeviceWorkspaceManager.h"
-#include "v2/execution/WorkspaceDescriptor.h"
+#include "v2/execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "v2/execution/local_execution/device/WorkspaceDescriptor.h"
 #include "v2/interfaces/IWorkspaceConsumer.h"
 
 namespace llaminar2::test

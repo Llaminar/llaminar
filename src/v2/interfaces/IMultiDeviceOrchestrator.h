@@ -19,7 +19,7 @@
 
 #pragma once
 
-#include "../execution/IInferenceRunner.h"
+#include "../execution/interfaces/IInferenceRunner.h"
 
 namespace llaminar2
 {
