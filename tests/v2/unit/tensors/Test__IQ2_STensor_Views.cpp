@@ -4,7 +4,7 @@
  * @author David Sanftenberg
  */
 
-#include "../../../../src/v2/tensors/Tensors.h"
+#include "tensors/Tensors.h"
 #include <gtest/gtest.h>
 #include <memory>
 #include <vector>

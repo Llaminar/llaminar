@@ -6,10 +6,10 @@
  * configuration, environment variables, and auto-detection.
  */
 
-#include "../../../../src/v2/loaders/WeightStreamerFactory.h"
-#include "../../../../src/v2/loaders/NullWeightStreamer.h"
-#include "../../../../src/v2/loaders/LayerWeightStreamer.h"
-#include "../../../../src/v2/backends/DeviceId.h"
+#include "loaders/WeightStreamerFactory.h"
+#include "loaders/NullWeightStreamer.h"
+#include "loaders/LayerWeightStreamer.h"
+#include "backends/DeviceId.h"
 #include <gtest/gtest.h>
 #include <memory>
 #include <cstdlib>

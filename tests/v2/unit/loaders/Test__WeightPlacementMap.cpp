@@ -5,9 +5,9 @@
  * Tests block-level and MoE-specific device placement methods added for MoE readiness.
  */
 
-#include "../../../../src/v2/loaders/WeightPlacementMap.h"
-#include "../../../../src/v2/backends/DeviceId.h"
-#include "../../../../src/v2/execution/mpi_orchestration/PlacementPlan.h"
+#include "loaders/WeightPlacementMap.h"
+#include "backends/DeviceId.h"
+#include "execution/mpi_orchestration/PlacementPlan.h"
 #include <gtest/gtest.h>
 #include <memory>
 

@@ -9,10 +9,10 @@
  * model files while testing the streaming logic.
  */
 
-#include "../../../../src/v2/loaders/LayerWeightStreamer.h"
-#include "../../../../src/v2/loaders/WeightManager.h"
-#include "../../../../src/v2/loaders/ModelLoader.h"
-#include "../../../../src/v2/backends/DeviceId.h"
+#include "loaders/LayerWeightStreamer.h"
+#include "loaders/WeightManager.h"
+#include "loaders/ModelLoader.h"
+#include "backends/DeviceId.h"
 #include <gtest/gtest.h>
 #include <memory>
 

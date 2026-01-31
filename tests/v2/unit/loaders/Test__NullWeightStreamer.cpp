@@ -6,8 +6,8 @@
  * Verifies that all methods return expected values and have no side effects.
  */
 
-#include "../../../../src/v2/loaders/NullWeightStreamer.h"
-#include "../../../../src/v2/backends/DeviceId.h"
+#include "loaders/NullWeightStreamer.h"
+#include "backends/DeviceId.h"
 #include <gtest/gtest.h>
 #include <memory>
 

@@ -20,7 +20,7 @@
 #include <cmath>
 #include <cstring>
 #include <random>
-#include "../../../../src/v2/tensors/Tensors.h"
+#include "tensors/Tensors.h"
 #include "loaders/ModelLoader.h"
 #include <fstream>
 

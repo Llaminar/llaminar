@@ -290,7 +290,7 @@ add_v2_test(V2_Unit_TensorBasics
 )
 
 # Test: TensorAllocateOnDevice - CPUTensorBase::allocateOnDevice() method
-add_executable(v2_test_tensor_allocate_on_device unit/Test__TensorAllocateOnDevice.cpp)
+add_executable(v2_test_tensor_allocate_on_device unit/tensors/Test__TensorAllocateOnDevice.cpp)
 target_link_libraries(v2_test_tensor_allocate_on_device 
     llaminar2_core 
     GTest::gtest
@@ -305,7 +305,7 @@ add_v2_test(V2_Unit_TensorAllocateOnDevice
 # Test: TensorByteSize - Verify byte_size() implementation for all tensor types
 # This is critical because CPUTensorBase::byte_size() throws if not overridden,
 # which causes GPU transfer failures.
-add_executable(v2_test_tensor_byte_size unit/Test__TensorByteSize.cpp)
+add_executable(v2_test_tensor_byte_size unit/tensors/Test__TensorByteSize.cpp)
 target_link_libraries(v2_test_tensor_byte_size 
     llaminar2_core 
     GTest::gtest
@@ -318,7 +318,7 @@ add_v2_test(V2_Unit_TensorByteSize
 )
 
 # Test: BARBackedTensor - BAR-backed tensor factory and operations
-add_executable(v2_test_bar_backed_tensor unit/Test__BARBackedTensor.cpp)
+add_executable(v2_test_bar_backed_tensor unit/tensors/Test__BARBackedTensor.cpp)
 target_link_libraries(v2_test_bar_backed_tensor 
     llaminar2_core 
     GTest::gtest
@@ -331,7 +331,7 @@ add_v2_test(V2_Unit_BARBackedTensor
 )
 
 # Test: TensorFactory_BARBacked - TensorFactory BAR-backed tensor creation methods
-add_executable(v2_test_tensor_factory_bar_backed unit/Test__TensorFactory_BARBacked.cpp)
+add_executable(v2_test_tensor_factory_bar_backed unit/tensors/Test__TensorFactory_BARBacked.cpp)
 target_link_libraries(v2_test_tensor_factory_bar_backed 
     llaminar2_core 
     GTest::gtest
@@ -344,7 +344,7 @@ add_v2_test(V2_Unit_TensorFactory_BARBacked
 )
 
 # Test: Qwen2BufferSpec - Buffer allocation strategy for BAR-backed tensors
-add_executable(v2_test_qwen2_buffer_spec unit/Test__Qwen2BufferSpec.cpp)
+add_executable(v2_test_qwen2_buffer_spec unit/models/qwen/Test__Qwen2BufferSpec.cpp)
 target_link_libraries(v2_test_qwen2_buffer_spec 
     llaminar2_core 
     GTest::gtest
@@ -357,7 +357,7 @@ add_v2_test(V2_Unit_Qwen2BufferSpec
 )
 
 # Test: CacheInfo - CPU cache detection and batch size optimization
-add_executable(v2_test_cache_info unit/Test__CacheInfo.cpp)
+add_executable(v2_test_cache_info unit/utils/Test__CacheInfo.cpp)
 target_link_libraries(v2_test_cache_info 
     llaminar2_core 
     GTest::gtest
@@ -370,7 +370,7 @@ add_v2_test(V2_Unit_CacheInfo
 )
 
 # Test: StageDumpConfig - Environment variable parsing and filtering for stage dumps
-add_executable(v2_test_stage_dump_config unit/Test__StageDumpConfig.cpp)
+add_executable(v2_test_stage_dump_config unit/execution/debug/Test__StageDumpConfig.cpp)
 target_link_libraries(v2_test_stage_dump_config 
     llaminar2_core 
     GTest::gtest
@@ -383,7 +383,7 @@ add_v2_test(V2_Unit_StageDumpConfig
 )
 
 # Test: CrossDomainTransfer - Cross-domain activation transfer utility
-add_executable(v2_test_cross_domain_transfer unit/Test__CrossDomainTransfer.cpp)
+add_executable(v2_test_cross_domain_transfer unit/execution/local_execution/coherence/Test__CrossDomainTransfer.cpp)
 target_link_libraries(v2_test_cross_domain_transfer 
     llaminar2_core 
     GTest::gtest
@@ -399,7 +399,7 @@ add_v2_test(V2_Unit_CrossDomainTransfer
 )
 
 # Test: DeviceGroup - Device group construction and predicates for collective operations
-add_executable(v2_unit_device_group unit/Test__DeviceGroup.cpp)
+add_executable(v2_unit_device_group unit/collective/Test__DeviceGroup.cpp)
 target_link_libraries(v2_unit_device_group 
     llaminar2_core 
     GTest::gtest
@@ -412,7 +412,7 @@ add_v2_test(V2_Unit_DeviceGroup
 )
 
 # Test: DeviceBenchmark - Lightweight device benchmarking infrastructure
-add_executable(v2_unit_device_benchmark unit/Test__DeviceBenchmark.cpp)
+add_executable(v2_unit_device_benchmark unit/backends/benchmarks/Test__DeviceBenchmark.cpp)
 target_link_libraries(v2_unit_device_benchmark 
     llaminar2_core 
     device_benchmarks
@@ -428,7 +428,7 @@ add_v2_test(V2_Unit_DeviceBenchmark
 # Test: DirectP2P - Cross-vendor P2P via PCIe BAR mapping
 # Requires both CUDA and ROCm - tests true zero-copy P2P between GPU vendors
 if(HAVE_CUDA AND HAVE_ROCM)
-    add_executable(v2_integration_direct_p2p integration/Test__DirectP2P.cpp)
+    add_executable(v2_integration_direct_p2p integration/collective/Test__DirectP2P.cpp)
     target_link_libraries(v2_integration_direct_p2p 
         llaminar2_core 
         device_benchmarks
@@ -444,7 +444,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
 
     # Test: CrossVendorTensorParallel - Real tensor parallel inference across NVIDIA+AMD
     # Tests FP32/Q8_1 tensor transfers, column/row parallel GEMM, AllReduce semantics
-    add_executable(v2_integration_cross_vendor_tp integration/Test__CrossVendorTensorParallel.cpp)
+    add_executable(v2_integration_cross_vendor_tp integration/execution/Test__CrossVendorTensorParallel.cpp)
     target_link_libraries(v2_integration_cross_vendor_tp 
         llaminar2_core 
         device_benchmarks
@@ -462,7 +462,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
     )
 
     # Test: PCIeBARBackend Integration - End-to-end collective operations via PCIe BAR P2P
-    add_executable(v2_integration_pcie_bar_backend integration/Test__PCIeBARBackendIntegration.cpp)
+    add_executable(v2_integration_pcie_bar_backend integration/collective/backends/Test__PCIeBARBackendIntegration.cpp)
     target_link_libraries(v2_integration_pcie_bar_backend 
         llaminar2_core 
         device_benchmarks
@@ -483,7 +483,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
     # Tests GCD-based parallel bridging where multiple device pairs perform
     # allreduce operations simultaneously. Requires 2+ CUDA and 2+ ROCm devices
     # for full multi-pair tests; single-pair tests run with 1 CUDA + 1 ROCm.
-    add_executable(v2_integration_pcie_bar_backend_multi_pair integration/Test__PCIeBarBackend_MultiPair.cpp)
+    add_executable(v2_integration_pcie_bar_backend_multi_pair integration/collective/backends/Test__PCIeBarBackend_MultiPair.cpp)
     target_link_libraries(v2_integration_pcie_bar_backend_multi_pair 
         llaminar2_core 
         device_benchmarks
@@ -509,8 +509,8 @@ if(HAVE_CUDA AND HAVE_ROCM)
     # - AMD dmabuf export → CUDA import FAILS (NVIDIA rejects foreign dmabufs, error 999)
     # - Dmabuf CPU mmap is slow (~21 MB/s, uncached PCIe access)
     # Conclusion: Use hipMemcpy(D2D) to stage ROCm kernel output to BAR before CUDA reads.
-    # See: tests/v2/integration/Test__BARBackedHipAllocation.cpp for detailed documentation.
-    add_executable(v2_integration_bar_backed_hip_allocation integration/Test__BARBackedHipAllocation.cpp)
+    # See: tests/v2/integration/backends/rocm/Test__BARBackedHipAllocation.cpp for detailed documentation.
+    add_executable(v2_integration_bar_backed_hip_allocation integration/backends/rocm/Test__BARBackedHipAllocation.cpp)
     target_link_libraries(v2_integration_bar_backed_hip_allocation 
         llaminar2_core 
         GTest::gtest
@@ -529,7 +529,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
     # direct page table manipulation, as implemented by tinygrad for bidirectional P2P.
     # DISABLED: Requires root access and deep understanding of AMD GPU page table format.
     # Run manually via: ctest -R DISABLED_V2_Integration_AMD_PCIe_P2P_Mapping
-    add_executable(v2_integration_amd_pcie_p2p_mapping integration/experimental/Test__AMD_PCIe_P2P_Mapping.cpp)
+    add_executable(v2_integration_amd_pcie_p2p_mapping integration/backends/rocm/Test__AMD_PCIe_P2P_Mapping.cpp)
     target_link_libraries(v2_integration_amd_pcie_p2p_mapping 
         llaminar2_core 
         GTest::gtest
@@ -543,7 +543,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
     )
 
     # Test: PCIeBAR Latency Benchmark - Performance benchmark for cross-vendor collective latency
-    add_executable(v2_integration_pcie_bar_latency_benchmark integration/Test__PCIeBARLatencyBenchmark.cpp)
+    add_executable(v2_integration_pcie_bar_latency_benchmark integration/collective/backends/Test__PCIeBARLatencyBenchmark.cpp)
     target_link_libraries(v2_integration_pcie_bar_latency_benchmark 
         llaminar2_core 
         device_benchmarks
@@ -561,7 +561,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
     )
 
     # Test: CUDA Vector Add Kernels - Accuracy tests for FP32/FP16/BF16/INT8/INT32 reduction kernels
-    add_executable(v2_integration_cuda_vector_add_kernels integration/Test__CUDAVectorAddKernels.cpp)
+    add_executable(v2_integration_cuda_vector_add_kernels integration/kernels/cuda/ops/Test__CUDAVectorAddKernels.cpp)
     target_link_libraries(v2_integration_cuda_vector_add_kernels 
         llaminar2_core 
         GTest::gtest
@@ -576,7 +576,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
     # Test: CollectiveBackendIntegration - Comprehensive collective backend tests
     # Tests CPU+CPU (MPI), NVIDIA+NVIDIA (NCCL), AMD+AMD (RCCL), NVIDIA+AMD (PCIeBAR),
     # and complex heterogeneous scenarios with multi-domain tensor parallelism
-    add_executable(v2_integration_collective_backend integration/Test__CollectiveBackendIntegration.cpp)
+    add_executable(v2_integration_collective_backend integration/collective/Test__CollectiveBackendIntegration.cpp)
     target_link_libraries(v2_integration_collective_backend 
         llaminar2_core 
         device_benchmarks
@@ -607,7 +607,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
     # - RCCL P2P within ROCm domain
     # - PCIeBAR P2P between CUDA and ROCm
     # - Cross-backend staging patterns
-    add_executable(v2_integration_cross_backend_p2p integration/Test__CrossBackendP2P.cpp)
+    add_executable(v2_integration_cross_backend_p2p integration/collective/Test__CrossBackendP2P.cpp)
     target_link_libraries(v2_integration_cross_backend_p2p 
         llaminar2_core 
         GTest::gtest
@@ -630,7 +630,7 @@ endif()
 # Test: CrossDomainTransferGPU - GPU integration tests for cross-domain activation transfer
 # Requires either CUDA or ROCm - tests actual PCIe transfers
 if(HAVE_CUDA OR HAVE_ROCM)
-    add_executable(v2_integration_cross_domain_transfer_gpu integration/Test__CrossDomainTransferGPU.cpp)
+    add_executable(v2_integration_cross_domain_transfer_gpu integration/execution/coherence/Test__CrossDomainTransferGPU.cpp)
     target_link_libraries(v2_integration_cross_domain_transfer_gpu 
         llaminar2_core 
         GTest::gtest
@@ -648,7 +648,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
 endif()
 
 # Test: BackendRouter - Backend selection and routing for collective operations
-add_executable(v2_unit_backend_router unit/Test__BackendRouter.cpp)
+add_executable(v2_unit_backend_router unit/collective/Test__BackendRouter.cpp)
 target_link_libraries(v2_unit_backend_router 
     llaminar2_core 
     GTest::gtest
@@ -661,7 +661,7 @@ add_v2_test(V2_Unit_BackendRouter
 )
 
 # Test: IBufferRegistration - Buffer registration interface for collective backends
-add_executable(v2_unit_buffer_registration unit/Test__IBufferRegistration.cpp)
+add_executable(v2_unit_buffer_registration unit/collective/Test__IBufferRegistration.cpp)
 target_link_libraries(v2_unit_buffer_registration 
     llaminar2_core 
     GTest::gtest
@@ -674,7 +674,7 @@ add_v2_test(V2_Unit_BufferRegistration
 )
 
 # Test: HostBackend - CPU-based fallback collective backend
-add_executable(v2_unit_host_backend unit/Test__HostBackend.cpp)
+add_executable(v2_unit_host_backend unit/collective/backends/Test__HostBackend.cpp)
 target_link_libraries(v2_unit_host_backend 
     llaminar2_core 
     GTest::gtest
@@ -687,7 +687,7 @@ add_v2_test(V2_Unit_HostBackend
 )
 
 # Test: CPUBackend - CPU/NUMA backend implementing IBackend interface
-add_executable(v2_unit_cpu_backend unit/Test__CPUBackend.cpp)
+add_executable(v2_unit_cpu_backend unit/backends/Test__CPUBackend.cpp)
 target_link_libraries(v2_unit_cpu_backend 
     llaminar2_core 
     GTest::gtest
@@ -701,7 +701,7 @@ add_v2_test(V2_Unit_CPUBackend
 )
 
 # Test: DeviceWorkspaceManager - Per-device GPU workspace buffer management
-add_executable(v2_unit_device_workspace_manager unit/Test__DeviceWorkspaceManager.cpp)
+add_executable(v2_unit_device_workspace_manager unit/execution/local_execution/device/Test__DeviceWorkspaceManager.cpp)
 target_link_libraries(v2_unit_device_workspace_manager 
     llaminar2_core 
     GTest::gtest
@@ -714,7 +714,7 @@ add_v2_test(V2_Unit_DeviceWorkspaceManager
 )
 
 # Test: IWorkspaceConsumerStage - Mixin for stages that delegate workspace to kernels
-add_executable(v2_unit_workspace_consumer_stage unit/Test__IWorkspaceConsumerStage.cpp)
+add_executable(v2_unit_workspace_consumer_stage unit/execution/compute_stages/Test__IWorkspaceConsumerStage.cpp)
 target_link_libraries(v2_unit_workspace_consumer_stage 
     llaminar2_core 
     GTest::gtest
@@ -727,7 +727,7 @@ add_v2_test(V2_Unit_IWorkspaceConsumerStage
 )
 
 # Test: ROCmQuantisedGemmKernel_Workspace - IWorkspaceConsumer interface integration
-add_executable(v2_unit_rocm_gemm_workspace unit/Test__ROCmQuantisedGemmKernel_Workspace.cpp)
+add_executable(v2_unit_rocm_gemm_workspace unit/kernels/rocm/Test__ROCmQuantisedGemmKernel_Workspace.cpp)
 target_link_libraries(v2_unit_rocm_gemm_workspace 
     llaminar2_core 
     GTest::gtest
@@ -740,7 +740,7 @@ add_v2_test(V2_Unit_ROCmQuantisedGemmKernel_Workspace
 )
 
 # Test: MPIBackend - MPI-based collective backend for inter-node communication
-add_executable(v2_unit_mpi_backend unit/Test__MPIBackend.cpp)
+add_executable(v2_unit_mpi_backend unit/collective/backends/Test__MPIBackend.cpp)
 target_link_libraries(v2_unit_mpi_backend 
     llaminar2_core 
     GTest::gtest
@@ -753,7 +753,7 @@ add_v2_test(V2_Unit_MPIBackend
 )
 
 # Test: UPIBackend - UPI-based collective backend for cross-socket CPU tensor parallelism
-add_executable(v2_unit_upi_backend unit/Test__UPIBackend.cpp)
+add_executable(v2_unit_upi_backend unit/collective/backends/Test__UPIBackend.cpp)
 target_link_libraries(v2_unit_upi_backend 
     llaminar2_core 
     GTest::gtest
@@ -767,7 +767,7 @@ add_v2_test(V2_Unit_UPIBackend
 
 # Test: PCIeBARBackend - PCIe BAR direct P2P collective backend (CUDA + ROCm)
 if(HAVE_CUDA AND HAVE_ROCM)
-    add_executable(v2_unit_pcie_bar_backend unit/Test__PCIeBARBackend.cpp)
+    add_executable(v2_unit_pcie_bar_backend unit/collective/backends/Test__PCIeBARBackend.cpp)
     target_link_libraries(v2_unit_pcie_bar_backend 
         llaminar2_core 
         device_benchmarks
@@ -783,7 +783,7 @@ endif()
 
 # Test: NCCLBackend - NCCL collective backend for NVIDIA GPUs (P2P operations)
 if(HAVE_CUDA)
-    add_executable(v2_unit_nccl_backend unit/Test__NCCLBackend.cpp)
+    add_executable(v2_unit_nccl_backend unit/collective/backends/Test__NCCLBackend.cpp)
     target_link_libraries(v2_unit_nccl_backend 
         llaminar2_core 
         GTest::gtest
@@ -799,7 +799,7 @@ endif()
 
 # Test: RCCLBackend - RCCL collective backend for AMD GPUs (P2P operations)
 if(HAVE_ROCM)
-    add_executable(v2_unit_rccl_backend unit/Test__RCCLBackend.cpp)
+    add_executable(v2_unit_rccl_backend unit/collective/backends/Test__RCCLBackend.cpp)
     target_link_libraries(v2_unit_rccl_backend 
         llaminar2_core 
         GTest::gtest
@@ -815,7 +815,7 @@ endif()
 
 # Test: HeterogeneousBackend - Heterogeneous multi-GPU collective backend (CUDA + ROCm)
 # NOTE: Unit tests work even without hardware by testing validation logic
-add_executable(v2_unit_heterogeneous_backend unit/Test__HeterogeneousBackend.cpp)
+add_executable(v2_unit_heterogeneous_backend unit/collective/backends/Test__HeterogeneousBackend.cpp)
 target_link_libraries(v2_unit_heterogeneous_backend 
     llaminar2_core 
     device_benchmarks
@@ -829,7 +829,7 @@ add_v2_test(V2_Unit_HeterogeneousBackend
 )
 
 # Test: CollectiveContext - Runtime context for collective operations
-add_executable(v2_unit_collective_context unit/Test__CollectiveContext.cpp)
+add_executable(v2_unit_collective_context unit/execution/local_execution/collective/Test__CollectiveContext.cpp)
 target_link_libraries(v2_unit_collective_context 
     llaminar2_core 
     GTest::gtest
@@ -842,7 +842,7 @@ add_v2_test(V2_Unit_CollectiveContext
 )
 
 # Test: GraphExecutorCollective - CollectiveContext integration with GraphExecutor
-add_executable(v2_unit_graph_executor_collective unit/Test__GraphExecutorCollective.cpp)
+add_executable(v2_unit_graph_executor_collective unit/execution/local_execution/graph/Test__GraphExecutorCollective.cpp)
 target_include_directories(v2_unit_graph_executor_collective PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
 )
@@ -1003,7 +1003,7 @@ add_v2_test(V2_Unit_MockWeightPlacementMap
 
 # Test: JIT Register Allocation Framework
 # Compile-time safe register allocation for JIT code generation
-add_executable(v2_test_register_allocation unit/Test__RegisterAllocation.cpp)
+add_executable(v2_test_register_allocation unit/kernels/cpu/jit/Test__RegisterAllocation.cpp)
 target_link_libraries(v2_test_register_allocation 
     llaminar2_core 
     GTest::gtest
@@ -1027,7 +1027,7 @@ add_v2_test(V2_Unit_RegisterGuard
 )
 
 # Test: RegisterEnforcement - Compile-time register type enforcement
-add_executable(v2_test_register_enforcement unit/jit/Test__RegisterEnforcement.cpp)
+add_executable(v2_test_register_enforcement unit/kernels/cpu/jit/Test__RegisterEnforcement.cpp)
 target_link_libraries(v2_test_register_enforcement 
     llaminar2_core 
     GTest::gtest
@@ -1039,7 +1039,7 @@ add_v2_test(V2_Unit_RegisterEnforcement
 )
 
 # Test: JitWoProjectionOptimized - BLAS-style Wo projection microkernels
-add_executable(v2_test_jit_wo_projection_optimized unit/jit/Test__JitWoProjectionOptimized.cpp)
+add_executable(v2_test_jit_wo_projection_optimized unit/kernels/cpu/attention/q8_1/jit/Test__JitWoProjectionOptimized.cpp)
 target_link_libraries(v2_test_jit_wo_projection_optimized 
     llaminar2_core 
     GTest::gtest
@@ -1051,7 +1051,7 @@ add_v2_test(V2_Unit_JitWoProjectionOptimized
 )
 
 # Test: JitQ16MicrokernelParity - JIT vs Reference Q16 microkernel parity tests
-add_executable(v2_test_jit_q16_microkernel_parity unit/jit/Test__JitQ16MicrokernelParity.cpp)
+add_executable(v2_test_jit_q16_microkernel_parity unit/kernels/cpu/attention/q16_1/jit/Test__JitQ16MicrokernelParity.cpp)
 target_link_libraries(v2_test_jit_q16_microkernel_parity 
     llaminar2_core 
     GTest::gtest
@@ -1064,7 +1064,7 @@ add_v2_test(V2_Unit_JitQ16MicrokernelParity
 
 # Test: SwiGLU formula correctness (regression test for gate/up swap bug)
 # This test verifies that SwiGLU computes silu(gate) * up, NOT gate * silu(up)
-add_executable(v2_test_swiglu_formula unit/Test__SwiGLUFormula.cpp)
+add_executable(v2_test_swiglu_formula unit/kernels/cpu/ops/Test__SwiGLUFormula.cpp)
 target_link_libraries(v2_test_swiglu_formula 
     llaminar2_core 
     GTest::gtest
@@ -1249,7 +1249,7 @@ add_v2_test(V2_Unit_Q8_1_BlockAlignedSlicing
 # Verifies that Q8_1, BF16, FP16 activation tensors have correct device_index
 # after creation via createActivation(). Bug: tensors were created with device=-1
 # even when device_idx=0 was passed, causing spurious device transfer attempts.
-add_executable(v2_test_tensor_factory_device_idx unit/Test__TensorFactory_DeviceIndex.cpp)
+add_executable(v2_test_tensor_factory_device_idx unit/tensors/Test__TensorFactory_DeviceIndex.cpp)
 target_link_libraries(v2_test_tensor_factory_device_idx 
     llaminar2_core 
     GTest::gtest
@@ -1264,7 +1264,7 @@ add_v2_test(V2_Unit_TensorFactory_DeviceIndex
 # Test: TensorFactory Q16_1 variable block size creation (Phase 3)
 # Verifies that createQ16_1(shape, block_size, device_idx) creates tensors
 # with correct block sizes (BLOCK_64, BLOCK_128) for different head_dims.
-add_executable(v2_test_tensor_factory_q16_block_size unit/Test__TensorFactory_Q16BlockSize.cpp)
+add_executable(v2_test_tensor_factory_q16_block_size unit/tensors/Test__TensorFactory_Q16BlockSize.cpp)
 target_link_libraries(v2_test_tensor_factory_q16_block_size 
     llaminar2_core 
     GTest::gtest
@@ -1279,7 +1279,7 @@ add_v2_test(V2_Unit_TensorFactory_Q16BlockSize
 # Test: ITensor Runtime Interface
 # Tests the ITensor interface including native_type_id(), is<T>(), typed_as<T>(),
 # try_as<T>(), and static_type_id() for type-safe runtime polymorphism.
-add_executable(v2_test_itensor unit/Test__ITensor.cpp)
+add_executable(v2_test_itensor unit/tensors/Test__ITensor.cpp)
 target_link_libraries(v2_test_itensor 
     llaminar2_core 
     GTest::gtest
@@ -1293,7 +1293,7 @@ add_v2_test(V2_Unit_ITensor
 
 # Test: AttentionMode enum and detection function
 # Tests the AttentionMode dispatch (PREFILL, DECODE, BATCHED_DECODE, CHUNKED_PREFILL)
-add_executable(v2_test_attention_mode unit/Test__AttentionMode.cpp)
+add_executable(v2_test_attention_mode unit/kernels/cpu/attention/Test__AttentionMode.cpp)
 target_link_libraries(v2_test_attention_mode 
     llaminar2_core 
     GTest::gtest
@@ -1358,7 +1358,7 @@ add_v2_test(V2_Unit_Q8_1_Add_Comprehensive
 )
 
 # Test: Q8_1 Residual Add Layer 21 (using actual layer 21 dump data patterns)
-add_executable(v2_test_q8_1_residual_layer21 unit/Test__Q8_1_ResidualAdd_Layer21.cpp)
+add_executable(v2_test_q8_1_residual_layer21 unit/tensors/Test__Q8_1_ResidualAdd_Layer21.cpp)
 target_link_libraries(v2_test_q8_1_residual_layer21 
     llaminar2_core 
     GTest::gtest
@@ -1371,7 +1371,7 @@ add_v2_test(V2_Unit_Q8_1_ResidualAdd_Layer21
 )
 
 # Test: INT8Tensor class (runtime activation quantization with per-row scales)
-add_executable(v2_test_int8_tensor unit/Test__INT8Tensor.cpp)
+add_executable(v2_test_int8_tensor unit/tensors/Test__INT8Tensor.cpp)
 target_link_libraries(v2_test_int8_tensor 
     llaminar2_core 
     GTest::gtest
@@ -1399,7 +1399,7 @@ add_v2_test(V2_Unit_INT32Tensor
 # INT32→INT8 RMSNorm is no longer used; pipeline uses CPURMSNormKernelT<Q8_1> instead
 
 # Test: Q8_1 Pure-Integer RMSNorm (NO floating-point operations)
-add_executable(v2_test_q8_1_pure_integer_rmsnorm unit/Test__Q8_1PureIntegerRMSNorm.cpp)
+add_executable(v2_test_q8_1_pure_integer_rmsnorm unit/kernels/cpu/ops/Test__Q8_1PureIntegerRMSNorm.cpp)
 target_link_libraries(v2_test_q8_1_pure_integer_rmsnorm 
     llaminar2_core 
     GTest::gtest
@@ -1412,7 +1412,7 @@ add_v2_test(V2_Unit_Q8_1PureIntegerRMSNorm
 )
 
 # Test: Q16_1 RMSNorm (Q16_1 input → FP32 output)
-add_executable(v2_test_q16_1_rmsnorm unit/Test__Q16_1RMSNorm.cpp)
+add_executable(v2_test_q16_1_rmsnorm unit/kernels/cpu/ops/Test__Q16_1RMSNorm.cpp)
 target_link_libraries(v2_test_q16_1_rmsnorm 
     llaminar2_core 
     GTest::gtest
@@ -1440,7 +1440,7 @@ add_v2_test(V2_Unit_Q8_1_OnlineSoftmax
 
 # Test: Q8_1 Fused Attention JIT Kernel Unit Tests
 # Tests the fully fused Q8_1 attention kernel with dynamic head_dim support
-add_executable(v2_test_xbyak_vpmovdb unit/Test__Xbyak_VPMOVDB.cpp)
+add_executable(v2_test_xbyak_vpmovdb unit/kernels/cpu/jit/Test__Xbyak_VPMOVDB.cpp)
 target_link_libraries(v2_test_xbyak_vpmovdb llaminar2_core GTest::gtest_main)
 add_v2_test(V2_Unit_Xbyak_VPMOVDB
     COMMAND v2_test_xbyak_vpmovdb
@@ -1525,7 +1525,7 @@ add_v2_test(V2_Unit_Q3_K_SIMD_Unpack
 )
 
 # Test: Q3_K Bug Repro
-add_executable(v2_test_q3k_bug unit/Test__Q3K_Bug.cpp)
+add_executable(v2_test_q3k_bug unit/tensors/Test__Q3K_Bug.cpp)
 target_link_libraries(v2_test_q3k_bug 
     llaminar2_core 
     GTest::gtest
@@ -1603,7 +1603,7 @@ add_v2_test(V2_Unit_Gemm_MinsFlag
 )
 
 # Test: Q4_1 Integration (GEMM)
-add_executable(v2_test_q4_1_integration integration/Test__Q4_1Tensor.cpp)
+add_executable(v2_test_q4_1_integration integration/tensors/Test__Q4_1Tensor.cpp)
 target_link_libraries(v2_test_q4_1_integration 
     llaminar2_core 
     GTest::gtest
@@ -1615,7 +1615,7 @@ add_v2_test(V2_Integration_Q4_1Tensor
 )
 
 # Test: Q2_K Integration (GEMM)
-add_executable(v2_test_q2_k_integration integration/Test__Q2_KTensor.cpp)
+add_executable(v2_test_q2_k_integration integration/tensors/Test__Q2_KTensor.cpp)
 target_link_libraries(v2_test_q2_k_integration 
     llaminar2_core 
     GTest::gtest
@@ -1627,7 +1627,7 @@ add_v2_test(V2_Integration_Q2_KTensor
 )
 
 # Test: Q3_K Integration (GEMM)
-add_executable(v2_test_q3_k_integration integration/Test__Q3_KTensor.cpp)
+add_executable(v2_test_q3_k_integration integration/tensors/Test__Q3_KTensor.cpp)
 target_link_libraries(v2_test_q3_k_integration 
     llaminar2_core 
     GTest::gtest
@@ -1639,7 +1639,7 @@ add_v2_test(V2_Integration_Q3_KTensor
 )
 
 # Test: Q4_K Integration (GEMM)
-add_executable(v2_test_q4_k_integration integration/Test__Q4_KTensor.cpp)
+add_executable(v2_test_q4_k_integration integration/tensors/Test__Q4_KTensor.cpp)
 target_link_libraries(v2_test_q4_k_integration 
     llaminar2_core 
     GTest::gtest
@@ -1651,7 +1651,7 @@ add_v2_test(V2_Integration_Q4_KTensor
 )
 
 # Test: Q6_K Integration (GEMM)
-add_executable(v2_test_q6_k_integration integration/Test__Q6_KTensor.cpp)
+add_executable(v2_test_q6_k_integration integration/tensors/Test__Q6_KTensor.cpp)
 target_link_libraries(v2_test_q6_k_integration 
     llaminar2_core 
     GTest::gtest
@@ -1663,7 +1663,7 @@ add_v2_test(V2_Integration_Q6_KTensor
 )
 
 # Test: IQ4_NL Integration (GEMM)
-add_executable(v2_test_iq4_nl_integration integration/Test__IQ4_NLTensor.cpp)
+add_executable(v2_test_iq4_nl_integration integration/tensors/Test__IQ4_NLTensor.cpp)
 target_link_libraries(v2_test_iq4_nl_integration 
     llaminar2_core 
     GTest::gtest
@@ -1675,7 +1675,7 @@ add_v2_test(V2_Integration_IQ4_NLTensor
 )
 
 # Test: FusedGEMM kernel (generic N-projection fused GEMM)
-add_executable(v2_test_fused_gemm unit/Test__FusedGEMM.cpp)
+add_executable(v2_test_fused_gemm unit/kernels/cpu/gemm_v4/Test__FusedGEMM.cpp)
 target_link_libraries(v2_test_fused_gemm
     llaminar2_core
     GTest::gtest
@@ -1688,7 +1688,7 @@ add_v2_test(V2_Unit_FusedGEMM
 )
 
 # Test: FusedQKVGEMMStage compute stage (regression test for QKV bias bug)
-add_executable(v2_test_fused_qkv_gemm_stage unit/Test__FusedQKVGEMMStage.cpp)
+add_executable(v2_test_fused_qkv_gemm_stage unit/execution/compute_stages/stages/Test__FusedQKVGEMMStage.cpp)
 target_link_libraries(v2_test_fused_qkv_gemm_stage
     llaminar2_core
     GTest::gtest
@@ -1701,7 +1701,7 @@ add_v2_test(V2_Unit_FusedQKVGEMMStage
 )
 
 # Test: FusedGateUpGEMMStage compute stage (FFN gate/up bias handling)
-add_executable(v2_test_fused_gate_up_gemm_stage unit/Test__FusedGateUpGEMMStage.cpp)
+add_executable(v2_test_fused_gate_up_gemm_stage unit/execution/compute_stages/stages/Test__FusedGateUpGEMMStage.cpp)
 target_link_libraries(v2_test_fused_gate_up_gemm_stage
     llaminar2_core
     GTest::gtest
@@ -1714,7 +1714,7 @@ add_v2_test(V2_Unit_FusedGateUpGEMMStage
 )
 
 # Test: Device index handling in CPU kernels (regression test for device_idx=0 bug)
-add_executable(v2_test_device_index_cpu_kernels unit/Test__DeviceIndexCPUKernels.cpp)
+add_executable(v2_test_device_index_cpu_kernels unit/kernels/cpu/Test__DeviceIndexCPUKernels.cpp)
 target_link_libraries(v2_test_device_index_cpu_kernels
     llaminar2_core
     GTest::gtest
@@ -1727,7 +1727,7 @@ add_v2_test(V2_Unit_DeviceIndexCPUKernels
 )
 
 # Test: KernelFactory centralized kernel dispatch
-add_executable(v2_test_kernel_factory unit/Test__KernelFactory.cpp)
+add_executable(v2_test_kernel_factory unit/kernels/Test__KernelFactory.cpp)
 target_link_libraries(v2_test_kernel_factory
     llaminar2_core
     GTest::gtest
@@ -1740,7 +1740,7 @@ add_v2_test(V2_Unit_KernelFactory
 )
 
 # Test: KernelFactory sliced GEMM for tensor parallelism (Phase 2.1)
-add_executable(v2_test_kernel_factory_sliced unit/Test__KernelFactorySliced.cpp)
+add_executable(v2_test_kernel_factory_sliced unit/kernels/Test__KernelFactorySliced.cpp)
 target_link_libraries(v2_test_kernel_factory_sliced
     llaminar2_core
     GTest::gtest
@@ -1753,7 +1753,7 @@ add_v2_test(V2_Unit_KernelFactorySliced
 )
 
 # Test: KernelFactory automatic cache invalidation on tensor destruction
-add_executable(v2_test_kernel_factory_cache_invalidation unit/Test__KernelFactoryCacheInvalidation.cpp)
+add_executable(v2_test_kernel_factory_cache_invalidation unit/kernels/Test__KernelFactoryCacheInvalidation.cpp)
 target_link_libraries(v2_test_kernel_factory_cache_invalidation
     llaminar2_core
     GTest::gtest
@@ -1769,7 +1769,7 @@ add_v2_test(V2_Unit_KernelFactoryCacheInvalidation
 # Regression test for: "unsupported tensor type 10 for device CUDA:0"
 # Root cause: dynamic_cast<Q4_0Tensor*>(TensorSlice*) returns nullptr
 # Solution: Unwrap TensorSlice via slice->inner() before type dispatch
-add_executable(v2_test_kernel_factory_tensorslice_cuda unit/Test__KernelFactoryTensorSliceCUDA.cpp)
+add_executable(v2_test_kernel_factory_tensorslice_cuda unit/kernels/Test__KernelFactoryTensorSliceCUDA.cpp)
 target_link_libraries(v2_test_kernel_factory_tensorslice_cuda
     llaminar2_core
     GTest::gtest
@@ -1786,7 +1786,7 @@ add_v2_test(V2_Unit_KernelFactoryTensorSliceCUDA
 # Critical for MPI tensor parallelism where weights are wrapped in TensorSlice
 # Root cause: TensorSlice inherits from CPUTensorBase but doesn't override coherence methods
 # Solution: StageCoherence.cpp unwraps TensorSlice to access inner tensor
-add_executable(v2_test_tensorslice_coherence unit/Test__TensorSliceCoherence.cpp)
+add_executable(v2_test_tensorslice_coherence unit/tensors/Test__TensorSliceCoherence.cpp)
 target_link_libraries(v2_test_tensorslice_coherence
     llaminar2_core
     GTest::gtest
@@ -1799,7 +1799,7 @@ add_v2_test(V2_Unit_TensorSliceCoherence
 )
 
 # Test: NUMATopology NUMA detection (local node, GPU affinity) - INTEGRATION (requires real GPUs)
-add_executable(v2_integration_numa_topology integration/Test__NUMATopology.cpp)
+add_executable(v2_integration_numa_topology integration/utils/Test__NUMATopology.cpp)
 target_link_libraries(v2_integration_numa_topology
     llaminar2_core
     GTest::gtest
@@ -1812,7 +1812,7 @@ add_v2_test(V2_Integration_NUMATopology
 )
 
 # Test: KernelFactory ops kernel creation (RMSNorm, SwiGLU, RoPE, Attention, Embedding, ResidualAdd)
-add_executable(v2_test_kernel_factory_ops unit/Test__KernelFactoryOps.cpp)
+add_executable(v2_test_kernel_factory_ops unit/kernels/Test__KernelFactoryOps.cpp)
 target_link_libraries(v2_test_kernel_factory_ops
     llaminar2_core
     GTest::gtest
@@ -1825,7 +1825,7 @@ add_v2_test(V2_Unit_KernelFactoryOps
 )
 
 # Test: RMSNorm precision variants (FP32/BF16/FP16/INT32 scalar/AVX2/AVX512 parity)
-add_executable(v2_test_rmsnorm_precision unit/Test__RMSNormPrecision.cpp)
+add_executable(v2_test_rmsnorm_precision unit/kernels/cpu/ops/Test__RMSNormPrecision.cpp)
 target_link_libraries(v2_test_rmsnorm_precision 
     llaminar2_core 
     GTest::gtest
@@ -1838,7 +1838,7 @@ add_v2_test(V2_Unit_RMSNormPrecision
 )
 
 # Test: INT32→INT8 RMSNorm with dynamic requantization (full INT8 pipeline)
-add_executable(v2_test_rmsnorm_int32 unit/Test__RMSNormINT32.cpp)
+add_executable(v2_test_rmsnorm_int32 unit/kernels/cpu/ops/Test__RMSNormINT32.cpp)
 target_link_libraries(v2_test_rmsnorm_int32
     llaminar2_core
     GTest::gtest
@@ -1854,7 +1854,7 @@ add_v2_test(V2_Unit_RMSNormINT32
 # The typed kernel test suite provides comprehensive coverage of all precision variants
 
 # Test: Softmax primitives (scalar/AVX2/AVX512 parity, cross-precision accuracy)
-add_executable(v2_test_softmax_primitives unit/Test__SoftmaxPrimitives.cpp)
+add_executable(v2_test_softmax_primitives unit/kernels/cpu/primitives/Test__SoftmaxPrimitives.cpp)
 target_link_libraries(v2_test_softmax_primitives
     llaminar2_core
     GTest::gtest
@@ -1867,7 +1867,7 @@ add_v2_test(V2_Unit_SoftmaxPrimitives
 )
 
 # Test: Softmax -Inf handling (AVX512 specific regression test)
-add_executable(v2_test_softmax_inf unit/Test__SoftmaxInf.cpp)
+add_executable(v2_test_softmax_inf unit/kernels/cpu/primitives/Test__SoftmaxInf.cpp)
 target_link_libraries(v2_test_softmax_inf
     llaminar2_core
     GTest::gtest
@@ -1880,7 +1880,7 @@ add_v2_test(V2_Unit_SoftmaxInf
 )
 
 # Test: Q8_1 Integer-Aware Softmax primitives (native Q8_1 softmax vs FP32 reference)
-add_executable(v2_test_q8_1_softmax_primitives unit/Test__Q8_1SoftmaxPrimitives.cpp)
+add_executable(v2_test_q8_1_softmax_primitives unit/kernels/cpu/primitives/Test__Q8_1SoftmaxPrimitives.cpp)
 target_link_libraries(v2_test_q8_1_softmax_primitives
     llaminar2_core
     GTest::gtest
@@ -1893,7 +1893,7 @@ add_v2_test(V2_Unit_Q8_1SoftmaxPrimitives
 )
 
 # Test: IndexSoftmax integer-domain softmax (IntAttention paper arXiv:2511.21513)
-add_executable(v2_test_index_softmax unit/Test__IndexSoftmax.cpp)
+add_executable(v2_test_index_softmax unit/kernels/cpu/primitives/Test__IndexSoftmax.cpp)
 target_link_libraries(v2_test_index_softmax
     GTest::gtest
     GTest::gtest_main
@@ -1905,7 +1905,7 @@ add_v2_test(V2_Unit_IndexSoftmax
 )
 
 # Test: Quantised JIT GEMM kernel
-add_executable(v2_test_quantised_gemm_kernel unit/kernels/gemm/Test__QuantisedGemmKernel.cpp)
+add_executable(v2_test_quantised_gemm_kernel unit/kernels/cpu/gemm_v4/Test__QuantisedGemmKernel.cpp)
 target_link_libraries(v2_test_quantised_gemm_kernel
     llaminar2_core
     GTest::gtest
@@ -1918,7 +1918,7 @@ add_v2_test(V2_Unit_QuantisedGemmKernel
 )
 
 # Test: Quantised GEMM Kernel Reproduction (Asymmetric/Tail bugs)
-add_executable(v2_test_quantised_gemm_kernel_repro unit/kernels/Test__QuantisedGemmKernel_Repro.cpp)
+add_executable(v2_test_quantised_gemm_kernel_repro unit/kernels/cpu/gemm_v4/Test__QuantisedGemmKernel_Repro.cpp)
 target_link_libraries(v2_test_quantised_gemm_kernel_repro
     llaminar2_core
     GTest::gtest
@@ -1931,7 +1931,7 @@ add_v2_test(V2_Unit_QuantisedGemmKernel_Repro
 )
 
 # Test: Quantised GEMM Kernel Q8_1 Output Epilogue
-add_executable(v2_test_quantised_gemm_q8_1_output unit/kernels/gemm/Test__QuantisedGemmKernel_Q8_1_Output.cpp)
+add_executable(v2_test_quantised_gemm_q8_1_output unit/kernels/cpu/gemm_v4/Test__QuantisedGemmKernel_Q8_1_Output.cpp)
 target_link_libraries(v2_test_quantised_gemm_q8_1_output
     llaminar2_core
     GTest::gtest
@@ -1944,7 +1944,7 @@ add_v2_test(V2_Unit_QuantisedGemmKernel_Q8_1_Output
 )
 
 # Test: Quantised GEMM Kernel Q16_1 Output Epilogue
-add_executable(v2_test_quantised_gemm_q16_1_output unit/kernels/gemm/Test__QuantisedGemmKernel_Q16_1_Output.cpp)
+add_executable(v2_test_quantised_gemm_q16_1_output unit/kernels/cpu/gemm_v4/Test__QuantisedGemmKernel_Q16_1_Output.cpp)
 target_link_libraries(v2_test_quantised_gemm_q16_1_output
     llaminar2_core
     GTest::gtest
@@ -1957,7 +1957,7 @@ add_v2_test(V2_Unit_QuantisedGemmKernel_Q16_1_Output
 )
 
 # Test: Quantised JIT GEMM Fused Operations (Bias, Mask, Softmax)
-add_executable(v2_test_quantised_gemm_fused unit/kernels/gemm/Test__QuantisedGemmFused.cpp)
+add_executable(v2_test_quantised_gemm_fused unit/kernels/cpu/gemm_v4/Test__QuantisedGemmFused.cpp)
 target_link_libraries(v2_test_quantised_gemm_fused
     llaminar2_core
     GTest::gtest
@@ -1970,7 +1970,7 @@ add_v2_test(V2_Unit_QuantisedGemmFused
 )
 
 # Test: FloatingPointGemmKernel (OneDNN-based FP32/BF16/FP16 GEMM)
-add_executable(v2_test_fp_gemm_kernel unit/kernels/gemm/Test__FloatingPointGemmKernel.cpp)
+add_executable(v2_test_fp_gemm_kernel unit/kernels/cpu/gemm_v4/Test__FloatingPointGemmKernel.cpp)
 target_link_libraries(v2_test_fp_gemm_kernel
     llaminar2_core
     GTest::gtest
@@ -1983,7 +1983,7 @@ add_v2_test(V2_Unit_FloatingPointGemmKernel
 )
 
 # Test: ActivationTraits (trait dispatch to softmax primitives, GEMM, workspace allocation)
-add_executable(v2_test_activation_traits unit/Test__ActivationTraits.cpp)
+add_executable(v2_test_activation_traits unit/kernels/cpu/primitives/Test__ActivationTraits.cpp)
 target_link_libraries(v2_test_activation_traits
     llaminar2_core
     GTest::gtest
@@ -1996,7 +1996,7 @@ add_v2_test(V2_Unit_ActivationTraits
 )
 
 # Test: CPURMSNormKernelT (typed RMSNorm with fused precision conversion)
-add_executable(v2_test_rmsnorm_typed_kernel unit/Test__CPURMSNormKernelT.cpp)
+add_executable(v2_test_rmsnorm_typed_kernel unit/kernels/cpu/ops/Test__CPURMSNormKernelT.cpp)
 target_link_libraries(v2_test_rmsnorm_typed_kernel
     llaminar2_core
     GTest::gtest
@@ -2009,7 +2009,7 @@ add_v2_test(V2_Unit_CPURMSNormKernelT
 )
 
 # Test: CPURoPEKernelT (typed RoPE with fused precision conversion)
-add_executable(v2_test_rope_typed_kernel unit/Test__CPURoPEKernelT.cpp)
+add_executable(v2_test_rope_typed_kernel unit/kernels/cpu/ops/Test__CPURoPEKernelT.cpp)
 target_link_libraries(v2_test_rope_typed_kernel
     llaminar2_core
     GTest::gtest
@@ -2022,7 +2022,7 @@ add_v2_test(V2_Unit_CPURoPEKernelT
 )
 
 # Test: CPURoPEKernelT<Q16_1> with variable block sizes (32, 64, 128, 192)
-add_executable(v2_test_rope_q16_block_sizes unit/Test__CPURoPEKernelT_Q16_1_BlockSizes.cpp)
+add_executable(v2_test_rope_q16_block_sizes unit/kernels/cpu/ops/Test__CPURoPEKernelT_Q16_1_BlockSizes.cpp)
 target_link_libraries(v2_test_rope_q16_block_sizes
     llaminar2_core
     GTest::gtest
@@ -2035,7 +2035,7 @@ add_v2_test(V2_Unit_CPURoPEKernelT_Q16_1_BlockSizes
 )
 
 # Test: Q16HeadNormalization primitives (per-head scale normalization)
-add_executable(v2_test_q16_head_normalization unit/Test__Q16HeadNormalization.cpp)
+add_executable(v2_test_q16_head_normalization unit/kernels/cpu/primitives/Test__Q16HeadNormalization.cpp)
 target_link_libraries(v2_test_q16_head_normalization
     llaminar2_core
     GTest::gtest
@@ -2048,7 +2048,7 @@ add_v2_test(V2_Unit_Q16HeadNormalization
 )
 
 # Test: Q16 VNNI-Safe Normalization (rescaling for safe VNNI dot products)
-add_executable(v2_test_q16_vnni_safe_normalization unit/Test__Q16_VNNI_Safe_Normalization.cpp)
+add_executable(v2_test_q16_vnni_safe_normalization unit/kernels/cpu/ops/Test__Q16_VNNI_Safe_Normalization.cpp)
 target_link_libraries(v2_test_q16_vnni_safe_normalization
     llaminar2_core
     GTest::gtest
@@ -2061,7 +2061,7 @@ add_v2_test(V2_Unit_Q16VNNISafeNormalization
 )
 
 # Test: CPUAttentionKernelT (Enum-based attention kernel via Factory)
-add_executable(v2_test_cpu_attention_kernel_t unit/Test__CPUAttentionKernelT.cpp)
+add_executable(v2_test_cpu_attention_kernel_t unit/kernels/cpu/attention/Test__CPUAttentionKernelT.cpp)
 target_link_libraries(v2_test_cpu_attention_kernel_t
     llaminar2_core
     GTest::gtest
@@ -2074,7 +2074,7 @@ add_v2_test(V2_Unit_CPUAttentionKernelT
 )
 
 # Test: AttentionComputeStage (Phase 9 - ComputeStage for attention via KernelFactory)
-add_executable(v2_test_attention_compute_stage unit/Test__AttentionComputeStage.cpp)
+add_executable(v2_test_attention_compute_stage unit/execution/compute_stages/stages/Test__AttentionComputeStage.cpp)
 target_link_libraries(v2_test_attention_compute_stage
     llaminar2_core
     GTest::gtest
@@ -2087,7 +2087,7 @@ add_v2_test(V2_Unit_AttentionComputeStage
 )
 
 # Test: CPUSoftmaxKernelT (Enum-based softmax kernel with native precision paths)
-add_executable(v2_test_cpu_softmax_kernel_typed unit/Test__CPUSoftmaxKernelT.cpp)
+add_executable(v2_test_cpu_softmax_kernel_typed unit/kernels/cpu/ops/Test__CPUSoftmaxKernelT.cpp)
 target_link_libraries(v2_test_cpu_softmax_kernel_typed
     llaminar2_core
     GTest::gtest
@@ -2100,7 +2100,7 @@ add_v2_test(V2_Unit_CPUSoftmaxKernelT
 )
 
 # Test: BF16 SIMD Accuracy (Stage 2 - SIMD-optimized BF16 conversion)
-add_executable(v2_test_bf16_simd_accuracy unit/Test__BF16_SIMD_Accuracy.cpp)
+add_executable(v2_test_bf16_simd_accuracy unit/tensors/Test__BF16_SIMD_Accuracy.cpp)
 target_link_libraries(v2_test_bf16_simd_accuracy
     llaminar2_core
     GTest::gtest
@@ -2113,7 +2113,7 @@ add_v2_test(V2_Unit_BF16_SIMD_Accuracy
 )
 
 # Test: Precision-aware allreduce N-way sum functions (FP16, BF16, Q8_1, Q16_1)
-add_executable(v2_test_precision_aware_allreduce unit/mpi/Test__PrecisionAwareAllreduce.cpp)
+add_executable(v2_test_precision_aware_allreduce unit/collective/Test__PrecisionAwareAllreduce.cpp)
 target_link_libraries(v2_test_precision_aware_allreduce 
     llaminar2_core 
     GTest::gtest
@@ -2132,7 +2132,7 @@ add_v2_test(V2_Unit_PrecisionAwareAllreduce
 # NOTE: FP16 GEMM tests removed - depend on obsolete gemm implementations (FP16GemmImpl, FP16PackedGemm)
 
 # Test: RoPE primitives (scalar, AVX2, AVX512 parity)
-add_executable(v2_test_rope_primitives unit/Test__RoPEPrimitives.cpp)
+add_executable(v2_test_rope_primitives unit/kernels/cpu/primitives/Test__RoPEPrimitives.cpp)
 target_link_libraries(v2_test_rope_primitives 
     llaminar2_core 
     GTest::gtest
@@ -2145,7 +2145,7 @@ add_v2_test(V2_Unit_RoPEPrimitives
 )
 
 # Test: RoPE precision correctness (scalar/AVX2/AVX512 parity + cross-precision accuracy)
-add_executable(v2_test_rope_precision unit/Test__RoPEPrecisionCorrectness.cpp)
+add_executable(v2_test_rope_precision unit/kernels/cpu/ops/Test__RoPEPrecisionCorrectness.cpp)
 target_link_libraries(v2_test_rope_precision 
     llaminar2_core 
     GTest::gtest
@@ -2158,7 +2158,7 @@ add_v2_test(V2_Unit_RoPEPrecisionCorrectness
 )
 
 # Test: Q16_1 RoPE SIMD correctness and performance
-add_executable(v2_test_q16_1_rope unit/Test__Q16_1RoPE.cpp)
+add_executable(v2_test_q16_1_rope unit/kernels/cpu/ops/Test__Q16_1RoPE.cpp)
 target_link_libraries(v2_test_q16_1_rope 
     llaminar2_core 
     GTest::gtest
@@ -2171,7 +2171,7 @@ add_v2_test(V2_Unit_Q16_1RoPE_Correctness
 )
 
 # Test: Q16 Variable Block Size SIMD Operations
-add_executable(v2_test_q16_variable_block_simd unit/Test__Q16VariableBlockSIMD.cpp)
+add_executable(v2_test_q16_variable_block_simd unit/tensors/Test__Q16VariableBlockSIMD.cpp)
 target_link_libraries(v2_test_q16_variable_block_simd 
     llaminar2_core 
     GTest::gtest
@@ -2184,7 +2184,7 @@ add_v2_test(V2_Unit_Q16VariableBlockSIMD
 )
 
 # Test: Q8_1 to Q16 RoPE Block Size Conversion (32/64/128/192 output blocks)
-add_executable(v2_test_q8_1_to_q16_rope_blocksizes unit/kernels/Test__Q8_1_to_Q16_RoPE_BlockSizes.cpp)
+add_executable(v2_test_q8_1_to_q16_rope_blocksizes unit/kernels/cpu/ops/Test__Q8_1_to_Q16_RoPE_BlockSizes.cpp)
 target_link_libraries(v2_test_q8_1_to_q16_rope_blocksizes 
     llaminar2_core 
     GTest::gtest
@@ -2197,7 +2197,7 @@ add_v2_test(V2_Unit_Q8_1_to_Q16_RoPE_BlockSizes
 )
 
 # Test: Q8_1 RoPE SIMD correctness and performance
-add_executable(v2_test_q8_1_rope unit/Test__Q8_1RoPE.cpp)
+add_executable(v2_test_q8_1_rope unit/kernels/cpu/ops/Test__Q8_1RoPE.cpp)
 target_link_libraries(v2_test_q8_1_rope 
     llaminar2_core 
     GTest::gtest
@@ -2210,7 +2210,7 @@ add_v2_test(V2_Unit_Q8_1RoPE_Correctness
 )
 
 # Test: Fixed-Scale Q8_1 to Q16 RoPE (for integer attention)
-add_executable(v2_test_q8_1_to_q16_rope_fixed_scale unit/Test__Q8_1_to_Q16_RoPE_FixedScale.cpp)
+add_executable(v2_test_q8_1_to_q16_rope_fixed_scale unit/kernels/cpu/ops/Test__Q8_1_to_Q16_RoPE_FixedScale.cpp)
 target_link_libraries(v2_test_q8_1_to_q16_rope_fixed_scale 
     llaminar2_core 
     GTest::gtest
@@ -2223,7 +2223,7 @@ add_v2_test(V2_Unit_Q8_1_to_Q16_RoPE_FixedScale
 )
 
 # Test: Fixed-Scale Q16 to Q16 RoPE (for HybridQ16 K precision fix)
-add_executable(v2_test_q16_to_q16_rope_fixed_scale unit/Test__Q16_to_Q16_RoPE_FixedScale.cpp)
+add_executable(v2_test_q16_to_q16_rope_fixed_scale unit/kernels/cpu/ops/Test__Q16_to_Q16_RoPE_FixedScale.cpp)
 target_link_libraries(v2_test_q16_to_q16_rope_fixed_scale 
     llaminar2_core 
     GTest::gtest
@@ -2237,7 +2237,7 @@ add_v2_test(V2_Unit_Q16_to_Q16_RoPE_FixedScale
 
 # Test: Dynamic-Scale Q16 to Q16 RoPE (Phase 12 - preserves spiky K projection) [DISABLED - project on hold]
 if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_q16_to_q16_rope_dynamic_scale unit/Test__Q16_to_Q16_RoPE_DynamicScale.cpp)
+    add_executable(v2_test_q16_to_q16_rope_dynamic_scale unit/kernels/cpu/ops/Test__Q16_to_Q16_RoPE_DynamicScale.cpp)
     target_link_libraries(v2_test_q16_to_q16_rope_dynamic_scale 
         llaminar2_core 
         GTest::gtest
@@ -2253,7 +2253,7 @@ endif()
 # Test: HybridQ16 K Precision Fix Regression Tests (Phase 8 bugs) [DISABLED - project on hold]
 # Covers: single-block RoPE, Q8_1 field names, block_size constraints, FP32→Q8 quantization
 if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_hybridq16_k_regression unit/Test__HybridQ16_K_Precision_Fix_Regressions.cpp)
+    add_executable(v2_test_hybridq16_k_regression unit/tensors/Test__HybridQ16_K_Precision_Fix_Regressions.cpp)
     target_link_libraries(v2_test_hybridq16_k_regression 
         llaminar2_core 
         GTest::gtest
@@ -2267,7 +2267,7 @@ if(ENABLE_HYBRIDQ16_TESTS)
 endif()
 
 # Test: CPURoPEKernelT class interface
-add_executable(v2_test_cpu_rope_kernel unit/kernels/Test__CPURoPEKernelT.cpp)
+add_executable(v2_test_cpu_rope_kernel unit/kernels/cpu/ops/Test__CPURoPEKernelT.cpp)
 target_link_libraries(v2_test_cpu_rope_kernel 
     llaminar2_core 
     GTest::gtest
@@ -2280,7 +2280,7 @@ add_v2_test(V2_Unit_CPURoPEKernelT_Interface
 )
 
 # Test: CPUSwiGLUKernelT class interface
-add_executable(v2_test_cpu_swiglu_kernel unit/kernels/Test__CPUSwiGLUKernelT.cpp)
+add_executable(v2_test_cpu_swiglu_kernel unit/kernels/cpu/ops/Test__CPUSwiGLUKernelT.cpp)
 target_link_libraries(v2_test_cpu_swiglu_kernel 
     llaminar2_core 
     GTest::gtest
@@ -2293,7 +2293,7 @@ add_v2_test(V2_Unit_CPUSwiGLUKernelT
 )
 
 # Test: CPUSwiGLUKernelT (Enum-based SwiGLU kernel with native precision paths)
-add_executable(v2_test_cpu_swiglu_kernel_typed unit/Test__CPUSwiGLUKernelT.cpp)
+add_executable(v2_test_cpu_swiglu_kernel_typed unit/kernels/cpu/ops/Test__CPUSwiGLUKernelT.cpp)
 target_link_libraries(v2_test_cpu_swiglu_kernel_typed
     llaminar2_core
     GTest::gtest
@@ -2306,7 +2306,7 @@ add_v2_test(V2_Unit_CPUSwiGLUKernelT_Precision
 )
 
 # Test: Native Format Decode (Q4_0→int8 without requantization)
-add_executable(v2_test_native_format_decode unit/kernels/Test__NativeFormatDecode.cpp)
+add_executable(v2_test_native_format_decode unit/kernels/cpu/gemm_v4/Test__NativeFormatDecode.cpp)
 target_link_libraries(v2_test_native_format_decode
     llaminar2_core
     GTest::gtest
@@ -2319,7 +2319,7 @@ add_v2_test(V2_Unit_NativeFormatDecode
 )
 
 # Test: BPETokenizer (native tokenizer implementation)
-add_executable(v2_test_bpe_tokenizer integration/Test__BPETokenizer.cpp)
+add_executable(v2_test_bpe_tokenizer integration/loaders/Test__BPETokenizer.cpp)
 target_link_libraries(v2_test_bpe_tokenizer 
     llaminar2_core 
     GTest::gtest
@@ -2332,7 +2332,7 @@ add_v2_test(V2_Integration_BPETokenizer
 )
 
 # Test: Stop token detection (template-specific stop tokens for generation)
-add_executable(v2_test_stop_tokens integration/Test__StopTokens.cpp)
+add_executable(v2_test_stop_tokens integration/utils/Test__StopTokens.cpp)
 target_link_libraries(v2_test_stop_tokens 
     llaminar2_core 
     GTest::gtest
@@ -2345,7 +2345,7 @@ add_v2_test(V2_Integration_StopTokens
 )
 
 # Test: Sampler (token sampling strategies for generation)
-add_executable(v2_test_sampler unit/Test__Sampler.cpp)
+add_executable(v2_test_sampler unit/utils/Test__Sampler.cpp)
 target_link_libraries(v2_test_sampler 
     llaminar2_core 
     GTest::gtest
@@ -2358,7 +2358,7 @@ add_v2_test(V2_Unit_Sampler
 )
 
 # Test: ChatTemplate (chat template detection and formatting)
-add_executable(v2_test_chat_template unit/Test__ChatTemplate.cpp)
+add_executable(v2_test_chat_template unit/utils/Test__ChatTemplate.cpp)
 target_link_libraries(v2_test_chat_template 
     llaminar2_core 
     GTest::gtest
@@ -2371,7 +2371,7 @@ add_v2_test(V2_Unit_ChatTemplate
 )
 
 # Test: ArgParser (command-line argument parsing and validation)
-add_executable(v2_test_arg_parser unit/Test__ArgParser.cpp)
+add_executable(v2_test_arg_parser unit/utils/Test__ArgParser.cpp)
 target_link_libraries(v2_test_arg_parser 
     llaminar2_core 
     GTest::gtest
@@ -2384,7 +2384,7 @@ add_v2_test(V2_Unit_ArgParser
 )
 
 # Test: ArgParserHeterogeneous (Phase 6.5 heterogeneous CLI flags)
-add_executable(v2_test_arg_parser_heterogeneous unit/Test__ArgParserHeterogeneous.cpp)
+add_executable(v2_test_arg_parser_heterogeneous unit/utils/Test__ArgParserHeterogeneous.cpp)
 target_link_libraries(v2_test_arg_parser_heterogeneous 
     llaminar2_core 
     GTest::gtest
@@ -2397,7 +2397,7 @@ add_v2_test(V2_Unit_ArgParserHeterogeneous
 )
 
 # Test: NodeTopology (NUMA/socket topology detection for CPU tensor parallelism)
-add_executable(v2_test_node_topology unit/Test__NodeTopology.cpp)
+add_executable(v2_test_node_topology unit/utils/Test__NodeTopology.cpp)
 target_link_libraries(v2_test_node_topology 
     llaminar2_core 
     GTest::gtest
@@ -2410,7 +2410,7 @@ add_v2_test(V2_Unit_NodeTopology
 )
 
 # Test: NUMAAllocator (NUMA-aware memory allocation for cross-socket CPU tensor parallelism)
-add_executable(v2_test_numa_allocator unit/Test__NUMAAllocator.cpp)
+add_executable(v2_test_numa_allocator unit/memory/Test__NUMAAllocator.cpp)
 target_link_libraries(v2_test_numa_allocator 
     llaminar2_core 
     GTest::gtest
@@ -2423,7 +2423,7 @@ add_v2_test(V2_Unit_NUMAAllocator
 )
 
 # Test: NUMATopology sysfs detection (hardware-independent unit tests with temp files)
-add_executable(v2_test_numa_topology_sysfs unit/Test__NUMATopologySysfs.cpp)
+add_executable(v2_test_numa_topology_sysfs unit/utils/Test__NUMATopologySysfs.cpp)
 target_link_libraries(v2_test_numa_topology_sysfs 
     llaminar2_core 
     GTest::gtest
@@ -2436,7 +2436,7 @@ add_v2_test(V2_Unit_NUMATopologySysfs
 )
 
 # Test: BPETokenizer byte encoding (GPT-2 style byte-level encoding/decoding)
-add_executable(v2_test_bpe_byte_encoding unit/Test__BPETokenizerByteEncoding.cpp)
+add_executable(v2_test_bpe_byte_encoding unit/utils/Test__BPETokenizerByteEncoding.cpp)
 target_link_libraries(v2_test_bpe_byte_encoding 
     GTest::gtest
     GTest::gtest_main
@@ -2450,7 +2450,7 @@ add_v2_test(V2_Unit_BPEByteEncoding
 # Test: Attention parity regression tests (locks in RoPE theta, causal masking, GQA behavior)
 
 # Test: AttentionComputeStage dynamic kv_len from KV cache
-add_executable(v2_test_attention_dynamic_kvlen unit/Test__AttentionComputeStage_DynamicKVLen.cpp)
+add_executable(v2_test_attention_dynamic_kvlen unit/execution/compute_stages/stages/Test__AttentionComputeStage_DynamicKVLen.cpp)
 target_link_libraries(v2_test_attention_dynamic_kvlen 
     llaminar2_core 
     GTest::gtest
@@ -2463,7 +2463,7 @@ add_v2_test(V2_Unit_AttentionComputeStage_DynamicKVLen
 )
 
 # Test: SwiGLU parity regression tests (locks in correct formula: gate * silu(up))
-add_executable(v2_test_swiglu_parity unit/Test__SwiGLUParity.cpp)
+add_executable(v2_test_swiglu_parity unit/kernels/cpu/ops/Test__SwiGLUParity.cpp)
 target_link_libraries(v2_test_swiglu_parity 
     llaminar2_core 
     GTest::gtest
@@ -2478,7 +2478,7 @@ add_v2_test(V2_Unit_SwiGLUParity
 # Test: Batch attention correctness - mask generation and batched processing
 
 # Test: Attention mask application - verify masks are applied before softmax
-add_executable(v2_test_attention_mask_application unit/Test__AttentionMaskApplication.cpp)
+add_executable(v2_test_attention_mask_application unit/kernels/cpu/attention/Test__AttentionMaskApplication.cpp)
 target_link_libraries(v2_test_attention_mask_application 
     llaminar2_core 
     GTest::gtest
@@ -2491,7 +2491,7 @@ add_v2_test(V2_Unit_AttentionMaskApplication
 )
 
 # Test: Sequential vs Batched Attention Comparison
-add_executable(v2_test_attention_sequential_vs_batched unit/Test__AttentionSequentialVsBatched.cpp)
+add_executable(v2_test_attention_sequential_vs_batched unit/kernels/cpu/attention/Test__AttentionSequentialVsBatched.cpp)
 target_link_libraries(v2_test_attention_sequential_vs_batched 
     llaminar2_core 
     GTest::gtest
@@ -2512,7 +2512,7 @@ add_v2_test(V2_Unit_AttentionSequentialVsBatched
 # Test: MpiAttentionOrchestrator mask passing verification
 
 # Test: Attention mask diagnostic (basic mask construction verification)
-add_executable(v2_test_attention_mask_diagnostic unit/Test__AttentionMaskDiagnostic.cpp)
+add_executable(v2_test_attention_mask_diagnostic unit/kernels/cpu/attention/Test__AttentionMaskDiagnostic.cpp)
 target_link_libraries(v2_test_attention_mask_diagnostic 
     llaminar2_core 
     GTest::gtest
@@ -2564,7 +2564,7 @@ target_link_libraries(v2_test_iq4nl_views
 # centric kernels.
 
 # Test: CPUKVCache (supports both single-sequence and batched modes, all precisions)
-add_executable(v2_test_cpu_kv_cache unit/tensors/Test__CPUKVCache.cpp)
+add_executable(v2_test_cpu_kv_cache unit/kernels/cpu/Test__CPUKVCache.cpp)
 target_link_libraries(v2_test_cpu_kv_cache 
     llaminar2_core 
     GTest::gtest
@@ -2577,7 +2577,7 @@ add_v2_test(V2_Unit_CPUKVCache
 )
 
 # Test: KernelFactory KVCache methods (unified factory interface for KV cache creation)
-add_executable(v2_test_kernelfactory_kvcache unit/Test__KernelFactory_KVCache.cpp)
+add_executable(v2_test_kernelfactory_kvcache unit/kernels/Test__KernelFactory_KVCache.cpp)
 target_link_libraries(v2_test_kernelfactory_kvcache 
     llaminar2_core 
     GTest::gtest
@@ -2603,7 +2603,7 @@ add_v2_test(V2_Unit_Q16SafeBlockAccess
 )
 
 # Test: ShardedKVCache (tensor parallelism support - local KV heads)
-add_executable(v2_test_sharded_kv_cache unit/Test__ShardedKVCache.cpp)
+add_executable(v2_test_sharded_kv_cache unit/execution/kvcache/Test__ShardedKVCache.cpp)
 target_link_libraries(v2_test_sharded_kv_cache 
     llaminar2_core 
     GTest::gtest
@@ -2680,7 +2680,7 @@ add_v2_test(V2_Unit_IQ2_XS_Views
 )
 
 # Test: IQ2_XS Decode Vectorization
-add_executable(v2_test_iq2xs_decode_vectorization unit/Test__IQ2_XS_DecodeVectorization.cpp)
+add_executable(v2_test_iq2xs_decode_vectorization unit/tensors/Test__IQ2_XS_DecodeVectorization.cpp)
 target_link_libraries(v2_test_iq2xs_decode_vectorization 
     llaminar2_core 
     GTest::gtest
@@ -2693,7 +2693,7 @@ add_v2_test(V2_Unit_IQ2_XS_DecodeVectorization
 )
 
 # Test: IQ2_XS Unpack Vectorization (AVX512)
-add_executable(v2_test_iq2_xs_unpack_vectorization unit/Test__IQ2_XS_UnpackVectorization.cpp)
+add_executable(v2_test_iq2_xs_unpack_vectorization unit/tensors/Test__IQ2_XS_UnpackVectorization.cpp)
 target_link_libraries(v2_test_iq2_xs_unpack_vectorization 
     llaminar2_core 
     GTest::gtest
@@ -2706,7 +2706,7 @@ add_v2_test(V2_Unit_IQ2_XS_UnpackVectorization
 )
 
 # Test: IQ1_M Decode Vectorization
-add_executable(v2_test_iq1m_decode_vectorization unit/Test__IQ1_M_DecodeVectorization.cpp)
+add_executable(v2_test_iq1m_decode_vectorization unit/tensors/Test__IQ1_M_DecodeVectorization.cpp)
 target_link_libraries(v2_test_iq1m_decode_vectorization 
     llaminar2_core 
     GTest::gtest
@@ -2719,7 +2719,7 @@ add_v2_test(V2_Unit_IQ1_M_DecodeVectorization
 )
 
 # Test: IQ3_S Decode Vectorization
-add_executable(v2_test_iq3s_decode_vectorization unit/Test__IQ3_S_DecodeVectorization.cpp)
+add_executable(v2_test_iq3s_decode_vectorization unit/tensors/Test__IQ3_S_DecodeVectorization.cpp)
 target_link_libraries(v2_test_iq3s_decode_vectorization 
     llaminar2_core 
     GTest::gtest
@@ -2744,7 +2744,7 @@ add_v2_test(V2_Unit_IQ3_XXS_Views
 )
 
 # Test: IQ3_XXS Tensor Interface (IINT8Unpackable)
-add_executable(v2_test_iq3xxs_tensor unit/Test__IQ3_XXSTensor.cpp)
+add_executable(v2_test_iq3xxs_tensor unit/tensors/Test__IQ3_XXSTensor.cpp)
 target_link_libraries(v2_test_iq3xxs_tensor 
     llaminar2_core 
     GTest::gtest
@@ -2756,7 +2756,7 @@ add_v2_test(V2_Unit_IQ3_XXS_Tensor
 )
 
 # Test: IQ3_S Tensor Interface (IINT8Unpackable)
-add_executable(v2_test_iq3s_tensor unit/Test__IQ3_STensor.cpp)
+add_executable(v2_test_iq3s_tensor unit/tensors/Test__IQ3_STensor.cpp)
 target_link_libraries(v2_test_iq3s_tensor 
     llaminar2_core 
     GTest::gtest
@@ -2768,7 +2768,7 @@ add_v2_test(V2_Unit_IQ3_S_Tensor
 )
 
 # Test: IQ3_XXS GEMM Integration
-add_executable(v2_test_iq3xxs_gemm integration/Test__IQ3_XXS_GEMM.cpp)
+add_executable(v2_test_iq3xxs_gemm integration/kernels/cpu/gemm/Test__IQ3_XXS_GEMM.cpp)
 target_link_libraries(v2_test_iq3xxs_gemm 
     llaminar2_core 
     GTest::gtest
@@ -2780,7 +2780,7 @@ add_v2_test(V2_Integration_IQ3_XXS_GEMM
 )
 
 # Test: IQ3_S GEMM Integration
-add_executable(v2_test_iq3s_gemm integration/Test__IQ3_S_GEMM.cpp)
+add_executable(v2_test_iq3s_gemm integration/kernels/cpu/gemm/Test__IQ3_S_GEMM.cpp)
 target_link_libraries(v2_test_iq3s_gemm 
     llaminar2_core 
     GTest::gtest
@@ -2792,7 +2792,7 @@ add_v2_test(V2_Integration_IQ3_S_GEMM
 )
 
 # Test: IQ2_XXS Tensor (IINT8Unpackable)
-add_executable(v2_test_iq2xxs_tensor unit/Test__IQ2_XXSTensor.cpp)
+add_executable(v2_test_iq2xxs_tensor unit/tensors/Test__IQ2_XXSTensor.cpp)
 target_link_libraries(v2_test_iq2xxs_tensor 
     llaminar2_core 
     GTest::gtest
@@ -2804,7 +2804,7 @@ add_v2_test(V2_Unit_IQ2_XXSTensor
 )
 
 # Test: IQ2_XXS Unpack Vectorization (AVX512)
-add_executable(v2_test_iq2_xxs_unpack_vectorization unit/Test__IQ2_XXS_UnpackVectorization.cpp)
+add_executable(v2_test_iq2_xxs_unpack_vectorization unit/tensors/Test__IQ2_XXS_UnpackVectorization.cpp)
 target_link_libraries(v2_test_iq2_xxs_unpack_vectorization 
     llaminar2_core 
     GTest::gtest
@@ -2817,7 +2817,7 @@ add_v2_test(V2_Unit_IQ2_XXS_UnpackVectorization
 )
 
 # Test: IQ2_XXS GEMM Integration
-add_executable(v2_test_iq2xxs_gemm_integration integration/Test__IQ2_XXS_GEMM_Integration.cpp)
+add_executable(v2_test_iq2xxs_gemm_integration integration/kernels/cpu/gemm/Test__IQ2_XXS_GEMM_Integration.cpp)
 target_link_libraries(v2_test_iq2xxs_gemm_integration 
     llaminar2_core 
     GTest::gtest
@@ -2830,7 +2830,7 @@ add_v2_test(V2_Integration_IQ2_XXS_GEMM
 
 
 # Test: IQ2_XS GEMM Integration
-add_executable(v2_test_iq2xs_gemm_integration integration/Test__IQ2_XS_GEMM_Integration.cpp)
+add_executable(v2_test_iq2xs_gemm_integration integration/kernels/cpu/gemm/Test__IQ2_XS_GEMM_Integration.cpp)
 target_link_libraries(v2_test_iq2xs_gemm_integration 
     llaminar2_core 
     GTest::gtest
@@ -2842,7 +2842,7 @@ add_v2_test(V2_Integration_IQ2_XS_GEMM
 )
 
 # Test: IQ4_XS GEMM Integration
-add_executable(v2_test_iq4xs_gemm_integration integration/Test__IQ4_XS_GEMM_Integration.cpp)
+add_executable(v2_test_iq4xs_gemm_integration integration/kernels/cpu/gemm/Test__IQ4_XS_GEMM_Integration.cpp)
 target_link_libraries(v2_test_iq4xs_gemm_integration 
     llaminar2_core 
     GTest::gtest
@@ -2866,7 +2866,7 @@ add_v2_test(V2_Unit_IQ2_STensor
 )
 
 # Test: IQ2_S GEMM Integration
-add_executable(v2_test_iq2s_gemm_integration integration/Test__IQ2_S_GEMM_Integration.cpp)
+add_executable(v2_test_iq2s_gemm_integration integration/kernels/cpu/gemm/Test__IQ2_S_GEMM_Integration.cpp)
 target_link_libraries(v2_test_iq2s_gemm_integration 
     llaminar2_core 
     GTest::gtest
@@ -3054,7 +3054,7 @@ add_v2_test(V2_Unit_Q8_K_Views
 # with synthetic test data to ensure numerical equivalency across all code paths.
 
 # Test: Q4_0 SIMD Equivalency
-add_executable(v2_test_q4_0_simd integration/Test__Q4_0Tensor.cpp)
+add_executable(v2_test_q4_0_simd integration/tensors/Test__Q4_0Tensor.cpp)
 target_link_libraries(v2_test_q4_0_simd 
     llaminar2_core 
     GTest::gtest
@@ -3081,7 +3081,7 @@ add_v2_test(V2_Unit_Q4_1_SIMD
 )
 
 # Test: Q5_0 SIMD Equivalency
-add_executable(v2_test_q5_0_simd integration/Test__Q5_0Tensor.cpp)
+add_executable(v2_test_q5_0_simd integration/tensors/Test__Q5_0Tensor.cpp)
 target_link_libraries(v2_test_q5_0_simd 
     llaminar2_core 
     GTest::gtest
@@ -3094,7 +3094,7 @@ add_v2_test(V2_Integration_Q5_0_SIMD
 )
 
 # Test: Q5_0 GEMM Integration
-add_executable(v2_test_q5_0_gemm integration/Test__Q5_0_GEMM.cpp)
+add_executable(v2_test_q5_0_gemm integration/kernels/cpu/gemm/Test__Q5_0_GEMM.cpp)
 target_link_libraries(v2_test_q5_0_gemm 
     llaminar2_core 
     GTest::gtest
@@ -3106,7 +3106,7 @@ add_v2_test(V2_Integration_Q5_0_GEMM
 )
 
 # Test: Q5_1 GEMM Integration
-add_executable(v2_test_q5_1_gemm integration/Test__Q5_1_GEMM.cpp)
+add_executable(v2_test_q5_1_gemm integration/kernels/cpu/gemm/Test__Q5_1_GEMM.cpp)
 target_link_libraries(v2_test_q5_1_gemm 
     llaminar2_core 
     GTest::gtest
@@ -3118,7 +3118,7 @@ add_v2_test(V2_Integration_Q5_1_GEMM
 )
 
 # Test: Q5_K GEMM Integration
-add_executable(v2_test_q5_k_gemm integration/Test__Q5_K_GEMM.cpp)
+add_executable(v2_test_q5_k_gemm integration/kernels/cpu/gemm/Test__Q5_K_GEMM.cpp)
 target_link_libraries(v2_test_q5_k_gemm 
     llaminar2_core 
     GTest::gtest
@@ -3174,7 +3174,7 @@ add_v2_test(V2_Unit_Q2_K_SIMD
 )
 
 # Test: Q8_1 Quantize SIMD Equivalency (FP32 → Q8_1)
-add_executable(v2_test_q8_1_quantize_simd unit/Test__Q8_1_QuantizeSIMD.cpp)
+add_executable(v2_test_q8_1_quantize_simd unit/tensors/Test__Q8_1_QuantizeSIMD.cpp)
 target_link_libraries(v2_test_q8_1_quantize_simd 
     llaminar2_core 
     GTest::gtest
@@ -3187,7 +3187,7 @@ add_v2_test(V2_Unit_Q8_1_QuantizeSIMD
 )
 
 # Test: Q8_0 SIMD Equivalency
-add_executable(v2_test_q8_0_simd integration/Test__Q8_0Tensor.cpp)
+add_executable(v2_test_q8_0_simd integration/tensors/Test__Q8_0Tensor.cpp)
 target_link_libraries(v2_test_q8_0_simd 
     llaminar2_core 
     GTest::gtest
@@ -3352,7 +3352,7 @@ add_v2_test(V2_Unit_WeightStreamerFactory
 
 # Test: WorkDistributor (hierarchical work distribution across ranks/devices)
 # Tests rank-level slicing, device-level slicing with weights, and hierarchical distribution
-add_executable(v2_test_work_distributor unit/Test__WorkDistributor.cpp)
+add_executable(v2_test_work_distributor unit/execution/mpi_orchestration/Test__WorkDistributor.cpp)
 target_link_libraries(v2_test_work_distributor llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_WorkDistributor
     COMMAND $<TARGET_FILE:v2_test_work_distributor>
@@ -3362,7 +3362,7 @@ add_v2_test(V2_Unit_WorkDistributor
 
 # Test: DeviceContext (abstract execution context for CPU/GPU)
 # Tests CPUDeviceContext memory allocation, parallel execution, and workspace management
-add_executable(v2_test_device_context unit/Test__DeviceContext.cpp)
+add_executable(v2_test_device_context unit/execution/local_execution/device/Test__DeviceContext.cpp)
 target_link_libraries(v2_test_device_context llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_DeviceContext
     COMMAND $<TARGET_FILE:v2_test_device_context>
@@ -3384,7 +3384,7 @@ add_v2_test(V2_Unit_MultiGPU
 # Test: MultiGPU Real Model (Integration tests with actual GGUF model data)
 # Tests GPU transfers of real weight tensors, data integrity verification,
 # cross-backend transfers (CUDA ↔ ROCm), and multi-tensor GPU staging
-add_executable(v2_test_multi_gpu_real_model integration/Test__MultiGPU_RealModel.cpp)
+add_executable(v2_test_multi_gpu_real_model integration/pipelines/Test__MultiGPU_RealModel.cpp)
 target_link_libraries(v2_test_multi_gpu_real_model llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_MultiGPU_RealModel
     COMMAND $<TARGET_FILE:v2_test_multi_gpu_real_model>
@@ -3397,7 +3397,7 @@ add_v2_test(V2_Integration_MultiGPU_RealModel
 # =============================================================================
 # Test: CUDA Tensor Transfer (Phase 1 - GPU upload/download via TensorBase::ensureOnDevice)
 # Tests FP32, BF16, FP16 tensor upload/download, round-trip verification, edge cases
-add_executable(v2_test_cuda_tensor_transfer unit/Test__CUDATensorTransfer.cpp)
+add_executable(v2_test_cuda_tensor_transfer unit/kernels/cuda/Test__CUDATensorTransfer.cpp)
 target_link_libraries(v2_test_cuda_tensor_transfer llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_CUDATensorTransfer
     COMMAND $<TARGET_FILE:v2_test_cuda_tensor_transfer>
@@ -3419,7 +3419,7 @@ add_v2_test(V2_Unit_CUDAFlashAttention_DecodeKVLen
 
 # Integration Test: cuBLAS GEMM (Phase 1 - dense GEMM via cuBLAS for FP32/FP16/BF16)
 # Tests correctness against CPU reference, various matrix sizes, transpose variants
-add_executable(v2_test_cublas_gemm integration/Test__CuBLASGemm.cpp)
+add_executable(v2_test_cublas_gemm integration/kernels/cuda/Test__CuBLASGemm.cpp)
 target_link_libraries(v2_test_cublas_gemm llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_CuBLASGemm
     COMMAND $<TARGET_FILE:v2_test_cublas_gemm>
@@ -3440,7 +3440,7 @@ add_v2_test(V2_Unit_HipBLASGemm
 
 # Test: CUDA Basic Pipeline (Phase 1 - end-to-end KernelFactory + tensor transfer)
 # Tests KernelFactory dispatch to cuBLAS, tensor upload/download in GEMM context
-add_executable(v2_integration_cuda_basic_pipeline integration/Test__CUDABasicPipeline.cpp)
+add_executable(v2_integration_cuda_basic_pipeline integration/kernels/cuda/Test__CUDABasicPipeline.cpp)
 target_link_libraries(v2_integration_cuda_basic_pipeline llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_CUDABasicPipeline
     COMMAND $<TARGET_FILE:v2_integration_cuda_basic_pipeline>
@@ -3452,7 +3452,7 @@ add_v2_test(V2_Integration_CUDABasicPipeline
 # Tests the two-flag coherence model (host_valid_, device_valid_) with full state
 # transition coverage, edge cases, and efficiency verification.
 # See: docs/v2/TENSOR_MEMORY_COHERENCE_DESIGN.md
-add_executable(v2_integration_tensor_coherence integration/Test__TensorCoherence.cpp)
+add_executable(v2_integration_tensor_coherence integration/execution/coherence/Test__TensorCoherence.cpp)
 target_link_libraries(v2_integration_tensor_coherence llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_TensorCoherence
     COMMAND $<TARGET_FILE:v2_integration_tensor_coherence>
@@ -3464,7 +3464,7 @@ add_v2_test(V2_Integration_TensorCoherence
 # Tests StageCoherence functions with MockBackend transfer tracking
 # Verifies: cohereInputs, cohereOutputs, markOutputsDirty behavior
 # See: docs/v2/GPU_RESIDENT_EXECUTION_PROJECT_PLAN.md
-add_executable(v2_integration_gpu_resident_data_flow integration/Test__GpuResidentDataFlow.cpp)
+add_executable(v2_integration_gpu_resident_data_flow integration/execution/Test__GpuResidentDataFlow.cpp)
 target_link_libraries(v2_integration_gpu_resident_data_flow llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_GpuResidentDataFlow
     COMMAND $<TARGET_FILE:v2_integration_gpu_resident_data_flow>
@@ -3477,7 +3477,7 @@ add_v2_test(V2_Integration_GpuResidentDataFlow
 # Verifies: gpu_data_ptr valid after creation, ensureOnHost is no-op, 
 #           kernel writes visible on host, both valid flags stay true
 # See: docs/v2/GPU_RESIDENT_EXECUTION_PROJECT_PLAN.md
-add_executable(v2_integration_mapped_memory_coherence integration/Test__MappedMemoryCoherence.cpp)
+add_executable(v2_integration_mapped_memory_coherence integration/execution/coherence/Test__MappedMemoryCoherence.cpp)
 target_include_directories(v2_integration_mapped_memory_coherence PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
 )
@@ -3513,7 +3513,7 @@ add_v2_test(V2_Perf_CoherenceTransferOverhead
 # cudaDeviceSynchronize(), which is essential for snapshot capture performance.
 
 add_executable(v2_integration_cuda_event_synchronization
-    integration/Test__CUDAEventSynchronization.cpp
+    integration/backends/cuda/Test__CUDAEventSynchronization.cpp
 )
 target_link_libraries(v2_integration_cuda_event_synchronization
     llaminar2_core
@@ -3530,7 +3530,7 @@ message(STATUS "V2 Tests: Added CUDA Event Synchronization tests")
 # Test: CUDA GEMM Parity (FP32 and IQ4_NL: CUDA vs CPU kernel comparison)
 # Tests CUDAFloatingPointGemmKernel and CUDAQuantisedGemmKernel through KernelFactory
 # with cosine similarity metrics against CPU reference kernels
-add_executable(v2_integration_cuda_gemm_parity integration/Test__CUDAGemmParity.cpp)
+add_executable(v2_integration_cuda_gemm_parity integration/kernels/cuda/Test__CUDAGemmParity.cpp)
 target_link_libraries(v2_integration_cuda_gemm_parity llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_CUDAGemmParity
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
@@ -3541,7 +3541,7 @@ add_v2_test(V2_Integration_CUDAGemmParity
 # Test: CUDA Ops Parity (RMSNorm, SwiGLU, RoPE)
 # Tests CUDA kernel implementations of normalization and activation functions
 # against CPU reference kernels with cosine similarity metrics
-add_executable(v2_integration_cuda_ops_parity integration/Test__CUDAOpsParity.cpp)
+add_executable(v2_integration_cuda_ops_parity integration/kernels/cuda/ops/Test__CUDAOpsParity.cpp)
 target_link_libraries(v2_integration_cuda_ops_parity llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_CUDAOpsParity
     COMMAND $<TARGET_FILE:v2_integration_cuda_ops_parity>
@@ -3552,7 +3552,7 @@ add_v2_test(V2_Integration_CUDAOpsParity
 # Test: CUDA ResidualAdd Parity
 # Tests CUDA ResidualAdd kernels (FP32, BF16, FP16) against CPU reference
 # with cosine similarity and L2 error metrics
-add_executable(v2_integration_cuda_residual_add_parity integration/Test__CUDAResidualAddParity.cpp)
+add_executable(v2_integration_cuda_residual_add_parity integration/kernels/cuda/ops/Test__CUDAResidualAddParity.cpp)
 target_link_libraries(v2_integration_cuda_residual_add_parity llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_CUDAResidualAddParity
     COMMAND $<TARGET_FILE:v2_integration_cuda_residual_add_parity>
@@ -3563,7 +3563,7 @@ add_v2_test(V2_Integration_CUDAResidualAddParity
 # Test: CUDA Flash Attention Parity
 # Tests Flash Attention 2 (prefill) and Flash Decoding (decode) CUDA kernels
 # against CPU attention reference with cosine similarity metrics
-add_executable(v2_integration_cuda_flash_attention_parity integration/Test__CUDAFlashAttentionParity.cpp)
+add_executable(v2_integration_cuda_flash_attention_parity integration/kernels/cuda/attention/Test__CUDAFlashAttentionParity.cpp)
 target_link_libraries(v2_integration_cuda_flash_attention_parity llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_CUDAFlashAttentionParity
     COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
@@ -3585,7 +3585,7 @@ add_v2_test(V2_Perf_CUDAFlashAttention
 # Test: CUDA Ring Buffer KV Cache Parity
 # Tests ring buffer KV cache with O(1) eviction, wrap-around, batched gather, FP32/FP16/BF16
 if(HAVE_CUDA)
-add_executable(v2_integration_cuda_ring_kv_cache_parity integration/Test__CUDARingKVCacheParity.cpp)
+add_executable(v2_integration_cuda_ring_kv_cache_parity integration/kernels/cuda/Test__CUDARingKVCacheParity.cpp)
 target_link_libraries(v2_integration_cuda_ring_kv_cache_parity llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_CUDARingKVCacheParity
     COMMAND $<TARGET_FILE:v2_integration_cuda_ring_kv_cache_parity>
@@ -3596,7 +3596,7 @@ add_v2_test(V2_Integration_CUDARingKVCacheParity
 # Integration Test: CUDA Ring Buffer KV Cache Sharding (Tensor Parallelism)
 # Tests sharded KV cache for tensor-parallel inference: per-rank metadata,
 # local_n_kv_heads, kv_head_start offsets, memory allocation, IKVCache interface.
-add_executable(v2_integration_cuda_ring_kv_cache_sharding integration/Test__CUDARingKVCache_Sharding.cpp)
+add_executable(v2_integration_cuda_ring_kv_cache_sharding integration/kernels/cuda/Test__CUDARingKVCache_Sharding.cpp)
 target_link_libraries(v2_integration_cuda_ring_kv_cache_sharding llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_CUDARingKVCache_Sharding
     COMMAND $<TARGET_FILE:v2_integration_cuda_ring_kv_cache_sharding>
@@ -3609,7 +3609,7 @@ message(STATUS "V2 Tests: Added CUDA Ring KV Cache sharding integration tests")
 # Tests NCCL-based collective operations for multi-GPU communication
 # Validates initialization, allreduce, allgather, broadcast, and clean shutdown
 if(HAVE_NCCL)
-add_executable(v2_integration_nccl_backend integration/Test__NCCLBackend.cpp)
+add_executable(v2_integration_nccl_backend integration/collective/backends/Test__NCCLBackend.cpp)
 target_link_libraries(v2_integration_nccl_backend 
     llaminar2_core 
     GTest::gtest 
@@ -3630,7 +3630,7 @@ endif()
 # Validates initialization, allreduce, allgather, broadcast, and clean shutdown
 # NOTE: RCCL is for ROCm (AMD GPUs), separate from NCCL (NVIDIA CUDA)
 if(HAVE_RCCL)
-add_executable(v2_integration_rccl_backend integration/Test__RCCLBackend.cpp)
+add_executable(v2_integration_rccl_backend integration/collective/backends/Test__RCCLBackend.cpp)
 target_link_libraries(v2_integration_rccl_backend 
     llaminar2_core 
     GTest::gtest 
@@ -3645,7 +3645,7 @@ message(STATUS "V2 Tests: Added RCCL backend integration tests")
 
 # Test: RCCLAllreduceAccuracy - Focused numerical accuracy tests for RCCL allreduce
 # Tests allreduce operations with inference-relevant sizes to isolate numerical issues
-add_executable(v2_integration_rccl_allreduce_accuracy integration/Test__RCCLAllreduceAccuracy.cpp)
+add_executable(v2_integration_rccl_allreduce_accuracy integration/collective/backends/Test__RCCLAllreduceAccuracy.cpp)
 target_link_libraries(v2_integration_rccl_allreduce_accuracy 
     llaminar2_core 
     GTest::gtest 
@@ -3663,7 +3663,7 @@ endif()
 # Tests parallel NCCL and RCCL reduce operations for heterogeneous GPU configurations
 # Requires both CUDA and ROCm hardware
 if(HAVE_CUDA AND HAVE_ROCM)
-add_executable(v2_integration_heterogeneous_backend_phase1 integration/Test__HeterogeneousBackend_Phase1.cpp)
+add_executable(v2_integration_heterogeneous_backend_phase1 integration/collective/backends/Test__HeterogeneousBackend_Phase1.cpp)
 target_link_libraries(v2_integration_heterogeneous_backend_phase1 
     llaminar2_core 
     GTest::gtest 
@@ -3679,7 +3679,7 @@ message(STATUS "V2 Tests: Added HeterogeneousBackend Phase 1 integration tests")
 # Test: HeterogeneousBackend Phase 2 - Cross-Domain Bridge Exchange
 # Tests PCIeBAR allreduce between CUDA and ROCm bridge devices
 # Requires both CUDA and ROCm hardware
-add_executable(v2_integration_heterogeneous_backend_phase2 integration/Test__HeterogeneousBackend_Phase2.cpp)
+add_executable(v2_integration_heterogeneous_backend_phase2 integration/collective/backends/Test__HeterogeneousBackend_Phase2.cpp)
 target_link_libraries(v2_integration_heterogeneous_backend_phase2 
     llaminar2_core 
     GTest::gtest 
@@ -3695,7 +3695,7 @@ message(STATUS "V2 Tests: Added HeterogeneousBackend Phase 2 integration tests")
 # Test: HeterogeneousBackend Phase 3 - Intra-Domain Broadcast
 # Tests NCCL/RCCL broadcast from bridge devices to all domain devices
 # Requires both CUDA and ROCm hardware
-add_executable(v2_integration_heterogeneous_backend_phase3 integration/Test__HeterogeneousBackend_Phase3.cpp)
+add_executable(v2_integration_heterogeneous_backend_phase3 integration/collective/backends/Test__HeterogeneousBackend_Phase3.cpp)
 target_link_libraries(v2_integration_heterogeneous_backend_phase3 
     llaminar2_core 
     GTest::gtest 
@@ -3711,7 +3711,7 @@ message(STATUS "V2 Tests: Added HeterogeneousBackend Phase 3 integration tests")
 # Test: HeterogeneousBackend Full AllReduce - 3-Phase AllReduce
 # Tests complete 3-phase allreduce: intra-domain reduce, bridge exchange, intra-domain broadcast
 # Requires both CUDA and ROCm hardware
-add_executable(v2_integration_heterogeneous_backend_full_allreduce integration/Test__HeterogeneousBackend_FullAllReduce.cpp)
+add_executable(v2_integration_heterogeneous_backend_full_allreduce integration/collective/backends/Test__HeterogeneousBackend_FullAllReduce.cpp)
 target_link_libraries(v2_integration_heterogeneous_backend_full_allreduce 
     llaminar2_core 
     GTest::gtest 
@@ -3727,7 +3727,7 @@ message(STATUS "V2 Tests: Added HeterogeneousBackend Full AllReduce integration 
 # Test: HeterogeneousBackend Reduce-Scatter Pattern
 # Tests the reduce-scatter + allgather optimization for large tensors (>=4MB)
 # This pattern reduces cross-vendor PCIe BAR traffic from 100% to 1/max(N,M)
-add_executable(v2_integration_heterogeneous_backend_reduce_scatter integration/Test__HeterogeneousBackend_ReduceScatter.cpp)
+add_executable(v2_integration_heterogeneous_backend_reduce_scatter integration/collective/backends/Test__HeterogeneousBackend_ReduceScatter.cpp)
 target_link_libraries(v2_integration_heterogeneous_backend_reduce_scatter 
     llaminar2_core 
     GTest::gtest 
@@ -3743,7 +3743,7 @@ message(STATUS "V2 Tests: Added HeterogeneousBackend Reduce-Scatter pattern inte
 # Test: HeterogeneousBackend Phase 2→3 Pipelining
 # Tests chunk-based pipelining that overlaps PCIe BAR bridge transfer with intra-domain allgather
 # This optimization reduces latency for large tensors by processing chunks in parallel
-add_executable(v2_integration_heterogeneous_backend_pipelining integration/Test__HeterogeneousBackend_Pipelining.cpp)
+add_executable(v2_integration_heterogeneous_backend_pipelining integration/collective/backends/Test__HeterogeneousBackend_Pipelining.cpp)
 target_link_libraries(v2_integration_heterogeneous_backend_pipelining 
     llaminar2_core 
     GTest::gtest 
@@ -3759,7 +3759,7 @@ message(STATUS "V2 Tests: Added HeterogeneousBackend Pipelining integration test
 # Test: HeterogeneousBackend GCD Multi-Bridge Pattern
 # Tests the GCD-based multi-bridge pattern for asymmetric GPU configurations
 # where GCD(cuda_count, rocm_count) > 1 (uses parallel PCIeBAR bridges)
-add_executable(v2_integration_heterogeneous_backend_gcd_multi_bridge integration/Test__HeterogeneousBackend_GcdMultiBridge.cpp)
+add_executable(v2_integration_heterogeneous_backend_gcd_multi_bridge integration/collective/backends/Test__HeterogeneousBackend_GcdMultiBridge.cpp)
 target_link_libraries(v2_integration_heterogeneous_backend_gcd_multi_bridge 
     llaminar2_core 
     GTest::gtest 
@@ -3776,7 +3776,7 @@ message(STATUS "V2 Tests: Added HeterogeneousBackend GCD Multi-Bridge pattern in
 # Tests the partial reduce-scatter pattern for singleton GPU configurations
 # Singleton configs: 1 CUDA + N ROCm (N > 1) or N CUDA + 1 ROCm (N > 1)
 # Our hardware (1 CUDA + 2 ROCm) is perfect for testing this pattern!
-add_executable(v2_integration_heterogeneous_backend_partial_rs integration/Test__HeterogeneousBackend_PartialRS.cpp)
+add_executable(v2_integration_heterogeneous_backend_partial_rs integration/collective/backends/Test__HeterogeneousBackend_PartialRS.cpp)
 target_link_libraries(v2_integration_heterogeneous_backend_partial_rs 
     llaminar2_core 
     GTest::gtest 
@@ -3793,7 +3793,7 @@ endif()
 # Test: CUDA Full Model Inference
 # End-to-end GPU inference: model loading, forward pass, token prediction
 # Tests GPU vs CPU parity for prefill and decode
-add_executable(v2_integration_cuda_full_model_inference integration/Test__CUDAFullModelInference.cpp)
+add_executable(v2_integration_cuda_full_model_inference integration/kernels/cuda/Test__CUDAFullModelInference.cpp)
 target_link_libraries(v2_integration_cuda_full_model_inference llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_CUDAFullModelInference
     COMMAND $<TARGET_FILE:v2_integration_cuda_full_model_inference>
@@ -3867,7 +3867,7 @@ endif()
 
 # Test: ComputeStage (device-agnostic kernel dispatch abstraction)
 # Tests all compute stage types: RMSNorm, RoPE, Attention, SwiGLU, ResidualAdd, MoE stages
-add_executable(v2_test_compute_stage unit/Test__ComputeStage.cpp)
+add_executable(v2_test_compute_stage unit/execution/compute_stages/Test__ComputeStage.cpp)
 target_link_libraries(v2_test_compute_stage llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_ComputeStage
     COMMAND $<TARGET_FILE:v2_test_compute_stage>
@@ -3877,7 +3877,7 @@ add_v2_test(V2_Unit_ComputeStage
 
 # Test: GEMMStage (GEMM compute stage with workspace support)
 # Tests construction, IWorkspaceConsumerStage delegation, params validation, metrics
-add_executable(v2_test_gemm_stage unit/Test__GEMMStage.cpp)
+add_executable(v2_test_gemm_stage unit/execution/compute_stages/stages/Test__GEMMStage.cpp)
 target_link_libraries(v2_test_gemm_stage llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_GEMMStage
     COMMAND $<TARGET_FILE:v2_test_gemm_stage>
@@ -3887,7 +3887,7 @@ add_v2_test(V2_Unit_GEMMStage
 
 # Test: ExecutionPolicy (declarative operation control)
 # Tests factory methods, environment variable parsing, utility methods, comparison operators
-add_executable(v2_test_execution_policy unit/Test__ExecutionPolicy.cpp)
+add_executable(v2_test_execution_policy unit/execution/config/Test__ExecutionPolicy.cpp)
 target_link_libraries(v2_test_execution_policy llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_ExecutionPolicy
     COMMAND $<TARGET_FILE:v2_test_execution_policy>
@@ -3900,7 +3900,7 @@ add_v2_test(V2_Unit_ExecutionPolicy
 # Verifies FP32 → Q16_1 quantization preserves embedding values
 # NOTE: This is an Integration test (slow, requires model loading)
 if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_embedding_stage_q16_1 unit/stages/Test__EmbeddingStage_Q16_1Output.cpp)
+    add_executable(v2_test_embedding_stage_q16_1 unit/execution/compute_stages/stages/Test__EmbeddingStage_Q16_1Output.cpp)
     target_link_libraries(v2_test_embedding_stage_q16_1 llaminar2_core GTest::gtest GTest::gtest_main)
     add_v2_test(V2_Integration_EmbeddingStage_Q16_1Output
         COMMAND $<TARGET_FILE:v2_test_embedding_stage_q16_1>
@@ -3912,7 +3912,7 @@ endif()
 # Test: HybridQ16 Layer 0 Dataflow Diagnostics [DISABLED - project on hold]
 # Traces data flow from embedding through RMSNorm in HybridQ16 mode
 if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_hybridq16_layer0_dataflow unit/stages/Test__HybridQ16_Layer0_Dataflow.cpp)
+    add_executable(v2_test_hybridq16_layer0_dataflow unit/execution/compute_stages/stages/Test__HybridQ16_Layer0_Dataflow.cpp)
     target_link_libraries(v2_test_hybridq16_layer0_dataflow llaminar2_core GTest::gtest GTest::gtest_main)
     add_v2_test(V2_Unit_HybridQ16_Layer0_Dataflow
         COMMAND $<TARGET_FILE:v2_test_hybridq16_layer0_dataflow>
@@ -3923,7 +3923,7 @@ endif()
 
 # Test: FusedAttentionWoStage with Q16_INTEGER backend
 # Tests stage construction, type, backend support, and dump info with Q16FusedAttentionKernel
-add_executable(v2_test_fused_attention_wo_stage_q16 unit/stages/Test__FusedAttentionWoStage_Q16Backend.cpp)
+add_executable(v2_test_fused_attention_wo_stage_q16 unit/execution/compute_stages/stages/Test__FusedAttentionWoStage_Q16Backend.cpp)
 target_link_libraries(v2_test_fused_attention_wo_stage_q16 llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_FusedAttentionWoStage_Q16Backend
     COMMAND $<TARGET_FILE:v2_test_fused_attention_wo_stage_q16>
@@ -3935,7 +3935,7 @@ add_v2_test(V2_Unit_FusedAttentionWoStage_Q16Backend
 # Locks in the VNNI-safe quantization contract for Q16_1 KV cache
 # Tests default scale (8.0), custom scale propagation, and VNNI safety limits
 if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_kv_cache_scale_propagation unit/stages/Test__KVCacheScalePropagation.cpp)
+    add_executable(v2_test_kv_cache_scale_propagation unit/execution/kvcache/Test__KVCacheScalePropagation.cpp)
     target_link_libraries(v2_test_kv_cache_scale_propagation llaminar2_core GTest::gtest GTest::gtest_main)
     add_v2_test(V2_Unit_KVCacheScalePropagation
         COMMAND $<TARGET_FILE:v2_test_kv_cache_scale_propagation>
@@ -3947,7 +3947,7 @@ endif()
 # Test: ResidualAddStage Precision Awareness
 # Tests precision-aware residual addition: FP32, BF16, FP16, Q8_1
 # Verifies Q8_1 uses native simd::q8_1_add_q8_1 (no explicit dequant)
-add_executable(v2_test_residual_add_precision unit/Test__ResidualAddStage_Precision.cpp)
+add_executable(v2_test_residual_add_precision unit/execution/compute_stages/stages/Test__ResidualAddStage_Precision.cpp)
 target_link_libraries(v2_test_residual_add_precision llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_ResidualAddPrecision
     COMMAND $<TARGET_FILE:v2_test_residual_add_precision>
@@ -3958,7 +3958,7 @@ add_v2_test(V2_Unit_ResidualAddPrecision
 # Test: Pure Integer Residual Add (Q16_1 + Q16_1 → Q16_1)
 # Phase 6 of Q16 Integer Attention: Full integer residual stream
 # Tests block sizes 32/64/128, edge cases, error handling
-add_executable(v2_test_residual_add_q16_1 unit/stages/Test__ResidualAddStage_Q16_1.cpp)
+add_executable(v2_test_residual_add_q16_1 unit/execution/compute_stages/stages/Test__ResidualAddStage_Q16_1.cpp)
 target_link_libraries(v2_test_residual_add_q16_1 llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_ResidualAddQ16_1
     COMMAND $<TARGET_FILE:v2_test_residual_add_q16_1>
@@ -3969,7 +3969,7 @@ add_v2_test(V2_Unit_ResidualAddQ16_1
 # Test: ComputeGraph Execution Flow
 # Comprehensive tests for graph construction, dependency resolution, execution order,
 # error handling, snapshot callbacks, statistics tracking, and multi-device execution
-add_executable(v2_test_compute_graph_execution unit/Test__ComputeGraphExecution.cpp)
+add_executable(v2_test_compute_graph_execution unit/execution/local_execution/graph/Test__ComputeGraphExecution.cpp)
 target_link_libraries(v2_test_compute_graph_execution llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_ComputeGraphExecution
     COMMAND $<TARGET_FILE:v2_test_compute_graph_execution>
@@ -3980,7 +3980,7 @@ add_v2_test(V2_Unit_ComputeGraphExecution
 # Test: DeviceGraphOrchestrator Snapshot API
 # Tests pipeline-compatible snapshot capture API (enableSnapshotCapture/getSnapshot/getSnapshotKeys)
 # and stage name conversion for E2E test compatibility
-add_executable(v2_test_device_graph_orchestrator_snapshots unit/Test__DeviceGraphOrchestratorSnapshots.cpp)
+add_executable(v2_test_device_graph_orchestrator_snapshots unit/execution/local_execution/orchestrators/Test__DeviceGraphOrchestratorSnapshots.cpp)
 target_link_libraries(v2_test_device_graph_orchestrator_snapshots llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_DeviceGraphOrchestratorSnapshots
     COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator_snapshots>
@@ -3991,7 +3991,7 @@ add_v2_test(V2_Unit_DeviceGraphOrchestratorSnapshots
 # Test: LayerExecutor (layer-level execution orchestration)
 # Tests compute graph construction, topological ordering, dependency tracking,
 # attention/FFN/MoE graph building, and multi-device execution
-add_executable(v2_test_layer_executor unit/Test__LayerExecutor.cpp)
+add_executable(v2_test_layer_executor unit/execution/local_execution/model/Test__LayerExecutor.cpp)
 target_link_libraries(v2_test_layer_executor llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_LayerExecutor
     COMMAND $<TARGET_FILE:v2_test_layer_executor>
@@ -4002,7 +4002,7 @@ add_v2_test(V2_Unit_LayerExecutor
 # Test: BufferRole (buffer role classification and descriptor types)
 # Tests BufferRole enum, BufferDescriptor, StageBufferRequirements, and real-world usage patterns
 # Part of Phase 1: GraphExecutor buffer management infrastructure
-add_executable(v2_test_buffer_role unit/Test__BufferRole.cpp)
+add_executable(v2_test_buffer_role unit/execution/debug/Test__BufferRole.cpp)
 target_link_libraries(v2_test_buffer_role llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_BufferRole
     COMMAND $<TARGET_FILE:v2_test_buffer_role>
@@ -4013,7 +4013,7 @@ add_v2_test(V2_Unit_BufferRole
 # Test: GraphBufferManager (centralized buffer allocation and management)
 # Tests buffer allocation, retrieval, statistics, graph allocation, and executor integration
 # Part of Phase 2: GraphExecutor buffer management infrastructure
-add_executable(v2_test_graph_buffer_manager unit/Test__GraphBufferManager.cpp)
+add_executable(v2_test_graph_buffer_manager unit/execution/local_execution/graph/Test__GraphBufferManager.cpp)
 target_link_libraries(v2_test_graph_buffer_manager llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_GraphBufferManager
     COMMAND $<TARGET_FILE:v2_test_graph_buffer_manager>
@@ -4024,7 +4024,7 @@ add_v2_test(V2_Unit_GraphBufferManager
 # Test: GraphBufferManager BAR Allocation (Phase 3: BAR-backed tensor support)
 # Tests integration between GraphBufferManager and TensorFactory for BAR-backed
 # tensor allocation when using PCIeBAR backend with heterogeneous CUDA/ROCm GPUs.
-add_executable(v2_test_graph_buffer_manager_bar_allocation unit/Test__GraphBufferManager_BARAllocation.cpp)
+add_executable(v2_test_graph_buffer_manager_bar_allocation unit/execution/local_execution/graph/Test__GraphBufferManager_BARAllocation.cpp)
 target_link_libraries(v2_test_graph_buffer_manager_bar_allocation llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_GraphBufferManager_BARAllocation
     COMMAND $<TARGET_FILE:v2_test_graph_buffer_manager_bar_allocation>
@@ -4035,7 +4035,7 @@ add_v2_test(V2_Unit_GraphBufferManager_BARAllocation
 # Test: DomainAwareBufferManager (Phase 5.2: Domain-aware buffer allocation)
 # Tests domain-aware buffer allocation based on layer placement configuration.
 # GPU layers get GPU buffers, CPU layers get NUMA-local CPU buffers.
-add_executable(v2_test_domain_aware_buffer_manager unit/Test__DomainAwareBufferManager.cpp)
+add_executable(v2_test_domain_aware_buffer_manager unit/execution/local_execution/device/Test__DomainAwareBufferManager.cpp)
 target_link_libraries(v2_test_domain_aware_buffer_manager llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_DomainAwareBufferManager
     COMMAND $<TARGET_FILE:v2_test_domain_aware_buffer_manager>
@@ -4046,7 +4046,7 @@ add_v2_test(V2_Unit_DomainAwareBufferManager
 # Test: CollectiveBufferAllocation (Phase 3 Buffer Registration API)
 # Tests integration of BAR-region allocator with buffer management
 # for collective operations (AllReduce, AllGather)
-add_executable(v2_test_collective_buffer_allocation unit/Test__CollectiveBufferAllocation.cpp)
+add_executable(v2_test_collective_buffer_allocation unit/collective/Test__CollectiveBufferAllocation.cpp)
 target_link_libraries(v2_test_collective_buffer_allocation llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_CollectiveBufferAllocation
     COMMAND $<TARGET_FILE:v2_test_collective_buffer_allocation>
@@ -4057,7 +4057,7 @@ add_v2_test(V2_Unit_CollectiveBufferAllocation
 # Test: ComputeGraphMerge (graph merging, root/leaf detection)
 # Tests merge(), getRootNodes(), getLeafNodes() for combining subgraphs
 # Part of Phase 3: Declarative Qwen2Graph refactoring
-add_executable(v2_test_compute_graph_merge unit/Test__ComputeGraphMerge.cpp)
+add_executable(v2_test_compute_graph_merge unit/execution/local_execution/graph/Test__ComputeGraphMerge.cpp)
 target_link_libraries(v2_test_compute_graph_merge llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_ComputeGraphMerge
     COMMAND $<TARGET_FILE:v2_test_compute_graph_merge>
@@ -4067,7 +4067,7 @@ add_v2_test(V2_Unit_ComputeGraphMerge
 
 # Test: IGraphBuilder interface and MockGraphBuilder
 # Part of Phase 5: Declarative Qwen2Graph refactoring - Interface extraction
-add_executable(v2_test_igraph_builder unit/Test__IGraphBuilder.cpp)
+add_executable(v2_test_igraph_builder unit/execution/local_execution/graph/Test__IGraphBuilder.cpp)
 target_link_libraries(v2_test_igraph_builder llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_IGraphBuilder
     COMMAND $<TARGET_FILE:v2_test_igraph_builder>
@@ -4078,7 +4078,7 @@ add_v2_test(V2_Unit_IGraphBuilder
 # Test: HybridPrecisionConfig (per-buffer precision configuration for Hybrid mode)
 # Tests buffer precision resolution, default configuration, and requiresSeparateBuffer
 # Part of Hybrid Activation Precision Mode implementation
-add_executable(v2_test_hybrid_precision_config unit/Test__HybridPrecisionConfig.cpp)
+add_executable(v2_test_hybrid_precision_config unit/execution/config/Test__HybridPrecisionConfig.cpp)
 target_link_libraries(v2_test_hybrid_precision_config llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_HybridPrecisionConfig
     COMMAND $<TARGET_FILE:v2_test_hybrid_precision_config>
@@ -4089,7 +4089,7 @@ add_v2_test(V2_Unit_HybridPrecisionConfig
 # Test: TensorParallelConfig (proportional head assignment for heterogeneous TP)
 # Tests equal splits, proportional splits (73%/27%), GQA alignment, d_ff alignment
 # Part of Phase 1a: Heterogeneous Tensor Parallelism Infrastructure
-add_executable(v2_test_tensor_parallel_config unit/Test__TensorParallelConfig.cpp)
+add_executable(v2_test_tensor_parallel_config unit/config/Test__TensorParallelConfig.cpp)
 target_link_libraries(v2_test_tensor_parallel_config llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_TensorParallelConfig
     COMMAND $<TARGET_FILE:v2_test_tensor_parallel_config>
@@ -4101,7 +4101,7 @@ add_v2_test(V2_Unit_TensorParallelConfig
 # Tests creation of TensorParallelConfig from ILocalTPContext for LOCAL TP weight sharding.
 # Covers equal splits, proportional splits (73%/27%), 3-way splits, device lookup.
 # Part of Phase 1: LOCAL TP Weight Sharding Infrastructure
-add_executable(v2_test_tensor_parallel_config_localtp unit/Test__TensorParallelConfig_LocalTP.cpp)
+add_executable(v2_test_tensor_parallel_config_localtp unit/config/Test__TensorParallelConfig_LocalTP.cpp)
 target_link_libraries(v2_test_tensor_parallel_config_localtp llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_TensorParallelConfig_LocalTP
     COMMAND $<TARGET_FILE:v2_test_tensor_parallel_config_localtp>
@@ -4112,7 +4112,7 @@ add_v2_test(V2_Unit_TensorParallelConfig_LocalTP
 # Test: WeightManager_LocalTPSlicing (helper methods for device-aware weight slicing)
 # Tests weight category detection (isQKVWeight, isFFNGateUpWeight, etc.) and sliceRowRange.
 # Part of Phase 1: LOCAL TP Weight Sharding Infrastructure
-add_executable(v2_test_weight_manager_localtp_slicing unit/Test__WeightManager_LocalTPSlicing.cpp)
+add_executable(v2_test_weight_manager_localtp_slicing unit/loaders/Test__WeightManager_LocalTPSlicing.cpp)
 target_link_libraries(v2_test_weight_manager_localtp_slicing llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_weight_manager_localtp_slicing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/utils)
 add_v2_test(V2_Unit_WeightManager_LocalTPSlicing
@@ -4124,7 +4124,7 @@ add_v2_test(V2_Unit_WeightManager_LocalTPSlicing
 # Test: PipelineParallelConfig (layer range assignment for pipeline parallelism)
 # Tests equal splits, custom splits, topology methods, validation
 # Part of Phase 2.3: Heterogeneous TP - Pipeline Parallelism Layer Assignment
-add_executable(v2_test_pipeline_parallel_config unit/Test__PipelineParallelConfig.cpp)
+add_executable(v2_test_pipeline_parallel_config unit/config/Test__PipelineParallelConfig.cpp)
 target_link_libraries(v2_test_pipeline_parallel_config llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_PipelineParallelConfig
     COMMAND $<TARGET_FILE:v2_test_pipeline_parallel_config>
@@ -4136,7 +4136,7 @@ add_v2_test(V2_Unit_PipelineParallelConfig
 # Tests allOnDevice, cpuFirstLayers, cpuLastLayers, alternating, custom assignments,
 # transition point detection, device inventory, and validation
 # Part of Phase 3.1: CPU Pipeline Stage Support
-add_executable(v2_test_layer_placement_config unit/Test__LayerPlacementConfig.cpp)
+add_executable(v2_test_layer_placement_config unit/config/Test__LayerPlacementConfig.cpp)
 target_link_libraries(v2_test_layer_placement_config llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_LayerPlacementConfig
     COMMAND $<TARGET_FILE:v2_test_layer_placement_config>
@@ -4148,7 +4148,7 @@ add_v2_test(V2_Unit_LayerPlacementConfig
 # Tests getDeviceTypeForLayer, isGPULayer/isCPULayer predicates, getGPULayers/getCPULayers,
 # getDomainBoundaries for HeterogeneousLayerExecutor integration.
 # Part of Phase 5.4: HeterogeneousLayerExecutor + LayerPlacementConfig Integration
-add_executable(v2_test_layer_placement_config_extended unit/Test__LayerPlacementConfigExtended.cpp)
+add_executable(v2_test_layer_placement_config_extended unit/config/Test__LayerPlacementConfigExtended.cpp)
 target_link_libraries(v2_test_layer_placement_config_extended llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_LayerPlacementConfigExtended
     COMMAND $<TARGET_FILE:v2_test_layer_placement_config_extended>
@@ -4159,7 +4159,7 @@ add_v2_test(V2_Unit_LayerPlacementConfigExtended
 # Test: TPDomain (multi-domain tensor parallelism)
 # Tests TPDomain struct, MultiDomainTPConfig, domain type helpers, layer mapping
 # Part of Phase 3.2b: TPDomain for Hybrid Parallelism
-add_executable(v2_test_tpdomain unit/Test__TPDomain.cpp)
+add_executable(v2_test_tpdomain unit/config/Test__TPDomain.cpp)
 target_link_libraries(v2_test_tpdomain llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_TPDomain
     COMMAND $<TARGET_FILE:v2_test_tpdomain>
@@ -4170,7 +4170,7 @@ add_v2_test(V2_Unit_TPDomain
 # Test: GlobalDeviceAddress (fully-qualified device address across nodes)
 # Tests factory methods, parsing (full/short forms), toString, predicates (isLocal, isGPU, etc.)
 # Part of Phase 0.1: CLI and Configuration Architecture
-add_executable(v2_test_global_device_address unit/Test__GlobalDeviceAddress.cpp)
+add_executable(v2_test_global_device_address unit/backends/Test__GlobalDeviceAddress.cpp)
 target_link_libraries(v2_test_global_device_address llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_GlobalDeviceAddress
     COMMAND $<TARGET_FILE:v2_test_global_device_address>
@@ -4180,7 +4180,7 @@ add_v2_test(V2_Unit_GlobalDeviceAddress
 
 # Test: DeviceRegistry (Phase 6 - centralized device discovery and management)
 # Tests discovery of CPU/CUDA/ROCm devices, validation, memory queries, backend access, topology
-add_executable(v2_test_device_registry unit/Test__DeviceRegistry.cpp)
+add_executable(v2_test_device_registry unit/backends/Test__DeviceRegistry.cpp)
 target_link_libraries(v2_test_device_registry llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_DeviceRegistry
     COMMAND $<TARGET_FILE:v2_test_device_registry>
@@ -4190,7 +4190,7 @@ add_v2_test(V2_Unit_DeviceRegistry
 
 # Test: DeviceAddressAdapter (Phase 6 - legacy-to-GlobalDeviceAddress bridge)
 # Tests conversion between DeviceId, raw ordinals, and GlobalDeviceAddress
-add_executable(v2_test_device_address_adapter unit/Test__DeviceAddressAdapter.cpp)
+add_executable(v2_test_device_address_adapter unit/backends/Test__DeviceAddressAdapter.cpp)
 target_link_libraries(v2_test_device_address_adapter llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_DeviceAddressAdapter
     COMMAND $<TARGET_FILE:v2_test_device_address_adapter>
@@ -4201,7 +4201,7 @@ add_v2_test(V2_Unit_DeviceAddressAdapter
 # Test: OrchestrationConfig (configuration structs for heterogeneous orchestration)
 # Tests enums, DomainDefinition, PPStageDefinition, OrchestrationConfig validation
 # Part of Phase 0.2: CLI and Configuration Architecture
-add_executable(v2_test_orchestration_config unit/Test__OrchestrationConfig.cpp)
+add_executable(v2_test_orchestration_config unit/config/Test__OrchestrationConfig.cpp)
 target_link_libraries(v2_test_orchestration_config llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_OrchestrationConfig
     COMMAND $<TARGET_FILE:v2_test_orchestration_config>
@@ -4212,7 +4212,7 @@ add_v2_test(V2_Unit_OrchestrationConfig
 # Test: OrchestrationConfigParser (CLI and YAML parsing for orchestration config)
 # Tests CLI parsing (--tp, --pp, --device, --define-domain, --pp-stage), YAML parsing
 # Part of Phase 0.3: CLI and Configuration Architecture
-add_executable(v2_test_orchestration_config_parser unit/Test__OrchestrationConfigParser.cpp)
+add_executable(v2_test_orchestration_config_parser unit/config/Test__OrchestrationConfigParser.cpp)
 target_link_libraries(v2_test_orchestration_config_parser llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_OrchestrationConfigParser
     COMMAND $<TARGET_FILE:v2_test_orchestration_config_parser>
@@ -4223,7 +4223,7 @@ add_v2_test(V2_Unit_OrchestrationConfigParser
 # Test: TPPPValidator (validates TP/PP configuration against model architecture)
 # Tests head divisibility, dimension divisibility, layer assignment, proportional weights.
 # Part of Phase 0.4: Model-Aware Configuration Validation
-add_executable(v2_test_tppp_validator unit/Test__TPPPValidator.cpp)
+add_executable(v2_test_tppp_validator unit/config/Test__TPPPValidator.cpp)
 target_link_libraries(v2_test_tppp_validator llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_TPPPValidator
     COMMAND $<TARGET_FILE:v2_test_tppp_validator>
@@ -4234,7 +4234,7 @@ add_v2_test(V2_Unit_TPPPValidator
 # Test: RankExecutionPlan (contract between Layer 2 and Layer 3)
 # Tests validation, convenience methods, toString(), and integration scenarios.
 # Part of Phase 1: Plan-to-Graph Translation
-add_executable(v2_test_rank_execution_plan unit/Test__RankExecutionPlan.cpp)
+add_executable(v2_test_rank_execution_plan unit/execution/mpi_orchestration/Test__RankExecutionPlan.cpp)
 target_link_libraries(v2_test_rank_execution_plan llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_RankExecutionPlan
     COMMAND $<TARGET_FILE:v2_test_rank_execution_plan>
@@ -4245,7 +4245,7 @@ add_v2_test(V2_Unit_RankExecutionPlan
 # Test: ExecutionPlanBuilder (builds execution plans from orchestration config)
 # Tests single device, LOCAL TP, GLOBAL TP, PP, named domains, weight sharding.
 # Part of Phase 1: Plan-to-Graph Translation
-add_executable(v2_test_execution_plan_builder unit/Test__ExecutionPlanBuilder.cpp)
+add_executable(v2_test_execution_plan_builder unit/execution/mpi_orchestration/Test__ExecutionPlanBuilder.cpp)
 target_link_libraries(v2_test_execution_plan_builder llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_ExecutionPlanBuilder
     COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
@@ -4257,7 +4257,7 @@ add_v2_test(V2_Unit_ExecutionPlanBuilder
 # Tests SingleDevicePlacement, HybridCpuGpuPlacement, PipelineParallelPlacement,
 # LocalTPPlacement, and factory method fromExecutionPlan().
 # Part of Phase 2: Multi-Device Graph Building
-add_executable(v2_test_layer_device_placement unit/Test__LayerDevicePlacement.cpp)
+add_executable(v2_test_layer_device_placement unit/execution/local_execution/device/Test__LayerDevicePlacement.cpp)
 target_link_libraries(v2_test_layer_device_placement llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_LayerDevicePlacement
     COMMAND $<TARGET_FILE:v2_test_layer_device_placement>
@@ -4269,7 +4269,7 @@ add_v2_test(V2_Unit_LayerDevicePlacement
 # Tests config building for single device, PP layer ranges, LOCAL TP head distribution,
 # proportional weights, and combined PP+TP scenarios.
 # Part of Phase 2: Multi-Device Graph Building
-add_executable(v2_test_qwen2_graph_config_builder unit/Test__Qwen2GraphConfigBuilder.cpp)
+add_executable(v2_test_qwen2_graph_config_builder unit/models/qwen/Test__Qwen2GraphConfigBuilder.cpp)
 target_link_libraries(v2_test_qwen2_graph_config_builder llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_Qwen2GraphConfigBuilder
     COMMAND $<TARGET_FILE:v2_test_qwen2_graph_config_builder>
@@ -4281,7 +4281,7 @@ add_v2_test(V2_Unit_Qwen2GraphConfigBuilder
 # Tests device routing based on LayerPlacementConfig, statistics tracking,
 # cross-domain transfer detection, and layer execution on GPU/CPU.
 # Part of Phase 5.1: Heterogeneous Layer Execution
-add_executable(v2_test_heterogeneous_layer_executor unit/Test__HeterogeneousLayerExecutor.cpp)
+add_executable(v2_test_heterogeneous_layer_executor unit/execution/local_execution/model/Test__HeterogeneousLayerExecutor.cpp)
 target_link_libraries(v2_test_heterogeneous_layer_executor llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_HeterogeneousLayerExecutor
     COMMAND $<TARGET_FILE:v2_test_heterogeneous_layer_executor>
@@ -4293,7 +4293,7 @@ add_v2_test(V2_Unit_HeterogeneousLayerExecutor
 # Tests buffer requirement declarations for all compute stages (SwiGLU, ResidualAdd,
 # RMSNorm, RoPE, GEMM, FusedQKVGEMM, FusedGateUpGEMM) for GraphBufferManager integration
 # Part of Phase 3: Stage Migration for buffer management infrastructure
-add_executable(v2_test_stage_buffer_requirements unit/Test__StageBufferRequirements.cpp)
+add_executable(v2_test_stage_buffer_requirements unit/execution/compute_stages/Test__StageBufferRequirements.cpp)
 target_link_libraries(v2_test_stage_buffer_requirements llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_StageBufferRequirements
     COMMAND $<TARGET_FILE:v2_test_stage_buffer_requirements>
@@ -4304,7 +4304,7 @@ add_v2_test(V2_Unit_StageBufferRequirements
 # Test: TensorVerification (unified tensor verification system)
 # Tests VerificationResult, verifyRawBuffer, VerificationFailure, dumpStageBuffers.
 # Part of Tensor Contracts and Validation Framework - Phase 1
-add_executable(v2_test_tensor_verification unit/utils/Test__TensorVerification.cpp)
+add_executable(v2_test_tensor_verification unit/tensors/Test__TensorVerification.cpp)
 target_link_libraries(v2_test_tensor_verification llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_TensorVerification
     COMMAND $<TARGET_FILE:v2_test_tensor_verification>
@@ -4315,7 +4315,7 @@ add_v2_test(V2_Unit_TensorVerification
 # Test: GraphValidator (buffer flow validation for compute graphs)
 # Tests buffer producer/consumer ordering, orphan detection, type compatibility.
 # Part of Buffer Contract Validation System - Phase 2: Buffer Contracts
-add_executable(v2_test_graph_validator unit/Test__GraphValidator.cpp)
+add_executable(v2_test_graph_validator unit/execution/local_execution/graph/Test__GraphValidator.cpp)
 target_link_libraries(v2_test_graph_validator llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_GraphValidator
     COMMAND $<TARGET_FILE:v2_test_graph_validator>
@@ -4326,7 +4326,7 @@ add_v2_test(V2_Unit_GraphValidator
 # Test: StageOutputManifest (getDeclaredOutputs for stage output contracts)
 # Tests that stages correctly declare their output buffers with producer contracts.
 # Part of Buffer Contract Validation System - Phase 3: Stage Output Manifest
-add_executable(v2_test_stage_output_manifest unit/Test__StageOutputManifest.cpp)
+add_executable(v2_test_stage_output_manifest unit/execution/debug/Test__StageOutputManifest.cpp)
 target_link_libraries(v2_test_stage_output_manifest llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_StageOutputManifest
     COMMAND $<TARGET_FILE:v2_test_stage_output_manifest>
@@ -4337,7 +4337,7 @@ add_v2_test(V2_Unit_StageOutputManifest
 # Test: InferenceMode (centralized mode context for activation precision)
 # Tests mode identification, buffer requirements, attention strategy, validation.
 # Part of Buffer Contract Validation System - Phase 4: InferenceMode Context
-add_executable(v2_test_inference_mode unit/Test__InferenceMode.cpp)
+add_executable(v2_test_inference_mode unit/execution/config/Test__InferenceMode.cpp)
 target_link_libraries(v2_test_inference_mode llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_InferenceMode
     COMMAND $<TARGET_FILE:v2_test_inference_mode>
@@ -4348,7 +4348,7 @@ add_v2_test(V2_Unit_InferenceMode
 # Test: ValidationConfig (buffer validation environment variables and GraphExecutor integration)
 # Tests LLAMINAR_VALIDATE_BUFFERS, LLAMINAR_FAIL_ON_ZERO, LLAMINAR_FAIL_ON_NAN.
 # Part of Buffer Contract Validation System - Phase 5: Debug Validation Flag
-add_executable(v2_test_validation_config unit/Test__ValidationConfig.cpp)
+add_executable(v2_test_validation_config unit/execution/config/Test__ValidationConfig.cpp)
 target_link_libraries(v2_test_validation_config llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_ValidationConfig
     COMMAND $<TARGET_FILE:v2_test_validation_config>
@@ -4360,7 +4360,7 @@ add_v2_test(V2_Unit_ValidationConfig
 # Tests LLAMINAR_WEIGHT_STREAMING, LLAMINAR_STREAM_MEMORY_MB, LLAMINAR_STREAM_PREFETCH_DEPTH,
 # LLAMINAR_STREAM_EVICTION_POLICY, LLAMINAR_STREAM_VERBOSE.
 # Part of Option B: Weight Streaming infrastructure
-add_executable(v2_test_streaming_env unit/Test__StreamingEnv.cpp)
+add_executable(v2_test_streaming_env unit/loaders/Test__StreamingEnv.cpp)
 target_link_libraries(v2_test_streaming_env llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_StreamingEnv
     COMMAND $<TARGET_FILE:v2_test_streaming_env>
@@ -4371,7 +4371,7 @@ add_v2_test(V2_Unit_StreamingEnv
 # Test: MultiDomainOrchestrator (multi-domain tensor parallelism wrapper)
 # Tests factory methods, domain access, delegation to inner orchestrator, and stats.
 # Part of Phase 4.2: Multi-domain TP support for heterogeneous GPU systems
-add_executable(v2_test_multi_domain_orchestrator unit/Test__MultiDomainOrchestrator.cpp)
+add_executable(v2_test_multi_domain_orchestrator unit/execution/local_execution/orchestrators/Test__MultiDomainOrchestrator.cpp)
 target_link_libraries(v2_test_multi_domain_orchestrator llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_MultiDomainOrchestrator
     COMMAND $<TARGET_FILE:v2_test_multi_domain_orchestrator>
@@ -4383,7 +4383,7 @@ add_v2_test(V2_Unit_MultiDomainOrchestrator
 # Tests mock device runner and TP context, configuration validation, device coordination,
 # forward/clear_cache delegation, logits retrieval, and synchronization.
 # Part of LOCAL TP implementation for multi-GPU inference within single MPI rank.
-add_executable(v2_test_multi_device_orchestrator unit/Test__MultiDeviceOrchestrator.cpp)
+add_executable(v2_test_multi_device_orchestrator unit/execution/local_execution/orchestrators/Test__MultiDeviceOrchestrator.cpp)
 target_link_libraries(v2_test_multi_device_orchestrator llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_MultiDeviceOrchestrator
     COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator>
@@ -4395,7 +4395,7 @@ add_v2_test(V2_Unit_MultiDeviceOrchestrator
 # Tests createMultiDeviceOrchestrator and createTestableMultiDeviceOrchestrator
 # factory functions with various configurations, validation, and error handling.
 # Part of Phase 5: MultiDeviceOrchestrator integration with InferenceRunnerFactory
-add_executable(v2_unit_inference_runner_factory_multidevice unit/Test__InferenceRunnerFactory_MultiDevice.cpp)
+add_executable(v2_unit_inference_runner_factory_multidevice unit/execution/factory/Test__InferenceRunnerFactory_MultiDevice.cpp)
 target_include_directories(v2_unit_inference_runner_factory_multidevice PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
 )
@@ -4415,7 +4415,7 @@ add_v2_test(V2_Unit_InferenceRunnerFactory_MultiDevice
 # Tests CoherencePolicy enum, cohereInputs/markOutputsDirty, buffer extraction,
 # and stage coherence policy reporting.
 # Part of Device Abstraction Phase 2: Automatic Stage Boundary Coherence
-add_executable(v2_test_stage_coherence unit/Test__StageCoherence.cpp)
+add_executable(v2_test_stage_coherence unit/execution/local_execution/coherence/Test__StageCoherence.cpp)
 target_link_libraries(v2_test_stage_coherence llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_StageCoherence
     COMMAND $<TARGET_FILE:v2_test_stage_coherence>
@@ -4426,7 +4426,7 @@ add_v2_test(V2_Unit_StageCoherence
 # Test: LivenessAnalyzer (buffer lifetime analysis for memory optimization)
 # Tests buffer liveness tracking, aliasing group computation, memory savings calculation.
 # Part of Phase 4: Liveness Analysis for buffer management infrastructure
-add_executable(v2_test_liveness_analyzer unit/Test__LivenessAnalyzer.cpp)
+add_executable(v2_test_liveness_analyzer unit/execution/local_execution/graph/Test__LivenessAnalyzer.cpp)
 target_link_libraries(v2_test_liveness_analyzer llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_LivenessAnalyzer
     COMMAND $<TARGET_FILE:v2_test_liveness_analyzer>
@@ -4438,7 +4438,7 @@ add_v2_test(V2_Unit_LivenessAnalyzer
 # Tests setTensorFactory/initializeBuffers workflow, buffer allocation/binding,
 # statistics tracking, and release cleanup.
 # Part of Phase 3: Buffer Management moved to DeviceGraphOrchestrator
-add_executable(v2_test_device_graph_orchestrator_buffer_mgmt unit/Test__DeviceGraphOrchestratorBufferManagement.cpp)
+add_executable(v2_test_device_graph_orchestrator_buffer_mgmt unit/execution/local_execution/orchestrators/Test__DeviceGraphOrchestratorBufferManagement.cpp)
 target_link_libraries(v2_test_device_graph_orchestrator_buffer_mgmt llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_DeviceGraphOrchestratorBufferManagement
     COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator_buffer_mgmt>
@@ -4452,7 +4452,7 @@ add_v2_test(V2_Unit_DeviceGraphOrchestratorBufferManagement
 # - Cache initialization and management
 # - Device context lazy creation and caching
 # - Cache statistics tracking
-add_executable(v2_test_device_graph_orchestrator unit/Test__DeviceGraphOrchestrator.cpp)
+add_executable(v2_test_device_graph_orchestrator unit/execution/local_execution/orchestrators/Test__DeviceGraphOrchestrator.cpp)
 target_link_libraries(v2_test_device_graph_orchestrator llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_DeviceGraphOrchestrator
     COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator>
@@ -4466,7 +4466,7 @@ add_v2_test(V2_Unit_DeviceGraphOrchestrator
 # - WeightManager and PlacementMap integration
 # - Phase-aware weight selection logic
 # - CPU decode participation checks
-add_executable(v2_test_device_graph_orchestrator_phase_aware_weights unit/Test__DeviceGraphOrchestratorPhaseAwareWeights.cpp)
+add_executable(v2_test_device_graph_orchestrator_phase_aware_weights unit/execution/local_execution/orchestrators/Test__DeviceGraphOrchestratorPhaseAwareWeights.cpp)
 target_link_libraries(v2_test_device_graph_orchestrator_phase_aware_weights llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_DeviceGraphOrchestrator_PhaseAwareWeights
     COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator_phase_aware_weights>
@@ -4479,7 +4479,7 @@ add_v2_test(V2_Unit_DeviceGraphOrchestrator_PhaseAwareWeights
 # - Phase transition notifications to streamer
 # - Weight streaming hooks (ensure/prefetch/release) during layer execution
 # - Streaming is optional (works without streamer set)
-add_executable(v2_test_device_graph_orchestrator_weight_streaming unit/Test__DeviceGraphOrchestratorWeightStreaming.cpp)
+add_executable(v2_test_device_graph_orchestrator_weight_streaming unit/execution/local_execution/orchestrators/Test__DeviceGraphOrchestratorWeightStreaming.cpp)
 target_link_libraries(v2_test_device_graph_orchestrator_weight_streaming llaminar2_core GTest::gtest GTest::gtest_main GTest::gmock)
 add_v2_test(V2_Unit_DeviceGraphOrchestrator_WeightStreaming
     COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator_weight_streaming>
@@ -4493,7 +4493,7 @@ add_v2_test(V2_Unit_DeviceGraphOrchestrator_WeightStreaming
 # - getDomainForLayer() routing logic
 # - Domain config persistence across operations
 # - Integration with AllreduceStage domain-aware communicator selection
-add_executable(v2_test_device_graph_orchestrator_domain_wiring unit/Test__DeviceGraphOrchestratorDomainWiring.cpp)
+add_executable(v2_test_device_graph_orchestrator_domain_wiring unit/execution/local_execution/orchestrators/Test__DeviceGraphOrchestratorDomainWiring.cpp)
 target_link_libraries(v2_test_device_graph_orchestrator_domain_wiring llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_DeviceGraphOrchestratorDomainWiring
     COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator_domain_wiring>
@@ -4504,7 +4504,7 @@ add_v2_test(V2_Unit_DeviceGraphOrchestratorDomainWiring
 # Test: GraphResolver (declarative schema resolution for multi-model support)
 # Tests the three-layer architecture: GraphSchema -> GraphResolver -> ComputeGraph
 # Part of Phase 4: Schema-based graph building for model scalability
-add_executable(v2_test_graph_resolver unit/Test__GraphResolver.cpp)
+add_executable(v2_test_graph_resolver unit/execution/local_execution/graph/Test__GraphResolver.cpp)
 target_link_libraries(v2_test_graph_resolver llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_GraphResolver
     COMMAND $<TARGET_FILE:v2_test_graph_resolver>
@@ -4516,7 +4516,7 @@ add_v2_test(V2_Unit_GraphResolver
 # Tests the new buildForwardGraphFromSchema() method that uses
 # Qwen2Schema + GraphResolver + GraphBuilder architecture.
 # Validates that schema-based graphs match legacy imperative graphs.
-add_executable(v2_test_qwen2_graph_schema unit/Test__Qwen2GraphSchema.cpp)
+add_executable(v2_test_qwen2_graph_schema unit/models/qwen/Test__Qwen2GraphSchema.cpp)
 target_link_libraries(v2_test_qwen2_graph_schema llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_Qwen2GraphSchema
     COMMAND $<TARGET_FILE:v2_test_qwen2_graph_schema>
@@ -4528,7 +4528,7 @@ add_v2_test(V2_Unit_Qwen2GraphSchema
 # Tests that use_graph_buffer_management=true auto-enables all exec_* flags
 # to prevent empty graphs (0 nodes) when graph buffer management is enabled.
 # Covers the "repeating tokens" bug caused by graph having no computation nodes.
-add_executable(v2_test_execution_config_auto_enable unit/Test__ExecutionConfigAutoEnable.cpp)
+add_executable(v2_test_execution_config_auto_enable unit/execution/config/Test__ExecutionConfigAutoEnable.cpp)
 target_link_libraries(v2_test_execution_config_auto_enable llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_ExecutionConfigAutoEnable
     COMMAND $<TARGET_FILE:v2_test_execution_config_auto_enable>
@@ -4539,7 +4539,7 @@ add_v2_test(V2_Unit_ExecutionConfigAutoEnable
 # Test: CPUKernelDeviceIndex (regression test for device_idx validation bug)
 # Tests that CPU kernels accept any device_idx value (not just -1) for NUMA support.
 # Covers the bug where CPUAttentionKernelT rejected device_idx=0 or 1.
-add_executable(v2_test_cpu_kernel_device_index unit/Test__CPUKernelDeviceIndex.cpp)
+add_executable(v2_test_cpu_kernel_device_index unit/kernels/cpu/Test__CPUKernelDeviceIndex.cpp)
 target_link_libraries(v2_test_cpu_kernel_device_index llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_CPUKernelDeviceIndex
     COMMAND $<TARGET_FILE:v2_test_cpu_kernel_device_index>
@@ -4555,7 +4555,7 @@ add_v2_test(V2_Unit_CPUKernelDeviceIndex
 # Test: LayerExecutorInterface (ILayerExecutor interface and MockLayerExecutor)
 # Tests polymorphic execution, MockLayerExecutor behavior, interface-based testing patterns,
 # configuration, statistics, and multi-device execution through interface abstraction
-add_executable(v2_test_layer_executor_interface unit/Test__LayerExecutorInterface.cpp)
+add_executable(v2_test_layer_executor_interface unit/execution/local_execution/model/Test__LayerExecutorInterface.cpp)
 target_link_libraries(v2_test_layer_executor_interface llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_LayerExecutorInterface
     COMMAND $<TARGET_FILE:v2_test_layer_executor_interface>
@@ -4567,7 +4567,7 @@ add_v2_test(V2_Unit_LayerExecutorInterface
 # Validates that all stage Params satisfy StageParamsRequired concept, device_id defaults
 # to CPU, and device() returns correct device from params - prevents bug where
 # stages accidentally run on CPU when intended for GPU.
-add_executable(v2_test_stage_params_base unit/Test__StageParamsBase.cpp)
+add_executable(v2_test_stage_params_base unit/execution/compute_stages/Test__StageParamsBase.cpp)
 target_link_libraries(v2_test_stage_params_base llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_StageParamsBase
     COMMAND $<TARGET_FILE:v2_test_stage_params_base>
@@ -4578,7 +4578,7 @@ add_v2_test(V2_Unit_StageParamsBase
 # Test: ComputeStages (individual compute stage unit tests)
 # Tests GEMMStage, RMSNormStage, RoPEStage, SwiGLUStage, ResidualAddStage, etc.
 # Verifies correctness, precision preservation, FLOP estimation, and backend compatibility
-add_executable(v2_test_compute_stages unit/Test__ComputeStages.cpp)
+add_executable(v2_test_compute_stages unit/execution/compute_stages/Test__ComputeStages.cpp)
 target_link_libraries(v2_test_compute_stages llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_ComputeStages
     COMMAND $<TARGET_FILE:v2_test_compute_stages>
@@ -4588,7 +4588,7 @@ add_v2_test(V2_Unit_ComputeStages
 
 # Test: StageDumpInfo (getDumpInfo() snapshot support for all compute stages)
 # Validates that each compute stage correctly reports inputs, outputs, weights, and scalars
-add_executable(v2_test_stage_dump_info unit/Test__StageDumpInfo.cpp)
+add_executable(v2_test_stage_dump_info unit/execution/debug/Test__StageDumpInfo.cpp)
 target_link_libraries(v2_test_stage_dump_info llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_StageDumpInfo
     COMMAND $<TARGET_FILE:v2_test_stage_dump_info>
@@ -4600,7 +4600,7 @@ add_v2_test(V2_Unit_StageDumpInfo
 # Validates that addInput(TensorBase*)/addOutput(TensorBase*) preserve native format
 # (Q8_1, Q16_1, FP32) instead of dequantizing to FP32 - critical for replay testing
 if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_stage_dumper_native_format unit/execution/Test__StageDumperNativeFormat.cpp)
+    add_executable(v2_test_stage_dumper_native_format unit/execution/debug/Test__StageDumperNativeFormat.cpp)
     target_link_libraries(v2_test_stage_dumper_native_format llaminar2_core GTest::gtest GTest::gtest_main)
     add_v2_test(V2_Unit_StageDumperNativeFormat
         COMMAND $<TARGET_FILE:v2_test_stage_dumper_native_format>
@@ -4611,7 +4611,7 @@ endif()
 
 # Test: KernelSnapshotInfo (getKernelSnapshotInfo() for all kernel implementations)
 # Validates that each kernel correctly reports its I/O buffers via IKernelSnapshotCapable
-add_executable(v2_test_kernel_snapshot_info unit/Test__KernelSnapshotInfo.cpp)
+add_executable(v2_test_kernel_snapshot_info unit/tensors/Test__KernelSnapshotInfo.cpp)
 target_link_libraries(v2_test_kernel_snapshot_info llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_KernelSnapshotInfo
     COMMAND $<TARGET_FILE:v2_test_kernel_snapshot_info>
@@ -4621,7 +4621,7 @@ add_v2_test(V2_Unit_KernelSnapshotInfo
 
 # Test: AllGatherStage (MPI collective for column-parallel LM head)
 # Phase 5: Tests AllGatherStage for collecting distributed logits
-add_executable(v2_test_allgather_stage unit/Test__AllGatherStage.cpp)
+add_executable(v2_test_allgather_stage unit/execution/compute_stages/stages/Test__AllGatherStage.cpp)
 target_link_libraries(v2_test_allgather_stage llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_AllGatherStage
     COMMAND $<TARGET_FILE:v2_test_allgather_stage>
@@ -4631,7 +4631,7 @@ add_v2_test(V2_Unit_AllGatherStage
 
 # Test: AllGatherVStage (Variable-sized MPI collective for heterogeneous TP)
 # Phase 1d: Tests AllGatherVStage for variable send counts per rank
-add_executable(v2_test_allgatherv_stage unit/Test__AllGatherVStage.cpp)
+add_executable(v2_test_allgatherv_stage unit/execution/compute_stages/stages/Test__AllGatherVStage.cpp)
 target_link_libraries(v2_test_allgatherv_stage llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_AllGatherVStage
     COMMAND $<TARGET_FILE:v2_test_allgatherv_stage>
@@ -4641,7 +4641,7 @@ add_v2_test(V2_Unit_AllGatherVStage
 
 # Test: AllreduceStage (MPI collective for tensor parallel reductions)
 # Phase 4.1a: Tests AllreduceStage including TPDomain support
-add_executable(v2_test_allreduce_stage unit/Test__AllreduceStage.cpp)
+add_executable(v2_test_allreduce_stage unit/execution/compute_stages/stages/Test__AllreduceStage.cpp)
 target_link_libraries(v2_test_allreduce_stage llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_AllreduceStage
     COMMAND $<TARGET_FILE:v2_test_allreduce_stage>
@@ -4660,7 +4660,7 @@ add_v2_test(V2_Unit_AllreduceStage
 # Phase 4: Tests ILocalTPContext implementation for device management and collectives
 # Validates constructor, auto-detection, proportional weight distribution, head/row/col
 # sharding queries, and collective operation interfaces.
-add_executable(v2_test_local_tp_context unit/Test__LocalTPContext.cpp)
+add_executable(v2_test_local_tp_context unit/collective/Test__LocalTPContext.cpp)
 target_link_libraries(v2_test_local_tp_context llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_LocalTPContext
     COMMAND $<TARGET_FILE:v2_test_local_tp_context>
@@ -4672,7 +4672,7 @@ add_v2_test(V2_Unit_LocalTPContext
 # Phase 4: Tests ILocalTPWeightSharder implementation for column/row-parallel sharding
 # Validates proportional weight distribution, equal weight handling, single-device
 # extraction, and correct shard sizing based on device weights.
-add_executable(v2_test_local_tp_weight_sharder unit/Test__LocalTPWeightSharder.cpp)
+add_executable(v2_test_local_tp_weight_sharder unit/loaders/Test__LocalTPWeightSharder.cpp)
 target_link_libraries(v2_test_local_tp_weight_sharder llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_LocalTPWeightSharder
     COMMAND $<TARGET_FILE:v2_test_local_tp_weight_sharder>
@@ -4684,7 +4684,7 @@ add_v2_test(V2_Unit_LocalTPWeightSharder
 # Phase 4: Tests LocalTPAllreduceStage for intra-rank collective operations
 # Validates stage type/name, buffer requirements, single-device no-op, multi-device
 # placeholder behavior, and dump info generation.
-add_executable(v2_test_local_tp_allreduce_stage unit/Test__LocalTPAllreduceStage.cpp)
+add_executable(v2_test_local_tp_allreduce_stage unit/execution/compute_stages/stages/Test__LocalTPAllreduceStage.cpp)
 target_link_libraries(v2_test_local_tp_allreduce_stage llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_LocalTPAllreduceStage
     COMMAND $<TARGET_FILE:v2_test_local_tp_allreduce_stage>
@@ -4695,7 +4695,7 @@ add_v2_test(V2_Unit_LocalTPAllreduceStage
 # Test: LocalTPContext Barrier Synchronization
 # Tests the NCCL-style barrier for PCIeBAR heterogeneous allreduce
 # Validates that multiple device threads rendezvous before data transfer
-add_executable(v2_test_local_tp_context_barrier unit/Test__LocalTPContextBarrier.cpp)
+add_executable(v2_test_local_tp_context_barrier unit/collective/Test__LocalTPContextBarrier.cpp)
 target_link_libraries(v2_test_local_tp_context_barrier PRIVATE llaminar2_core GTest::gtest_main)
 add_v2_test(V2_Unit_LocalTPContextBarrier
     COMMAND $<TARGET_FILE:v2_test_local_tp_context_barrier>
@@ -4706,7 +4706,7 @@ add_v2_test(V2_Unit_LocalTPContextBarrier
 # Test: LocalTPContext BAR-backed Tensor Management
 # Tests registration and lookup of BAR-backed tensors for zero-copy allreduce
 # Phase 2 of PCIeBAR zero-copy allreduce implementation
-add_executable(v2_test_local_tp_context_bar_management unit/Test__LocalTPContext_BARManagement.cpp)
+add_executable(v2_test_local_tp_context_bar_management unit/collective/Test__LocalTPContext_BARManagement.cpp)
 target_link_libraries(v2_test_local_tp_context_bar_management PRIVATE llaminar2_core GTest::gtest_main)
 add_v2_test(V2_Unit_LocalTPContext_BARManagement
     COMMAND $<TARGET_FILE:v2_test_local_tp_context_bar_management>
@@ -4717,7 +4717,7 @@ add_v2_test(V2_Unit_LocalTPContext_BARManagement
 # Test: LocalTPContext Zero-Copy Allreduce (executePCIeBarAllreduce)
 # Tests Phase 4 implementation: proper A+B summation (not 2A bug)
 # Validates zero-copy path with BAR-backed tensors and host staging fallback
-add_executable(v2_test_local_tp_context_zero_copy_allreduce unit/Test__LocalTPContext_ZeroCopyAllreduce.cpp)
+add_executable(v2_test_local_tp_context_zero_copy_allreduce unit/collective/Test__LocalTPContext_ZeroCopyAllreduce.cpp)
 target_link_libraries(v2_test_local_tp_context_zero_copy_allreduce PRIVATE llaminar2_core GTest::gtest_main)
 add_v2_test(V2_Unit_LocalTPContext_ZeroCopyAllreduce
     COMMAND $<TARGET_FILE:v2_test_local_tp_context_zero_copy_allreduce>
@@ -4729,7 +4729,7 @@ add_v2_test(V2_Unit_LocalTPContext_ZeroCopyAllreduce
 # Phase 6.4: Tests SendActivationsStage and ReceiveActivationsStage interfaces
 # Validates stage type, name generation, buffer requirements, dump info, and async support
 # Note: Unit tests only - no actual MPI communication (use integration test for real P2P)
-add_executable(v2_test_pp_activation_stages unit/Test__PPActivationStages.cpp)
+add_executable(v2_test_pp_activation_stages unit/execution/compute_stages/stages/Test__PPActivationStages.cpp)
 target_link_libraries(v2_test_pp_activation_stages llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_PPActivationStages
     COMMAND $<TARGET_FILE:v2_test_pp_activation_stages>
@@ -4742,7 +4742,7 @@ add_v2_test(V2_Unit_PPActivationStages
 # Validates receive stage insertion (root node), send stage insertion (leaf node),
 # graph dependency wiring, MPI tag uniqueness, and stage naming conventions.
 # Note: Unit tests only - uses RankExecutionPlan configuration, no actual MPI
-add_executable(v2_test_pipeline_parallel_graph_builder unit/Test__PipelineParallelGraphBuilder.cpp)
+add_executable(v2_test_pipeline_parallel_graph_builder unit/execution/local_execution/graph/Test__PipelineParallelGraphBuilder.cpp)
 target_link_libraries(v2_test_pipeline_parallel_graph_builder llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_PipelineParallelGraphBuilder
     COMMAND $<TARGET_FILE:v2_test_pipeline_parallel_graph_builder>
@@ -4755,7 +4755,7 @@ add_v2_test(V2_Unit_PipelineParallelGraphBuilder
 # Validates weight name generation (attention/FFN), memory estimation, embedding/LM head handling,
 # layer range filtering, and weight info construction.
 # Part of memory-efficient PP where each rank loads only its assigned layers.
-add_executable(v2_test_partial_weight_loader unit/Test__PartialWeightLoader.cpp)
+add_executable(v2_test_partial_weight_loader unit/loaders/Test__PartialWeightLoader.cpp)
 target_link_libraries(v2_test_partial_weight_loader llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_PartialWeightLoader
     COMMAND $<TARGET_FILE:v2_test_partial_weight_loader>
@@ -4765,7 +4765,7 @@ add_v2_test(V2_Unit_PartialWeightLoader
 
 # Test: CollectiveStageIntegration (AllreduceStage and AllGatherStage with CollectiveContext)
 # Unit test for collective stages using the new collective infrastructure with mocks
-add_executable(v2_unit_collective_stage_integration integration/Test__CollectiveStageIntegration.cpp)
+add_executable(v2_unit_collective_stage_integration integration/collective/Test__CollectiveStageIntegration.cpp)
 target_link_libraries(v2_unit_collective_stage_integration 
     llaminar2_core 
     GTest::gtest
@@ -4780,7 +4780,7 @@ add_v2_test(V2_Unit_CollectiveStageIntegration
 # Test: HeterogeneousExecution - Unit test for mixed CPU/GPU execution across ranks
 # Phase 5a testability refactoring: validates heterogeneous topology handling via mocks
 # Note: Uses mock infrastructure, no real MPI/GPU required - runs as unit test
-add_executable(v2_unit_heterogeneous_execution integration/Test__HeterogeneousExecution.cpp)
+add_executable(v2_unit_heterogeneous_execution integration/execution/Test__HeterogeneousExecution.cpp)
 target_include_directories(v2_unit_heterogeneous_execution PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
 )
@@ -4800,7 +4800,7 @@ add_v2_test(V2_Unit_HeterogeneousExecution
 # Verifies device routing, domain boundary detection, statistics tracking, and various
 # placement patterns (first N, last N, alternating, multi-GPU, etc.)
 # Note: Uses mocks, no real GPU required - runs as unit test
-add_executable(v2_integration_heterogeneous_layer_executor integration/Test__HeterogeneousLayerExecutorIntegration.cpp)
+add_executable(v2_integration_heterogeneous_layer_executor integration/execution/model/Test__HeterogeneousLayerExecutorIntegration.cpp)
 target_link_libraries(v2_integration_heterogeneous_layer_executor 
     llaminar2_core 
     GTest::gtest
@@ -4825,7 +4825,7 @@ add_v2_test(V2_Unit_HeterogeneousLayerExecutorPlacement
 # Tests full pipeline with actual GPU hardware (graceful fallback to CPU-only)
 if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_heterogeneous_pipeline 
-        integration/Test__HeterogeneousPipeline.cpp
+        integration/execution/model/Test__HeterogeneousPipeline.cpp
     )
     target_include_directories(v2_integration_heterogeneous_pipeline PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/utils
@@ -4844,7 +4844,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
 else()
     # CPU-only version for systems without GPU
     add_executable(v2_integration_heterogeneous_pipeline 
-        integration/Test__HeterogeneousPipeline.cpp
+        integration/execution/model/Test__HeterogeneousPipeline.cpp
     )
     target_include_directories(v2_integration_heterogeneous_pipeline PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/utils
@@ -4865,7 +4865,7 @@ endif()
 # Test: HeterogeneousPipelineMPI - Multi-rank heterogeneous pipeline tests
 # MPI-aware tests for cross-rank domain configuration and collective operations
 add_executable(v2_integration_heterogeneous_pipeline_mpi 
-    integration/Test__HeterogeneousPipelineMPI.cpp
+    integration/execution/model/Test__HeterogeneousPipelineMPI.cpp
 )
 target_include_directories(v2_integration_heterogeneous_pipeline_mpi PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/utils
@@ -4885,7 +4885,7 @@ message(STATUS "V2 Tests: Added HeterogeneousPipelineMPI multi-rank integration 
 # Test: WorkDistribution - Integration test for work distribution across ranks
 # Phase 5b testability refactoring: validates tensor-parallel work distribution via mocks
 # Note: Uses mock infrastructure, no real MPI required - runs as unit test
-add_executable(v2_integration_work_distribution integration/Test__WorkDistribution.cpp)
+add_executable(v2_integration_work_distribution integration/execution/Test__WorkDistribution.cpp)
 target_include_directories(v2_integration_work_distribution PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
 )
@@ -4903,7 +4903,7 @@ add_v2_test(V2_Unit_WorkDistribution
 # Test: WeightStreaming - Unit test for weight streaming with prefetch/eviction
 # Phase 5c testability refactoring: validates weight streaming via mocks
 # Note: Uses mock infrastructure, no real GPU memory management - runs as unit test
-add_executable(v2_integration_weight_streaming integration/Test__WeightStreaming.cpp)
+add_executable(v2_integration_weight_streaming integration/loaders/Test__WeightStreaming.cpp)
 target_include_directories(v2_integration_weight_streaming PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
 )
@@ -4921,7 +4921,7 @@ add_v2_test(V2_Unit_WeightStreaming
 # Test: PhaseAwareExecution - Integration test for prefill vs decode device selection
 # Phase 5d testability refactoring: validates phase-aware device selection via mocks
 # Note: Uses mock infrastructure, no real MPI/GPU required - runs as unit test
-add_executable(v2_integration_phase_aware_execution integration/Test__PhaseAwareExecution.cpp)
+add_executable(v2_integration_phase_aware_execution integration/execution/Test__PhaseAwareExecution.cpp)
 target_include_directories(v2_integration_phase_aware_execution PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
 )
@@ -5082,7 +5082,7 @@ add_v2_test(V2_Unit_Orchestration_Scenario7_HeterogeneousPipelineCluster
 # Validates buffer offsets, mask application, and cross-sequence isolation
 
 # Test: ModelLoader
-add_executable(v2_test_model_loader integration/Test__ModelLoader.cpp)
+add_executable(v2_test_model_loader integration/loaders/Test__ModelLoader.cpp)
 target_link_libraries(v2_test_model_loader 
     llaminar2_core 
     GTest::gtest
@@ -5095,7 +5095,7 @@ add_v2_test(V2_Integration_ModelLoader
 )
 
 # Test: ModelLoader Row Slice (memory-efficient tensor row slicing from GGUF)
-add_executable(v2_test_model_loader_row_slice unit/Test__ModelLoaderRowSlice.cpp)
+add_executable(v2_test_model_loader_row_slice unit/loaders/Test__ModelLoaderRowSlice.cpp)
 target_link_libraries(v2_test_model_loader_row_slice 
     llaminar2_core 
     GTest::gtest
@@ -5108,7 +5108,7 @@ add_v2_test(V2_Unit_ModelLoaderRowSlice
 )
 
 # Test: WeightManager Memory Efficient Slicing
-add_executable(v2_test_weight_manager_memory_efficient integration/Test__WeightManagerMemoryEfficient.cpp)
+add_executable(v2_test_weight_manager_memory_efficient integration/loaders/Test__WeightManagerMemoryEfficient.cpp)
 target_link_libraries(v2_test_weight_manager_memory_efficient 
     llaminar2_core 
     GTest::gtest
@@ -5121,7 +5121,7 @@ add_v2_test(V2_Integration_WeightManagerMemoryEfficient
 )
 
 # Test: WeightManager Proportional Slicing (TensorParallelConfig support)
-add_executable(v2_test_weight_manager_proportional integration/Test__WeightManagerProportional.cpp)
+add_executable(v2_test_weight_manager_proportional integration/loaders/Test__WeightManagerProportional.cpp)
 target_link_libraries(v2_test_weight_manager_proportional 
     llaminar2_core 
     GTest::gtest
@@ -5136,7 +5136,7 @@ add_v2_test(V2_Integration_WeightManagerProportional
 # Test: WeightManager Multi-Device (device-aware features integration)
 # Tests multi-device weight isolation, concurrent access, real GPU packing,
 # and end-to-end preload workflow for LOCAL tensor parallelism
-add_executable(v2_integration_weight_manager_multi_device integration/Test__WeightManager_MultiDevice.cpp)
+add_executable(v2_integration_weight_manager_multi_device integration/loaders/Test__WeightManager_MultiDevice.cpp)
 target_include_directories(v2_integration_weight_manager_multi_device PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ and tests/v2/utils/ includes
 )
@@ -5152,7 +5152,7 @@ add_v2_test(V2_Integration_WeightManager_MultiDevice
 )
 
 # Test: Qwen2Graph with TensorParallelConfig (Phase 1c: Proportional TP)
-add_executable(v2_test_qwen2graph_proportional_tp integration/Test__Qwen2GraphProportionalTP.cpp)
+add_executable(v2_test_qwen2graph_proportional_tp integration/models/qwen/Test__Qwen2GraphProportionalTP.cpp)
 target_link_libraries(v2_test_qwen2graph_proportional_tp 
     llaminar2_core 
     GTest::gtest
@@ -5167,7 +5167,7 @@ add_v2_test(V2_Integration_Qwen2GraphProportionalTP
 # Test: Qwen2Graph with MultiDomainTPConfig (Phase 4.3: Heterogeneous TP Domains)
 # Tests that Qwen2Graph correctly passes TPDomain to AllreduceStage for
 # domain-based collective routing in heterogeneous tensor parallelism scenarios.
-add_executable(v2_test_qwen2graph_domain unit/Test__Qwen2GraphDomain.cpp)
+add_executable(v2_test_qwen2graph_domain unit/models/qwen/Test__Qwen2GraphDomain.cpp)
 target_link_libraries(v2_test_qwen2graph_domain 
     llaminar2_core 
     GTest::gtest
@@ -5180,7 +5180,7 @@ add_v2_test(V2_Unit_Qwen2GraphDomain
 )
 
 # Test: PlacementStrategy and PlacementPlan (weight/compute placement algorithms)
-add_executable(v2_test_placement_strategy unit/Test__PlacementStrategy.cpp)
+add_executable(v2_test_placement_strategy unit/execution/mpi_orchestration/Test__PlacementStrategy.cpp)
 target_link_libraries(v2_test_placement_strategy 
     llaminar2_core 
     GTest::gtest
@@ -5193,7 +5193,7 @@ add_v2_test(V2_Unit_PlacementStrategy
 )
 
 # Test: MPITopology Capability Exchange (serialization/deserialization of RankInventory)
-add_executable(v2_test_mpi_topology_capability_exchange unit/Test__MPITopologyCapabilityExchange.cpp)
+add_executable(v2_test_mpi_topology_capability_exchange unit/utils/Test__MPITopologyCapabilityExchange.cpp)
 target_link_libraries(v2_test_mpi_topology_capability_exchange 
     llaminar2_core 
     GTest::gtest
@@ -5206,7 +5206,7 @@ add_v2_test(V2_Unit_MPITopologyCapabilityExchange
 )
 
 # Test: HeterogeneousMultiDomainStrategy (multi-domain TP + PP for heterogeneous clusters)
-add_executable(v2_test_heterogeneous_multi_domain_strategy unit/Test__HeterogeneousMultiDomainStrategy.cpp)
+add_executable(v2_test_heterogeneous_multi_domain_strategy unit/execution/mpi_orchestration/placement/Test__HeterogeneousMultiDomainStrategy.cpp)
 target_link_libraries(v2_test_heterogeneous_multi_domain_strategy 
     llaminar2_core 
     GTest::gtest
@@ -5225,7 +5225,7 @@ add_v2_test(V2_Unit_HeterogeneousMultiDomainStrategy
 # - Domain wiring in DeviceGraphOrchestrator
 # - PP Send/Recv stages
 # - Plan broadcast and deterministic computation
-add_executable(v2_integration_phase6_domain integration/Test__Phase6HeterogeneousDomainIntegration.cpp)
+add_executable(v2_integration_phase6_domain integration/execution/Test__Phase6HeterogeneousDomainIntegration.cpp)
 target_link_libraries(v2_integration_phase6_domain 
     llaminar2_core 
     GTest::gtest
@@ -5237,7 +5237,7 @@ add_v2_test(V2_Integration_Phase6_HeterogeneousDomain
 )
 
 # Test: Quantised GEMM Sliced Parity (verifies sliced GEMM across MPI ranks matches unsliced)
-add_executable(v2_test_quantised_gemm_sliced_parity integration/Test__QuantisedGemmSlicedParity.cpp)
+add_executable(v2_test_quantised_gemm_sliced_parity integration/kernels/cpu/gemm/Test__QuantisedGemmSlicedParity.cpp)
 target_link_libraries(v2_test_quantised_gemm_sliced_parity 
     llaminar2_core 
     GTest::gtest
@@ -5250,7 +5250,7 @@ add_v2_test(V2_Integration_QuantisedGemmSlicedParity
 
 # Test: Q16 MPI Allreduce (variable block size allreduce across 2 MPI ranks)
 # Validates templated allreduce_q16_inplace<BlockType>() for BLOCK_32/64/128/192
-add_executable(v2_integration_q16_mpi_allreduce integration/Test__Q16MPI_Allreduce.cpp)
+add_executable(v2_integration_q16_mpi_allreduce integration/utils/mpi/Test__Q16MPI_Allreduce.cpp)
 target_link_libraries(v2_integration_q16_mpi_allreduce 
     llaminar2_core 
     GTest::gtest
@@ -5263,7 +5263,7 @@ add_v2_test(V2_Integration_Q16MPI_Allreduce
 
 # Test: QuantisedGemmKernel Fused Operations (Bias, Softmax, SwiGLU)
 # Validates mathematical correctness of fused ops against separate primitives
-add_executable(v2_integration_quantised_gemm_fused integration/Test__QuantisedGemmFused.cpp)
+add_executable(v2_integration_quantised_gemm_fused integration/kernels/cpu/gemm/Test__QuantisedGemmFused.cpp)
 target_link_libraries(v2_integration_quantised_gemm_fused 
     llaminar2_core 
     GTest::gtest
@@ -5277,7 +5277,7 @@ add_v2_test(V2_Integration_QuantisedGemmFused
 
 # Test: Q8_1 OnlineSoftmax Kernel Correctness (Q8_1 x Q8_1 attention + fused softmax)
 # Validates correctness across model sizes (Qwen 0.5B/7B/32B) and sequence lengths
-add_executable(v2_integration_q8_1_online_softmax integration/Test__Q8_1_OnlineSoftmax.cpp)
+add_executable(v2_integration_q8_1_online_softmax integration/kernels/cpu/attention/q8_1/Test__Q8_1_OnlineSoftmax.cpp)
 target_link_libraries(v2_integration_q8_1_online_softmax 
     llaminar2_core 
     GTest::gtest
@@ -5291,7 +5291,7 @@ add_v2_test(V2_Integration_Q8_1_OnlineSoftmax
 # Test: Q8_1 Fully Fused Attention Kernel Correctness
 # Validates the fused Q8_1 attention kernel (Q@K^T + softmax + @V + requant)
 # against pure FP32 reference implementation (FP32 GEMM + softmax + FP32 GEMM)
-add_executable(v2_integration_q8_1_fused_attention integration/Test__Q8_1_FusedAttention.cpp)
+add_executable(v2_integration_q8_1_fused_attention integration/kernels/cpu/attention/q8_1/Test__Q8_1_FusedAttention.cpp)
 target_link_libraries(v2_integration_q8_1_fused_attention 
     llaminar2_core 
     GTest::gtest
@@ -5316,7 +5316,7 @@ add_v2_test(V2_Integration_Q8_1_FusedAttention
 # Test: Q8_1 Attention Replay from Captured Dump
 # Loads actual Q/K/V blocks captured from E2E pipeline via LLAMINAR_DUMP_ATTENTION_INPUTS
 # Compares JIT kernel output to C++ reference to isolate kernel bugs from precision loss
-add_executable(v2_integration_q8_1_attention_replay_dump integration/Test__Q8_1_AttentionReplayFromDump.cpp)
+add_executable(v2_integration_q8_1_attention_replay_dump integration/kernels/cpu/attention/q8_1/Test__Q8_1_AttentionReplayFromDump.cpp)
 target_link_libraries(v2_integration_q8_1_attention_replay_dump 
     llaminar2_core 
     GTest::gtest
@@ -5386,7 +5386,7 @@ endif()
 # - Dump file sizes match metadata byte_size
 # - Block counts in metadata are correct for quantized formats
 # - Metadata dimensions produce correct block counts
-add_executable(v2_integration_stage_dump_integrity integration/Test__StageDumpIntegrity.cpp)
+add_executable(v2_integration_stage_dump_integrity integration/execution/debug/Test__StageDumpIntegrity.cpp)
 target_link_libraries(v2_integration_stage_dump_integrity 
     llaminar2_core 
     GTest::gtest
@@ -5404,7 +5404,7 @@ add_v2_test(V2_Integration_StageDumpIntegrity
 # - Context buffer uses local_dim (not d_model) for query stride
 # - Stack allocation handles TP local dimensions correctly
 # - No memory corruption from buffer overflows
-add_executable(v2_integration_q8_1_fused_attention_wo_prefill_tp integration/Test__Q8_1_FusedAttentionWo_Prefill_TP.cpp)
+add_executable(v2_integration_q8_1_fused_attention_wo_prefill_tp integration/kernels/cpu/attention/q8_1/Test__Q8_1_FusedAttentionWo_Prefill_TP.cpp)
 target_link_libraries(v2_integration_q8_1_fused_attention_wo_prefill_tp 
     llaminar2_core 
     GTest::gtest
@@ -5427,7 +5427,7 @@ add_v2_test(V2_Integration_Q8_1_FusedAttentionWo_Prefill_TP
 # - Batched prefill populates KV cache slots independently
 # - Sequential execution matches batched execution for KV cache contents
 # - Per-sequence cache isolation
-add_executable(v2_integration_graph_batched_kvcache integration/Test__GraphBatchedKVCache.cpp)
+add_executable(v2_integration_graph_batched_kvcache integration/execution/graph/Test__GraphBatchedKVCache.cpp)
 target_link_libraries(v2_integration_graph_batched_kvcache
     llaminar2_core
     GTest::gtest
@@ -5454,7 +5454,7 @@ add_v2_test(V2_Integration_GraphBatchedKVCache
 # Validates Qwen2LayerExecutor produces equivalent results with Q8_1 vs FP32 activations
 # Tests single layer execution using mock weights (faster than full pipeline test)
 # Uses decomposed attention path (Phase 9 ComputeStage architecture)
-add_executable(v2_integration_layer_executor_q8_1_vs_fp32_parity integration/Test__LayerExecutor_Q8_1_vs_FP32_Parity.cpp)
+add_executable(v2_integration_layer_executor_q8_1_vs_fp32_parity integration/pipelines/Test__LayerExecutor_Q8_1_vs_FP32_Parity.cpp)
 target_link_libraries(v2_integration_layer_executor_q8_1_vs_fp32_parity
     llaminar2_core
     GTest::gtest
@@ -5474,7 +5474,7 @@ add_v2_test(V2_Integration_LayerExecutor_Q8_1_vs_FP32_Parity
 # Requires ENABLE_PIPELINE_SNAPSHOTS for snapshot capture.
 if(ENABLE_PIPELINE_SNAPSHOTS AND ENABLE_HYBRIDQ16_TESTS)
     add_executable(v2_integration_hybridq16_vs_fp32_pipeline 
-        integration/Test__HybridQ16Pipeline_vs_FP32_LayerByLayer.cpp
+        integration/pipelines/Test__HybridQ16Pipeline_vs_FP32_LayerByLayer.cpp
     )
     target_link_libraries(v2_integration_hybridq16_vs_fp32_pipeline 
         llaminar2_core 
@@ -5518,7 +5518,7 @@ endif()
 # Test: Precision-Aware MPI Allreduce Integration Tests
 # Tests actual MPI communication for FP32, FP16, BF16, Q8_1, and Q16_1 formats
 # Validates correctness of partial sum accumulation across ranks
-add_executable(v2_integration_mpi_precision_allreduce integration/Test__MPI_PrecisionAwareAllreduce.cpp)
+add_executable(v2_integration_mpi_precision_allreduce integration/utils/mpi/Test__MPI_PrecisionAwareAllreduce.cpp)
 target_link_libraries(v2_integration_mpi_precision_allreduce
     llaminar2_core
     GTest::gtest
@@ -5538,7 +5538,7 @@ add_v2_test(V2_Integration_MPI_PrecisionAwareAllreduce
 # - Tag-based message differentiation
 # - Bidirectional communication patterns
 add_executable(v2_integration_mpi_context_p2p 
-    integration/Test__MPIContextP2P.cpp
+    integration/utils/mpi/Test__MPIContextP2P.cpp
     integration/mpi_gtest_main.cpp
 )
 target_link_libraries(v2_integration_mpi_context_p2p
@@ -5558,7 +5558,7 @@ add_v2_test(V2_Integration_MPI_ContextP2P
 # - Multi-layer sequence with tags
 # - Error handling
 add_executable(v2_integration_pipeline_activation_transfer
-    integration/Test__PipelineActivationTransfer.cpp
+    integration/execution/Test__PipelineActivationTransfer.cpp
     integration/mpi_gtest_main.cpp
 )
 target_link_libraries(v2_integration_pipeline_activation_transfer
@@ -5581,7 +5581,7 @@ add_v2_test(V2_Integration_PipelineActivationTransfer
 # - Local head distribution calculation
 # - Column-sliced Q/K/V weight GEMM correctness
 # - Buffer dimension validation for local heads
-add_executable(v2_integration_mpi_column_parallel_qkv integration/Test__MPI_ColumnParallelQKV.cpp)
+add_executable(v2_integration_mpi_column_parallel_qkv integration/utils/mpi/Test__MPI_ColumnParallelQKV.cpp)
 target_link_libraries(v2_integration_mpi_column_parallel_qkv
     llaminar2_core
     GTest::gtest
@@ -5599,7 +5599,7 @@ add_v2_test(V2_Integration_MPI_ColumnParallelQKV
 # - Column-sliced Gate/Up weight shapes and GEMM correctness
 # - Input-sliced Down weight shape
 # - Buffer dimension validation for local FFN
-add_executable(v2_integration_mpi_column_parallel_ffn integration/Test__MPI_ColumnParallelFFN.cpp)
+add_executable(v2_integration_mpi_column_parallel_ffn integration/utils/mpi/Test__MPI_ColumnParallelFFN.cpp)
 target_link_libraries(v2_integration_mpi_column_parallel_ffn
     llaminar2_core
     GTest::gtest
@@ -5617,7 +5617,7 @@ add_v2_test(V2_Integration_MPI_ColumnParallelFFN
 # - Column-sliced LM head weight shape
 # - AllGather stage collects distributed logits
 # - Full forward data flow with distributed LM head
-add_executable(v2_integration_mpi_column_parallel_lmhead integration/Test__MPI_ColumnParallelLMHead.cpp)
+add_executable(v2_integration_mpi_column_parallel_lmhead integration/utils/mpi/Test__MPI_ColumnParallelLMHead.cpp)
 target_link_libraries(v2_integration_mpi_column_parallel_lmhead
     llaminar2_core
     GTest::gtest
@@ -5636,7 +5636,7 @@ add_v2_test(V2_Integration_MPI_ColumnParallelLMHead
 # - Append/clear operations work independently per rank
 # - Memory usage is reduced by world_size factor
 # - All precisions (FP32, BF16, FP16, Q8_1) work correctly
-add_executable(v2_integration_mpi_sharded_kv_cache integration/Test__MPI_ShardedKVCache.cpp)
+add_executable(v2_integration_mpi_sharded_kv_cache integration/utils/mpi/Test__MPI_ShardedKVCache.cpp)
 target_link_libraries(v2_integration_mpi_sharded_kv_cache
     llaminar2_core
     GTest::gtest
@@ -5658,7 +5658,7 @@ add_v2_test(V2_Integration_MPI_ShardedKVCache
 #   - Sharded KV Cache: Per-rank cache with local heads
 #   - AllReduceStage: After Wo projection, FFN down projection
 #   - AllGatherStage: After LM head for logits aggregation
-add_executable(v2_integration_mpi_e2e_tp_inference integration/Test__MPI_E2E_TensorParallelInference.cpp)
+add_executable(v2_integration_mpi_e2e_tp_inference integration/utils/mpi/Test__MPI_E2E_TensorParallelInference.cpp)
 target_link_libraries(v2_integration_mpi_e2e_tp_inference
     llaminar2_core
     GTest::gtest
@@ -5671,7 +5671,7 @@ add_v2_test(V2_Integration_MPI_E2E_TensorParallelInference
 
 # Test: FloatingPointGemmKernel Integration Tests (thorough OneDNN FP32/BF16/FP16 GEMM tests)
 # Large matrices, mixed precision, strided layouts, fused softmax, causal masking
-add_executable(v2_integration_fp_gemm integration/Test__FloatingPointGemmKernel.cpp)
+add_executable(v2_integration_fp_gemm integration/kernels/cpu/gemm/Test__FloatingPointGemmKernel.cpp)
 target_link_libraries(v2_integration_fp_gemm
     llaminar2_core
     GTest::gtest
@@ -5815,7 +5815,7 @@ add_v2_test(V2_Unit_IQ1_STensor
 )
 
 # Test: IQ1_S GEMM Integration
-add_executable(v2_test_iq1s_gemm_integration integration/Test__IQ1_S_GEMM_Integration.cpp)
+add_executable(v2_test_iq1s_gemm_integration integration/kernels/cpu/gemm/Test__IQ1_S_GEMM_Integration.cpp)
 target_link_libraries(v2_test_iq1s_gemm_integration 
     llaminar2_core 
     GTest::gtest
@@ -5827,7 +5827,7 @@ add_v2_test(V2_Integration_IQ1_S_GEMM
 )
 
 # Test: IQ1_M GEMM Integration
-add_executable(v2_test_iq1m_gemm_integration integration/Test__IQ1_M_GEMM_Integration.cpp)
+add_executable(v2_test_iq1m_gemm_integration integration/kernels/cpu/gemm/Test__IQ1_M_GEMM_Integration.cpp)
 target_link_libraries(v2_test_iq1m_gemm_integration 
     llaminar2_core 
     GTest::gtest
@@ -6163,7 +6163,7 @@ add_v2_test(V2_Perf_Q16_to_Q16_RoPE_FixedScale
 # See docs/v2/FUSED_ATTENTION_WO_PROJECT_PLAN.md for design documentation.
 
 # Test: μK1 - Q8_1 Dot Product Microkernel
-add_executable(v2_test_microkernel_q8_dot_product unit/microkernels/Test__Q8DotProduct.cpp)
+add_executable(v2_test_microkernel_q8_dot_product unit/kernels/cpu/attention/q8_1/microkernels/Test__Q8DotProduct.cpp)
 target_link_libraries(v2_test_microkernel_q8_dot_product 
     llaminar2_core 
     GTest::gtest
@@ -6176,7 +6176,7 @@ add_v2_test(V2_Unit_Microkernel_Q8DotProduct
 )
 
 # Test: μK2 - Online Softmax Microkernel
-add_executable(v2_test_microkernel_online_softmax unit/microkernels/Test__OnlineSoftmax.cpp)
+add_executable(v2_test_microkernel_online_softmax unit/kernels/cpu/attention/q8_1/microkernels/Test__OnlineSoftmax.cpp)
 target_link_libraries(v2_test_microkernel_online_softmax 
     llaminar2_core 
     GTest::gtest
@@ -6194,7 +6194,7 @@ add_v2_test(V2_Unit_Microkernel_OnlineSoftmax
 # - Chunked accumulation overflow safety
 # - Deferred normalization equivalence to running average
 # - Weight sum tracking exactness
-add_executable(v2_test_microkernel_online_softmax_v2 unit/microkernels/Test__OnlineSoftmaxV2_Unit.cpp)
+add_executable(v2_test_microkernel_online_softmax_v2 unit/kernels/cpu/attention/q8_1/microkernels/Test__OnlineSoftmaxV2_Unit.cpp)
 target_link_libraries(v2_test_microkernel_online_softmax_v2 
     llaminar2_core 
     GTest::gtest
@@ -6207,7 +6207,7 @@ add_v2_test(V2_Unit_Microkernel_OnlineSoftmaxV2
 )
 
 # Test: μK2b - Q16 Online Softmax K-Scales Microkernel (HybridQ16 K precision fix)
-add_executable(v2_test_microkernel_q16_online_softmax_kscales unit/microkernels/Test__Q16OnlineSoftmaxKScales.cpp)
+add_executable(v2_test_microkernel_q16_online_softmax_kscales unit/kernels/cpu/attention/q16_1/Test__Q16OnlineSoftmaxKScales.cpp)
 target_link_libraries(v2_test_microkernel_q16_online_softmax_kscales 
     llaminar2_core 
     GTest::gtest
@@ -6222,7 +6222,7 @@ add_v2_test(V2_Unit_Microkernel_Q16OnlineSoftmaxKScales
 # Test: Q16 Attention with Realistic Pipeline Data
 # Tests attention kernel using actual data captured from pipeline stage dumps.
 # Exposes the K precision bug where K values exceed representable range (max_abs ~130 > 128).
-add_executable(v2_test_microkernel_q16_attention_realistic unit/microkernels/Test__Q16AttentionRealisticData.cpp)
+add_executable(v2_test_microkernel_q16_attention_realistic unit/kernels/cpu/attention/q16_1/Test__Q16AttentionRealisticData.cpp)
 target_link_libraries(v2_test_microkernel_q16_attention_realistic 
     llaminar2_core 
     GTest::gtest
@@ -6238,7 +6238,7 @@ add_v2_test(V2_Unit_Microkernel_Q16AttentionRealistic
 # Unit tests to isolate and reproduce the HybridQ16 OnlineSoftmax per-position K scale bug.
 # The tests demonstrate that mixing different alpha values in the scaled score domain
 # leads to incorrect softmax weights because the domains are incompatible.
-add_executable(v2_test_microkernel_online_softmax_k_scales unit/microkernels/Test__OnlineSoftmaxPerPositionKScales.cpp)
+add_executable(v2_test_microkernel_online_softmax_k_scales unit/kernels/cpu/attention/q8_1/microkernels/Test__OnlineSoftmaxPerPositionKScales.cpp)
 target_link_libraries(v2_test_microkernel_online_softmax_k_scales 
     llaminar2_core 
     GTest::gtest
@@ -6251,7 +6251,7 @@ add_v2_test(V2_Unit_Microkernel_OnlineSoftmaxKScales
 )
 
 # Test: μK3 - V Weighted Accumulation Microkernel
-add_executable(v2_test_microkernel_v_weighted_accum unit/microkernels/Test__VWeightedAccum.cpp)
+add_executable(v2_test_microkernel_v_weighted_accum unit/kernels/cpu/attention/q8_1/microkernels/Test__VWeightedAccum.cpp)
 target_link_libraries(v2_test_microkernel_v_weighted_accum 
     llaminar2_core 
     GTest::gtest
@@ -6264,7 +6264,7 @@ add_v2_test(V2_Unit_Microkernel_VWeightedAccum
 )
 
 # Test: μK4 - Wo Projection Microkernel
-add_executable(v2_test_microkernel_wo_projection unit/microkernels/Test__WoProjection.cpp)
+add_executable(v2_test_microkernel_wo_projection unit/kernels/cpu/attention/q8_1/microkernels/Test__WoProjection.cpp)
 target_link_libraries(v2_test_microkernel_wo_projection 
     llaminar2_core 
     GTest::gtest
@@ -6277,7 +6277,7 @@ add_v2_test(V2_Unit_Microkernel_WoProjection
 )
 
 # Test: μK5 - Fast Exp Microkernel
-add_executable(v2_test_microkernel_fast_exp unit/microkernels/Test__FastExp.cpp)
+add_executable(v2_test_microkernel_fast_exp unit/kernels/cpu/attention/q8_1/microkernels/Test__FastExp.cpp)
 target_link_libraries(v2_test_microkernel_fast_exp 
     llaminar2_core 
     GTest::gtest
@@ -6296,7 +6296,7 @@ add_v2_test(V2_Unit_Microkernel_FastExp
 # See docs/v2/PROJECT_Q16_INTEGER_ATTENTION.md for design documentation.
 
 # Test: Q16 μK1 - Q16 Dot Product Microkernel (Q×K^T)
-add_executable(v2_test_microkernel_q16_dot_product unit/microkernels/Test__Q16DotProduct.cpp)
+add_executable(v2_test_microkernel_q16_dot_product unit/kernels/cpu/attention/q16_1/ref/microkernels/Test__Q16DotProduct.cpp)
 target_link_libraries(v2_test_microkernel_q16_dot_product 
     llaminar2_core 
     GTest::gtest
@@ -6309,7 +6309,7 @@ add_v2_test(V2_Unit_Microkernel_Q16DotProduct
 )
 
 # Test: Q16 μK2 - P×V Accumulation Microkernel
-add_executable(v2_test_microkernel_pv_accumulate unit/microkernels/Test__PVAccumulate.cpp)
+add_executable(v2_test_microkernel_pv_accumulate unit/kernels/cpu/attention/q16_1/ref/microkernels/Test__PVAccumulate.cpp)
 target_link_libraries(v2_test_microkernel_pv_accumulate 
     llaminar2_core 
     GTest::gtest
@@ -6322,7 +6322,7 @@ add_v2_test(V2_Unit_Microkernel_PVAccumulate
 )
 
 # Test: Q16 μK3 - Wo Projection Microkernel (INT32 → Q16_1)
-add_executable(v2_test_microkernel_q16_wo_projection unit/microkernels/Test__Q16WoProjection.cpp)
+add_executable(v2_test_microkernel_q16_wo_projection unit/kernels/cpu/attention/q16_1/ref/microkernels/Test__Q16WoProjection.cpp)
 target_link_libraries(v2_test_microkernel_q16_wo_projection 
     llaminar2_core 
     GTest::gtest
@@ -6339,7 +6339,7 @@ add_v2_test(V2_Unit_Microkernel_Q16WoProjection
 # =============================================================================
 
 # Test: FusedAttentionWoRef - Reference implementation using all microkernels
-add_executable(v2_test_fused_attention_wo_ref integration/Test__FusedAttentionWoRef.cpp)
+add_executable(v2_test_fused_attention_wo_ref integration/kernels/cpu/attention/Test__FusedAttentionWoRef.cpp)
 target_link_libraries(v2_test_fused_attention_wo_ref 
     llaminar2_core
     GTest::gtest 
@@ -6354,7 +6354,7 @@ add_v2_test(V2_Integration_FusedAttentionWoRef
 # Test: FusedAttentionWoRef Robustness - Edge cases from real pipeline issues
 # Tests for: softmax saturation, catastrophic cancellation, quantization clipping,
 #            scale disparity, sign flips, residual collapse, extreme outliers
-add_executable(v2_test_fused_attention_wo_robustness integration/Test__FusedAttentionWoRef_Robustness.cpp)
+add_executable(v2_test_fused_attention_wo_robustness integration/kernels/cpu/attention/Test__FusedAttentionWoRef_Robustness.cpp)
 target_link_libraries(v2_test_fused_attention_wo_robustness 
     llaminar2_core
     GTest::gtest 
@@ -6368,7 +6368,7 @@ add_v2_test(V2_Integration_FusedAttentionWo_Robustness
 
 # Test: FusedAttentionWoRef Batch - Batched execution modes
 # Tests for: prefill, incremental decode, batched decode uniform/variable KV
-add_executable(v2_test_fused_attention_wo_batch integration/Test__FusedAttentionWoRef_Batch.cpp)
+add_executable(v2_test_fused_attention_wo_batch integration/kernels/cpu/attention/Test__FusedAttentionWoRef_Batch.cpp)
 target_link_libraries(v2_test_fused_attention_wo_batch 
     llaminar2_core
     GTest::gtest 
@@ -6382,7 +6382,7 @@ add_v2_test(V2_Integration_FusedAttentionWo_Batch
 
 # Test: FusedAttentionWoTiled - Cache-blocked tiled implementation (Phase 3)
 # Tests for: tile size computation, tiled vs reference parity, various configs
-add_executable(v2_test_fused_attention_wo_tiled unit/attention/Test__FusedAttentionWoTiled.cpp)
+add_executable(v2_test_fused_attention_wo_tiled unit/kernels/cpu/attention/q8_1/Test__FusedAttentionWoTiled.cpp)
 target_link_libraries(v2_test_fused_attention_wo_tiled 
     llaminar2_core
     GTest::gtest 
@@ -6397,7 +6397,7 @@ add_v2_test(V2_Unit_FusedAttentionWo_Tiled
 
 # Test: JIT Microkernels - Modular JIT attention microkernels (Phase 4)
 # Tests for: JitFastExp, JitQ8DotProduct, JitOnlineSoftmax, JitVWeightedAccum, JitWoProjection
-add_executable(v2_test_jit_microkernels unit/attention/Test__JitMicrokernels.cpp)
+add_executable(v2_test_jit_microkernels unit/kernels/cpu/attention/q8_1/jit/Test__JitMicrokernels.cpp)
 target_link_libraries(v2_test_jit_microkernels 
     llaminar2_core
     GTest::gtest 
@@ -6411,7 +6411,7 @@ add_v2_test(V2_Unit_JitMicrokernels
 
 # Test: JIT Fused Attention + Wo - Composed JIT kernel (Phase 4)
 # Tests the complete fused attention + Wo projection JIT kernel
-add_executable(v2_test_jit_fused_attention_wo unit/attention/Test__JitFusedAttentionWo.cpp)
+add_executable(v2_test_jit_fused_attention_wo unit/kernels/cpu/attention/q8_1/jit/Test__JitFusedAttentionWo.cpp)
 target_link_libraries(v2_test_jit_fused_attention_wo 
     llaminar2_core
     GTest::gtest 
@@ -6426,7 +6426,7 @@ add_v2_test(V2_Unit_JitFusedAttentionWo
 # Test: JIT Fused Attention + Wo - Numerical Correctness Tests
 # Comprehensive tests comparing JIT kernel against reference implementation
 # Covers Qwen 0.5B, 7B, 32B model configurations with various sequence lengths
-add_executable(v2_test_jit_fused_attention_wo_correctness unit/attention/Test__JitFusedAttentionWo_Correctness.cpp)
+add_executable(v2_test_jit_fused_attention_wo_correctness unit/kernels/cpu/attention/q8_1/jit/Test__JitFusedAttentionWo_Correctness.cpp)
 target_link_libraries(v2_test_jit_fused_attention_wo_correctness 
     llaminar2_core
     GTest::gtest 
@@ -6441,7 +6441,7 @@ add_v2_test(V2_Unit_JitFusedAttentionWo_Correctness
 # Test: JIT Fused Attention + Wo - Q16_1 Residual Fusion Tests [DISABLED - project on hold]
 # Tests the fused residual addition path for Q16_1 typed residual streams
 if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_jit_fused_attention_wo_q16_1_residual unit/attention/Test__JitFusedAttentionWo_Q16_1Residual.cpp)
+    add_executable(v2_test_jit_fused_attention_wo_q16_1_residual unit/kernels/cpu/attention/q8_1/jit/Test__JitFusedAttentionWo_Q16_1Residual.cpp)
     target_link_libraries(v2_test_jit_fused_attention_wo_q16_1_residual 
         llaminar2_core
         GTest::gtest 
@@ -6457,7 +6457,7 @@ endif()
 # Test: JIT Fused Attention Manual Verification
 # Tests JIT kernel against MANUALLY COMPUTED ground truth (not C++ reference).
 # This catches bugs where both JIT and reference have the same error.
-add_executable(v2_test_jit_fused_attention_manual_verify unit/attention/Test__JitFusedAttentionWo_ManualVerification.cpp)
+add_executable(v2_test_jit_fused_attention_manual_verify unit/kernels/cpu/attention/q8_1/jit/Test__JitFusedAttentionWo_ManualVerification.cpp)
 target_link_libraries(v2_test_jit_fused_attention_manual_verify 
     llaminar2_core
     GTest::gtest 
@@ -6471,7 +6471,7 @@ add_v2_test(V2_Unit_JitFusedAttention_ManualVerify
 
 # Test: JIT Wo Projection Isolated
 # Tests the Wo projection logic in isolation to debug 1.0 output issue
-add_executable(v2_test_jit_wo_projection_isolated unit/attention/Test__JitWoProjectionIsolated.cpp)
+add_executable(v2_test_jit_wo_projection_isolated unit/kernels/cpu/attention/q8_1/jit/Test__JitWoProjectionIsolated.cpp)
 target_link_libraries(v2_test_jit_wo_projection_isolated 
     llaminar2_core
     GTest::gtest 
@@ -6486,7 +6486,7 @@ add_v2_test(V2_Unit_JitWoProjectionIsolated
 # Test: JIT Fused Attention + Wo - Prefill Mode Tests
 # Tests the prefill kernel (H→KV→Q loop order) for K/V cache reuse optimization
 # Validates prefill vs decode parity, tile boundary handling, causal masking
-add_executable(v2_test_jit_fused_attention_wo_prefill unit/attention/Test__JitFusedAttentionWo_Prefill.cpp)
+add_executable(v2_test_jit_fused_attention_wo_prefill unit/kernels/cpu/attention/q8_1/jit/Test__JitFusedAttentionWo_Prefill.cpp)
 target_link_libraries(v2_test_jit_fused_attention_wo_prefill 
     llaminar2_core
     GTest::gtest 
@@ -6499,7 +6499,7 @@ add_v2_test(V2_Unit_JitFusedAttentionWo_Prefill
 )
 
 # Debug test for prefill alternating zeros issue
-add_executable(v2_test_jit_fused_attention_wo_debug unit/attention/Test__JitFusedAttentionWo_Debug.cpp)
+add_executable(v2_test_jit_fused_attention_wo_debug unit/kernels/cpu/attention/q8_1/jit/Test__JitFusedAttentionWo_Debug.cpp)
 target_link_libraries(v2_test_jit_fused_attention_wo_debug 
     llaminar2_core
     GTest::gtest 
@@ -6514,7 +6514,7 @@ add_v2_test(V2_Unit_JitFusedAttentionWo_Debug
 # Test: JIT Fused Attention + Wo - FA2 vs FA1 Parity Tests
 # Tests that FA2 tiling (use_fa2_tiling=true) produces identical output to FA1
 # Validates tile boundary handling, remainder processing, various KV lengths
-add_executable(v2_test_jit_fused_attention_wo_fa2parity unit/attention/Test__JitFusedAttentionWo_FA2Parity.cpp)
+add_executable(v2_test_jit_fused_attention_wo_fa2parity unit/kernels/cpu/attention/q8_1/jit/Test__JitFusedAttentionWo_FA2Parity.cpp)
 target_link_libraries(v2_test_jit_fused_attention_wo_fa2parity 
     llaminar2_core
     GTest::gtest 
@@ -6528,7 +6528,7 @@ add_v2_test(V2_Unit_JitFusedAttentionWo_FA2Parity
 
 # Test: JIT Wo Projection - Tests the Wo projection implementation in JIT kernel
 # Validates FP32, FP16, BF16, Q8_1 Wo formats against REFERENCE backend
-add_executable(v2_test_jit_wo_projection unit/attention/Test__JitWoProjection.cpp)
+add_executable(v2_test_jit_wo_projection unit/kernels/cpu/attention/q8_1/jit/Test__JitWoProjection.cpp)
 target_link_libraries(v2_test_jit_wo_projection 
     llaminar2_core
     GTest::gtest 
@@ -6545,7 +6545,7 @@ add_v2_test(V2_Unit_JitWoProjection
 # - wo_projection_vnni_int16() for decode (single token GEMV)
 # - wo_projection_vnni_int16_batched() for prefill (batched GEMM)
 # - FP32 reference comparison for correctness validation
-add_executable(v2_test_q16_wo_projection unit/attention/Test__Q16WoProjection.cpp)
+add_executable(v2_test_q16_wo_projection unit/kernels/cpu/attention/q16_1/ref/microkernels/Test__Q16WoProjection.cpp)
 target_link_libraries(v2_test_q16_wo_projection
     llaminar2_core
     GTest::gtest
@@ -6561,7 +6561,7 @@ add_v2_test(V2_Unit_Q16WoProjection
 # Tests the FULL attention output path: Context → Wo Projection → Residual Add → Q16_1
 # This is the bridge between microkernel unit tests and full pipeline integration tests.
 # See: docs/v2/PLAN_FIXED_SCALE_ROPE_Q16.md "Addendum 2"
-add_executable(v2_test_q16_attention_output_composition unit/attention/Test__Q16AttentionOutput_Composition.cpp)
+add_executable(v2_test_q16_attention_output_composition unit/kernels/cpu/attention/q16_1/Test__Q16AttentionOutput_Composition.cpp)
 target_link_libraries(v2_test_q16_attention_output_composition
     llaminar2_core
     GTest::gtest
@@ -6579,7 +6579,7 @@ add_v2_test(V2_Unit_Q16AttentionOutput_Composition
 
 # Test: FusedAttentionWoKernel - Pipeline-compatible wrapper for fused attention
 # Tests all backends (Reference, Tiled, JIT) and verifies cross-backend parity
-add_executable(v2_test_fused_attention_wo_kernel integration/attention/Test__FusedAttentionWoKernel.cpp)
+add_executable(v2_test_fused_attention_wo_kernel integration/kernels/cpu/attention/Test__FusedAttentionWoKernel.cpp)
 target_link_libraries(v2_test_fused_attention_wo_kernel 
     llaminar2_core
     GTest::gtest 
@@ -6667,7 +6667,7 @@ add_v2_test(V2_Perf_FusedAttentionWo_Tuning
 # Tests work distribution, capability exchange, and placement determinism
 # across multiple MPI ranks.
 # NOTE: These tests have custom main() with MPI_Init/MPI_Finalize
-add_executable(v2_integration_mpi_topology integration/Test__MPITopologyIntegration.cpp)
+add_executable(v2_integration_mpi_topology integration/utils/mpi/Test__MPITopologyIntegration.cpp)
 target_link_libraries(v2_integration_mpi_topology
     llaminar2_core
     GTest::gtest
@@ -6681,7 +6681,7 @@ add_v2_test(V2_Integration_MPITopology
 # Test: Sliced GEMM MPI Integration Tests (Phase 2)
 # Tests row-parallel GEMM with AllGatherv and column-parallel with AllReduce
 # using the new KernelFactory::getOrCreateGemmSliced() API.
-add_executable(v2_integration_sliced_gemm_mpi integration/Test__SlicedGEMM_MPI_Integration.cpp)
+add_executable(v2_integration_sliced_gemm_mpi integration/utils/mpi/Test__SlicedGEMM_MPI_Integration.cpp)
 target_link_libraries(v2_integration_sliced_gemm_mpi
     llaminar2_core
     GTest::gtest
@@ -6695,7 +6695,7 @@ add_v2_test(V2_Integration_SlicedGEMM_MPI
 # Test: PlacementStrategy MPI Integration Tests (Phase G0)
 # Tests that PlacementStrategy produces identical plans across all ranks
 # and integrates correctly with MPITopology.
-add_executable(v2_integration_placement_strategy_mpi integration/Test__PlacementStrategy_MPI_Integration.cpp)
+add_executable(v2_integration_placement_strategy_mpi integration/utils/mpi/Test__PlacementStrategy_MPI_Integration.cpp)
 target_link_libraries(v2_integration_placement_strategy_mpi
     llaminar2_core
     GTest::gtest
@@ -6712,7 +6712,7 @@ add_v2_test(V2_Integration_PlacementStrategy_MPI
 #   2. PlacementStrategyFactory::autoSelect() selects the right strategy
 #   3. HeterogeneousMultiDomainStrategy is used when appropriate
 #   4. PlacementPlan flows through to DeviceGraphOrchestrator
-add_executable(v2_integration_orchestrator_wiring integration/Test__OrchestratorWiringIntegration.cpp)
+add_executable(v2_integration_orchestrator_wiring integration/pipelines/Test__OrchestratorWiringIntegration.cpp)
 target_include_directories(v2_integration_orchestrator_wiring PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
 )
@@ -6734,7 +6734,7 @@ add_v2_test(V2_Integration_OrchestratorWiring
 #   2. createInferenceRunner() should use PlacementPlan for execution
 #   3. MPIContext should expose topology() for placement computation
 #   4. PlacementPlan should be honored during actual inference
-add_executable(v2_integration_orchestration_wiring integration/Test__OrchestrationWiring.cpp)
+add_executable(v2_integration_orchestration_wiring integration/pipelines/Test__OrchestrationWiring.cpp)
 target_include_directories(v2_integration_orchestration_wiring PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
 )
@@ -6750,7 +6750,7 @@ add_v2_test(V2_Integration_OrchestrationWiring
 # Test: TPDomain MPI Integration Tests (Phase 3.2b)
 # Tests TPDomainBuilder, MPI_Comm_split, cross-rank domain creation, and cleanup
 # Verifies communicator management and domain consistency across ranks.
-add_executable(v2_integration_tpdomain_mpi integration/Test__TPDomainMPI.cpp)
+add_executable(v2_integration_tpdomain_mpi integration/collective/Test__TPDomainMPI.cpp)
 target_link_libraries(v2_integration_tpdomain_mpi
     llaminar2_core
     GTest::gtest
@@ -6764,7 +6764,7 @@ add_v2_test(V2_Integration_TPDomainMPI
 # Test: UPIBackend MPI Integration Tests (Phase 3.3)
 # Tests UPICollectiveBackend with actual MPI collectives over UPI fabric
 # Verifies AllReduce, AllGather, AllGatherV, Broadcast, Barrier, and performance
-add_executable(v2_integration_upi_backend_mpi integration/Test__UPIBackendMPI.cpp integration/mpi_gtest_main.cpp)
+add_executable(v2_integration_upi_backend_mpi integration/collective/backends/Test__UPIBackendMPI.cpp integration/mpi_gtest_main.cpp)
 target_link_libraries(v2_integration_upi_backend_mpi
     llaminar2_core
     GTest::gtest
@@ -6778,7 +6778,7 @@ add_v2_test(V2_Integration_UPIBackendMPI
 
 # Test: Qwen2Graph Fused Attention Integration
 # Verifies that the graph builder correctly switches between fused and decomposed paths
-add_executable(v2_test_qwen2_graph_fused_attention integration/Test__Qwen2Graph_FusedAttention.cpp)
+add_executable(v2_test_qwen2_graph_fused_attention integration/models/qwen/Test__Qwen2Graph_FusedAttention.cpp)
 target_link_libraries(v2_test_qwen2_graph_fused_attention 
     llaminar2_core 
     GTest::gtest
@@ -6798,7 +6798,7 @@ add_v2_test(V2_Integration_Qwen2Graph_FusedAttention
 #   - Full Qwen2 graph with DeviceGraphOrchestrator
 #   - FusedAttentionWo context/output capture
 #   - Decode phase callback invocation
-add_executable(v2_test_graph_snapshot_callback_invocation integration/Test__GraphSnapshotCallbackInvocation.cpp)
+add_executable(v2_test_graph_snapshot_callback_invocation integration/execution/graph/Test__GraphSnapshotCallbackInvocation.cpp)
 target_link_libraries(v2_test_graph_snapshot_callback_invocation
     llaminar2_core
     GTest::gtest
@@ -6816,7 +6816,7 @@ add_v2_test(V2_Integration_GraphSnapshotCallbackInvocation
 # Test: Exp2FixedSoftmax microkernel
 # Integer-only softmax using exp2 LUT approximation (2048 entries)
 # Produces INT16 weights in [0, 32767] for VNNI compatibility
-add_executable(v2_test_exp2_fixed_softmax unit/kernels/cpu/q16_attention/Test__Exp2FixedSoftmax.cpp)
+add_executable(v2_test_exp2_fixed_softmax unit/kernels/cpu/attention/q16_1/ref/microkernels/Test__Exp2FixedSoftmax.cpp)
 target_link_libraries(v2_test_exp2_fixed_softmax
     llaminar2_core
     GTest::gtest
@@ -6830,7 +6830,7 @@ add_v2_test(V2_Unit_Exp2FixedSoftmax
 # Test: Exp2Core primitives
 # Core exp2 LUT primitives shared by Exp2FixedSoftmax and OnlineSoftmax
 # Tests LUT initialization, AdaptiveAlphaConfig, weight/rescale computation
-add_executable(v2_test_exp2_core unit/kernels/cpu/q16_attention/Test__Exp2Core.cpp)
+add_executable(v2_test_exp2_core unit/kernels/cpu/attention/q16_1/ref/microkernels/Test__Exp2Core.cpp)
 target_link_libraries(v2_test_exp2_core
     llaminar2_core
     GTest::gtest
@@ -6843,7 +6843,7 @@ add_v2_test(V2_Unit_Exp2Core
 
 # Test: Q16 OnlineSoftmax microkernel (FlashDecode)
 # Block-wise online softmax with rescaling for streaming KV processing
-add_executable(v2_test_q16_online_softmax unit/kernels/cpu/q16_attention/Test__Q16OnlineSoftmax.cpp)
+add_executable(v2_test_q16_online_softmax unit/kernels/cpu/attention/q16_1/Test__Q16OnlineSoftmax.cpp)
 target_link_libraries(v2_test_q16_online_softmax
     llaminar2_core
     GTest::gtest
@@ -6858,7 +6858,7 @@ add_v2_test(V2_Unit_Q16OnlineSoftmax
 # Complete attention kernel including Flash Decode and FA2 Prefill paths
 # Tests parameter validation, snapshot capture, and multi-head/GQA configurations
 if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_q16_integer_attention unit/kernels/cpu/q16_attention/Test__Q16IntegerAttention.cpp)
+    add_executable(v2_test_q16_integer_attention unit/kernels/cpu/attention/q16_1/ref/Test__Q16IntegerAttention.cpp)
     target_link_libraries(v2_test_q16_integer_attention
         llaminar2_core
         GTest::gtest
@@ -6876,7 +6876,7 @@ endif()
 # Validates cosine similarity, RMSE, and softmax weight normalization
 # NOTE: This is an integration test due to long runtime (~270s)
 if(ENABLE_HYBRIDQ16_TESTS)
-    add_executable(v2_test_q16_integer_attention_parity unit/kernels/cpu/q16_attention/Test__Q16IntegerAttentionParity.cpp)
+    add_executable(v2_test_q16_integer_attention_parity unit/kernels/cpu/attention/q16_1/ref/Test__Q16IntegerAttentionParity.cpp)
     target_link_libraries(v2_test_q16_integer_attention_parity
         llaminar2_core
         GTest::gtest
@@ -6890,7 +6890,7 @@ if(ENABLE_HYBRIDQ16_TESTS)
 endif()
 # Test: MLA (Multi-head Latent Attention) Microkernels - DeepSeek V3/Kimi K2
 # Split NOPE/ROPE Q×K^T with combined scoring for latent attention architectures
-add_executable(v2_test_mla_attention unit/microkernels/Test__MLAAttention.cpp)
+add_executable(v2_test_mla_attention unit/kernels/cpu/attention/q16_1/ref/microkernels/Test__MLAAttention.cpp)
 target_link_libraries(v2_test_mla_attention
     llaminar2_core
     GTest::gtest
@@ -6904,7 +6904,7 @@ add_v2_test(V2_Unit_MLAAttention
 
 # Test: Q16 Fixed-Scale Quantization Accuracy
 # Measures precision impact of VNNI-safe fixed-scale vs adaptive quantization
-add_executable(v2_test_q16_fixed_scale_accuracy unit/microkernels/Test__Q16FixedScaleAccuracy.cpp)
+add_executable(v2_test_q16_fixed_scale_accuracy unit/kernels/cpu/attention/q16_1/Test__Q16FixedScaleAccuracy.cpp)
 target_link_libraries(v2_test_q16_fixed_scale_accuracy
     llaminar2_core
     GTest::gtest
@@ -6918,7 +6918,7 @@ add_v2_test(V2_Unit_Q16FixedScaleAccuracy
 
 # Test: VNNI Overflow Analysis
 # Comprehensive analysis of INT32 overflow risks in Q×K^T and P×V paths
-add_executable(v2_test_vnni_overflow_analysis unit/microkernels/Test__VNNIOverflowAnalysis.cpp)
+add_executable(v2_test_vnni_overflow_analysis unit/kernels/cpu/attention/Test__VNNIOverflowAnalysis.cpp)
 target_link_libraries(v2_test_vnni_overflow_analysis
     GTest::gtest
     GTest::gtest_main
@@ -6931,7 +6931,7 @@ add_v2_test(V2_Unit_VNNIOverflowAnalysis
 
 # Test: Q16 Fixed-Scale Quantization with VNNI-safe clipping
 # Tests copyFrom_fp32_fixed_scale() and copyFrom_fp32_rows_fixed_scale()
-add_executable(v2_test_q16_fixed_scale_quantization unit/kernels/Test__Q16FixedScaleQuantization.cpp)
+add_executable(v2_test_q16_fixed_scale_quantization unit/kernels/cpu/gemm_v4/Test__Q16FixedScaleQuantization.cpp)
 target_link_libraries(v2_test_q16_fixed_scale_quantization
     llaminar2_core
     GTest::gtest
@@ -6967,7 +6967,7 @@ if(HAVE_ROCM)
     # Integration Test: ROCm Quantised GEMM Kernel Pipeline
     # Tests full pipeline: weight packing + activation quantization + realistic model dims
     add_executable(v2_integration_rocm_quantised_gemm_kernel 
-        integration/Test__ROCmQuantisedGemmKernel.cpp
+        integration/kernels/rocm/Test__ROCmQuantisedGemmKernel.cpp
     )
     target_link_libraries(v2_integration_rocm_quantised_gemm_kernel 
         llaminar2_core 
@@ -7048,7 +7048,7 @@ if(HAVE_ROCM)
     # Integration Test: ROCm Ring Buffer KV Cache
     # Tests append, wrap-around, eviction, linearization, FP32/FP16 precision
     add_executable(v2_integration_rocm_ring_kv_cache 
-        integration/Test__ROCmRingKVCache.cpp
+        integration/kernels/rocm/Test__ROCmRingKVCache.cpp
     )
     target_link_libraries(v2_integration_rocm_ring_kv_cache 
         llaminar2_core 
@@ -7065,7 +7065,7 @@ if(HAVE_ROCM)
     # Integration Test: ROCm Ring Buffer KV Cache Sharding
     # Tests sharded KV cache for tensor parallelism (stub tests until sharding implemented)
     add_executable(v2_integration_rocm_ring_kv_cache_sharding 
-        integration/Test__ROCmRingKVCache_Sharding.cpp
+        integration/kernels/rocm/Test__ROCmRingKVCache_Sharding.cpp
     )
     target_link_libraries(v2_integration_rocm_ring_kv_cache_sharding 
         llaminar2_core 
@@ -7087,7 +7087,7 @@ if(HAVE_ROCM)
     # Tests ROCm SwiGLU kernels (FP32, BF16, FP16) against CPU reference
     # with cosine similarity and L2 error metrics
     add_executable(v2_integration_rocm_swiglu_parity 
-        integration/Test__ROCmSwiGLUParity.cpp
+        integration/kernels/rocm/Test__ROCmSwiGLUParity.cpp
     )
     target_link_libraries(v2_integration_rocm_swiglu_parity 
         llaminar2_core 
@@ -7108,7 +7108,7 @@ if(HAVE_ROCM)
     # Tests ROCm RoPE kernels (FP32, BF16, FP16) against CPU reference
     # with cosine similarity and L2 error metrics
     add_executable(v2_integration_rocm_rope_parity 
-        integration/Test__ROCmRoPEParity.cpp
+        integration/kernels/rocm/Test__ROCmRoPEParity.cpp
     )
     target_link_libraries(v2_integration_rocm_rope_parity 
         llaminar2_core 
@@ -7129,7 +7129,7 @@ if(HAVE_ROCM)
     # Tests ROCm RMSNorm kernels (FP32, BF16, FP16) against CPU reference
     # with cosine similarity and L2 error metrics
     add_executable(v2_integration_rocm_rmsnorm_parity 
-        integration/Test__ROCmRMSNormParity.cpp
+        integration/kernels/rocm/Test__ROCmRMSNormParity.cpp
     )
     target_link_libraries(v2_integration_rocm_rmsnorm_parity 
         llaminar2_core 
@@ -7150,7 +7150,7 @@ if(HAVE_ROCM)
     # Tests ROCm Embedding kernels (FP32, BF16, FP16, Q8_1) against CPU reference
     # with cosine similarity and L2 error metrics
     add_executable(v2_integration_rocm_embedding_parity 
-        integration/Test__ROCmEmbeddingParity.cpp
+        integration/kernels/rocm/Test__ROCmEmbeddingParity.cpp
     )
     target_link_libraries(v2_integration_rocm_embedding_parity 
         llaminar2_core 
@@ -7171,7 +7171,7 @@ if(HAVE_ROCM)
     # Tests Flash Attention 2 (prefill) and Flash Decoding (decode) ROCm kernels
     # against CPU attention reference with cosine similarity metrics
     add_executable(v2_integration_rocm_flash_attention_parity 
-        integration/Test__ROCmFlashAttentionParity.cpp
+        integration/kernels/rocm/Test__ROCmFlashAttentionParity.cpp
     )
     target_link_libraries(v2_integration_rocm_flash_attention_parity 
         llaminar2_core 
@@ -7192,7 +7192,7 @@ if(HAVE_ROCM)
     # Tests ROCm ResidualAdd kernels (FP32, BF16, FP16) against CPU reference
     # with cosine similarity and L2 error metrics
     add_executable(v2_integration_rocm_residual_add_parity 
-        integration/Test__ROCmResidualAddParity.cpp
+        integration/kernels/rocm/Test__ROCmResidualAddParity.cpp
     )
     target_link_libraries(v2_integration_rocm_residual_add_parity 
         llaminar2_core 
@@ -7213,7 +7213,7 @@ if(HAVE_ROCM)
     # hipStreamSynchronize(), which is essential for snapshot capture performance.
 
     add_executable(v2_integration_rocm_event_synchronization
-        integration/Test__ROCmEventSynchronization.cpp
+        integration/backends/rocm/Test__ROCmEventSynchronization.cpp
     )
     target_link_libraries(v2_integration_rocm_event_synchronization
         llaminar2_core
@@ -7236,7 +7236,7 @@ endif()
 
 if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_collective_context_gpu
-        integration/Test__CollectiveContext_GPU.cpp
+        integration/collective/Test__CollectiveContext_GPU.cpp
     )
     target_link_libraries(v2_integration_collective_context_gpu PRIVATE
         llaminar2_core
@@ -7271,7 +7271,7 @@ endif()
 
 if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_local_tp_multi_device
-        integration/Test__LocalTPMultiDevice.cpp
+        integration/collective/Test__LocalTPMultiDevice.cpp
     )
     target_link_libraries(v2_integration_local_tp_multi_device PRIVATE
         llaminar2_core
@@ -7301,7 +7301,7 @@ endif()
 
 if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_local_tp_backend_behavior
-        integration/Test__LocalTPBackendBehavior.cpp
+        integration/collective/Test__LocalTPBackendBehavior.cpp
     )
     target_link_libraries(v2_integration_local_tp_backend_behavior PRIVATE
         llaminar2_core
@@ -7331,7 +7331,7 @@ endif()
 
 if(HAVE_CUDA AND HAVE_ROCM)
     add_executable(v2_integration_pciebar_cuda_event_lifecycle
-        integration/Test__PCIeBAR_CUDA_EventLifecycle.cpp
+        integration/collective/backends/Test__PCIeBAR_CUDA_EventLifecycle.cpp
     )
     target_link_libraries(v2_integration_pciebar_cuda_event_lifecycle PRIVATE
         llaminar2_core
@@ -7381,7 +7381,7 @@ endif()
 # Validates factory creation, configuration, execution plan building, and inference lifecycle.
 
 add_executable(v2_integration_orchestration_runner
-    integration/Test__OrchestrationRunner.cpp
+    integration/execution/runner/Test__OrchestrationRunner.cpp
 )
 target_include_directories(v2_integration_orchestration_runner PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
@@ -7403,7 +7403,7 @@ message(STATUS "V2 Tests: Added OrchestrationRunner integration tests")
 # Validates end-to-end integration for multi-domain PP with heterogeneous devices.
 # Hardware: GPU domain (CUDA) -> GPU domain (ROCm) -> CPU domain (2 sockets)
 add_executable(v2_integration_scenario7_multidomain_pp
-    integration/Test__Scenario7_MultiDomainPP.cpp
+    integration/execution/runner/Test__Scenario7_MultiDomainPP.cpp
 )
 target_include_directories(v2_integration_scenario7_multidomain_pp PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path

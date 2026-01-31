@@ -7,7 +7,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../../src/v2/tensors/Tensors.h"
+#include "tensors/Tensors.h"
 #include <random>
 #include <cmath>
 #include <cstring>

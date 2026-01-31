@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
-#include "../../../../src/v2/tensors/Tensors.h"
-#include "../../../../src/v2/tensors/TensorFactory.h"
-#include "../../../../src/v2/utils/MPIContext.h"
-#include "../../../../src/v2/tensors/FP16Utils.h"
+#include "tensors/Tensors.h"
+#include "tensors/TensorFactory.h"
+#include "utils/MPIContext.h"
+#include "tensors/FP16Utils.h"
 #include <vector>
 #include <cstring>
 

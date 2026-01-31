@@ -5,9 +5,9 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../src/v2/tensors/Tensors.h"
-#include "../../src/v2/tensors/FP16Utils.h"
-#include "../../src/v2/tensors/IQQuantTables.h"
+#include "tensors/Tensors.h"
+#include "tensors/FP16Utils.h"
+#include "tensors/IQQuantTables.h"
 #include <cmath>
 #include <random>
 #include <vector>

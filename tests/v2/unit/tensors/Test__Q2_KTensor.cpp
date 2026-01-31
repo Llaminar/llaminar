@@ -8,7 +8,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../../src/v2/tensors/Tensors.h"
+#include "tensors/Tensors.h"
 #include <vector>
 #include <cmath>
 #include <cstring>

@@ -8,9 +8,9 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../../src/v2/tensors/SIMDHelpers.h"
-#include "../../../../src/v2/tensors/BlockStructures.h"
-#include "../../../../src/v2/utils/CPUFeatures.h"
+#include "tensors/SIMDHelpers.h"
+#include "tensors/BlockStructures.h"
+#include "utils/CPUFeatures.h"
 #include <vector>
 #include <cstring>
 #include <random>

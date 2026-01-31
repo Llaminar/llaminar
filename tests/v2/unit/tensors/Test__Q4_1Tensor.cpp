@@ -6,8 +6,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../../src/v2/tensors/Tensors.h"
-#include "../../../../src/v2/utils/DebugEnv.h"
+#include "tensors/Tensors.h"
+#include "utils/DebugEnv.h"
 #include <vector>
 #include <cmath>
 #include <cstdlib>

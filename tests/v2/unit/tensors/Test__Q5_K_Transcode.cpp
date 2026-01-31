@@ -5,9 +5,9 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../../src/v2/tensors/Tensors.h"
-#include "../../../../src/v2/tensors/SIMDHelpers.h"
-#include "../../../../src/v2/utils/MPIContext.h"
+#include "tensors/Tensors.h"
+#include "tensors/SIMDHelpers.h"
+#include "utils/MPIContext.h"
 #include <vector>
 #include <random>
 #include <cstring>
