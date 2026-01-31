@@ -177,21 +177,6 @@ namespace llaminar2
                 return false;
             }
 
-            // TEMP DEBUG: Log first few weight values for K (N=64) case
-            if (N == 64 && K == 896)
-            {
-                LOG_INFO("[packWeightsToCUDA] DEBUG K WEIGHT PACKING: tensor=" << tensor
-                                                                               << " shape=[" << N << "x" << K << "]");
-                LOG_INFO("[packWeightsToCUDA] First 5 FP32 values row0: "
-                         << h_weights_fp32[0] << ", " << h_weights_fp32[1] << ", "
-                         << h_weights_fp32[2] << ", " << h_weights_fp32[3] << ", "
-                         << h_weights_fp32[4]);
-                LOG_INFO("[packWeightsToCUDA] First 5 FP32 values row1: "
-                         << h_weights_fp32[K] << ", " << h_weights_fp32[K + 1] << ", "
-                         << h_weights_fp32[K + 2] << ", " << h_weights_fp32[K + 3] << ", "
-                         << h_weights_fp32[K + 4]);
-            }
-
             // Allocate output vectors
             out.int8_data.resize(static_cast<size_t>(K) * N);
             out.scales.resize(N);

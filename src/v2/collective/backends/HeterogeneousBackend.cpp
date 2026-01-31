@@ -1949,6 +1949,87 @@ namespace llaminar2
         }
 
         LOG_DEBUG("HeterogeneousBackend Partial RS Phase3: Complete");
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // Phase 4: Handle leftover elements (if count not evenly divisible)
+        // ═══════════════════════════════════════════════════════════════════════
+        // The extra elements weren't processed by reduce-scatter/allgather.
+        // We handle them via direct bridge exchange on the tail elements.
+
+        if (last_chunk_extra > 0)
+        {
+            LOG_DEBUG("HeterogeneousBackend Partial RS Phase4: Processing "
+                      << last_chunk_extra << " leftover elements");
+
+            // Calculate offset to leftover elements
+            size_t main_elements = chunk_size * larger_count;
+            size_t leftover_offset = main_elements * element_size;
+
+            // Get pointers to leftover portions of each buffer
+            void *singleton_leftover = static_cast<char *>(singleton_buffer) + leftover_offset;
+
+            // For the larger domain, we need to reduce the leftover elements from all
+            // devices and exchange with singleton via bridge.
+            // Since this is a small number of elements, we use the simpler approach:
+            // 1. Reduce leftovers within larger domain to bridge device
+            // 2. Exchange bridge ↔ singleton
+            // 3. Broadcast result in larger domain
+
+            std::vector<void *> larger_leftovers;
+            for (void *buf : larger_buffers)
+            {
+                larger_leftovers.push_back(static_cast<char *>(buf) + leftover_offset);
+            }
+            void *bridge_leftover = static_cast<char *>(bridge_buffer) + leftover_offset;
+
+            // Step 1: Reduce within larger domain to bridge (device 0)
+            if (larger_backend && larger_count > 1)
+            {
+                bool reduce_ok = larger_backend->reduceMulti(
+                    larger_leftovers, last_chunk_extra, dtype,
+                    CollectiveOp::ALLREDUCE_SUM, 0 /* root = bridge */);
+
+                if (!reduce_ok)
+                {
+                    last_error_ = "Partial RS Phase 4: Reduce of leftover failed: " +
+                                  larger_backend->lastError();
+                    LOG_ERROR("HeterogeneousBackend: " << last_error_);
+                    return false;
+                }
+                larger_backend->synchronize();
+            }
+
+            // Step 2: Bridge exchange for leftovers
+            void *cuda_leftover = cuda_is_singleton ? singleton_leftover : larger_leftovers[0];
+            void *rocm_leftover = cuda_is_singleton ? larger_leftovers[0] : singleton_leftover;
+
+            if (!executePhase2_BridgeExchange(cuda_leftover, rocm_leftover, last_chunk_extra,
+                                              dtype, CollectiveOp::ALLREDUCE_SUM))
+            {
+                last_error_ = "Partial RS Phase 4: Bridge exchange of leftover failed: " + last_error_;
+                LOG_ERROR("HeterogeneousBackend: " << last_error_);
+                return false;
+            }
+
+            // Step 3: Broadcast result to all devices in larger domain
+            if (larger_backend && larger_count > 1)
+            {
+                bool bcast_ok = larger_backend->broadcastMulti(
+                    larger_leftovers, last_chunk_extra, dtype, 0 /* root = bridge */);
+
+                if (!bcast_ok)
+                {
+                    last_error_ = "Partial RS Phase 4: Broadcast of leftover failed: " +
+                                  larger_backend->lastError();
+                    LOG_ERROR("HeterogeneousBackend: " << last_error_);
+                    return false;
+                }
+                larger_backend->synchronize();
+            }
+
+            LOG_DEBUG("HeterogeneousBackend Partial RS Phase4: Complete");
+        }
+
         LOG_DEBUG("HeterogeneousBackend: Partial reduce-scatter allreduce complete");
         return true;
     }
@@ -1981,6 +2062,13 @@ namespace llaminar2
         // Determine bridge device index in the larger domain (always 0, lowest ordinal)
         constexpr size_t bridge_idx = 0;
 
+        // CRITICAL: Use separate staging area to avoid overwriting chunk 0 results.
+        // The bridge_buffer is the same as chunk_buffers[0]. After chunk 0 is processed,
+        // the result is stored at bridge_buffer[0..chunk_size). If we stage chunk 1
+        // to bridge_buffer[0], we'd overwrite chunk 0's result. Instead, use an offset
+        // in the bridge buffer for staging non-bridge chunks.
+        void *staging_buffer = static_cast<char *>(bridge_buffer) + chunk_bytes;
+
         LOG_DEBUG("HeterogeneousBackend stageChunks: Processing " << num_chunks << " chunks, "
                                                                   << chunk_size << " elements each");
 
@@ -2008,11 +2096,12 @@ namespace llaminar2
 
                 if (larger_backend)
                 {
-                    // Transfer chunk from device i to bridge device (index 0)
-                    // sendrecvMulti handles the NCCL/RCCL group coordination
+                    // Transfer chunk from device i to staging area on bridge device.
+                    // Use staging_buffer (offset from bridge_buffer) to avoid overwriting
+                    // chunk 0's result which is at bridge_buffer[0..chunk_size).
                     bool ok = larger_backend->sendrecvMulti(
-                        chunk_ptr,     // src: chunk on device i
-                        bridge_buffer, // dst: staging buffer on bridge device
+                        chunk_ptr,      // src: chunk on device i
+                        staging_buffer, // dst: staging area on bridge device (at offset)
                         chunk_size,
                         dtype,
                         static_cast<int>(i),           // src_gpu: device i
@@ -2050,9 +2139,9 @@ namespace llaminar2
             LOG_DEBUG("    Step 2: Bridge exchange for chunk " << i);
 
             // Determine which buffer to use for the bridge exchange
-            // If i == bridge_idx, use chunk_buffers[i] directly
-            // Otherwise, use bridge_buffer (which now has chunk[i] staged to it)
-            void *larger_bridge_chunk = (i == bridge_idx) ? chunk_ptr : bridge_buffer;
+            // If i == bridge_idx, use chunk_buffers[i] directly (the bridge device's own buffer)
+            // Otherwise, use staging_buffer (where we staged chunk[i] in step 1)
+            void *larger_bridge_chunk = (i == bridge_idx) ? chunk_ptr : staging_buffer;
 
             // For the singleton side, we exchange chunk[i] portion of its full buffer
             void *cuda_buf = singleton_is_cuda ? singleton_chunk : larger_bridge_chunk;
@@ -2075,11 +2164,11 @@ namespace llaminar2
 
                 if (larger_backend)
                 {
-                    // Transfer result from bridge device back to device i
+                    // Transfer result from staging area back to device i
                     // sendrecvMulti handles the NCCL/RCCL group coordination
                     bool ok = larger_backend->sendrecvMulti(
-                        bridge_buffer, // src: result on bridge device
-                        chunk_ptr,     // dst: original chunk location on device i
+                        staging_buffer, // src: result in staging area on bridge device
+                        chunk_ptr,      // dst: original chunk location on device i
                         chunk_size,
                         dtype,
                         static_cast<int>(bridge_idx), // src_gpu: bridge device (0)
@@ -2953,6 +3042,33 @@ namespace llaminar2
             last_error_ = "RCCL intra-domain reduce failed: " + rccl_error;
             LOG_ERROR("HeterogeneousBackend: " << last_error_);
             return false;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // CRITICAL: Synchronize NCCL/RCCL streams before returning
+        // ═══════════════════════════════════════════════════════════════════
+        // The reduceMulti calls are asynchronous - they launch operations on
+        // GPU streams but return immediately. We MUST synchronize before Phase 2
+        // starts, otherwise Phase 2 may read stale data from the bridge buffer.
+        // ═══════════════════════════════════════════════════════════════════
+        if (nccl_backend_ && plan.will_call_nccl_reduce)
+        {
+            if (!nccl_backend_->synchronize())
+            {
+                last_error_ = "NCCL stream synchronization failed: " + nccl_backend_->lastError();
+                LOG_ERROR("HeterogeneousBackend: " << last_error_);
+                return false;
+            }
+        }
+
+        if (rccl_backend_ && plan.will_call_rccl_reduce)
+        {
+            if (!rccl_backend_->synchronize())
+            {
+                last_error_ = "RCCL stream synchronization failed: " + rccl_backend_->lastError();
+                LOG_ERROR("HeterogeneousBackend: " << last_error_);
+                return false;
+            }
         }
 
         LOG_DEBUG("HeterogeneousBackend Phase1: Intra-domain reduce complete");

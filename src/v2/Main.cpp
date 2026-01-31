@@ -89,40 +89,77 @@ DeviceId parse_device(const std::string &device_str, DeviceManager &dm, int loca
 {
     if (device_str == "auto")
     {
-        // MPI-aware device selection: distribute GPUs round-robin across local ranks
-        // This ensures that different MPI ranks on the same node use different GPUs
+        // MPI-aware device selection with HOMOGENEOUS PREFERENCE
+        // Prefer all-CUDA (NCCL) or all-ROCm (RCCL) groups to avoid slow MPI fallback
 
         const auto &devices = dm.devices();
 
-        // Count available GPUs (skip device 0 which is CPU)
-        std::vector<size_t> gpu_indices;
+        // Separate GPUs by type for homogeneous group selection
+        std::vector<size_t> cuda_indices, rocm_indices;
         for (size_t i = 1; i < devices.size(); ++i)
         {
             const auto &dev = devices[i];
-            if (dev.type == ComputeBackendType::GPU_CUDA ||
-                dev.type == ComputeBackendType::GPU_ROCM)
+            if (dev.type == ComputeBackendType::GPU_CUDA)
+                cuda_indices.push_back(i);
+            else if (dev.type == ComputeBackendType::GPU_ROCM)
+                rocm_indices.push_back(i);
+        }
+
+        // Choose the best homogeneous group based on world size
+        // Preference order: CUDA (NCCL) > ROCm (RCCL) > single GPU > CPU
+        std::vector<size_t> *chosen = nullptr;
+        const char *type_name = nullptr;
+
+        if (!cuda_indices.empty() && local_size <= static_cast<int>(cuda_indices.size()))
+        {
+            chosen = &cuda_indices;
+            type_name = "CUDA (NCCL-capable)";
+        }
+        else if (!rocm_indices.empty() && local_size <= static_cast<int>(rocm_indices.size()))
+        {
+            chosen = &rocm_indices;
+            type_name = "ROCm (RCCL-capable)";
+        }
+        else
+        {
+            // Fallback: not enough homogeneous GPUs for all ranks
+            // Use best single GPU (only rank 0 gets a GPU, others get CPU)
+            if (local_rank == 0)
             {
-                gpu_indices.push_back(i);
+                if (!cuda_indices.empty())
+                {
+                    chosen = &cuda_indices;
+                    type_name = "CUDA (single, other ranks on CPU)";
+                }
+                else if (!rocm_indices.empty())
+                {
+                    chosen = &rocm_indices;
+                    type_name = "ROCm (single, other ranks on CPU)";
+                }
+            }
+            else
+            {
+                // Non-zero ranks fall back to CPU when GPUs are heterogeneous
+                LOG_WARN("Rank " << local_rank << " falling back to CPU (heterogeneous GPU config)");
+                return DeviceId::cpu();
             }
         }
 
-        if (gpu_indices.empty())
+        if (!chosen || chosen->empty())
         {
             LOG_DEBUG("No GPUs available, falling back to CPU");
             return DeviceId::cpu();
         }
 
-        // Round-robin GPU assignment based on local_rank
-        // local_rank 0 -> GPU 0, local_rank 1 -> GPU 1, etc.
-        size_t gpu_idx = local_rank % gpu_indices.size();
-        size_t dm_idx = gpu_indices[gpu_idx];
-
+        // Assign within the homogeneous group
+        size_t gpu_idx = local_rank % chosen->size();
+        size_t dm_idx = (*chosen)[gpu_idx];
         const auto &dev = devices[dm_idx];
-        LOG_DEBUG("MPI-aware auto-selected device: " << dev.name << " (type=" << static_cast<int>(dev.type)
-                                                     << ", device_id=" << dev.device_id << ")"
-                                                     << " for local_rank " << local_rank << "/" << local_size);
 
-        // Create DeviceId with the physical device ordinal, not the array index
+        LOG_INFO("Homogeneous auto-select: " << type_name
+                                             << " device " << dev.device_id
+                                             << " for local_rank " << local_rank << "/" << local_size);
+
         switch (dev.type)
         {
         case ComputeBackendType::GPU_CUDA:
@@ -130,8 +167,7 @@ DeviceId parse_device(const std::string &device_str, DeviceManager &dm, int loca
         case ComputeBackendType::GPU_ROCM:
             return DeviceId::rocm(dev.device_id);
         default:
-            LOG_WARN("Unknown GPU type in auto-select, falling back to CUDA ordinal");
-            return DeviceId::cuda(dev.device_id);
+            return DeviceId::cpu();
         }
     }
 

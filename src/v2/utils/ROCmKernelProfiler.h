@@ -1,28 +1,28 @@
 /**
- * @file CUDAKernelProfiler.h
- * @brief CUDA event-based kernel profiling for accurate GPU timing
+ * @file ROCmKernelProfiler.h
+ * @brief ROCm/HIP event-based kernel profiling for accurate GPU timing
  * @author David Sanftenberg
  *
- * Provides accurate GPU kernel timing using CUDA events. Unlike CPU-based
- * timing which only measures kernel launch time, CUDA events measure
+ * Provides accurate GPU kernel timing using HIP events. Unlike CPU-based
+ * timing which only measures kernel launch time, HIP events measure
  * actual kernel execution time on the GPU.
  *
- * Enable via LLAMINAR_PROFILE_KERNELS=1 environment variable (shared with
- * KernelProfiler.h for unified control).
+ * Enable via LLAMINAR_PROFILING=1 environment variable (shared with
+ * KernelProfiler.h and CUDAKernelProfiler.h for unified control).
  *
  * Usage:
  *   // Option 1: Scoped timing (RAII)
  *   {
- *       CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTENTION);
+ *       ROCM_KERNEL_PROFILE_SCOPE(ROCmKernelType::FLASH_ATTENTION);
  *       // ... launch kernel ...
  *   }
  *
  *   // Option 2: Manual timing
- *   CUDA_KERNEL_PROFILE_BEGIN(timer);
+ *   ROCM_KERNEL_PROFILE_BEGIN(timer);
  *   // ... launch kernel ...
- *   CUDA_KERNEL_PROFILE_END(timer, CUDAKernelType::GEMM_CUTLASS);
+ *   ROCM_KERNEL_PROFILE_END(timer, ROCmKernelType::GEMM_CK);
  *
- * At end of inference, call CUDAKernelProfiler::printSummary() to see results.
+ * At end of inference, call ROCmKernelProfiler::printSummary() to see results.
  */
 #pragma once
 
@@ -40,30 +40,30 @@
 #include "DebugEnv.h"
 #include "fort.hpp"
 
-// Forward declare CUDA types to avoid including cuda_runtime.h in header
-// (allows .cpp files to include this without nvcc)
-struct CUevent_st;
-typedef CUevent_st *cudaEvent_t;
-typedef struct CUstream_st *cudaStream_t;
+// Forward declare HIP types to avoid including hip_runtime.h in header
+// (allows .cpp files to include this without hipcc)
+struct ihipEvent_t;
+typedef ihipEvent_t *hipEvent_t;
+typedef struct ihipStream_t *hipStream_t;
 
 namespace llaminar2
 {
 
     /**
-     * @brief CUDA-specific kernel type categories for GPU profiling
+     * @brief ROCm-specific kernel type categories for GPU profiling
      *
-     * These are separate from KernelType to provide finer-grained GPU timing.
+     * These mirror CUDAKernelType but are specific to ROCm/HIP kernels.
      */
-    enum class CUDAKernelType : uint8_t
+    enum class ROCmKernelType : uint8_t
     {
         // GEMM variants
-        GEMM_CUTLASS = 0,    ///< CUTLASS INT8 quantized GEMM
-        GEMM_CUBLAS,         ///< cuBLAS FP32/FP16/BF16 GEMM
+        GEMM_CK = 0,         ///< Composable Kernel INT8/FP8 GEMM
+        GEMM_ROCBLAS,        ///< rocBLAS FP32/FP16/BF16 GEMM
         GEMM_WEIGHT_CONVERT, ///< Weight quantization/conversion
         GEMM_SCALE_OUTPUT,   ///< Output rescaling after INT8 GEMM
 
         // Flash Attention
-        FLASH_ATTN_PREFILL, ///< FA3-style prefill kernel
+        FLASH_ATTN_PREFILL, ///< Flash Attention 2 prefill kernel
         FLASH_ATTN_DECODE,  ///< Flash Decoding kernel
         FLASH_ATTN_REDUCE,  ///< Partial sum reduction
 
@@ -94,51 +94,51 @@ namespace llaminar2
     };
 
     /**
-     * @brief Get human-readable name for a CUDA kernel type
+     * @brief Get human-readable name for a ROCm kernel type
      */
-    inline const char *cudaKernelTypeName(CUDAKernelType type)
+    inline const char *rocmKernelTypeName(ROCmKernelType type)
     {
         switch (type)
         {
-        case CUDAKernelType::GEMM_CUTLASS:
-            return "GEMM_CUTLASS";
-        case CUDAKernelType::GEMM_CUBLAS:
-            return "GEMM_CUBLAS";
-        case CUDAKernelType::GEMM_WEIGHT_CONVERT:
+        case ROCmKernelType::GEMM_CK:
+            return "GEMM_CK";
+        case ROCmKernelType::GEMM_ROCBLAS:
+            return "GEMM_ROCBLAS";
+        case ROCmKernelType::GEMM_WEIGHT_CONVERT:
             return "GEMM_WEIGHT_CONVERT";
-        case CUDAKernelType::GEMM_SCALE_OUTPUT:
+        case ROCmKernelType::GEMM_SCALE_OUTPUT:
             return "GEMM_SCALE_OUTPUT";
-        case CUDAKernelType::FLASH_ATTN_PREFILL:
+        case ROCmKernelType::FLASH_ATTN_PREFILL:
             return "FLASH_ATTN_PREFILL";
-        case CUDAKernelType::FLASH_ATTN_DECODE:
+        case ROCmKernelType::FLASH_ATTN_DECODE:
             return "FLASH_ATTN_DECODE";
-        case CUDAKernelType::FLASH_ATTN_REDUCE:
+        case ROCmKernelType::FLASH_ATTN_REDUCE:
             return "FLASH_ATTN_REDUCE";
-        case CUDAKernelType::RMS_NORM:
+        case ROCmKernelType::RMS_NORM:
             return "RMS_NORM";
-        case CUDAKernelType::SWIGLU:
+        case ROCmKernelType::SWIGLU:
             return "SWIGLU";
-        case CUDAKernelType::ROPE:
+        case ROCmKernelType::ROPE:
             return "ROPE";
-        case CUDAKernelType::RESIDUAL_ADD:
+        case ROCmKernelType::RESIDUAL_ADD:
             return "RESIDUAL_ADD";
-        case CUDAKernelType::BIAS_ADD:
+        case ROCmKernelType::BIAS_ADD:
             return "BIAS_ADD";
-        case CUDAKernelType::VECTOR_ADD:
+        case ROCmKernelType::VECTOR_ADD:
             return "VECTOR_ADD";
-        case CUDAKernelType::EMBEDDING_LOOKUP:
+        case ROCmKernelType::EMBEDDING_LOOKUP:
             return "EMBEDDING_LOOKUP";
-        case CUDAKernelType::KVCACHE_APPEND:
+        case ROCmKernelType::KVCACHE_APPEND:
             return "KVCACHE_APPEND";
-        case CUDAKernelType::KVCACHE_GATHER:
+        case ROCmKernelType::KVCACHE_GATHER:
             return "KVCACHE_GATHER";
-        case CUDAKernelType::H2D_TRANSFER:
+        case ROCmKernelType::H2D_TRANSFER:
             return "H2D_TRANSFER";
-        case CUDAKernelType::D2H_TRANSFER:
+        case ROCmKernelType::D2H_TRANSFER:
             return "D2H_TRANSFER";
-        case CUDAKernelType::D2D_TRANSFER:
+        case ROCmKernelType::D2D_TRANSFER:
             return "D2D_TRANSFER";
-        case CUDAKernelType::QUANTIZE_ACTIVATIONS:
+        case ROCmKernelType::QUANTIZE_ACTIVATIONS:
             return "QUANTIZE_ACTIVATIONS";
         default:
             return "UNKNOWN";
@@ -146,15 +146,18 @@ namespace llaminar2
     }
 
     /**
-     * @brief Thread-safe CUDA kernel profiling accumulator with per-device tracking
+     * @brief Thread-safe ROCm kernel profiling accumulator
      *
-     * Uses mutex for thread-safe accumulation (CUDA event timing requires
+     * Uses mutex for thread-safe accumulation (HIP event timing requires
      * synchronization anyway, so mutex overhead is acceptable).
-     * Supports per-device breakdown for multi-GPU tensor parallelism.
+     *
+     * Supports per-device statistics for multi-GPU tensor parallelism.
      */
-    class CUDAKernelProfiler
+    class ROCmKernelProfiler
     {
     public:
+        static constexpr size_t COUNT = static_cast<size_t>(ROCmKernelType::COUNT);
+
         /**
          * @brief Per-kernel-type timing statistics (microseconds)
          */
@@ -164,40 +167,18 @@ namespace llaminar2
             uint64_t call_count = 0; ///< Number of calls
             double max_us = 0.0;     ///< Maximum single call time
             double min_us = 1e12;    ///< Minimum single call time
-
-            void reset()
-            {
-                total_us = 0.0;
-                call_count = 0;
-                max_us = 0.0;
-                min_us = 1e12;
-            }
-
-            void add(double elapsed_us)
-            {
-                total_us += elapsed_us;
-                call_count++;
-                max_us = std::max(max_us, elapsed_us);
-                min_us = std::min(min_us, elapsed_us);
-            }
         };
 
         /**
-         * @brief Per-device kernel statistics array
+         * @brief Per-device statistics container
          */
         struct DeviceStats
         {
-            std::array<KernelStats, static_cast<size_t>(CUDAKernelType::COUNT)> stats;
-
-            void reset()
-            {
-                for (auto &s : stats)
-                    s.reset();
-            }
+            std::array<KernelStats, COUNT> stats;
         };
 
         /**
-         * @brief Check if CUDA profiling is enabled
+         * @brief Check if ROCm profiling is enabled
          */
         static bool isEnabled()
         {
@@ -205,8 +186,8 @@ namespace llaminar2
         }
 
         /**
-         * @brief Set the current CUDA device for this thread
-         * @param device_id CUDA device ordinal (0, 1, 2, ...)
+         * @brief Set the current device context for profiling
+         * @param device_id HIP device ID (0, 1, 2, ...)
          */
         static void setCurrentDevice(int device_id)
         {
@@ -214,7 +195,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Clear the current device context for this thread
+         * @brief Clear the current device context
          */
         static void clearCurrentDevice()
         {
@@ -222,55 +203,71 @@ namespace llaminar2
         }
 
         /**
-         * @brief Record a kernel timing (in microseconds, auto-attributes to current device)
+         * @brief Record a kernel timing (in microseconds)
          */
-        static void record(CUDAKernelType type, double elapsed_us)
+        static void record(ROCmKernelType type, double elapsed_us)
         {
             auto &inst = getInstance();
             std::lock_guard<std::mutex> lock(inst.mutex_);
 
             auto idx = static_cast<size_t>(type);
 
-            // Record to global stats
-            inst.stats_[idx].add(elapsed_us);
+            // Update global stats
+            auto &stats = inst.stats_[idx];
+            stats.total_us += elapsed_us;
+            stats.call_count++;
+            stats.max_us = std::max(stats.max_us, elapsed_us);
+            stats.min_us = std::min(stats.min_us, elapsed_us);
 
-            // Record to per-device stats if device context is set
-            int device = current_device_id();
-            if (device >= 0)
+            // Update per-device stats if device context is set
+            int dev_id = current_device_id();
+            if (dev_id >= 0)
             {
-                inst.device_stats_[device].stats[idx].add(elapsed_us);
+                auto &dev_stats = inst.device_stats_[dev_id].stats[idx];
+                dev_stats.total_us += elapsed_us;
+                dev_stats.call_count++;
+                dev_stats.max_us = std::max(dev_stats.max_us, elapsed_us);
+                dev_stats.min_us = std::min(dev_stats.min_us, elapsed_us);
             }
         }
 
         /**
-         * @brief Record a kernel timing with explicit device
+         * @brief Record a kernel timing with explicit device ID
          */
-        static void record(CUDAKernelType type, double elapsed_us, int device_id)
+        static void record(ROCmKernelType type, double elapsed_us, int device_id)
         {
             auto &inst = getInstance();
             std::lock_guard<std::mutex> lock(inst.mutex_);
 
             auto idx = static_cast<size_t>(type);
 
-            // Record to global stats
-            inst.stats_[idx].add(elapsed_us);
+            // Update global stats
+            auto &stats = inst.stats_[idx];
+            stats.total_us += elapsed_us;
+            stats.call_count++;
+            stats.max_us = std::max(stats.max_us, elapsed_us);
+            stats.min_us = std::min(stats.min_us, elapsed_us);
 
-            // Record to per-device stats
+            // Update per-device stats
             if (device_id >= 0)
             {
-                inst.device_stats_[device_id].stats[idx].add(elapsed_us);
+                auto &dev_stats = inst.device_stats_[device_id].stats[idx];
+                dev_stats.total_us += elapsed_us;
+                dev_stats.call_count++;
+                dev_stats.max_us = std::max(dev_stats.max_us, elapsed_us);
+                dev_stats.min_us = std::min(dev_stats.min_us, elapsed_us);
             }
         }
 
         /**
-         * @brief Get list of devices that have recorded stats
+         * @brief Get list of devices with recorded stats
          */
         static std::vector<int> getDevices()
         {
             auto &inst = getInstance();
             std::lock_guard<std::mutex> lock(inst.mutex_);
+
             std::vector<int> devices;
-            devices.reserve(inst.device_stats_.size());
             for (const auto &[id, _] : inst.device_stats_)
             {
                 devices.push_back(id);
@@ -280,7 +277,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Get number of devices with recorded stats
+         * @brief Get the number of unique devices
          */
         static size_t getDeviceCount()
         {
@@ -299,7 +296,7 @@ namespace llaminar2
 
             for (auto &stats : inst.stats_)
             {
-                stats.reset();
+                stats = KernelStats{};
             }
             inst.device_stats_.clear();
         }
@@ -324,7 +321,7 @@ namespace llaminar2
             }
             if (!has_stats)
             {
-                return ""; // No CUDA kernels were profiled
+                return ""; // No ROCm kernels were profiled
             }
 
             size_t device_count = inst.device_stats_.size();
@@ -351,12 +348,12 @@ namespace llaminar2
                 if (device_count > 1)
                 {
                     std::ostringstream title_ss;
-                    title_ss << "CUDA KERNEL PROFILING SUMMARY (" << device_count << " GPUs)";
+                    title_ss << "ROCm KERNEL PROFILING SUMMARY (" << device_count << " GPUs)";
                     title << title_ss.str() << fort::endr;
                 }
                 else
                 {
-                    title << "CUDA KERNEL PROFILING SUMMARY" << fort::endr;
+                    title << "ROCm KERNEL PROFILING SUMMARY" << fort::endr;
                 }
                 title[0][0].set_cell_text_align(fort::text_align::center);
                 title.row(0).set_cell_row_type(fort::row_type::header);
@@ -365,7 +362,7 @@ namespace llaminar2
             }
 
             // Sort by total time (descending)
-            std::array<size_t, static_cast<size_t>(CUDAKernelType::COUNT)> indices;
+            std::array<size_t, COUNT> indices;
             for (size_t i = 0; i < indices.size(); ++i)
                 indices[i] = i;
             std::sort(indices.begin(), indices.end(), [&inst](size_t a, size_t b)
@@ -382,7 +379,7 @@ namespace llaminar2
                 for (int dev : devices)
                 {
                     std::ostringstream dev_ss;
-                    dev_ss << "cuda:" << dev;
+                    dev_ss << "rocm:" << dev;
                     table << dev_ss.str();
                 }
                 table << "Balance" << fort::endr;
@@ -431,7 +428,7 @@ namespace llaminar2
                     total_ss << std::fixed << std::setprecision(2) << total_ms;
                     balance_ss << static_cast<int>(balance) << "%";
 
-                    table << cudaKernelTypeName(static_cast<CUDAKernelType>(idx)) << total_ss.str();
+                    table << rocmKernelTypeName(static_cast<ROCmKernelType>(idx)) << total_ss.str();
                     for (double t : dev_times)
                     {
                         std::ostringstream dev_time_ss;
@@ -494,7 +491,7 @@ namespace llaminar2
                     max_ss << std::fixed << std::setprecision(1) << stats.max_us;
                     pct_ss << static_cast<int>(pct) << "%";
 
-                    table << cudaKernelTypeName(static_cast<CUDAKernelType>(idx))
+                    table << rocmKernelTypeName(static_cast<ROCmKernelType>(idx))
                           << stats.call_count
                           << total_ss.str()
                           << avg_ss.str()
@@ -539,11 +536,11 @@ namespace llaminar2
         }
 
     private:
-        CUDAKernelProfiler() = default;
+        ROCmKernelProfiler() = default;
 
-        static CUDAKernelProfiler &getInstance()
+        static ROCmKernelProfiler &getInstance()
         {
-            static CUDAKernelProfiler instance;
+            static ROCmKernelProfiler instance;
             return instance;
         }
 
@@ -554,114 +551,114 @@ namespace llaminar2
         }
 
         std::mutex mutex_;
-        std::array<KernelStats, static_cast<size_t>(CUDAKernelType::COUNT)> stats_;
+        std::array<KernelStats, COUNT> stats_;
         std::unordered_map<int, DeviceStats> device_stats_;
     };
 
     // ========================================================================
-    // CUDA Event-based timer (implementation in .cu file)
+    // HIP Event-based timer (implementation in .hip file)
     // ========================================================================
 
     /**
-     * @brief Scoped CUDA kernel timer using CUDA events
+     * @brief Scoped ROCm kernel timer using HIP events
      *
      * Records start event at construction, stop event and elapsed time at destruction.
      * The timing is synchronous - destructor blocks until GPU kernel completes.
      */
-    class ScopedCUDAKernelTimer
+    class ScopedROCmKernelTimer
     {
     public:
         /**
          * @brief Construct timer and record start event
          * @param type Kernel type for profiling categorization
-         * @param stream CUDA stream (nullptr = default stream)
+         * @param stream HIP stream (nullptr = default stream)
          */
-        ScopedCUDAKernelTimer(CUDAKernelType type, cudaStream_t stream = nullptr);
+        ScopedROCmKernelTimer(ROCmKernelType type, hipStream_t stream = nullptr);
 
         /**
          * @brief Record stop event, synchronize, and record elapsed time
          */
-        ~ScopedCUDAKernelTimer();
+        ~ScopedROCmKernelTimer();
 
         // Non-copyable, non-movable
-        ScopedCUDAKernelTimer(const ScopedCUDAKernelTimer &) = delete;
-        ScopedCUDAKernelTimer &operator=(const ScopedCUDAKernelTimer &) = delete;
+        ScopedROCmKernelTimer(const ScopedROCmKernelTimer &) = delete;
+        ScopedROCmKernelTimer &operator=(const ScopedROCmKernelTimer &) = delete;
 
     private:
-        CUDAKernelType type_;
+        ROCmKernelType type_;
         bool enabled_;
-        cudaEvent_t start_event_;
-        cudaEvent_t stop_event_;
-        cudaStream_t stream_;
+        hipEvent_t start_event_;
+        hipEvent_t stop_event_;
+        hipStream_t stream_;
     };
 
     /**
-     * @brief Manual CUDA kernel timer for non-RAII usage patterns
+     * @brief Manual ROCm kernel timer for non-RAII usage patterns
      */
-    class ManualCUDAKernelTimer
+    class ManualROCmKernelTimer
     {
     public:
-        ManualCUDAKernelTimer();
-        ~ManualCUDAKernelTimer();
+        ManualROCmKernelTimer();
+        ~ManualROCmKernelTimer();
 
         /**
          * @brief Record start event
-         * @param stream CUDA stream (nullptr = default stream)
+         * @param stream HIP stream (nullptr = default stream)
          */
-        void begin(cudaStream_t stream = nullptr);
+        void begin(hipStream_t stream = nullptr);
 
         /**
          * @brief Record stop event, synchronize, and record elapsed time
          * @param type Kernel type for profiling categorization
          */
-        void end(CUDAKernelType type);
+        void end(ROCmKernelType type);
 
         // Non-copyable, non-movable
-        ManualCUDAKernelTimer(const ManualCUDAKernelTimer &) = delete;
-        ManualCUDAKernelTimer &operator=(const ManualCUDAKernelTimer &) = delete;
+        ManualROCmKernelTimer(const ManualROCmKernelTimer &) = delete;
+        ManualROCmKernelTimer &operator=(const ManualROCmKernelTimer &) = delete;
 
     private:
         bool enabled_;
         bool started_;
-        cudaEvent_t start_event_;
-        cudaEvent_t stop_event_;
-        cudaStream_t stream_;
+        hipEvent_t start_event_;
+        hipEvent_t stop_event_;
+        hipStream_t stream_;
     };
 
 } // namespace llaminar2
 
 // ============================================================================
-// Convenience macros for CUDA kernel profiling
+// Convenience macros for ROCm kernel profiling
 // ============================================================================
 
 /**
- * @brief Scoped CUDA kernel profiling (RAII-based, synchronous)
+ * @brief Scoped ROCm kernel profiling (RAII-based, synchronous)
  *
  * Usage:
  *   {
- *       CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_DECODE);
- *       cudaKernel<<<grid, block>>>(args...);
+ *       ROCM_KERNEL_PROFILE_SCOPE(ROCmKernelType::FLASH_ATTN_DECODE);
+ *       hipLaunchKernelGGL(...);
  *   } // Timer synchronizes and records here
  */
-#define CUDA_KERNEL_PROFILE_SCOPE(kernel_type) \
-    ::llaminar2::ScopedCUDAKernelTimer _cuda_timer_##__LINE__(kernel_type)
+#define ROCM_KERNEL_PROFILE_SCOPE(kernel_type) \
+    ::llaminar2::ScopedROCmKernelTimer _rocm_timer_##__LINE__(kernel_type)
 
 /**
- * @brief Scoped CUDA kernel profiling with stream
+ * @brief Scoped ROCm kernel profiling with stream
  */
-#define CUDA_KERNEL_PROFILE_SCOPE_STREAM(kernel_type, stream) \
-    ::llaminar2::ScopedCUDAKernelTimer _cuda_timer_##__LINE__(kernel_type, stream)
+#define ROCM_KERNEL_PROFILE_SCOPE_STREAM(kernel_type, stream) \
+    ::llaminar2::ScopedROCmKernelTimer _rocm_timer_##__LINE__(kernel_type, stream)
 
 /**
- * @brief Manual CUDA kernel profiling begin
+ * @brief Manual ROCm kernel profiling begin
  */
-#define CUDA_KERNEL_PROFILE_BEGIN(timer_name)      \
-    ::llaminar2::ManualCUDAKernelTimer timer_name; \
+#define ROCM_KERNEL_PROFILE_BEGIN(timer_name)      \
+    ::llaminar2::ManualROCmKernelTimer timer_name; \
     timer_name.begin()
 
-#define CUDA_KERNEL_PROFILE_BEGIN_STREAM(timer_name, stream) \
-    ::llaminar2::ManualCUDAKernelTimer timer_name;           \
+#define ROCM_KERNEL_PROFILE_BEGIN_STREAM(timer_name, stream) \
+    ::llaminar2::ManualROCmKernelTimer timer_name;           \
     timer_name.begin(stream)
 
-#define CUDA_KERNEL_PROFILE_END(timer_name, kernel_type) \
+#define ROCM_KERNEL_PROFILE_END(timer_name, kernel_type) \
     timer_name.end(kernel_type)

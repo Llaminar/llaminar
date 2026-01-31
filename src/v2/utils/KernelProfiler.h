@@ -30,11 +30,16 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <sstream>
 #include <iomanip>
+#include <unordered_map>
+#include <vector>
+#include <algorithm>
 
 #include "DebugEnv.h"
+#include "fort.hpp"
 
 namespace llaminar2
 {
@@ -308,14 +313,6 @@ namespace llaminar2
                 return "";
             }
 
-            std::ostringstream oss;
-            oss << std::fixed << std::setprecision(2);
-
-            oss << "\n";
-            oss << "╔══════════════════════════════════════════════════════════════════════════════════════════════╗\n";
-            oss << "║                              TENSOR TRANSFER SUMMARY                                         ║\n";
-            oss << "╠══════════════════════════════════════════════════════════════════════════════════════════════╣\n";
-
             auto formatBytes = [](uint64_t bytes) -> std::string
             {
                 std::ostringstream s;
@@ -331,15 +328,36 @@ namespace llaminar2
                 return s.str();
             };
 
+            std::ostringstream oss;
+
+            // Title table
+            {
+                fort::utf8_table title;
+                title.set_border_style(FT_DOUBLE2_STYLE);
+                title << "TENSOR TRANSFER SUMMARY" << fort::endr;
+                title[0][0].set_cell_text_align(fort::text_align::center);
+                title.row(0).set_cell_row_type(fort::row_type::header);
+                oss << "\n"
+                    << title.to_string();
+            }
+
             // Per-stage breakdown
             {
                 std::lock_guard<std::mutex> lock(inst.stage_mutex_);
                 if (!inst.stage_stats_.empty())
                 {
-                    oss << "║  STAGE BREAKDOWN (H2D Upload / D2H Download):                                                ║\n";
-                    oss << "╠══════════════════════════════════════════════════════════════════════════════════════════════╣\n";
-                    oss << "║  Stage Name                        │  H2D Count │   H2D Bytes   │  D2H Count │   D2H Bytes  ║\n";
-                    oss << "╠══════════════════════════════════════════════════════════════════════════════════════════════╣\n";
+                    fort::utf8_table stage_table;
+                    stage_table.set_border_style(FT_DOUBLE2_STYLE);
+
+                    stage_table << fort::header
+                                << "Stage Name" << "H2D Count" << "H2D Bytes" << "D2H Count" << "D2H Bytes"
+                                << fort::endr;
+
+                    stage_table.column(0).set_cell_text_align(fort::text_align::left);
+                    stage_table.column(1).set_cell_text_align(fort::text_align::right);
+                    stage_table.column(2).set_cell_text_align(fort::text_align::right);
+                    stage_table.column(3).set_cell_text_align(fort::text_align::right);
+                    stage_table.column(4).set_cell_text_align(fort::text_align::right);
 
                     // Sort stages by total bytes (descending)
                     std::vector<std::pair<std::string, const StageTransferStats *>> sorted_stages;
@@ -373,50 +391,67 @@ namespace llaminar2
                             display_name = display_name.substr(0, 31) + "...";
                         }
 
-                        oss << "║  " << std::left << std::setw(34) << display_name
-                            << "│" << std::right << std::setw(10) << sh2d_count << "  "
-                            << "│" << std::setw(13) << formatBytes(sh2d_bytes) << "  "
-                            << "│" << std::setw(10) << sd2h_count << "  "
-                            << "│" << std::setw(12) << formatBytes(sd2h_bytes) << " ║\n";
+                        stage_table << display_name
+                                    << sh2d_count
+                                    << formatBytes(sh2d_bytes)
+                                    << sd2h_count
+                                    << formatBytes(sd2h_bytes)
+                                    << fort::endr;
                     }
 
-                    oss << "╠══════════════════════════════════════════════════════════════════════════════════════════════╣\n";
+                    oss << stage_table.to_string();
                 }
             }
 
-            // Global totals
-            oss << "║  TOTALS:                                                                                     ║\n";
-            oss << "╠══════════════════════════════════════════════════════════════════════════════════════════════╣\n";
-            oss << "║  Direction        │  Transfers │  Total Bytes   │  Avg Size      │  Bandwidth               ║\n";
-            oss << "╠══════════════════════════════════════════════════════════════════════════════════════════════╣\n";
-
-            // H2D row
-            if (h2d_count > 0)
+            // Global totals table
             {
-                double avg_bytes = static_cast<double>(h2d_bytes) / h2d_count;
-                double bandwidth_gbps = (h2d_ns > 0) ? (h2d_bytes / 1e9) / (h2d_ns / 1e9) : 0.0;
+                fort::utf8_table totals;
+                totals.set_border_style(FT_DOUBLE2_STYLE);
 
-                oss << "║  " << std::left << std::setw(16) << "H2D (Upload)"
-                    << "│" << std::right << std::setw(10) << h2d_count << "  "
-                    << "│" << std::setw(14) << formatBytes(h2d_bytes) << "  "
-                    << "│" << std::setw(14) << formatBytes(static_cast<uint64_t>(avg_bytes)) << "  "
-                    << "│" << std::setw(8) << (h2d_ns > 0 ? bandwidth_gbps : 0.0) << " GB/s           ║\n";
+                totals << fort::header
+                       << "Direction" << "Transfers" << "Total Bytes" << "Avg Size" << "Bandwidth"
+                       << fort::endr;
+
+                totals.column(0).set_cell_text_align(fort::text_align::left);
+                totals.column(1).set_cell_text_align(fort::text_align::right);
+                totals.column(2).set_cell_text_align(fort::text_align::right);
+                totals.column(3).set_cell_text_align(fort::text_align::right);
+                totals.column(4).set_cell_text_align(fort::text_align::right);
+
+                // H2D row
+                if (h2d_count > 0)
+                {
+                    double avg_bytes = static_cast<double>(h2d_bytes) / h2d_count;
+                    double bandwidth_gbps = (h2d_ns > 0) ? (h2d_bytes / 1e9) / (h2d_ns / 1e9) : 0.0;
+                    std::ostringstream bw_ss;
+                    bw_ss << std::fixed << std::setprecision(2) << bandwidth_gbps << " GB/s";
+
+                    totals << "H2D (Upload)"
+                           << h2d_count
+                           << formatBytes(h2d_bytes)
+                           << formatBytes(static_cast<uint64_t>(avg_bytes))
+                           << bw_ss.str()
+                           << fort::endr;
+                }
+
+                // D2H row
+                if (d2h_count > 0)
+                {
+                    double avg_bytes = static_cast<double>(d2h_bytes) / d2h_count;
+                    double bandwidth_gbps = (d2h_ns > 0) ? (d2h_bytes / 1e9) / (d2h_ns / 1e9) : 0.0;
+                    std::ostringstream bw_ss;
+                    bw_ss << std::fixed << std::setprecision(2) << bandwidth_gbps << " GB/s";
+
+                    totals << "D2H (Download)"
+                           << d2h_count
+                           << formatBytes(d2h_bytes)
+                           << formatBytes(static_cast<uint64_t>(avg_bytes))
+                           << bw_ss.str()
+                           << fort::endr;
+                }
+
+                oss << totals.to_string();
             }
-
-            // D2H row
-            if (d2h_count > 0)
-            {
-                double avg_bytes = static_cast<double>(d2h_bytes) / d2h_count;
-                double bandwidth_gbps = (d2h_ns > 0) ? (d2h_bytes / 1e9) / (d2h_ns / 1e9) : 0.0;
-
-                oss << "║  " << std::left << std::setw(16) << "D2H (Download)"
-                    << "│" << std::right << std::setw(10) << d2h_count << "  "
-                    << "│" << std::setw(14) << formatBytes(d2h_bytes) << "  "
-                    << "│" << std::setw(14) << formatBytes(static_cast<uint64_t>(avg_bytes)) << "  "
-                    << "│" << std::setw(8) << (d2h_ns > 0 ? bandwidth_gbps : 0.0) << " GB/s           ║\n";
-            }
-
-            oss << "╚══════════════════════════════════════════════════════════════════════════════════════════════╝\n";
 
             return oss.str();
         }
@@ -473,10 +508,11 @@ namespace llaminar2
     };
 
     /**
-     * @brief Thread-safe kernel profiling accumulator
+     * @brief Thread-safe kernel profiling accumulator with per-device tracking
      *
      * Uses atomic operations for thread-safe accumulation without locks.
      * Each kernel type has its own accumulator to avoid false sharing.
+     * Supports per-device breakdown for multi-GPU tensor parallelism.
      */
     class KernelProfiler
     {
@@ -494,6 +530,52 @@ namespace llaminar2
             std::atomic<uint64_t> call_count{0};      ///< Number of calls
             std::atomic<uint64_t> max_ns{0};          ///< Maximum single call time
             std::atomic<uint64_t> min_ns{UINT64_MAX}; ///< Minimum single call time
+
+            void reset()
+            {
+                total_ns.store(0, std::memory_order_relaxed);
+                call_count.store(0, std::memory_order_relaxed);
+                max_ns.store(0, std::memory_order_relaxed);
+                min_ns.store(UINT64_MAX, std::memory_order_relaxed);
+            }
+
+            void add(uint64_t duration_ns)
+            {
+                total_ns.fetch_add(duration_ns, std::memory_order_relaxed);
+                call_count.fetch_add(1, std::memory_order_relaxed);
+
+                // Update max (lock-free CAS)
+                uint64_t current_max = max_ns.load(std::memory_order_relaxed);
+                while (duration_ns > current_max &&
+                       !max_ns.compare_exchange_weak(current_max, duration_ns,
+                                                     std::memory_order_relaxed,
+                                                     std::memory_order_relaxed))
+                {
+                }
+
+                // Update min (lock-free CAS)
+                uint64_t current_min = min_ns.load(std::memory_order_relaxed);
+                while (duration_ns < current_min &&
+                       !min_ns.compare_exchange_weak(current_min, duration_ns,
+                                                     std::memory_order_relaxed,
+                                                     std::memory_order_relaxed))
+                {
+                }
+            }
+        };
+
+        /**
+         * @brief Per-device kernel statistics array
+         */
+        struct DeviceStats
+        {
+            std::array<KernelStats, static_cast<size_t>(KernelType::COUNT)> stats;
+
+            void reset()
+            {
+                for (auto &s : stats)
+                    s.reset();
+            }
         };
 
         /**
@@ -506,7 +588,24 @@ namespace llaminar2
         }
 
         /**
-         * @brief Record a kernel execution time
+         * @brief Set the current device context for this thread
+         * @param device_key Device identifier (e.g., "cuda:0", "rocm:1", "cpu")
+         */
+        static void setCurrentDevice(const std::string &device_key)
+        {
+            current_device_key() = device_key;
+        }
+
+        /**
+         * @brief Clear the current device context for this thread
+         */
+        static void clearCurrentDevice()
+        {
+            current_device_key().clear();
+        }
+
+        /**
+         * @brief Record a kernel execution time (auto-attributes to current device)
          * @param type Kernel type
          * @param duration_ns Duration in nanoseconds
          */
@@ -515,35 +614,77 @@ namespace llaminar2
             if (!isEnabled())
                 return;
 
-            auto &stats = getStats(type);
-            stats.total_ns.fetch_add(duration_ns, std::memory_order_relaxed);
-            stats.call_count.fetch_add(1, std::memory_order_relaxed);
+            // Record to global stats (backward compatible)
+            auto &global = getInstance().stats_[static_cast<size_t>(type)];
+            global.add(duration_ns);
 
-            // Update max (lock-free)
-            uint64_t current_max = stats.max_ns.load(std::memory_order_relaxed);
-            while (duration_ns > current_max &&
-                   !stats.max_ns.compare_exchange_weak(current_max, duration_ns,
-                                                       std::memory_order_relaxed,
-                                                       std::memory_order_relaxed))
+            // Record to per-device stats if device context is set
+            const std::string &device = current_device_key();
+            if (!device.empty())
             {
-            }
-
-            // Update min (lock-free)
-            uint64_t current_min = stats.min_ns.load(std::memory_order_relaxed);
-            while (duration_ns < current_min &&
-                   !stats.min_ns.compare_exchange_weak(current_min, duration_ns,
-                                                       std::memory_order_relaxed,
-                                                       std::memory_order_relaxed))
-            {
+                auto &inst = getInstance();
+                std::lock_guard<std::mutex> lock(inst.device_mutex_);
+                inst.device_stats_[device].stats[static_cast<size_t>(type)].add(duration_ns);
             }
         }
 
         /**
-         * @brief Get stats for a kernel type (for external access)
+         * @brief Record a kernel execution time with explicit device
+         * @param type Kernel type
+         * @param duration_ns Duration in nanoseconds
+         * @param device_key Device identifier
+         */
+        static void record(KernelType type, uint64_t duration_ns, const std::string &device_key)
+        {
+            if (!isEnabled())
+                return;
+
+            // Record to global stats
+            auto &global = getInstance().stats_[static_cast<size_t>(type)];
+            global.add(duration_ns);
+
+            // Record to per-device stats
+            if (!device_key.empty())
+            {
+                auto &inst = getInstance();
+                std::lock_guard<std::mutex> lock(inst.device_mutex_);
+                inst.device_stats_[device_key].stats[static_cast<size_t>(type)].add(duration_ns);
+            }
+        }
+
+        /**
+         * @brief Get stats for a kernel type (global/combined)
          */
         static KernelStats &getStats(KernelType type)
         {
             return getInstance().stats_[static_cast<size_t>(type)];
+        }
+
+        /**
+         * @brief Get list of devices that have recorded stats
+         */
+        static std::vector<std::string> getDevices()
+        {
+            auto &inst = getInstance();
+            std::lock_guard<std::mutex> lock(inst.device_mutex_);
+            std::vector<std::string> devices;
+            devices.reserve(inst.device_stats_.size());
+            for (const auto &[key, _] : inst.device_stats_)
+            {
+                devices.push_back(key);
+            }
+            std::sort(devices.begin(), devices.end());
+            return devices;
+        }
+
+        /**
+         * @brief Get number of devices with recorded stats
+         */
+        static size_t getDeviceCount()
+        {
+            auto &inst = getInstance();
+            std::lock_guard<std::mutex> lock(inst.device_mutex_);
+            return inst.device_stats_.size();
         }
 
         /**
@@ -554,10 +695,12 @@ namespace llaminar2
             auto &inst = getInstance();
             for (auto &stats : inst.stats_)
             {
-                stats.total_ns.store(0, std::memory_order_relaxed);
-                stats.call_count.store(0, std::memory_order_relaxed);
-                stats.max_ns.store(0, std::memory_order_relaxed);
-                stats.min_ns.store(UINT64_MAX, std::memory_order_relaxed);
+                stats.reset();
+            }
+            // Reset per-device stats
+            {
+                std::lock_guard<std::mutex> lock(inst.device_mutex_);
+                inst.device_stats_.clear();
             }
         }
 
@@ -570,60 +713,191 @@ namespace llaminar2
         {
             if (!isEnabled())
             {
-                return "[Kernel profiling disabled. Set LLAMINAR_PROFILE_KERNELS=1 to enable]\n";
+                return "[Kernel profiling disabled. Set LLAMINAR_PROFILING=1 to enable]\n";
             }
 
-            std::ostringstream oss;
-            oss << std::fixed << std::setprecision(2);
+            auto &inst = getInstance();
+            size_t device_count = getDeviceCount();
+            std::vector<std::string> devices = getDevices();
 
-            oss << "\n";
-            oss << "╔══════════════════════════════════════════════════════════════════════════════╗\n";
-            oss << "║                         KERNEL PROFILING SUMMARY                             ║\n";
-            oss << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
-            oss << "║  Kernel Type      │  Calls   │  Total (ms)  │  Avg (µs)  │  Min/Max (µs)     ║\n";
-            oss << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
+            std::ostringstream oss;
+
+            // Title table
+            {
+                fort::utf8_table title;
+                title.set_border_style(FT_DOUBLE2_STYLE);
+                if (device_count > 1)
+                {
+                    std::ostringstream title_ss;
+                    title_ss << "CPU KERNEL PROFILING SUMMARY (" << device_count << " devices)";
+                    title << title_ss.str() << fort::endr;
+                }
+                else
+                {
+                    title << "KERNEL PROFILING SUMMARY" << fort::endr;
+                }
+                title[0][0].set_cell_text_align(fort::text_align::center);
+                title.row(0).set_cell_row_type(fort::row_type::header);
+                oss << "\n"
+                    << title.to_string();
+            }
+
+            // Main data table
+            fort::utf8_table table;
+            table.set_border_style(FT_DOUBLE2_STYLE);
+
+            if (device_count > 1)
+            {
+                // Multi-device header
+                table << fort::header << "Kernel Type" << "Total (ms)";
+                for (const auto &dev : devices)
+                {
+                    std::string dev_short = dev.length() > 10 ? dev.substr(0, 10) : dev;
+                    table << dev_short;
+                }
+                table << "Balance" << fort::endr;
+
+                table.column(0).set_cell_text_align(fort::text_align::left);
+                table.column(1).set_cell_text_align(fort::text_align::right);
+                for (size_t i = 0; i < devices.size(); ++i)
+                {
+                    table.column(2 + i).set_cell_text_align(fort::text_align::right);
+                }
+                table.column(2 + devices.size()).set_cell_text_align(fort::text_align::right);
+            }
+            else
+            {
+                // Single device header
+                table << fort::header << "Kernel Type" << "Calls" << "Total (ms)" << "Avg (µs)" << "Min/Max (µs)" << fort::endr;
+                table.column(0).set_cell_text_align(fort::text_align::left);
+                table.column(1).set_cell_text_align(fort::text_align::right);
+                table.column(2).set_cell_text_align(fort::text_align::right);
+                table.column(3).set_cell_text_align(fort::text_align::right);
+                table.column(4).set_cell_text_align(fort::text_align::right);
+            }
 
             uint64_t grand_total_ns = 0;
 
             for (size_t i = 0; i < static_cast<size_t>(KernelType::COUNT); ++i)
             {
-                const auto &stats = getStats(static_cast<KernelType>(i));
+                const auto &stats = inst.stats_[i];
                 uint64_t count = stats.call_count.load(std::memory_order_relaxed);
                 if (count == 0)
                     continue;
 
                 uint64_t total_ns = stats.total_ns.load(std::memory_order_relaxed);
-                uint64_t min_ns = stats.min_ns.load(std::memory_order_relaxed);
-                uint64_t max_ns = stats.max_ns.load(std::memory_order_relaxed);
-
                 double total_ms = total_ns / 1e6;
-                double avg_us = (total_ns / static_cast<double>(count)) / 1e3;
-                double min_us = min_ns / 1e3;
-                double max_us = max_ns / 1e3;
-
                 grand_total_ns += total_ns;
 
-                // Format: kernel name (16 chars), calls (8), total ms (12), avg µs (10), min/max
-                oss << "║  " << std::left << std::setw(16) << kernelTypeName(static_cast<KernelType>(i))
-                    << "│" << std::right << std::setw(8) << count << "  "
-                    << "│" << std::setw(12) << total_ms << "  "
-                    << "│" << std::setw(10) << avg_us << "  "
-                    << "│" << std::setw(8) << min_us << "/" << std::setw(8) << max_us << " ║\n";
+                std::ostringstream total_ss;
+                total_ss << std::fixed << std::setprecision(2) << total_ms;
+
+                if (device_count > 1)
+                {
+                    // Collect per-device times for this kernel
+                    std::vector<double> device_times;
+                    double max_time = 0.0, min_time = 1e12;
+
+                    std::lock_guard<std::mutex> lock(inst.device_mutex_);
+                    for (const auto &dev : devices)
+                    {
+                        auto it = inst.device_stats_.find(dev);
+                        if (it != inst.device_stats_.end())
+                        {
+                            uint64_t dev_ns = it->second.stats[i].total_ns.load(std::memory_order_relaxed);
+                            double dev_ms = dev_ns / 1e6;
+                            device_times.push_back(dev_ms);
+                            max_time = std::max(max_time, dev_ms);
+                            min_time = std::min(min_time, dev_ms);
+                        }
+                        else
+                        {
+                            device_times.push_back(0.0);
+                        }
+                    }
+
+                    // Calculate load balance (0-100%, higher is better)
+                    double balance = (max_time > 0) ? (min_time / max_time * 100.0) : 100.0;
+
+                    std::ostringstream balance_ss;
+                    balance_ss << static_cast<int>(balance) << "%";
+
+                    table << kernelTypeName(static_cast<KernelType>(i)) << total_ss.str();
+                    for (double t : device_times)
+                    {
+                        std::ostringstream dev_ss;
+                        dev_ss << std::fixed << std::setprecision(2) << t;
+                        table << dev_ss.str();
+                    }
+                    table << balance_ss.str() << fort::endr;
+                }
+                else
+                {
+                    // Single device format
+                    uint64_t min_ns = stats.min_ns.load(std::memory_order_relaxed);
+                    uint64_t max_ns = stats.max_ns.load(std::memory_order_relaxed);
+                    double avg_us = (total_ns / static_cast<double>(count)) / 1e3;
+                    double min_us = min_ns / 1e3;
+                    double max_us = max_ns / 1e3;
+
+                    std::ostringstream avg_ss, minmax_ss;
+                    avg_ss << std::fixed << std::setprecision(1) << avg_us;
+                    minmax_ss << std::fixed << std::setprecision(1) << min_us << "/" << max_us;
+
+                    table << kernelTypeName(static_cast<KernelType>(i))
+                          << count
+                          << total_ss.str()
+                          << avg_ss.str()
+                          << minmax_ss.str()
+                          << fort::endr;
+                }
             }
 
-            oss << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
+            // Separator and total row
+            table << fort::separator;
 
             double grand_total_ms = grand_total_ns / 1e6;
-            oss << "║  TOTAL KERNEL TIME: " << std::setw(10) << grand_total_ms << " ms";
+            std::ostringstream grand_ss;
+            grand_ss << std::fixed << std::setprecision(2) << grand_total_ms << " ms";
 
             if (total_tokens > 0)
             {
                 double toks_per_sec = (total_tokens * 1e9) / static_cast<double>(grand_total_ns);
-                oss << "   (" << std::setw(6) << toks_per_sec << " kernel tok/s)";
-            }
-            oss << std::setw(20) << " " << "║\n";
+                std::ostringstream throughput_ss;
+                throughput_ss << std::fixed << std::setprecision(2) << toks_per_sec << " kernel tok/s";
 
-            oss << "╚══════════════════════════════════════════════════════════════════════════════╝\n";
+                if (device_count > 1)
+                {
+                    table << "TOTAL KERNEL TIME" << grand_ss.str();
+                    for (size_t i = 0; i < devices.size(); ++i)
+                    {
+                        table << "";
+                    }
+                    table << throughput_ss.str() << fort::endr;
+                }
+                else
+                {
+                    table << "TOTAL" << "" << grand_ss.str() << "" << throughput_ss.str() << fort::endr;
+                }
+            }
+            else
+            {
+                if (device_count > 1)
+                {
+                    table << "TOTAL KERNEL TIME" << grand_ss.str();
+                    for (size_t i = 0; i < devices.size() + 1; ++i)
+                    {
+                        table << "";
+                    }
+                    table << fort::endr;
+                }
+                else
+                {
+                    table << "TOTAL" << "" << grand_ss.str() << "" << "" << fort::endr;
+                }
+            }
+
+            oss << table.to_string();
 
             // Append transfer stats if any transfers occurred
             oss << TransferProfiler::getSummary();
@@ -657,7 +931,15 @@ namespace llaminar2
             return instance;
         }
 
+        static std::string &current_device_key()
+        {
+            thread_local std::string device_key;
+            return device_key;
+        }
+
         std::array<KernelStats, static_cast<size_t>(KernelType::COUNT)> stats_;
+        std::mutex device_mutex_;
+        std::unordered_map<std::string, DeviceStats> device_stats_;
     };
 
     /**

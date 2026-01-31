@@ -9,7 +9,9 @@
 #include "Logger.h"
 #include "KernelProfiler.h"
 #include "CUDAKernelProfiler.h"
+#include "ROCmKernelProfiler.h"
 #include "../execution/local_execution/graph/IGraphExecutor.h"
+#include "fort.hpp"
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -287,6 +289,7 @@ namespace llaminar2
         {
             KernelProfiler::reset();
             CUDAKernelProfiler::reset();
+            ROCmKernelProfiler::reset();
         }
 
         // ========================================================================
@@ -396,61 +399,83 @@ namespace llaminar2
         }
 
         std::cout << "\n";
-        std::cout << "╔══════════════════════════════════════════════════════════════╗\n";
-        std::cout << "║                    BENCHMARK RESULTS                         ║\n";
-        std::cout << "║              (average of " << BENCHMARK_ITERATIONS << " runs after warmup)                ║\n";
-        std::cout << "╠══════════════════════════════════════════════════════════════╣\n";
+
+        // Title table
+        {
+            fort::utf8_table title;
+            title.set_border_style(FT_DOUBLE2_STYLE);
+            std::ostringstream title_ss;
+            title_ss << "BENCHMARK RESULTS (average of " << BENCHMARK_ITERATIONS << " runs after warmup)";
+            title << title_ss.str() << fort::endr;
+            title[0][0].set_cell_text_align(fort::text_align::center);
+            title.row(0).set_cell_row_type(fort::row_type::header);
+            std::cout << title.to_string();
+        }
+
+        // Results table
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+
+        table << fort::header << "Phase" << "Metric" << "Value" << fort::endr;
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        table.column(1).set_cell_text_align(fort::text_align::left);
+        table.column(2).set_cell_text_align(fort::text_align::right);
 
         // Prefill results
         if (result.prefill_tokens > 0)
         {
-            std::cout << "║ PREFILL PHASE                                                ║\n";
-            std::cout << "║   Tokens:      " << std::setw(8) << result.prefill_tokens
-                      << " tokens                               ║\n";
-            std::cout << "║   Time:        " << std::setw(8) << std::fixed << std::setprecision(2)
-                      << result.prefill_time_ms << " ms                                   ║\n";
-            std::cout << "║   Throughput:  " << std::setw(8) << std::fixed << std::setprecision(2)
-                      << result.prefill_tokens_per_sec << " tok/s                                ║\n";
+            std::ostringstream tokens_ss, time_ss, throughput_ss;
+            tokens_ss << result.prefill_tokens << " tokens";
+            time_ss << std::fixed << std::setprecision(2) << result.prefill_time_ms << " ms";
+            throughput_ss << std::fixed << std::setprecision(2) << result.prefill_tokens_per_sec << " tok/s";
+
+            table << "PREFILL" << "Tokens" << tokens_ss.str() << fort::endr;
+            table << "" << "Time" << time_ss.str() << fort::endr;
+            table << "" << "Throughput" << throughput_ss.str() << fort::endr;
         }
         else
         {
-            std::cout << "║ PREFILL PHASE                           (SKIPPED)           ║\n";
+            table << "PREFILL" << "(SKIPPED)" << "" << fort::endr;
         }
 
-        std::cout << "╠══════════════════════════════════════════════════════════════╣\n";
+        table << fort::separator;
 
         // Decode results
         if (result.decode_tokens > 0)
         {
-            std::cout << "║ DECODE PHASE                                                 ║\n";
-            std::cout << "║   Tokens:      " << std::setw(8) << result.decode_tokens
-                      << " tokens                               ║\n";
-            std::cout << "║   Time:        " << std::setw(8) << std::fixed << std::setprecision(2)
-                      << result.decode_time_ms << " ms                                   ║\n";
-            std::cout << "║   Throughput:  " << std::setw(8) << std::fixed << std::setprecision(2)
-                      << result.decode_tokens_per_sec << " tok/s                                ║\n";
+            std::ostringstream tokens_ss, time_ss, throughput_ss;
+            tokens_ss << result.decode_tokens << " tokens";
+            time_ss << std::fixed << std::setprecision(2) << result.decode_time_ms << " ms";
+            throughput_ss << std::fixed << std::setprecision(2) << result.decode_tokens_per_sec << " tok/s";
+
+            table << "DECODE" << "Tokens" << tokens_ss.str() << fort::endr;
+            table << "" << "Time" << time_ss.str() << fort::endr;
+            table << "" << "Throughput" << throughput_ss.str() << fort::endr;
         }
         else
         {
-            std::cout << "║ DECODE PHASE                            (SKIPPED)           ║\n";
+            table << "DECODE" << "(SKIPPED)" << "" << fort::endr;
         }
 
-        std::cout << "╠══════════════════════════════════════════════════════════════╣\n";
+        table << fort::separator;
 
         // Total
-        std::cout << "║ TOTAL                                                        ║\n";
-        std::cout << "║   Time:        " << std::setw(8) << std::fixed << std::setprecision(2)
-                  << result.total_time_ms << " ms                                   ║\n";
-
-        if (result.prefill_tokens + result.decode_tokens > 0 && result.total_time_ms > 0)
         {
-            double total_tokens = result.prefill_tokens + result.decode_tokens;
-            double overall_throughput = (total_tokens * 1000.0) / result.total_time_ms;
-            std::cout << "║   Overall:     " << std::setw(8) << std::fixed << std::setprecision(2)
-                      << overall_throughput << " tok/s (avg)                          ║\n";
+            std::ostringstream time_ss;
+            time_ss << std::fixed << std::setprecision(2) << result.total_time_ms << " ms";
+            table << "TOTAL" << "Time" << time_ss.str() << fort::endr;
+
+            if (result.prefill_tokens + result.decode_tokens > 0 && result.total_time_ms > 0)
+            {
+                double total_tokens = result.prefill_tokens + result.decode_tokens;
+                double overall_throughput = (total_tokens * 1000.0) / result.total_time_ms;
+                std::ostringstream throughput_ss;
+                throughput_ss << std::fixed << std::setprecision(2) << overall_throughput << " tok/s (avg)";
+                table << "" << "Overall" << throughput_ss.str() << fort::endr;
+            }
         }
 
-        std::cout << "╚══════════════════════════════════════════════════════════════╝\n";
+        std::cout << table.to_string();
 
         // Print kernel profiling summary if enabled
         if (KernelProfiler::isEnabled())
@@ -458,6 +483,7 @@ namespace llaminar2
             uint64_t total_tokens = result.prefill_tokens + result.decode_tokens;
             KernelProfiler::printSummary(total_tokens);
             CUDAKernelProfiler::printSummary(total_tokens);
+            ROCmKernelProfiler::printSummary(total_tokens);
         }
 
         // Print executor overhead profiling if enabled (LLAMINAR_PROFILING=1)

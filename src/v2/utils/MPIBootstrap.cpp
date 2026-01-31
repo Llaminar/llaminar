@@ -296,11 +296,14 @@ namespace llaminar2
     {
         MPILaunchConfig config;
 
-        // One MPI rank per socket (optimal for NUMA)
-        config.num_procs = topology.num_sockets;
+        // CONSERVATIVE DEFAULT: Single process to avoid heterogeneous device trap
+        // Mixed CUDA+ROCm systems fall back to slow MPI host-staged collectives.
+        // Users wanting multi-GPU should use explicit --mpi-procs N or --tp-devices.
+        // Future: Add --auto-tp for model-aware automatic scaling.
+        config.num_procs = 1;
 
-        // Use physical cores per socket for OpenMP threads
-        config.omp_threads_per_rank = topology.cores_per_socket;
+        // Use physical cores per socket for OpenMP threads (full socket for single rank)
+        config.omp_threads_per_rank = topology.cores_per_socket * topology.num_sockets;
 
         // Default binding
         config.bind_to_socket = true;

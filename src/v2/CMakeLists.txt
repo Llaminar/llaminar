@@ -475,6 +475,8 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmRMSNormKernels.hip              # RMSNorm kernels (FP32, BF16, FP16)
         kernels/rocm/ops/ROCmEmbeddingKernels.hip            # Embedding kernels (FP32, BF16, FP16, Q8_1)
         kernels/rocm/ops/ROCmResidualAddKernels.hip          # Residual Add kernels (FP32, BF16, FP16)
+        # Profiling utilities
+        utils/ROCmKernelProfiler.hip                         # ROCm/HIP event-based kernel profiling
     )
     
     # ROCm enumeration and backend must be compiled with hipcc to use HIP runtime
@@ -1065,6 +1067,14 @@ FetchContent_MakeAvailable(libfort)
 # Reset policy version
 unset(CMAKE_POLICY_VERSION_MINIMUM)
 message(STATUS "V2: libfort v0.4.2 configured for formatted table output")
+
+# Link fort to GPU backends (for CUDAKernelProfiler.h and ROCmKernelProfiler.h table output)
+if(HAVE_CUDA)
+    target_link_libraries(cuda_backend PUBLIC fort)
+endif()
+if(HAVE_ROCM)
+    target_link_libraries(rocm_backend PUBLIC fort)
+endif()
 
 # =============================================================================
 # Typed Register Enforcement (JIT Code Quality)

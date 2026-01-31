@@ -25,6 +25,7 @@
 // Include project headers
 #include "tensors/Tensors.h"
 #include "execution/config/RuntimeConfig.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -280,8 +281,12 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_Small)
     cpu_kernel.apply_typed(cpu_q.data(), cpu_k.data(), position_ids.data(),
                            seq_len, n_heads, n_kv_heads, head_dim, rope_theta, -1);
 
-    // ROCm kernel
+    // ROCm kernel with workspace
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP32> rocm_kernel;
+    DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
+    auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
+    ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
+    rocm_kernel.bindWorkspace(&workspace);
 
     float *d_q, *d_k;
     int *d_pos_ids;
@@ -352,6 +357,10 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_Large)
                            seq_len, n_heads, n_kv_heads, head_dim, rope_theta, -1);
 
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP32> rocm_kernel;
+    DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
+    auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
+    ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
+    rocm_kernel.bindWorkspace(&workspace);
 
     float *d_q, *d_k;
     int *d_pos_ids;
@@ -427,10 +436,14 @@ TEST_F(Test__ROCmRoPEParity, RoPE_BF16_Small)
     cpu_kernel.apply_typed(cpu_q.data(), cpu_k.data(), position_ids.data(),
                            seq_len, n_heads, n_kv_heads, head_dim, rope_theta, -1);
 
-    // ROCm kernel
+    // ROCm kernel with workspace
     std::vector<uint16_t> rocm_q = q_bf16;
     std::vector<uint16_t> rocm_k = k_bf16;
     rocm::ROCmRoPEKernelT<ActivationPrecision::BF16> rocm_kernel;
+    DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
+    auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
+    ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
+    rocm_kernel.bindWorkspace(&workspace);
 
     uint16_t *d_q, *d_k;
     int *d_pos_ids;
@@ -512,6 +525,10 @@ TEST_F(Test__ROCmRoPEParity, RoPE_BF16_Large)
     std::vector<uint16_t> rocm_q = q_bf16;
     std::vector<uint16_t> rocm_k = k_bf16;
     rocm::ROCmRoPEKernelT<ActivationPrecision::BF16> rocm_kernel;
+    DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
+    auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
+    ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
+    rocm_kernel.bindWorkspace(&workspace);
 
     uint16_t *d_q, *d_k;
     int *d_pos_ids;
@@ -595,6 +612,10 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP16_Small)
     std::vector<uint16_t> rocm_q = q_fp16;
     std::vector<uint16_t> rocm_k = k_fp16;
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP16> rocm_kernel;
+    DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
+    auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
+    ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
+    rocm_kernel.bindWorkspace(&workspace);
 
     uint16_t *d_q, *d_k;
     int *d_pos_ids;
@@ -674,6 +695,10 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP16_Large)
     std::vector<uint16_t> rocm_q = q_fp16;
     std::vector<uint16_t> rocm_k = k_fp16;
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP16> rocm_kernel;
+    DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
+    auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
+    ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
+    rocm_kernel.bindWorkspace(&workspace);
 
     uint16_t *d_q, *d_k;
     int *d_pos_ids;

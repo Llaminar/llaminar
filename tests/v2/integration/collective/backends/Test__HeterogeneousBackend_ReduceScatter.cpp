@@ -574,8 +574,8 @@ namespace llaminar2::test
         EXPECT_FALSE(analysis.is_rocm_singleton);
         EXPECT_EQ(analysis.gcd, 1); // GCD(1, 2) = 1
 
-        // Currently falls back to standard (partial RS not yet implemented)
-        EXPECT_EQ(analysis.pattern, HeterogeneousBackend::AllreducePattern::STANDARD_3PHASE);
+        // For singleton configs (1+N or N+1) with large tensors, partial RS is preferred
+        EXPECT_EQ(analysis.pattern, HeterogeneousBackend::AllreducePattern::PARTIAL_REDUCE_SCATTER);
         EXPECT_EQ(analysis.bridge_parallelism, 1.0); // Single bridge bottleneck
 
         LOG_INFO("TopologyAnalysis 1+2: " << analysis.reason);

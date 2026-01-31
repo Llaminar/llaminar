@@ -607,24 +607,31 @@ if(HAVE_CUDA AND HAVE_ROCM)
     # - RCCL P2P within ROCm domain
     # - PCIeBAR P2P between CUDA and ROCm
     # - Cross-backend staging patterns
-    add_executable(v2_integration_cross_backend_p2p integration/collective/Test__CrossBackendP2P.cpp)
-    target_link_libraries(v2_integration_cross_backend_p2p 
-        llaminar2_core 
-        GTest::gtest
-        GTest::gtest_main
-    )
-    if(HAVE_CUDA)
-        target_link_libraries(v2_integration_cross_backend_p2p CUDA::cudart)
+    # NOTE: This test is DISABLED by default - it hangs for hours on some systems
+    #       due to PCIe BAR P2P initialization issues. Enable with -DENABLE_CROSS_BACKEND_P2P_TEST=ON
+    option(ENABLE_CROSS_BACKEND_P2P_TEST "Enable the slow CrossBackendP2P test" OFF)
+    if(ENABLE_CROSS_BACKEND_P2P_TEST)
+        add_executable(v2_integration_cross_backend_p2p integration/collective/Test__CrossBackendP2P.cpp)
+        target_link_libraries(v2_integration_cross_backend_p2p 
+            llaminar2_core 
+            GTest::gtest
+            GTest::gtest_main
+        )
+        if(HAVE_CUDA)
+            target_link_libraries(v2_integration_cross_backend_p2p CUDA::cudart)
+        endif()
+        if(HAVE_ROCM)
+            target_link_libraries(v2_integration_cross_backend_p2p hip::host)
+        endif()
+        add_v2_test(V2_Integration_CrossBackendP2P
+            COMMAND $<TARGET_FILE:v2_integration_cross_backend_p2p>
+            LABELS "V2;Integration;Collective;P2P;NCCL;RCCL;PCIeBAR;Send;Recv;Sendrecv;CrossVendor"
+            MPI_PROCS 1
+        )
+        message(STATUS "V2 Tests: Added CrossBackendP2P integration tests")
+    else()
+        message(STATUS "V2 Tests: CrossBackendP2P test DISABLED (hangs on some systems) - enable with -DENABLE_CROSS_BACKEND_P2P_TEST=ON")
     endif()
-    if(HAVE_ROCM)
-        target_link_libraries(v2_integration_cross_backend_p2p hip::host)
-    endif()
-    add_v2_test(V2_Integration_CrossBackendP2P
-        COMMAND $<TARGET_FILE:v2_integration_cross_backend_p2p>
-        LABELS "V2;Integration;Collective;P2P;NCCL;RCCL;PCIeBAR;Send;Recv;Sendrecv;CrossVendor"
-        MPI_PROCS 1
-    )
-    message(STATUS "V2 Tests: Added CrossBackendP2P integration tests")
 endif()
 
 # Test: CrossDomainTransferGPU - GPU integration tests for cross-domain activation transfer

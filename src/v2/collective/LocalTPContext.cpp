@@ -180,6 +180,34 @@ namespace llaminar2
         // Instead, use the barrier-synchronized approach where all device threads
         // rendezvous, collect their buffers, then the last arrival executes
         // allreduceMulti with all buffers.
+        // ================================================================
+        // PCIeBAR Backend: Use barrier-synchronized allreduce
+        // ================================================================
+        // CRITICAL: This check MUST happen BEFORE ensureOnDevice() because:
+        // - Multiple threads call allreduce() concurrently, each with their OWN tensor
+        // - Each thread may be running on behalf of a different device (CUDA:0 or ROCm:0)
+        // - We cannot know which device "this thread" is without the barrier rendezvous
+        // - If we call ensureOnDevice(devices_[0]) here, ALL threads would upload to CUDA:0
+        // - The allreduceWithBarrier path handles device placement correctly via stage registration
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+        if (backend_ == CollectiveBackendType::PCIE_BAR && degree() > 1)
+        {
+            // Release the main mutex before entering barrier (to avoid deadlock)
+            // The barrier has its own mutex for synchronization
+            lock.unlock();
+            return allreduceWithBarrier(tensor, stage_name, effective_count);
+        }
+#endif
+
+        // ================================================================
+        // Multi-GPU Backends (NCCL/RCCL): Use barrier-synchronized allreduce
+        // ================================================================
+        // For LOCAL TP with multiple threads (one per device), each thread calls
+        // allreduce() with its OWN tensor. We CANNOT use getDeviceBuffers() on a
+        // single tensor because TensorBase can only be on ONE GPU at a time.
+        // Instead, use the barrier-synchronized approach where all device threads
+        // rendezvous, collect their buffers, then the last arrival executes
+        // allreduceMulti with all buffers.
         if (backend_impl_->isMultiGpuSingleProcess() && degree() > 1)
         {
             // Release the main mutex before entering barrier (to avoid deadlock)
@@ -207,23 +235,6 @@ namespace llaminar2
 
             size_t reduce_count = effective_count;
             CollectiveDataType dtype = tensorDTypeToCollective(tensor);
-
-            // ================================================================
-            // PCIeBAR Backend: Use barrier-synchronized allreduce
-            // ================================================================
-            // For heterogeneous GPU setups (CUDA + ROCm), multiple threads call
-            // allreduce() concurrently from different devices. We need NCCL-style
-            // collective semantics where all devices must arrive at the allreduce
-            // before any data transfer happens. Use barrier-synchronized path.
-#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-            if (backend_ == CollectiveBackendType::PCIE_BAR && degree() > 1)
-            {
-                // Release the main mutex before entering barrier (to avoid deadlock)
-                // The barrier has its own mutex for synchronization
-                lock.unlock();
-                return allreduceWithBarrier(tensor, stage_name, effective_count);
-            }
-#endif
 
             LOG_DEBUG("LocalTPContext::allreduce: Single-buffer allreduce with "
                       << reduce_count << " elements (tensor numel=" << tensor->numel() << ")");

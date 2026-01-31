@@ -24,6 +24,7 @@
 // Include project headers BEFORE CUDATestUtils.h
 #include "tensors/Tensors.h"
 #include "execution/config/RuntimeConfig.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
@@ -711,8 +712,14 @@ TEST_F(Test__CUDAOpsParity, RoPE_FP32_Small)
     cpu_kernel.apply_typed(cpu_q.data(), cpu_k.data(), position_ids.data(),
                            seq_len, n_heads, n_heads, head_dim, rope_theta, -1);
 
-    // CUDA kernel
+    // CUDA kernel with workspace
     llaminar2::cuda::CUDARoPEKernelT<ActivationPrecision::FP32> cuda_kernel;
+
+    // Set up workspace for RoPE kernel
+    DeviceWorkspaceManager workspace(DeviceId::cuda(0), 16 * 1024 * 1024); // 16MB
+    auto reqs = cuda_kernel.getWorkspaceRequirements(seq_len);
+    ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
+    cuda_kernel.bindWorkspace(&workspace);
 
     float *d_q, *d_k;
     int *d_pos_ids;
@@ -787,6 +794,12 @@ TEST_F(Test__CUDAOpsParity, RoPE_FP32_Large)
                            seq_len, n_heads, n_kv_heads, head_dim, rope_theta, -1);
 
     llaminar2::cuda::CUDARoPEKernelT<ActivationPrecision::FP32> cuda_kernel;
+
+    // Set up workspace for RoPE kernel
+    DeviceWorkspaceManager workspace(DeviceId::cuda(0), 16 * 1024 * 1024); // 16MB
+    auto reqs = cuda_kernel.getWorkspaceRequirements(seq_len);
+    ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
+    cuda_kernel.bindWorkspace(&workspace);
 
     float *d_q, *d_k;
     int *d_pos_ids;

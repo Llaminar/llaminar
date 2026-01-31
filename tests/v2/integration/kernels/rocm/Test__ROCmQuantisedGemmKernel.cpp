@@ -78,7 +78,7 @@ extern "C"
         int rocm_device_id);
 
     // Memory management
-    void rocmQuantGemm_freeDevice(void *d_ptr);
+    void rocmQuantGemm_freeDevice(void *d_ptr, int rocm_device_id);
     bool rocmQuantGemm_copyHostToDevice(float *d_dst, const float *h_src, size_t count, int rocm_device_id);
     bool rocmQuantGemm_copyDeviceToHost(float *h_dst, const float *d_src, size_t count, int rocm_device_id);
     bool rocmQuantGemm_allocFloat(float **d_ptr, size_t count, int rocm_device_id);
@@ -563,10 +563,10 @@ namespace llaminar2
                 }
 
                 // Cleanup
-                rocmQuantGemm_freeDevice(d_activations);
-                rocmQuantGemm_freeDevice(d_A_int8);
-                rocmQuantGemm_freeDevice(d_scales_A);
-                rocmQuantGemm_freeDevice(d_C_int32);
+                rocmQuantGemm_freeDevice(d_activations, 0);
+                rocmQuantGemm_freeDevice(d_A_int8, 0);
+                rocmQuantGemm_freeDevice(d_scales_A, 0);
+                rocmQuantGemm_freeDevice(d_C_int32, 0);
             }
 
             // =====================================================================
@@ -673,9 +673,9 @@ namespace llaminar2
 
                 EXPECT_EQ(mismatch_count, 0) << "Base GEMM should produce exact INT32 results";
 
-                rocmQuantGemm_freeDevice(d_A);
-                rocmQuantGemm_freeDevice(d_B);
-                rocmQuantGemm_freeDevice(d_C);
+                rocmQuantGemm_freeDevice(d_A, 0);
+                rocmQuantGemm_freeDevice(d_B, 0);
+                rocmQuantGemm_freeDevice(d_C, 0);
             }
 
             // =====================================================================
@@ -758,11 +758,11 @@ namespace llaminar2
                 // Two-Kernel path should have very high accuracy (>0.9999)
                 EXPECT_GT(cos, 0.9999f) << "Two-Kernel path cosine similarity too low";
 
-                rocmQuantGemm_freeDevice(d_A);
-                rocmQuantGemm_freeDevice(d_B);
-                rocmQuantGemm_freeDevice(d_scaleA);
-                rocmQuantGemm_freeDevice(d_scaleB);
-                rocmQuantGemm_freeDevice(d_E);
+                rocmQuantGemm_freeDevice(d_A, 0);
+                rocmQuantGemm_freeDevice(d_B, 0);
+                rocmQuantGemm_freeDevice(d_scaleA, 0);
+                rocmQuantGemm_freeDevice(d_scaleB, 0);
+                rocmQuantGemm_freeDevice(d_E, 0);
             }
 
             /**
@@ -814,10 +814,10 @@ namespace llaminar2
                 }
 
                 // Cleanup
-                rocmQuantGemm_freeDevice(d_activations);
-                rocmQuantGemm_freeDevice(d_A_int8);
-                rocmQuantGemm_freeDevice(d_scales_A);
-                rocmQuantGemm_freeDevice(d_C_int32);
+                rocmQuantGemm_freeDevice(d_activations, 0);
+                rocmQuantGemm_freeDevice(d_A_int8, 0);
+                rocmQuantGemm_freeDevice(d_scales_A, 0);
+                rocmQuantGemm_freeDevice(d_C_int32, 0);
             }
 
             /**
@@ -876,10 +876,10 @@ namespace llaminar2
                 }
 
                 // Cleanup
-                rocmQuantGemm_freeDevice(d_activations);
-                rocmQuantGemm_freeDevice(d_A_int8);
-                rocmQuantGemm_freeDevice(d_scales_A);
-                rocmQuantGemm_freeDevice(d_C_int32);
+                rocmQuantGemm_freeDevice(d_activations, 0);
+                rocmQuantGemm_freeDevice(d_A_int8, 0);
+                rocmQuantGemm_freeDevice(d_scales_A, 0);
+                rocmQuantGemm_freeDevice(d_C_int32, 0);
             }
 
             /**
@@ -951,10 +951,10 @@ namespace llaminar2
                 LOG_INFO("[Integration] Reconstruction: max_error=" << max_error << ", avg_error=" << avg_error);
 
                 // Cleanup
-                rocmQuantGemm_freeDevice(d_activations);
-                rocmQuantGemm_freeDevice(d_A_int8);
-                rocmQuantGemm_freeDevice(d_scales_A);
-                rocmQuantGemm_freeDevice(d_C_int32);
+                rocmQuantGemm_freeDevice(d_activations, 0);
+                rocmQuantGemm_freeDevice(d_A_int8, 0);
+                rocmQuantGemm_freeDevice(d_scales_A, 0);
+                rocmQuantGemm_freeDevice(d_C_int32, 0);
             }
 
             // =====================================================================
@@ -992,9 +992,9 @@ namespace llaminar2
                 EXPECT_GE(work_buffer_M, M);
 
                 // Cleanup
-                rocmQuantGemm_freeDevice(d_A_int8);
-                rocmQuantGemm_freeDevice(d_scales_A);
-                rocmQuantGemm_freeDevice(d_C_int32);
+                rocmQuantGemm_freeDevice(d_A_int8, 0);
+                rocmQuantGemm_freeDevice(d_scales_A, 0);
+                rocmQuantGemm_freeDevice(d_C_int32, 0);
             }
 
             /**
@@ -1039,9 +1039,9 @@ namespace llaminar2
                 EXPECT_GE(work_buffer_M, 256);
 
                 // Cleanup
-                rocmQuantGemm_freeDevice(d_A_int8);
-                rocmQuantGemm_freeDevice(d_scales_A);
-                rocmQuantGemm_freeDevice(d_C_int32);
+                rocmQuantGemm_freeDevice(d_A_int8, 0);
+                rocmQuantGemm_freeDevice(d_scales_A, 0);
+                rocmQuantGemm_freeDevice(d_C_int32, 0);
             }
 
             // =====================================================================
@@ -1521,10 +1521,10 @@ namespace llaminar2
                                                                  << " → INT8, max_error=" << max_error);
 
                 // Cleanup
-                rocmQuantGemm_freeDevice(d_activations);
-                rocmQuantGemm_freeDevice(d_A_int8);
-                rocmQuantGemm_freeDevice(d_scales_A);
-                rocmQuantGemm_freeDevice(d_C_int32);
+                rocmQuantGemm_freeDevice(d_activations, 0);
+                rocmQuantGemm_freeDevice(d_A_int8, 0);
+                rocmQuantGemm_freeDevice(d_scales_A, 0);
+                rocmQuantGemm_freeDevice(d_C_int32, 0);
             }
 
             /**
@@ -1588,10 +1588,10 @@ namespace llaminar2
                         << "Failed to quantize activations for " << tc.name;
 
                     // Cleanup
-                    rocmQuantGemm_freeDevice(d_activations);
-                    rocmQuantGemm_freeDevice(d_A_int8);
-                    rocmQuantGemm_freeDevice(d_scales_A);
-                    rocmQuantGemm_freeDevice(d_C_int32);
+                    rocmQuantGemm_freeDevice(d_activations, 0);
+                    rocmQuantGemm_freeDevice(d_A_int8, 0);
+                    rocmQuantGemm_freeDevice(d_scales_A, 0);
+                    rocmQuantGemm_freeDevice(d_C_int32, 0);
                 }
             }
 
@@ -1641,13 +1641,13 @@ namespace llaminar2
                         d_activations, d_A_int8, d_scales_A, M, K, 0))
                         << "Failed to quantize for M=" << M;
 
-                    rocmQuantGemm_freeDevice(d_activations);
+                    rocmQuantGemm_freeDevice(d_activations, 0);
                 }
 
                 // Cleanup shared buffers
-                rocmQuantGemm_freeDevice(d_A_int8);
-                rocmQuantGemm_freeDevice(d_scales_A);
-                rocmQuantGemm_freeDevice(d_C_int32);
+                rocmQuantGemm_freeDevice(d_A_int8, 0);
+                rocmQuantGemm_freeDevice(d_scales_A, 0);
+                rocmQuantGemm_freeDevice(d_C_int32, 0);
 
                 LOG_INFO("[Integration] Tested batch sizes: 1 to 2048");
             }
@@ -1741,12 +1741,12 @@ namespace llaminar2
                 LOG_INFO("[Integration] Bias scaling match rate: " << (match_rate * 100.0f) << "%");
 
                 // Cleanup
-                rocmQuantGemm_freeDevice(d_C_int32);
-                rocmQuantGemm_freeDevice(d_C_fp32_no_bias);
-                rocmQuantGemm_freeDevice(d_C_fp32_with_bias);
-                rocmQuantGemm_freeDevice(d_scales_A);
-                rocmQuantGemm_freeDevice(d_scales_B);
-                rocmQuantGemm_freeDevice(d_bias);
+                rocmQuantGemm_freeDevice(d_C_int32, 0);
+                rocmQuantGemm_freeDevice(d_C_fp32_no_bias, 0);
+                rocmQuantGemm_freeDevice(d_C_fp32_with_bias, 0);
+                rocmQuantGemm_freeDevice(d_scales_A, 0);
+                rocmQuantGemm_freeDevice(d_scales_B, 0);
+                rocmQuantGemm_freeDevice(d_bias, 0);
             }
 
             /**
@@ -1799,10 +1799,10 @@ namespace llaminar2
 
                 EXPECT_EQ(matches, M * N) << "Alpha scaling incorrect";
 
-                rocmQuantGemm_freeDevice(d_C_int32);
-                rocmQuantGemm_freeDevice(d_C_fp32);
-                rocmQuantGemm_freeDevice(d_scales_A);
-                rocmQuantGemm_freeDevice(d_scales_B);
+                rocmQuantGemm_freeDevice(d_C_int32, 0);
+                rocmQuantGemm_freeDevice(d_C_fp32, 0);
+                rocmQuantGemm_freeDevice(d_scales_A, 0);
+                rocmQuantGemm_freeDevice(d_scales_B, 0);
             }
 
             // MScaling tests removed - covered by decode/prefill tests above

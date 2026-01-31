@@ -690,11 +690,7 @@ namespace llaminar2
         if (world_size_ > 1)
         {
             builder.setName("global_mpi_group")
-                .setScope(CollectiveScope::GLOBAL)
-                // local_rank is the index into devices[], not the MPI rank.
-                // Since we add only the tensor_device (1 device), local_rank = 0.
-                // The MPI rank is used by the backend for comm coordination.
-                .setLocalRank(0);
+                .setScope(CollectiveScope::GLOBAL);
 
             // CRITICAL: Add ALL local devices to enable heterogeneous detection.
             // This allows the backend router to see if this node has both CUDA and ROCm,
@@ -702,21 +698,29 @@ namespace llaminar2
             //
             // The local_devices_ list contains all GPUs available to this rank,
             // populated from the cluster_inventory during construction.
-            bool added_any_gpu = false;
+            int gpu_count = 0;
             for (const auto &device : local_devices_)
             {
                 if (device.type == DeviceType::CUDA || device.type == DeviceType::ROCm)
                 {
                     builder.addDevice(device);
-                    added_any_gpu = true;
+                    gpu_count++;
                 }
             }
 
             // Fallback: if no GPUs in local_devices_, add the tensor device
-            if (!added_any_gpu)
+            if (gpu_count == 0)
             {
                 builder.addDevice(tensor_device);
+                gpu_count = 1;
             }
+
+            // local_rank determines which device this process uses in the group.
+            // For multi-process NCCL/RCCL, each rank should use a different GPU.
+            // Use MPI rank modulo number of devices to assign GPUs round-robin.
+            int mpi_rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+            int local_rank = mpi_rank % gpu_count;
+            builder.setLocalRank(local_rank);
         }
         else
         {
