@@ -249,7 +249,34 @@ public:
 
 ### 2.2 Factory Functions
 
+**Recommended: OrchestrationRunnerFactory** (Modern API)
+
+Location: `src/v2/execution/runner/IOrchestrationRunnerFactory.h`
+
+```cpp
+// Create factory instance
+auto factory = createOrchestrationRunnerFactory();
+
+// Simple runner with defaults
+auto runner = factory->createSimple("model.gguf", "cuda:0");
+
+// From full config
+OrchestrationConfig config;
+config.model_path = "model.gguf";
+config.tp_degree = 2;
+auto runner = factory->createFromOrchestrationConfig(config);
+
+// Usage
+runner->prefill(tokens);
+auto result = runner->decodeStep();
+```
+
+**Internal: InferenceRunnerFactory** (Legacy, for internal use only)
+
 Location: `src/v2/execution/factory/InferenceRunnerFactory.h`
+
+> **Note:** This factory is now an internal implementation detail used by OrchestrationRunner.
+> For new code, use `IOrchestrationRunnerFactory` or `TestOrchestrationHelper` instead.
 
 ```cpp
 // Standard factory - creates DeviceGraphOrchestrator with full model context

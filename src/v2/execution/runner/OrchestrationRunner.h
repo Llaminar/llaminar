@@ -27,8 +27,10 @@
 #include "../mpi_orchestration/DeviceInventory.h"
 #include "../local_execution/orchestrators/MultiDeviceOrchestrator.h"
 #include "../../collective/ILocalTPContext.h"
+#include "../../collective/ILocalPPContext.h"
 #include "../../loaders/ModelContext.h"
 #include "../../utils/MPIContext.h"
+#include "../../utils/Tokenizer.h"
 #include <memory>
 #include <mutex>
 #include <atomic>
@@ -137,6 +139,17 @@ namespace llaminar2
 
         const float *lastLogits() const override;
         void setStopTokens(const std::vector<int32_t> &stop_tokens) override;
+        std::shared_ptr<ITokenizer> tokenizer() const override;
+
+        // =====================================================================
+        // IOrchestrationRunner: Snapshot API
+        // =====================================================================
+
+        void enableSnapshotCapture(const std::string& output_dir = "") override;
+        void disableSnapshotCapture() override;
+        void clearSnapshots() override;
+        const float* getSnapshot(const std::string& key, size_t& out_size) const override;
+        std::vector<std::string> getSnapshotKeys() const override;
 
     private:
         // =====================================================================
@@ -157,6 +170,11 @@ namespace llaminar2
          * @brief Set up LOCAL TP context if enabled
          */
         bool setupLocalTPContext();
+
+        /**
+         * @brief Set up LOCAL PP context if enabled
+         */
+        bool setupLocalPPContext();
 
         /**
          * @brief Load model weights (partial for PP, sharded for TP)
@@ -262,6 +280,7 @@ namespace llaminar2
         std::shared_ptr<MPIContext> mpi_ctx_;
         std::shared_ptr<ModelContext> model_ctx_;
         std::unique_ptr<ILocalTPContext> local_tp_ctx_;
+        std::unique_ptr<ILocalPPContext> local_pp_ctx_;
 
         // Execution infrastructure
         std::unique_ptr<IInferenceRunner> runner_;
@@ -275,6 +294,7 @@ namespace llaminar2
         std::vector<int32_t> stop_tokens_;
         Sampler sampler_;
         int32_t last_token_{0}; // Last token for decode step
+        std::shared_ptr<ITokenizer> tokenizer_;
     };
 
 } // namespace llaminar2

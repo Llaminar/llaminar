@@ -55,15 +55,15 @@ See `.github/instructions/llaminar-architecture-v2.instructions.md` for a full-s
 
 ```bash
 # Debug build (for development and "V2_Unit*" unit tests)
-cmake -B build_v2 -S src/v2 -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake -B build_v2 -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 cmake --build build_v2 --parallel
 
 # Release build (for performance)
-cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release
+cmake -B build_v2_release -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build_v2_release --parallel
 
 # Integration build (for "V2_Integration*" integration tests with snapshots + debug symbols)
-cmake -B build_v2_integration -S src/v2 -DCMAKE_BUILD_TYPE=Integration
+cmake -B build_v2_integration -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Integration
 cmake --build build_v2_integration --parallel
 ```
 
@@ -84,6 +84,14 @@ cmake --build build_v2_integration --parallel
 | `HAVE_CUDA` | OFF | Enable CUDA backend |
 | `HAVE_ROCM` | OFF | Enable ROCm backend |
 | `ENABLE_SNAPSHOTS` | OFF | Enable tensor snapshot capture (auto-enabled for Debug/Integration) |
+
+**IMPORTANT: Use Ninja Generator**
+
+Always use `-G Ninja` when configuring builds. The Ninja generator is **required** for:
+- **nvlink job pool**: Limits concurrent CUDA/HIP device linking to 8 processes, preventing OOM during builds with 500+ test targets
+- **Faster builds**: Ninja has better parallelism and dependency tracking than Unix Makefiles
+
+If you see OOM errors during linking or excessive nvlink processes, verify you're using Ninja.
 
 ---
 
@@ -139,7 +147,7 @@ The orchestration system provides fine-grained control over device placement and
 **Tensor Parallelism**:
 | Option | Description | Example |
 |--------|-------------|----------|
-| `-t, --tp <degree>` | TP parallelism degree | `--tp 2` |
+| `-tp, --tensor-parallelism-degree <n>` | TP parallelism degree | `-tp 2` |
 | `--tp-scope <scope>` | Scope: `auto`, `local`, `global`, `hybrid` | `--tp-scope local` |
 | `--tp-devices <list>` | Explicit device list for LOCAL TP | `--tp-devices "cuda:0,cuda:1"` |
 | `--tp-weights <list>` | Proportional weight distribution | `--tp-weights "0.73,0.27"` |
@@ -149,7 +157,7 @@ The orchestration system provides fine-grained control over device placement and
 **Pipeline Parallelism**:
 | Option | Description | Example |
 |--------|-------------|----------|
-| `-p, --pp <degree>` | PP parallelism degree | `--pp 2` |
+| `-pp, --pipeline-parallelism-degree <n>` | PP parallelism degree | `-pp 2` |
 | `--pp-split <mode>` | Layer split: `equal`, `weighted`, `manual` | `--pp-split weighted` |
 
 **Layer Placement**:
@@ -168,7 +176,7 @@ Valid backends: `auto`, `nccl`, `rccl`, `pcie_bar`, `upi`, `mpi`, `host`
 **Configuration File**:
 | Option | Description | Example |
 |--------|-------------|----------|
-| `-c, --config <path>` | Load configuration from YAML file | `--config orchestration.yaml` |
+| `--config <path>` | Load configuration from YAML file | `--config orchestration.yaml` |
 
 ### Named Domains (Advanced)
 
@@ -360,7 +368,7 @@ grep -A 50 "Program received signal" gdb_output.log
 ### ASAN for Memory Issues
 
 ```bash
-cmake -B build_v2_asan -S src/v2 -DCMAKE_BUILD_TYPE=Debug \
+cmake -B build_v2_asan -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_CXX_FLAGS="-g3 -O0 -fno-omit-frame-pointer -fsanitize=address" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
 cmake --build build_v2_asan --parallel
@@ -672,7 +680,7 @@ All parity tests are located in `tests/v2/integration/parity/` with a comprehens
 **Running Parity Tests**:
 ```bash
 # Build integration tests (includes parity tests)
-cmake -B build_v2_integration -S src/v2 -DCMAKE_BUILD_TYPE=Integration
+cmake -B build_v2_integration -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Integration
 cmake --build build_v2_integration --parallel
 
 # Run all parity tests
@@ -1170,7 +1178,7 @@ With 2-way TP: ~50% reduction for sharded weights, ~25-30% overall.
 
 ```bash
 # 2-way LOCAL TP on CUDA GPUs (auto-detects NCCL)
-./build_v2_release/llaminar2 --tp 2 --tp-scope local -m model.gguf -p "Hello"
+./build_v2_release/llaminar2 -tp 2 --tp-scope local -m model.gguf -p "Hello"
 
 # Explicit device list for LOCAL TP
 ./build_v2_release/llaminar2 --tp-devices "cuda:0,cuda:1" -m model.gguf -p "Hello"
@@ -1179,7 +1187,7 @@ With 2-way TP: ~50% reduction for sharded weights, ~25-30% overall.
 ./build_v2_release/llaminar2 --tp-devices "cuda:0,rocm:0" --tp-weights "0.73,0.27" -m model.gguf -p "Hello"
 
 # Preview TP configuration without running
-./build_v2_release/llaminar2 --tp 4 --tp-scope local --explain-placement --dry-run -m model.gguf
+./build_v2_release/llaminar2 -tp 4 --tp-scope local --explain-placement --dry-run -m model.gguf
 ```
 
 ### YAML Configuration
@@ -1582,12 +1590,13 @@ LLAMINAR_TRACE_TRANSFERS_MIN_BYTES=1000000 \
 | `src/v2/inference/` | IInferenceRunner interface and factory |
 | `src/v2/execution/` | ComputeGraph, GraphExecutor, ComputeStages |
 | `src/v2/pipelines/qwen/` | GraphOrchestrator, Qwen2Graph, buffer specs |
+| `src/v2/config/` | OrchestrationConfig, OrchestrationConfigParser (CLI/YAML parsing) |
 | `src/v2/kernels/cpu/` | CPU kernels (GEMM, attention, primitives) |
 | `src/v2/kernels/cpu/jit/` | JIT infrastructure (RegisterGuard, RegisterAllocation, JitMicrokernelBase) |
 | `src/v2/kernels/cpu/attention/q8_1/jit/` | JIT attention microkernels (Q8DotProduct, OnlineSoftmax, etc.) |
 | `src/v2/tensors/` | Tensor types (FP32, BF16, quantized) |
 | `src/v2/loaders/` | GGUF loading, WeightManager |
-| `src/v2/utils/` | MPIContext, MPITopology, logging |
+| `src/v2/utils/` | MPIContext, MPITopology, Tokenizer, Sampler, logging |
 | `src/v2/cmake/` | CMake modules (EnforceTypedRegisters, etc.) |
 
 ### Writing Changelogs

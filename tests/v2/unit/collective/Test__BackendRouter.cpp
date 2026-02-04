@@ -967,4 +967,291 @@ namespace llaminar2::test
         EXPECT_EQ(backend->type(), CollectiveBackendType::MPI);
     }
 
+    // =========================================================================
+    // Pre-initialization tests
+    //
+    // These tests verify that BackendRouter uses the injected ClusterInventory
+    // for pre-initialization instead of the DeviceManager singleton, enabling
+    // unit testing without real hardware.
+    // =========================================================================
+
+    TEST_F(Test__BackendRouter, PreInitSkipsNCCLWhenNoDevicesInInventory)
+    {
+        // Setup: Empty cluster inventory (no GPUs)
+        cluster_inventory_.world_size = 1;
+        cluster_inventory_.node_count = 1;
+        cluster_inventory_.ranks.clear();
+
+        // Add rank 0 with NO GPUs
+        RankInventory rank0;
+        rank0.rank = 0;
+        rank0.node_id = 0;
+        rank0.local_rank = 0;
+        // rank0.gpus is empty
+        cluster_inventory_.ranks.push_back(rank0);
+
+        auto factory = std::make_unique<MockBackendFactory>();
+        auto *mock_nccl = factory->addMockBackend(CollectiveBackendType::NCCL);
+        mock_nccl->setAvailable(true);
+
+        // Create router - pre-init runs in constructor
+        auto router = createRouter(std::move(factory));
+
+        // Verify NCCL initialize() was NOT called (no CUDA devices in inventory)
+        EXPECT_FALSE(mock_nccl->wasInitialized())
+            << "NCCL should NOT be initialized when no CUDA devices in inventory";
+    }
+
+    TEST_F(Test__BackendRouter, PreInitSkipsRCCLWhenNoDevicesInInventory)
+    {
+        // Setup: Empty cluster inventory (no GPUs)
+        cluster_inventory_.world_size = 1;
+        cluster_inventory_.node_count = 1;
+        cluster_inventory_.ranks.clear();
+
+        // Add rank 0 with NO GPUs
+        RankInventory rank0;
+        rank0.rank = 0;
+        rank0.node_id = 0;
+        rank0.local_rank = 0;
+        // rank0.gpus is empty
+        cluster_inventory_.ranks.push_back(rank0);
+
+        auto factory = std::make_unique<MockBackendFactory>();
+        auto *mock_rccl = factory->addMockBackend(CollectiveBackendType::RCCL);
+        mock_rccl->setAvailable(true);
+
+        // Create router - pre-init runs in constructor
+        auto router = createRouter(std::move(factory));
+
+        // Verify RCCL initialize() was NOT called (no ROCm devices in inventory)
+        EXPECT_FALSE(mock_rccl->wasInitialized())
+            << "RCCL should NOT be initialized when no ROCm devices in inventory";
+    }
+
+#ifdef HAVE_NCCL
+    TEST_F(Test__BackendRouter, PreInitializesNCCLWithCUDADevicesFromInventory)
+    {
+        // Setup: Cluster inventory with CUDA devices
+        cluster_inventory_.world_size = 1;
+        cluster_inventory_.node_count = 1;
+        cluster_inventory_.ranks.clear();
+
+        RankInventory rank0;
+        rank0.rank = 0;
+        rank0.node_id = 0;
+        rank0.local_rank = 0;
+
+        // Add 2 CUDA GPUs to inventory
+        DeviceInfo cuda0;
+        cuda0.type = DeviceType::CUDA;
+        cuda0.local_device_id = 0;
+        cuda0.name = "TestGPU0";
+        rank0.gpus.push_back(cuda0);
+
+        DeviceInfo cuda1;
+        cuda1.type = DeviceType::CUDA;
+        cuda1.local_device_id = 1;
+        cuda1.name = "TestGPU1";
+        rank0.gpus.push_back(cuda1);
+
+        cluster_inventory_.ranks.push_back(rank0);
+        cluster_inventory_.total_gpus = 2;
+
+        auto factory = std::make_unique<MockBackendFactory>();
+        factory->setAvailable(CollectiveBackendType::NCCL, true);
+        auto *mock_nccl = factory->addMockBackend(CollectiveBackendType::NCCL);
+        mock_nccl->setAvailable(true);
+
+        // Create router - pre-init runs in constructor
+        auto router = createRouter(std::move(factory));
+
+        // Verify NCCL initialize() WAS called with CUDA devices from inventory
+        EXPECT_TRUE(mock_nccl->wasInitialized())
+            << "NCCL should be initialized when CUDA devices in inventory";
+
+        // Verify it was initialized with correct group (2 CUDA devices)
+        const auto &init_group = mock_nccl->initGroup();
+        EXPECT_EQ(init_group.devices.size(), 2u);
+        EXPECT_EQ(init_group.devices[0], DeviceId::cuda(0));
+        EXPECT_EQ(init_group.devices[1], DeviceId::cuda(1));
+    }
+#endif // HAVE_NCCL
+
+#ifdef HAVE_RCCL
+    TEST_F(Test__BackendRouter, PreInitializesRCCLWithROCmDevicesFromInventory)
+    {
+        // Setup: Cluster inventory with ROCm devices
+        cluster_inventory_.world_size = 1;
+        cluster_inventory_.node_count = 1;
+        cluster_inventory_.ranks.clear();
+
+        RankInventory rank0;
+        rank0.rank = 0;
+        rank0.node_id = 0;
+        rank0.local_rank = 0;
+
+        // Add 2 ROCm GPUs to inventory
+        DeviceInfo rocm0;
+        rocm0.type = DeviceType::ROCm;
+        rocm0.local_device_id = 0;
+        rocm0.name = "TestMI100_0";
+        rank0.gpus.push_back(rocm0);
+
+        DeviceInfo rocm1;
+        rocm1.type = DeviceType::ROCm;
+        rocm1.local_device_id = 1;
+        rocm1.name = "TestMI100_1";
+        rank0.gpus.push_back(rocm1);
+
+        cluster_inventory_.ranks.push_back(rank0);
+        cluster_inventory_.total_gpus = 2;
+
+        auto factory = std::make_unique<MockBackendFactory>();
+        factory->setAvailable(CollectiveBackendType::RCCL, true);
+        auto *mock_rccl = factory->addMockBackend(CollectiveBackendType::RCCL);
+        mock_rccl->setAvailable(true);
+
+        // Create router - pre-init runs in constructor
+        auto router = createRouter(std::move(factory));
+
+        // Verify RCCL initialize() WAS called with ROCm devices from inventory
+        EXPECT_TRUE(mock_rccl->wasInitialized())
+            << "RCCL should be initialized when ROCm devices in inventory";
+
+        // Verify it was initialized with correct group (2 ROCm devices)
+        const auto &init_group = mock_rccl->initGroup();
+        EXPECT_EQ(init_group.devices.size(), 2u);
+        EXPECT_EQ(init_group.devices[0], DeviceId::rocm(0));
+        EXPECT_EQ(init_group.devices[1], DeviceId::rocm(1));
+    }
+#endif // HAVE_RCCL
+
+#if defined(HAVE_NCCL) && defined(HAVE_RCCL)
+    TEST_F(Test__BackendRouter, PreInitializesBothBackendsWithMixedInventory)
+    {
+        // Setup: Cluster inventory with both CUDA and ROCm devices
+        cluster_inventory_.world_size = 1;
+        cluster_inventory_.node_count = 1;
+        cluster_inventory_.ranks.clear();
+
+        RankInventory rank0;
+        rank0.rank = 0;
+        rank0.node_id = 0;
+        rank0.local_rank = 0;
+
+        // Add 1 CUDA and 1 ROCm GPU
+        DeviceInfo cuda0;
+        cuda0.type = DeviceType::CUDA;
+        cuda0.local_device_id = 0;
+        cuda0.name = "NVIDIA A100";
+        rank0.gpus.push_back(cuda0);
+
+        DeviceInfo rocm0;
+        rocm0.type = DeviceType::ROCm;
+        rocm0.local_device_id = 0;
+        rocm0.name = "AMD MI250";
+        rank0.gpus.push_back(rocm0);
+
+        cluster_inventory_.ranks.push_back(rank0);
+        cluster_inventory_.total_gpus = 2;
+
+        auto factory = std::make_unique<MockBackendFactory>();
+        factory->setAvailable(CollectiveBackendType::NCCL, true);
+        factory->setAvailable(CollectiveBackendType::RCCL, true);
+        auto *mock_nccl = factory->addMockBackend(CollectiveBackendType::NCCL);
+        auto *mock_rccl = factory->addMockBackend(CollectiveBackendType::RCCL);
+        mock_nccl->setAvailable(true);
+        mock_rccl->setAvailable(true);
+
+        // Create router - pre-init runs in constructor
+        auto router = createRouter(std::move(factory));
+
+        // Verify BOTH backends were initialized
+        EXPECT_TRUE(mock_nccl->wasInitialized())
+            << "NCCL should be initialized (CUDA device in inventory)";
+        EXPECT_TRUE(mock_rccl->wasInitialized())
+            << "RCCL should be initialized (ROCm device in inventory)";
+
+        // Verify each was initialized with correct device type only
+        const auto &nccl_group = mock_nccl->initGroup();
+        EXPECT_EQ(nccl_group.devices.size(), 1u);
+        EXPECT_EQ(nccl_group.devices[0], DeviceId::cuda(0));
+
+        const auto &rccl_group = mock_rccl->initGroup();
+        EXPECT_EQ(rccl_group.devices.size(), 1u);
+        EXPECT_EQ(rccl_group.devices[0], DeviceId::rocm(0));
+    }
+#endif // HAVE_NCCL && HAVE_RCCL
+
+    TEST_F(Test__BackendRouter, PreInitNCCLOnlyInitializesCUDANotROCm)
+    {
+        // Setup: Inventory with ONLY ROCm devices
+        cluster_inventory_.world_size = 1;
+        cluster_inventory_.node_count = 1;
+        cluster_inventory_.ranks.clear();
+
+        RankInventory rank0;
+        rank0.rank = 0;
+        rank0.node_id = 0;
+        rank0.local_rank = 0;
+
+        // Add ROCm GPU only
+        DeviceInfo rocm0;
+        rocm0.type = DeviceType::ROCm;
+        rocm0.local_device_id = 0;
+        rocm0.name = "AMD MI250";
+        rank0.gpus.push_back(rocm0);
+
+        cluster_inventory_.ranks.push_back(rank0);
+        cluster_inventory_.total_gpus = 1;
+
+        auto factory = std::make_unique<MockBackendFactory>();
+        factory->setAvailable(CollectiveBackendType::NCCL, true);
+        auto *mock_nccl = factory->addMockBackend(CollectiveBackendType::NCCL);
+        mock_nccl->setAvailable(true);
+
+        // Create router - pre-init runs in constructor
+        auto router = createRouter(std::move(factory));
+
+        // Verify NCCL initialize() was NOT called (no CUDA devices)
+        EXPECT_FALSE(mock_nccl->wasInitialized())
+            << "NCCL should NOT be initialized when only ROCm devices in inventory";
+    }
+
+    TEST_F(Test__BackendRouter, PreInitRCCLOnlyInitializesROCmNotCUDA)
+    {
+        // Setup: Inventory with ONLY CUDA devices
+        cluster_inventory_.world_size = 1;
+        cluster_inventory_.node_count = 1;
+        cluster_inventory_.ranks.clear();
+
+        RankInventory rank0;
+        rank0.rank = 0;
+        rank0.node_id = 0;
+        rank0.local_rank = 0;
+
+        // Add CUDA GPU only
+        DeviceInfo cuda0;
+        cuda0.type = DeviceType::CUDA;
+        cuda0.local_device_id = 0;
+        cuda0.name = "NVIDIA A100";
+        rank0.gpus.push_back(cuda0);
+
+        cluster_inventory_.ranks.push_back(rank0);
+        cluster_inventory_.total_gpus = 1;
+
+        auto factory = std::make_unique<MockBackendFactory>();
+        factory->setAvailable(CollectiveBackendType::RCCL, true);
+        auto *mock_rccl = factory->addMockBackend(CollectiveBackendType::RCCL);
+        mock_rccl->setAvailable(true);
+
+        // Create router - pre-init runs in constructor
+        auto router = createRouter(std::move(factory));
+
+        // Verify RCCL initialize() was NOT called (no ROCm devices)
+        EXPECT_FALSE(mock_rccl->wasInitialized())
+            << "RCCL should NOT be initialized when only CUDA devices in inventory";
+    }
+
 } // namespace llaminar2::test

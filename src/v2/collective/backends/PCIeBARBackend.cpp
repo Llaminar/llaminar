@@ -1854,6 +1854,132 @@ namespace llaminar2
         return result.success;
     }
 
+    // =========================================================================
+    // Direct Device-to-Device Copy Operations
+    // =========================================================================
+
+    std::optional<size_t> PCIeBARBackend::findBarOffset(const void *ptr, size_t size) const
+    {
+        if (!ptr || !bar_host_ptr_)
+        {
+            return std::nullopt;
+        }
+
+        // Check if pointer is within BAR region
+        const char *bar_start = static_cast<const char *>(bar_host_ptr_);
+        const char *bar_end = bar_start + bar_total_mapped_size_;
+        const char *target = static_cast<const char *>(ptr);
+
+        if (target >= bar_start && target < bar_end)
+        {
+            size_t offset = static_cast<size_t>(target - bar_start);
+            // Bounds check
+            if (offset + size <= bar_total_mapped_size_)
+            {
+                return offset;
+            }
+        }
+
+        // Also check our tracked allocations for exact matches
+        for (const auto &alloc : bar_allocations_)
+        {
+            if (alloc.ptr == ptr && alloc.size >= size)
+            {
+                return alloc.offset;
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    bool PCIeBARBackend::copy(
+        void *dst_ptr, DeviceId dst_device,
+        const void *src_ptr, DeviceId src_device,
+        size_t bytes)
+    {
+        if (bytes == 0)
+        {
+            return true;
+        }
+        if (!dst_ptr || !src_ptr)
+        {
+            LOG_ERROR("PCIeBARBackend::copy: Null pointer provided");
+            return false;
+        }
+
+        // Same vendor CUDA - not our job, use NCCLBackend
+        if (src_device.is_cuda() && dst_device.is_cuda())
+        {
+            LOG_DEBUG("PCIeBARBackend::copy: CUDA↔CUDA not handled here, use NCCLBackend");
+            return false;
+        }
+
+        // Same vendor ROCm - not our job, use RCCLBackend
+        if (src_device.is_rocm() && dst_device.is_rocm())
+        {
+            LOG_DEBUG("PCIeBARBackend::copy: ROCm↔ROCm not handled here, use RCCLBackend");
+            return false;
+        }
+
+        // Cross-vendor CUDA → ROCm
+        if (src_device.is_cuda() && dst_device.is_rocm())
+        {
+            // dst_ptr is ROCm, need to find its BAR offset
+            auto offset = findBarOffset(dst_ptr, bytes);
+            if (!offset)
+            {
+                LOG_ERROR("PCIeBARBackend::copy: ROCm destination pointer not in BAR region. "
+                          << "ROCm buffers must be allocated via allocateInBarRegion()");
+                return false;
+            }
+            return transferCUDAtoROCm(src_ptr, *offset, bytes);
+        }
+
+        // Cross-vendor ROCm → CUDA
+        if (src_device.is_rocm() && dst_device.is_cuda())
+        {
+            // src_ptr is ROCm, need to find its BAR offset
+            auto offset = findBarOffset(src_ptr, bytes);
+            if (!offset)
+            {
+                LOG_ERROR("PCIeBARBackend::copy: ROCm source pointer not in BAR region. "
+                          << "ROCm buffers must be allocated via allocateInBarRegion()");
+                return false;
+            }
+            return transferROCmtoCUDA(*offset, dst_ptr, bytes);
+        }
+
+        // Host involved - not supported (fail fast)
+        LOG_ERROR("PCIeBARBackend::copy: Host transfers not supported. "
+                  << "Use HostBackend for CPU↔CPU. Got: "
+                  << src_device.toString() << " -> " << dst_device.toString());
+        return false;
+    }
+
+    bool PCIeBARBackend::copyAsync(
+        void *dst_ptr, DeviceId dst_device,
+        const void *src_ptr, DeviceId src_device,
+        size_t bytes, void *stream)
+    {
+        // BAR transfers are currently synchronous
+        // Future: could use cudaMemcpyAsync with BAR pointers
+        (void)stream;
+        return copy(dst_ptr, dst_device, src_ptr, src_device, bytes);
+    }
+
+    bool PCIeBARBackend::supportsCopy(DeviceId src_device, DeviceId dst_device) const
+    {
+        // Cross-vendor GPU↔GPU is our specialty
+        if ((src_device.is_cuda() && dst_device.is_rocm()) ||
+            (src_device.is_rocm() && dst_device.is_cuda()))
+        {
+            return isPCIeBarActive();
+        }
+
+        // Same-vendor or host-involved: not our job
+        return false;
+    }
+
     bool PCIeBARBackend::reduceOnCUDA(
         void *output,
         const void *input1,

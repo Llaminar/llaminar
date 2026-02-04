@@ -153,6 +153,18 @@ if(HAVE_CUDA)
     
     # Relocatable device code for separate compilation
     set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+    
+    # CRITICAL: Limit nvlink parallelism to avoid OOM during device linking
+    # nvlink is extremely memory-intensive (~1-2GB per process). With 500+ test targets
+    # that each need device linking, unlimited parallelism causes system OOM.
+    # This creates a Ninja job pool that limits concurrent link jobs to 8.
+    # The pool must be defined BEFORE any targets that use it.
+    if(CMAKE_GENERATOR MATCHES "Ninja")
+        # Define the job pool with depth=8 (max 8 concurrent nvlink processes)
+        set_property(GLOBAL APPEND PROPERTY JOB_POOLS nvlink_pool=8)
+        # Apply to all link jobs (includes CUDA device linking)
+        set(CMAKE_JOB_POOL_LINK nvlink_pool)
+    endif()
 endif()
 
 # =============================================================================
@@ -236,12 +248,18 @@ if(HAVE_CUDA)
     # Note: HostBackendCUDA.cu isolates CUDA runtime calls from HostBackend.cpp
     # Note: CUDARingKVCacheTensorAdapter.cpp provides ITensor interface implementations for
     # CUDARingKVCache and must be in cuda_backend to satisfy template instantiation dependencies
+    # Note: NvidiaContextFactory.cu registers the CUDA factory with GPUDeviceContextPool
+    # Note: CUDAWorkerImpl.cu provides cuda_worker::initializeContext/cleanupContext for GPUDeviceWorker
     add_library(cuda_backend STATIC 
         backends/cuda/CUDABackend.cu
         backends/cuda/CUDATensorValidation.cu
+        backends/cuda/NvidiaDeviceContext.cu
+        backends/cuda/NvidiaContextFactory.cu
+        backends/cuda/CUDAWorkerImpl.cu
         backends/CUDAEnumeration.cu
         collective/backends/NCCLBackendCUDA.cu
         collective/backends/HostBackendCUDA.cu
+        collective/coordinators/NCCLCoordinator.cu
         kernels/cuda/kvcache/CUDARingKVCacheTensorAdapter.cpp
         ${CUDA_KERNEL_SOURCES}
     )
@@ -249,12 +267,12 @@ if(HAVE_CUDA)
     
     # NCCLBackend.cpp must be compiled with g++ (not nvcc) because it includes MPI headers.
     # NCCLDynamicLoader.cpp must also be compiled with g++ as it uses dlopen/dlsym.
-    # Add them as separate sources with regular C++ compilation.
+    # Add NCCLBackend sources as separate with regular C++ compilation.
     target_sources(cuda_backend PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/collective/backends/NCCLBackend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/collective/backends/NCCLDynamicLoader.cpp
     )
-    # Set the source files to be compiled with C++ compiler, not nvcc
+    # Set NCCLBackend source files to be compiled with C++ compiler, not nvcc
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/collective/backends/NCCLBackend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/collective/backends/NCCLDynamicLoader.cpp
@@ -488,14 +506,20 @@ if(HAVE_ROCM)
     # CRITICAL: RCCL is now loaded dynamically via dlopen() in RCCLDynamicLoader.cpp
     # to avoid symbol conflicts with NCCL, which exports identical symbol names.
     # RCCLBackendHIP.cpp isolates HIP runtime calls and uses the dynamic loader.
+    # Note: AMDContextFactory.cpp registers the ROCm factory with GPUDeviceContextPool
+    # Note: ROCmWorkerImpl.cpp provides rocm_worker::initializeContext/cleanupContext for GPUDeviceWorker
     add_library(rocm_backend STATIC 
         backends/rocm/ROCmBackend.cpp
         backends/rocm/ROCmTensorValidation.cpp
+        backends/rocm/AMDDeviceContext.cpp
+        backends/rocm/AMDContextFactory.cpp
+        backends/rocm/ROCmWorkerImpl.cpp
         backends/ROCmEnumeration.cpp
         collective/backends/HostBackendROCm.cpp              # HIP-specific host memory registration
         collective/backends/RCCLBackend.cpp                  # RCCL backend (MUST be here, not in llaminar2_core)
         collective/backends/RCCLDynamicLoader.cpp            # Dynamic loader for RCCL (dlopen/dlsym)
         collective/backends/RCCLBackendHIP.cpp               # HIP runtime wrappers for RCCL backend
+        collective/coordinators/RCCLCoordinator.cpp          # RCCL collective coordinator
         ${ROCM_KERNEL_SOURCES}
     )
     target_include_directories(rocm_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -1092,6 +1116,10 @@ add_library(llaminar2_core STATIC
     backends/ComputeBackend.cpp
     backends/BackendManager.cpp
     backends/CPUBackend.cpp
+    # GPUDeviceContextPool is backend-agnostic (uses factory functions registered by cuda_backend/rocm_backend)
+    backends/GPUDeviceContextPool.cpp
+    # GPUDeviceWorker is backend-agnostic (uses forward-declared cuda_worker/rocm_worker namespaces)
+    backends/GPUDeviceWorker.cpp
     # Execution framework (hierarchical work distribution)
     execution/mpi_orchestration/WorkDistributor.cpp
     execution/local_execution/device/DeviceContext.cpp
@@ -1124,6 +1152,7 @@ add_library(llaminar2_core STATIC
     execution/local_execution/device/DomainAwareBufferManager.cpp
     execution/local_execution/graph/GraphResolver.cpp
     execution/local_execution/graph/LivenessAnalyzer.cpp
+    execution/local_execution/graph/SchemaFactoryRegistry.cpp
     execution/local_execution/model/LayerExecutor.cpp
     execution/local_execution/model/ModelExecutor.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp
@@ -1143,9 +1172,17 @@ add_library(llaminar2_core STATIC
     config/LayerPlacementConfig.cpp
     # TP Domain configuration (multi-domain tensor parallelism for hybrid systems)
     config/TPDomain.cpp
+    # TP Domain Config (Phase 1.1 - Unified PP Graph Architecture)
+    config/TPDomainConfig.cpp
+    # PP Stage Config (Phase 1.2 - Unified PP Graph Architecture)
+    config/PPStageConfig.cpp
+    # Pipeline Config (Phase 1.3 - Unified PP Graph Architecture)
+    config/PipelineConfig.cpp
     # Orchestration configuration (Phase 0 - CLI/Config architecture for heterogeneous orchestration)
     config/OrchestrationConfig.cpp
     config/OrchestrationConfigParser.cpp
+    # Backend selector (Part 2 - automatic backend selection for PP/TP)
+    config/BackendSelector.cpp
     # Global device address (fully-qualified device identification across nodes)
     backends/GlobalDeviceAddress.cpp
     # Device registry and adapter (Phase 6 - GlobalDeviceAddress migration)
@@ -1165,6 +1202,7 @@ add_library(llaminar2_core STATIC
     execution/factory/InferenceRunnerFactory.cpp
     loaders/ModelLoader.cpp
     loaders/ModelContext.cpp
+    loaders/ModelContextConfig.cpp
     loaders/WeightManager.cpp
     loaders/WeightPlacementMap.cpp
     loaders/WeightPreloader.cpp
@@ -1175,6 +1213,8 @@ add_library(llaminar2_core STATIC
     loaders/PartialWeightLoader.cpp
     # Layer device placement (Phase 2 - multi-device graph building)
     execution/local_execution/device/LayerDevicePlacement.cpp
+    # Per-stage buffer pool (Phase 1 - PP+TP buffer management)
+    execution/local_execution/device/PerStageBufferPool.cpp
     # Qwen2 model and graph configuration
     models/qwen/Qwen2Graph.cpp
     models/qwen/Qwen2GraphConfigBuilder.cpp
@@ -1257,7 +1297,6 @@ add_library(llaminar2_core STATIC
     kernels/DeviceKernelCache.cpp
     # Testing infrastructure
     testing/PerfHarness.cpp
-    utils/ArgParser.cpp
     utils/BatchPaddingUtils.cpp
     utils/MPIBootstrap.cpp
     utils/NUMATopology.cpp
@@ -1285,8 +1324,18 @@ add_library(llaminar2_core STATIC
     memory/NUMAAllocator.cpp
     # LOCAL tensor parallelism (Phase 4: multi-device within single MPI rank)
     collective/LocalTPContext.cpp
+    collective/LocalPPContext.cpp
+    # GLOBAL tensor parallelism (cross-MPI-rank TP)
+    collective/GlobalTPContext.cpp
+    # TP context factory (Phase 3 Global TP Unified Interface)
+    collective/TPContextFactory.cpp
+    collective/PPStage.cpp
     loaders/LocalTPWeightSharder.cpp
+    # TP allreduce stage (Phase 4: supports both LOCAL and GLOBAL TP)
+    execution/compute_stages/stages/TPAllreduceStage.cpp
+    # Legacy LOCAL TP allreduce stage (deprecated, use TPAllreduceStage)
     execution/compute_stages/stages/LocalTPAllreduceStage.cpp
+    execution/compute_stages/stages/LocalPPTransferStage.cpp
     # Orchestration runner (Phase 5: end-to-end integration)
     execution/runner/OrchestrationRunner.cpp
     execution/runner/OrchestrationRunnerFactory.cpp

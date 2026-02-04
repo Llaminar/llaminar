@@ -34,6 +34,9 @@
 namespace llaminar2
 {
 
+    // Forward declaration
+    class RCCLCoordinator;
+
     /**
      * @brief RCCL-based collective backend for AMD ROCm GPUs
      *
@@ -176,6 +179,43 @@ namespace llaminar2
                            CollectiveDataType dtype, int peer, void *stream) override;
 
         // =====================================================================
+        // Data Copy Operations
+        // =====================================================================
+
+        /**
+         * @brief Synchronous copy between ROCm devices
+         *
+         * Supports:
+         * - Same device: hipMemcpy DeviceToDevice
+         * - Different devices: hipMemcpyPeer (requires P2P access)
+         *
+         * FAIL-FAST: Returns false if P2P is not available between different devices.
+         * Does NOT fall back to host staging.
+         *
+         * @return false for non-ROCm devices or if P2P unavailable
+         */
+        bool copy(void *dst_ptr, DeviceId dst_device,
+                  const void *src_ptr, DeviceId src_device,
+                  size_t bytes) override;
+
+        /**
+         * @brief Async copy between ROCm devices
+         *
+         * Same semantics as copy() but non-blocking.
+         */
+        bool copyAsync(void *dst_ptr, DeviceId dst_device,
+                       const void *src_ptr, DeviceId src_device,
+                       size_t bytes, void *stream = nullptr) override;
+
+        /**
+         * @brief Check if copy is supported between device pair
+         *
+         * Returns true only for ROCm↔ROCm pairs where P2P is available
+         * (or same device).
+         */
+        bool supportsCopy(DeviceId src_device, DeviceId dst_device) const override;
+
+        // =====================================================================
         // Multi-GPU Single-Process Collective Operations
         // =====================================================================
 
@@ -257,13 +297,16 @@ namespace llaminar2
 
 #ifdef HAVE_RCCL
         // Use void* for opaque RCCL types - dynamic loading hides the actual types
-        void *comm_ = nullptr;   // ncclComm_t (opaque pointer)
+        void *comm_ = nullptr;   // rcclComm_t (opaque pointer)
         void *stream_ = nullptr; // hipStream_t (opaque pointer)
 
-        // For multi-GPU single-process mode: one comm and stream per GPU
-        std::vector<void *> all_comms_;
-        std::vector<void *> all_streams_;
-        std::vector<int> device_ordinals_; // GPU ordinals for each rank
+        // Multi-GPU single-process: per-GPU communicators and streams
+        std::vector<void *> all_comms_;    // One communicator per GPU - ONLY for non-coordinator mode
+        std::vector<void *> all_streams_;  // One stream per GPU - ONLY for non-coordinator mode
+        std::vector<int> device_ordinals_; // Device ordinals for each GPU
+
+        // Coordinator for multi-GPU single-process mode (owns all RCCL comms/streams)
+        std::unique_ptr<RCCLCoordinator> coordinator_;
 
         // Helper to convert our types to integer values for wrapper functions
         static int toRcclDataTypeInt(CollectiveDataType dtype);

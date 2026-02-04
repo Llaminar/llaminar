@@ -37,6 +37,160 @@ namespace llaminar2
           cluster_inventory_(cluster_inventory),
           factory_(factory ? std::move(factory) : std::make_unique<DefaultBackendFactory>())
     {
+        // =====================================================================
+        // Pre-initialize GPU backends with their coordinators
+        // =====================================================================
+        // CRITICAL: This must happen BEFORE any tensor allocations occur.
+        // NCCL/RCCL use GPU contexts internally during ncclCommInitRank/rcclCommInitRank,
+        // which can corrupt events/streams if initialized after tensors are created.
+        // By initializing here, we ensure coordinators are ready before any GPU work.
+        // =====================================================================
+        preInitializeNCCLBackend();
+        preInitializeRCCLBackend();
+    }
+
+    void BackendRouter::preInitializeNCCLBackend()
+    {
+#ifdef HAVE_NCCL
+        // Check if NCCL backend is available
+        if (!factory_->isAvailable(CollectiveBackendType::NCCL))
+        {
+            LOG_DEBUG("[BackendRouter] NCCL backend not available, skipping pre-initialization");
+            return;
+        }
+
+        // Create NCCL backend if not already created
+        auto *backend = getOrCreateBackend(CollectiveBackendType::NCCL);
+        if (!backend)
+        {
+            LOG_DEBUG("[BackendRouter] Failed to create NCCL backend for pre-initialization");
+            return;
+        }
+
+        // If already initialized, nothing to do
+        if (backend->isInitialized())
+        {
+            LOG_DEBUG("[BackendRouter] NCCL backend already initialized");
+            return;
+        }
+
+        // Get local CUDA devices from cluster inventory
+        // Use rank 0 for single-process, or mpi_ctx_->rank() for multi-process
+        const int my_rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+        const auto &rank_inv = cluster_inventory_.getRank(my_rank);
+
+        // Count CUDA devices in this rank's inventory
+        std::vector<int> cuda_ordinals;
+        for (const auto &gpu : rank_inv.gpus)
+        {
+            if (gpu.type == DeviceType::CUDA)
+            {
+                cuda_ordinals.push_back(gpu.local_device_id);
+            }
+        }
+
+        if (cuda_ordinals.empty())
+        {
+            LOG_DEBUG("[BackendRouter] No CUDA devices in cluster inventory, skipping NCCL pre-initialization");
+            return;
+        }
+
+        // Build a device group with ALL available CUDA devices from inventory
+        // This triggers the NCCL backend's copy communicator initialization
+        DeviceGroupBuilder builder;
+        builder.setName("nccl_copy_preinit")
+            .setScope(CollectiveScope::LOCAL);
+
+        for (int ordinal : cuda_ordinals)
+        {
+            builder.addDevice(DeviceId::cuda(ordinal));
+        }
+
+        DeviceGroup group = builder.build();
+
+        if (!backend->initialize(group))
+        {
+            LOG_WARN("[BackendRouter] Failed to pre-initialize NCCL backend - "
+                     "CUDA-to-CUDA copy may not work correctly");
+            return;
+        }
+
+        LOG_INFO("[BackendRouter] Pre-initialized NCCL backend with copy communicators");
+#else
+        LOG_DEBUG("[BackendRouter] NCCL not available (HAVE_NCCL not defined)");
+#endif
+    }
+
+    void BackendRouter::preInitializeRCCLBackend()
+    {
+#ifdef HAVE_RCCL
+        // Check if RCCL backend is available
+        if (!factory_->isAvailable(CollectiveBackendType::RCCL))
+        {
+            LOG_DEBUG("[BackendRouter] RCCL backend not available, skipping pre-initialization");
+            return;
+        }
+
+        // Create RCCL backend if not already created
+        auto *backend = getOrCreateBackend(CollectiveBackendType::RCCL);
+        if (!backend)
+        {
+            LOG_DEBUG("[BackendRouter] Failed to create RCCL backend for pre-initialization");
+            return;
+        }
+
+        // If already initialized, nothing to do
+        if (backend->isInitialized())
+        {
+            LOG_DEBUG("[BackendRouter] RCCL backend already initialized");
+            return;
+        }
+
+        // Get local ROCm devices from cluster inventory
+        // Use rank 0 for single-process, or mpi_ctx_->rank() for multi-process
+        const int my_rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+        const auto &rank_inv = cluster_inventory_.getRank(my_rank);
+
+        // Count ROCm devices in this rank's inventory
+        std::vector<int> rocm_ordinals;
+        for (const auto &gpu : rank_inv.gpus)
+        {
+            if (gpu.type == DeviceType::ROCm)
+            {
+                rocm_ordinals.push_back(gpu.local_device_id);
+            }
+        }
+
+        if (rocm_ordinals.empty())
+        {
+            LOG_DEBUG("[BackendRouter] No ROCm devices in cluster inventory, skipping RCCL pre-initialization");
+            return;
+        }
+
+        // Build a device group with ALL available ROCm devices from inventory
+        // This triggers the RCCL backend's copy communicator initialization
+        DeviceGroupBuilder builder;
+        builder.setName("rccl_copy_preinit")
+            .setScope(CollectiveScope::LOCAL);
+
+        for (int ordinal : rocm_ordinals)
+        {
+            builder.addDevice(DeviceId::rocm(ordinal));
+        }
+
+        DeviceGroup group = builder.build();
+
+        if (!backend->initialize(group))
+        {
+            LOG_WARN("[BackendRouter] Failed to pre-initialize RCCL backend - "
+                     "ROCm-to-ROCm copy may not work correctly");
+            return;
+        }
+
+        LOG_INFO("[BackendRouter] Pre-initialized RCCL backend with copy communicators");
+#else
+        LOG_DEBUG("[BackendRouter] RCCL not available (HAVE_RCCL not defined)");
+#endif
     }
 
     BackendRouter::~BackendRouter()
@@ -132,6 +286,143 @@ namespace llaminar2
         }
 
         return selection;
+    }
+
+    ICollectiveBackend *BackendRouter::getBackendForCopy(DeviceId src, DeviceId dst)
+    {
+        // Same device = no transfer needed, but return a backend anyway
+        if (src == dst)
+        {
+            if (src.is_cuda())
+            {
+                auto *backend = getOrCreateBackend(CollectiveBackendType::NCCL);
+                if (backend && backend->supportsCopy(src, dst))
+                    return backend;
+            }
+            else if (src.is_rocm())
+            {
+                auto *backend = getOrCreateBackend(CollectiveBackendType::RCCL);
+                if (backend && backend->supportsCopy(src, dst))
+                    return backend;
+            }
+            else if (src.is_cpu())
+            {
+                auto *backend = getOrCreateBackend(CollectiveBackendType::HOST);
+                if (backend && backend->supportsCopy(src, dst))
+                    return backend;
+            }
+            return nullptr;
+        }
+
+        // Cross-vendor (CUDA↔ROCm): use PCIeBAR
+        if ((src.is_cuda() && dst.is_rocm()) || (src.is_rocm() && dst.is_cuda()))
+        {
+            auto *backend = getOrCreateBackend(CollectiveBackendType::PCIE_BAR);
+            if (backend)
+            {
+                // PCIeBAR needs to be initialized before supportsCopy() returns true.
+                // Create a DeviceGroup with the src/dst devices.
+                if (!backend->isInitialized())
+                {
+                    DeviceGroupBuilder builder;
+                    builder.setName("copy_" + src.toString() + "_to_" + dst.toString())
+                        .setScope(CollectiveScope::LOCAL)
+                        .addDevice(src)
+                        .addDevice(dst);
+                    DeviceGroup group = builder.build();
+
+                    if (!backend->initialize(group))
+                    {
+                        LOG_ERROR("[getBackendForCopy] Failed to initialize PCIeBAR backend for "
+                                  << src.toString() << " -> " << dst.toString());
+                        return nullptr;
+                    }
+                }
+
+                if (backend->supportsCopy(src, dst))
+                {
+                    return backend;
+                }
+            }
+            // No fallback for cross-vendor - fail fast
+            return nullptr;
+        }
+
+        // Same CUDA vendor: use NCCL (supports P2P or pinned staging fallback)
+        if (src.is_cuda() && dst.is_cuda())
+        {
+            auto *backend = getOrCreateBackend(CollectiveBackendType::NCCL);
+            if (backend)
+            {
+                // NCCL backend needs to be initialized before copy() works.
+                // The copy communicator is created during initialize() to span all CUDA devices.
+                if (!backend->isInitialized())
+                {
+                    DeviceGroupBuilder builder;
+                    builder.setName("nccl_copy_" + src.toString() + "_to_" + dst.toString())
+                        .setScope(CollectiveScope::LOCAL)
+                        .addDevice(src)
+                        .addDevice(dst);
+                    DeviceGroup group = builder.build();
+
+                    if (!backend->initialize(group))
+                    {
+                        LOG_ERROR("[getBackendForCopy] Failed to initialize NCCL backend for "
+                                  << src.toString() << " -> " << dst.toString());
+                        return nullptr;
+                    }
+                }
+
+                if (backend->supportsCopy(src, dst))
+                {
+                    return backend;
+                }
+            }
+        }
+
+        // Same ROCm vendor: use RCCL (supports P2P or pinned staging fallback)
+        if (src.is_rocm() && dst.is_rocm())
+        {
+            auto *backend = getOrCreateBackend(CollectiveBackendType::RCCL);
+            if (backend)
+            {
+                // RCCL backend needs to be initialized before copy() works.
+                // The copy communicator is created during initialize() to span all ROCm devices.
+                if (!backend->isInitialized())
+                {
+                    DeviceGroupBuilder builder;
+                    builder.setName("rccl_copy_" + src.toString() + "_to_" + dst.toString())
+                        .setScope(CollectiveScope::LOCAL)
+                        .addDevice(src)
+                        .addDevice(dst);
+                    DeviceGroup group = builder.build();
+
+                    if (!backend->initialize(group))
+                    {
+                        LOG_ERROR("[getBackendForCopy] Failed to initialize RCCL backend for "
+                                  << src.toString() << " -> " << dst.toString());
+                        return nullptr;
+                    }
+                }
+
+                if (backend->supportsCopy(src, dst))
+                {
+                    return backend;
+                }
+            }
+        }
+
+        // CPU-to-CPU: use Host backend
+        if (src.is_cpu() && dst.is_cpu())
+        {
+            auto *backend = getOrCreateBackend(CollectiveBackendType::HOST);
+            if (backend && backend->supportsCopy(src, dst))
+            {
+                return backend;
+            }
+        }
+
+        return nullptr; // No suitable backend
     }
 
     bool BackendRouter::isAvailable(CollectiveBackendType type) const
@@ -641,6 +932,57 @@ namespace llaminar2
         const ClusterInventory &cluster_inventory)
     {
         instance_ = std::make_unique<BackendRouter>(std::move(mpi_ctx), cluster_inventory);
+    }
+
+    bool GlobalBackendRouter::initForTests()
+    {
+        // Already initialized?
+        if (instance_)
+        {
+            return true;
+        }
+
+        // Create cluster inventory populated with local devices from DeviceManager
+        // This is the ONE place where we access the DeviceManager singleton for tests
+        ClusterInventory test_inventory;
+        test_inventory.world_size = 1;
+        test_inventory.node_count = 1;
+
+        // Create rank 0 inventory with actual devices
+        RankInventory rank0;
+        rank0.rank = 0;
+        rank0.node_id = 0;
+        rank0.local_rank = 0;
+
+        // Populate GPU list from DeviceManager
+        const auto &dm = DeviceManager::instance();
+        const int cuda_count = dm.cuda_device_count();
+        const int rocm_count = dm.rocm_device_count();
+
+        for (int i = 0; i < cuda_count; ++i)
+        {
+            DeviceInfo info;
+            info.type = DeviceType::CUDA;
+            info.local_device_id = i;
+            rank0.gpus.push_back(info);
+        }
+
+        for (int i = 0; i < rocm_count; ++i)
+        {
+            DeviceInfo info;
+            info.type = DeviceType::ROCm;
+            info.local_device_id = i;
+            rank0.gpus.push_back(info);
+        }
+
+        test_inventory.ranks.push_back(rank0);
+        test_inventory.total_gpus = cuda_count + rocm_count;
+
+        // No MPI context needed for tests
+        instance_ = std::make_unique<BackendRouter>(nullptr, test_inventory);
+
+        LOG_INFO("[GlobalBackendRouter] Initialized for testing (no MPI)");
+        return instance_ != nullptr;
     }
 
     BackendRouter *GlobalBackendRouter::get()

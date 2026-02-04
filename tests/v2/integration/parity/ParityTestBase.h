@@ -72,8 +72,19 @@
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/debug/TPSnapshot.h"
 #include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+
+// Pipeline parallelism support
+#include "config/PipelineConfig.h"
+#include "collective/BackendRouter.h"
+#include "collective/BackendRouter.h"
+
+// Modern orchestration runner support (for incremental migration)
+#include "utils/TestOrchestrationHelper.h"
+#include "execution/runner/IOrchestrationRunner.h"
 #include "kernels/KernelFactory.h"
 #include "backends/BackendManager.h"
+#include "backends/GlobalDeviceAddress.h"
 #ifdef HAVE_CUDA
 #include "kernels/cuda/ops/CUDAEmbeddingKernelT.h"
 #endif
@@ -304,6 +315,307 @@ namespace llaminar2::test::parity
         int total_layers_passed = 0;
         bool overall_passed = false;
     };
+
+    // =============================================================================
+    // Device and Parallelism Configuration (Model-Agnostic)
+    // =============================================================================
+
+    /**
+     * @brief Device type for parity tests
+     * Note: Named ParityDeviceType to avoid collision with llaminar2::DeviceType
+     */
+    enum class ParityDeviceType
+    {
+        CPU,
+        CUDA,
+        ROCm
+    };
+
+    /**
+     * @brief Parallelism strategy for multi-device tests
+     */
+    enum class Parallelism
+    {
+        None,     ///< Single device, no parallelism
+        LocalTP,  ///< Local Tensor Parallelism (multi-device, single process)
+        LocalPP,  ///< Local Pipeline Parallelism (multi-device, single process)
+        GlobalTP, ///< Global Tensor Parallelism (multi-rank MPI)
+    };
+
+    /**
+     * @brief Collective backend for parallel tests
+     */
+    enum class Collective
+    {
+        None,    ///< No collective needed (single device)
+        HOST,    ///< Host-based collective (staging through CPU)
+        NCCL,    ///< NVIDIA NCCL (CUDA-CUDA)
+        RCCL,    ///< AMD RCCL (ROCm-ROCm)
+        PCIeBAR, ///< Cross-vendor via PCIe BAR (CUDA-ROCm)
+        MPI,     ///< MPI backend (for global TP, cross-rank)
+    };
+
+    // =============================================================================
+    // Device Configuration Utilities
+    // =============================================================================
+
+    inline DeviceId toDeviceId(ParityDeviceType type, int index = 0)
+    {
+        switch (type)
+        {
+        case ParityDeviceType::CPU:
+            return DeviceId::cpu();
+        case ParityDeviceType::CUDA:
+            return DeviceId::cuda(index);
+        case ParityDeviceType::ROCm:
+            return DeviceId::rocm(index);
+        }
+        return DeviceId::cpu();
+    }
+
+    inline GlobalDeviceAddress toGlobalAddress(ParityDeviceType type, int index = 0)
+    {
+        switch (type)
+        {
+        case ParityDeviceType::CPU:
+            return GlobalDeviceAddress::cpu();
+        case ParityDeviceType::CUDA:
+            return GlobalDeviceAddress::cuda(index);
+        case ParityDeviceType::ROCm:
+            return GlobalDeviceAddress::rocm(index);
+        }
+        return GlobalDeviceAddress::cpu();
+    }
+
+    inline CollectiveBackendType toCollectiveBackend(Collective c)
+    {
+        switch (c)
+        {
+        case Collective::None:
+            return CollectiveBackendType::HOST;
+        case Collective::HOST:
+            return CollectiveBackendType::HOST;
+        case Collective::NCCL:
+            return CollectiveBackendType::NCCL;
+        case Collective::RCCL:
+            return CollectiveBackendType::RCCL;
+        case Collective::PCIeBAR:
+            return CollectiveBackendType::PCIE_BAR;
+        case Collective::MPI:
+            return CollectiveBackendType::MPI;
+        }
+        return CollectiveBackendType::HOST;
+    }
+
+    inline std::string deviceTypeName(ParityDeviceType type)
+    {
+        switch (type)
+        {
+        case ParityDeviceType::CPU:
+            return "CPU";
+        case ParityDeviceType::CUDA:
+            return "CUDA";
+        case ParityDeviceType::ROCm:
+            return "ROCm";
+        }
+        return "Unknown";
+    }
+
+    inline std::string parallelismName(Parallelism p)
+    {
+        switch (p)
+        {
+        case Parallelism::None:
+            return "None";
+        case Parallelism::LocalTP:
+            return "LocalTP";
+        case Parallelism::LocalPP:
+            return "LocalPP";
+        case Parallelism::GlobalTP:
+            return "GlobalTP";
+        }
+        return "Unknown";
+    }
+
+    inline std::string collectiveName(Collective c)
+    {
+        switch (c)
+        {
+        case Collective::None:
+            return "None";
+        case Collective::HOST:
+            return "Host";
+        case Collective::NCCL:
+            return "NCCL";
+        case Collective::RCCL:
+            return "RCCL";
+        case Collective::PCIeBAR:
+            return "PCIeBAR";
+        case Collective::MPI:
+            return "MPI";
+        }
+        return "Unknown";
+    }
+
+    // =============================================================================
+    // Hardware Detection Utilities
+    // =============================================================================
+
+    inline bool isMpiInitialized()
+    {
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+        return initialized != 0;
+    }
+
+    inline int getCudaDeviceCount()
+    {
+#ifdef HAVE_CUDA
+        if (auto *backend = getCUDABackend())
+            return backend->deviceCount();
+#endif
+        return 0;
+    }
+
+    inline int getRocmDeviceCount()
+    {
+#ifdef HAVE_ROCM
+        if (auto *backend = getROCmBackend())
+            return backend->deviceCount();
+#endif
+        return 0;
+    }
+
+    // =============================================================================
+    // Backend Thresholds for Parity Tests
+    // =============================================================================
+
+    /**
+     * @brief Backend-specific parity thresholds
+     *
+     * Different backends may have different numerical precision characteristics.
+     * These thresholds define what constitutes "passing" parity for each backend.
+     */
+    struct BackendThresholds
+    {
+        float cosine_threshold = 0.999f;               ///< Min avg cosine for layer pass
+        float decode_cosine_threshold = 0.99f;         ///< Threshold for decode parity
+        int early_layers_count = 4;                    ///< Number of early layers to check
+        int min_early_layers_passed = 4;               ///< Min early layers that must pass
+        float kl_threshold = 0.05f;                    ///< Max KL divergence for logits
+        std::vector<std::string> excluded_stages = {}; ///< Stages to exclude from parity comparison
+        float min_top1_accuracy = 80.0f;               ///< Min Top-1 accuracy %
+        float min_decode_pass_rate = 0.8f;             ///< Min fraction of decode steps passing
+    };
+
+    // =============================================================================
+    // Test Configuration (Model-Agnostic)
+    // =============================================================================
+
+    /**
+     * @brief Complete declarative test configuration
+     *
+     * The devices vector is the single source of truth for device configuration.
+     * Use the helper methods device_count() and primary_device() to derive values.
+     */
+    struct TestConfig
+    {
+        std::string name;                      ///< Human-readable test name
+        std::vector<ParityDeviceType> devices; ///< Device list (heterogeneous supported)
+        Parallelism parallelism;               ///< Parallelism strategy
+        Collective collective;                 ///< Collective backend
+        BackendThresholds thresholds;          ///< Parity thresholds
+        std::string skip_reason;               ///< If non-empty, test will skip with this message
+        int mpi_ranks = 1;                     ///< Required MPI ranks for GlobalTP tests
+
+        /// PP stage device sizes for hybrid PP+TP configurations
+        /// Example: {2, 1} means stage 0 has 2 devices (TP domain), stage 1 has 1 device
+        /// Empty means one device per stage (pure PP) or all devices in one domain (pure TP)
+        std::vector<int> pp_stage_sizes;
+
+        /// TP backend for stages that are TP domains (only used when pp_stage_sizes has entries > 1)
+        Collective tp_collective = Collective::None;
+
+        // Derived accessors
+        size_t device_count() const { return devices.size(); }
+        ParityDeviceType primary_device() const { return devices.empty() ? ParityDeviceType::CPU : devices[0]; }
+        bool is_local_tp() const { return parallelism == Parallelism::LocalTP; }
+        bool is_local_pp() const { return parallelism == Parallelism::LocalPP; }
+        bool is_global_tp() const { return parallelism == Parallelism::GlobalTP; }
+        bool is_single_device() const { return parallelism == Parallelism::None && devices.size() == 1; }
+        bool should_skip() const { return !skip_reason.empty(); }
+
+        /// Check if this is a hybrid PP+TP configuration (PP with TP domains inside stages)
+        bool is_hybrid_pp_tp() const
+        {
+            if (!is_local_pp() || pp_stage_sizes.empty())
+                return false;
+            // Hybrid if any stage has more than 1 device
+            for (int size : pp_stage_sizes)
+            {
+                if (size > 1)
+                    return true;
+            }
+            return false;
+        }
+
+        /// Get number of PP stages (uses pp_stage_sizes if set, otherwise device_count)
+        size_t num_pp_stages() const
+        {
+            if (!pp_stage_sizes.empty())
+                return pp_stage_sizes.size();
+            return device_count();
+        }
+    };
+
+    /**
+     * @brief Check if a TestConfig can run on current hardware
+     * @return std::nullopt if available, or a skip reason string
+     */
+    inline std::optional<std::string> checkHardwareAvailability(const TestConfig &cfg)
+    {
+        // Check explicit skip reason first
+        if (cfg.should_skip())
+            return cfg.skip_reason;
+
+        // Check MPI initialization for LocalTP/LocalPP/GlobalTP tests
+        if (cfg.is_local_tp() || cfg.is_local_pp() || cfg.is_global_tp())
+        {
+            if (!isMpiInitialized())
+                return "Test requires MPI (run with mpirun)";
+        }
+
+        // Check MPI world size for GlobalTP tests
+        if (cfg.is_global_tp())
+        {
+            int world_size = 1;
+            MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+            if (world_size < cfg.mpi_ranks)
+            {
+                return "GlobalTP test requires " + std::to_string(cfg.mpi_ranks) +
+                       " MPI ranks (got " + std::to_string(world_size) + ")";
+            }
+        }
+
+        int cuda_count = getCudaDeviceCount();
+        int rocm_count = getRocmDeviceCount();
+
+        int required_cuda = 0, required_rocm = 0;
+        for (auto dt : cfg.devices)
+        {
+            if (dt == ParityDeviceType::CUDA)
+                required_cuda++;
+            if (dt == ParityDeviceType::ROCm)
+                required_rocm++;
+        }
+
+        if (required_cuda > cuda_count)
+            return "Need " + std::to_string(required_cuda) + " CUDA devices, found " + std::to_string(cuda_count);
+        if (required_rocm > rocm_count)
+            return "Need " + std::to_string(required_rocm) + " ROCm devices, found " + std::to_string(rocm_count);
+
+        return std::nullopt; // Hardware is available
+    }
 
     // =============================================================================
     // Metric Computation Functions
@@ -835,6 +1147,43 @@ namespace llaminar2::test::parity
         // MPI context for tensor-parallel tests (optional, null for single-rank)
         std::shared_ptr<MPIContext> mpi_ctx_;
 
+        // Modern orchestration runner (for incremental migration from IInferenceRunner)
+        // Tests can use either runner_ OR orch_runner_, but not both simultaneously.
+        // Use setupOrchestrationRunner() to initialize orch_runner_, or
+        // setupPipeline() to initialize runner_ (legacy path).
+        std::unique_ptr<IOrchestrationRunner> orch_runner_;
+
+        // Optional TestConfig for declarative test configuration (LocalPP, LocalTP, etc.)
+        // Subclasses override cfg() to return their test configuration.
+        // Default returns a single-device CPU config for backward compatibility.
+        std::optional<TestConfig> test_config_;
+
+        // =============================================================================
+        // Test Configuration
+        // =============================================================================
+
+        /**
+         * @brief Get the test configuration (override in subclasses)
+         * @return Reference to TestConfig for this test
+         *
+         * Subclasses with declarative config should override this to return
+         * their TestConfig. Default returns a single-device CPU configuration.
+         */
+        virtual const TestConfig &cfg() const
+        {
+            static const TestConfig default_config = {
+                .name = "SingleDevice",
+                .devices = {ParityDeviceType::CPU},
+                .parallelism = Parallelism::None,
+                .collective = Collective::None,
+                .thresholds = {},
+                .skip_reason = "",
+                .mpi_ranks = 1};
+            if (test_config_.has_value())
+                return test_config_.value();
+            return default_config;
+        }
+
         // =============================================================================
         // MPI Helper Methods
         // =============================================================================
@@ -1002,6 +1351,7 @@ namespace llaminar2::test::parity
 
             model_ctx_.reset();
             runner_.reset();
+            orch_runner_.reset(); // Clean up modern orchestration runner
             pytorch_snapshots_.clear();
 
             // CRITICAL: Synchronize and clear error state on all GPU devices!
@@ -1406,6 +1756,412 @@ namespace llaminar2::test::parity
         }
 
         /**
+         * @brief Setup pipeline for LocalPP (Pipeline Parallelism) tests
+         *
+         * Creates a pipeline parallel configuration where layers are split across
+         * multiple devices. Uses MultiDeviceOrchestrator with PP mode which:
+         * - Creates per-stage DeviceGraphOrchestrator instances
+         * - Handles sequential forward execution through stages
+         * - Manages activation transfer via LocalPPContext
+         *
+         * This is model-agnostic: any model that reports blockCount() can be used.
+         * Uses cfg() to get device list, collective backend, etc.
+         *
+         * @return true if setup succeeded, false on error
+         */
+        bool setupLocalPPPipeline()
+        {
+            DeviceManager::instance().initialize(-1);
+
+            // Initialize GlobalBackendRouter for activation transfers between PP stages
+            GlobalBackendRouter::initForTests();
+
+            // Load model with REPLICATED strategy (each stage needs full model access
+            // for weight lookup - layer partitioning happens at runtime)
+            model_ctx_ = ModelContext::create(
+                config_.model_path,
+                mpi_ctx_,
+                nullptr,
+                nullptr,
+                WeightDistributionStrategy::REPLICATED);
+
+            if (!model_ctx_)
+            {
+                LOG_ERROR("[Parity] Failed to load model");
+                return false;
+            }
+
+            // Get model parameters (model-agnostic)
+            int n_layers = model_ctx_->blockCount();
+
+            // Build GlobalDeviceAddress list from TestConfig
+            std::vector<GlobalDeviceAddress> all_device_addresses;
+            int cuda_idx = 0, rocm_idx = 0;
+            for (auto dt : cfg().devices)
+            {
+                switch (dt)
+                {
+                case ParityDeviceType::CPU:
+                    all_device_addresses.push_back(GlobalDeviceAddress::cpu());
+                    break;
+                case ParityDeviceType::CUDA:
+                    all_device_addresses.push_back(GlobalDeviceAddress::cuda(cuda_idx++));
+                    break;
+                case ParityDeviceType::ROCm:
+                    all_device_addresses.push_back(GlobalDeviceAddress::rocm(rocm_idx++));
+                    break;
+                }
+            }
+
+            // Determine number of PP stages:
+            // - If pp_stage_sizes is set, use its length (supports hybrid PP+TP)
+            // - Otherwise, assume 1 device per stage (pure PP)
+            int num_stages = static_cast<int>(cfg().num_pp_stages());
+            if (num_stages < 1)
+                num_stages = 1;
+
+            // Calculate layer boundaries (equal split)
+            int layers_per_stage = n_layers / num_stages;
+
+            if (cfg().is_hybrid_pp_tp())
+            {
+                LOG_INFO("[Parity] Hybrid PP+TP configuration: " << num_stages << " PP stages, "
+                                                                 << n_layers << " layers");
+                for (size_t i = 0; i < cfg().pp_stage_sizes.size(); ++i)
+                {
+                    LOG_INFO("[Parity]   Stage " << i << " has " << cfg().pp_stage_sizes[i]
+                                                 << " device(s)" << (cfg().pp_stage_sizes[i] > 1 ? " (TP domain)" : ""));
+                }
+            }
+            else
+            {
+                LOG_INFO("[Parity] LocalPP configuration: " << num_stages << " stages, "
+                                                            << n_layers << " layers");
+            }
+
+            // Create MultiDeviceOrchestrator::Config with PP mode (or TP_PP for hybrid)
+            MultiDeviceOrchestrator::Config mdo_config;
+            mdo_config.mode = cfg().is_hybrid_pp_tp()
+                                  ? MultiDeviceOrchestrator::ParallelismMode::TP_PP
+                                  : MultiDeviceOrchestrator::ParallelismMode::PP;
+            mdo_config.max_seq_len = 4096;
+            mdo_config.batch_size = 1;
+            mdo_config.activation_precision = ActivationPrecision::FP32;
+
+            // Create PP stage configurations
+            // Track which device index we're at in the flat device list
+            size_t device_offset = 0;
+
+            for (int s = 0; s < num_stages; ++s)
+            {
+                MultiDeviceOrchestrator::PPStageConfig stage_config;
+                stage_config.first_layer = s * layers_per_stage;
+                stage_config.last_layer = (s == num_stages - 1) ? n_layers : (s + 1) * layers_per_stage;
+                stage_config.has_embedding = (s == 0);
+                stage_config.has_lm_head = (s == num_stages - 1);
+
+                // Determine how many devices this stage gets
+                int stage_device_count = 1;
+                if (!cfg().pp_stage_sizes.empty() && s < static_cast<int>(cfg().pp_stage_sizes.size()))
+                {
+                    stage_device_count = cfg().pp_stage_sizes[s];
+                }
+
+                // Add devices for this stage
+                for (int d = 0; d < stage_device_count && device_offset < all_device_addresses.size(); ++d)
+                {
+                    stage_config.stage_devices.push_back(all_device_addresses[device_offset++]);
+                }
+
+                // If this is a TP domain (multiple devices), set TP backend
+                if (stage_config.isTPDomain())
+                {
+                    // Use tp_collective from config, falling back to the main collective
+                    Collective tp_backend = cfg().tp_collective != Collective::None
+                                                ? cfg().tp_collective
+                                                : cfg().collective;
+                    stage_config.tp_backend = toCollectiveBackend(tp_backend);
+
+                    // Equal TP weights for this domain
+                    for (int d = 0; d < stage_device_count; ++d)
+                    {
+                        stage_config.tp_weights.push_back(1.0f / static_cast<float>(stage_device_count));
+                    }
+                }
+
+                // Log stage configuration
+                std::ostringstream devices_str;
+                for (size_t i = 0; i < stage_config.stage_devices.size(); ++i)
+                {
+                    if (i > 0)
+                        devices_str << ", ";
+                    devices_str << stage_config.stage_devices[i].toString();
+                }
+                LOG_INFO("[Parity]   Stage " << s << ": layers ["
+                                             << stage_config.first_layer << ", " << stage_config.last_layer << ") on "
+                                             << (stage_config.isTPDomain() ? "TP(" : "")
+                                             << devices_str.str()
+                                             << (stage_config.isTPDomain() ? ")" : ""));
+
+                mdo_config.pp_stages.push_back(stage_config);
+            }
+
+            // Validate PP config
+            if (!mdo_config.validate())
+            {
+                LOG_ERROR("[Parity] Invalid MultiDeviceOrchestrator PP config");
+                return false;
+            }
+
+            // Create MultiDeviceOrchestrator with PP mode
+            auto multi_orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx_, mdo_config);
+
+            if (!multi_orch)
+            {
+                LOG_ERROR("[Parity] Failed to create MultiDeviceOrchestrator for PP");
+                return false;
+            }
+
+            // Enable snapshot capture for parity testing
+            multi_orch->enableSnapshotCapture();
+
+            LOG_INFO("[Parity] MultiDeviceOrchestrator " << (cfg().is_hybrid_pp_tp() ? "TP_PP" : "PP")
+                                                         << " created with " << num_stages << " stages");
+
+            // Transfer ownership to base class runner_
+            runner_ = std::move(multi_orch);
+
+            return true;
+        }
+
+        // =========================================================================
+        // Modern Orchestration Runner Support (for incremental migration)
+        // =========================================================================
+
+        /**
+         * @brief Setup an OrchestrationRunner for parity testing
+         *
+         * This is the modern alternative to setupPipeline(). Creates an
+         * OrchestrationRunner using the TestOrchestrationHelper utilities.
+         *
+         * Unlike setupPipeline(), this method:
+         * - Uses the OrchestrationConfig/OrchestrationRunner pattern
+         * - Has a simpler, more declarative API
+         * - Supports all orchestration features (PP, LOCAL TP, etc.)
+         *
+         * @param orch_config Pre-configured OrchestrationConfig
+         * @return true on success, false on failure
+         *
+         * @note Call this OR setupPipeline(), not both. The active runner is
+         *       whichever was last set up successfully.
+         */
+        bool setupOrchestrationRunner(const OrchestrationConfig &orch_config)
+        {
+            // Clear any existing runner
+            orch_runner_.reset();
+
+            // Create runner via TestOrchestrationHelper
+            orch_runner_ = test::TestOrchestrationHelper::create(orch_config);
+            if (!orch_runner_)
+            {
+                LOG_ERROR("[Parity] Failed to create OrchestrationRunner");
+                return false;
+            }
+
+            // Initialize the runner
+            if (!orch_runner_->initialize())
+            {
+                LOG_ERROR("[Parity] Failed to initialize OrchestrationRunner: " << orch_runner_->lastError());
+                orch_runner_.reset();
+                return false;
+            }
+
+            // Enable snapshot capture for parity testing
+            orch_runner_->enableSnapshotCapture();
+
+            if (isRank0())
+            {
+                LOG_INFO("[" << getBackendName() << " Parity] OrchestrationRunner created and initialized");
+            }
+            return true;
+        }
+
+        /**
+         * @brief Setup a simple single-device OrchestrationRunner
+         *
+         * Convenience wrapper that creates a simple OrchestrationConfig
+         * and calls setupOrchestrationRunner().
+         *
+         * @return true on success, false on failure
+         */
+        bool setupSimpleOrchestrationRunner()
+        {
+            OrchestrationConfig config;
+            config.model_path = config_.model_path;
+            config.device_mode = DeviceAssignmentMode::EXPLICIT;
+            config.device_for_this_rank = GlobalDeviceAddress::fromLocalDeviceId(getDevice());
+            config.max_seq_len = 4096;
+            // No PP, no TP - simple single-device execution
+            return setupOrchestrationRunner(config);
+        }
+
+        /**
+         * @brief Run forward pass with whichever runner is active
+         *
+         * This helper allows tests to work with either the legacy IInferenceRunner
+         * or the modern IOrchestrationRunner without changing test logic.
+         *
+         * @param tokens Input token IDs
+         * @return true on success, false on failure
+         */
+        bool runForward(const std::vector<int32_t> &tokens)
+        {
+            if (orch_runner_)
+            {
+                // Modern path: use prefill
+                if (!orch_runner_->prefill(tokens))
+                {
+                    LOG_ERROR("[Parity] OrchestrationRunner prefill failed: " << orch_runner_->lastError());
+                    return false;
+                }
+                // For single-step forward (prefill only), no decode needed
+                return true;
+            }
+            else if (runner_)
+            {
+                // Legacy path: use forward()
+                return runner_->forward(tokens.data(), tokens.size());
+            }
+            LOG_ERROR("[Parity] No runner available - call setupPipeline() or setupOrchestrationRunner() first");
+            return false;
+        }
+
+        /**
+         * @brief Get logits from whichever runner is active
+         *
+         * @return Pointer to logits, or nullptr if unavailable
+         */
+        const float *getActiveLogits() const
+        {
+            if (orch_runner_)
+            {
+                return orch_runner_->lastLogits();
+            }
+            else if (runner_)
+            {
+                return runner_->logits();
+            }
+            return nullptr;
+        }
+
+        /**
+         * @brief Get vocabulary size from whichever runner is active
+         *
+         * @return Vocabulary size, or 0 if unavailable
+         */
+        int getActiveVocabSize() const
+        {
+            if (orch_runner_)
+            {
+                return orch_runner_->vocabSize();
+            }
+            else if (runner_)
+            {
+                return static_cast<int>(runner_->vocab_size());
+            }
+            return 0;
+        }
+
+        /**
+         * @brief Get snapshot from whichever runner is active
+         *
+         * @param key Snapshot identifier
+         * @param out_size Output parameter for snapshot size
+         * @return Pointer to snapshot data, or nullptr if not found
+         */
+        const float *activeSnapshot(const std::string &key, size_t &out_size) const
+        {
+            if (orch_runner_)
+            {
+                return orch_runner_->getSnapshot(key, out_size);
+            }
+            else if (runner_)
+            {
+                return runner_->getSnapshot(key, out_size);
+            }
+            out_size = 0;
+            return nullptr;
+        }
+
+        /**
+         * @brief Get snapshot keys from whichever runner is active
+         *
+         * @return Vector of snapshot keys, empty if no runner
+         */
+        std::vector<std::string> activeSnapshotKeys() const
+        {
+            if (orch_runner_)
+            {
+                return orch_runner_->getSnapshotKeys();
+            }
+            else if (runner_)
+            {
+                return runner_->getSnapshotKeys();
+            }
+            return {};
+        }
+
+        /**
+         * @brief Clear KV cache on whichever runner is active
+         */
+        void activeClearCache()
+        {
+            if (orch_runner_)
+            {
+                orch_runner_->clearCache();
+            }
+            else if (runner_)
+            {
+                runner_->clear_cache();
+            }
+        }
+
+        /**
+         * @brief Clear snapshots on whichever runner is active
+         */
+        void activeClearSnapshots()
+        {
+            if (orch_runner_)
+            {
+                orch_runner_->clearSnapshots();
+            }
+            else if (runner_)
+            {
+                runner_->clearSnapshots();
+            }
+        }
+
+        /**
+         * @brief Check if an orchestration runner is active
+         *
+         * @return true if orch_runner_ is set, false otherwise
+         */
+        bool hasOrchestrationRunner() const
+        {
+            return orch_runner_ != nullptr;
+        }
+
+        /**
+         * @brief Check if a legacy runner is active
+         *
+         * @return true if runner_ is set, false otherwise
+         */
+        bool hasLegacyRunner() const
+        {
+            return runner_ != nullptr;
+        }
+
+        /**
          * @brief Read decode tokens from metadata file
          */
         std::vector<int> readDecodeTokensFromMetadata()
@@ -1470,19 +2226,42 @@ namespace llaminar2::test::parity
          * @brief Run single-device prefill parity test and return summary
          *
          * This is the main test driver for SINGLE-DEVICE tests - compares
-         * layer-by-layer against PyTorch. Always calls setupPipeline() to
-         * create a single-device runner.
+         * layer-by-layer against PyTorch. Calls setupPipeline() to create
+         * a single-device runner, then delegates to runPrefillParity().
          *
          * For multi-device LOCAL TP tests, use runTPPrefillParity() instead.
+         * For LocalPP tests, call setupPipeline() first, then runPrefillParity().
          */
         ParityTestSummary runSingleDevicePrefillParity()
         {
+            // Setup single-device pipeline then delegate
+            EXPECT_TRUE(setupPipeline()) << "Pipeline setup failed";
+            return runPrefillParity();
+        }
+
+        /**
+         * @brief Run prefill parity test using existing runner_
+         *
+         * Compares layer-by-layer Llaminar snapshots against PyTorch reference.
+         * Requires runner_ to be already set up (via setupPipeline() or
+         * setupLocalPPPipeline() etc).
+         *
+         * Use this for LocalPP tests where you want to set up the PP pipeline
+         * first, then run parity comparison without overwriting the runner.
+         *
+         * @return ParityTestSummary with layer-by-layer metrics
+         */
+        ParityTestSummary runPrefillParity()
+        {
             ParityTestSummary summary;
 
-            // Always setup single-device pipeline
-            EXPECT_TRUE(setupPipeline()) << "Pipeline setup failed";
+            // Require runner_ to be already set up
             if (!runner_)
+            {
+                LOG_ERROR("[Parity] runPrefillParity() called but runner_ is null - "
+                          "ensure setupPipeline() or setupLocalPPPipeline() was called first");
                 return summary;
+            }
 
             // Run prefill
             bool success = runner_->forward(config_.token_ids.data(), config_.token_ids.size());
@@ -2100,12 +2879,33 @@ namespace llaminar2::test::parity
          * - PyTorch snapshots with decode_step{N}_LM_HEAD.npy files
          * - metadata.txt with decode_tokens line
          *
-         * This is for SINGLE-DEVICE tests. Always calls setupPipeline().
+         * This is for SINGLE-DEVICE tests. Calls setupPipeline() then delegates
+         * to runDecodeParity().
          * For multi-device LOCAL TP tests, use runTPDecodeParity() instead.
+         * For LocalPP tests, call setupPipeline() first, then runDecodeParity().
          *
          * @return DecodeParitySummary with per-step and aggregate results
          */
         DecodeParitySummary runSingleDeviceDecodeParity()
+        {
+            // Setup single-device pipeline then delegate
+            EXPECT_TRUE(setupPipeline()) << "Pipeline setup failed";
+            return runDecodeParity();
+        }
+
+        /**
+         * @brief Run decode parity test using existing runner_
+         *
+         * Compares incremental decode logits against PyTorch reference snapshots.
+         * Requires runner_ to be already set up (via setupPipeline() or
+         * setupLocalPPPipeline() etc).
+         *
+         * Use this for LocalPP tests where you want to set up the PP pipeline
+         * first, then run parity comparison without overwriting the runner.
+         *
+         * @return DecodeParitySummary with per-step and aggregate results
+         */
+        DecodeParitySummary runDecodeParity()
         {
             DecodeParitySummary summary;
 
@@ -2125,10 +2925,13 @@ namespace llaminar2::test::parity
                 return summary;
             }
 
-            // Always setup single-device pipeline
-            EXPECT_TRUE(setupPipeline()) << "Pipeline setup failed";
+            // Require runner_ to be already set up
             if (!runner_)
+            {
+                LOG_ERROR("[Parity] runDecodeParity() called but runner_ is null - "
+                          "ensure setupPipeline() or setupLocalPPPipeline() was called first");
                 return summary;
+            }
 
             // Run prefill first (required to initialize KV cache)
             bool success = runner_->forward(config_.token_ids.data(), config_.token_ids.size());

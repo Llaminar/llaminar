@@ -63,7 +63,7 @@ namespace llaminar2
         GEMM_SCALE_OUTPUT,   ///< Output rescaling after INT8 GEMM
 
         // Flash Attention
-        FLASH_ATTN_PREFILL, ///< FA3-style prefill kernel
+        FLASH_ATTN_PREFILL, ///< FA2-style pipelined prefill kernel (Ampere+)
         FLASH_ATTN_DECODE,  ///< Flash Decoding kernel
         FLASH_ATTN_REDUCE,  ///< Partial sum reduction
 

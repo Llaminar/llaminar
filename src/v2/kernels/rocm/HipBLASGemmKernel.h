@@ -5,10 +5,15 @@
  * **Purpose**: Provide GPU GEMM for non-quantized (floating-point) tensors using hipBLAS.
  *
  * **Design**:
+ * - Inherits from ROCmKernelBase for workspace and device context support
  * - Implements IDeviceKernel for universal caching via DeviceKernelCache
  * - Uses hipBLAS sgemm (FP32), hgemm (FP16), or emulated BF16 (via FP32 compute)
  * - Expects input/output matrices already on GPU device
  * - Caller responsible for device memory management
+ *
+ * **Device Context Support (Phase 4)**:
+ * - Can use hipBLAS handle from IWorkerGPUContext instead of creating own
+ * - Backward compatible: existing constructor still creates own handle
  *
  * **Usage** (via DeviceKernelCache):
  * ```cpp
@@ -26,6 +31,7 @@
 
 #pragma once
 
+#include "ROCmKernelBase.h"
 #include "../DeviceKernelCache.h"
 #include "../../backends/DeviceId.h"
 #include <cstddef>
@@ -39,12 +45,16 @@
 
 namespace llaminar2
 {
+    // Forward declaration
+    class IWorkerGPUContext;
+
     namespace rocm
     {
 
         /**
          * @brief hipBLAS-based GEMM kernel for floating-point tensors
          *
+         * Inherits from ROCmKernelBase for workspace and device context support.
          * Implements IDeviceKernel for universal caching.
          *
          * Supports:
@@ -61,7 +71,7 @@ namespace llaminar2
          * - No Tensor Cores, but matrix FMA is well optimized
          * - BF16 requires conversion overhead (no hardware support)
          */
-        class HipBLASGemmKernel : public IDeviceKernel
+        class HipBLASGemmKernel : public ROCmKernelBase, public IDeviceKernel
         {
         public:
             /**
@@ -75,7 +85,7 @@ namespace llaminar2
             };
 
             /**
-             * @brief Create hipBLAS GEMM kernel
+             * @brief Create hipBLAS GEMM kernel (legacy constructor - creates own handle)
              *
              * @param device_id DeviceId (must be ROCm)
              * @param precision Floating-point precision to use
@@ -85,7 +95,21 @@ namespace llaminar2
             explicit HipBLASGemmKernel(const DeviceId &device_id, Precision precision = Precision::FP32);
 
             /**
-             * @brief Destructor - destroys hipBLAS handle
+             * @brief Create hipBLAS GEMM kernel using device context's handle
+             *
+             * This constructor uses the hipBLAS handle from the provided device context,
+             * avoiding the overhead of creating a separate handle. The kernel does NOT
+             * own the handle and will not destroy it.
+             *
+             * @param ctx Device context providing hipBLAS handle (must outlive this kernel)
+             * @param precision Floating-point precision to use
+             *
+             * @throws std::runtime_error if ctx is null or not initialized
+             */
+            explicit HipBLASGemmKernel(IWorkerGPUContext *ctx, Precision precision = Precision::FP32);
+
+            /**
+             * @brief Destructor - destroys hipBLAS handle only if owned
              */
             ~HipBLASGemmKernel() override;
 
@@ -189,6 +213,12 @@ namespace llaminar2
             int device_ordinal() const { return device_id_.ordinal; }
             Precision precision() const { return precision_; }
 
+            /**
+             * @brief Check if this kernel owns its hipBLAS handle
+             * @return true if destructor will destroy the handle, false if using context's handle
+             */
+            bool ownsHandle() const { return owns_handle_; }
+
         private:
             // hipblasHandle_t and hipblasLtHandle_t stored as void* to avoid including HIP headers.
             // This allows g++-compiled files to include this header without HIP namespace pollution.
@@ -196,13 +226,22 @@ namespace llaminar2
             void *lt_handle_ = nullptr; // hipBLASLt handle for fused operations
             DeviceId device_id_;
             Precision precision_ = Precision::FP32;
+            bool owns_handle_ = true;    ///< false when using context's hipBLAS handle
+            bool owns_lt_handle_ = true; ///< false when using context's hipBLASLt handle
         };
 
         /**
-         * @brief Factory function for hipBLAS GEMM kernel
+         * @brief Factory function for hipBLAS GEMM kernel (legacy - creates own handle)
          */
         std::unique_ptr<HipBLASGemmKernel> createHipBLASGemm(
             const DeviceId &device_id,
+            HipBLASGemmKernel::Precision precision = HipBLASGemmKernel::Precision::FP32);
+
+        /**
+         * @brief Factory function for hipBLAS GEMM kernel using device context
+         */
+        std::unique_ptr<HipBLASGemmKernel> createHipBLASGemm(
+            IWorkerGPUContext *ctx,
             HipBLASGemmKernel::Precision precision = HipBLASGemmKernel::Precision::FP32);
 
         /**

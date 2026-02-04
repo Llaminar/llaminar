@@ -2212,55 +2212,60 @@ namespace llaminar
                     throw std::runtime_error("KernelFactory::createAttention: null tensor");
                 }
 
-                // For GPU tensors, dispatch based on dev_type
-                if (tensor->is_on_gpu())
+                // Dispatch based on REQUESTED device type, not tensor location.
+                // Tensor data location is a coherence concern handled at execution time.
+                // Stage device_id determines which kernel to use.
+                switch (dev_type)
                 {
-                    switch (dev_type)
+                case DeviceType::CPU:
+                {
+                    // For CPU execution, use TensorBase* dispatch path
+                    auto *cpu_tensor = dynamic_cast<const llaminar2::TensorBase *>(tensor);
+                    if (!cpu_tensor)
                     {
-#ifdef HAVE_CUDA
-                    case DeviceType::CUDA:
-                        switch (tensor->native_type())
-                        {
-                        case llaminar2::TensorType::FP32:
-                            return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
-                        case llaminar2::TensorType::FP16:
-                            return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
-                        case llaminar2::TensorType::BF16:
-                            return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
-                        default:
-                            throw std::runtime_error(
-                                "KernelFactory::createAttention: unsupported CUDA GPU tensor type " +
-                                std::string(tensor->dtype_name()));
-                        }
-#endif
-#ifdef HAVE_ROCM
-                    case DeviceType::ROCm:
-                        switch (tensor->native_type())
-                        {
-                        case llaminar2::TensorType::FP32:
-                            return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
-                        case llaminar2::TensorType::FP16:
-                            return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
-                        case llaminar2::TensorType::BF16:
-                            return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
-                        default:
-                            throw std::runtime_error(
-                                "KernelFactory::createAttention: unsupported ROCm GPU tensor type " +
-                                std::string(tensor->dtype_name()));
-                        }
-#endif
-                    default:
-                        throw std::runtime_error("KernelFactory::createAttention: GPU tensor but requested backend not available");
+                        throw std::runtime_error("KernelFactory::createAttention: ITensor for CPU must be TensorBase");
                     }
+                    return createAttention(cpu_tensor, dev_type);
                 }
 
-                // For CPU tensors, use existing TensorBase* dispatch
-                auto *cpu_tensor = dynamic_cast<const llaminar2::TensorBase *>(tensor);
-                if (!cpu_tensor)
-                {
-                    throw std::runtime_error("KernelFactory::createAttention: non-GPU ITensor must be TensorBase");
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    switch (tensor->native_type())
+                    {
+                    case llaminar2::TensorType::FP32:
+                        return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    case llaminar2::TensorType::FP16:
+                        return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    case llaminar2::TensorType::BF16:
+                        return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    default:
+                        throw std::runtime_error(
+                            "KernelFactory::createAttention: unsupported CUDA tensor type " +
+                            std::string(tensor->dtype_name()));
+                    }
+#endif
+
+#ifdef HAVE_ROCM
+                case DeviceType::ROCm:
+                    switch (tensor->native_type())
+                    {
+                    case llaminar2::TensorType::FP32:
+                        return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    case llaminar2::TensorType::FP16:
+                        return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    case llaminar2::TensorType::BF16:
+                        return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    default:
+                        throw std::runtime_error(
+                            "KernelFactory::createAttention: unsupported ROCm tensor type " +
+                            std::string(tensor->dtype_name()));
+                    }
+#endif
+
+                default:
+                    throw std::runtime_error(
+                        "KernelFactory::createAttention: unsupported device type for ITensor");
                 }
-                return createAttention(cpu_tensor, dev_type);
             }
 
             // ==========================================================================

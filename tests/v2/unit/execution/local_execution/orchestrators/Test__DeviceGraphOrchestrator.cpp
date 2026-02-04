@@ -70,7 +70,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ConstructWithGraphBuilder)
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     EXPECT_NE(orchestrator, nullptr);
-    EXPECT_EQ(orchestrator->graphBuilder(), graph_builder_.get());
+    EXPECT_EQ(std::as_const(*orchestrator).graphBuilder(), graph_builder_.get());
     EXPECT_TRUE(orchestrator->isGraphCachingEnabled());
 }
 
@@ -80,7 +80,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ConstructWithConfig)
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     EXPECT_NE(orchestrator, nullptr);
-    EXPECT_NE(orchestrator->graphBuilder(), nullptr);
+    EXPECT_NE(std::as_const(*orchestrator).graphBuilder(), nullptr);
     EXPECT_TRUE(orchestrator->isGraphCachingEnabled());
 }
 
@@ -297,14 +297,14 @@ TEST_F(Test__DeviceGraphOrchestrator, GraphBuilderAccess)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
-    // Non-const access
-    Qwen2Graph *builder = orchestrator->graphBuilder();
-    EXPECT_EQ(builder, graph_builder_.get());
-
-    // Const access
-    const DeviceGraphOrchestrator *const_orch = orchestrator.get();
-    const Qwen2Graph *const_builder = const_orch->graphBuilder();
+    // Const access (non-const graphBuilder() is now protected to enforce fluent API)
+    const Qwen2Graph *const_builder = std::as_const(*orchestrator).graphBuilder();
     EXPECT_EQ(const_builder, graph_builder_.get());
+
+    // Explicit const cast also works
+    const DeviceGraphOrchestrator *const_orch = orchestrator.get();
+    const Qwen2Graph *builder = const_orch->graphBuilder();
+    EXPECT_EQ(builder, graph_builder_.get());
 }
 
 // =============================================================================
@@ -341,7 +341,7 @@ TEST_F(Test__DeviceGraphOrchestrator, MoveConstruction)
     auto orchestrator2 = std::move(orchestrator1);
 
     EXPECT_NE(orchestrator2, nullptr);
-    EXPECT_EQ(orchestrator2->graphBuilder(), graph_builder_.get());
+    EXPECT_EQ(std::as_const(*orchestrator2).graphBuilder(), graph_builder_.get());
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, MoveAssignment)
@@ -354,7 +354,7 @@ TEST_F(Test__DeviceGraphOrchestrator, MoveAssignment)
     // Move assign
     *orchestrator2 = std::move(*orchestrator1);
 
-    EXPECT_EQ(orchestrator2->graphBuilder(), graph_builder_.get());
+    EXPECT_EQ(std::as_const(*orchestrator2).graphBuilder(), graph_builder_.get());
 }
 
 // =============================================================================
@@ -446,7 +446,7 @@ TEST_F(Test__DeviceGraphOrchestrator, SetWeightsDelegatesToGraphBuilder)
     orchestrator->setWeights(weights);
 
     // Verify graph builder's isInitialized returns true
-    EXPECT_TRUE(orchestrator->graphBuilder()->isInitialized());
+    EXPECT_TRUE(std::as_const(*orchestrator).graphBuilder()->isInitialized());
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, SetBuffersDelegatesToGraphBuilder)

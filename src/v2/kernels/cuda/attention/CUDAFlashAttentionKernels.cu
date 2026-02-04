@@ -1,17 +1,19 @@
 /**
  * @file CUDAFlashAttentionKernels.cu
- * @brief CUDA device kernels for Flash Attention 3 and Flash Decoding
+ * @brief CUDA device kernels for Flash Attention 2 (Ampere) and Flash Decoding
  *
  * This file contains the CUDA device kernels and extern "C" wrapper functions
  * called from the C++ implementation file.
  *
  * Algorithms implemented:
- * - Flash Attention 3: Pipelined attention with warp specialization (SM >= 8.0)
- *   - Uses cp.async for overlapped memory transfers
+ * - Flash Attention 2 with Pipelined Prefetching: Optimized for Ampere (SM >= 8.0)
+ *   - Uses cp.async for overlapped global->shared memory transfers
  *   - Double-buffered shared memory for K/V tiles
  *   - Producer/consumer warp specialization
+ *   - WMMA (Tensor Core) acceleration for Q @ K^T matmul
  *   - Adaptive tile sizing for head_dim=64 and head_dim=128
  * - Flash Decoding: Split-K parallelism for single-token decode
+ *
  *
  * @author David Sanftenberg
  */
@@ -42,40 +44,44 @@ namespace
     constexpr int WMMA_K = 16;
 
     // =========================================================================
-    // Flash Attention 3 - Pipelined Prefill with cp.async (SM >= 8.0)
+    // Flash Attention 2 - Pipelined Prefill with cp.async (Ampere, SM >= 8.0)
     // =========================================================================
+    //
+    // This implements Flash Attention 2 (Dao et al., 2023) with software pipelining
+    // optimizations enabled by Ampere's cp.async instruction.
     //
     // Key optimizations:
     //   1. cp.async for asynchronous global->shared memory transfers
     //   2. Double-buffered K/V tiles to overlap load and compute
     //   3. Producer/consumer warp specialization
-    //   4. Reduced synchronization points
+    //   4. WMMA (16x16x16) for Tensor Core Q @ K^T computation
     //   5. Adaptive tile sizing for different head_dim values
     //
-    // Pipeline structure (2 stages):
+    // Pipeline structure (2 stages, software-managed):
     //   Stage 0: Load K[i], V[i] while computing on K[i-1], V[i-1]
     //   Stage 1: Load K[i+1], V[i+1] while computing on K[i], V[i]
     //
     // Warp roles (configurable via template):
-    //   Warps 0-1: Producers - async load K/V tiles
-    //   Warps 2+:  Consumers - WMMA compute + softmax
+    //   Warps 0-1: Producers - async load K/V tiles via cp.async
+    //   Warps 2+:  Consumers - WMMA compute + online softmax
+    //
     // =========================================================================
 
     // Pipeline configuration
-    constexpr int FA3_NUM_STAGES = 2;     // Double buffering
-    constexpr int FA3_PRODUCER_WARPS = 2; // Warps dedicated to loading (fixed)
-    constexpr int FA3_TILE_KV = 64;       // KV tile size (constant for good K/V reuse)
+    constexpr int FA2_NUM_STAGES = 2;     // Double buffering
+    constexpr int FA2_PRODUCER_WARPS = 2; // Warps dedicated to loading (fixed)
+    constexpr int FA2_TILE_KV = 64;       // KV tile size (constant for good K/V reuse)
     // Shared-memory padding for the [tile_q, tile_kv] scores matrix.
     // Note: WMMA store/load paths can have implicit alignment/stride constraints;
     // keep the padded leading dimension a multiple of 16.
-    constexpr int FA3_SCORES_LD_PAD = 16;
-    constexpr int FA3_QKV_PAD = 8; // Pad Q/K/V leading dimension by 8 halves (16 bytes)
+    constexpr int FA2_SCORES_LD_PAD = 16;
+    constexpr int FA2_QKV_PAD = 8; // Pad Q/K/V leading dimension by 8 halves (16 bytes)
 
     // =========================================================================
     // Cached Device Properties for Fast Kernel Launch
     // =========================================================================
 
-    struct FA3DeviceConfig
+    struct FA2DeviceConfig
     {
         int sm_major = 0;
         int sm_minor = 0;
@@ -84,16 +90,16 @@ namespace
     };
 
     // Per-device cached config (thread-safe via atomics on first init)
-    static FA3DeviceConfig g_fa3_device_config[8]; // Support up to 8 GPUs
+    static FA2DeviceConfig g_fa2_device_config[8]; // Support up to 8 GPUs
 
     /**
      * @brief Get cached device configuration (lazy init, thread-safe)
      */
-    inline FA3DeviceConfig &getFA3DeviceConfig(int device)
+    inline FA2DeviceConfig &getFA2DeviceConfig(int device)
     {
         if (device < 0 || device >= 8)
             device = 0;
-        FA3DeviceConfig &cfg = g_fa3_device_config[device];
+        FA2DeviceConfig &cfg = g_fa2_device_config[device];
 
         if (!cfg.initialized)
         {
@@ -120,12 +126,12 @@ namespace
      */
     inline int computeOptimalTileQ(int head_dim, int max_smem)
     {
-        const int tile_kv = FA3_TILE_KV;
-        const int scores_ld = tile_kv + FA3_SCORES_LD_PAD;
-        const int qkv_stride = head_dim + FA3_QKV_PAD;
+        const int tile_kv = FA2_TILE_KV;
+        const int scores_ld = tile_kv + FA2_SCORES_LD_PAD;
+        const int qkv_stride = head_dim + FA2_QKV_PAD;
 
         // KV buffer is fixed size (doesn't depend on tile_q)
-        size_t kv_buffer_size = FA3_NUM_STAGES * 2 * tile_kv * qkv_stride * sizeof(half);
+        size_t kv_buffer_size = FA2_NUM_STAGES * 2 * tile_kv * qkv_stride * sizeof(half);
 
         // Available for Q tile + scores
         if (kv_buffer_size >= max_smem)
@@ -174,13 +180,13 @@ namespace
     }
 
     /**
-     * @brief Compute FA3 kernel configuration based on head_dim
+     * @brief Compute FA2 kernel configuration based on head_dim
      *
      * Configurations:
      *   - head_dim <= 64:  tile_q=96, 6 consumers, 256 threads (~70KB smem)
      *   - head_dim <= 128: tile_q=64, 4 consumers, 192 threads (~98KB smem)
      */
-    struct FA3KernelConfig
+    struct FA2KernelConfig
     {
         int tile_q;
         int tile_kv;
@@ -189,32 +195,32 @@ namespace
         size_t smem_size;
     };
 
-    inline FA3KernelConfig computeFA3Config(int head_dim, int max_smem)
+    inline FA2KernelConfig computeFA2Config(int head_dim, int max_smem)
     {
-        FA3KernelConfig cfg;
-        cfg.tile_kv = FA3_TILE_KV; // Always 64
+        FA2KernelConfig cfg;
+        cfg.tile_kv = FA2_TILE_KV; // Always 64
 
         if (head_dim <= 64)
         {
             // Default config: 6 consumer warps for smaller head_dim
             cfg.tile_q = 96; // 6 * 16
             cfg.num_consumer_warps = 6;
-            cfg.block_size = (FA3_PRODUCER_WARPS + 6) * WARP_SIZE; // 256
+            cfg.block_size = (FA2_PRODUCER_WARPS + 6) * WARP_SIZE; // 256
         }
         else
         {
             // Reduced config for head_dim=128: 4 consumer warps
             cfg.tile_q = 64; // 4 * 16
             cfg.num_consumer_warps = 4;
-            cfg.block_size = (FA3_PRODUCER_WARPS + 4) * WARP_SIZE; // 192
+            cfg.block_size = (FA2_PRODUCER_WARPS + 4) * WARP_SIZE; // 192
         }
 
         // Verify shared memory fits
-        int qkv_stride = head_dim + FA3_QKV_PAD;
+        int qkv_stride = head_dim + FA2_QKV_PAD;
         size_t q_tile_size = cfg.tile_q * qkv_stride * sizeof(half);
-        size_t kv_buffer_size = FA3_NUM_STAGES * 2 * cfg.tile_kv * qkv_stride * sizeof(half);
+        size_t kv_buffer_size = FA2_NUM_STAGES * 2 * cfg.tile_kv * qkv_stride * sizeof(half);
         // Pad scores leading dimension to mitigate shared-memory bank conflicts
-        size_t scores_size = cfg.tile_q * (cfg.tile_kv + FA3_SCORES_LD_PAD) * sizeof(float);
+        size_t scores_size = cfg.tile_q * (cfg.tile_kv + FA2_SCORES_LD_PAD) * sizeof(float);
         cfg.smem_size = q_tile_size + kv_buffer_size + scores_size;
 
         // If still too large, fall back to even smaller tile_q
@@ -226,11 +232,11 @@ namespace
                 cfg.num_consumer_warps = 2;
             if (cfg.num_consumer_warps > 6)
                 cfg.num_consumer_warps = 6;
-            cfg.block_size = (FA3_PRODUCER_WARPS + cfg.num_consumer_warps) * WARP_SIZE;
+            cfg.block_size = (FA2_PRODUCER_WARPS + cfg.num_consumer_warps) * WARP_SIZE;
 
             // Recompute smem
             q_tile_size = cfg.tile_q * head_dim * sizeof(half);
-            scores_size = cfg.tile_q * (cfg.tile_kv + FA3_SCORES_LD_PAD) * sizeof(float);
+            scores_size = cfg.tile_q * (cfg.tile_kv + FA2_SCORES_LD_PAD) * sizeof(float);
             cfg.smem_size = q_tile_size + kv_buffer_size + scores_size;
         }
 
@@ -238,11 +244,11 @@ namespace
     }
 
     /**
-     * @brief Flash Attention 3 style kernel with pipelining (SM >= 8.0)
+     * @brief Flash Attention 2 kernel with pipelined prefetching (Ampere, SM >= 8.0)
      *
      * Uses cp.async for overlapped memory transfers with computation.
      * Double-buffered shared memory for K/V tiles.
-     * Producer/consumer warp specialization.
+     * Producer/consumer warp specialization with WMMA Tensor Core acceleration.
      *
      * Template parameters:
      *   NUM_CONSUMER_WARPS: Number of consumer warps (4 for head_dim=128, 6 for head_dim=64)
@@ -251,7 +257,7 @@ namespace
      *   - tile_q should be NUM_CONSUMER_WARPS * 16 (WMMA_M)
      */
     template <int NUM_CONSUMER_WARPS>
-    __global__ void flash_attention_3_pipelined_kernel(
+    __global__ void flash_attention_2_pipelined_kernel(
         const float *__restrict__ Q,
         const float *__restrict__ K,
         const float *__restrict__ V,
@@ -286,8 +292,8 @@ namespace
 
         // Warp role: producer (warps 0-1) or consumer (warps 2+)
         // Use template parameter for consumer warp count
-        const bool is_producer = (warp_id < FA3_PRODUCER_WARPS);
-        const int consumer_warp_id = warp_id - FA3_PRODUCER_WARPS;
+        const bool is_producer = (warp_id < FA2_PRODUCER_WARPS);
+        const int consumer_warp_id = warp_id - FA2_PRODUCER_WARPS;
         const bool is_active_consumer = (!is_producer && consumer_warp_id >= 0 && consumer_warp_id < NUM_CONSUMER_WARPS);
 
         // Shared memory layout with double buffering:
@@ -297,13 +303,13 @@ namespace
         // scores: [tile_q, tile_kv]
         extern __shared__ char smem[];
 
-        const int smem_stride = head_dim + FA3_QKV_PAD;
+        const int smem_stride = head_dim + FA2_QKV_PAD;
         const int kv_tile_size = tile_kv * smem_stride;
-        const int scores_ld = tile_kv + FA3_SCORES_LD_PAD; // padded LD to reduce shared-memory bank conflicts
+        const int scores_ld = tile_kv + FA2_SCORES_LD_PAD; // padded LD to reduce shared-memory bank conflicts
 
         half *Q_tile_fp16 = reinterpret_cast<half *>(smem);
         half *KV_buffers = Q_tile_fp16 + tile_q * smem_stride;
-        float *scores = reinterpret_cast<float *>(KV_buffers + FA3_NUM_STAGES * 2 * kv_tile_size);
+        float *scores = reinterpret_cast<float *>(KV_buffers + FA2_NUM_STAGES * 2 * kv_tile_size);
 
         // Helper to get K/V tile for a stage
         auto get_K_tile = [&](int stage) -> half *
@@ -391,8 +397,8 @@ namespace
         // =====================================================================
         for (int kv_tile_iter = 0; kv_tile_iter < num_kv_tiles; kv_tile_iter++)
         {
-            const int current_stage = kv_tile_iter % FA3_NUM_STAGES;
-            const int next_stage = (kv_tile_iter + 1) % FA3_NUM_STAGES;
+            const int current_stage = kv_tile_iter % FA2_NUM_STAGES;
+            const int next_stage = (kv_tile_iter + 1) % FA2_NUM_STAGES;
 
             const int kv_start = kv_tile_iter * tile_kv;
             const int kv_end_tile = min(kv_start + tile_kv, kv_len);
@@ -557,10 +563,10 @@ namespace
     }
 
     // Explicit template instantiations for supported configurations
-    template __global__ void flash_attention_3_pipelined_kernel<6>(
+    template __global__ void flash_attention_2_pipelined_kernel<6>(
         const float *, const float *, const float *, float *,
         int, int, int, int, int, int, float, bool, int, int, int, int);
-    template __global__ void flash_attention_3_pipelined_kernel<4>(
+    template __global__ void flash_attention_2_pipelined_kernel<4>(
         const float *, const float *, const float *, float *,
         int, int, int, int, int, int, float, bool, int, int, int, int);
 
@@ -830,7 +836,7 @@ namespace
 extern "C"
 {
     /**
-     * @brief Launch Flash Attention 3 pipelined kernel (SM >= 8.0)
+     * @brief Launch Flash Attention 2 pipelined kernel (SM >= 8.0)
      *
      * Dispatches to different kernel variants based on head_dim:
      *   - head_dim <= 64:  6 consumer warps, tile_q=96, 256 threads
@@ -838,7 +844,7 @@ extern "C"
      *
      * Returns -1 on invalid input, -2 if GPU doesn't support SM 8.0.
      */
-    int cudaFlashAttn_prefill_fa3(
+    int cudaFlashAttn_prefill_fa2(
         const float *Q, const float *K, const float *V, float *O,
         int batch_size, int seq_len, int kv_len,
         int n_heads, int n_kv_heads, int head_dim,
@@ -852,11 +858,11 @@ extern "C"
         // Get cached device config
         int device;
         cudaGetDevice(&device);
-        const FA3DeviceConfig &dev_cfg = getFA3DeviceConfig(device);
+        const FA2DeviceConfig &dev_cfg = getFA2DeviceConfig(device);
 
         if (dev_cfg.sm_major < 8)
         {
-            printf("[cudaFlashAttn_prefill_fa3] Error: SM %d.%d not supported, requires SM >= 8.0\n",
+            printf("[cudaFlashAttn_prefill_fa2] Error: SM %d.%d not supported, requires SM >= 8.0\n",
                    dev_cfg.sm_major, dev_cfg.sm_minor);
             return -2;
         }
@@ -864,22 +870,22 @@ extern "C"
         // Input validation
         if (head_dim <= 0)
         {
-            printf("[cudaFlashAttn_prefill_fa3] Error: head_dim=%d must be positive\n", head_dim);
+            printf("[cudaFlashAttn_prefill_fa2] Error: head_dim=%d must be positive\n", head_dim);
             return -1;
         }
         if (head_dim % 16 != 0)
         {
-            printf("[cudaFlashAttn_prefill_fa3] Error: head_dim=%d must be multiple of 16 for WMMA\n", head_dim);
+            printf("[cudaFlashAttn_prefill_fa2] Error: head_dim=%d must be multiple of 16 for WMMA\n", head_dim);
             return -1;
         }
         if (head_dim > 256)
         {
-            printf("[cudaFlashAttn_prefill_fa3] Error: head_dim=%d exceeds maximum supported (256)\n", head_dim);
+            printf("[cudaFlashAttn_prefill_fa2] Error: head_dim=%d exceeds maximum supported (256)\n", head_dim);
             return -1;
         }
 
         // Compute kernel configuration based on head_dim
-        FA3KernelConfig cfg = computeFA3Config(head_dim, dev_cfg.max_smem_optin);
+        FA2KernelConfig cfg = computeFA2Config(head_dim, dev_cfg.max_smem_optin);
 
         // Grid: (n_heads, num_q_tiles, batch_size)
         int num_q_tiles = (seq_len + cfg.tile_q - 1) / cfg.tile_q;
@@ -890,11 +896,11 @@ extern "C"
         // Dispatch to correct kernel variant based on consumer warp count
         if (cfg.num_consumer_warps == 6)
         {
-            cudaFuncSetAttribute(flash_attention_3_pipelined_kernel<6>,
+            cudaFuncSetAttribute(flash_attention_2_pipelined_kernel<6>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  cfg.smem_size);
 
-            flash_attention_3_pipelined_kernel<6><<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(
+            flash_attention_2_pipelined_kernel<6><<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(
                 Q, K, V, O,
                 batch_size, seq_len, kv_len,
                 n_heads, n_kv_heads, head_dim,
@@ -904,11 +910,11 @@ extern "C"
         else
         {
             // 4 consumer warps for head_dim=128
-            cudaFuncSetAttribute(flash_attention_3_pipelined_kernel<4>,
+            cudaFuncSetAttribute(flash_attention_2_pipelined_kernel<4>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  cfg.smem_size);
 
-            flash_attention_3_pipelined_kernel<4><<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(
+            flash_attention_2_pipelined_kernel<4><<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(
                 Q, K, V, O,
                 batch_size, seq_len, kv_len,
                 n_heads, n_kv_heads, head_dim,
@@ -919,7 +925,7 @@ extern "C"
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            printf("[cudaFlashAttn_prefill_fa3] CUDA error: %s (smem=%zu bytes, tile_q=%d, tile_kv=%d, head_dim=%d, "
+            printf("[cudaFlashAttn_prefill_fa2] CUDA error: %s (smem=%zu bytes, tile_q=%d, tile_kv=%d, head_dim=%d, "
                    "consumer_warps=%d, max_smem=%d, grid=(%d,%d,%d), block=%d)\n",
                    cudaGetErrorString(err), cfg.smem_size, cfg.tile_q, cfg.tile_kv, head_dim,
                    cfg.num_consumer_warps, dev_cfg.max_smem_optin,

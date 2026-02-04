@@ -214,6 +214,8 @@ namespace llaminar2::test
             return static_cast<int>(config_.devices.size());
         }
 
+        int myIndex() const override { return 0; }
+
         // =====================================================================
         // ILocalTPContext Implementation - Collective Operations
         // =====================================================================
@@ -365,6 +367,16 @@ namespace llaminar2::test
         bool reserveTempBufferBytes(size_t /*bytes*/) override { return true; }
 
         // =====================================================================
+        // ILocalTPContext Implementation - Broadcast
+        // =====================================================================
+
+        bool broadcast(TensorBase* /*tensor*/, int /*source_device_index*/ = 0) override
+        {
+            broadcast_calls_.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+
+        // =====================================================================
         // Test Utilities - Call Tracking
         // =====================================================================
 
@@ -376,6 +388,11 @@ namespace llaminar2::test
         size_t allgather_call_count() const
         {
             return allgather_calls_.load(std::memory_order_relaxed);
+        }
+
+        size_t broadcast_call_count() const
+        {
+            return broadcast_calls_.load(std::memory_order_relaxed);
         }
 
         size_t gather_from_devices_call_count() const
@@ -397,6 +414,7 @@ namespace llaminar2::test
         {
             allreduce_calls_.store(0, std::memory_order_relaxed);
             allgather_calls_.store(0, std::memory_order_relaxed);
+            broadcast_calls_.store(0, std::memory_order_relaxed);
             gather_from_devices_calls_.store(0, std::memory_order_relaxed);
             reduce_scatter_calls_.store(0, std::memory_order_relaxed);
             synchronize_calls_.store(0, std::memory_order_relaxed);
@@ -415,6 +433,7 @@ namespace llaminar2::test
         Config config_;
         mutable std::atomic<size_t> allreduce_calls_{0};
         mutable std::atomic<size_t> allgather_calls_{0};
+        mutable std::atomic<size_t> broadcast_calls_{0};
         mutable std::atomic<size_t> gather_from_devices_calls_{0};
         mutable std::atomic<size_t> reduce_scatter_calls_{0};
         mutable std::atomic<size_t> synchronize_calls_{0};

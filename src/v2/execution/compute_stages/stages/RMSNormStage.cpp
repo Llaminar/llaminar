@@ -68,7 +68,7 @@ namespace llaminar2
                                                      << " device=" << static_cast<int>(dev_type));
 
         // DEBUG: Log input for parity debugging (guard expensive fp32_data() call)
-        if (Logger::getInstance().shouldLog(LogLevel::TRACE))
+        if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
         {
             const float *in_data = params_.input->fp32_data();
             if (in_data)
@@ -99,7 +99,7 @@ namespace llaminar2
             params_.device_id.toKernelDeviceIndex());
 
         // DEBUG: Log RMSNorm output for parity debugging (guard expensive fp32_data() call)
-        if (success && Logger::getInstance().shouldLog(LogLevel::TRACE))
+        if (success && Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
         {
             // Get output from host after GPU kernel (if GPU, needs sync)
             const float *out_data = params_.output->fp32_data();
@@ -162,7 +162,7 @@ namespace llaminar2
         }
     }
 
-    StageDumpInfo RMSNormStage::buildDumpInfoImpl() const
+    StageDumpInfo RMSNormStage::getDumpInfo() const
     {
         StageDumpInfo info;
 

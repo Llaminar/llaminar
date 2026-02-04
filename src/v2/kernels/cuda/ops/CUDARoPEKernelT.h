@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include "../../../backends/IWorkerGPUContext.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/config/RuntimeConfig.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
@@ -262,6 +263,7 @@ namespace llaminar2
             int device_idx_;
             float rope_theta_;
             DeviceWorkspaceManager *workspace_;
+            IWorkerGPUContext *device_ctx_ = nullptr;
 
             // Inverse frequency cache state (for workspace-based allocation)
             mutable bool inv_freq_initialized_;
@@ -285,7 +287,31 @@ namespace llaminar2
             explicit CUDARoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
                 : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
                   inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
+
+            /**
+             * @brief Construct with device context (Phase 4 pattern)
+             * @param ctx Device context for shared handles/streams
+             * @param rope_theta RoPE theta parameter
+             */
+            explicit CUDARoPEKernelT(IWorkerGPUContext *ctx, float rope_theta = 10000.0f)
+                : rope_theta_(rope_theta), workspace_(nullptr),
+                  inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f)
+            {
+                if (!ctx)
+                    throw std::runtime_error("CUDARoPEKernelT<BF16>: Device context is null");
+                if (!ctx->isInitialized())
+                    throw std::runtime_error("CUDARoPEKernelT<BF16>: Device context not initialized");
+                device_ctx_ = ctx;
+                device_idx_ = ctx->deviceOrdinal();
+            }
+
             ~CUDARoPEKernelT() override = default;
+
+            // ===== Device Context Support (Phase 4) =====
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
@@ -483,6 +509,7 @@ namespace llaminar2
             int device_idx_;
             float rope_theta_;
             DeviceWorkspaceManager *workspace_;
+            IWorkerGPUContext *device_ctx_ = nullptr;
 
             // Inverse frequency cache state (for workspace-based allocation)
             mutable bool inv_freq_initialized_;
@@ -506,7 +533,31 @@ namespace llaminar2
             explicit CUDARoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
                 : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
                   inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
+
+            /**
+             * @brief Construct with device context (Phase 4 pattern)
+             * @param ctx Device context for shared handles/streams
+             * @param rope_theta RoPE theta parameter
+             */
+            explicit CUDARoPEKernelT(IWorkerGPUContext *ctx, float rope_theta = 10000.0f)
+                : rope_theta_(rope_theta), workspace_(nullptr),
+                  inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f)
+            {
+                if (!ctx)
+                    throw std::runtime_error("CUDARoPEKernelT<FP16>: Device context is null");
+                if (!ctx->isInitialized())
+                    throw std::runtime_error("CUDARoPEKernelT<FP16>: Device context not initialized");
+                device_ctx_ = ctx;
+                device_idx_ = ctx->deviceOrdinal();
+            }
+
             ~CUDARoPEKernelT() override = default;
+
+            // ===== Device Context Support (Phase 4) =====
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
@@ -704,6 +755,7 @@ namespace llaminar2
             int device_idx_;
             float rope_theta_;
             DeviceWorkspaceManager *workspace_;
+            IWorkerGPUContext *device_ctx_ = nullptr;
 
             // Inverse frequency cache state (for workspace-based allocation)
             mutable bool inv_freq_initialized_;

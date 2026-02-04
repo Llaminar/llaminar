@@ -575,4 +575,51 @@ namespace llaminar2
         return device_id == 0;
     }
 
+    // ====================================================================
+    // Async Operations (Trivial for CPU - immediate completion)
+    // ====================================================================
+
+    std::future<bool> CPUBackend::deviceToHostAsync(void *dst, const void *src, size_t bytes, int device_id)
+    {
+        std::promise<bool> p;
+        p.set_value(deviceToHost(dst, src, bytes, device_id));
+        return p.get_future();
+    }
+
+    std::future<bool> CPUBackend::hostToDeviceAsync(void *dst, const void *src, size_t bytes, int device_id)
+    {
+        std::promise<bool> p;
+        p.set_value(hostToDevice(dst, src, bytes, device_id));
+        return p.get_future();
+    }
+
+    std::future<bool> CPUBackend::synchronizeAsync(int device_id)
+    {
+        std::promise<bool> p;
+        p.set_value(synchronize(device_id));
+        return p.get_future();
+    }
+
+    std::future<void *> CPUBackend::allocateAsync(size_t bytes, int device_id)
+    {
+        std::promise<void *> p;
+        p.set_value(allocate(bytes, device_id));
+        return p.get_future();
+    }
+
+    std::future<void> CPUBackend::freeAsync(void *ptr, int device_id)
+    {
+        free(ptr, device_id);
+        std::promise<void> p;
+        p.set_value();
+        return p.get_future();
+    }
+
+    std::future<bool> CPUBackend::memsetAsync(void *ptr, int value, size_t bytes, int device_id)
+    {
+        std::promise<bool> p;
+        p.set_value(memset(ptr, value, bytes, device_id));
+        return p.get_future();
+    }
+
 } // namespace llaminar2

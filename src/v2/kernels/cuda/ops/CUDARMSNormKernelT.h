@@ -16,10 +16,12 @@
 
 #pragma once
 
+#include "../../../backends/IWorkerGPUContext.h"
 #include "../../../execution/config/RuntimeConfig.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/BlockStructures.h"
 #include <cstdint>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -53,9 +55,30 @@ namespace llaminar2
             using StorageType = float;
 
             explicit CUDARMSNormKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+
+            /**
+             * @brief Construct with device context (Phase 4 pattern)
+             * @param ctx Device context for shared handles/streams
+             */
+            explicit CUDARMSNormKernelT(IWorkerGPUContext *ctx)
+            {
+                if (!ctx)
+                    throw std::runtime_error("CUDARMSNormKernelT: Device context is null");
+                if (!ctx->isInitialized())
+                    throw std::runtime_error("CUDARMSNormKernelT: Device context not initialized");
+                device_ctx_ = ctx;
+                device_idx_ = ctx->deviceOrdinal();
+            }
+
             ~CUDARMSNormKernelT() override = default;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
+
+            // ===== Device Context Support (Phase 4) =====
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             // ===== ITensorRMSNorm interface =====
             bool apply(
@@ -130,7 +153,8 @@ namespace llaminar2
             static const char *precision_name() { return "FP32"; }
 
         private:
-            int device_idx_;
+            int device_idx_ = 0;
+            IWorkerGPUContext *device_ctx_ = nullptr;
         };
 
         // =========================================================================
@@ -144,9 +168,25 @@ namespace llaminar2
             using StorageType = uint16_t;
 
             explicit CUDARMSNormKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+
+            explicit CUDARMSNormKernelT(IWorkerGPUContext *ctx)
+            {
+                if (!ctx)
+                    throw std::runtime_error("CUDARMSNormKernelT: Device context is null");
+                if (!ctx->isInitialized())
+                    throw std::runtime_error("CUDARMSNormKernelT: Device context not initialized");
+                device_ctx_ = ctx;
+                device_idx_ = ctx->deviceOrdinal();
+            }
+
             ~CUDARMSNormKernelT() override = default;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
+
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             // ===== ITensorRMSNorm interface =====
             bool apply(
@@ -223,7 +263,8 @@ namespace llaminar2
             static const char *precision_name() { return "BF16"; }
 
         private:
-            int device_idx_;
+            int device_idx_ = 0;
+            IWorkerGPUContext *device_ctx_ = nullptr;
         };
 
         // =========================================================================
@@ -237,9 +278,25 @@ namespace llaminar2
             using StorageType = uint16_t;
 
             explicit CUDARMSNormKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+
+            explicit CUDARMSNormKernelT(IWorkerGPUContext *ctx)
+            {
+                if (!ctx)
+                    throw std::runtime_error("CUDARMSNormKernelT: Device context is null");
+                if (!ctx->isInitialized())
+                    throw std::runtime_error("CUDARMSNormKernelT: Device context not initialized");
+                device_ctx_ = ctx;
+                device_idx_ = ctx->deviceOrdinal();
+            }
+
             ~CUDARMSNormKernelT() override = default;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
+
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             // ===== ITensorRMSNorm interface =====
             bool apply(
@@ -316,7 +373,8 @@ namespace llaminar2
             static const char *precision_name() { return "FP16"; }
 
         private:
-            int device_idx_;
+            int device_idx_ = 0;
+            IWorkerGPUContext *device_ctx_ = nullptr;
         };
 
     } // namespace cuda

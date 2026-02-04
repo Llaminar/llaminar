@@ -15,7 +15,11 @@
 #include "../../../loaders/WeightManager.h"
 #include "../../../loaders/WeightPlacementMap.h"
 #include "../../../config/TensorParallelConfig.h"
-#include "../../../collective/ILocalTPContext.h"
+#include "../../../config/PipelineConfig.h"
+#include "../../../collective/ILocalTPContext.h" // createLocalTPContext()
+#include "../../../collective/ILocalPPContext.h" // createLocalPPContext(), HierarchicalPPConfig
+#include "../../../collective/PPStage.h"         // PPStage variant type
+#include "../../../backends/p2p/DirectP2P.h"     // DirectP2PEngine for BAR-backed allocation
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/MPIContext.h"
@@ -504,9 +508,24 @@ namespace llaminar2
 
         auto start = std::chrono::high_resolution_clock::now();
 
-        if (!input.token_ids && !input.batches)
+        // Token input OR activation input is required
+        bool has_token_input = input.token_ids || input.batches;
+        bool has_activation_input = external_hidden_state_input_ != nullptr;
+
+        // For PP stages without embedding, activation input is required instead of tokens
+        bool is_pp_middle_stage = pp_stage_config_.has_value() &&
+                                  !pp_stage_config_.value().has_embedding;
+
+        if (!has_token_input && !has_activation_input)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] No token input provided");
+            LOG_ERROR("[DeviceGraphOrchestrator] No token or activation input provided");
+            return false;
+        }
+
+        if (is_pp_middle_stage && !has_activation_input)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] PP middle stage requires activation input "
+                      "via setHiddenState()");
             return false;
         }
 
@@ -531,9 +550,91 @@ namespace llaminar2
             effective_input.position_ids = position_ids_storage.data();
         }
 
-        // Build forward graph via declarative builder
-        LOG_DEBUG("[DeviceGraphOrchestrator] Building forward graph...");
-        ComputeGraph graph = graph_builder_->buildFullForwardGraph(effective_input, output);
+        // Pass external hidden state to graph builder input for PP middle/final stages
+        if (external_hidden_state_input_)
+        {
+            effective_input.external_hidden_state = external_hidden_state_input_;
+            LOG_DEBUG("[DeviceGraphOrchestrator] Using external hidden state input: "
+                      << external_hidden_state_input_->numel() << " elements");
+
+            // Clear for next invocation (single-use semantics)
+            external_hidden_state_input_ = nullptr;
+        }
+
+        // Build forward graph via fluent builder API
+        // Priority is auto-selected: unified PP > partial PP stage > full forward
+        GraphBuildResult build_result = [&]() -> GraphBuildResult
+        {
+            // Start building the graph with input
+            auto session = buildGraph()
+                               .forInput(effective_input);
+
+            // Add external hidden state for PP middle/final stages (if set above)
+            // Note: external_hidden_state is already in effective_input.external_hidden_state
+            // but the fluent API uses it via prepareInput()
+
+            if (pipeline_config_ && pipeline_config_->hasPP())
+            {
+                // Unified PP+TP path: single graph spanning all PP stages
+                LOG_DEBUG("[DeviceGraphOrchestrator] Building UNIFIED PIPELINE graph: "
+                          << pipeline_config_->numStages() << " PP stages, "
+                          << pipeline_config_->total_layers << " layers");
+
+                // Initialize PP and TP contexts if needed
+                if (!pp_contexts_initialized_ && !initializePPContexts())
+                {
+                    return GraphBuildResult("Failed to initialize PP contexts");
+                }
+                if (!tp_contexts_initialized_ && !initializeTPContexts())
+                {
+                    return GraphBuildResult("Failed to initialize TP contexts");
+                }
+
+                // Wire PP contexts to the session
+                for (const auto &[key, ctx] : pp_contexts_)
+                {
+                    session.withPPContext(key.first, key.second, ctx.get());
+                }
+
+                // Wire TP contexts to the session
+                for (const auto &[name, ctx] : domain_tp_contexts_)
+                {
+                    session.withTPContext(name, ctx.get());
+                }
+
+                return session
+                    .withPipelineConfig(pipeline_config_)
+                    .buildUnified();
+            }
+            else if (pp_stage_config_.has_value())
+            {
+                // Legacy single-stage PP path
+                const auto &pp = pp_stage_config_.value();
+                LOG_DEBUG("[DeviceGraphOrchestrator] Building PARTIAL forward graph: "
+                          << "layers=[" << pp.first_layer << ", " << pp.last_layer << ") "
+                          << "has_embedding=" << pp.has_embedding
+                          << " has_lm_head=" << pp.has_lm_head);
+
+                return session
+                    .forPPStage(pp.first_layer, pp.last_layer, pp.has_embedding, pp.has_lm_head)
+                    .buildPartial();
+            }
+            else
+            {
+                LOG_DEBUG("[DeviceGraphOrchestrator] Building FULL forward graph...");
+                return session.buildForward();
+            }
+        }();
+
+        if (!build_result)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Graph build failed: " << build_result.error());
+            return false;
+        }
+
+        output = build_result.output();
+        ComputeGraph graph = build_result.takeGraph();
+
         LOG_DEBUG("[DeviceGraphOrchestrator] Forward graph built with " << graph.size() << " stages");
 
         if (graph.size() == 0)
@@ -542,21 +643,48 @@ namespace llaminar2
             return false;
         }
 
-        // Get device context
-        LOG_DEBUG("[DeviceGraphOrchestrator] Getting device context for " << input.device << "...");
-        IDeviceContext *ctx = getDeviceContext(input.device);
-        if (!ctx)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Failed to get device context");
-            return false;
-        }
-        LOG_DEBUG("[DeviceGraphOrchestrator] Got device context, starting execution...");
-
         // Ensure GPU workspace is allocated for GEMM kernels (lazy initialization)
         ensureDeviceWorkspaceAllocated(graph);
 
-        // Execute
-        bool success = executor_.execute(graph, ctx);
+        bool success = false;
+
+        // Execution path depends on configuration:
+        // - Unified PP: multi-device execution with all PP stage devices
+        // - Single-device: standard single-context execution
+        if (pipeline_config_ && pipeline_config_->hasPP())
+        {
+            // Build device contexts map for all devices in the pipeline
+            std::unordered_map<DeviceId, IDeviceContext *> contexts;
+            for (const auto &device : pipeline_config_->getAllDevices())
+            {
+                IDeviceContext *ctx = getDeviceContext(device);
+                if (!ctx)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to get device context for " << device);
+                    return false;
+                }
+                contexts[device] = ctx;
+            }
+
+            LOG_DEBUG("[DeviceGraphOrchestrator] Executing unified PP graph with "
+                      << contexts.size() << " device contexts...");
+
+            success = executor_.executeMultiDevice(graph, contexts);
+        }
+        else
+        {
+            // Get single device context
+            LOG_DEBUG("[DeviceGraphOrchestrator] Getting device context for " << input.device << "...");
+            IDeviceContext *ctx = getDeviceContext(input.device);
+            if (!ctx)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to get device context");
+                return false;
+            }
+            LOG_DEBUG("[DeviceGraphOrchestrator] Got device context, starting execution...");
+
+            success = executor_.execute(graph, ctx);
+        }
 
         auto end = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
@@ -863,13 +991,26 @@ namespace llaminar2
                 return success;
             }
 
-            // Build and cache the graph
+            // Build and cache the graph using fluent API
             LOG_DEBUG("[DeviceGraphOrchestrator] Building and caching attention graph for layer "
                       << layer_idx << " (decode mode)");
 
-            cache.attention_decode = std::make_unique<ComputeGraph>(
-                graph_builder_->buildAttentionGraph(layer, buffers, layer_idx, seq_len,
-                                                    1, kv_cache, position_ids, device, nullptr));
+            auto result = buildAttentionGraph()
+                              .forLayer(layer, layer_idx)
+                              .withBuffers(buffers)
+                              .withSequence(seq_len, 1)
+                              .onDevice(device)
+                              .withKVCache(kv_cache)
+                              .withPositionIds(position_ids)
+                              .build();
+
+            if (!result)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Attention graph build failed: " << result.error());
+                return false;
+            }
+
+            cache.attention_decode = std::make_unique<ComputeGraph>(result.takeGraph());
             cache.cached_seq_len = seq_len;
             cache.valid = true;
             cache_stats_.attention_cache_misses++;
@@ -886,12 +1027,26 @@ namespace llaminar2
         }
 
         // =============================================================================
-        // Non-cached path (prefill or caching disabled)
+        // Non-cached path (prefill or caching disabled) using fluent API
         // =============================================================================
         cache_stats_.attention_cache_misses++;
 
-        ComputeGraph graph = graph_builder_->buildAttentionGraph(
-            layer, buffers, layer_idx, seq_len, 1, kv_cache, position_ids, device, nullptr);
+        auto result = buildAttentionGraph()
+                          .forLayer(layer, layer_idx)
+                          .withBuffers(buffers)
+                          .withSequence(seq_len, 1)
+                          .onDevice(device)
+                          .withKVCache(kv_cache)
+                          .withPositionIds(position_ids)
+                          .build();
+
+        if (!result)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Attention graph build failed: " << result.error());
+            return false;
+        }
+
+        ComputeGraph graph = result.takeGraph();
 
         // Debug: log graph structure
         if (layer_idx == 0)
@@ -964,12 +1119,24 @@ namespace llaminar2
                 return success;
             }
 
-            // Build and cache the graph
+            // Build and cache the graph using fluent API
             LOG_DEBUG("[DeviceGraphOrchestrator] Building and caching FFN graph for layer "
                       << layer_idx << " (decode mode)");
 
-            cache.ffn_decode = std::make_unique<ComputeGraph>(
-                graph_builder_->buildFFNGraph(layer, buffers, layer_idx, seq_len, 1, device)); // batch_size=1 for decode
+            auto result = buildFFNGraph()
+                              .forLayer(layer, layer_idx)
+                              .withBuffers(buffers)
+                              .withSequence(seq_len, 1)
+                              .onDevice(device)
+                              .build();
+
+            if (!result)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] FFN graph build failed: " << result.error());
+                return false;
+            }
+
+            cache.ffn_decode = std::make_unique<ComputeGraph>(result.takeGraph());
             cache_stats_.ffn_cache_misses++;
 
             // Execute the newly built graph
@@ -984,11 +1151,24 @@ namespace llaminar2
         }
 
         // =============================================================================
-        // Non-cached path (prefill or caching disabled)
+        // Non-cached path (prefill or caching disabled) using fluent API
         // =============================================================================
         cache_stats_.ffn_cache_misses++;
 
-        ComputeGraph graph = graph_builder_->buildFFNGraph(layer, buffers, layer_idx, seq_len, 1, device); // batch_size=1 for deprecated path
+        auto result = buildFFNGraph()
+                          .forLayer(layer, layer_idx)
+                          .withBuffers(buffers)
+                          .withSequence(seq_len, 1)
+                          .onDevice(device)
+                          .build();
+
+        if (!result)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] FFN graph build failed: " << result.error());
+            return false;
+        }
+
+        ComputeGraph graph = result.takeGraph();
 
         bool success = executor_.execute(graph, ctx);
 
@@ -1275,9 +1455,63 @@ namespace llaminar2
         LOG_DEBUG("[DeviceGraphOrchestrator] Activation buffer precision: " << activationPrecisionToString(act_prec));
 
         // Allocate core buffers (always FP32 - interface with embeddings/softmax)
-        state_.hidden = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-            device);
+        // =========================================================================
+        // Hidden State: BAR-backed allocation for cross-vendor PP transfers
+        // =========================================================================
+        // When use_bar_backed_hidden is true and the device is ROCm, allocate hidden
+        // state in PCIe BAR memory. This enables zero-copy reads from CUDA devices
+        // during PP activation transfer (ROCm stage → CUDA stage).
+        // =========================================================================
+        if (init_config.use_bar_backed_hidden && device.is_rocm() && factory.canCreateBARBacked())
+        {
+            // Find the CUDA device in the system for BAR-backed allocation
+            // The DirectP2PEngine singleton should have been initialized with the CUDA device
+            auto p2p = DirectP2PEngine::getSharedInstance();
+            if (p2p && p2p->isPCIeBarActive())
+            {
+                // Use cuda:0 as the default CUDA device for BAR allocation
+                // In typical cross-vendor PP setups, there's usually one CUDA device
+                DeviceId cuda_device_for_bar = DeviceId::cuda(0);
+
+                try
+                {
+                    auto bar_backed_hidden = factory.createFP32BARBacked(
+                        {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                        device, // ROCm device owns the BAR memory
+                        cuda_device_for_bar);
+
+                    if (bar_backed_hidden)
+                    {
+                        state_.hidden = std::move(bar_backed_hidden);
+                        LOG_INFO("[DeviceGraphOrchestrator] Allocated BAR-backed hidden state for cross-vendor PP: "
+                                 << "ROCm=" << device.toString() << ", CUDA=" << cuda_device_for_bar.toString());
+                    }
+                    else
+                    {
+                        LOG_WARN("[DeviceGraphOrchestrator] BAR-backed hidden allocation returned nullptr, "
+                                 << "falling back to standard allocation");
+                    }
+                }
+                catch (const std::exception &e)
+                {
+                    LOG_WARN("[DeviceGraphOrchestrator] BAR-backed hidden allocation failed: " << e.what()
+                                                                                               << " - falling back to standard allocation");
+                }
+            }
+            else
+            {
+                LOG_WARN("[DeviceGraphOrchestrator] use_bar_backed_hidden requested but PCIe BAR not active, "
+                         << "falling back to standard allocation");
+            }
+        }
+
+        // Standard allocation if BAR-backed not used or failed
+        if (!state_.hidden)
+        {
+            state_.hidden = factory.createFP32(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                device);
+        }
 
         // Logits ALWAYS use mapped memory on GPU devices (regardless of init_config)
         // because logits are returned to the caller for sampling - they must be host-accessible.
@@ -1533,18 +1767,6 @@ namespace llaminar2
         LOG_DEBUG("[DeviceGraphOrchestrator] KV cache layout mode: "
                   << (kv_layout_mode == KVCacheLayoutMode::HEAD_MAJOR ? "HEAD_MAJOR" : "POSITION_MAJOR"));
 
-        // Build KVCacheConfig for factory
-        llaminar::v2::kernels::KVCacheConfig kv_config;
-        kv_config.precision = kv_cache_prec;
-        kv_config.device = device;
-        kv_config.num_layers = n_layers;
-        kv_config.batch_size = batch_size;
-        kv_config.max_seq_len = max_seq_len;
-        kv_config.n_kv_heads = n_kv_heads;
-        kv_config.head_dim = head_dim;
-        kv_config.layout_mode = kv_layout_mode;
-        kv_config.mpi_ctx = local_mpi_ctx.get();
-
         // Set sharding parameters if needed (tensor parallelism)
         // Sharding is needed when local_n_kv_heads < n_kv_heads, AND tensor parallelism is active.
         // TP can be:
@@ -1554,35 +1776,141 @@ namespace llaminar2
         bool is_global_tp = mpi_ctx_ && mpi_ctx_->world_size() > 1;
         bool is_local_tp = config.local_tp_ctx && config.local_tp_ctx->degree() > 1;
 
-        if (use_sharded_cache && (is_global_tp || is_local_tp))
+        // =====================================================================
+        // KV Cache Creation: Per-stage for PP, single for non-PP
+        // =====================================================================
+        if (pipeline_config_ && pipeline_config_->hasPP())
         {
-            kv_config.local_n_kv_heads = config.local_n_kv_heads;
+            // Pipeline Parallelism: Create a KV cache for each PP stage's device
+            // Each cache only stores the layers processed by that stage
+            LOG_DEBUG("[DeviceGraphOrchestrator] Creating per-stage KV caches for PP ("
+                      << pipeline_config_->numStages() << " stages)");
 
-            // Calculate kv_head_start based on TP mode:
-            // - LOCAL TP: Use device index within the LOCAL TP context
-            // - GLOBAL TP: Use MPI rank
-            if (is_local_tp)
+            for (const auto &pp_stage : pipeline_config_->pp_stages)
             {
-                kv_config.kv_head_start = config.local_tp_device_idx * config.local_n_kv_heads;
-                LOG_DEBUG("[DeviceGraphOrchestrator] Creating sharded KV cache (LOCAL TP): "
-                          << n_kv_heads << " total KV heads, "
-                          << config.local_n_kv_heads << " local KV heads (device_idx="
-                          << config.local_tp_device_idx << ", start=" << kv_config.kv_head_start << ")"
-                          << " precision=" << activationPrecisionToString(kv_cache_prec));
+                // Get device for this stage
+                const TPDomainConfig *domain = pipeline_config_->getDomainForStage(pp_stage.stage_id);
+                if (!domain)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] No domain for PP stage " << pp_stage.stage_id);
+                    return false;
+                }
+                DeviceId stage_device = domain->primaryDevice();
+
+                // Skip if we already have a cache for this device
+                // (multiple stages on same device share one cache)
+                if (state_.pp_kv_caches.find(stage_device) != state_.pp_kv_caches.end())
+                {
+                    LOG_DEBUG("[DeviceGraphOrchestrator] Reusing existing KV cache for device "
+                              << stage_device.to_string());
+                    continue;
+                }
+
+                // Count layers on this device
+                int layers_on_device = 0;
+                int first_layer_on_device = -1;
+                for (const auto &stage : pipeline_config_->pp_stages)
+                {
+                    const TPDomainConfig *stage_domain = pipeline_config_->getDomainForStage(stage.stage_id);
+                    if (stage_domain && stage_domain->primaryDevice() == stage_device)
+                    {
+                        int stage_layers = stage.last_layer - stage.first_layer;
+                        if (first_layer_on_device < 0)
+                            first_layer_on_device = stage.first_layer;
+                        layers_on_device += stage_layers;
+                    }
+                }
+
+                // Build KVCacheConfig for this stage
+                llaminar::v2::kernels::KVCacheConfig kv_config;
+                kv_config.precision = kv_cache_prec;
+                kv_config.device = stage_device;
+                kv_config.num_layers = layers_on_device;
+                kv_config.first_layer_index = first_layer_on_device; // Layer index offset
+                kv_config.batch_size = batch_size;
+                kv_config.max_seq_len = max_seq_len;
+                kv_config.n_kv_heads = n_kv_heads;
+                kv_config.head_dim = head_dim;
+                kv_config.layout_mode = kv_layout_mode;
+                kv_config.mpi_ctx = local_mpi_ctx.get();
+
+                if (use_sharded_cache && (is_global_tp || is_local_tp))
+                {
+                    kv_config.local_n_kv_heads = config.local_n_kv_heads;
+                    if (is_local_tp)
+                    {
+                        kv_config.kv_head_start = config.local_tp_device_idx * config.local_n_kv_heads;
+                    }
+                    else
+                    {
+                        kv_config.kv_head_start = mpi_ctx_->rank() * config.local_n_kv_heads;
+                    }
+                }
+
+                LOG_DEBUG("[DeviceGraphOrchestrator] Creating KV cache for PP stage device "
+                          << stage_device.to_string() << ": layers [" << first_layer_on_device
+                          << ", " << (first_layer_on_device + layers_on_device) << "), "
+                          << layers_on_device << " layers, precision="
+                          << activationPrecisionToString(kv_cache_prec));
+
+                state_.pp_kv_caches[stage_device] =
+                    llaminar::v2::kernels::KernelFactory::createKVCache(kv_config);
+
+                if (!state_.pp_kv_caches[stage_device])
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to create KV cache for device "
+                              << stage_device.to_string());
+                    return false;
+                }
             }
-            else
-            {
-                kv_config.kv_head_start = mpi_ctx_->rank() * config.local_n_kv_heads;
-                LOG_DEBUG("[DeviceGraphOrchestrator] Creating sharded KV cache (GLOBAL TP): "
-                          << n_kv_heads << " total KV heads, "
-                          << config.local_n_kv_heads << " local KV heads (rank="
-                          << mpi_ctx_->rank() << ", start=" << kv_config.kv_head_start << ")"
-                          << " precision=" << activationPrecisionToString(kv_cache_prec));
-            }
+
+            LOG_DEBUG("[DeviceGraphOrchestrator] Created " << state_.pp_kv_caches.size()
+                                                           << " per-device KV caches for PP");
         }
+        else
+        {
+            // Non-PP: Single KV cache for all layers
+            llaminar::v2::kernels::KVCacheConfig kv_config;
+            kv_config.precision = kv_cache_prec;
+            kv_config.device = device;
+            kv_config.num_layers = n_layers;
+            kv_config.batch_size = batch_size;
+            kv_config.max_seq_len = max_seq_len;
+            kv_config.n_kv_heads = n_kv_heads;
+            kv_config.head_dim = head_dim;
+            kv_config.layout_mode = kv_layout_mode;
+            kv_config.mpi_ctx = local_mpi_ctx.get();
 
-        // Create cache via factory (handles sharded vs non-sharded automatically)
-        state_.kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(kv_config);
+            if (use_sharded_cache && (is_global_tp || is_local_tp))
+            {
+                kv_config.local_n_kv_heads = config.local_n_kv_heads;
+
+                // Calculate kv_head_start based on TP mode:
+                // - LOCAL TP: Use device index within the LOCAL TP context
+                // - GLOBAL TP: Use MPI rank
+                if (is_local_tp)
+                {
+                    kv_config.kv_head_start = config.local_tp_device_idx * config.local_n_kv_heads;
+                    LOG_DEBUG("[DeviceGraphOrchestrator] Creating sharded KV cache (LOCAL TP): "
+                              << n_kv_heads << " total KV heads, "
+                              << config.local_n_kv_heads << " local KV heads (device_idx="
+                              << config.local_tp_device_idx << ", start=" << kv_config.kv_head_start << ")"
+                              << " precision=" << activationPrecisionToString(kv_cache_prec));
+                }
+                else
+                {
+                    kv_config.kv_head_start = mpi_ctx_->rank() * config.local_n_kv_heads;
+                    LOG_DEBUG("[DeviceGraphOrchestrator] Creating sharded KV cache (GLOBAL TP): "
+                              << n_kv_heads << " total KV heads, "
+                              << config.local_n_kv_heads << " local KV heads (rank="
+                              << mpi_ctx_->rank() << ", start=" << kv_config.kv_head_start << ")"
+                              << " precision=" << activationPrecisionToString(kv_cache_prec));
+                }
+            }
+
+            // Create cache via factory (handles sharded vs non-sharded automatically)
+            state_.kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(kv_config);
+        }
 
         // Initialize position tracking
         state_.positions.assign(batch_size, 0);
@@ -1720,6 +2048,20 @@ namespace llaminar2
         input.position_offset = state_.positions[0]; // Legacy compat
         input.device = state_.device_id;
         input.kv_cache = state_.kv_cache.get();
+
+        // For PP mode: build raw pointer map from per-device KV caches
+        std::unordered_map<DeviceId, IKVCache *> pp_kv_cache_ptrs;
+        if (!state_.pp_kv_caches.empty())
+        {
+            for (const auto &[device, cache] : state_.pp_kv_caches)
+            {
+                pp_kv_cache_ptrs[device] = cache.get();
+            }
+            input.pp_kv_caches = &pp_kv_cache_ptrs;
+            LOG_DEBUG("[DeviceGraphOrchestrator] Set " << pp_kv_cache_ptrs.size()
+                                                       << " per-device KV caches for PP forward");
+        }
+
         // Pass sequence_lengths for batch-aware attention masking
         // This enables proper separation of sequences in batched execution
         input.sequence_lengths = (batch_size > 1 && !state_.sequence_lengths.empty())
@@ -1977,6 +2319,65 @@ namespace llaminar2
         }
     }
 
+    // =========================================================================
+    // Pipeline Parallelism Configuration
+    // =========================================================================
+
+    void DeviceGraphOrchestrator::setPPStageConfig(const FactoryPPStageConfig &config)
+    {
+        if (!config.isValid())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Invalid FactoryPPStageConfig: "
+                      << "first_layer=" << config.first_layer
+                      << ", last_layer=" << config.last_layer);
+            throw std::invalid_argument("Invalid FactoryPPStageConfig");
+        }
+
+        pp_stage_config_ = config;
+
+        LOG_INFO("[DeviceGraphOrchestrator] PP stage configured: "
+                 << "layers=[" << config.first_layer << ", " << config.last_layer << ") "
+                 << "has_embedding=" << (config.has_embedding ? "yes" : "no")
+                 << " has_lm_head=" << (config.has_lm_head ? "yes" : "no"));
+    }
+
+    // =========================================================================
+    // Hidden State API (for Pipeline Parallelism)
+    // =========================================================================
+
+    TensorBase *DeviceGraphOrchestrator::getHiddenState()
+    {
+        if (!state_.hidden)
+        {
+            LOG_WARN("[DeviceGraphOrchestrator] getHiddenState: no hidden state available");
+            return nullptr;
+        }
+        return state_.hidden.get();
+    }
+
+    const TensorBase *DeviceGraphOrchestrator::getHiddenState() const
+    {
+        return state_.hidden.get();
+    }
+
+    void DeviceGraphOrchestrator::setHiddenState(TensorBase *hidden_state)
+    {
+        external_hidden_state_input_ = hidden_state;
+        LOG_DEBUG("[DeviceGraphOrchestrator] setHiddenState: "
+                  << (hidden_state ? "set" : "cleared")
+                  << " external hidden state input");
+    }
+
+    bool DeviceGraphOrchestrator::hasHiddenStateInput() const
+    {
+        return external_hidden_state_input_ != nullptr;
+    }
+
+    void DeviceGraphOrchestrator::clearHiddenStateInput()
+    {
+        external_hidden_state_input_ = nullptr;
+    }
+
     const TPDomain *DeviceGraphOrchestrator::getDomainForLayer(int layer_idx, bool is_attention) const
     {
         if (!domain_config_)
@@ -2170,6 +2571,848 @@ namespace llaminar2
         }
 
         return false;
+    }
+
+    // =========================================================================
+    // Unified Pipeline Configuration (Phase 6)
+    // =========================================================================
+
+    void DeviceGraphOrchestrator::setPipelineConfig(std::shared_ptr<PipelineConfig> config)
+    {
+        if (config)
+        {
+            std::string validation_error;
+            if (!config->validate(&validation_error))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Invalid PipelineConfig: " << validation_error);
+                throw std::invalid_argument("Invalid PipelineConfig: " + validation_error);
+            }
+        }
+
+        pipeline_config_ = std::move(config);
+
+        // Reset initialization flags - contexts need to be recreated
+        pp_contexts_initialized_ = false;
+        tp_contexts_initialized_ = false;
+        pp_contexts_.clear();
+        domain_tp_contexts_.clear();
+
+        if (pipeline_config_)
+        {
+            LOG_INFO("[DeviceGraphOrchestrator] Unified pipeline configured: "
+                     << pipeline_config_->numStages() << " PP stages, "
+                     << pipeline_config_->tp_domains.size() << " TP domains, "
+                     << pipeline_config_->total_layers << " total layers");
+
+            // Propagate to graph builder via setter
+            graph_builder_->setPipelineConfig(pipeline_config_);
+        }
+        else
+        {
+            LOG_INFO("[DeviceGraphOrchestrator] Pipeline configuration cleared (single-device mode)");
+            graph_builder_->setPipelineConfig(nullptr);
+        }
+    }
+
+    bool DeviceGraphOrchestrator::initializePPContexts()
+    {
+        if (pp_contexts_initialized_)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] PP contexts already initialized");
+            return true;
+        }
+
+        if (!pipeline_config_ || !pipeline_config_->hasPP())
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] No PP configuration - skipping PP context initialization");
+            pp_contexts_initialized_ = true;
+            return true;
+        }
+
+        // Ensure TP contexts are initialized first (needed for PPStage::fromTPContext)
+        if (!initializeTPContexts())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to initialize TP contexts - cannot create PP contexts");
+            return false;
+        }
+
+        // Check if any domain has internal TP (degree > 1)
+        // If so, we need to use HierarchicalPPConfig to properly handle TP domains
+        const bool has_internal_tp = pipeline_config_->hasTP();
+
+        LOG_INFO("[DeviceGraphOrchestrator] Initializing PP contexts for "
+                 << (pipeline_config_->numStages() - 1) << " inter-stage transfers"
+                 << (has_internal_tp ? " (with TP domains)" : "") << "...");
+
+        // Create PP context for each adjacent pair of stages
+        for (int stage = 0; stage < pipeline_config_->numStages() - 1; ++stage)
+        {
+            int next_stage = stage + 1;
+            auto key = std::make_pair(stage, next_stage);
+
+            // Get domains for the two stages
+            const auto *domain_from = pipeline_config_->getDomainForStage(stage);
+            const auto *domain_to = pipeline_config_->getDomainForStage(next_stage);
+
+            if (!domain_from || !domain_to)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to get domains for PP transfer "
+                          << stage << " -> " << next_stage);
+                return false;
+            }
+
+            // Build layer boundaries for the PP context
+            // We need to include all stages up to and including next_stage
+            std::vector<int> layer_boundaries;
+            for (int s = 0; s <= next_stage; ++s)
+            {
+                const auto &pp_stage = pipeline_config_->pp_stages[s];
+                if (s == 0)
+                {
+                    layer_boundaries.push_back(pp_stage.first_layer);
+                }
+                layer_boundaries.push_back(pp_stage.last_layer);
+            }
+
+            std::unique_ptr<ILocalPPContext> pp_ctx;
+
+            if (has_internal_tp)
+            {
+                // Use HierarchicalPPConfig with PPStage variant type
+                // This allows PP transfers to understand TP domains
+                HierarchicalPPConfig pp_config;
+                pp_config.layer_boundaries = layer_boundaries;
+
+                // Build PPStage for each stage 0..next_stage
+                for (int s = 0; s <= next_stage; ++s)
+                {
+                    const auto *domain = pipeline_config_->getDomainForStage(s);
+                    if (!domain)
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] Missing domain for stage " << s);
+                        return false;
+                    }
+
+                    if (domain->degree() > 1)
+                    {
+                        // This stage has internal TP - look up the TP context
+                        auto it = domain_tp_contexts_.find(domain->name);
+                        if (it == domain_tp_contexts_.end())
+                        {
+                            LOG_ERROR("[DeviceGraphOrchestrator] TP context not found for domain '"
+                                      << domain->name << "' (stage " << s << ")");
+                            return false;
+                        }
+                        pp_config.stages.push_back(PPStage::fromTPContext(it->second));
+                        LOG_DEBUG("[DeviceGraphOrchestrator] Stage " << s << " → TP domain '"
+                                                                     << domain->name << "' (" << domain->degree() << " devices)");
+                    }
+                    else
+                    {
+                        // Single device stage
+                        auto device = GlobalDeviceAddress::fromLocalDeviceId(domain->primaryDevice());
+                        pp_config.stages.push_back(PPStage::fromDevice(device));
+                        LOG_DEBUG("[DeviceGraphOrchestrator] Stage " << s << " → single device "
+                                                                     << device.toString());
+                    }
+                }
+
+                if (!pp_config.isValid())
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Invalid HierarchicalPPConfig for stages "
+                              << stage << " -> " << next_stage);
+                    return false;
+                }
+
+                pp_ctx = createLocalPPContext(pp_config);
+            }
+            else
+            {
+                // Use flat LocalPPConfig (simpler, no TP domain awareness needed)
+                std::vector<GlobalDeviceAddress> stage_devices;
+                for (int s = 0; s <= next_stage; ++s)
+                {
+                    const auto *domain = pipeline_config_->getDomainForStage(s);
+                    if (domain && !domain->devices.empty())
+                    {
+                        stage_devices.push_back(GlobalDeviceAddress::fromLocalDeviceId(domain->primaryDevice()));
+                    }
+                }
+
+                LocalPPConfig pp_ctx_config{
+                    .stage_devices = stage_devices,
+                    .layer_boundaries = layer_boundaries};
+
+                pp_ctx = createLocalPPContext(pp_ctx_config);
+            }
+
+            if (!pp_ctx)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to create PP context for transfer "
+                          << stage << " -> " << next_stage);
+                return false;
+            }
+
+            pp_contexts_[key] = std::move(pp_ctx);
+
+            LOG_DEBUG("[DeviceGraphOrchestrator] Created PP context: stage " << stage
+                                                                             << " (" << domain_from->name << ") -> stage " << next_stage
+                                                                             << " (" << domain_to->name << ")");
+        }
+
+        // Wire PP contexts to graph builder via setters
+        for (auto &[key, ctx] : pp_contexts_)
+        {
+            graph_builder_->setPPContext(key.first, key.second, ctx.get());
+        }
+
+        pp_contexts_initialized_ = true;
+        LOG_INFO("[DeviceGraphOrchestrator] Initialized " << pp_contexts_.size() << " PP contexts"
+                                                          << (has_internal_tp ? " (hierarchical)" : " (flat)"));
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::initializeTPContexts()
+    {
+        if (tp_contexts_initialized_)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] TP contexts already initialized");
+            return true;
+        }
+
+        if (!pipeline_config_ || pipeline_config_->tp_domains.empty())
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] No TP domains - skipping TP context initialization");
+            tp_contexts_initialized_ = true;
+            return true;
+        }
+
+        LOG_INFO("[DeviceGraphOrchestrator] Initializing TP contexts for "
+                 << pipeline_config_->tp_domains.size() << " domains...");
+
+        // Create TP context for each domain that has degree > 1
+        for (const auto &domain : pipeline_config_->tp_domains)
+        {
+            if (domain.devices.size() <= 1)
+            {
+                LOG_DEBUG("[DeviceGraphOrchestrator] Domain '" << domain.name
+                                                               << "' has degree " << domain.devices.size() << " - no TP context needed");
+                continue;
+            }
+
+            // Convert DeviceId to GlobalDeviceAddress
+            std::vector<GlobalDeviceAddress> addresses;
+            for (const auto &dev : domain.devices)
+            {
+                addresses.push_back(GlobalDeviceAddress::fromLocalDeviceId(dev));
+            }
+
+            // Equal weights for now (TODO: support proportional TP)
+            std::vector<float> weights(domain.devices.size(), 1.0f / domain.devices.size());
+
+            // Create TP context (convert unique_ptr to shared_ptr so PPStage can reference it)
+            auto tp_ctx = createLocalTPContext(addresses, weights, domain.tp_backend);
+            if (!tp_ctx)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to create TP context for domain '"
+                          << domain.name << "'");
+                return false;
+            }
+
+            domain_tp_contexts_[domain.name] = std::shared_ptr<ILocalTPContext>(std::move(tp_ctx));
+
+            LOG_DEBUG("[DeviceGraphOrchestrator] Created TP context for domain '" << domain.name
+                                                                                  << "': " << domain.devices.size() << " devices, backend="
+                                                                                  << static_cast<int>(domain.tp_backend));
+        }
+
+        // Wire TP contexts to graph builder via setters
+        for (auto &[name, ctx] : domain_tp_contexts_)
+        {
+            graph_builder_->setTPContext(name, ctx.get());
+        }
+
+        tp_contexts_initialized_ = true;
+        LOG_INFO("[DeviceGraphOrchestrator] Initialized " << domain_tp_contexts_.size() << " TP contexts");
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::initializeBufferPool(const PPStageBufferSpec &spec, const MPIContext *mpi_ctx)
+    {
+        if (!pipeline_config_)
+        {
+            LOG_WARN("[DeviceGraphOrchestrator] Cannot initialize buffer pool without PipelineConfig");
+            return false;
+        }
+
+        if (!pipeline_config_->hasPP())
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] No PP stages - buffer pool not needed");
+            return true;
+        }
+
+        LOG_INFO("[DeviceGraphOrchestrator] Initializing per-stage buffer pool for "
+                 << pipeline_config_->numStages() << " PP stages...");
+
+        // Initialize the buffer pool
+        buffer_pool_.emplace();
+        if (!buffer_pool_->initialize(*pipeline_config_, spec, mpi_ctx))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to initialize per-stage buffer pool");
+            buffer_pool_.reset();
+            return false;
+        }
+
+        LOG_INFO("[DeviceGraphOrchestrator] Per-stage buffer pool initialized: "
+                 << buffer_pool_->stats().total_bytes() << " bytes across "
+                 << buffer_pool_->numStages() << " stages");
+        return true;
+    }
+
+    // =========================================================================
+    // GraphBuildSession Implementation (nested class)
+    // =========================================================================
+
+    DeviceGraphOrchestrator::GraphBuildSession &
+    DeviceGraphOrchestrator::GraphBuildSession::forInput(const Qwen2ForwardInput &input)
+    {
+        input_ = input;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::GraphBuildSession &
+    DeviceGraphOrchestrator::GraphBuildSession::withPositionIds(const int *position_ids)
+    {
+        explicit_position_ids_ = position_ids;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::GraphBuildSession &
+    DeviceGraphOrchestrator::GraphBuildSession::withExternalHiddenState(TensorBase *hidden_state)
+    {
+        external_hidden_state_ = hidden_state;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::GraphBuildSession &
+    DeviceGraphOrchestrator::GraphBuildSession::withPipelineConfig(std::shared_ptr<PipelineConfig> config)
+    {
+        pipeline_config_ = std::move(config);
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::GraphBuildSession &
+    DeviceGraphOrchestrator::GraphBuildSession::forPPStage(int first_layer, int last_layer,
+                                                           bool has_embedding, bool has_lm_head)
+    {
+        pp_stage_ = PPStageSpec{first_layer, last_layer, has_embedding, has_lm_head};
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::GraphBuildSession &
+    DeviceGraphOrchestrator::GraphBuildSession::withPPContext(int from_stage, int to_stage, ILocalPPContext *context)
+    {
+        pp_contexts_[{from_stage, to_stage}] = context;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::GraphBuildSession &
+    DeviceGraphOrchestrator::GraphBuildSession::withTPContext(const std::string &domain_name, ILocalTPContext *context)
+    {
+        tp_contexts_[domain_name] = context;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::GraphBuildSession &
+    DeviceGraphOrchestrator::GraphBuildSession::withWeights(const Qwen2ModelWeights &weights)
+    {
+        weights_ = weights;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::GraphBuildSession &
+    DeviceGraphOrchestrator::GraphBuildSession::withBuffers(const Qwen2ModelBuffers &buffers)
+    {
+        buffers_ = buffers;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::GraphBuildSession &
+    DeviceGraphOrchestrator::GraphBuildSession::withKVCache(IKVCache *kv_cache)
+    {
+        kv_cache_ = kv_cache;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::GraphBuildSession &
+    DeviceGraphOrchestrator::GraphBuildSession::withBufferPool(PerStageBufferPool *pool)
+    {
+        buffer_pool_ = pool;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::GraphBuildResult
+    DeviceGraphOrchestrator::GraphBuildSession::buildForward()
+    {
+        if (!isValid())
+        {
+            return GraphBuildResult(validationError());
+        }
+
+        applyConfiguration();
+        auto prepared_input = prepareInput();
+
+        auto *graph_builder = orchestrator_.graphBuilder();
+        if (!graph_builder)
+        {
+            return GraphBuildResult("No graph builder available");
+        }
+
+        Qwen2ForwardOutput output;
+        ComputeGraph graph = graph_builder->buildFullForwardGraph(prepared_input, output);
+
+        if (graph.size() == 0)
+        {
+            return GraphBuildResult("buildFullForwardGraph returned empty graph");
+        }
+
+        LOG_DEBUG("[GraphBuildSession] Built full forward graph with " << graph.size() << " nodes");
+        return GraphBuildResult(std::move(graph), output);
+    }
+
+    DeviceGraphOrchestrator::GraphBuildResult
+    DeviceGraphOrchestrator::GraphBuildSession::buildPartial()
+    {
+        if (!isValid())
+        {
+            return GraphBuildResult(validationError());
+        }
+
+        if (!pp_stage_.has_value())
+        {
+            return GraphBuildResult("buildPartial() requires forPPStage() configuration");
+        }
+
+        applyConfiguration();
+        auto prepared_input = prepareInput();
+
+        auto *graph_builder = orchestrator_.graphBuilder();
+        if (!graph_builder)
+        {
+            return GraphBuildResult("No graph builder available");
+        }
+
+        const auto &stage = pp_stage_.value();
+        Qwen2ForwardOutput output;
+        ComputeGraph graph = graph_builder->buildPartialForwardGraph(
+            prepared_input, output,
+            stage.first_layer, stage.last_layer,
+            stage.has_embedding, stage.has_lm_head);
+
+        if (graph.size() == 0)
+        {
+            return GraphBuildResult("buildPartialForwardGraph returned empty graph");
+        }
+
+        LOG_DEBUG("[GraphBuildSession] Built partial forward graph: layers=["
+                  << stage.first_layer << ", " << stage.last_layer << ") with "
+                  << graph.size() << " nodes");
+        return GraphBuildResult(std::move(graph), output);
+    }
+
+    DeviceGraphOrchestrator::GraphBuildResult
+    DeviceGraphOrchestrator::GraphBuildSession::buildUnified()
+    {
+        if (!isValid())
+        {
+            return GraphBuildResult(validationError());
+        }
+
+        if (!pipeline_config_ || !pipeline_config_->hasPP())
+        {
+            return GraphBuildResult("buildUnified() requires withPipelineConfig() with hasPP()");
+        }
+
+        applyConfiguration();
+        auto prepared_input = prepareInput();
+
+        auto *graph_builder = orchestrator_.graphBuilder();
+        if (!graph_builder)
+        {
+            return GraphBuildResult("No graph builder available");
+        }
+
+        // Set pipeline config on graph builder
+        graph_builder->setPipelineConfig(pipeline_config_);
+
+        // Wire PP contexts
+        for (const auto &[key, ctx] : pp_contexts_)
+        {
+            graph_builder->setPPContext(key.first, key.second, ctx);
+        }
+
+        // Wire TP contexts
+        for (const auto &[name, ctx] : tp_contexts_)
+        {
+            graph_builder->setTPContext(name, ctx);
+        }
+
+        Qwen2ForwardOutput output;
+        ComputeGraph graph = graph_builder->buildUnifiedPipelineGraph(prepared_input, output);
+
+        if (graph.size() == 0)
+        {
+            return GraphBuildResult("buildUnifiedPipelineGraph returned empty graph");
+        }
+
+        LOG_DEBUG("[GraphBuildSession] Built unified PP graph: "
+                  << pipeline_config_->numStages() << " stages, "
+                  << graph.size() << " nodes");
+        return GraphBuildResult(std::move(graph), output);
+    }
+
+    DeviceGraphOrchestrator::GraphBuildResult
+    DeviceGraphOrchestrator::GraphBuildSession::build()
+    {
+        // Auto-select based on configuration
+        if (pipeline_config_ && pipeline_config_->hasPP())
+        {
+            return buildUnified();
+        }
+        else if (pp_stage_.has_value())
+        {
+            return buildPartial();
+        }
+        else
+        {
+            return buildForward();
+        }
+    }
+
+    bool DeviceGraphOrchestrator::GraphBuildSession::isValid() const
+    {
+        return validationError().empty();
+    }
+
+    std::string DeviceGraphOrchestrator::GraphBuildSession::validationError() const
+    {
+        if (!input_.has_value())
+        {
+            return "No input configured (call forInput())";
+        }
+
+        const auto &input = input_.value();
+
+        // Check if this is a PP middle/final stage (no embedding, uses external hidden state)
+        bool is_pp_non_embedding_stage = pp_stage_.has_value() && !pp_stage_->has_embedding;
+        // Check both session-level and input-level external hidden state
+        bool has_external_hidden = external_hidden_state_ != nullptr ||
+                                   input.external_hidden_state != nullptr;
+
+        if (input.token_ids == nullptr)
+        {
+            // PP middle/final stages don't need token_ids if they have external hidden state
+            if (is_pp_non_embedding_stage && has_external_hidden)
+            {
+                // Valid: PP stage with external hidden state input
+            }
+            else if (is_pp_non_embedding_stage)
+            {
+                return "PP stage without embedding requires external hidden state (call withExternalHiddenState())";
+            }
+            else
+            {
+                return "Input token_ids are null";
+            }
+        }
+
+        if (input.seq_len <= 0)
+        {
+            return "Invalid sequence length: " + std::to_string(input.seq_len);
+        }
+
+        if (input.batch_size <= 0)
+        {
+            return "Invalid batch size: " + std::to_string(input.batch_size);
+        }
+
+        // Unified PP requires pipeline config
+        if (pipeline_config_ && pipeline_config_->hasPP())
+        {
+            // PP contexts should be registered for all stage pairs
+            int num_stages = pipeline_config_->numStages();
+            for (int s = 0; s < num_stages - 1; ++s)
+            {
+                auto key = std::make_pair(s, s + 1);
+                if (pp_contexts_.find(key) == pp_contexts_.end())
+                {
+                    return "Missing PP context for stage transfer " + std::to_string(s) +
+                           " -> " + std::to_string(s + 1);
+                }
+            }
+        }
+
+        return "";
+    }
+
+    Qwen2ForwardInput DeviceGraphOrchestrator::GraphBuildSession::prepareInput() const
+    {
+        Qwen2ForwardInput prepared = input_.value();
+
+        // Override position IDs if explicitly set
+        if (explicit_position_ids_)
+        {
+            prepared.position_ids = explicit_position_ids_;
+        }
+
+        // Set external hidden state for PP middle/final stages
+        if (external_hidden_state_)
+        {
+            prepared.external_hidden_state = external_hidden_state_;
+        }
+
+        // Set KV cache
+        if (kv_cache_)
+        {
+            prepared.kv_cache = kv_cache_;
+        }
+
+        return prepared;
+    }
+
+    void DeviceGraphOrchestrator::GraphBuildSession::applyConfiguration()
+    {
+        auto *graph_builder = orchestrator_.graphBuilder();
+        if (!graph_builder)
+        {
+            return;
+        }
+
+        // Apply weights if provided
+        if (weights_.has_value())
+        {
+            graph_builder->setWeights(weights_.value());
+        }
+
+        // Apply buffers if provided
+        if (buffers_.has_value())
+        {
+            graph_builder->setBuffers(buffers_.value());
+        }
+    }
+
+    // =========================================================================
+    // AttentionGraphSession Implementation (nested class)
+    // =========================================================================
+
+    DeviceGraphOrchestrator::AttentionGraphSession &
+    DeviceGraphOrchestrator::AttentionGraphSession::forLayer(const Qwen2LayerWeights &layer, int layer_idx)
+    {
+        layer_ = &layer;
+        layer_idx_ = layer_idx;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::AttentionGraphSession &
+    DeviceGraphOrchestrator::AttentionGraphSession::withBuffers(Qwen2ActivationBuffers &buffers)
+    {
+        buffers_ = &buffers;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::AttentionGraphSession &
+    DeviceGraphOrchestrator::AttentionGraphSession::withSequence(int seq_len, int batch_size)
+    {
+        seq_len_ = seq_len;
+        batch_size_ = batch_size;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::AttentionGraphSession &
+    DeviceGraphOrchestrator::AttentionGraphSession::onDevice(DeviceId device)
+    {
+        device_ = device;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::AttentionGraphSession &
+    DeviceGraphOrchestrator::AttentionGraphSession::withKVCache(IKVCache *kv_cache)
+    {
+        kv_cache_ = kv_cache;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::AttentionGraphSession &
+    DeviceGraphOrchestrator::AttentionGraphSession::withPositionIds(const int *position_ids)
+    {
+        position_ids_ = position_ids;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::AttentionGraphSession &
+    DeviceGraphOrchestrator::AttentionGraphSession::withSequenceLengths(const std::vector<int> *lengths)
+    {
+        sequence_lengths_ = lengths;
+        return *this;
+    }
+
+    bool DeviceGraphOrchestrator::AttentionGraphSession::isValid() const
+    {
+        return validationError().empty();
+    }
+
+    std::string DeviceGraphOrchestrator::AttentionGraphSession::validationError() const
+    {
+        if (!layer_)
+        {
+            return "No layer weights configured (call forLayer())";
+        }
+        if (!buffers_)
+        {
+            return "No buffers configured (call withBuffers())";
+        }
+        if (layer_idx_ < 0)
+        {
+            return "Invalid layer index: " + std::to_string(layer_idx_);
+        }
+        if (seq_len_ <= 0)
+        {
+            return "Invalid sequence length (call withSequence())";
+        }
+        if (batch_size_ <= 0)
+        {
+            return "Invalid batch size: " + std::to_string(batch_size_);
+        }
+        if (!device_.has_value())
+        {
+            return "No device configured (call onDevice())";
+        }
+        return "";
+    }
+
+    DeviceGraphOrchestrator::SubGraphBuildResult
+    DeviceGraphOrchestrator::AttentionGraphSession::build()
+    {
+        if (!isValid())
+        {
+            return SubGraphBuildResult(validationError());
+        }
+
+        auto *graph_builder = orchestrator_.graphBuilder();
+        if (!graph_builder)
+        {
+            return SubGraphBuildResult("No graph builder available");
+        }
+
+        ComputeGraph graph = graph_builder->buildAttentionGraph(
+            *layer_, *buffers_, layer_idx_, seq_len_, batch_size_,
+            kv_cache_, position_ids_, device_.value(), sequence_lengths_);
+
+        if (graph.size() == 0)
+        {
+            return SubGraphBuildResult("buildAttentionGraph returned empty graph");
+        }
+
+        LOG_DEBUG("[AttentionGraphSession] Built attention graph for layer "
+                  << layer_idx_ << " with " << graph.size() << " nodes");
+
+        return SubGraphBuildResult(std::move(graph));
+    }
+
+    // =========================================================================
+    // FFNGraphSession Implementation (nested class)
+    // =========================================================================
+
+    DeviceGraphOrchestrator::FFNGraphSession &
+    DeviceGraphOrchestrator::FFNGraphSession::forLayer(const Qwen2LayerWeights &layer, int layer_idx)
+    {
+        layer_ = &layer;
+        layer_idx_ = layer_idx;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::FFNGraphSession &
+    DeviceGraphOrchestrator::FFNGraphSession::withBuffers(Qwen2ActivationBuffers &buffers)
+    {
+        buffers_ = &buffers;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::FFNGraphSession &
+    DeviceGraphOrchestrator::FFNGraphSession::withSequence(int seq_len, int batch_size)
+    {
+        seq_len_ = seq_len;
+        batch_size_ = batch_size;
+        return *this;
+    }
+
+    DeviceGraphOrchestrator::FFNGraphSession &
+    DeviceGraphOrchestrator::FFNGraphSession::onDevice(DeviceId device)
+    {
+        device_ = device;
+        return *this;
+    }
+
+    bool DeviceGraphOrchestrator::FFNGraphSession::isValid() const
+    {
+        return validationError().empty();
+    }
+
+    std::string DeviceGraphOrchestrator::FFNGraphSession::validationError() const
+    {
+        if (!layer_)
+        {
+            return "No layer weights configured (call forLayer())";
+        }
+        if (!buffers_)
+        {
+            return "No buffers configured (call withBuffers())";
+        }
+        if (layer_idx_ < 0)
+        {
+            return "Invalid layer index: " + std::to_string(layer_idx_);
+        }
+        if (seq_len_ <= 0)
+        {
+            return "Invalid sequence length (call withSequence())";
+        }
+        if (batch_size_ <= 0)
+        {
+            return "Invalid batch size: " + std::to_string(batch_size_);
+        }
+        if (!device_.has_value())
+        {
+            return "No device configured (call onDevice())";
+        }
+        return "";
+    }
+
+    DeviceGraphOrchestrator::SubGraphBuildResult
+    DeviceGraphOrchestrator::FFNGraphSession::build()
+    {
+        if (!isValid())
+        {
+            return SubGraphBuildResult(validationError());
+        }
+
+        auto *graph_builder = orchestrator_.graphBuilder();
+        if (!graph_builder)
+        {
+            return SubGraphBuildResult("No graph builder available");
+        }
+
+        ComputeGraph graph = graph_builder->buildFFNGraph(
+            *layer_, *buffers_, layer_idx_, seq_len_, batch_size_, device_.value());
+
+        if (graph.size() == 0)
+        {
+            return SubGraphBuildResult("buildFFNGraph returned empty graph");
+        }
+
+        LOG_DEBUG("[FFNGraphSession] Built FFN graph for layer "
+                  << layer_idx_ << " with " << graph.size() << " nodes");
+
+        return SubGraphBuildResult(std::move(graph));
     }
 
 } // namespace llaminar2

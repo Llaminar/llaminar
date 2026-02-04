@@ -11,6 +11,7 @@
  */
 
 #include "RCCLBackend.h"
+#include "../coordinators/RCCLCoordinator.h"
 #include "../../utils/Logger.h"
 
 #ifdef HAVE_RCCL
@@ -81,6 +82,23 @@ namespace llaminar2
                              void *comm, void *stream, std::string &error_out);
         bool rcclRecvWrapper(void *recvbuff, size_t count, int dtype_int, int peer,
                              void *comm, void *stream, std::string &error_out);
+
+        // Device memory copy operations
+        bool hipMemcpySameDevice(void *dst, const void *src, size_t bytes, int device_ordinal);
+        bool hipMemcpyPeerDevice(void *dst, int dst_device, const void *src, int src_device, size_t bytes);
+        bool hipMemcpyAsyncSameDevice(void *dst, const void *src, size_t bytes, int device_ordinal, void *stream);
+        bool hipMemcpyPeerAsyncDevice(void *dst, int dst_device, const void *src, int src_device, size_t bytes, void *stream);
+        bool hipCanAccessPeerDevice(int dst_device, int src_device);
+        bool hipEnablePeerAccessDevice(int peer_device);
+        bool hipDeviceSynchronizeWrapper();
+
+        // Host staging memory operations (for non-P2P fallback)
+        void *hipHostMallocWrapper(size_t bytes);
+        bool hipHostFreeWrapper(void *ptr);
+        bool hipMemcpyD2H(void *dst_host, const void *src_device, size_t bytes, int src_device_ordinal);
+        bool hipMemcpyH2D(void *dst_device, const void *src_host, size_t bytes, int dst_device_ordinal);
+        bool hipMemcpyD2HAsync(void *dst_host, const void *src_device, size_t bytes, int src_device_ordinal, void *stream);
+        bool hipMemcpyH2DAsync(void *dst_device, const void *src_host, size_t bytes, int dst_device_ordinal, void *stream);
     } // namespace rccl_backend_detail
 } // namespace llaminar2
 
@@ -296,125 +314,31 @@ namespace llaminar2
         else
         {
             // Multi-GPU single process (no MPI context)
-            // Use threaded ncclCommInitRank - each GPU gets its own thread
-            // Allocate arrays for per-GPU resources
-            all_comms_.resize(num_ranks_, nullptr);
-            all_streams_.resize(num_ranks_, nullptr);
-            device_ordinals_.resize(num_ranks_);
-            std::atomic<int> error_count{0};
-            std::vector<std::string> thread_errors(num_ranks_);
+            // Use RCCLCoordinator which owns all RCCL comms/streams on a dedicated thread
+            LOG_DEBUG("RCCLBackend: Single-process multi-GPU mode with " << num_ranks_ << " GPUs (using RCCLCoordinator)");
 
-            // Build device list from group
-            for (int i = 0; i < num_ranks_; ++i)
-            {
-                device_ordinals_[i] = group.devices[i].ordinal;
-            }
-
-            // Pre-initialize RCCL: check P2P, set env vars, load library
-            // This MUST happen before any other RCCL call (like rcclGetUniqueId)
-            if (!rccl_backend_detail::rcclPreInitialize(device_ordinals_, p2p_available_))
-            {
-                last_error_ = "RCCL pre-initialization failed";
-                LOG_ERROR(last_error_);
-                rccl_backend_detail::hipDestroyStream(stream_);
-                stream_ = nullptr;
-                return false;
-            }
-
-            // Now get unique ID (RCCL is already loaded with correct env vars)
-            std::vector<char> id_buffer(rccl_backend_detail::rcclUniqueIdSize());
-            if (!rccl_backend_detail::rcclGetUniqueIdWrapper(id_buffer.data()))
-            {
-                last_error_ = "rcclGetUniqueId failed";
-                LOG_ERROR(last_error_);
-                rccl_backend_detail::hipDestroyStream(stream_);
-                stream_ = nullptr;
-                return false;
-            }
-
-            // Launch threads - each thread initializes one GPU's communicator and stream
-            std::vector<std::thread> threads;
-            threads.reserve(num_ranks_);
-
-            for (int rank = 0; rank < num_ranks_; ++rank)
-            {
-                threads.emplace_back([this, rank, &id_buffer, &error_count, &thread_errors]()
-                                     {
-                    // Set device for this thread
-                    if (!rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[rank])) {
-                        thread_errors[rank] = "hipSetDevice failed for rank " + std::to_string(rank);
-                        error_count.fetch_add(1, std::memory_order_relaxed);
-                        return;
-                    }
-
-                    // Create stream for this GPU
-                    if (!rccl_backend_detail::hipCreateStream(&all_streams_[rank])) {
-                        thread_errors[rank] = "hipStreamCreate failed for rank " + std::to_string(rank);
-                        error_count.fetch_add(1, std::memory_order_relaxed);
-                        return;
-                    }
-
-                    // Initialize communicator for this rank
-                    std::string rccl_error;
-                    if (!rccl_backend_detail::rcclCommInitRankWrapper(&all_comms_[rank], num_ranks_,
-                                                                       const_cast<char*>(id_buffer.data()), rank, rccl_error)) {
-                        thread_errors[rank] = "rcclCommInitRank failed for rank " + std::to_string(rank) + ": " + rccl_error;
-                        error_count.fetch_add(1, std::memory_order_relaxed);
-                        rccl_backend_detail::hipDestroyStream(all_streams_[rank]);
-                        all_streams_[rank] = nullptr;
-                        return;
-                    } });
-            }
-
-            // Wait for all threads to complete
-            for (auto &t : threads)
-            {
-                t.join();
-            }
-
-            // Check for errors
-            if (error_count.load() > 0)
-            {
-                std::string combined_errors;
-                for (int i = 0; i < num_ranks_; ++i)
-                {
-                    if (!thread_errors[i].empty())
-                    {
-                        if (!combined_errors.empty())
-                            combined_errors += "; ";
-                        combined_errors += thread_errors[i];
-                    }
-                }
-                last_error_ = "Threaded rcclCommInitRank failed: " + combined_errors;
-                LOG_ERROR(last_error_);
-
-                // Cleanup any successfully created resources
-                for (int i = 0; i < num_ranks_; ++i)
-                {
-                    if (all_comms_[i])
-                    {
-                        rccl_backend_detail::rcclCommDestroyWrapper(all_comms_[i]);
-                        all_comms_[i] = nullptr;
-                    }
-                    if (all_streams_[i])
-                    {
-                        rccl_backend_detail::hipDestroyStream(all_streams_[i]);
-                        all_streams_[i] = nullptr;
-                    }
-                }
-                all_comms_.clear();
-                all_streams_.clear();
-                device_ordinals_.clear();
-                rccl_backend_detail::hipDestroyStream(stream_);
-                stream_ = nullptr;
-                return false;
-            }
-
-            // Store the communicator and stream for local_rank
-            comm_ = all_comms_[local_rank_];
             is_multi_gpu_single_process_ = true;
 
-            LOG_INFO("RCCLBackend: Initialized multi-GPU single-process (threaded rcclCommInitRank) with "
+            // Store device ordinals from the group
+            device_ordinals_.clear();
+            for (const auto &device : group.devices)
+            {
+                device_ordinals_.push_back(device.ordinal);
+            }
+
+            // Create and initialize the coordinator
+            coordinator_ = std::make_unique<RCCLCoordinator>();
+            if (!coordinator_->initialize(device_ordinals_))
+            {
+                last_error_ = "RCCLCoordinator initialization failed: " + coordinator_->lastError();
+                LOG_ERROR(last_error_);
+                coordinator_.reset();
+                rccl_backend_detail::hipDestroyStream(stream_);
+                stream_ = nullptr;
+                return false;
+            }
+
+            LOG_INFO("RCCLBackend: Initialized multi-GPU single-process (via RCCLCoordinator) with "
                      << num_ranks_ << " GPU(s), local_rank=" << local_rank_);
         }
 
@@ -436,26 +360,20 @@ namespace llaminar2
             return;
         }
 
-        // If we used multi-GPU single-process mode, destroy all resources
-        if (!all_comms_.empty())
+        // Clean up multi-GPU single-process resources
+        if (is_multi_gpu_single_process_)
         {
-            for (size_t i = 0; i < all_comms_.size(); ++i)
+            // Coordinator owns all RCCL comms/streams - just shut it down
+            if (coordinator_)
             {
-                if (all_comms_[i])
-                {
-                    rccl_backend_detail::rcclCommDestroyWrapper(all_comms_[i]);
-                }
-                if (i < all_streams_.size() && all_streams_[i])
-                {
-                    rccl_backend_detail::hipDestroyStream(all_streams_[i]);
-                }
+                coordinator_->shutdown();
+                coordinator_.reset();
             }
-            all_comms_.clear();
-            all_streams_.clear();
             device_ordinals_.clear();
-            comm_ = nullptr;
+            is_multi_gpu_single_process_ = false;
         }
-        else if (comm_)
+
+        if (comm_)
         {
             rccl_backend_detail::rcclCommDestroyWrapper(comm_);
             comm_ = nullptr;
@@ -467,7 +385,6 @@ namespace llaminar2
             stream_ = nullptr;
         }
 
-        is_multi_gpu_single_process_ = false;
         initialized_ = false;
         LOG_DEBUG("RCCLBackend: Shutdown complete");
 #endif
@@ -1144,12 +1061,14 @@ namespace llaminar2
         if (!initialized_)
         {
             last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
             return false;
         }
 
         if (!is_multi_gpu_single_process_)
         {
             last_error_ = "allreduceMulti requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
             return false;
         }
 
@@ -1157,54 +1076,24 @@ namespace llaminar2
         {
             last_error_ = "Buffer count (" + std::to_string(buffers.size()) +
                           ") doesn't match GPU count (" + std::to_string(num_ranks_) + ")";
-            return false;
-        }
-
-        std::string rccl_error;
-        if (!rccl_backend_detail::rcclGroupStartWrapper(rccl_error))
-        {
-            last_error_ = "rcclGroupStart failed: " + rccl_error;
             LOG_ERROR(last_error_);
             return false;
         }
 
-        // TRACE: Log all buffer pointers and device mappings before issuing allreduce
-        LOG_TRACE("[RCCLBackend::allreduceMulti] Starting group allreduce: count=" << count
-                                                                                   << " num_ranks=" << num_ranks_ << " p2p_available=" << p2p_available_);
-
-        // Issue AllReduce on each GPU with its buffer, communicator, and stream
-        for (int i = 0; i < num_ranks_; ++i)
+        // Delegate to coordinator
+        if (!coordinator_)
         {
-            // TRACE: Log each device's buffer before issuing the allreduce
-            LOG_TRACE("[RCCLBackend::allreduceMulti] RANK[" << i << "] "
-                                                            << "buffer=" << buffers[i]
-                                                            << " device_ordinal=" << device_ordinals_[i]
-                                                            << " comm=" << all_comms_[i]
-                                                            << " stream=" << all_streams_[i]);
-
-            // Set device context
-            rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[i]);
-
-            if (!rccl_backend_detail::rcclAllReduceWrapper(
-                    buffers[i], buffers[i], count,
-                    toRcclDataTypeInt(dtype), toRcclRedOpInt(op),
-                    all_comms_[i], all_streams_[i], rccl_error))
-            {
-                rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
-                last_error_ = "rcclAllReduce failed on GPU " + std::to_string(i) + ": " + rccl_error;
-                LOG_ERROR(last_error_);
-                return false;
-            }
-        }
-
-        if (!rccl_backend_detail::rcclGroupEndWrapper(rccl_error))
-        {
-            last_error_ = "rcclGroupEnd failed: " + rccl_error;
+            last_error_ = "RCCLCoordinator not initialized";
             LOG_ERROR(last_error_);
             return false;
         }
 
-        LOG_TRACE("[RCCLBackend::allreduceMulti] Group allreduce issued successfully");
+        if (!coordinator_->allreduceMulti(buffers, count, dtype, op))
+        {
+            last_error_ = "RCCLCoordinator allreduceMulti failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
 
         return true;
 #else
@@ -1227,12 +1116,14 @@ namespace llaminar2
         if (!initialized_)
         {
             last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
             return false;
         }
 
         if (!is_multi_gpu_single_process_)
         {
             last_error_ = "allgatherMulti requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
             return false;
         }
 
@@ -1240,36 +1131,21 @@ namespace llaminar2
             recv_bufs.size() != static_cast<size_t>(num_ranks_))
         {
             last_error_ = "Buffer count doesn't match GPU count";
-            return false;
-        }
-
-        std::string rccl_error;
-        if (!rccl_backend_detail::rcclGroupStartWrapper(rccl_error))
-        {
-            last_error_ = "rcclGroupStart failed: " + rccl_error;
             LOG_ERROR(last_error_);
             return false;
         }
 
-        for (int i = 0; i < num_ranks_; ++i)
+        // Delegate to coordinator
+        if (!coordinator_)
         {
-            rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[i]);
-
-            if (!rccl_backend_detail::rcclAllGatherWrapper(
-                    send_bufs[i], recv_bufs[i], send_count,
-                    toRcclDataTypeInt(dtype),
-                    all_comms_[i], all_streams_[i], rccl_error))
-            {
-                rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
-                last_error_ = "rcclAllGather failed on GPU " + std::to_string(i) + ": " + rccl_error;
-                LOG_ERROR(last_error_);
-                return false;
-            }
+            last_error_ = "RCCLCoordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
         }
 
-        if (!rccl_backend_detail::rcclGroupEndWrapper(rccl_error))
+        if (!coordinator_->allgatherMulti(send_bufs, recv_bufs, send_count, dtype))
         {
-            last_error_ = "rcclGroupEnd failed: " + rccl_error;
+            last_error_ = "RCCLCoordinator allgatherMulti failed: " + coordinator_->lastError();
             LOG_ERROR(last_error_);
             return false;
         }
@@ -1295,53 +1171,43 @@ namespace llaminar2
         if (!initialized_)
         {
             last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
             return false;
         }
 
         if (!is_multi_gpu_single_process_)
         {
             last_error_ = "broadcastMulti requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
             return false;
         }
 
         if (buffers.size() != static_cast<size_t>(num_ranks_))
         {
-            last_error_ = "Buffer count doesn't match GPU count";
+            last_error_ = "Buffer count (" + std::to_string(buffers.size()) +
+                          ") doesn't match GPU count (" + std::to_string(num_ranks_) + ")";
+            LOG_ERROR(last_error_);
             return false;
         }
 
         if (root < 0 || root >= num_ranks_)
         {
             last_error_ = "Invalid root rank: " + std::to_string(root);
-            return false;
-        }
-
-        std::string rccl_error;
-        if (!rccl_backend_detail::rcclGroupStartWrapper(rccl_error))
-        {
-            last_error_ = "rcclGroupStart failed: " + rccl_error;
             LOG_ERROR(last_error_);
             return false;
         }
 
-        for (int i = 0; i < num_ranks_; ++i)
+        // Delegate to coordinator
+        if (!coordinator_)
         {
-            rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[i]);
-
-            if (!rccl_backend_detail::rcclBroadcastWrapper(
-                    buffers[i], count, toRcclDataTypeInt(dtype), root,
-                    all_comms_[i], all_streams_[i], rccl_error))
-            {
-                rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
-                last_error_ = "rcclBroadcast failed on GPU " + std::to_string(i) + ": " + rccl_error;
-                LOG_ERROR(last_error_);
-                return false;
-            }
+            last_error_ = "RCCLCoordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
         }
 
-        if (!rccl_backend_detail::rcclGroupEndWrapper(rccl_error))
+        if (!coordinator_->broadcastMulti(buffers, count, dtype, root))
         {
-            last_error_ = "rcclGroupEnd failed: " + rccl_error;
+            last_error_ = "RCCLCoordinator broadcastMulti failed: " + coordinator_->lastError();
             LOG_ERROR(last_error_);
             return false;
         }
@@ -1379,55 +1245,16 @@ namespace llaminar2
             return false;
         }
 
-        if (buffers.size() != static_cast<size_t>(num_ranks_))
-        {
-            last_error_ = "Buffer count (" + std::to_string(buffers.size()) +
-                          ") doesn't match GPU count (" + std::to_string(num_ranks_) + ")";
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
-        if (root < 0 || root >= num_ranks_)
-        {
-            last_error_ = "Invalid root rank: " + std::to_string(root);
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
-        std::string rccl_error;
-        if (!rccl_backend_detail::rcclGroupStartWrapper(rccl_error))
-        {
-            last_error_ = "rcclGroupStart failed: " + rccl_error;
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
-        for (int i = 0; i < num_ranks_; ++i)
-        {
-            rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[i]);
-            // Send buffer is each GPU's buffer, receive buffer is root's buffer
-            // For non-root GPUs, recvbuff is ignored by RCCL
-            void *recvbuff = buffers[root];
-            if (!rccl_backend_detail::rcclReduceInGroupWrapper(
-                    buffers[i], recvbuff, count,
-                    toRcclDataTypeInt(dtype), toRcclRedOpInt(op), root,
-                    all_comms_[i], all_streams_[i], rccl_error))
-            {
-                rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
-                last_error_ = "rcclReduce failed on GPU " + std::to_string(i) + ": " + rccl_error;
-                LOG_ERROR(last_error_);
-                return false;
-            }
-        }
-
-        if (!rccl_backend_detail::rcclGroupEndWrapper(rccl_error))
-        {
-            last_error_ = "rcclGroupEnd failed: " + rccl_error;
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
-        return true;
+        // reduceMulti not yet implemented in RCCLCoordinator
+        // TODO: Add reduceMulti to RCCLCoordinator when needed
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)root;
+        last_error_ = "reduceMulti not yet implemented in coordinator mode";
+        LOG_ERROR(last_error_);
+        return false;
 #else
         (void)buffers;
         (void)count;
@@ -1471,32 +1298,17 @@ namespace llaminar2
             return false;
         }
 
-        std::string rccl_error;
-        if (!rccl_backend_detail::rcclGroupStartWrapper(rccl_error))
+        // Delegate to coordinator
+        if (!coordinator_)
         {
-            last_error_ = "rcclGroupStart failed: " + rccl_error;
+            last_error_ = "RCCLCoordinator not initialized";
             LOG_ERROR(last_error_);
             return false;
         }
 
-        for (int i = 0; i < num_ranks_; ++i)
+        if (!coordinator_->reduceScatterMulti(send_buffers, recv_buffers, recv_count, dtype, op))
         {
-            rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[i]);
-            if (!rccl_backend_detail::rcclReduceScatterInGroupWrapper(
-                    send_buffers[i], recv_buffers[i], recv_count,
-                    toRcclDataTypeInt(dtype), toRcclRedOpInt(op),
-                    all_comms_[i], all_streams_[i], rccl_error))
-            {
-                rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
-                last_error_ = "rcclReduceScatter failed on GPU " + std::to_string(i) + ": " + rccl_error;
-                LOG_ERROR(last_error_);
-                return false;
-            }
-        }
-
-        if (!rccl_backend_detail::rcclGroupEndWrapper(rccl_error))
-        {
-            last_error_ = "rcclGroupEnd failed: " + rccl_error;
+            last_error_ = "RCCLCoordinator reduceScatterMulti failed: " + coordinator_->lastError();
             LOG_ERROR(last_error_);
             return false;
         }
@@ -1536,15 +1348,6 @@ namespace llaminar2
             return false;
         }
 
-        if (src_gpu < 0 || src_gpu >= num_ranks_ || dst_gpu < 0 || dst_gpu >= num_ranks_)
-        {
-            last_error_ = "sendrecvMulti: Invalid GPU indices src=" + std::to_string(src_gpu) +
-                          ", dst=" + std::to_string(dst_gpu) +
-                          " (valid: 0-" + std::to_string(num_ranks_ - 1) + ")";
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
         if (src_gpu == dst_gpu)
         {
             // Self-transfer: just log and succeed - caller shouldn't do this
@@ -1552,71 +1355,17 @@ namespace llaminar2
             return true;
         }
 
-        std::string rccl_error;
-
-        // CRITICAL: NCCL/RCCL requires BOTH endpoints to participate in a group
-        // The send (on src_gpu) and recv (on dst_gpu) must both be issued before
-        // rcclGroupEnd is called.
-        if (!rccl_backend_detail::rcclGroupStartWrapper(rccl_error))
-        {
-            last_error_ = "rcclGroupStart failed: " + rccl_error;
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
-        // Issue send on source GPU's communicator (to dst_gpu rank)
-        rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[src_gpu]);
-        if (!rccl_backend_detail::rcclSendWrapper(
-                src_buffer, count, toRcclDataTypeInt(dtype),
-                dst_gpu, all_comms_[src_gpu], all_streams_[src_gpu], rccl_error))
-        {
-            rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
-            last_error_ = "rcclSend failed on GPU " + std::to_string(src_gpu) + ": " + rccl_error;
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
-        // Issue recv on destination GPU's communicator (from src_gpu rank)
-        rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[dst_gpu]);
-        if (!rccl_backend_detail::rcclRecvWrapper(
-                dst_buffer, count, toRcclDataTypeInt(dtype),
-                src_gpu, all_comms_[dst_gpu], all_streams_[dst_gpu], rccl_error))
-        {
-            rccl_backend_detail::rcclGroupEndWrapper(rccl_error);
-            last_error_ = "rcclRecv failed on GPU " + std::to_string(dst_gpu) + ": " + rccl_error;
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
-        // Now both operations are queued - commit the group
-        if (!rccl_backend_detail::rcclGroupEndWrapper(rccl_error))
-        {
-            last_error_ = "rcclGroupEnd failed: " + rccl_error;
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
-        // Synchronize both streams to ensure transfer completes
-        rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[src_gpu]);
-        if (!rccl_backend_detail::hipSynchronizeStream(all_streams_[src_gpu]))
-        {
-            last_error_ = "hipStreamSynchronize failed on src GPU " + std::to_string(src_gpu);
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
-        rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[dst_gpu]);
-        if (!rccl_backend_detail::hipSynchronizeStream(all_streams_[dst_gpu]))
-        {
-            last_error_ = "hipStreamSynchronize failed on dst GPU " + std::to_string(dst_gpu);
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
-        LOG_DEBUG("RCCLBackend::sendrecvMulti: GPU " << src_gpu << " -> GPU " << dst_gpu
-                                                     << ", " << count << " elements");
-
-        return true;
+        // sendrecvMulti not yet implemented in RCCLCoordinator
+        // TODO: Add sendrecvMulti to RCCLCoordinator when needed
+        (void)src_buffer;
+        (void)dst_buffer;
+        (void)count;
+        (void)dtype;
+        (void)src_gpu;
+        (void)dst_gpu;
+        last_error_ = "sendrecvMulti not yet implemented in coordinator mode";
+        LOG_ERROR(last_error_);
+        return false;
 #else
         (void)src_buffer;
         (void)dst_buffer;
@@ -1641,18 +1390,21 @@ namespace llaminar2
             return true;
         }
 
-        // In multi-GPU single-process mode, synchronize ALL streams
+        // In multi-GPU single-process mode, delegate to coordinator
         if (is_multi_gpu_single_process_)
         {
-            for (int i = 0; i < num_ranks_; ++i)
+            if (!coordinator_)
             {
-                rccl_backend_detail::hipSetDeviceOrdinal(device_ordinals_[i]);
-                if (!rccl_backend_detail::hipSynchronizeStream(all_streams_[i]))
-                {
-                    last_error_ = "hipStreamSynchronize failed on GPU " + std::to_string(i);
-                    LOG_ERROR(last_error_);
-                    return false;
-                }
+                last_error_ = "RCCLCoordinator not initialized";
+                LOG_ERROR(last_error_);
+                return false;
+            }
+
+            if (!coordinator_->synchronize())
+            {
+                last_error_ = "RCCLCoordinator synchronize failed: " + coordinator_->lastError();
+                LOG_ERROR(last_error_);
+                return false;
             }
             return true;
         }
@@ -1668,6 +1420,132 @@ namespace llaminar2
         return true;
 #else
         return true;
+#endif
+    }
+
+    // =========================================================================
+    // Data Copy Operations
+    // =========================================================================
+
+    bool RCCLBackend::copy(void *dst_ptr, DeviceId dst_device,
+                           const void *src_ptr, DeviceId src_device,
+                           size_t bytes)
+    {
+#ifdef HAVE_RCCL
+        // RCCLBackend only supports ROCm↔ROCm copies
+        if (!src_device.is_rocm() || !dst_device.is_rocm())
+        {
+            LOG_DEBUG("RCCLBackend::copy: requires ROCm devices, got "
+                      << src_device.toString() << " -> " << dst_device.toString());
+            return false;
+        }
+
+        if (bytes == 0)
+            return true;
+        if (!dst_ptr || !src_ptr)
+            return false;
+
+        int src_idx = src_device.toKernelDeviceIndex();
+        int dst_idx = dst_device.toKernelDeviceIndex();
+
+        // Require coordinator for all copies (including same-device for consistency)
+        if (!coordinator_)
+        {
+            last_error_ = "RCCLBackend::copy: coordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Delegate to coordinator (handles both same-device and cross-device)
+        if (!coordinator_->copy(dst_ptr, dst_idx, src_ptr, src_idx, bytes))
+        {
+            last_error_ = "RCCLBackend::copy: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        return true;
+#else
+        (void)dst_ptr;
+        (void)dst_device;
+        (void)src_ptr;
+        (void)src_device;
+        (void)bytes;
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::copyAsync(void *dst_ptr, DeviceId dst_device,
+                                const void *src_ptr, DeviceId src_device,
+                                size_t bytes, void *stream)
+    {
+#ifdef HAVE_RCCL
+        (void)stream; // Coordinator manages its own streams
+
+        // RCCLBackend only supports ROCm↔ROCm copies
+        if (!src_device.is_rocm() || !dst_device.is_rocm())
+        {
+            LOG_DEBUG("RCCLBackend::copyAsync: requires ROCm devices, got "
+                      << src_device.toString() << " -> " << dst_device.toString());
+            return false;
+        }
+
+        if (bytes == 0)
+            return true;
+        if (!dst_ptr || !src_ptr)
+            return false;
+
+        int src_idx = src_device.toKernelDeviceIndex();
+        int dst_idx = dst_device.toKernelDeviceIndex();
+
+        // Require coordinator for all copies
+        if (!coordinator_)
+        {
+            last_error_ = "RCCLBackend::copyAsync: coordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Delegate to coordinator async copy (enqueues work, returns immediately)
+        // Caller should use coordinator_->getCompletionEvent(dst_idx) to synchronize
+        if (!coordinator_->copyAsync(dst_ptr, dst_idx, src_ptr, src_idx, bytes))
+        {
+            last_error_ = "RCCLBackend::copyAsync: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        return true;
+#else
+        (void)dst_ptr;
+        (void)dst_device;
+        (void)src_ptr;
+        (void)src_device;
+        (void)bytes;
+        (void)stream;
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::supportsCopy(DeviceId src_device, DeviceId dst_device) const
+    {
+#ifdef HAVE_RCCL
+        if (!src_device.is_rocm() || !dst_device.is_rocm())
+        {
+            return false;
+        }
+
+        // Same-device copy is always supported via hipMemcpy (no coordinator needed)
+        if (src_device == dst_device)
+        {
+            return true;
+        }
+
+        // Cross-device copies require coordinator (RCCL send/recv or xGMI)
+        // Coordinator handles: cross-device via best available transport (xGMI, P2P, or host staging)
+        return coordinator_ != nullptr;
+#else
+        (void)src_device;
+        (void)dst_device;
+        return false;
 #endif
     }
 

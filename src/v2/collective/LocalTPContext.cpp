@@ -135,6 +135,26 @@ namespace llaminar2
         return static_cast<int>(devices_.size());
     }
 
+    int LocalTPContext::myIndex() const
+    {
+        if (current_device_index_ < 0) {
+            throw std::runtime_error(
+                "LocalTPContext::myIndex() called before setCurrentDeviceIndex(). "
+                "In orchestrator-driven LOCAL TP, the current device must be set explicitly.");
+        }
+        return current_device_index_;
+    }
+
+    void LocalTPContext::setCurrentDeviceIndex(int index)
+    {
+        if (index < 0 || index >= static_cast<int>(devices_.size())) {
+            throw std::out_of_range(
+                "LocalTPContext::setCurrentDeviceIndex(): index " + std::to_string(index) +
+                " out of range [0, " + std::to_string(devices_.size()) + ")");
+        }
+        current_device_index_ = index;
+    }
+
     // =========================================================================
     // Collective Operations
     // =========================================================================
@@ -1465,6 +1485,91 @@ namespace llaminar2
                       << backend_impl_->lastError());
         }
         return result;
+    }
+
+    bool LocalTPContext::broadcast(TensorBase *tensor, int source_device_index)
+    {
+        if (!tensor)
+        {
+            LOG_ERROR("LocalTPContext::broadcast: null tensor");
+            return false;
+        }
+
+        if (source_device_index < 0 || source_device_index >= degree())
+        {
+            LOG_ERROR("LocalTPContext::broadcast: invalid source_device_index "
+                      << source_device_index << " (degree=" << degree() << ")");
+            return false;
+        }
+
+        // Single device - no-op (already broadcast to the only device)
+        if (degree() == 1)
+        {
+            LOG_DEBUG("LocalTPContext::broadcast: single device, no-op");
+            return true;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        // Ensure backend is initialized
+        if (!backend_initialized_)
+        {
+            LOG_WARN("LocalTPContext::broadcast: Backend not initialized, skipping");
+            return true; // Non-fatal: single device fallback
+        }
+
+        const GlobalDeviceAddress &source_device = devices_[source_device_index];
+        DeviceId src_device_id = source_device.toLocalDeviceId();
+
+        LOG_DEBUG("LocalTPContext::broadcast: Broadcasting from device "
+                  << source_device_index << " (" << source_device.toString()
+                  << ") to " << degree() << " devices");
+
+        // Ensure tensor data is on the source device
+        if (!tensor->ensureOnDevice(src_device_id))
+        {
+            LOG_ERROR("LocalTPContext::broadcast: Failed to ensure tensor on source device "
+                      << src_device_id.toString());
+            return false;
+        }
+        tensor->mark_device_dirty();
+
+        // For homogeneous backends (NCCL/RCCL), use native broadcast if available
+        // For now, we implement broadcast as point-to-point transfers from source to all others
+        // TODO: Use backend_impl_->broadcast() when available in backend interface
+
+        bool all_ok = true;
+        for (int i = 0; i < degree(); ++i)
+        {
+            if (i == source_device_index)
+            {
+                continue; // Skip source device
+            }
+
+            DeviceId dst_device_id = devices_[i].toLocalDeviceId();
+
+            LOG_DEBUG("LocalTPContext::broadcast: " << src_device_id.toString()
+                      << " → " << dst_device_id.toString());
+
+            // Use tensor's transferTo which uses GlobalBackendRouter
+            // For same-vendor this will use NCCL/RCCL P2P or CUDA/HIP memcpy
+            // For cross-vendor this will use PCIe BAR staging
+            if (!tensor->transferTo(dst_device_id))
+            {
+                LOG_ERROR("LocalTPContext::broadcast: Transfer failed from "
+                          << src_device_id.toString() << " to " << dst_device_id.toString());
+                all_ok = false;
+                // Continue trying other devices
+            }
+        }
+
+        if (all_ok)
+        {
+            LOG_DEBUG("LocalTPContext::broadcast: Complete, tensor on all "
+                      << degree() << " devices");
+        }
+
+        return all_ok;
     }
 
     // =========================================================================

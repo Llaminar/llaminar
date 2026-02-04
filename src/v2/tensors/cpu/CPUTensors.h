@@ -803,20 +803,25 @@ namespace llaminar2
         /**
          * @brief Mark tensor as modified on device (requires sync to host before host access)
          * @note Call this after GPU kernels write to the tensor via gpu_data_ptr()
-         * @note This forwards to mark_device_dirty_with_event() for event-based sync
          *
          * After calling this:
          *   - device_valid_ = true (device just got written to)
          *   - host_valid_ = false (host is now stale) -- UNLESS tensor is mapped
-         *   - A completion event is recorded for fine-grained synchronization
          *
          * For mapped tensors, both host and device stay valid since they share memory,
          * but we set mapped_needs_sync_ so ensureOnHost() knows to synchronize.
          */
         virtual void mark_device_dirty()
         {
-            // Forward to event-based implementation for fine-grained sync
-            mark_device_dirty_with_event();
+            device_valid_ = true; // Device just got written to
+            // For mapped memory, host is ALSO valid since they share the same memory
+            // For non-mapped memory, host is now stale
+            host_valid_ = is_mapped_;
+            // For mapped memory: signal that sync is needed before CPU reads
+            if (is_mapped_)
+            {
+                mapped_needs_sync_ = true;
+            }
         }
 
         /**

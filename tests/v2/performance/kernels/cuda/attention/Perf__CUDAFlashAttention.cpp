@@ -3,10 +3,8 @@
  * @brief Performance benchmarks for CUDA Flash Attention kernels
  *
  * Measures throughput (TFLOPS, tokens/sec) for:
- *   - FA3 pipelined prefill (SM 8.0+, warp specialization, cp.async)
- *   - WMMA prefill (SM 7.0+, Tensor Core)
- *   - Scalar FP32 prefill (fallback)
- *   - Flash Decoding (all variants)
+ *   - FA2 pipelined prefill (Ampere SM 8.0+, warp specialization, cp.async, WMMA)
+ *   - Flash Decoding (split-K parallelism)
  *
  * **Tested Configurations**:
  * - Sequence lengths: 128, 512, 2048, 8192

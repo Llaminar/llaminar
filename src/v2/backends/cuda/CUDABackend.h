@@ -11,6 +11,7 @@
 #pragma once
 
 #include "../IBackend.h"
+#include <future>
 
 namespace llaminar2
 {
@@ -36,6 +37,11 @@ namespace llaminar2
         bool streamSynchronize(int device_id) override;
         bool setDevice(int device_id) override;
 
+        // Async variants of transfer/sync operations
+        std::future<bool> deviceToHostAsync(void *dst, const void *src, size_t bytes, int device_id) override;
+        std::future<bool> hostToDeviceAsync(void *dst, const void *src, size_t bytes, int device_id) override;
+        std::future<bool> synchronizeAsync(int device_id) override;
+
         // Event operations (fine-grained synchronization)
         void *createEvent(int device_id) override;
         void destroyEvent(void *event, int device_id) override;
@@ -46,6 +52,11 @@ namespace llaminar2
         void *allocate(size_t bytes, int device_id) override;
         void free(void *ptr, int device_id) override;
         bool memset(void *ptr, int value, size_t bytes, int device_id) override;
+
+        // Async variants of allocation operations
+        std::future<void *> allocateAsync(size_t bytes, int device_id) override;
+        std::future<void> freeAsync(void *ptr, int device_id) override;
+        std::future<bool> memsetAsync(void *ptr, int value, size_t bytes, int device_id) override;
 
         // Zero-copy mapped memory operations
         void *allocateMapped(size_t bytes, int device_id, void **device_ptr) override;

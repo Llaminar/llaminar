@@ -18,6 +18,7 @@
 #include "../backends/DeviceId.h"
 #include "../kernels/KernelFactory.h"
 #include "../collective/backends/PCIeBARBackend.h"
+#include "../collective/BackendRouter.h"
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
@@ -136,6 +137,34 @@ namespace llaminar2
 
         // Free BAR-backed memory if allocated
         freeBARBackedMemory();
+
+        // Free secondary device buffers (from multi-device transfers)
+        for (auto &[key, ptr] : secondary_device_buffers_)
+        {
+            if (ptr != nullptr)
+            {
+                // Skip BAR-allocated buffers - they're managed by PCIeBARBackend
+                // and will be reclaimed when the backend shuts down
+                if (secondary_bar_allocated_keys_.count(key) > 0)
+                {
+                    LOG_DEBUG("[TensorBase::~TensorBase] Skipping BAR-allocated secondary buffer (key=" << key << ")");
+                    continue;
+                }
+
+                // Unpack device ID from key
+                DeviceType type = static_cast<DeviceType>(key >> 16);
+                int ordinal = key & 0xFFFF;
+                DeviceId device(type, ordinal);
+
+                IBackend *backend = getBackendForDevice(device);
+                if (backend)
+                {
+                    backend->free(ptr, ordinal);
+                }
+            }
+        }
+        secondary_device_buffers_.clear();
+        secondary_bar_allocated_keys_.clear();
 
         // Free GPU memory if allocated (before unpinning host memory)
         // Skip if gpu_data_ptr_ was pointing to BAR memory (already freed above)
@@ -1049,7 +1078,6 @@ namespace llaminar2
         {
             device_valid_ = false;
             // CRITICAL WARNING: Repeated invalidation causes re-uploads!
-            // This is being called by something that shouldn't modify GPU-resident data.
             if (debugEnv().rocm.trace_coherence)
             {
                 LOG_WARN("[TensorBase::invalidateGpuData] EXPENSIVE! Device data marked stale for ptr="
@@ -1171,18 +1199,38 @@ namespace llaminar2
         int backend_device_id = target_device.gpu_ordinal();
 
         // Free existing device memory if on different device
+        LOG_DEBUG("[TensorBase::ensureOnDevice] tensor=" << static_cast<void *>(this)
+                                                         << " target_device=" << target_device.toString()
+                                                         << " gpu_data_ptr_=" << gpu_data_ptr_
+                                                         << " gpu_device_=" << (gpu_device_.has_value() ? gpu_device_->toString() : "none")
+                                                         << " device_completion_event_=" << device_completion_event_);
         if (gpu_data_ptr_ && gpu_device_.has_value() && *gpu_device_ != target_device)
         {
+            LOG_DEBUG("[TensorBase::ensureOnDevice] Device migration: " << gpu_device_->toString()
+                                                                        << " -> " << target_device.toString());
             // Use the OLD device's backend for freeing
             IBackend *old_backend = getBackendForDevice(*gpu_device_);
             int old_backend_device_id = gpu_device_->gpu_ordinal();
             if (old_backend)
             {
+                // Destroy completion event from old device before freeing memory
+                // The event was created by the old backend and cannot be reused on a different device
+                if (device_completion_event_)
+                {
+                    LOG_DEBUG("[TensorBase::ensureOnDevice] Destroying old completion event on device "
+                              << gpu_device_->toString() << " before migrating to " << target_device.toString());
+                    old_backend->destroyEvent(device_completion_event_, old_backend_device_id);
+                    device_completion_event_ = nullptr;
+                }
                 old_backend->free(gpu_data_ptr_, old_backend_device_id);
             }
             gpu_data_ptr_ = nullptr;
             gpu_device_.reset();
             device_valid_ = false;
+        }
+        else
+        {
+            LOG_DEBUG("[TensorBase::ensureOnDevice] No device migration needed (conditions not met)");
         }
 
         // Allocate on target device if needed
@@ -1338,6 +1386,12 @@ namespace llaminar2
         // BAR-backed tensors have memory allocated EXTERNALLY via PCIeBAR and are visible
         // to both CUDA and ROCm devices. They must NEVER be reallocated via backend->free/allocate.
         // The bar_backend_ field is set when the tensor is created as BAR-backed.
+        //
+        // IMPORTANT: is_bar_backed_ can be true in two scenarios:
+        // 1. Tensor was initialized via initBARBackedDirect() with both pointers set up
+        // 2. Tensor became BAR-backed via transferTo() where only the ROCm buffer is in BAR region
+        //
+        // For case 2, bar_cuda_device_ptr_ may be NULL, so we must fall through to normal path.
         if (is_bar_backed_)
         {
             // BAR memory is accessible from both devices via different pointers:
@@ -1347,7 +1401,21 @@ namespace llaminar2
 
             if (target_device.is_cuda())
             {
-                gpu_data_ptr_ = bar_cuda_device_ptr_;
+                if (bar_cuda_device_ptr_)
+                {
+                    gpu_data_ptr_ = bar_cuda_device_ptr_;
+                }
+                else
+                {
+                    // BAR dual-pointer not set up (likely from transferTo()).
+                    // Fall through to check secondary buffers or allocate new.
+                    if (trace)
+                    {
+                        LOG_INFO("[TensorBase::allocateOnDevice] BAR-BACKED but bar_cuda_device_ptr_ is null, "
+                                 "falling through to normal allocation path");
+                    }
+                    goto normal_allocation;
+                }
             }
             else if (target_device.is_rocm())
             {
@@ -1363,12 +1431,22 @@ namespace llaminar2
                                  << hip_staging_ptr_ << " (BAR mmap=" << bar_rocm_ptr_ << ")");
                     }
                 }
-                else
+                else if (bar_rocm_ptr_)
                 {
                     // Fallback to BAR mmap (may crash if used by HIP kernels)
                     LOG_WARN("[TensorBase::allocateOnDevice] BAR-BACKED ROCm: No HIP staging buffer! "
                              "Falling back to BAR mmap address (may crash)");
                     gpu_data_ptr_ = bar_rocm_ptr_;
+                }
+                else
+                {
+                    // Neither staging nor BAR pointer available - fall through
+                    if (trace)
+                    {
+                        LOG_INFO("[TensorBase::allocateOnDevice] BAR-BACKED but no ROCm pointer available, "
+                                 "falling through to normal allocation path");
+                    }
+                    goto normal_allocation;
                 }
             }
             else
@@ -1388,6 +1466,8 @@ namespace llaminar2
             }
             return true;
         }
+
+    normal_allocation:
 
         // ===== ZERO-COPY MAPPED MEMORY FAST PATH =====
         // If tensor uses mapped memory, GPU can access host memory directly.
@@ -1434,6 +1514,59 @@ namespace llaminar2
         }
 
         int backend_device_id = target_device.gpu_ordinal();
+
+        // ===== CHECK SECONDARY BUFFERS FIRST =====
+        // If we have a buffer in secondary_device_buffers_ for the target device,
+        // promote it to primary instead of allocating new memory.
+        // This is critical for PP mode where tensors ping-pong between devices.
+        {
+            int target_key = packDeviceId(target_device);
+            auto sec_it = secondary_device_buffers_.find(target_key);
+            if (sec_it != secondary_device_buffers_.end() && sec_it->second != nullptr)
+            {
+                // Store current primary in secondary (if not already there)
+                if (gpu_data_ptr_ && gpu_device_.has_value())
+                {
+                    int old_key = packDeviceId(*gpu_device_);
+                    if (secondary_device_buffers_.find(old_key) == secondary_device_buffers_.end())
+                    {
+                        secondary_device_buffers_[old_key] = gpu_data_ptr_;
+                        // If current primary was BAR-backed, track it in secondary
+                        if (is_bar_backed_)
+                        {
+                            secondary_bar_allocated_keys_.insert(old_key);
+                        }
+                    }
+                }
+
+                // Promote secondary to primary
+                void *promoted_ptr = sec_it->second;
+                secondary_device_buffers_.erase(sec_it);
+
+                gpu_data_ptr_ = promoted_ptr;
+                gpu_device_ = target_device;
+                device_valid_ = false;
+
+                // Check if promoted buffer was BAR-backed in secondary
+                bool was_bar = (secondary_bar_allocated_keys_.count(target_key) > 0);
+                if (was_bar)
+                {
+                    secondary_bar_allocated_keys_.erase(target_key);
+                }
+                // CRITICAL: Update is_bar_backed_ to reflect the promoted buffer's status.
+                // The promoted buffer is only BAR-backed if it was tracked as such in secondary.
+                // A regular CUDA buffer promoted from secondary is NOT BAR-backed.
+                is_bar_backed_ = was_bar;
+
+                if (trace)
+                {
+                    LOG_INFO("[TensorBase::allocateOnDevice] Promoted secondary buffer to primary for "
+                             << target_device.toString() << " ptr=" << promoted_ptr
+                             << (was_bar ? " (BAR-backed)" : " (regular)"));
+                }
+                return true;
+            }
+        }
 
         // Free existing device memory if on different device
         if (gpu_data_ptr_ && gpu_device_.has_value() && *gpu_device_ != target_device)
@@ -1564,6 +1697,7 @@ namespace llaminar2
             // Both host and device are always valid for mapped memory
             host_valid_ = true;
             device_valid_ = true;
+            authoritative_device_ = std::nullopt; // Host is now authoritative
             return true;
         }
 
@@ -1579,6 +1713,46 @@ namespace llaminar2
         {
             LOG_ERROR("[TensorBase::ensureOnHost] COHERENCE ERROR: Both host and device are invalid!");
             return false;
+        }
+
+        // ===== BAR-BACKED BUFFER PATH =====
+        // If the tensor's gpu_data_ptr_ is a BAR-allocated pointer (host-mapped to GPU BAR region),
+        // we can read it directly via memcpy since it's already host-accessible.
+        // This happens after transferTo() with cross-vendor (CUDA↔ROCm) transfers.
+        if (is_bar_backed_ && gpu_data_ptr_ && gpu_device_.has_value())
+        {
+            size_t bytes = byte_size();
+            void *dst = raw_host_data_ptr();
+            if (!dst)
+            {
+                LOG_ERROR("[TensorBase::ensureOnHost] Host data pointer is null");
+                return false;
+            }
+
+            // Synchronize with GPU before reading BAR region
+            // (need to ensure any pending writes are complete)
+            if (device_completion_event_)
+            {
+                IBackend *backend = getBackendForDevice(*gpu_device_);
+                int backend_device_id = gpu_device_->gpu_ordinal();
+                if (backend && !waitForEventWithProxy(backend, device_completion_event_, backend_device_id, *gpu_device_))
+                {
+                    LOG_WARN("[TensorBase::ensureOnHost] Event wait failed for BAR-backed tensor, continuing anyway");
+                }
+            }
+
+            LOG_DEBUG("[TensorBase::ensureOnHost] BAR-BACKED: Direct memcpy from BAR region "
+                      << static_cast<const void *>(gpu_data_ptr_) << " -> " << dst
+                      << " (" << bytes << " bytes)");
+
+            // Direct memcpy since BAR region is host-accessible
+            std::memcpy(dst, gpu_data_ptr_, bytes);
+
+            host_valid_ = true;
+            authoritative_device_ = std::nullopt; // Host is now authoritative
+
+            LOG_DEBUG("[TensorBase::ensureOnHost] BAR-BACKED: Copied " << bytes << " bytes from BAR region");
+            return true;
         }
 
         // If GPU has data, download it
@@ -1670,6 +1844,7 @@ namespace llaminar2
 
             host_valid_ = true; // Host now has current data
             // device_valid_ stays true - we downloaded FROM device, so both are now in sync
+            authoritative_device_ = std::nullopt; // Host is now authoritative
 
             LOG_DEBUG("[TensorBase::ensureOnHost] Downloaded " << bytes
                                                                << " bytes from device " << gpu_device_->toString()
@@ -1681,10 +1856,17 @@ namespace llaminar2
 
     void TensorBase::mark_device_dirty_with_event()
     {
+        LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] ENTRY: tensor=" << static_cast<void *>(this)
+                                                                              << " name=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
+                                                                              << " gpu_device_=" << (gpu_device_.has_value() ? gpu_device_->toString() : "none"));
+
         // Mark as device dirty (standard behavior)
         // For mapped memory, both host and device stay valid
         device_valid_ = true;
         host_valid_ = is_mapped_; // Mapped memory: host is also valid
+
+        // Track which device is now authoritative (for multi-device coherence)
+        authoritative_device_ = gpu_device_; // GPU now has authoritative data
 
         // For mapped memory: signal that sync is needed before CPU reads
         if (is_mapped_)
@@ -1695,17 +1877,36 @@ namespace llaminar2
         // If we have a device, record an event for fine-grained sync
         if (gpu_device_.has_value())
         {
+            LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Getting backend for device " << gpu_device_->toString());
             IBackend *backend = getBackendForDevice(*gpu_device_);
             if (backend)
             {
                 int backend_device_id = gpu_device_->gpu_ordinal();
+                LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Got backend, device_id=" << backend_device_id);
+
+                // Check if existing event is on a different device - must recreate
+                if (device_completion_event_ && event_device_.has_value() && *event_device_ != *gpu_device_)
+                {
+                    LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Event device mismatch: "
+                              << "event on " << event_device_->toString()
+                              << " but tensor now on " << gpu_device_->toString() << ", clearing old event");
+                    // Note: We don't destroy the old event here since it was created on a different
+                    // device/backend. The old event will be leaked but this is safer than calling
+                    // destroyEvent with the wrong backend. In practice this should be rare.
+                    device_completion_event_ = nullptr;
+                    event_device_.reset();
+                }
 
                 // Create event if we don't have one
                 if (!device_completion_event_)
                 {
+                    LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Creating event...");
                     device_completion_event_ = backend->createEvent(backend_device_id);
+                    LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] createEvent returned: "
+                              << (device_completion_event_ ? "valid" : "nullptr"));
                     if (device_completion_event_)
                     {
+                        event_device_ = *gpu_device_; // Track which device the event was created on
                         LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Created completion event for tensor on device "
                                   << gpu_device_->toString());
                     }
@@ -1719,6 +1920,7 @@ namespace llaminar2
                 // Record the event (marks this point in the stream)
                 if (device_completion_event_)
                 {
+                    LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Recording event...");
                     if (!backend->recordEvent(device_completion_event_, backend_device_id))
                     {
                         LOG_WARN("[TensorBase::mark_device_dirty_with_event] Failed to record event");
@@ -1727,6 +1929,7 @@ namespace llaminar2
                     {
                         LOG_TRACE("[TensorBase::mark_device_dirty_with_event] Recorded completion event");
                     }
+                    LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Event recording complete");
                 }
             }
             else
@@ -1739,6 +1942,7 @@ namespace llaminar2
         {
             LOG_TRACE("[TensorBase::mark_device_dirty_with_event] Tensor not on GPU (no gpu_device_)");
         }
+        LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] EXIT");
     }
 
     bool TensorBase::releaseDeviceMemory()
@@ -2166,6 +2370,308 @@ namespace llaminar2
         }
 
         return false; // CPU doesn't use device caching
+    }
+
+    // =========================================================================
+    // Direct GPU-to-GPU Transfer (Phase 2 GPU-Native Coherence)
+    // =========================================================================
+
+    bool TensorBase::transferTo(DeviceId dst_device)
+    {
+        // 1. Validate preconditions
+        if (!authoritative_device_.has_value())
+        {
+            LOG_ERROR("[TensorBase::transferTo] Tensor has no authoritative GPU device. "
+                      "Call ensureOnDevice() + mark_device_dirty() first.");
+            return false;
+        }
+
+        DeviceId src_device = *authoritative_device_;
+
+        // Same device = no-op success
+        if (src_device == dst_device)
+        {
+            LOG_DEBUG("[TensorBase::transferTo] Same device (" << src_device.toString()
+                                                               << "), no transfer needed");
+            return true;
+        }
+
+        // Must be GPU to GPU
+        if (src_device.is_cpu() || dst_device.is_cpu())
+        {
+            LOG_ERROR("[TensorBase::transferTo] Only GPU-to-GPU transfers supported. "
+                      "Got: "
+                      << src_device.toString() << " -> " << dst_device.toString());
+            return false;
+        }
+
+        // 2. Get backend that supports this transfer
+        auto *router = GlobalBackendRouter::get();
+        if (!router)
+        {
+            LOG_ERROR("[TensorBase::transferTo] GlobalBackendRouter not initialized");
+            return false;
+        }
+
+        ICollectiveBackend *backend = router->getBackendForCopy(src_device, dst_device);
+        if (!backend)
+        {
+            LOG_ERROR("[TensorBase::transferTo] No backend registered for "
+                      << src_device.toString() << " -> " << dst_device.toString());
+            return false;
+        }
+
+        if (!backend->supportsCopy(src_device, dst_device))
+        {
+            LOG_ERROR("[TensorBase::transferTo] Backend does not support "
+                      << src_device.toString() << " -> " << dst_device.toString()
+                      << " (fail-fast, no host fallback)");
+            return false;
+        }
+
+        // 3. Ensure source buffer pointer is valid
+        void *src_ptr = gpu_data_ptr_;
+        if (!src_ptr)
+        {
+            LOG_ERROR("[TensorBase::transferTo] Source GPU buffer is null");
+            return false;
+        }
+
+        // 4. Get or allocate destination buffer
+        void *dst_ptr = getOrAllocateDeviceBuffer(dst_device);
+        if (!dst_ptr)
+        {
+            LOG_ERROR("[TensorBase::transferTo] Failed to allocate buffer on "
+                      << dst_device.toString());
+            return false;
+        }
+
+        // Check if the destination buffer is BAR-allocated
+        // (either just allocated, or previously stored as BAR-allocated in secondary)
+        int dst_key = packDeviceId(dst_device);
+        bool dst_is_bar_backed = (secondary_bar_allocated_keys_.count(dst_key) > 0);
+
+        // 5. Get transfer size
+        size_t bytes = byte_size();
+        if (bytes == 0)
+        {
+            LOG_WARN("[TensorBase::transferTo] Zero-byte tensor, nothing to transfer");
+            return true;
+        }
+
+        LOG_DEBUG("[TensorBase::transferTo] " << src_device.toString() << " -> "
+                                              << dst_device.toString() << " (" << bytes << " bytes)");
+
+        // 6. Perform direct GPU-to-GPU copy
+        if (!backend->copy(dst_ptr, dst_device, src_ptr, src_device, bytes))
+        {
+            LOG_ERROR("[TensorBase::transferTo] Backend copy failed");
+            return false;
+        }
+
+        // 7. Update coherence state
+        // Store old primary buffer in secondary map if not already there
+        if (gpu_device_.has_value() && *gpu_device_ != dst_device)
+        {
+            int old_key = packDeviceId(*gpu_device_);
+            if (secondary_device_buffers_.find(old_key) == secondary_device_buffers_.end())
+            {
+                secondary_device_buffers_[old_key] = gpu_data_ptr_;
+                // If old primary was BAR-backed, track it in secondary_bar_allocated_keys_
+                if (is_bar_backed_)
+                {
+                    secondary_bar_allocated_keys_.insert(old_key);
+                }
+            }
+        }
+
+        // Remove destination buffer from secondary since it's now primary
+        // (prevents double-free in destructor)
+        secondary_device_buffers_.erase(dst_key);
+        // Note: we keep dst_key in secondary_bar_allocated_keys_ if it was BAR-backed
+        // because is_bar_backed_ tracks primary status, not secondary
+
+        // Update primary buffer to destination
+        gpu_data_ptr_ = dst_ptr;
+        gpu_device_ = dst_device;
+        authoritative_device_ = dst_device;
+        device_valid_ = true;
+        host_valid_ = false;                // Host is now stale
+        is_bar_backed_ = dst_is_bar_backed; // Track if new primary is BAR-backed
+
+        // 8. Clear completion event - events are tied to the device/context where created
+        // Must clear for ANY cross-device transfer (not just cross-vendor), because CUDA
+        // events created on GPU:0 cannot be recorded on GPU:1's stream.
+        clearCompletionEvent();
+
+        LOG_DEBUG("[TensorBase::transferTo] Transfer completed, "
+                  << dst_device.toString() << " is now authoritative"
+                  << (is_bar_backed_ ? " (BAR-backed)" : ""));
+        return true;
+    }
+
+    bool TensorBase::copyTo(DeviceId dst_device)
+    {
+        // Similar to transferTo but doesn't change authoritative
+        if (!authoritative_device_.has_value())
+        {
+            LOG_ERROR("[TensorBase::copyTo] Tensor has no authoritative GPU device");
+            return false;
+        }
+
+        DeviceId src_device = *authoritative_device_;
+        if (src_device == dst_device)
+        {
+            return true; // Already there
+        }
+
+        if (src_device.is_cpu() || dst_device.is_cpu())
+        {
+            LOG_ERROR("[TensorBase::copyTo] Only GPU-to-GPU supported");
+            return false;
+        }
+
+        auto *router = GlobalBackendRouter::get();
+        if (!router)
+        {
+            LOG_ERROR("[TensorBase::copyTo] GlobalBackendRouter not initialized");
+            return false;
+        }
+
+        ICollectiveBackend *backend = router->getBackendForCopy(src_device, dst_device);
+        if (!backend || !backend->supportsCopy(src_device, dst_device))
+        {
+            LOG_ERROR("[TensorBase::copyTo] No backend supports this transfer");
+            return false;
+        }
+
+        void *src_ptr = gpu_data_ptr_;
+        if (!src_ptr)
+        {
+            LOG_ERROR("[TensorBase::copyTo] Source GPU buffer is null");
+            return false;
+        }
+
+        void *dst_ptr = getOrAllocateDeviceBuffer(dst_device);
+        if (!dst_ptr)
+        {
+            LOG_ERROR("[TensorBase::copyTo] Failed to allocate destination buffer");
+            return false;
+        }
+
+        size_t bytes = byte_size();
+        if (bytes == 0)
+        {
+            return true;
+        }
+
+        if (!backend->copy(dst_ptr, dst_device, src_ptr, src_device, bytes))
+        {
+            LOG_ERROR("[TensorBase::copyTo] Backend copy failed");
+            return false;
+        }
+
+        // NOTE: Unlike transferTo(), we do NOT change authoritative_device_
+        // The source device remains authoritative, destination is just a copy
+
+        LOG_DEBUG("[TensorBase::copyTo] Copied to " << dst_device.toString()
+                                                    << ", source " << src_device.toString() << " remains authoritative");
+        return true;
+    }
+
+    void *TensorBase::getOrAllocateDeviceBuffer(DeviceId device)
+    {
+        // Check if this is the current primary device
+        if (gpu_device_.has_value() && *gpu_device_ == device)
+        {
+            return gpu_data_ptr_;
+        }
+
+        // Check secondary buffers
+        int key = packDeviceId(device);
+        auto it = secondary_device_buffers_.find(key);
+        if (it != secondary_device_buffers_.end() && it->second != nullptr)
+        {
+            return it->second;
+        }
+
+        // Need to allocate new buffer
+        size_t bytes = byte_size();
+        if (bytes == 0)
+        {
+            LOG_ERROR("[TensorBase::getOrAllocateDeviceBuffer] Cannot allocate 0 bytes");
+            return nullptr;
+        }
+
+        // For cross-vendor transfers (CUDA↔ROCm), ROCm buffers need to be
+        // allocated in the BAR region for PCIe BAR P2P to work.
+        // Check if we need BAR-region allocation.
+        bool need_bar_allocation = false;
+        if (device.is_rocm() && authoritative_device_.has_value() && authoritative_device_->is_cuda())
+        {
+            // Destination is ROCm, source is CUDA → need BAR allocation
+            need_bar_allocation = true;
+        }
+
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+        if (need_bar_allocation)
+        {
+            // Try to allocate in BAR region via PCIeBAR backend
+            auto *router = GlobalBackendRouter::get();
+            if (router)
+            {
+                auto *backend = router->getBackend(CollectiveBackendType::PCIE_BAR);
+                if (backend)
+                {
+                    auto *pcie_backend = dynamic_cast<PCIeBARBackend *>(backend);
+                    if (pcie_backend && pcie_backend->isPCIeBarActive())
+                    {
+                        auto bar_alloc = pcie_backend->allocateInBarRegion(bytes);
+                        if (bar_alloc.has_value())
+                        {
+                            void *bar_ptr = bar_alloc->first;
+                            secondary_device_buffers_[key] = bar_ptr;
+                            secondary_bar_allocated_keys_.insert(key); // Track as BAR-allocated
+                            LOG_DEBUG("[TensorBase::getOrAllocateDeviceBuffer] Allocated " << bytes
+                                                                                           << " bytes in BAR region for " << device.toString());
+                            return bar_ptr;
+                        }
+                        else
+                        {
+                            LOG_WARN("[TensorBase::getOrAllocateDeviceBuffer] BAR allocation failed, "
+                                     "falling back to standard allocation");
+                        }
+                    }
+                }
+            }
+        }
+#endif
+
+        // Standard allocation via device backend
+        IBackend *backend = getBackendForDevice(device);
+        if (!backend)
+        {
+            LOG_ERROR("[TensorBase::getOrAllocateDeviceBuffer] No backend for device "
+                      << device.toString());
+            return nullptr;
+        }
+
+        int backend_device_id = device.gpu_ordinal();
+        void *new_ptr = backend->allocate(bytes, backend_device_id);
+
+        if (new_ptr)
+        {
+            secondary_device_buffers_[key] = new_ptr;
+            LOG_DEBUG("[TensorBase::getOrAllocateDeviceBuffer] Allocated " << bytes
+                                                                           << " bytes on " << device.toString());
+        }
+        else
+        {
+            LOG_ERROR("[TensorBase::getOrAllocateDeviceBuffer] Allocation failed on "
+                      << device.toString());
+        }
+
+        return new_ptr;
     }
 
 } // namespace llaminar2

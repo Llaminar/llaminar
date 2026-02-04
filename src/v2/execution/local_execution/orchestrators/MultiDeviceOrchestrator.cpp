@@ -17,8 +17,11 @@
 #include "DeviceGraphOrchestrator.h"
 #include "../../factory/InferenceRunnerFactory.h"
 #include "../../../collective/ILocalTPContext.h"
+#include "../../../collective/ILocalPPContext.h"
 #include "../../../config/TensorParallelConfig.h"
 #include "../../../interfaces/IModelContext.h"
+#include "../../../loaders/ModelContext.h"
+#include "../graph/SchemaFactoryRegistry.h" // Model-agnostic sharding config access
 #include "../../../tensors/TensorClasses.h"
 #include "../../../tensors/TensorFactory.h"
 #include "../../../utils/Logger.h"
@@ -35,31 +38,150 @@ namespace llaminar2
     // Config Implementation
     // =========================================================================
 
-    bool MultiDeviceOrchestrator::Config::validate() const
+    bool MultiDeviceOrchestrator::PPStageConfig::validate() const
     {
+        // Layer range must be valid
+        if (last_layer <= first_layer)
+        {
+            LOG_ERROR("PPStageConfig: Invalid layer range [" << first_layer << ", " << last_layer << ")");
+            return false;
+        }
+
         // Must have at least one device
-        if (devices.empty())
+        if (stage_devices.empty())
         {
-            LOG_ERROR("MultiDeviceOrchestrator::Config: No devices specified");
+            LOG_ERROR("PPStageConfig: No stage devices specified");
             return false;
         }
 
-        // If weights are provided, must match device count
-        if (!weights.empty() && weights.size() != devices.size())
+        // If TP weights are provided, must match device count
+        if (!tp_weights.empty() && tp_weights.size() != stage_devices.size())
         {
-            LOG_ERROR("MultiDeviceOrchestrator::Config: Weights count (" << weights.size()
-                                                                         << ") doesn't match device count (" << devices.size() << ")");
+            LOG_ERROR("PPStageConfig: TP weights count (" << tp_weights.size()
+                                                          << ") doesn't match device count (" << stage_devices.size() << ")");
             return false;
         }
 
-        // If weights are provided, must sum to approximately 1.0
-        if (!weights.empty())
+        // If TP weights are provided, must sum to approximately 1.0
+        if (!tp_weights.empty())
         {
-            float sum = std::accumulate(weights.begin(), weights.end(), 0.0f);
+            float sum = std::accumulate(tp_weights.begin(), tp_weights.end(), 0.0f);
             if (std::abs(sum - 1.0f) > 0.01f)
             {
-                LOG_ERROR("MultiDeviceOrchestrator::Config: Weights sum to " << sum << ", expected 1.0");
+                LOG_ERROR("PPStageConfig: TP weights sum to " << sum << ", expected 1.0");
                 return false;
+            }
+        }
+
+        return true;
+    }
+
+    MultiDeviceOrchestrator::ParallelismMode
+    MultiDeviceOrchestrator::Config::detectMode() const
+    {
+        if (pp_stages.empty())
+        {
+            // No PP stages - pure TP mode
+            return ParallelismMode::TP;
+        }
+
+        // Check if any PP stage is a TP domain
+        bool has_tp_stages = std::any_of(pp_stages.begin(), pp_stages.end(),
+                                         [](const PPStageConfig &stage)
+                                         { return stage.isTPDomain(); });
+
+        return has_tp_stages ? ParallelismMode::TP_PP : ParallelismMode::PP;
+    }
+
+    std::vector<int> MultiDeviceOrchestrator::Config::buildLayerBoundaries() const
+    {
+        std::vector<int> boundaries;
+        if (pp_stages.empty())
+        {
+            return boundaries;
+        }
+
+        boundaries.push_back(0);
+        for (const auto &stage : pp_stages)
+        {
+            boundaries.push_back(stage.last_layer);
+        }
+        return boundaries;
+    }
+
+    bool MultiDeviceOrchestrator::Config::validate() const
+    {
+        ParallelismMode effective = effectiveMode();
+
+        if (effective == ParallelismMode::TP)
+        {
+            // TP mode validation
+            if (devices.empty())
+            {
+                LOG_ERROR("MultiDeviceOrchestrator::Config: No devices specified for TP mode");
+                return false;
+            }
+
+            // If weights are provided, must match device count
+            if (!weights.empty() && weights.size() != devices.size())
+            {
+                LOG_ERROR("MultiDeviceOrchestrator::Config: Weights count (" << weights.size()
+                                                                             << ") doesn't match device count (" << devices.size() << ")");
+                return false;
+            }
+
+            // If weights are provided, must sum to approximately 1.0
+            if (!weights.empty())
+            {
+                float sum = std::accumulate(weights.begin(), weights.end(), 0.0f);
+                if (std::abs(sum - 1.0f) > 0.01f)
+                {
+                    LOG_ERROR("MultiDeviceOrchestrator::Config: Weights sum to " << sum << ", expected 1.0");
+                    return false;
+                }
+            }
+        }
+        else
+        {
+            // PP or TP_PP mode validation
+            if (pp_stages.empty())
+            {
+                LOG_ERROR("MultiDeviceOrchestrator::Config: No PP stages specified for PP mode");
+                return false;
+            }
+
+            // Validate each stage
+            for (size_t i = 0; i < pp_stages.size(); ++i)
+            {
+                if (!pp_stages[i].validate())
+                {
+                    LOG_ERROR("MultiDeviceOrchestrator::Config: PP stage " << i << " validation failed");
+                    return false;
+                }
+            }
+
+            // Check layer continuity (no gaps)
+            int expected_first = 0;
+            for (size_t i = 0; i < pp_stages.size(); ++i)
+            {
+                if (pp_stages[i].first_layer != expected_first)
+                {
+                    LOG_ERROR("MultiDeviceOrchestrator::Config: PP stage " << i
+                                                                           << " first_layer=" << pp_stages[i].first_layer
+                                                                           << " but expected " << expected_first << " (gap in layers)");
+                    return false;
+                }
+                expected_first = pp_stages[i].last_layer;
+            }
+
+            // First stage should have embedding, last should have LM head
+            if (!pp_stages.front().has_embedding)
+            {
+                LOG_WARN("MultiDeviceOrchestrator::Config: First PP stage doesn't have embedding flag set");
+            }
+            if (!pp_stages.back().has_lm_head)
+            {
+                LOG_WARN("MultiDeviceOrchestrator::Config: Last PP stage doesn't have lm_head flag set");
             }
         }
 
@@ -124,38 +246,55 @@ namespace llaminar2
             throw std::invalid_argument("Invalid MultiDeviceOrchestrator configuration");
         }
 
-        LOG_INFO("MultiDeviceOrchestrator: Creating with " << config_.devices.size()
-                                                           << " devices, backend=" << static_cast<int>(config_.backend));
+        // Determine effective parallelism mode
+        mode_ = config_.effectiveMode();
 
-        // Create LOCAL TP context from config
-        tp_ctx_ = createLocalTPContext(
-            config_.devices,
-            config_.getNormalizedWeights(),
-            config_.backend);
+        LOG_INFO("MultiDeviceOrchestrator: Creating with mode="
+                 << (mode_ == ParallelismMode::TP ? "TP" : mode_ == ParallelismMode::PP ? "PP"
+                                                                                        : "TP_PP")
+                 << ", backend=" << static_cast<int>(config_.backend));
 
-        if (!tp_ctx_)
+        if (mode_ == ParallelismMode::TP)
         {
-            throw std::runtime_error("Failed to create LOCAL TP context");
-        }
+            // Pure TP mode - create LOCAL TP context from config
+            tp_ctx_ = createLocalTPContext(
+                config_.devices,
+                config_.getNormalizedWeights(),
+                config_.backend);
 
-        // Validate TP degree
-        if (tp_ctx_->degree() < 2)
+            if (!tp_ctx_)
+            {
+                throw std::runtime_error("Failed to create LOCAL TP context");
+            }
+
+            // Validate TP degree
+            if (tp_ctx_->degree() < 2)
+            {
+                LOG_WARN("MultiDeviceOrchestrator: TP degree is " << tp_ctx_->degree()
+                                                                  << ", multi-device orchestration may not be beneficial");
+            }
+
+            // Initialize device runners for TP mode
+            initializeDeviceRunners();
+
+            LOG_INFO("MultiDeviceOrchestrator: Initialized TP mode with " << device_runners_.size() << " device runners");
+        }
+        else
         {
-            LOG_WARN("MultiDeviceOrchestrator: TP degree is " << tp_ctx_->degree()
-                                                              << ", multi-device orchestration may not be beneficial");
+            // PP or TP_PP mode - create PP context and stage runners
+            initializePPDeviceRunners();
+            initializePPContext();
+
+            LOG_INFO("MultiDeviceOrchestrator: Initialized PP mode with " << config_.pp_stages.size() << " stages");
         }
-
-        // Initialize device runners
-        initializeDeviceRunners();
-
-        LOG_INFO("MultiDeviceOrchestrator: Initialized with " << device_runners_.size() << " device runners");
     }
 
     MultiDeviceOrchestrator::MultiDeviceOrchestrator(
         std::shared_ptr<IModelContext> model_ctx,
         std::unique_ptr<ILocalTPContext> tp_ctx,
         const Config &config)
-        : model_ctx_(std::move(model_ctx)), tp_ctx_(std::move(tp_ctx)), config_(config)
+        : model_ctx_(std::move(model_ctx)), tp_ctx_(std::move(tp_ctx)), config_(config),
+          mode_(ParallelismMode::TP) // Pre-existing TP context implies TP mode
     {
         if (!tp_ctx_)
         {
@@ -186,6 +325,7 @@ namespace llaminar2
         const Config &config)
         : model_ctx_(std::move(model_ctx)),
           tp_ctx_(std::move(tp_ctx)),
+          mode_(ParallelismMode::TP), // Test factory currently only supports TP mode
           device_runners_(std::move(device_runners)),
           config_(config)
     {
@@ -243,6 +383,20 @@ namespace llaminar2
                         *tp_ctx_, n_heads, n_kv_heads, d_ff, vocab_size));
 
                 weight_mgr->setTensorParallelConfig(tp_config);
+
+                // =====================================================================
+                // SET WEIGHT SHARDING CONFIG FOR TP SLICING MODE DETECTION
+                // =====================================================================
+                // WeightManager needs the sharding config to determine which weights
+                // should be column-parallel vs row-parallel vs replicated.
+                // Without this, determineShardingMode() throws an exception.
+                // Use SchemaFactoryRegistry for model-agnostic architecture lookup.
+                // =====================================================================
+                const std::string arch = model_ctx_->architecture();
+                auto sharding_config = SchemaFactoryRegistry::getWeightShardingConfig(arch);
+                weight_mgr->setWeightShardingConfig(sharding_config);
+                LOG_DEBUG("MultiDeviceOrchestrator: Set WeightShardingConfig for TP slicing mode detection"
+                          << " (architecture=" << arch << ")");
 
                 LOG_INFO("MultiDeviceOrchestrator: Set TensorParallelConfig for LOCAL TP ("
                          << tp_ctx_->degree() << " devices, "
@@ -352,6 +506,7 @@ namespace llaminar2
             runner_config.activation_precision = config_.activation_precision;
             runner_config.kv_cache_scale = config_.kv_cache_scale;
             runner_config.use_mapped_memory = config_.use_mapped_memory;
+            runner_config.use_bar_backed_hidden = config_.use_bar_backed_hidden;
 
             // Set LOCAL TP parameters
             runner_config.local_tp_ctx = tp_ctx_.get();
@@ -398,6 +553,239 @@ namespace llaminar2
                           << max_tokens << ", " << vocab << "]");
             }
         }
+    }
+
+    // =========================================================================
+    // PP Mode Initialization
+    // =========================================================================
+
+    void MultiDeviceOrchestrator::initializePPDeviceRunners()
+    {
+        if (config_.pp_stages.empty())
+        {
+            throw std::runtime_error("Cannot initialize PP device runners: no PP stages configured");
+        }
+
+        LOG_DEBUG("MultiDeviceOrchestrator: Initializing " << config_.pp_stages.size() << " PP stage runners");
+
+        // Get model path for creating stage-specific model contexts
+        const std::string &model_path = model_ctx_->path();
+        const size_t num_stages = config_.pp_stages.size();
+
+        // =========================================================================
+        // Cross-Vendor PP Detection
+        // =========================================================================
+        // Check if any PP transfer is cross-vendor (ROCm→CUDA or CUDA→ROCm).
+        // If so, the source stage's hidden state tensor needs BAR-backed allocation
+        // to enable zero-copy PCIe BAR transfers.
+        // =========================================================================
+        auto isCrossVendorTransfer = [](const PPStageConfig &src, const PPStageConfig &dst) -> bool
+        {
+            if (src.stage_devices.empty() || dst.stage_devices.empty())
+            {
+                return false;
+            }
+            DeviceId src_dev = src.stage_devices[0].toLocalDeviceId();
+            DeviceId dst_dev = dst.stage_devices[0].toLocalDeviceId();
+
+            bool src_cuda = src_dev.is_cuda();
+            bool src_rocm = src_dev.is_rocm();
+            bool dst_cuda = dst_dev.is_cuda();
+            bool dst_rocm = dst_dev.is_rocm();
+
+            return (src_cuda && dst_rocm) || (src_rocm && dst_cuda);
+        };
+
+        // Pre-compute which stages need BAR-backed hidden state
+        std::vector<bool> needs_bar_backed(num_stages, false);
+        for (size_t i = 0; i + 1 < num_stages; ++i)
+        {
+            if (isCrossVendorTransfer(config_.pp_stages[i], config_.pp_stages[i + 1]))
+            {
+                // Source stage outputs to cross-vendor, needs BAR-backed hidden
+                needs_bar_backed[i] = true;
+                LOG_INFO("MultiDeviceOrchestrator: PP stage " << i
+                                                              << " outputs to cross-vendor stage " << (i + 1)
+                                                              << " - will use BAR-backed hidden state");
+            }
+        }
+
+        pp_stage_runners_.reserve(num_stages);
+
+        for (size_t stage_idx = 0; stage_idx < num_stages; ++stage_idx)
+        {
+            const auto &stage_config = config_.pp_stages[stage_idx];
+
+            LOG_DEBUG("MultiDeviceOrchestrator: Creating PP stage " << stage_idx
+                                                                    << " [layers " << stage_config.first_layer
+                                                                    << "-" << stage_config.last_layer << ")"
+                                                                    << " has_embedding=" << stage_config.has_embedding
+                                                                    << " has_lm_head=" << stage_config.has_lm_head
+                                                                    << " needs_bar_backed=" << needs_bar_backed[stage_idx]);
+
+            // Validate stage has at least one device
+            if (stage_config.stage_devices.empty())
+            {
+                throw std::runtime_error("PP stage " + std::to_string(stage_idx) + " has no devices configured");
+            }
+
+            // Get primary device for this stage
+            DeviceId primary_device = stage_config.stage_devices[0].toLocalDeviceId();
+
+            // =====================================================================
+            // Create stage-specific ModelContext with layer-partitioned weights
+            // This only loads weights for this stage's layer range, reducing memory
+            // =====================================================================
+            auto stage_ctx = ModelContext::createForPPStage(
+                model_path,
+                stage_config.first_layer,
+                stage_config.last_layer,
+                stage_config.has_embedding,
+                stage_config.has_lm_head);
+
+            if (!stage_ctx)
+            {
+                throw std::runtime_error("Failed to create ModelContext for PP stage " +
+                                         std::to_string(stage_idx));
+            }
+
+            // =====================================================================
+            // Build InferenceRunnerConfig for this stage
+            // =====================================================================
+            InferenceRunnerConfig runner_config;
+            runner_config.max_seq_len = static_cast<int>(config_.max_seq_len);
+            runner_config.batch_size = config_.batch_size;
+            runner_config.activation_precision = config_.activation_precision;
+            runner_config.kv_cache_scale = config_.kv_cache_scale;
+            runner_config.use_mapped_memory = config_.use_mapped_memory;
+
+            // =====================================================================
+            // Build FactoryPPStageConfig for the createPPStageRunner factory
+            // =====================================================================
+            FactoryPPStageConfig factory_pp_config;
+            factory_pp_config.first_layer = stage_config.first_layer;
+            factory_pp_config.last_layer = stage_config.last_layer;
+            factory_pp_config.has_embedding = stage_config.has_embedding;
+            factory_pp_config.has_lm_head = stage_config.has_lm_head;
+            factory_pp_config.use_bar_backed_hidden = needs_bar_backed[stage_idx] || stage_config.requires_bar_backed_hidden;
+
+            // =====================================================================
+            // Handle single-device vs TP-domain stages
+            // =====================================================================
+            if (stage_config.isTPDomain())
+            {
+                // =====================================================================
+                // TP Domain Stage: Create nested MultiDeviceOrchestrator in TP mode
+                // =====================================================================
+                LOG_INFO("MultiDeviceOrchestrator: PP stage " << stage_idx
+                                                              << " is a TP domain with " << stage_config.stage_devices.size() << " devices");
+
+                // Build TP configuration for the nested orchestrator
+                Config nested_config;
+                nested_config.mode = ParallelismMode::TP;
+                nested_config.devices = stage_config.stage_devices;
+                nested_config.weights = stage_config.tp_weights;
+                nested_config.backend = stage_config.tp_backend;
+                nested_config.max_seq_len = config_.max_seq_len;
+                nested_config.batch_size = config_.batch_size;
+                nested_config.activation_precision = config_.activation_precision;
+                nested_config.kv_cache_scale = config_.kv_cache_scale;
+                nested_config.use_mapped_memory = config_.use_mapped_memory;
+                nested_config.use_bar_backed_hidden = needs_bar_backed[stage_idx] || stage_config.requires_bar_backed_hidden;
+
+                // Create the nested MultiDeviceOrchestrator
+                // Note: stage_ctx contains weights only for this stage's layers
+                auto nested_mdo = std::make_unique<MultiDeviceOrchestrator>(stage_ctx, nested_config);
+
+                if (!nested_mdo)
+                {
+                    throw std::runtime_error("Failed to create nested MultiDeviceOrchestrator for PP stage " +
+                                             std::to_string(stage_idx));
+                }
+
+                pp_stage_runners_.push_back(std::move(nested_mdo));
+
+                LOG_INFO("MultiDeviceOrchestrator: Created TP domain PP stage " << stage_idx
+                                                                                << " with " << stage_config.stage_devices.size() << " devices"
+                                                                                << " (layers " << stage_config.first_layer << "-" << stage_config.last_layer << ")");
+            }
+            else
+            {
+                // =====================================================================
+                // Single Device Stage: Use existing factory path
+                // =====================================================================
+                auto runner = createPPStageRunner(stage_ctx, primary_device, factory_pp_config, runner_config);
+
+                if (!runner)
+                {
+                    throw std::runtime_error("Failed to create PP stage runner for stage " +
+                                             std::to_string(stage_idx) + " on device " +
+                                             primary_device.to_string());
+                }
+
+                pp_stage_runners_.push_back(std::move(runner));
+
+                LOG_INFO("MultiDeviceOrchestrator: Created PP stage " << stage_idx
+                                                                      << " runner on device " << primary_device.to_string()
+                                                                      << " (layers " << stage_config.first_layer << "-" << stage_config.last_layer << ")");
+            }
+        }
+
+        LOG_INFO("MultiDeviceOrchestrator: Successfully initialized " << pp_stage_runners_.size() << " PP stage runners");
+
+        // Note: PP context initialization is done by the caller (constructor)
+        // after this method returns, to avoid double-initialization
+    }
+
+    void MultiDeviceOrchestrator::initializePPContext()
+    {
+        if (pp_stage_runners_.empty())
+        {
+            // PP stage runners not initialized - this is expected for Phase 1
+            LOG_DEBUG("MultiDeviceOrchestrator::initializePPContext: No PP stage runners yet");
+            return;
+        }
+
+        // Build LocalPPConfig for simple single-device stages
+        // TODO: Phase 5 - use HierarchicalPPConfig for TP domain stages
+        LocalPPConfig pp_config;
+        pp_config.stage_devices.reserve(config_.pp_stages.size());
+        pp_config.layer_boundaries.reserve(config_.pp_stages.size() + 1);
+
+        // Add first boundary (start of first stage)
+        pp_config.layer_boundaries.push_back(config_.pp_stages[0].first_layer);
+
+        for (size_t i = 0; i < config_.pp_stages.size(); ++i)
+        {
+            const auto &stage_config = config_.pp_stages[i];
+            // Use first device in stage_devices for single-device stages
+            if (stage_config.stage_devices.empty())
+            {
+                throw std::runtime_error("PP stage " + std::to_string(i) + " has no devices");
+            }
+            pp_config.stage_devices.push_back(stage_config.stage_devices[0]);
+            // Each boundary is the exclusive end = last_layer
+            pp_config.layer_boundaries.push_back(stage_config.last_layer);
+        }
+
+        // Validate config
+        if (!pp_config.isValid())
+        {
+            throw std::runtime_error("Generated LocalPPConfig is invalid");
+        }
+
+        LOG_DEBUG("MultiDeviceOrchestrator::initializePPContext: Creating LocalPPContext with "
+                  << pp_config.numStages() << " stages");
+
+        // Create the LocalPPContext using the factory function
+        pp_ctx_ = createLocalPPContext(pp_config);
+
+        if (!pp_ctx_)
+        {
+            throw std::runtime_error("Failed to create LocalPPContext");
+        }
+
+        LOG_INFO("MultiDeviceOrchestrator: Initialized LocalPPContext with " << pp_config.numStages() << " stages");
     }
 
     bool MultiDeviceOrchestrator::gatherLogits(size_t seq_len)
@@ -619,14 +1007,36 @@ namespace llaminar2
 
     bool MultiDeviceOrchestrator::forward(const int *tokens, int seq_len)
     {
+        // Dispatch to appropriate implementation based on parallelism mode
+        switch (mode_)
+        {
+        case ParallelismMode::TP:
+            return forwardTP(tokens, seq_len);
+        case ParallelismMode::PP:
+        case ParallelismMode::TP_PP:
+            // PP and TP_PP both use sequential stage execution
+            // The difference is that TP_PP stages may be nested MDOs (TP domains)
+            // but forwardPP() works through IInferenceRunner interface regardless
+            return forwardPP(tokens, seq_len);
+        default:
+            LOG_ERROR("MultiDeviceOrchestrator::forward: Unknown parallelism mode");
+            return false;
+        }
+    }
+
+    // =========================================================================
+    // TP Mode Forward Implementation (existing parallel execution)
+    // =========================================================================
+    bool MultiDeviceOrchestrator::forwardTP(const int *tokens, int seq_len)
+    {
         if (device_runners_.empty())
         {
-            LOG_ERROR("MultiDeviceOrchestrator::forward: No device runners available");
+            LOG_ERROR("MultiDeviceOrchestrator::forwardTP: No device runners available");
             return false;
         }
 
-        LOG_DEBUG("MultiDeviceOrchestrator::forward: seq_len=" << seq_len
-                                                               << ", devices=" << device_runners_.size());
+        LOG_DEBUG("MultiDeviceOrchestrator::forwardTP: seq_len=" << seq_len
+                                                                 << ", devices=" << device_runners_.size());
 
         // Launch parallel forward passes on all devices
         std::vector<std::future<bool>> futures;
@@ -665,7 +1075,7 @@ namespace llaminar2
                 bool success = futures[i].get();
                 if (!success)
                 {
-                    LOG_ERROR("MultiDeviceOrchestrator::forward: Device " << i << " forward failed");
+                    LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device " << i << " forward failed");
                     all_success = false;
                 }
             }
@@ -684,8 +1094,8 @@ namespace llaminar2
                     // This is the first exception - store it
                     first_exception = std::current_exception();
                     first_exception_device = i;
-                    LOG_ERROR("MultiDeviceOrchestrator::forward: Device " << i
-                                                                          << " threw PRIMARY exception: " << error_msg);
+                    LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device " << i
+                                                                            << " threw PRIMARY exception: " << error_msg);
                 }
                 else if (!is_context_destroyed)
                 {
@@ -706,22 +1116,22 @@ namespace llaminar2
                         if (first_is_context_destroyed)
                         {
                             // Replace context error with the real error
-                            LOG_WARN("MultiDeviceOrchestrator::forward: Replacing secondary context error "
+                            LOG_WARN("MultiDeviceOrchestrator::forwardTP: Replacing secondary context error "
                                      "with primary error from device "
                                      << i);
                             first_exception = std::current_exception();
                             first_exception_device = i;
                         }
                     }
-                    LOG_ERROR("MultiDeviceOrchestrator::forward: Device " << i
-                                                                          << " threw exception: " << error_msg);
+                    LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device " << i
+                                                                            << " threw exception: " << error_msg);
                 }
                 else
                 {
                     // Secondary context error - log but don't replace the primary exception
-                    LOG_WARN("MultiDeviceOrchestrator::forward: Device " << i
-                                                                         << " threw SECONDARY exception (likely due to primary failure): "
-                                                                         << error_msg);
+                    LOG_WARN("MultiDeviceOrchestrator::forwardTP: Device " << i
+                                                                           << " threw SECONDARY exception (likely due to primary failure): "
+                                                                           << error_msg);
                 }
             }
         }
@@ -729,7 +1139,7 @@ namespace llaminar2
         // If we captured an exception, re-throw it with full context
         if (first_exception)
         {
-            LOG_ERROR("MultiDeviceOrchestrator::forward: Re-throwing primary exception from device "
+            LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Re-throwing primary exception from device "
                       << first_exception_device);
             std::rethrow_exception(first_exception);
         }
@@ -741,7 +1151,7 @@ namespace llaminar2
             // (logits_local buffer is pre-allocated for max_seq_len)
             if (!gatherLogits(static_cast<size_t>(seq_len)))
             {
-                LOG_ERROR("MultiDeviceOrchestrator::forward: Failed to gather logits");
+                LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Failed to gather logits");
                 all_success = false;
             }
 
@@ -754,9 +1164,187 @@ namespace llaminar2
         return all_success;
     }
 
+    // =========================================================================
+    // PP Mode Forward Implementation (sequential pipeline execution)
+    // =========================================================================
+    bool MultiDeviceOrchestrator::forwardPP(const int *tokens, int seq_len)
+    {
+        if (pp_stage_runners_.empty())
+        {
+            LOG_ERROR("MultiDeviceOrchestrator::forwardPP: No PP stage runners available");
+            return false;
+        }
+
+        if (!pp_ctx_)
+        {
+            LOG_ERROR("MultiDeviceOrchestrator::forwardPP: No LocalPPContext available for transfers");
+            return false;
+        }
+
+        const size_t num_stages = pp_stage_runners_.size();
+
+        LOG_DEBUG("MultiDeviceOrchestrator::forwardPP: seq_len=" << seq_len
+                                                                 << " num_stages=" << num_stages);
+
+        // =====================================================================
+        // Stage 0: Embedding + first layers (receives tokens as input)
+        // =====================================================================
+        auto &stage0_runner = pp_stage_runners_[0];
+        if (!stage0_runner)
+        {
+            LOG_ERROR("MultiDeviceOrchestrator::forwardPP: Stage 0 runner is null");
+            return false;
+        }
+
+        LOG_DEBUG("MultiDeviceOrchestrator::forwardPP: Executing stage 0 (embedding)");
+        if (!stage0_runner->forward(tokens, seq_len))
+        {
+            LOG_ERROR("MultiDeviceOrchestrator::forwardPP: Stage 0 forward failed");
+            return false;
+        }
+
+        // =====================================================================
+        // Intermediate stages: Transfer activations and continue execution
+        // =====================================================================
+        for (size_t stage_idx = 1; stage_idx < num_stages; ++stage_idx)
+        {
+            auto &prev_runner = pp_stage_runners_[stage_idx - 1];
+            auto &curr_runner = pp_stage_runners_[stage_idx];
+
+            if (!curr_runner)
+            {
+                LOG_ERROR("MultiDeviceOrchestrator::forwardPP: Stage " << stage_idx << " runner is null");
+                return false;
+            }
+
+            // Get hidden state from previous stage
+            // DeviceGraphOrchestrator stores hidden state in InferenceState
+            TensorBase *hidden_state = prev_runner->getHiddenState();
+            if (!hidden_state)
+            {
+                LOG_ERROR("MultiDeviceOrchestrator::forwardPP: Stage " << (stage_idx - 1)
+                                                                       << " has no hidden state to transfer");
+                return false;
+            }
+
+            // Transfer activations from previous stage to current stage
+            LOG_DEBUG("MultiDeviceOrchestrator::forwardPP: Transferring hidden state from stage "
+                      << (stage_idx - 1) << " to stage " << stage_idx);
+
+            if (!pp_ctx_->transfer(hidden_state, static_cast<int>(stage_idx - 1),
+                                   static_cast<int>(stage_idx)))
+            {
+                LOG_ERROR("MultiDeviceOrchestrator::forwardPP: Transfer from stage "
+                          << (stage_idx - 1) << " to stage " << stage_idx << " failed");
+                return false;
+            }
+
+            // Set the hidden state as input for current stage
+            // This makes the stage runner skip embedding and use the transferred hidden state
+            curr_runner->setHiddenState(hidden_state);
+
+            LOG_DEBUG("MultiDeviceOrchestrator::forwardPP: Executing stage " << stage_idx);
+
+            // Call forward with nullptr tokens - the stage will use setHiddenState input
+            // and skip embedding since has_embedding=false for non-first stages
+            if (!curr_runner->forward(nullptr, seq_len))
+            {
+                LOG_ERROR("MultiDeviceOrchestrator::forwardPP: Stage " << stage_idx << " forward failed");
+                return false;
+            }
+
+            // Clear hidden state input for clean state on next forward
+            curr_runner->clearHiddenStateInput();
+        }
+
+        // =====================================================================
+        // Copy logits from last stage to combined buffer
+        // =====================================================================
+        copyLogitsFromStage(static_cast<int>(num_stages - 1));
+
+        // =====================================================================
+        // Update position tracking for PP mode
+        // Each PP stage runner updates its own position internally, but we also
+        // need to update current_position_ for consistency with TP mode and
+        // get_position() queries.
+        // =====================================================================
+        current_position_ += seq_len;
+
+        LOG_DEBUG("MultiDeviceOrchestrator::forwardPP: Complete, all " << num_stages << " stages executed"
+                                                                       << ", position now " << current_position_);
+        return true;
+    }
+
+    void MultiDeviceOrchestrator::copyLogitsFromStage(int stage_idx)
+    {
+        if (stage_idx < 0 || static_cast<size_t>(stage_idx) >= pp_stage_runners_.size())
+        {
+            LOG_ERROR("MultiDeviceOrchestrator::copyLogitsFromStage: Invalid stage index " << stage_idx);
+            return;
+        }
+
+        const auto &stage_runner = pp_stage_runners_[stage_idx];
+        if (!stage_runner)
+        {
+            LOG_ERROR("MultiDeviceOrchestrator::copyLogitsFromStage: Stage " << stage_idx << " runner is null");
+            return;
+        }
+
+        const float *stage_logits = stage_runner->logits();
+        if (!stage_logits)
+        {
+            LOG_DEBUG("MultiDeviceOrchestrator::copyLogitsFromStage: Stage " << stage_idx
+                                                                             << " has no logits (may not have LM head)");
+            return;
+        }
+
+        // Get logits shape from stage runner
+        int vocab = stage_runner->vocab_size();
+        if (vocab <= 0)
+        {
+            LOG_ERROR("MultiDeviceOrchestrator::copyLogitsFromStage: Invalid vocab_size from stage " << stage_idx);
+            return;
+        }
+
+        // Ensure combined_logits_ is allocated
+        if (!combined_logits_)
+        {
+            // Allocate based on config and vocab
+            size_t max_tokens = static_cast<size_t>(config_.batch_size) * static_cast<size_t>(config_.max_seq_len);
+            combined_logits_ = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{max_tokens, static_cast<size_t>(vocab)});
+            LOG_DEBUG("MultiDeviceOrchestrator::copyLogitsFromStage: Allocated combined logits buffer ["
+                      << max_tokens << ", " << vocab << "]");
+        }
+
+        // Copy logits from stage runner
+        // For decode mode (seq_len=1), copy vocab elements
+        // For prefill mode, copy seq_len * vocab elements
+        size_t copy_elements = last_gathered_logits_size_ > 0 ? last_gathered_logits_size_ : static_cast<size_t>(vocab);
+        std::memcpy(combined_logits_->mutable_data(), stage_logits, copy_elements * sizeof(float));
+
+        LOG_DEBUG("MultiDeviceOrchestrator::copyLogitsFromStage: Copied " << copy_elements
+                                                                          << " elements from stage " << stage_idx);
+    }
+
     const float *MultiDeviceOrchestrator::logits() const
     {
-        // Return combined logits if available
+        // For PP mode: return combined logits (copied from final stage)
+        if (mode_ == ParallelismMode::PP || mode_ == ParallelismMode::TP_PP)
+        {
+            if (combined_logits_)
+            {
+                return combined_logits_->data();
+            }
+            // Fallback: try to get from final PP stage
+            if (!pp_stage_runners_.empty() && pp_stage_runners_.back())
+            {
+                return pp_stage_runners_.back()->logits();
+            }
+            return nullptr;
+        }
+
+        // For TP mode: return combined logits if available (multi-device)
         if (combined_logits_ && device_runners_.size() > 1)
         {
             return combined_logits_->data();
@@ -912,9 +1500,20 @@ namespace llaminar2
     void MultiDeviceOrchestrator::clear_cache()
     {
         LOG_DEBUG("MultiDeviceOrchestrator::clear_cache: Clearing cache on all "
-                  << device_runners_.size() << " devices");
+                  << device_runners_.size() << " TP devices and "
+                  << pp_stage_runners_.size() << " PP stages");
 
+        // Clear TP device runners
         for (auto &runner : device_runners_)
+        {
+            if (runner)
+            {
+                runner->clear_cache();
+            }
+        }
+
+        // Clear PP stage runners (each has its own KV cache)
+        for (auto &runner : pp_stage_runners_)
         {
             if (runner)
             {
@@ -928,11 +1527,19 @@ namespace llaminar2
 
     int MultiDeviceOrchestrator::get_position() const
     {
-        // Return position from primary device
+        // PP mode: return position from first PP stage runner
+        // All PP stage runners should have synchronized positions
+        if (!pp_stage_runners_.empty() && pp_stage_runners_[0])
+        {
+            return pp_stage_runners_[0]->get_position();
+        }
+
+        // TP mode: return position from primary device
         if (!device_runners_.empty() && device_runners_[0])
         {
             return device_runners_[0]->get_position();
         }
+
         return current_position_;
     }
 
@@ -957,6 +1564,109 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // Hidden State API (for Pipeline Parallelism nesting)
+    // =========================================================================
+
+    TensorBase *MultiDeviceOrchestrator::getHiddenState()
+    {
+        if (mode_ == ParallelismMode::TP)
+        {
+            // In TP mode, all devices have same hidden state after allreduce
+            // Delegate to primary device runner
+            if (!device_runners_.empty() && device_runners_[0])
+            {
+                return device_runners_[0]->getHiddenState();
+            }
+        }
+        else
+        {
+            // PP or TP_PP mode - last stage has the final hidden state
+            if (!pp_stage_runners_.empty() && pp_stage_runners_.back())
+            {
+                return pp_stage_runners_.back()->getHiddenState();
+            }
+        }
+        return nullptr;
+    }
+
+    const TensorBase *MultiDeviceOrchestrator::getHiddenState() const
+    {
+        if (mode_ == ParallelismMode::TP)
+        {
+            // In TP mode, all devices have same hidden state after allreduce
+            // Delegate to primary device runner
+            if (!device_runners_.empty() && device_runners_[0])
+            {
+                return device_runners_[0]->getHiddenState();
+            }
+        }
+        else
+        {
+            // PP or TP_PP mode - last stage has the final hidden state
+            if (!pp_stage_runners_.empty() && pp_stage_runners_.back())
+            {
+                return pp_stage_runners_.back()->getHiddenState();
+            }
+        }
+        return nullptr;
+    }
+
+    void MultiDeviceOrchestrator::setHiddenState(TensorBase *hidden_state)
+    {
+        hidden_state_input_ = hidden_state;
+
+        if (mode_ == ParallelismMode::TP)
+        {
+            // In TP mode, set on ALL device runners (they all need the same input)
+            for (auto &runner : device_runners_)
+            {
+                if (runner)
+                {
+                    runner->setHiddenState(hidden_state);
+                }
+            }
+        }
+        else
+        {
+            // PP or TP_PP mode - set on first stage runner (stage 0 receives external input)
+            if (!pp_stage_runners_.empty() && pp_stage_runners_.front())
+            {
+                pp_stage_runners_.front()->setHiddenState(hidden_state);
+            }
+        }
+    }
+
+    bool MultiDeviceOrchestrator::hasHiddenStateInput() const
+    {
+        return hidden_state_input_ != nullptr;
+    }
+
+    void MultiDeviceOrchestrator::clearHiddenStateInput()
+    {
+        hidden_state_input_ = nullptr;
+
+        if (mode_ == ParallelismMode::TP)
+        {
+            // In TP mode, clear on all device runners
+            for (auto &runner : device_runners_)
+            {
+                if (runner)
+                {
+                    runner->clearHiddenStateInput();
+                }
+            }
+        }
+        else
+        {
+            // PP or TP_PP mode - clear on first stage runner
+            if (!pp_stage_runners_.empty() && pp_stage_runners_.front())
+            {
+                pp_stage_runners_.front()->clearHiddenStateInput();
+            }
+        }
+    }
+
+    // =========================================================================
     // Snapshot API
     // =========================================================================
 
@@ -964,7 +1674,17 @@ namespace llaminar2
     {
         LOG_DEBUG("MultiDeviceOrchestrator::enableSnapshotCapture: Enabling on all devices");
 
+        // Enable on TP device runners
         for (auto &runner : device_runners_)
+        {
+            if (runner)
+            {
+                runner->enableSnapshotCapture(output_dir);
+            }
+        }
+
+        // Enable on PP stage runners
+        for (auto &runner : pp_stage_runners_)
         {
             if (runner)
             {
@@ -977,7 +1697,17 @@ namespace llaminar2
     {
         LOG_DEBUG("MultiDeviceOrchestrator::disableSnapshotCapture: Disabling on all devices");
 
+        // Disable on TP device runners
         for (auto &runner : device_runners_)
+        {
+            if (runner)
+            {
+                runner->disableSnapshotCapture();
+            }
+        }
+
+        // Disable on PP stage runners
+        for (auto &runner : pp_stage_runners_)
         {
             if (runner)
             {
@@ -990,7 +1720,17 @@ namespace llaminar2
     {
         LOG_DEBUG("MultiDeviceOrchestrator::clearSnapshots: Clearing on all devices");
 
+        // Clear on TP device runners
         for (auto &runner : device_runners_)
+        {
+            if (runner)
+            {
+                runner->clearSnapshots();
+            }
+        }
+
+        // Clear on PP stage runners
+        for (auto &runner : pp_stage_runners_)
         {
             if (runner)
             {
@@ -1035,7 +1775,25 @@ namespace llaminar2
             }
         }
 
-        // Default: get from primary device
+        // PP mode: search across all PP stage runners
+        if (!pp_stage_runners_.empty())
+        {
+            for (const auto &runner : pp_stage_runners_)
+            {
+                if (runner)
+                {
+                    const float *result = runner->getSnapshot(key, out_size);
+                    if (result != nullptr)
+                    {
+                        return result;
+                    }
+                }
+            }
+            out_size = 0;
+            return nullptr;
+        }
+
+        // Default (TP mode): get from primary device
         if (!device_runners_.empty() && device_runners_[0])
         {
             return device_runners_[0]->getSnapshot(key, out_size);
@@ -1049,7 +1807,18 @@ namespace llaminar2
         // Merge keys from all devices (use set to deduplicate)
         std::set<std::string> all_keys;
 
+        // Collect from TP device runners
         for (const auto &runner : device_runners_)
+        {
+            if (runner)
+            {
+                auto keys = runner->getSnapshotKeys();
+                all_keys.insert(keys.begin(), keys.end());
+            }
+        }
+
+        // Collect from PP stage runners
+        for (const auto &runner : pp_stage_runners_)
         {
             if (runner)
             {

@@ -22,7 +22,7 @@
 #include "Tokenizer.h"
 #include "Sampler.h"
 #include "../execution/local_execution/orchestrators/IInferenceRunner.h"
-#include "ArgParser.h"
+#include "../config/OrchestrationConfig.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -93,10 +93,10 @@ namespace llaminar2
          * Executes prefill and decode phases, measuring timing for each.
          * Uses greedy sampling (temperature=0) for deterministic results.
          *
-         * @param args Parsed arguments (prompt, n_predict, etc.)
+         * @param config Parsed orchestration config (prompt, n_predict, etc.)
          * @return Benchmark results with timing metrics
          */
-        BenchmarkResult run(const ArgContext &args);
+        BenchmarkResult run(const OrchestrationConfig &config);
 
         /**
          * @brief Print benchmark results in a formatted table

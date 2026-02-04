@@ -1,0 +1,169 @@
+/**
+ * @file TPAllreduceStage.h
+ * @brief All-reduce stage for tensor parallelism (LOCAL and GLOBAL)
+ *
+ * Performs all-reduce across devices within a TP context, supporting both:
+ * - LOCAL TP: Intra-rank device all-reduce (NCCL/RCCL/PCIeBAR)
+ * - GLOBAL TP: Cross-rank MPI all-reduce (UPI/MPI backends)
+ *
+ * This stage uses ITPContext to abstract over both LOCAL and GLOBAL contexts,
+ * enabling unified stage creation regardless of TP scope.
+ *
+ * This stage is used after row-parallel GEMM operations (e.g., Wo projection,
+ * FFN down projection) to sum partial results across TP devices.
+ *
+ * @author David Sanftenberg
+ * @date February 2026
+ */
+
+#pragma once
+
+#include "../IComputeStage.h"
+#include "../StageParamsBase.h"
+#include "../../../collective/ITPContext.h"
+#include <string>
+
+namespace llaminar2
+{
+
+    /**
+     * @brief Parameters for TPAllreduceStage
+     */
+    struct TPAllreduceParams
+    {
+        STAGE_PARAMS_COMMON_FIELDS;
+
+        ITPContext *tp_ctx = nullptr;     ///< TP context (LOCAL or GLOBAL, required)
+        TensorBase *tensor = nullptr;     ///< Tensor to all-reduce (in-place)
+        size_t count = 0;                 ///< Elements to reduce (0 = use tensor->numel())
+        std::string stage_name;           ///< Stage identifier for BAR-backed tensor lookup (optional)
+    };
+
+    /**
+     * @brief All-reduce stage for tensor parallelism
+     *
+     * Performs in-place sum reduction across all devices in the TP context.
+     * The actual backend (NCCL/RCCL/PCIeBAR for LOCAL, UPI/MPI for GLOBAL)
+     * is determined by the tp_ctx implementation.
+     *
+     * Thread safety: Execute must be called from appropriate device context.
+     */
+    class TPAllreduceStage : public IComputeStage
+    {
+    public:
+        using Params = TPAllreduceParams;
+        static_assert(StageParamsRequired<Params>, "Params must have device_id and mpi_ctx");
+
+        /**
+         * @brief Construct with parameters
+         * @param params Stage parameters
+         */
+        explicit TPAllreduceStage(Params params);
+
+        ~TPAllreduceStage() override = default;
+
+        // =====================================================================
+        // IComputeStage Interface
+        // =====================================================================
+
+        /**
+         * @brief Execute the all-reduce operation
+         *
+         * Reduces tensor values across all TP devices using sum reduction.
+         * The operation is in-place: input tensor is modified with result.
+         *
+         * @param ctx Device context for execution
+         * @return true on success, false on error
+         */
+        bool execute(IDeviceContext *ctx) override;
+
+        /**
+         * @brief Get stage type
+         * @return ComputeStageType::ALLREDUCE
+         */
+        ComputeStageType type() const override { return ComputeStageType::ALLREDUCE; }
+
+        /**
+         * @brief Get stage name
+         * @return "TPAllreduce"
+         */
+        std::string name() const override { return "TPAllreduce"; }
+
+        /**
+         * @brief Check if stage requires all-reduce
+         * @return true
+         */
+        bool requiresAllreduce() const override { return true; }
+
+        /**
+         * @brief Check if stage supports a backend type
+         * @param backend Backend to check
+         * @return true for all backends (TP context handles routing internally)
+         */
+        bool supportsBackend(ComputeBackendType backend) const override;
+
+        /**
+         * @brief Get buffer requirements for this stage
+         * @return Buffer requirements (single in-place buffer)
+         */
+        StageBufferRequirements getBufferRequirements() const override;
+
+        /**
+         * @brief Get dump info for debugging
+         * @return StageDumpInfo with tensor info
+         */
+        StageDumpInfo buildDumpInfoImpl() const override;
+
+        /**
+         * @brief Get coherence policy
+         *
+         * TP stages handle their own synchronization across devices,
+         * so we return NONE to avoid interfering with device-specific sync.
+         *
+         * @return CoherencePolicy::NONE
+         */
+        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
+
+        // =====================================================================
+        // Accessors
+        // =====================================================================
+
+        /**
+         * @brief Get the TP context (LOCAL or GLOBAL)
+         * @return Pointer to ITPContext
+         */
+        ITPContext *getTPContext() const { return params_.tp_ctx; }
+
+        /**
+         * @brief Get the tensor being reduced
+         * @return Pointer to TensorBase
+         */
+        TensorBase *getTensor() const { return params_.tensor; }
+
+        /**
+         * @brief Update parameters (for stage reuse)
+         * @param params New parameters
+         */
+        void setParams(const Params &params);
+
+    private:
+        Params params_;
+    };
+
+    // =========================================================================
+    // Backward Compatibility Aliases (Deprecated)
+    // =========================================================================
+
+    /**
+     * @brief Backward compatibility alias for LocalTPAllreduceStage
+     * @deprecated Use TPAllreduceStage instead
+     */
+    using LocalTPAllreduceStage [[deprecated("Use TPAllreduceStage instead")]] = TPAllreduceStage;
+
+    /**
+     * @brief Backward compatibility alias for LocalTPAllreduceParams
+     * @deprecated Use TPAllreduceParams instead
+     */
+    using LocalTPAllreduceParams [[deprecated("Use TPAllreduceParams instead")]] = TPAllreduceParams;
+
+} // namespace llaminar2

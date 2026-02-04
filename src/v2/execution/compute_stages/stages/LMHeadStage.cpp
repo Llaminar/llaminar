@@ -122,7 +122,7 @@ namespace llaminar2
         }
     }
 
-    StageDumpInfo LMHeadStage::buildDumpInfoImpl() const
+    StageDumpInfo LMHeadStage::getDumpInfo() const
     {
         StageDumpInfo info;
 
@@ -195,7 +195,7 @@ namespace llaminar2
     {
         // Get the GEMM kernel and return it as workspace consumer
         // The kernel needs workspace for its ACC_INT32 accumulator buffer
-        // (vocab_size × M × sizeof(int32_t) can be large, but DeviceGraphOrchestrator
+        // (vocab_size × M × sizeof(int32_t) can be large, but GraphOrchestrator
         // now dynamically sizes the budget based on max_seq_len × vocab_size)
         auto *lm_head_weight = requireTensorBase(params_.lm_head_weight, "lm_head_weight");
         if (!lm_head_weight)

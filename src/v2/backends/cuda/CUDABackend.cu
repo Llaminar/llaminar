@@ -9,9 +9,13 @@
  */
 
 #include "CUDABackend.h"
+#include "../GPUDeviceContextPool.h"
+#include "NvidiaDeviceContext.h"
 #include "../../utils/Logger.h"
 #include <cuda_runtime.h>
 #include <cuda.h> // For cuCtxSetCurrent, cuDevicePrimaryCtxRetain
+#include <future>
+#include <memory>
 #include <stdexcept>
 #include <sstream>
 
@@ -569,6 +573,199 @@ namespace llaminar2
         // IQ4_NL GEMM via backend is deprecated - use kernel interface directly
         LOG_ERROR("CUDABackend::gemmIQ4NL is deprecated and no longer implemented");
         return false;
+    }
+
+    // ====================================================================
+    // Async Operations (Route through NvidiaDeviceContext worker thread)
+    // ====================================================================
+
+    std::future<bool> CUDABackend::deviceToHostAsync(void *dst, const void *src, size_t bytes, int device_id)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            std::promise<bool> p;
+            p.set_value(false);
+            return p.get_future();
+        }
+
+        try
+        {
+            NvidiaDeviceContext &ctx = static_cast<NvidiaDeviceContext &>(
+                GPUDeviceContextPool::instance().getNvidiaContext(device_id));
+            auto promise = std::make_shared<std::promise<bool>>();
+            auto future = promise->get_future();
+            ctx.submitAsync([this, dst, src, bytes, device_id, promise]()
+                            {
+                cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
+                promise->set_value(err == cudaSuccess); });
+            return future;
+        }
+        catch (...)
+        {
+            // Fallback: execute synchronously
+            std::promise<bool> p;
+            p.set_value(deviceToHost(dst, src, bytes, device_id));
+            return p.get_future();
+        }
+    }
+
+    std::future<bool> CUDABackend::hostToDeviceAsync(void *dst, const void *src, size_t bytes, int device_id)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            std::promise<bool> p;
+            p.set_value(false);
+            return p.get_future();
+        }
+
+        try
+        {
+            NvidiaDeviceContext &ctx = static_cast<NvidiaDeviceContext &>(
+                GPUDeviceContextPool::instance().getNvidiaContext(device_id));
+            auto promise = std::make_shared<std::promise<bool>>();
+            auto future = promise->get_future();
+            ctx.submitAsync([this, dst, src, bytes, device_id, promise]()
+                            {
+                cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+                promise->set_value(err == cudaSuccess); });
+            return future;
+        }
+        catch (...)
+        {
+            // Fallback: execute synchronously
+            std::promise<bool> p;
+            p.set_value(hostToDevice(dst, src, bytes, device_id));
+            return p.get_future();
+        }
+    }
+
+    std::future<bool> CUDABackend::synchronizeAsync(int device_id)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            std::promise<bool> p;
+            p.set_value(false);
+            return p.get_future();
+        }
+
+        try
+        {
+            NvidiaDeviceContext &ctx = static_cast<NvidiaDeviceContext &>(
+                GPUDeviceContextPool::instance().getNvidiaContext(device_id));
+            auto promise = std::make_shared<std::promise<bool>>();
+            auto future = promise->get_future();
+            ctx.submitAsync([promise]()
+                            {
+                cudaError_t err = cudaDeviceSynchronize();
+                promise->set_value(err == cudaSuccess); });
+            return future;
+        }
+        catch (...)
+        {
+            // Fallback: execute synchronously
+            std::promise<bool> p;
+            p.set_value(synchronize(device_id));
+            return p.get_future();
+        }
+    }
+
+    std::future<void *> CUDABackend::allocateAsync(size_t bytes, int device_id)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            std::promise<void *> p;
+            p.set_value(nullptr);
+            return p.get_future();
+        }
+
+        try
+        {
+            NvidiaDeviceContext &ctx = static_cast<NvidiaDeviceContext &>(
+                GPUDeviceContextPool::instance().getNvidiaContext(device_id));
+            auto promise = std::make_shared<std::promise<void *>>();
+            auto future = promise->get_future();
+            ctx.submitAsync([bytes, promise]()
+                            {
+                void *ptr = nullptr;
+                cudaError_t err = cudaMalloc(&ptr, bytes);
+                promise->set_value(err == cudaSuccess ? ptr : nullptr); });
+            return future;
+        }
+        catch (...)
+        {
+            // Fallback: execute synchronously
+            std::promise<void *> p;
+            p.set_value(allocate(bytes, device_id));
+            return p.get_future();
+        }
+    }
+
+    std::future<void> CUDABackend::freeAsync(void *ptr, int device_id)
+    {
+        if (ptr == nullptr || device_id >= device_count_ || device_id < 0)
+        {
+            std::promise<void> p;
+            p.set_value();
+            return p.get_future();
+        }
+
+        try
+        {
+            NvidiaDeviceContext &ctx = static_cast<NvidiaDeviceContext &>(
+                GPUDeviceContextPool::instance().getNvidiaContext(device_id));
+            auto promise = std::make_shared<std::promise<void>>();
+            auto future = promise->get_future();
+            ctx.submitAsync([ptr, promise]()
+                            {
+                cudaFree(ptr);
+                promise->set_value(); });
+            return future;
+        }
+        catch (...)
+        {
+            // Fallback: execute synchronously
+            free(ptr, device_id);
+            std::promise<void> p;
+            p.set_value();
+            return p.get_future();
+        }
+    }
+
+    std::future<bool> CUDABackend::memsetAsync(void *ptr, int value, size_t bytes, int device_id)
+    {
+        if (ptr == nullptr || bytes == 0)
+        {
+            std::promise<bool> p;
+            p.set_value(true);
+            return p.get_future();
+        }
+
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            std::promise<bool> p;
+            p.set_value(false);
+            return p.get_future();
+        }
+
+        try
+        {
+            NvidiaDeviceContext &ctx = static_cast<NvidiaDeviceContext &>(
+                GPUDeviceContextPool::instance().getNvidiaContext(device_id));
+            auto promise = std::make_shared<std::promise<bool>>();
+            auto future = promise->get_future();
+            ctx.submitAsync([ptr, value, bytes, promise]()
+                            {
+                cudaError_t err = cudaMemset(ptr, value, bytes);
+                promise->set_value(err == cudaSuccess); });
+            return future;
+        }
+        catch (...)
+        {
+            // Fallback: execute synchronously
+            std::promise<bool> p;
+            p.set_value(memset(ptr, value, bytes, device_id));
+            return p.get_future();
+        }
     }
 
 } // namespace llaminar2

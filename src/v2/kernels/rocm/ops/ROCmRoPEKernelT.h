@@ -18,11 +18,13 @@
 
 #pragma once
 
+#include "../../../backends/IWorkerGPUContext.h"
 #include "../../../execution/config/RuntimeConfig.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include <cstdint>
+#include <stdexcept>
 
 // Forward declaration
 namespace llaminar2
@@ -64,7 +66,31 @@ namespace llaminar2
             explicit ROCmRoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
                 : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
                   inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
+
+            /**
+             * @brief Construct with device context (Phase 4 pattern)
+             * @param ctx Device context for shared handles/streams
+             * @param rope_theta RoPE theta parameter
+             */
+            explicit ROCmRoPEKernelT(IWorkerGPUContext *ctx, float rope_theta = 10000.0f)
+                : rope_theta_(rope_theta), workspace_(nullptr),
+                  inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f)
+            {
+                if (!ctx)
+                    throw std::runtime_error("ROCmRoPEKernelT<FP32>: Device context is null");
+                if (!ctx->isInitialized())
+                    throw std::runtime_error("ROCmRoPEKernelT<FP32>: Device context not initialized");
+                device_ctx_ = ctx;
+                device_idx_ = ctx->deviceOrdinal();
+            }
+
             ~ROCmRoPEKernelT() override = default;
+
+            // ===== Device Context Support (Phase 4) =====
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
@@ -196,6 +222,7 @@ namespace llaminar2
         private:
             int device_idx_;
             float rope_theta_;
+            IWorkerGPUContext *device_ctx_ = nullptr;
 
             // Workspace state
             DeviceWorkspaceManager *workspace_ = nullptr;
@@ -226,7 +253,31 @@ namespace llaminar2
             explicit ROCmRoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
                 : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
                   inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
+
+            /**
+             * @brief Construct with device context (Phase 4 pattern)
+             * @param ctx Device context for shared handles/streams
+             * @param rope_theta RoPE theta parameter
+             */
+            explicit ROCmRoPEKernelT(IWorkerGPUContext *ctx, float rope_theta = 10000.0f)
+                : rope_theta_(rope_theta), workspace_(nullptr),
+                  inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f)
+            {
+                if (!ctx)
+                    throw std::runtime_error("ROCmRoPEKernelT<BF16>: Device context is null");
+                if (!ctx->isInitialized())
+                    throw std::runtime_error("ROCmRoPEKernelT<BF16>: Device context not initialized");
+                device_ctx_ = ctx;
+                device_idx_ = ctx->deviceOrdinal();
+            }
+
             ~ROCmRoPEKernelT() override = default;
+
+            // ===== Device Context Support (Phase 4) =====
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
@@ -336,6 +387,7 @@ namespace llaminar2
             int device_idx_;
             float rope_theta_;
             DeviceWorkspaceManager *workspace_ = nullptr;
+            IWorkerGPUContext *device_ctx_ = nullptr;
 
             // Workspace-based inverse frequency state (v3: tracked per instance)
             mutable bool inv_freq_initialized_ = false;
@@ -361,7 +413,31 @@ namespace llaminar2
             explicit ROCmRoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
                 : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
                   inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
+
+            /**
+             * @brief Construct with device context (Phase 4 pattern)
+             * @param ctx Device context for shared handles/streams
+             * @param rope_theta RoPE theta parameter
+             */
+            explicit ROCmRoPEKernelT(IWorkerGPUContext *ctx, float rope_theta = 10000.0f)
+                : rope_theta_(rope_theta), workspace_(nullptr),
+                  inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f)
+            {
+                if (!ctx)
+                    throw std::runtime_error("ROCmRoPEKernelT<FP16>: Device context is null");
+                if (!ctx->isInitialized())
+                    throw std::runtime_error("ROCmRoPEKernelT<FP16>: Device context not initialized");
+                device_ctx_ = ctx;
+                device_idx_ = ctx->deviceOrdinal();
+            }
+
             ~ROCmRoPEKernelT() override = default;
+
+            // ===== Device Context Support (Phase 4) =====
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
@@ -471,6 +547,7 @@ namespace llaminar2
             int device_idx_;
             float rope_theta_;
             DeviceWorkspaceManager *workspace_ = nullptr;
+            IWorkerGPUContext *device_ctx_ = nullptr;
 
             // Workspace-based inverse frequency state (v3: tracked per instance)
             mutable bool inv_freq_initialized_ = false;

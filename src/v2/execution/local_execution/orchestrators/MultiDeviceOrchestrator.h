@@ -48,6 +48,7 @@
 #include "IMultiDeviceOrchestrator.h"
 #include "../../../backends/GlobalDeviceAddress.h"
 #include "../../../config/OrchestrationConfig.h"
+#include "../../../collective/ILocalPPContext.h"
 #include "../../config/RuntimeConfig.h"
 #include "../../debug/TPSnapshot.h"
 #include <memory>
@@ -89,12 +90,79 @@ namespace llaminar2
         // =====================================================================
 
         /**
+         * @brief Parallelism mode for multi-device orchestration
+         */
+        enum class ParallelismMode
+        {
+            AUTO, ///< Auto-detect from configuration
+            TP,   ///< Tensor Parallelism only (parallel execution, same layers)
+            PP,   ///< Pipeline Parallelism only (sequential execution, different layers)
+            TP_PP ///< Combined: PP stages where each stage is a TP domain
+        };
+
+        /**
+         * @brief Configuration for a single PP stage
+         *
+         * Specifies layer range and optional TP configuration for this stage.
+         */
+        struct PPStageConfig
+        {
+            /// First layer index (inclusive)
+            int first_layer = 0;
+
+            /// Last layer index (exclusive)
+            int last_layer = 0;
+
+            /// Whether this stage has the embedding layer
+            bool has_embedding = false;
+
+            /// Whether this stage has the LM head
+            bool has_lm_head = false;
+
+            /// Devices for this stage (single device for pure PP, multiple for TP+PP)
+            std::vector<GlobalDeviceAddress> stage_devices;
+
+            /// TP weights for this stage (empty = equal distribution)
+            /// Only used when stage_devices.size() > 1
+            std::vector<float> tp_weights;
+
+            /// TP backend for this stage (only used when stage_devices.size() > 1)
+            CollectiveBackendType tp_backend = CollectiveBackendType::AUTO;
+
+            /// Whether hidden state output should be BAR-backed for cross-vendor PP transfer
+            /// Set true when this stage outputs to a stage with a different GPU vendor
+            /// (e.g., ROCm stage outputs to CUDA stage via PCIe BAR)
+            bool requires_bar_backed_hidden = false;
+
+            /// Get the number of layers in this stage
+            int numLayers() const { return last_layer - first_layer; }
+
+            /// Check if this stage is a TP domain (multiple devices)
+            bool isTPDomain() const { return stage_devices.size() > 1; }
+
+            /// Validate stage configuration
+            bool validate() const;
+        };
+
+        /**
          * @brief Configuration for multi-device orchestration
          *
          * Specifies devices, weights, backend, and inference parameters.
+         * Supports both TP (parallel) and PP (sequential) execution modes.
          */
         struct Config
         {
+            // =================================================================
+            // Parallelism Mode
+            // =================================================================
+
+            /// Parallelism mode (AUTO detects from configuration)
+            ParallelismMode mode = ParallelismMode::AUTO;
+
+            // =================================================================
+            // TP Configuration (used when mode is TP or AUTO with no PP stages)
+            // =================================================================
+
             /// Devices participating in LOCAL TP
             std::vector<GlobalDeviceAddress> devices;
 
@@ -105,6 +173,18 @@ namespace llaminar2
 
             /// Backend for collective operations (AUTO for auto-detection)
             CollectiveBackendType backend = CollectiveBackendType::AUTO;
+
+            // =================================================================
+            // PP Configuration (used when mode is PP or TP_PP)
+            // =================================================================
+
+            /// PP stage configurations (layer ranges per stage)
+            /// If non-empty, enables PP mode
+            std::vector<PPStageConfig> pp_stages;
+
+            // =================================================================
+            // Common Configuration
+            // =================================================================
 
             /// Maximum sequence length
             size_t max_seq_len = 4096;
@@ -122,13 +202,54 @@ namespace llaminar2
             /// Required for correct coherence with column-parallel LM head
             bool use_mapped_memory = false;
 
+            /// Use PCIe BAR-backed memory for hidden state allocation.
+            /// Required for cross-vendor PP transfers (ROCm→CUDA).
+            /// When enabled, hidden state tensors are allocated in BAR region
+            /// so that CUDA can access them for P2P transfers.
+            bool use_bar_backed_hidden = false;
+
+            // =================================================================
+            // Helper Methods
+            // =================================================================
+
+            /**
+             * @brief Check if PP is enabled
+             *
+             * @return true if pp_stages is non-empty
+             */
+            bool hasPP() const { return !pp_stages.empty(); }
+
+            /**
+             * @brief Detect parallelism mode from configuration
+             *
+             * - No devices and no PP stages: Invalid
+             * - Devices only: TP
+             * - PP stages only: PP
+             * - PP stages with TP domains: TP_PP
+             *
+             * @return Detected parallelism mode
+             */
+            ParallelismMode detectMode() const;
+
+            /**
+             * @brief Get effective mode (resolves AUTO)
+             *
+             * @return Effective parallelism mode
+             */
+            ParallelismMode effectiveMode() const
+            {
+                return mode == ParallelismMode::AUTO ? detectMode() : mode;
+            }
+
             /**
              * @brief Validate configuration
              *
              * Checks:
-             * - At least one device specified
+             * - At least one device specified (for TP) or PP stages defined
              * - Weights sum to ~1.0 (if provided)
              * - Weights count matches device count (if provided)
+             * - PP stages have valid layer ranges
+             * - PP stages cover all layers without gaps
              *
              * @return true if configuration is valid
              */
@@ -142,6 +263,15 @@ namespace llaminar2
              * @return Vector of normalized weights summing to 1.0
              */
             std::vector<float> getNormalizedWeights() const;
+
+            /**
+             * @brief Build layer boundaries vector from PP stages
+             *
+             * Returns {0, stage0.last_layer, stage1.last_layer, ...}
+             *
+             * @return Layer boundary indices
+             */
+            std::vector<int> buildLayerBoundaries() const;
         };
 
         // =====================================================================
@@ -279,6 +409,14 @@ namespace llaminar2
         int vocab_size() const override;
 
         /**
+         * @brief Get current parallelism mode (PP, TP, or TP_PP)
+         *
+         * Returns the effective mode after AUTO resolution.
+         * Useful for testing and diagnostics.
+         */
+        ParallelismMode effectiveMode() const { return mode_; }
+
+        /**
          * @brief Clear KV cache on all devices
          */
         void clear_cache() override;
@@ -297,6 +435,46 @@ namespace llaminar2
          * @brief Get architecture name
          */
         const char *architecture() const override;
+
+        // =====================================================================
+        // Hidden State API (for Pipeline Parallelism nesting)
+        // =====================================================================
+
+        /**
+         * @brief Get final hidden state from last forward pass
+         *
+         * In TP mode: Delegates to primary device runner (device_runners_[0])
+         * In PP/TP_PP mode: Delegates to last stage runner (has final hidden state)
+         *
+         * @return Pointer to hidden state tensor, or nullptr if unavailable
+         */
+        TensorBase *getHiddenState() override;
+        const TensorBase *getHiddenState() const override;
+
+        /**
+         * @brief Set initial hidden state for forward pass
+         *
+         * In TP mode: Sets on ALL device runners (all need same input)
+         * In PP/TP_PP mode: Sets on first stage runner (stage 0 receives input)
+         *
+         * @param hidden_state Tensor containing hidden state [seq_len, d_model]
+         */
+        void setHiddenState(TensorBase *hidden_state) override;
+
+        /**
+         * @brief Check if this orchestrator has hidden state set for next forward
+         *
+         * @return true if setHiddenState was called and not yet consumed/cleared
+         */
+        bool hasHiddenStateInput() const override;
+
+        /**
+         * @brief Clear hidden state input (reset to normal embedding mode)
+         *
+         * In TP mode: Clears on all device runners
+         * In PP/TP_PP mode: Clears on first stage runner
+         */
+        void clearHiddenStateInput() override;
 
         // =====================================================================
         // Snapshot API (from IInferenceRunner)
@@ -464,6 +642,46 @@ namespace llaminar2
         void initializeDeviceRunners();
 
         /**
+         * @brief Initialize device runners for PP mode
+         *
+         * Creates one DeviceGraphOrchestrator per PP stage (or one
+         * MultiDeviceOrchestrator per stage for TP+PP mode).
+         */
+        void initializePPDeviceRunners();
+
+        /**
+         * @brief Initialize PP context for inter-stage transfers
+         *
+         * Creates HierarchicalPPContext with appropriate stage types
+         * (single device or TP domain) based on configuration.
+         */
+        void initializePPContext();
+
+        /**
+         * @brief Execute forward pass in TP mode (parallel)
+         *
+         * All devices execute the same layers in parallel with sharded weights.
+         * AllReduce after row-parallel ops, AllGather for logits.
+         *
+         * @param tokens Input token IDs
+         * @param seq_len Sequence length
+         * @return true if forward pass succeeded on all devices
+         */
+        bool forwardTP(const int *tokens, int seq_len);
+
+        /**
+         * @brief Execute forward pass in PP mode (sequential)
+         *
+         * Stages execute sequentially with hidden state transfers between stages.
+         * Each stage processes a subset of layers.
+         *
+         * @param tokens Input token IDs
+         * @param seq_len Sequence length
+         * @return true if forward pass succeeded
+         */
+        bool forwardPP(const int *tokens, int seq_len);
+
+        /**
          * @brief Gather partial logits from all devices
          *
          * Performs AllGather of local logits shards into combined buffer.
@@ -474,6 +692,15 @@ namespace llaminar2
          * @return true if gather succeeded
          */
         bool gatherLogits(size_t seq_len);
+
+        /**
+         * @brief Copy logits from a specific stage to combined buffer
+         *
+         * Used in PP mode to get logits from the final stage.
+         *
+         * @param stage_idx Index of the stage with logits
+         */
+        void copyLogitsFromStage(int stage_idx);
 
         /**
          * @brief Aggregate stats from all device runners
@@ -487,11 +714,24 @@ namespace llaminar2
         /// Model context (shared across device runners)
         std::shared_ptr<IModelContext> model_ctx_;
 
-        /// LOCAL TP context for collective operations
+        /// LOCAL TP context for collective operations (TP mode)
         std::unique_ptr<ILocalTPContext> tp_ctx_;
 
+        /// LOCAL PP context for inter-stage transfers (PP mode)
+        std::unique_ptr<ILocalPPContext> pp_ctx_;
+
+        /// Effective parallelism mode (resolved from config)
+        ParallelismMode mode_ = ParallelismMode::TP;
+
         /// Per-device inference runners
+        /// In TP mode: one DeviceGraphOrchestrator per device
+        /// In PP mode: one DeviceGraphOrchestrator per stage
+        /// In TP+PP mode: one MultiDeviceOrchestrator (as IInferenceRunner) per stage
         std::vector<std::unique_ptr<DeviceGraphOrchestrator>> device_runners_;
+
+        /// PP stage runners (when stages are TP domains, these are MultiDeviceOrchestrator)
+        /// Only used in TP+PP mode - in pure PP mode, device_runners_ holds stage runners
+        std::vector<std::unique_ptr<IInferenceRunner>> pp_stage_runners_;
 
         /// Configuration
         Config config_;
@@ -520,6 +760,10 @@ namespace llaminar2
 
         /// Flag indicating if stats need re-aggregation
         mutable bool stats_dirty_ = true;
+
+        /// Hidden state input for PP nesting (when this orchestrator is a PP stage)
+        /// Set via setHiddenState(), cleared after forward or via clearHiddenStateInput()
+        TensorBase *hidden_state_input_ = nullptr;
     };
 
 } // namespace llaminar2

@@ -16,7 +16,7 @@
 #include "ROCmRingKVCache.h"
 #include "../../../utils/Logger.h"
 #include "../../../tensors/GpuTensorView.h"
-#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../../execution/DeviceWorkspaceManager.h"
 
 #include <algorithm>
 
@@ -207,13 +207,7 @@ namespace llaminar2
     template <ActivationPrecision Precision>
     ROCmRingKVCache<Precision>::~ROCmRingKVCache()
     {
-        // Check if HIP runtime is shutting down
-        hipError_t set_err = hipSetDevice(device_id_);
-        if (set_err == hipErrorDeinitialized || set_err == hipErrorNoDevice)
-        {
-            // Runtime is shutting down, skip cleanup
-            return;
-        }
+        hipSetDevice(device_id_);
 
         for (auto &layer_entries : entries_)
         {
@@ -247,37 +241,13 @@ namespace llaminar2
     void ROCmRingKVCache<Precision>::free_entry(EntryT &entry)
     {
         if (entry.d_K)
-        {
-            hipError_t err = hipFree(entry.d_K);
-            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
-            {
-                fprintf(stderr, "WARNING: hipFree(d_K) failed: %s\n", hipGetErrorString(err));
-            }
-        }
+            hipFree(entry.d_K);
         if (entry.d_V)
-        {
-            hipError_t err = hipFree(entry.d_V);
-            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
-            {
-                fprintf(stderr, "WARNING: hipFree(d_V) failed: %s\n", hipGetErrorString(err));
-            }
-        }
+            hipFree(entry.d_V);
         if (entry.d_K_scratch)
-        {
-            hipError_t err = hipFree(entry.d_K_scratch);
-            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
-            {
-                fprintf(stderr, "WARNING: hipFree(d_K_scratch) failed: %s\n", hipGetErrorString(err));
-            }
-        }
+            hipFree(entry.d_K_scratch);
         if (entry.d_V_scratch)
-        {
-            hipError_t err = hipFree(entry.d_V_scratch);
-            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
-            {
-                fprintf(stderr, "WARNING: hipFree(d_V_scratch) failed: %s\n", hipGetErrorString(err));
-            }
-        }
+            hipFree(entry.d_V_scratch);
 
         entry.d_K = nullptr;
         entry.d_V = nullptr;

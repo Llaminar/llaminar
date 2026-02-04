@@ -239,6 +239,20 @@ namespace llaminar2
         std::vector<float> local_tp_weights;
         CollectiveBackendType local_tp_backend = CollectiveBackendType::AUTO;
 
+        // =====================================================================
+        // LOCAL Pipeline Parallelism (PP within this rank)
+        // =====================================================================
+
+        /// Devices for each LOCAL PP stage (empty if no LOCAL PP)
+        std::vector<GlobalDeviceAddress> local_pp_devices;
+
+        /// Layer boundaries for LOCAL PP [start0, end0, start1, end1, ...]
+        /// Format: [stage0_first, stage1_first, ..., stageN_first, total_layers]
+        std::vector<int> local_pp_layer_boundaries;
+
+        /// Backend for LOCAL PP (auto-select based on device types)
+        CollectiveBackendType local_pp_backend = CollectiveBackendType::AUTO;
+
         // GLOBAL TP (participation in cross-rank TP)
         std::optional<int> global_tp_domain_id;
         int global_tp_rank_in_domain = 0;
@@ -288,6 +302,15 @@ namespace llaminar2
         bool usesLocalTP() const
         {
             return local_tp_devices.size() > 1;
+        }
+
+        /**
+         * @brief Check if this plan uses local pipeline parallelism
+         * @return true if multiple local PP stages
+         */
+        bool usesLocalPP() const
+        {
+            return local_pp_devices.size() > 1;
         }
 
         /**

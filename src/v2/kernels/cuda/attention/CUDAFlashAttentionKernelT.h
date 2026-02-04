@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "../../../backends/IWorkerGPUContext.h"
 #include "../../../execution/config/RuntimeConfig.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../tensors/TensorKernels.h"
@@ -240,7 +241,22 @@ namespace llaminar2
         public:
             using ElementType = float;
 
+            /**
+             * @brief Create CUDA Flash Attention kernel (legacy constructor)
+             * @param device_idx CUDA device index (0-based)
+             */
             explicit CUDAFlashAttentionKernelT(int device_idx = 0);
+
+            /**
+             * @brief Create CUDA Flash Attention kernel using device context
+             *
+             * Uses the device context's stream for kernel execution.
+             *
+             * @param ctx Device context (must outlive this kernel)
+             * @throws std::runtime_error if ctx is null or not initialized
+             */
+            explicit CUDAFlashAttentionKernelT(IWorkerGPUContext *ctx);
+
             ~CUDAFlashAttentionKernelT() override;
 
             CUDAFlashAttentionKernelT(const CUDAFlashAttentionKernelT &) = delete;
@@ -356,6 +372,28 @@ namespace llaminar2
              */
             DeviceWorkspaceManager *getWorkspace() const override;
 
+            // =========================================================================
+            // Device Context Support (Phase 4)
+            // =========================================================================
+
+            /**
+             * @brief Set the device context for this kernel
+             * @param ctx Device context (owned by GPUDeviceContextPool, not this kernel)
+             */
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+
+            /**
+             * @brief Get the currently bound device context
+             * @return Device context, or nullptr if not bound
+             */
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+
+            /**
+             * @brief Check if a device context is bound
+             * @return true if setDeviceContext() was called with a non-null context
+             */
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+
         private:
             int device_idx_;
             void *stream_ = nullptr;
@@ -367,6 +405,9 @@ namespace llaminar2
 
             // IWorkspaceConsumer state
             DeviceWorkspaceManager *workspace_ = nullptr;
+
+            // Device Context (Phase 4)
+            IWorkerGPUContext *device_ctx_ = nullptr;
 
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();
@@ -381,7 +422,19 @@ namespace llaminar2
         public:
             using ElementType = uint16_t;
 
+            /**
+             * @brief Create CUDA Flash Attention kernel (legacy constructor)
+             * @param device_idx CUDA device index (0-based)
+             */
             explicit CUDAFlashAttentionKernelT(int device_idx = 0);
+
+            /**
+             * @brief Create CUDA Flash Attention kernel using device context
+             * @param ctx Device context (must outlive this kernel)
+             * @throws std::runtime_error if ctx is null or not initialized
+             */
+            explicit CUDAFlashAttentionKernelT(IWorkerGPUContext *ctx);
+
             ~CUDAFlashAttentionKernelT() override;
 
             CUDAFlashAttentionKernelT(const CUDAFlashAttentionKernelT &) = delete;
@@ -464,6 +517,14 @@ namespace llaminar2
             bool hasWorkspace() const override;
             DeviceWorkspaceManager *getWorkspace() const override;
 
+            // =========================================================================
+            // Device Context Support (Phase 4)
+            // =========================================================================
+
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+
         private:
             int device_idx_;
             void *stream_ = nullptr;
@@ -475,6 +536,9 @@ namespace llaminar2
 
             // IWorkspaceConsumer state
             DeviceWorkspaceManager *workspace_ = nullptr;
+
+            // Device Context (Phase 4)
+            IWorkerGPUContext *device_ctx_ = nullptr;
 
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();
@@ -489,7 +553,19 @@ namespace llaminar2
         public:
             using ElementType = uint16_t;
 
+            /**
+             * @brief Create CUDA Flash Attention kernel (legacy constructor)
+             * @param device_idx CUDA device index (0-based)
+             */
             explicit CUDAFlashAttentionKernelT(int device_idx = 0);
+
+            /**
+             * @brief Create CUDA Flash Attention kernel using device context
+             * @param ctx Device context (must outlive this kernel)
+             * @throws std::runtime_error if ctx is null or not initialized
+             */
+            explicit CUDAFlashAttentionKernelT(IWorkerGPUContext *ctx);
+
             ~CUDAFlashAttentionKernelT() override;
 
             CUDAFlashAttentionKernelT(const CUDAFlashAttentionKernelT &) = delete;
@@ -572,6 +648,14 @@ namespace llaminar2
             bool hasWorkspace() const override;
             DeviceWorkspaceManager *getWorkspace() const override;
 
+            // =========================================================================
+            // Device Context Support (Phase 4)
+            // =========================================================================
+
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+
         private:
             int device_idx_;
             void *stream_ = nullptr;
@@ -583,6 +667,9 @@ namespace llaminar2
 
             // IWorkspaceConsumer state
             DeviceWorkspaceManager *workspace_ = nullptr;
+
+            // Device Context (Phase 4)
+            IWorkerGPUContext *device_ctx_ = nullptr;
 
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();

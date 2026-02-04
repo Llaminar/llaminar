@@ -20,6 +20,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cstring>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -263,11 +264,64 @@ namespace llaminar2
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), local_n_kv_heads_(n_kv_heads), kv_head_start_(0),
           head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim), device_id_(device_id),
-          is_sharded_(false)
+          is_sharded_(false), device_ctx_(nullptr)
     {
         LOG_INFO("[CUDARingKVCache] Creating cache: "
                  << n_layers << " layers, batch=" << batch_size
                  << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
+                 << ", precision=" << static_cast<int>(Precision));
+
+        cudaSetDevice(device_id_);
+
+        // Allocate entries
+        entries_.resize(n_layers_);
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            entries_[layer].resize(batch_size_);
+            for (int seq = 0; seq < batch_size_; ++seq)
+            {
+                allocate_entry(entries_[layer][seq]);
+            }
+        }
+
+        // Initialize tensor_views_ storage for get_k()/get_v() wrappers
+        tensor_views_.resize(n_layers_);
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            tensor_views_[layer].resize(batch_size_);
+            // Views are created lazily in get_k()/get_v()
+        }
+
+        LOG_INFO("[CUDARingKVCache] Allocated "
+                 << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                 << " MB total (including scratch)");
+    }
+
+    template <ActivationPrecision Precision>
+    CUDARingKVCache<Precision>::CUDARingKVCache(
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int head_dim, IWorkerGPUContext *ctx)
+        : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
+          n_kv_heads_(n_kv_heads), local_n_kv_heads_(n_kv_heads), kv_head_start_(0),
+          head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim), device_id_(0),
+          is_sharded_(false), device_ctx_(nullptr)
+    {
+        if (!ctx)
+        {
+            throw std::runtime_error("[CUDARingKVCache] Device context is null");
+        }
+        if (!ctx->isInitialized())
+        {
+            throw std::runtime_error("[CUDARingKVCache] Device context is not initialized");
+        }
+
+        device_ctx_ = ctx;
+        device_id_ = ctx->deviceOrdinal();
+
+        LOG_INFO("[CUDARingKVCache] Creating cache with device context: "
+                 << n_layers << " layers, batch=" << batch_size
+                 << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
+                 << ", device=" << device_id_
                  << ", precision=" << static_cast<int>(Precision));
 
         cudaSetDevice(device_id_);
@@ -304,13 +358,69 @@ namespace llaminar2
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads), kv_head_start_(kv_head_start),
           head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim), device_id_(device_id),
-          is_sharded_(local_n_kv_heads != n_kv_heads)
+          is_sharded_(local_n_kv_heads != n_kv_heads), device_ctx_(nullptr)
     {
         LOG_INFO("[CUDARingKVCache] Creating sharded cache: "
                  << n_layers << " layers, batch=" << batch_size
                  << ", max_seq=" << max_seq_len << ", total_kv_heads=" << n_kv_heads
                  << ", local_kv_heads=" << local_n_kv_heads << ", kv_head_start=" << kv_head_start
                  << ", local_kv_dim=" << kv_dim_
+                 << ", precision=" << static_cast<int>(Precision));
+
+        cudaSetDevice(device_id_);
+
+        // Allocate entries
+        entries_.resize(n_layers_);
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            entries_[layer].resize(batch_size_);
+            for (int seq = 0; seq < batch_size_; ++seq)
+            {
+                allocate_entry(entries_[layer][seq]);
+            }
+        }
+
+        // Initialize tensor_views_ storage for get_k()/get_v() wrappers
+        tensor_views_.resize(n_layers_);
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            tensor_views_[layer].resize(batch_size_);
+            // Views are created lazily in get_k()/get_v()
+        }
+
+        LOG_INFO("[CUDARingKVCache] Allocated "
+                 << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                 << " MB total (including scratch)");
+    }
+
+    template <ActivationPrecision Precision>
+    CUDARingKVCache<Precision>::CUDARingKVCache(
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+        int head_dim, IWorkerGPUContext *ctx)
+        : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
+          n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads), kv_head_start_(kv_head_start),
+          head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim), device_id_(0),
+          is_sharded_(local_n_kv_heads != n_kv_heads), device_ctx_(nullptr)
+    {
+        if (!ctx)
+        {
+            throw std::runtime_error("[CUDARingKVCache] Device context is null");
+        }
+        if (!ctx->isInitialized())
+        {
+            throw std::runtime_error("[CUDARingKVCache] Device context is not initialized");
+        }
+
+        device_ctx_ = ctx;
+        device_id_ = ctx->deviceOrdinal();
+
+        LOG_INFO("[CUDARingKVCache] Creating sharded cache with device context: "
+                 << n_layers << " layers, batch=" << batch_size
+                 << ", max_seq=" << max_seq_len << ", total_kv_heads=" << n_kv_heads
+                 << ", local_kv_heads=" << local_n_kv_heads << ", kv_head_start=" << kv_head_start
+                 << ", local_kv_dim=" << kv_dim_
+                 << ", device=" << device_id_
                  << ", precision=" << static_cast<int>(Precision));
 
         cudaSetDevice(device_id_);

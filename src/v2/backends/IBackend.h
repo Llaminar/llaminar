@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstddef>
+#include <future>
 #include <string>
 
 namespace llaminar2
@@ -74,6 +75,22 @@ namespace llaminar2
         virtual bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id) = 0;
 
         /**
+         * @brief Async variant of deviceToHost() - returns immediately
+         *
+         * @param dst Host destination pointer (must be pre-allocated)
+         * @param src Device source pointer
+         * @param bytes Number of bytes to copy
+         * @param device_id GPU device ID (0-based)
+         * @return Future that resolves to true on success, false on error
+         *
+         * **Semantics**:
+         * - Submits copy request to device worker thread
+         * - Returns immediately without blocking
+         * - Call future.get() to wait for completion and get result
+         */
+        virtual std::future<bool> deviceToHostAsync(void *dst, const void *src, size_t bytes, int device_id) = 0;
+
+        /**
          * @brief Copy data from host to device
          *
          * @param dst Device destination pointer (must be pre-allocated)
@@ -90,6 +107,22 @@ namespace llaminar2
         virtual bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id) = 0;
 
         /**
+         * @brief Async variant of hostToDevice() - returns immediately
+         *
+         * @param dst Device destination pointer (must be pre-allocated)
+         * @param src Host source pointer
+         * @param bytes Number of bytes to copy
+         * @param device_id GPU device ID (0-based)
+         * @return Future that resolves to true on success, false on error
+         *
+         * **Semantics**:
+         * - Submits copy request to device worker thread
+         * - Returns immediately without blocking
+         * - Call future.get() to wait for completion and get result
+         */
+        virtual std::future<bool> hostToDeviceAsync(void *dst, const void *src, size_t bytes, int device_id) = 0;
+
+        /**
          * @brief Synchronize all operations on a device
          *
          * @param device_id GPU device ID (0-based)
@@ -101,6 +134,19 @@ namespace llaminar2
          * - CPU: no-op (always synchronous)
          */
         virtual bool synchronize(int device_id) = 0;
+
+        /**
+         * @brief Async variant of synchronize() - returns immediately
+         *
+         * @param device_id GPU device ID (0-based)
+         * @return Future that resolves to true on success, false on error
+         *
+         * **Semantics**:
+         * - Submits sync request to device worker thread
+         * - Returns immediately without blocking
+         * - Call future.get() to wait for completion and get result
+         */
+        virtual std::future<bool> synchronizeAsync(int device_id) = 0;
 
         /**
          * @brief Synchronize the default stream on a device
@@ -222,6 +268,20 @@ namespace llaminar2
         virtual void *allocate(size_t bytes, int device_id) = 0;
 
         /**
+         * @brief Async variant of allocate() - returns immediately
+         *
+         * @param bytes Number of bytes to allocate
+         * @param device_id GPU device ID (0-based)
+         * @return Future that resolves to the allocated pointer (nullptr on failure)
+         *
+         * **Semantics**:
+         * - Submits allocation request to device worker thread
+         * - Returns immediately without blocking
+         * - Call future.get() to wait for completion and get result
+         */
+        virtual std::future<void *> allocateAsync(size_t bytes, int device_id) = 0;
+
+        /**
          * @brief Free device memory
          *
          * @param ptr Device pointer to free (may be nullptr)
@@ -235,6 +295,20 @@ namespace llaminar2
          * **Thread Safety**: Caller must ensure device is set before calling
          */
         virtual void free(void *ptr, int device_id) = 0;
+
+        /**
+         * @brief Async variant of free() - returns immediately
+         *
+         * @param ptr Device pointer to free (may be nullptr)
+         * @param device_id GPU device ID (0-based)
+         * @return Future that completes when free is done
+         *
+         * **Semantics**:
+         * - Submits free request to device worker thread
+         * - Returns immediately without blocking
+         * - Call future.wait() to wait for completion
+         */
+        virtual std::future<void> freeAsync(void *ptr, int device_id) = 0;
 
         /**
          * @brief Set device memory to a byte value
@@ -258,6 +332,22 @@ namespace llaminar2
          * **Thread Safety**: Caller must ensure device is set before calling
          */
         virtual bool memset(void *ptr, int value, size_t bytes, int device_id) = 0;
+
+        /**
+         * @brief Async variant of memset() - returns immediately
+         *
+         * @param ptr Device pointer to fill
+         * @param value Byte value to set (0-255)
+         * @param bytes Number of bytes to set
+         * @param device_id GPU device ID (0-based)
+         * @return Future that resolves to true on success, false on error
+         *
+         * **Semantics**:
+         * - Submits memset request to device worker thread
+         * - Returns immediately without blocking
+         * - Call future.get() to wait for completion and get result
+         */
+        virtual std::future<bool> memsetAsync(void *ptr, int value, size_t bytes, int device_id) = 0;
 
         // ====================================================================
         // Zero-Copy Mapped Memory Operations (GPU writes directly to host)

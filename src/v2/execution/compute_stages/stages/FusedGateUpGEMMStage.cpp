@@ -69,12 +69,15 @@ namespace llaminar2
             return false;
         }
 
-        LOG_DEBUG("[FusedGateUpGEMMStage] Looking up kernel for gate=" << (void *)w_gate_base
-                                                                       << " up=" << (void *)w_up_base << " device=" << params_.device_id.to_string());
+        // Get the target device type from device_id
+        DeviceType target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
 
-        // Get fused Gate/Up kernel from KernelFactory with explicit DeviceId
+        LOG_DEBUG("[FusedGateUpGEMMStage] Looking up kernel for gate=" << (void *)w_gate_base
+                                                                       << " up=" << (void *)w_up_base << " device=" << static_cast<int>(target_dev_type));
+
+        // Get fused Gate/Up kernel from KernelFactory
         auto *fused_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
-            w_gate_base, w_up_base, params_.device_id);
+            w_gate_base, w_up_base, target_dev_type);
 
         LOG_DEBUG("[FusedGateUpGEMMStage] Got fused_kernel=" << (void *)fused_kernel);
 
@@ -167,7 +170,7 @@ namespace llaminar2
         }
     }
 
-    StageDumpInfo FusedGateUpGEMMStage::buildDumpInfoImpl() const
+    StageDumpInfo FusedGateUpGEMMStage::getDumpInfo() const
     {
         StageDumpInfo info;
 
@@ -253,9 +256,12 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Get the fused kernel (cached by KernelFactory) using explicit DeviceId
+        // Get the target device type
+        DeviceType target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+
+        // Get the fused kernel (cached by KernelFactory)
         cached_kernel_ = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
-            w_gate_base, w_up_base, params_.device_id);
+            w_gate_base, w_up_base, target_dev_type);
 
         if (!cached_kernel_)
         {

@@ -8,10 +8,12 @@
 
 #pragma once
 
+#include "../../../backends/IWorkerGPUContext.h"
 #include "../../../execution/config/RuntimeConfig.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h" // For FP32Tensor, BF16Tensor, FP16Tensor (apply_tensor)
 #include <cstdint>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -41,6 +43,30 @@ namespace llaminar2
         {
         public:
             using StorageType = float;
+
+            explicit ROCmRMSNormKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+
+            /**
+             * @brief Construct with device context (Phase 4 pattern)
+             * @param ctx Device context for shared handles/streams
+             */
+            explicit ROCmRMSNormKernelT(IWorkerGPUContext *ctx)
+            {
+                if (!ctx)
+                    throw std::runtime_error("ROCmRMSNormKernelT<FP32>: Device context is null");
+                if (!ctx->isInitialized())
+                    throw std::runtime_error("ROCmRMSNormKernelT<FP32>: Device context not initialized");
+                device_ctx_ = ctx;
+                device_idx_ = ctx->deviceOrdinal();
+            }
+
+            ~ROCmRMSNormKernelT() = default;
+
+            // ===== Device Context Support (Phase 4) =====
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             static constexpr ActivationPrecision precision() { return ActivationPrecision::FP32; }
             static const char *precision_name() { return "FP32"; }
@@ -78,6 +104,10 @@ namespace llaminar2
                 int cols,
                 float epsilon,
                 int device_idx);
+
+        private:
+            int device_idx_ = 0;
+            IWorkerGPUContext *device_ctx_ = nullptr;
         };
 
         // ============================================================================
@@ -89,6 +119,30 @@ namespace llaminar2
         {
         public:
             using StorageType = uint16_t;
+
+            explicit ROCmRMSNormKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+
+            /**
+             * @brief Construct with device context (Phase 4 pattern)
+             * @param ctx Device context for shared handles/streams
+             */
+            explicit ROCmRMSNormKernelT(IWorkerGPUContext *ctx)
+            {
+                if (!ctx)
+                    throw std::runtime_error("ROCmRMSNormKernelT<BF16>: Device context is null");
+                if (!ctx->isInitialized())
+                    throw std::runtime_error("ROCmRMSNormKernelT<BF16>: Device context not initialized");
+                device_ctx_ = ctx;
+                device_idx_ = ctx->deviceOrdinal();
+            }
+
+            ~ROCmRMSNormKernelT() = default;
+
+            // ===== Device Context Support (Phase 4) =====
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             static constexpr ActivationPrecision precision() { return ActivationPrecision::BF16; }
             static const char *precision_name() { return "BF16"; }
@@ -135,6 +189,10 @@ namespace llaminar2
                 int cols,
                 float epsilon,
                 int device_idx);
+
+        private:
+            int device_idx_ = 0;
+            IWorkerGPUContext *device_ctx_ = nullptr;
         };
 
         // ============================================================================
@@ -146,6 +204,30 @@ namespace llaminar2
         {
         public:
             using StorageType = uint16_t;
+
+            explicit ROCmRMSNormKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+
+            /**
+             * @brief Construct with device context (Phase 4 pattern)
+             * @param ctx Device context for shared handles/streams
+             */
+            explicit ROCmRMSNormKernelT(IWorkerGPUContext *ctx)
+            {
+                if (!ctx)
+                    throw std::runtime_error("ROCmRMSNormKernelT<FP16>: Device context is null");
+                if (!ctx->isInitialized())
+                    throw std::runtime_error("ROCmRMSNormKernelT<FP16>: Device context not initialized");
+                device_ctx_ = ctx;
+                device_idx_ = ctx->deviceOrdinal();
+            }
+
+            ~ROCmRMSNormKernelT() = default;
+
+            // ===== Device Context Support (Phase 4) =====
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             static constexpr ActivationPrecision precision() { return ActivationPrecision::FP16; }
             static const char *precision_name() { return "FP16"; }
@@ -192,6 +274,10 @@ namespace llaminar2
                 int cols,
                 float epsilon,
                 int device_idx);
+
+        private:
+            int device_idx_ = 0;
+            IWorkerGPUContext *device_ctx_ = nullptr;
         };
 
     } // namespace rocm

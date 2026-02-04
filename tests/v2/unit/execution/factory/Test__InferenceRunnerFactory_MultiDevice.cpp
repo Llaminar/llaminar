@@ -48,6 +48,7 @@ namespace
         const std::vector<float> &weights() const override { return weights_; }
         CollectiveBackendType backend() const override { return CollectiveBackendType::HOST; }
         int degree() const override { return static_cast<int>(devices_.size()); }
+        int myIndex() const override { return 0; }
 
         bool allreduce(TensorBase * /*tensor*/) override { return true; }
         bool allreduce(TensorBase *tensor, const std::string & /*stage_name*/, size_t /*count*/ = 0) override { return allreduce(tensor); }
@@ -127,6 +128,9 @@ namespace
         void clearBARBackedOutputs() override {}
         std::shared_ptr<DirectP2PEngine> getDirectP2PEngine() const override { return nullptr; }
         bool reserveTempBufferBytes(size_t /*bytes*/) override { return true; }
+
+        // Broadcast (no-op)
+        bool broadcast(TensorBase* /*tensor*/, int /*source_device_index*/ = 0) override { return true; }
 
     private:
         std::vector<GlobalDeviceAddress> devices_;

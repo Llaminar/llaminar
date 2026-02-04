@@ -20,10 +20,12 @@
 
 #pragma once
 
+#include "../../../backends/IWorkerGPUContext.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include <unordered_map>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -40,7 +42,26 @@ namespace llaminar2
     {
     public:
         explicit CUDAEmbeddingKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+
+        /**
+         * @brief Construct with device context (Phase 4 pattern)
+         * @param ctx Device context for shared handles/streams
+         */
+        explicit CUDAEmbeddingKernelT(IWorkerGPUContext* ctx)
+        {
+            if (!ctx) throw std::runtime_error("CUDAEmbeddingKernelT: Device context is null");
+            if (!ctx->isInitialized()) throw std::runtime_error("CUDAEmbeddingKernelT: Device context not initialized");
+            device_ctx_ = ctx;
+            device_idx_ = ctx->deviceOrdinal();
+        }
+
         ~CUDAEmbeddingKernelT() override = default;
+
+        // ===== Device Context Support (Phase 4) =====
+        void setDeviceContext(IWorkerGPUContext* ctx) { device_ctx_ = ctx; }
+        IWorkerGPUContext* deviceContext() const { return device_ctx_; }
+        bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+        void* getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
         bool supports_device(int device_idx) const override
         {
@@ -180,6 +201,7 @@ namespace llaminar2
 
     private:
         int device_idx_ = 0;
+        IWorkerGPUContext* device_ctx_ = nullptr;
 
         // IWorkspaceConsumer state
         DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned)

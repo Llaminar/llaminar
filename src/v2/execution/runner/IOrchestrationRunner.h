@@ -31,6 +31,11 @@
 
 namespace llaminar2
 {
+    class ITokenizer; // Forward declaration
+}
+
+namespace llaminar2
+{
 
     /**
      * @brief Result of a generation step or full generation
@@ -237,6 +242,53 @@ namespace llaminar2
          * @param stop_tokens Vector of token IDs that trigger stop
          */
         virtual void setStopTokens(const std::vector<int32_t> &stop_tokens) = 0;
+
+        /**
+         * @brief Get the tokenizer
+         * @return Shared pointer to tokenizer, or nullptr if not initialized
+         */
+        virtual std::shared_ptr<ITokenizer> tokenizer() const = 0;
+
+        // =====================================================================
+        // Snapshot Capture (for parity testing)
+        // =====================================================================
+
+        /**
+         * @brief Enable snapshot capture of intermediate activations
+         *
+         * When enabled, intermediate tensors are captured during forward pass.
+         * These can be retrieved via getSnapshot() for comparison with
+         * reference implementations (e.g., PyTorch).
+         *
+         * @param output_dir Optional directory to save snapshots
+         */
+        virtual void enableSnapshotCapture(const std::string& output_dir = "") = 0;
+
+        /**
+         * @brief Disable snapshot capture and clear stored snapshots
+         */
+        virtual void disableSnapshotCapture() = 0;
+
+        /**
+         * @brief Clear stored snapshots but keep capture enabled
+         */
+        virtual void clearSnapshots() = 0;
+
+        /**
+         * @brief Retrieve a captured snapshot by key
+         *
+         * @param key Snapshot identifier (e.g., "layer0_Q_PROJECTION", "EMBEDDING")
+         * @param out_size Output parameter for snapshot size in bytes
+         * @return Pointer to snapshot data (FP32), or nullptr if key doesn't exist
+         */
+        virtual const float* getSnapshot(const std::string& key, size_t& out_size) const = 0;
+
+        /**
+         * @brief Get list of all captured snapshot keys
+         *
+         * @return Vector of snapshot identifiers
+         */
+        virtual std::vector<std::string> getSnapshotKeys() const = 0;
     };
 
 } // namespace llaminar2

@@ -9,10 +9,12 @@
 
 #pragma once
 
+#include "../../../backends/IWorkerGPUContext.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/CUDAKernelProfiler.h"
+#include <stdexcept>
 
 // Forward declarations for CUDA kernels
 extern "C"
@@ -37,12 +39,32 @@ namespace llaminar2::cuda
     {
     public:
         explicit CUDAResidualAddKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+
+        /**
+         * @brief Construct with device context (Phase 4 pattern)
+         */
+        explicit CUDAResidualAddKernelT(IWorkerGPUContext *ctx)
+        {
+            if (!ctx)
+                throw std::runtime_error("CUDAResidualAddKernelT: Device context is null");
+            if (!ctx->isInitialized())
+                throw std::runtime_error("CUDAResidualAddKernelT: Device context not initialized");
+            device_ctx_ = ctx;
+            device_idx_ = ctx->deviceOrdinal();
+        }
+
         ~CUDAResidualAddKernelT() override = default;
 
         bool supports_device(int device_idx) const override
         {
             return device_idx >= 0; // Supports any GPU device
         }
+
+        // ===== Device Context Support (Phase 4) =====
+        void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+        IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+        bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+        void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
         bool apply(
             const float *input, const float *residual, float *output,
@@ -82,7 +104,8 @@ namespace llaminar2::cuda
         }
 
     private:
-        int device_idx_;
+        int device_idx_ = 0;
+        IWorkerGPUContext *device_ctx_ = nullptr;
     };
 
     // ==========================================================================
@@ -94,12 +117,28 @@ namespace llaminar2::cuda
     {
     public:
         explicit CUDAResidualAddKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+
+        explicit CUDAResidualAddKernelT(IWorkerGPUContext *ctx)
+        {
+            if (!ctx)
+                throw std::runtime_error("CUDAResidualAddKernelT: Device context is null");
+            if (!ctx->isInitialized())
+                throw std::runtime_error("CUDAResidualAddKernelT: Device context not initialized");
+            device_ctx_ = ctx;
+            device_idx_ = ctx->deviceOrdinal();
+        }
+
         ~CUDAResidualAddKernelT() override = default;
 
         bool supports_device(int device_idx) const override
         {
             return device_idx >= 0;
         }
+
+        void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+        IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+        bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+        void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
         bool apply(
             const float *input, const float *residual, float *output,
@@ -153,7 +192,8 @@ namespace llaminar2::cuda
         }
 
     private:
-        int device_idx_;
+        int device_idx_ = 0;
+        IWorkerGPUContext *device_ctx_ = nullptr;
     };
 
     // ==========================================================================
@@ -165,12 +205,28 @@ namespace llaminar2::cuda
     {
     public:
         explicit CUDAResidualAddKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+
+        explicit CUDAResidualAddKernelT(IWorkerGPUContext *ctx)
+        {
+            if (!ctx)
+                throw std::runtime_error("CUDAResidualAddKernelT: Device context is null");
+            if (!ctx->isInitialized())
+                throw std::runtime_error("CUDAResidualAddKernelT: Device context not initialized");
+            device_ctx_ = ctx;
+            device_idx_ = ctx->deviceOrdinal();
+        }
+
         ~CUDAResidualAddKernelT() override = default;
 
         bool supports_device(int device_idx) const override
         {
             return device_idx >= 0;
         }
+
+        void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+        IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+        bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+        void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
         bool apply(
             const float *input, const float *residual, float *output,
@@ -224,7 +280,8 @@ namespace llaminar2::cuda
         }
 
     private:
-        int device_idx_;
+        int device_idx_ = 0;
+        IWorkerGPUContext *device_ctx_ = nullptr;
     };
 
 } // namespace llaminar2::cuda

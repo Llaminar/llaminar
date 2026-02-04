@@ -5,16 +5,22 @@
  * **Purpose**: Provide GPU GEMM for non-quantized (floating-point) tensors using cuBLAS.
  *
  * **Design**:
- * - Standalone kernel class (does not inherit ITensorGemm to avoid MPI header dependency in CUDA)
+ * - Inherits from CUDAKernelBase for workspace and device context support
  * - Uses cuBLAS sgemm (FP32), hgemm (FP16), or bfgemm (BF16)
  * - Expects input/output matrices already on GPU device
  * - Caller responsible for device memory management
  *
+ * **Device Context Support (Phase 4)**:
+ * - Can use cuBLAS handle from IWorkerGPUContext instead of creating own
+ * - Backward compatible: existing constructor still creates own handle
+ *
  * **Usage**:
  * ```cpp
- * // In KernelFactory::createCuBLASGemm(device_id):
+ * // Legacy: creates own cuBLAS handle
  * auto kernel = std::make_unique<CuBLASGemmKernel>(device_id);
- * kernel->execute(d_A, d_B, d_C, M, N, K, transA, transB);
+ *
+ * // New: uses context's cuBLAS handle
+ * auto kernel = std::make_unique<CuBLASGemmKernel>(context, Precision::FP32);
  * ```
  *
  * **Note**: For quantized tensors (Q4_0, Q8_0, IQ4_NL), use CudaQuantizedGemmKernel
@@ -26,6 +32,7 @@
 
 #pragma once
 
+#include "CUDAKernelBase.h"
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
@@ -37,6 +44,9 @@
 
 namespace llaminar2
 {
+    // Forward declaration
+    class IWorkerGPUContext;
+
     namespace cuda
     {
 
@@ -56,7 +66,7 @@ namespace llaminar2
          * - Tensor Core math enabled for FP16 when available (SM 7.0+)
          * - Optimized for large matrices (M, N, K > 128)
          */
-        class CuBLASGemmKernel
+        class CuBLASGemmKernel : public CUDAKernelBase
         {
         public:
             /**
@@ -70,7 +80,7 @@ namespace llaminar2
             };
 
             /**
-             * @brief Create cuBLAS GEMM kernel
+             * @brief Create cuBLAS GEMM kernel (legacy constructor - creates own handle)
              *
              * @param device_id CUDA device ID (from cudaGetDevice)
              * @param precision Floating-point precision to use
@@ -80,7 +90,21 @@ namespace llaminar2
             explicit CuBLASGemmKernel(int device_id, Precision precision = Precision::FP32);
 
             /**
-             * @brief Destructor - destroys cuBLAS handle
+             * @brief Create cuBLAS GEMM kernel using device context's handle
+             *
+             * This constructor uses the cuBLAS handle from the provided device context,
+             * avoiding the overhead of creating a separate handle. The kernel does NOT
+             * own the handle and will not destroy it.
+             *
+             * @param ctx Device context providing cuBLAS handle (must outlive this kernel)
+             * @param precision Floating-point precision to use
+             *
+             * @throws std::runtime_error if ctx is null or not initialized
+             */
+            explicit CuBLASGemmKernel(IWorkerGPUContext *ctx, Precision precision = Precision::FP32);
+
+            /**
+             * @brief Destructor - destroys cuBLAS handle only if owned
              */
             ~CuBLASGemmKernel();
 
@@ -166,6 +190,12 @@ namespace llaminar2
             int device_id() const { return device_id_; }
             Precision precision() const { return precision_; }
 
+            /**
+             * @brief Check if this kernel owns its cuBLAS handle
+             * @return true if destructor will destroy the handle, false if using context's handle
+             */
+            bool ownsHandle() const { return owns_handle_; }
+
         private:
 #ifdef HAVE_CUDA
             cublasHandle_t handle_ = nullptr;
@@ -173,10 +203,12 @@ namespace llaminar2
 #endif
             int device_id_ = 0;
             Precision precision_ = Precision::FP32;
+            bool owns_handle_ = true;    ///< false when using context's cuBLAS handle
+            bool owns_lt_handle_ = true; ///< false when using context's cuBLASLt handle
         };
 
         /**
-         * @brief Factory function for cuBLAS GEMM kernel
+         * @brief Factory function for cuBLAS GEMM kernel (legacy - creates own handle)
          *
          * @param device_id CUDA device ID
          * @param precision Desired precision (default FP32)
@@ -184,6 +216,17 @@ namespace llaminar2
          */
         std::unique_ptr<CuBLASGemmKernel> createCuBLASGemm(
             int device_id,
+            CuBLASGemmKernel::Precision precision = CuBLASGemmKernel::Precision::FP32);
+
+        /**
+         * @brief Factory function for cuBLAS GEMM kernel using device context
+         *
+         * @param ctx Device context providing cuBLAS handle
+         * @param precision Desired precision (default FP32)
+         * @return unique_ptr to CuBLASGemmKernel
+         */
+        std::unique_ptr<CuBLASGemmKernel> createCuBLASGemm(
+            IWorkerGPUContext *ctx,
             CuBLASGemmKernel::Precision precision = CuBLASGemmKernel::Precision::FP32);
 
     } // namespace cuda

@@ -19,6 +19,7 @@
 
 #include "../ICollectiveBackend.h"
 #include "../DeviceGroup.h"
+#include "../coordinators/NCCLCoordinator.h"
 #include "../../utils/MPIContext.h"
 
 // Note: NCCL types are NOT exposed in this header to avoid conflicts with RCCL/HIP
@@ -26,8 +27,10 @@
 // in NCCLBackendCUDA.cu, and void* is used for opaque handles here.
 // The actual types (ncclComm_t, cudaStream_t) are defined in the implementation.
 
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace llaminar2
@@ -258,6 +261,43 @@ namespace llaminar2
             int dst_gpu) override;
 
         // =====================================================================
+        // Data Copy Operations
+        // =====================================================================
+
+        /**
+         * @brief Synchronous copy between CUDA devices
+         *
+         * Supports:
+         * - Same device: cudaMemcpy DeviceToDevice
+         * - Different devices: cudaMemcpyPeer (requires P2P access)
+         *
+         * FAIL-FAST: Returns false if P2P is not available between different devices.
+         * Does NOT fall back to host staging.
+         *
+         * @return false for non-CUDA devices or if P2P unavailable
+         */
+        bool copy(void *dst_ptr, DeviceId dst_device,
+                  const void *src_ptr, DeviceId src_device,
+                  size_t bytes) override;
+
+        /**
+         * @brief Async copy between CUDA devices
+         *
+         * Same semantics as copy() but non-blocking.
+         */
+        bool copyAsync(void *dst_ptr, DeviceId dst_device,
+                       const void *src_ptr, DeviceId src_device,
+                       size_t bytes, void *stream = nullptr) override;
+
+        /**
+         * @brief Check if copy is supported between device pair
+         *
+         * Returns true only for CUDA↔CUDA pairs where P2P is available
+         * (or same device).
+         */
+        bool supportsCopy(DeviceId src_device, DeviceId dst_device) const override;
+
+        // =====================================================================
         // Synchronization
         // =====================================================================
 
@@ -295,13 +335,34 @@ namespace llaminar2
         void *stream_ = nullptr;
 
         // Multi-GPU single-process: per-GPU communicators and streams
-        std::vector<void *> all_comms_;    // One communicator per GPU (ncclComm_t)
-        std::vector<void *> all_streams_;  // One stream per GPU (cudaStream_t)
+        std::vector<void *> all_comms_;    // One communicator per GPU (ncclComm_t) - ONLY for non-coordinator mode
+        std::vector<void *> all_streams_;  // One stream per GPU (cudaStream_t) - ONLY for non-coordinator mode
         std::vector<int> device_ordinals_; // Device ordinals for each GPU
+
+        // Coordinator for multi-GPU single-process mode (owns all NCCL comms/streams)
+        std::unique_ptr<NCCLCoordinator> coordinator_;
 
         // Persistent temp buffer for stridedAllgather (avoids per-call alloc/sync)
         void *strided_allgather_temp_buf_ = nullptr;
         size_t strided_allgather_temp_size_ = 0;
+
+        // =====================================================================
+        // All-GPU NCCL communicator for copy() operations
+        // =====================================================================
+        // Initialized once during initialize() to span ALL enumerated CUDA devices.
+        // This allows efficient GPU-to-GPU copy via ncclSend/ncclRecv.
+        // NCCL handles all transport details (P2P, NVLink, PCIe staging) internally.
+
+        int copy_num_gpus_ = 0;               // Number of CUDA GPUs (all enumerated)
+        std::vector<void *> copy_comms_;      // Per-GPU NCCL communicators (size = copy_num_gpus_)
+        std::vector<void *> copy_streams_;    // Per-GPU CUDA streams (size = copy_num_gpus_)
+        bool copy_comms_initialized_ = false; // Flag to track initialization status
+
+        /// Initialize the all-GPU copy communicator (called from initialize())
+        bool initializeCopyComms();
+
+        /// Shutdown the copy communicator (called from shutdown())
+        void shutdownCopyComms();
 #endif
     };
 

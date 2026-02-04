@@ -9,18 +9,20 @@
  */
 
 #include "CUDAFlashAttentionKernelT.h"
+#include "../../../backends/IWorkerGPUContext.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/CUDAKernelProfiler.h"
 #include <cstring>
+#include <stdexcept>
 
 // Extern "C" declarations for CUDA kernel wrappers
 extern "C"
 {
-    // FA3-style pipelined prefill (SM >= 8.0)
+    // FA2-style pipelined prefill with WMMA (Ampere SM >= 8.0)
     // Supports head_dim=64 (6 consumer warps) and head_dim=128 (4 consumer warps)
-    int cudaFlashAttn_prefill_fa3(
+    int cudaFlashAttn_prefill_fa2(
         const float *Q, const float *K, const float *V, float *O,
         int batch_size, int seq_len, int kv_len,
         int n_heads, int n_kv_heads, int head_dim,
@@ -60,9 +62,37 @@ namespace llaminar2
         CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::CUDAFlashAttentionKernelT(int device_idx)
             : device_idx_(device_idx), stream_(nullptr),
               partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
-              workspace_size_(0), max_splits_(0)
+              workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
         {
             LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Created for device " << device_idx);
+        }
+
+        CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::CUDAFlashAttentionKernelT(
+            IWorkerGPUContext *ctx)
+            : stream_(nullptr),
+              partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
+              workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
+        {
+            if (!ctx)
+            {
+                throw std::runtime_error(
+                    "[CUDAFlashAttentionKernelT<FP32>] Device context is null");
+            }
+
+            if (!ctx->isInitialized())
+            {
+                throw std::runtime_error(
+                    "[CUDAFlashAttentionKernelT<FP32>] Device context is not initialized");
+            }
+
+            setDeviceContext(ctx);
+            device_idx_ = ctx->deviceOrdinal();
+
+            // Get stream from context
+            stream_ = ctx->defaultStream();
+
+            LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Created for device " << device_idx_
+                                                                               << " using device context");
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::~CUDAFlashAttentionKernelT()
@@ -78,7 +108,8 @@ namespace llaminar2
               partial_l_buf_(other.partial_l_buf_),
               workspace_size_(other.workspace_size_),
               max_splits_(other.max_splits_),
-              workspace_(other.workspace_)
+              workspace_(other.workspace_),
+              device_ctx_(other.device_ctx_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
@@ -87,6 +118,7 @@ namespace llaminar2
             other.workspace_size_ = 0;
             other.max_splits_ = 0;
             other.workspace_ = nullptr;
+            other.device_ctx_ = nullptr;
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP32> &
@@ -104,6 +136,7 @@ namespace llaminar2
                 workspace_size_ = other.workspace_size_;
                 max_splits_ = other.max_splits_;
                 workspace_ = other.workspace_;
+                device_ctx_ = other.device_ctx_;
 
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
@@ -112,6 +145,7 @@ namespace llaminar2
                 other.workspace_size_ = 0;
                 other.max_splits_ = 0;
                 other.workspace_ = nullptr;
+                other.device_ctx_ = nullptr;
             }
             return *this;
         }
@@ -295,14 +329,14 @@ namespace llaminar2
             }
             else
             {
-                // Flash Attention 3 for prefill or short KV
-                // Uses pipelined cp.async on SM >= 8.0, falls back to WMMA/scalar on older GPUs
-                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Using Flash Attention 3 (pipelined): "
+                // Flash Attention 2 (pipelined) for prefill or short KV
+                // Uses pipelined cp.async + WMMA on Ampere SM >= 8.0
+                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Using Flash Attention 2 (pipelined WMMA): "
                           << "batch=" << batch_size << " seq_len=" << seq_len << " kv_len=" << kv_len);
 
                 {
                     CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_PREFILL);
-                    result = cudaFlashAttn_prefill_fa3(
+                    result = cudaFlashAttn_prefill_fa2(
                         Q, K, V, output,
                         batch_size, seq_len, kv_len,
                         n_heads, n_kv_heads, head_dim,
@@ -474,9 +508,35 @@ namespace llaminar2
         CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::CUDAFlashAttentionKernelT(int device_idx)
             : device_idx_(device_idx), stream_(nullptr),
               partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
-              workspace_size_(0), max_splits_(0)
+              workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
         {
             LOG_DEBUG("[CUDAFlashAttentionKernelT<FP16>] Created for device " << device_idx);
+        }
+
+        CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::CUDAFlashAttentionKernelT(
+            IWorkerGPUContext *ctx)
+            : stream_(nullptr),
+              partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
+              workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
+        {
+            if (!ctx)
+            {
+                throw std::runtime_error(
+                    "[CUDAFlashAttentionKernelT<FP16>] Device context is null");
+            }
+
+            if (!ctx->isInitialized())
+            {
+                throw std::runtime_error(
+                    "[CUDAFlashAttentionKernelT<FP16>] Device context is not initialized");
+            }
+
+            setDeviceContext(ctx);
+            device_idx_ = ctx->deviceOrdinal();
+            stream_ = ctx->defaultStream();
+
+            LOG_DEBUG("[CUDAFlashAttentionKernelT<FP16>] Created for device " << device_idx_
+                                                                               << " using device context");
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::~CUDAFlashAttentionKernelT()
@@ -492,13 +552,15 @@ namespace llaminar2
               partial_l_buf_(other.partial_l_buf_),
               workspace_size_(other.workspace_size_),
               max_splits_(other.max_splits_),
-              workspace_(other.workspace_)
+              workspace_(other.workspace_),
+              device_ctx_(other.device_ctx_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
             other.partial_m_buf_ = nullptr;
             other.partial_l_buf_ = nullptr;
             other.workspace_ = nullptr;
+            other.device_ctx_ = nullptr;
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP16> &
@@ -516,11 +578,13 @@ namespace llaminar2
                 workspace_size_ = other.workspace_size_;
                 max_splits_ = other.max_splits_;
                 workspace_ = other.workspace_;
+                device_ctx_ = other.device_ctx_;
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
                 other.partial_m_buf_ = nullptr;
                 other.partial_l_buf_ = nullptr;
                 other.workspace_ = nullptr;
+                other.device_ctx_ = nullptr;
             }
             return *this;
         }
@@ -695,9 +759,35 @@ namespace llaminar2
         CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::CUDAFlashAttentionKernelT(int device_idx)
             : device_idx_(device_idx), stream_(nullptr),
               partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
-              workspace_size_(0), max_splits_(0)
+              workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
         {
             LOG_DEBUG("[CUDAFlashAttentionKernelT<BF16>] Created for device " << device_idx);
+        }
+
+        CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::CUDAFlashAttentionKernelT(
+            IWorkerGPUContext *ctx)
+            : stream_(nullptr),
+              partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
+              workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
+        {
+            if (!ctx)
+            {
+                throw std::runtime_error(
+                    "[CUDAFlashAttentionKernelT<BF16>] Device context is null");
+            }
+
+            if (!ctx->isInitialized())
+            {
+                throw std::runtime_error(
+                    "[CUDAFlashAttentionKernelT<BF16>] Device context is not initialized");
+            }
+
+            setDeviceContext(ctx);
+            device_idx_ = ctx->deviceOrdinal();
+            stream_ = ctx->defaultStream();
+
+            LOG_DEBUG("[CUDAFlashAttentionKernelT<BF16>] Created for device " << device_idx_
+                                                                               << " using device context");
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::~CUDAFlashAttentionKernelT()
@@ -713,13 +803,15 @@ namespace llaminar2
               partial_l_buf_(other.partial_l_buf_),
               workspace_size_(other.workspace_size_),
               max_splits_(other.max_splits_),
-              workspace_(other.workspace_)
+              workspace_(other.workspace_),
+              device_ctx_(other.device_ctx_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
             other.partial_m_buf_ = nullptr;
             other.partial_l_buf_ = nullptr;
             other.workspace_ = nullptr;
+            other.device_ctx_ = nullptr;
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::BF16> &
@@ -737,11 +829,13 @@ namespace llaminar2
                 workspace_size_ = other.workspace_size_;
                 max_splits_ = other.max_splits_;
                 workspace_ = other.workspace_;
+                device_ctx_ = other.device_ctx_;
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
                 other.partial_m_buf_ = nullptr;
                 other.partial_l_buf_ = nullptr;
                 other.workspace_ = nullptr;
+                other.device_ctx_ = nullptr;
             }
             return *this;
         }

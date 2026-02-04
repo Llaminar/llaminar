@@ -1,7 +1,10 @@
 #pragma once
 
-#include "kernels/IWorkspaceConsumer.h"
-#include "utils/Logging.h"
+#include "backends/IWorkerGPUContext.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/WorkspaceDescriptor.h"
+#include "interfaces/IWorkspaceConsumer.h"
+#include "utils/Logger.h"
 
 namespace llaminar2
 {
@@ -12,6 +15,10 @@ namespace llaminar2
      * Design Pattern: Dual-Mode Operation
      * - LEGACY MODE (hasWorkspace()=false): Kernel manages its own allocations
      * - MANAGED MODE (hasWorkspace()=true): Kernel uses pre-allocated workspace buffers
+     *
+     * Device Context Support (Phase 4):
+     * - When device context is set, kernels can use shared cuBLAS handles and streams
+     * - When no context, kernels manage their own handles (legacy behavior)
      *
      * Subclasses requiring workspace should:
      * 1. Override getWorkspaceRequirements() to declare buffer needs
@@ -42,6 +49,60 @@ namespace llaminar2
         bool hasWorkspace() const override { return workspace_ != nullptr; }
         DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
 
+        // =========================================================================
+        // Device Context Support (Phase 4)
+        // =========================================================================
+
+        /**
+         * @brief Set the device context for this kernel
+         *
+         * When a device context is set, the kernel can use shared library handles
+         * (cuBLAS, cuDNN, etc.) and streams from the context instead of creating
+         * its own. This reduces resource usage and improves multi-kernel coordination.
+         *
+         * @param ctx Device context (owned by GPUDeviceContextPool, not this kernel)
+         */
+        void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+
+        /**
+         * @brief Get the currently bound device context
+         * @return Device context, or nullptr if not bound
+         */
+        IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+
+        /**
+         * @brief Check if a device context is bound
+         * @return true if setDeviceContext() was called with a non-null context
+         */
+        bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+
+        /**
+         * @brief Get the CUDA stream from the device context
+         *
+         * Returns the default stream from the device context if one is bound,
+         * otherwise returns nullptr (which typically maps to the default CUDA stream).
+         *
+         * @return cudaStream_t cast to void*, or nullptr
+         */
+        void *getStream() const
+        {
+            return device_ctx_ ? device_ctx_->defaultStream() : nullptr;
+        }
+
+        /**
+         * @brief Get the cuBLAS handle from the device context
+         *
+         * Returns the cuBLAS handle from the device context if one is bound,
+         * otherwise returns nullptr. Kernels should fall back to their own
+         * handle when this returns nullptr.
+         *
+         * @return cublasHandle_t cast to void*, or nullptr
+         */
+        void *getBlasHandle() const
+        {
+            return device_ctx_ ? device_ctx_->blasHandle() : nullptr;
+        }
+
     protected:
         CUDAKernelBase() = default;
 
@@ -55,6 +116,7 @@ namespace llaminar2
         }
 
         DeviceWorkspaceManager *workspace_ = nullptr;
+        IWorkerGPUContext *device_ctx_ = nullptr;
     };
 
 } // namespace llaminar2

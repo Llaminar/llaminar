@@ -23,9 +23,9 @@
 #include "utils/ChatTemplate.h"
 #include "utils/BenchmarkRunner.h"
 #include "backends/ComputeBackend.h"
-#include "execution/factory/InferenceRunnerFactory.h"
-#include "execution/local_execution/orchestrators/IInferenceRunner.h"
-#include "execution/config/RuntimeConfig.h"
+#include "execution/InferenceRunnerFactory.h"
+#include "execution/IInferenceRunner.h"
+#include "execution/RuntimeConfig.h"
 #include "loaders/ModelLoader.h"
 #include "loaders/ModelContext.h"
 #include "loaders/DeviceOrchestrator.h"
@@ -85,90 +85,17 @@ void list_devices()
     LOG_DEBUG("\n");
 }
 
-DeviceId parse_device(const std::string &device_str, DeviceManager &dm, int local_rank = 0, int local_size = 1)
+DeviceId parse_device(const std::string &device_str, DeviceManager &dm)
 {
     if (device_str == "auto")
     {
-        // MPI-aware device selection with HOMOGENEOUS PREFERENCE
-        // Prefer all-CUDA (NCCL) or all-ROCm (RCCL) groups to avoid slow MPI fallback
-
-        const auto &devices = dm.devices();
-
-        // Separate GPUs by type for homogeneous group selection
-        std::vector<size_t> cuda_indices, rocm_indices;
-        for (size_t i = 1; i < devices.size(); ++i)
+        // DeviceManager returns 1-based indices for GPUs (0 = CPU)
+        int dm_idx = dm.select_device();
+        if (dm_idx == 0)
         {
-            const auto &dev = devices[i];
-            if (dev.type == ComputeBackendType::GPU_CUDA)
-                cuda_indices.push_back(i);
-            else if (dev.type == ComputeBackendType::GPU_ROCM)
-                rocm_indices.push_back(i);
-        }
-
-        // Choose the best homogeneous group based on world size
-        // Preference order: CUDA (NCCL) > ROCm (RCCL) > single GPU > CPU
-        std::vector<size_t> *chosen = nullptr;
-        const char *type_name = nullptr;
-
-        if (!cuda_indices.empty() && local_size <= static_cast<int>(cuda_indices.size()))
-        {
-            chosen = &cuda_indices;
-            type_name = "CUDA (NCCL-capable)";
-        }
-        else if (!rocm_indices.empty() && local_size <= static_cast<int>(rocm_indices.size()))
-        {
-            chosen = &rocm_indices;
-            type_name = "ROCm (RCCL-capable)";
-        }
-        else
-        {
-            // Fallback: not enough homogeneous GPUs for all ranks
-            // Use best single GPU (only rank 0 gets a GPU, others get CPU)
-            if (local_rank == 0)
-            {
-                if (!cuda_indices.empty())
-                {
-                    chosen = &cuda_indices;
-                    type_name = "CUDA (single, other ranks on CPU)";
-                }
-                else if (!rocm_indices.empty())
-                {
-                    chosen = &rocm_indices;
-                    type_name = "ROCm (single, other ranks on CPU)";
-                }
-            }
-            else
-            {
-                // Non-zero ranks fall back to CPU when GPUs are heterogeneous
-                LOG_WARN("Rank " << local_rank << " falling back to CPU (heterogeneous GPU config)");
-                return DeviceId::cpu();
-            }
-        }
-
-        if (!chosen || chosen->empty())
-        {
-            LOG_DEBUG("No GPUs available, falling back to CPU");
             return DeviceId::cpu();
         }
-
-        // Assign within the homogeneous group
-        size_t gpu_idx = local_rank % chosen->size();
-        size_t dm_idx = (*chosen)[gpu_idx];
-        const auto &dev = devices[dm_idx];
-
-        LOG_INFO("Homogeneous auto-select: " << type_name
-                                             << " device " << dev.device_id
-                                             << " for local_rank " << local_rank << "/" << local_size);
-
-        switch (dev.type)
-        {
-        case ComputeBackendType::GPU_CUDA:
-            return DeviceId::cuda(dev.device_id);
-        case ComputeBackendType::GPU_ROCM:
-            return DeviceId::rocm(dev.device_id);
-        default:
-            return DeviceId::cpu();
-        }
+        return DeviceId::cuda(dm_idx - 1);
     }
 
     if (device_str == "cpu")
@@ -397,68 +324,43 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Get local rank for MPI-aware device selection
-    // This uses MPI_Comm_split_type to identify ranks on the same node
-    MPI_Comm local_comm;
-    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, mpi_ctx->rank(),
-                        MPI_INFO_NULL, &local_comm);
-    int local_rank, local_size;
-    MPI_Comm_rank(local_comm, &local_rank);
-    MPI_Comm_size(local_comm, &local_size);
-    MPI_Comm_free(&local_comm);
-
-    LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Local rank: " << local_rank << "/" << local_size
-                       << " (for GPU assignment)");
-
-    // When --no-mpi-bootstrap is used and there are multiple local ranks,
-    // re-initialize DeviceManager WITHOUT NUMA filtering so all GPUs are visible.
-    // This allows manual multi-rank setups to cross NUMA boundaries if needed.
-    // Standard bootstrap respects NUMA affinity for optimal memory bandwidth.
-    if (args.mpi_no_bootstrap && local_size > 1)
-    {
-        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] --no-mpi-bootstrap with multi-rank: re-initializing DeviceManager without NUMA filtering");
-        dm.initialize(-1); // -1 = no NUMA filtering, all GPUs visible
-    }
-
-    // Parse device (MPI-aware: distributes GPUs across local ranks)
-    DeviceId device_id = parse_device(args.device, dm, local_rank, local_size);
+    // Parse device
+    DeviceId device_id = parse_device(args.device, dm);
     if (!device_id.is_valid())
     {
         MPI_Finalize();
         return 1;
     }
 
-    LOG_INFO("[Rank " << mpi_ctx->rank() << "] Using device: " << device_id.to_string());
-
     // Parse placement strategy
-    WeightPlacementStrategy strategy = WeightPlacementStrategy::AUTO;
+    PlacementStrategy strategy = PlacementStrategy::AUTO;
     if (args.strategy == "all-gpu")
     {
-        strategy = WeightPlacementStrategy::ALL_GPU;
+        strategy = PlacementStrategy::ALL_GPU;
     }
     else if (args.strategy == "all-cpu")
     {
-        strategy = WeightPlacementStrategy::ALL_CPU;
+        strategy = PlacementStrategy::ALL_CPU;
     }
     else if (args.strategy == "layer-split")
     {
-        strategy = WeightPlacementStrategy::LAYER_SPLIT;
+        strategy = PlacementStrategy::LAYER_SPLIT;
     }
     else if (args.strategy == "memory-aware")
     {
-        strategy = WeightPlacementStrategy::MEMORY_AWARE;
+        strategy = PlacementStrategy::MEMORY_AWARE;
     }
     else if (args.strategy == "moe-optimized")
     {
-        strategy = WeightPlacementStrategy::MOE_OPTIMIZED;
+        strategy = PlacementStrategy::MOE_OPTIMIZED;
     }
     else if (args.strategy == "custom")
     {
-        strategy = WeightPlacementStrategy::CUSTOM;
+        strategy = PlacementStrategy::CUSTOM;
     }
     else if (args.strategy == "multi-gpu")
     {
-        strategy = WeightPlacementStrategy::MULTI_GPU;
+        strategy = PlacementStrategy::MULTI_GPU;
     }
     else if (args.strategy != "auto")
     {
@@ -469,15 +371,13 @@ int main(int argc, char *argv[])
     }
 
     // Auto-enable multi-gpu strategy if --multi-gpu or --gpus specified
-    if (args.multi_gpu && strategy == WeightPlacementStrategy::AUTO)
+    if (args.multi_gpu && strategy == PlacementStrategy::AUTO)
     {
-        strategy = WeightPlacementStrategy::MULTI_GPU;
+        strategy = PlacementStrategy::MULTI_GPU;
     }
 
     // Create orchestration config from ArgContext
-    // NOTE: Using LegacyOrchestrationConfig for the old DeviceOrchestrator path
-    // New orchestration uses config/OrchestrationConfig.h via MultiDeviceOrchestrator
-    LegacyOrchestrationConfig orch_config;
+    OrchestrationConfig orch_config;
     orch_config.strategy = strategy;
     orch_config.gpu_device = device_id;
     orch_config.offload_layers = args.offload_layers;
@@ -493,24 +393,6 @@ int main(int argc, char *argv[])
     for (int gpu_idx : args.gpu_devices)
     {
         orch_config.gpu_devices.push_back(DeviceId::cuda(gpu_idx));
-    }
-
-    // Phase 6.5: Heterogeneous multi-domain parallelism configuration
-    orch_config.heterogeneous_mode = args.heterogeneous_mode;
-    orch_config.cpu_compute_fraction = args.cpu_compute_fraction;
-    orch_config.enable_gpu_tp = !args.disable_gpu_tp;
-    orch_config.enable_cpu_tp = !args.disable_cpu_tp;
-    orch_config.min_layers_per_domain = args.min_layers_per_domain;
-
-    // Warn if heterogeneous mode is used with single rank
-    if (args.heterogeneous_mode && mpi_ctx->world_size() == 1)
-    {
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_WARN("--heterogeneous specified with single MPI rank. "
-                     "Multi-domain parallelism works best with world_size >= 2. "
-                     "Consider using --mpi-procs to specify more ranks.");
-        }
     }
 
     // Create device orchestrator

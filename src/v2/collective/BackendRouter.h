@@ -199,6 +199,21 @@ namespace llaminar2
          */
         BackendSelection selectBackend(const DeviceGroup &group) const;
 
+        /**
+         * @brief Get backend that supports copy between two devices
+         *
+         * Selects the optimal backend for direct GPU-to-GPU copy:
+         * - Cross-vendor (CUDA↔ROCm): PCIeBAR backend
+         * - Same CUDA vendor: NCCL backend
+         * - Same ROCm vendor: RCCL backend
+         * - CPU-to-CPU: Host backend
+         *
+         * @param src Source device
+         * @param dst Destination device
+         * @return Backend pointer or nullptr if none supports this path
+         */
+        ICollectiveBackend *getBackendForCopy(DeviceId src, DeviceId dst);
+
         // =====================================================================
         // Backend Management
         // =====================================================================
@@ -338,6 +353,10 @@ namespace llaminar2
         CollectiveBackendType selectBackendType(const DeviceGroup &group) const;
         std::string makeGroupKey(const DeviceGroup &group) const;
 
+        // Pre-initialize GPU backends to avoid CUDA/HIP context corruption
+        void preInitializeNCCLBackend();
+        void preInitializeRCCLBackend();
+
         // Domain-aware selection helpers
         bool hasHeterogeneousGPUs(const std::vector<DeviceId> &devices) const;
         bool allCUDA(const std::vector<DeviceId> &devices) const;
@@ -378,9 +397,24 @@ namespace llaminar2
     class GlobalBackendRouter
     {
     public:
+        /**
+         * @brief Initialize global router with MPI context and cluster inventory
+         *
+         * Standard initialization for production use.
+         */
         static void init(
             std::shared_ptr<MPIContext> mpi_ctx,
             const ClusterInventory &cluster_inventory);
+
+        /**
+         * @brief Initialize global router for tests (no MPI required)
+         *
+         * Creates router with minimal ClusterInventory (single rank, single node).
+         * Use in test environments where MPI is not available.
+         *
+         * @return true if initialization succeeded
+         */
+        static bool initForTests();
 
         static BackendRouter *get();
 

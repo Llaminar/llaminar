@@ -321,21 +321,6 @@ namespace llaminar2
         int seed = -1;
 
         /**
-         * @brief Weight loading precision (how weights are stored in memory)
-         *
-         * Determines whether weights are kept in original GGUF format or
-         * immediately converted to a different format at load time.
-         *
-         * Examples:
-         * - NATIVE: IQ4_NL weights stay as IQ4_NL (dequantized on-the-fly in kernels)
-         * - CONVERT_TO_FP32: IQ4_NL weights converted to FP32 at load (no runtime dequant)
-         * - CONVERT_TO_INT8: Q8_0 weights converted to INT8 at load
-         *
-         * Default: NATIVE (memory-efficient, dequantize on-the-fly)
-         */
-        WeightPrecision weight_precision = WeightPrecision::NATIVE;
-
-        /**
          * @brief Activation buffer format
          *
          * Determines the format for all activation buffers in DRAM:

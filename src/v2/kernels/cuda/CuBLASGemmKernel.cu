@@ -7,6 +7,7 @@
  */
 
 #include "CuBLASGemmKernel.h"
+#include "backends/IWorkerGPUContext.h"
 #include "utils/Logger.h"
 
 #include <iostream>
@@ -73,7 +74,7 @@ namespace llaminar2
         // =====================================================================
 
         CuBLASGemmKernel::CuBLASGemmKernel(int device_id, Precision precision)
-            : device_id_(device_id), precision_(precision)
+            : device_id_(device_id), precision_(precision), owns_handle_(true)
         {
             // Set device
             cudaError_t cuda_err = cudaSetDevice(device_id_);
@@ -109,17 +110,79 @@ namespace llaminar2
 
             LOG_DEBUG("[CuBLASGemmKernel] Created on device " << device_id_
                                                               << " with precision "
-                                                              << static_cast<int>(precision_));
+                                                              << static_cast<int>(precision_)
+                                                              << " (owns handle)");
+        }
+
+        CuBLASGemmKernel::CuBLASGemmKernel(IWorkerGPUContext *ctx, Precision precision)
+            : precision_(precision), owns_handle_(false)
+        {
+            if (!ctx)
+            {
+                throw std::runtime_error(
+                    "[CuBLASGemmKernel] Device context is null");
+            }
+
+            if (!ctx->isInitialized())
+            {
+                throw std::runtime_error(
+                    "[CuBLASGemmKernel] Device context is not initialized");
+            }
+
+            // Store the device context (sets device_ctx_ in base class)
+            setDeviceContext(ctx);
+            device_id_ = ctx->deviceOrdinal();
+
+            // Get cuBLAS handle from context via submitAndWait
+            // blasHandle() must be called from the worker thread per thread-safety model
+            void *blas_handle = nullptr;
+            std::exception_ptr eptr = nullptr;
+            ctx->submitAndWait([&]() {
+                try {
+                    blas_handle = ctx->blasHandle();
+                } catch (...) {
+                    eptr = std::current_exception();
+                }
+            });
+            if (eptr) {
+                std::rethrow_exception(eptr);
+            }
+            if (!blas_handle)
+            {
+                throw std::runtime_error(
+                    "[CuBLASGemmKernel] Device context has no cuBLAS handle");
+            }
+            handle_ = static_cast<cublasHandle_t>(blas_handle);
+
+            // Get cuBLASLt handle from context (required for fused operations)
+            void *lt_handle_ptr = nullptr;
+            ctx->submitAndWait([&]() {
+                lt_handle_ptr = ctx->blasLtHandle();
+            });
+            if (!lt_handle_ptr)
+            {
+                throw std::runtime_error(
+                    "[CuBLASGemmKernel] Device context has no cuBLASLt handle");
+            }
+            lt_handle_ = static_cast<cublasLtHandle_t>(lt_handle_ptr);
+            owns_lt_handle_ = false;
+
+            LOG_DEBUG("[CuBLASGemmKernel] Created on device " << device_id_
+                                                              << " with precision "
+                                                              << static_cast<int>(precision_)
+                                                              << " (using context handle)");
         }
 
         CuBLASGemmKernel::~CuBLASGemmKernel()
         {
-            if (lt_handle_)
+            // Only destroy lt_handle_ if we own it
+            if (owns_lt_handle_ && lt_handle_)
             {
                 cublasLtDestroy(lt_handle_);
                 lt_handle_ = nullptr;
             }
-            if (handle_)
+            // Only destroy cuBLAS handle if we own it
+            if (owns_handle_ && handle_)
             {
                 cublasDestroy(handle_);
                 handle_ = nullptr;
@@ -128,13 +191,18 @@ namespace llaminar2
 
         // Move constructor
         CuBLASGemmKernel::CuBLASGemmKernel(CuBLASGemmKernel &&other) noexcept
-            : handle_(other.handle_),
+            : CUDAKernelBase(std::move(other)),
+              handle_(other.handle_),
               lt_handle_(other.lt_handle_),
               device_id_(other.device_id_),
-              precision_(other.precision_)
+              precision_(other.precision_),
+              owns_handle_(other.owns_handle_),
+              owns_lt_handle_(other.owns_lt_handle_)
         {
             other.handle_ = nullptr;
             other.lt_handle_ = nullptr;
+            other.owns_handle_ = false;    // Moved-from object shouldn't destroy anything
+            other.owns_lt_handle_ = false; // Moved-from object shouldn't destroy anything
         }
 
         // Move assignment
@@ -142,20 +210,31 @@ namespace llaminar2
         {
             if (this != &other)
             {
-                if (lt_handle_)
+                // Destroy our resources if we own them
+                if (owns_lt_handle_ && lt_handle_)
                 {
                     cublasLtDestroy(lt_handle_);
                 }
-                if (handle_)
+                if (owns_handle_ && handle_)
                 {
                     cublasDestroy(handle_);
                 }
+                
+                // Move base class
+                CUDAKernelBase::operator=(std::move(other));
+                
+                // Take ownership of other's resources
                 handle_ = other.handle_;
                 lt_handle_ = other.lt_handle_;
                 device_id_ = other.device_id_;
                 precision_ = other.precision_;
+                owns_handle_ = other.owns_handle_;
+                owns_lt_handle_ = other.owns_lt_handle_;
+                
                 other.handle_ = nullptr;
                 other.lt_handle_ = nullptr;
+                other.owns_handle_ = false;
+                other.owns_lt_handle_ = false;
             }
             return *this;
         }
@@ -422,11 +501,18 @@ namespace llaminar2
         // Factory function
         // =====================================================================
 
+        // Factory function - legacy (creates own handle)
         std::unique_ptr<CuBLASGemmKernel> createCuBLASGemm(
-            int device_id,
-            CuBLASGemmKernel::Precision precision)
+            int device_id, CuBLASGemmKernel::Precision precision)
         {
             return std::make_unique<CuBLASGemmKernel>(device_id, precision);
+        }
+
+        // Factory function - with device context
+        std::unique_ptr<CuBLASGemmKernel> createCuBLASGemm(
+            IWorkerGPUContext *ctx, CuBLASGemmKernel::Precision precision)
+        {
+            return std::make_unique<CuBLASGemmKernel>(ctx, precision);
         }
 
 #else // !HAVE_CUDA
@@ -434,7 +520,13 @@ namespace llaminar2
         // Stub implementations when CUDA is not available
 
         CuBLASGemmKernel::CuBLASGemmKernel(int device_id, Precision precision)
-            : device_id_(device_id), precision_(precision)
+            : device_id_(device_id), precision_(precision), owns_handle_(true)
+        {
+            throw std::runtime_error("[CuBLASGemmKernel] CUDA support not compiled");
+        }
+
+        CuBLASGemmKernel::CuBLASGemmKernel(IWorkerGPUContext * /*ctx*/, Precision precision)
+            : precision_(precision), owns_handle_(false)
         {
             throw std::runtime_error("[CuBLASGemmKernel] CUDA support not compiled");
         }
@@ -462,6 +554,11 @@ namespace llaminar2
         }
 
         std::unique_ptr<CuBLASGemmKernel> createCuBLASGemm(int, CuBLASGemmKernel::Precision)
+        {
+            return nullptr;
+        }
+
+        std::unique_ptr<CuBLASGemmKernel> createCuBLASGemm(IWorkerGPUContext *, CuBLASGemmKernel::Precision)
         {
             return nullptr;
         }

@@ -26,160 +26,57 @@
 
 #include "../ParityTestBase.h"
 #include "models/qwen/Qwen2Schema.h"
+#include "models/qwen/Qwen2Graph.h"
 #include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "execution/runner/OrchestrationRunner.h"
+#include "execution/mpi_orchestration/RankExecutionPlan.h"
+#include "execution/local_execution/graph/GraphExecutor.h"
+#include "execution/local_execution/graph/GraphBufferManager.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #include "collective/ILocalTPContext.h"
 #include "collective/LocalTPContext.h"
+#include "collective/ILocalPPContext.h"
+#include "collective/IGlobalTPContext.h"
+#include "collective/GlobalTPContext.h"
+#include "collective/PPStage.h"
+#include "config/PipelineConfig.h"
+#include "tensors/TensorFactory.h"
+#include "kernels/KernelFactory.h"
+#include "kernels/cpu/CPUKVCache.h"
+#include "utils/Sampler.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "backends/BackendManager.h"
 #include "backends/ComputeBackend.h"
+#include "execution/factory/InferenceRunnerFactory.h"
+#include "collective/BackendRouter.h"
+#include "../../../mocks/MockLocalPPContext.h"
 
 namespace llaminar2::test::parity::qwen2
 {
 
     // =============================================================================
-    // Device Configuration Types
+    // Import common types from base parity namespace
     // =============================================================================
-
-    /**
-     * @brief Device type for parity tests
-     * Note: Named ParityParityDeviceType to avoid collision with llaminar2::DeviceType
-     */
-    enum class ParityDeviceType
-    {
-        CPU,
-        CUDA,
-        ROCm
-    };
-
-    /**
-     * @brief Parallelism strategy
-     */
-    enum class Parallelism
-    {
-        None,    ///< Single device, no parallelism
-        LocalTP, ///< Local Tensor Parallelism (multi-device, single process)
-        // Future: GlobalTP, PipelineParallel, Hybrid
-    };
-
-    /**
-     * @brief Collective backend for tensor parallelism
-     */
-    enum class Collective
-    {
-        None,    ///< No collective needed (single device)
-        NCCL,    ///< NVIDIA NCCL (CUDA-CUDA)
-        RCCL,    ///< AMD RCCL (ROCm-ROCm)
-        PCIeBAR, ///< Cross-vendor via PCIe BAR (CUDA-ROCm)
-        // Future: MPI (for global TP)
-    };
+    using llaminar2::test::parity::BackendThresholds;
+    using llaminar2::test::parity::checkHardwareAvailability;
+    using llaminar2::test::parity::Collective;
+    using llaminar2::test::parity::collectiveName;
+    using llaminar2::test::parity::deviceTypeName;
+    using llaminar2::test::parity::getCudaDeviceCount;
+    using llaminar2::test::parity::getRocmDeviceCount;
+    using llaminar2::test::parity::isMpiInitialized;
+    using llaminar2::test::parity::Parallelism;
+    using llaminar2::test::parity::parallelismName;
+    using llaminar2::test::parity::ParityDeviceType;
+    using llaminar2::test::parity::TestConfig;
+    using llaminar2::test::parity::toCollectiveBackend;
+    using llaminar2::test::parity::toDeviceId;
+    using llaminar2::test::parity::toGlobalAddress;
 
     // =============================================================================
-    // Device Configuration Utilities
+    // Qwen2-Specific Hardware Detection (supplements base utilities)
     // =============================================================================
-
-    inline DeviceId toDeviceId(ParityDeviceType type, int index = 0)
-    {
-        switch (type)
-        {
-        case ParityDeviceType::CPU:
-            return DeviceId::cpu();
-        case ParityDeviceType::CUDA:
-            return DeviceId::cuda(index);
-        case ParityDeviceType::ROCm:
-            return DeviceId::rocm(index);
-        }
-        return DeviceId::cpu();
-    }
-
-    inline GlobalDeviceAddress toGlobalAddress(ParityDeviceType type, int index = 0)
-    {
-        switch (type)
-        {
-        case ParityDeviceType::CPU:
-            return GlobalDeviceAddress::cpu();
-        case ParityDeviceType::CUDA:
-            return GlobalDeviceAddress::cuda(index);
-        case ParityDeviceType::ROCm:
-            return GlobalDeviceAddress::rocm(index);
-        }
-        return GlobalDeviceAddress::cpu();
-    }
-
-    inline CollectiveBackendType toCollectiveBackend(Collective c)
-    {
-        switch (c)
-        {
-        case Collective::NCCL:
-            return CollectiveBackendType::NCCL;
-        case Collective::RCCL:
-            return CollectiveBackendType::RCCL;
-        case Collective::PCIeBAR:
-            return CollectiveBackendType::PCIE_BAR;
-        case Collective::None:
-            return CollectiveBackendType::MPI;
-        }
-        return CollectiveBackendType::MPI;
-    }
-
-    inline std::string deviceTypeName(ParityDeviceType t)
-    {
-        switch (t)
-        {
-        case ParityDeviceType::CPU:
-            return "CPU";
-        case ParityDeviceType::CUDA:
-            return "CUDA";
-        case ParityDeviceType::ROCm:
-            return "ROCm";
-        }
-        return "Unknown";
-    }
-
-    inline std::string collectiveName(Collective c)
-    {
-        switch (c)
-        {
-        case Collective::None:
-            return "None";
-        case Collective::NCCL:
-            return "NCCL";
-        case Collective::RCCL:
-            return "RCCL";
-        case Collective::PCIeBAR:
-            return "PCIeBAR";
-        }
-        return "Unknown";
-    }
-
-    // =============================================================================
-    // Hardware Detection
-    // =============================================================================
-
-    inline int getCudaDeviceCount()
-    {
-        auto &dm = DeviceManager::instance();
-        if (dm.devices().empty())
-            dm.initialize(-1);
-
-        int count = 0;
-        for (const auto &dev : dm.devices())
-            if (dev.type == ComputeBackendType::GPU_CUDA)
-                count++;
-        return count;
-    }
-
-    inline int getRocmDeviceCount()
-    {
-        auto &dm = DeviceManager::instance();
-        if (dm.devices().empty())
-            dm.initialize(-1);
-
-        int count = 0;
-        for (const auto &dev : dm.devices())
-            if (dev.type == ComputeBackendType::GPU_ROCM)
-                count++;
-        return count;
-    }
 
     inline bool isNcclAvailable()
     {
@@ -204,97 +101,23 @@ namespace llaminar2::test::parity::qwen2
         return getCudaDeviceCount() > 0 && getRocmDeviceCount() > 0;
     }
 
-    /**
-     * @brief Check if MPI is initialized
-     */
-    inline bool isMpiInitialized()
-    {
-        int initialized = 0;
-        MPI_Initialized(&initialized);
-        return initialized != 0;
-    }
-
     // =============================================================================
-    // Configuration Structures
+    // Qwen2-Specific Hardware Availability Check (extends base check)
     // =============================================================================
 
     /**
-     * @brief Backend-specific threshold configuration
+     * @brief Extended hardware availability check for Qwen2 tests
      *
-     * Different backends have different quantization characteristics:
-     * - CPU (Q8_1): Per-block quantization, tighter thresholds
-     * - CUDA (INT8): Per-row symmetric, relaxed thresholds
-     * - ROCm: Similar to CUDA
+     * Extends the base checkHardwareAvailability() with collective backend checks
+     * (NCCL, RCCL, PCIeBAR availability).
      */
-    struct BackendThresholds
+    inline std::optional<std::string> checkQwen2HardwareAvailability(const TestConfig &cfg)
     {
-        float cosine_threshold = 0.99f;        ///< Minimum cosine similarity for layer pass
-        float decode_cosine_threshold = 0.99f; ///< Minimum avg cosine for decode steps
-        int early_layers_count = 6;            ///< Number of early layers to check strictly
-        int min_early_layers_passed = 6;       ///< Minimum early layers that must pass
-        float kl_threshold = 0.15f;            ///< Maximum KL divergence for LM_HEAD
+        // First run base checks (device counts, MPI, etc.)
+        if (auto reason = checkHardwareAvailability(cfg))
+            return reason;
 
-        /// Stages to exclude from per-layer parity comparison.
-        std::vector<std::string> excluded_stages;
-    };
-
-    /**
-     * @brief Complete declarative test configuration
-     *
-     * The devices vector is the single source of truth for device configuration.
-     * Use the helper methods device_count() and primary_device() to derive values.
-     */
-    struct TestConfig
-    {
-        std::string name;                      ///< Human-readable test name
-        std::vector<ParityDeviceType> devices; ///< Device list (heterogeneous supported)
-        Parallelism parallelism;               ///< Parallelism strategy
-        Collective collective;                 ///< Collective backend
-        BackendThresholds thresholds;          ///< Parity thresholds
-        std::string skip_reason;               ///< If non-empty, test will skip with this message
-
-        // Derived accessors
-        size_t device_count() const { return devices.size(); }
-        ParityDeviceType primary_device() const { return devices.empty() ? ParityDeviceType::CPU : devices[0]; }
-        bool is_local_tp() const { return parallelism == Parallelism::LocalTP; }
-        bool is_single_device() const { return parallelism == Parallelism::None && devices.size() == 1; }
-        bool should_skip() const { return !skip_reason.empty(); }
-    };
-
-    /**
-     * @brief Check if a TestConfig can run on current hardware
-     * @return std::nullopt if available, or a skip reason string
-     */
-    inline std::optional<std::string> checkHardwareAvailability(const TestConfig &cfg)
-    {
-        // Check explicit skip reason first
-        if (cfg.should_skip())
-            return cfg.skip_reason;
-
-        // Check MPI initialization for LocalTP tests
-        if (cfg.is_local_tp())
-        {
-            if (!isMpiInitialized())
-                return "LocalTP requires MPI (run with mpirun -np 1)";
-        }
-
-        int cuda_count = getCudaDeviceCount();
-        int rocm_count = getRocmDeviceCount();
-
-        int required_cuda = 0, required_rocm = 0;
-        for (auto dt : cfg.devices)
-        {
-            if (dt == ParityDeviceType::CUDA)
-                required_cuda++;
-            if (dt == ParityDeviceType::ROCm)
-                required_rocm++;
-        }
-
-        if (required_cuda > cuda_count)
-            return "Need " + std::to_string(required_cuda) + " CUDA devices, found " + std::to_string(cuda_count);
-        if (required_rocm > rocm_count)
-            return "Need " + std::to_string(required_rocm) + " ROCm devices, found " + std::to_string(rocm_count);
-
+        // Additional checks for collective backends
         switch (cfg.collective)
         {
         case Collective::NCCL:
@@ -309,7 +132,10 @@ namespace llaminar2::test::parity::qwen2
             if (!isPcieBarAvailable())
                 return "PCIeBAR requires both CUDA and ROCm devices";
             break;
+        case Collective::MPI:
+        case Collective::HOST:
         case Collective::None:
+            // These are always available
             break;
         }
 
@@ -402,13 +228,22 @@ namespace llaminar2::test::parity::qwen2
 
         WeightDistributionStrategy getWeightStrategy() override
         {
-            return cfg().is_local_tp() ? WeightDistributionStrategy::SHARDED
-                                       : WeightDistributionStrategy::REPLICATED;
+            // LocalTP shards weights across devices
+            // LocalPP uses LAYER_PARTITIONED - each stage loads only its assigned layers
+            // GlobalTP shards weights across MPI ranks
+            if (cfg().is_local_tp())
+                return WeightDistributionStrategy::SHARDED;
+            else if (cfg().is_local_pp())
+                return WeightDistributionStrategy::LAYER_PARTITIONED;
+            else if (cfg().is_global_tp())
+                return WeightDistributionStrategy::SHARDED;
+            else
+                return WeightDistributionStrategy::REPLICATED;
         }
 
         void configureModel(std::shared_ptr<ModelContext> model_ctx) override
         {
-            if (cfg().is_local_tp())
+            if (cfg().is_local_tp() || cfg().is_global_tp())
             {
                 Qwen2SchemaFactory schema_factory;
                 model_ctx->weightManager()->setWeightShardingConfig(
@@ -422,14 +257,14 @@ namespace llaminar2::test::parity::qwen2
 
         void SetUp() override
         {
-            // Check hardware availability (includes MPI check for LocalTP)
-            if (auto skip_reason = checkHardwareAvailability(cfg()))
+            // Check hardware availability (includes MPI check for LocalTP + NCCL/RCCL/PCIeBAR)
+            if (auto skip_reason = checkQwen2HardwareAvailability(cfg()))
             {
                 GTEST_SKIP() << *skip_reason;
             }
 
-            // MPI setup for LOCAL TP (MPI_Initialized already checked above)
-            if (cfg().is_local_tp())
+            // MPI setup for LOCAL TP/PP (MPI_Initialized already checked above)
+            if (cfg().is_local_tp() || cfg().is_local_pp())
             {
                 int rank = 0, world_size = 1;
                 MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -437,7 +272,22 @@ namespace llaminar2::test::parity::qwen2
 
                 if (world_size != 1)
                 {
-                    GTEST_SKIP() << "LOCAL TP test must run with -np 1 (got " << world_size << ")";
+                    GTEST_SKIP() << "LOCAL TP/PP test must run with -np 1 (got " << world_size << ")";
+                }
+
+                mpi_ctx_ = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
+            }
+            // MPI setup for GLOBAL TP (requires multiple ranks)
+            else if (cfg().is_global_tp())
+            {
+                int rank = 0, world_size = 1;
+                MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+                MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+                if (world_size < cfg().mpi_ranks)
+                {
+                    GTEST_SKIP() << "GLOBAL TP test requires " << cfg().mpi_ranks
+                                 << " MPI ranks (got " << world_size << ")";
                 }
 
                 mpi_ctx_ = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
@@ -448,7 +298,7 @@ namespace llaminar2::test::parity::qwen2
             LOG_INFO("║  PARITY TEST: " << cfg().name);
             LOG_INFO("╠══════════════════════════════════════════════════════════════════╣");
             LOG_INFO("║  Devices: " << cfg().device_count() << "x " << deviceTypeName(cfg().primary_device()));
-            LOG_INFO("║  Parallelism: " << (cfg().is_local_tp() ? "LOCAL TP" : "None"));
+            LOG_INFO("║  Parallelism: " << parallelismName(cfg().parallelism));
             LOG_INFO("║  Collective: " << collectiveName(cfg().collective));
             LOG_INFO("╚══════════════════════════════════════════════════════════════════╝");
 
@@ -458,6 +308,8 @@ namespace llaminar2::test::parity::qwen2
         void TearDown() override
         {
             multi_orch_.reset();
+            global_tp_ctx_.reset();
+            pp_orchestrator_.reset();
             Qwen2ParityTestBase::TearDown();
         }
 
@@ -469,6 +321,10 @@ namespace llaminar2::test::parity::qwen2
         {
             if (cfg().is_local_tp())
                 return setupLocalTPPipeline();
+            else if (cfg().is_local_pp())
+                return setupLocalPPPipeline();
+            else if (cfg().is_global_tp())
+                return setupGlobalTPPipeline();
             else
                 return ParityTestBase::setupPipeline();
         }
@@ -552,6 +408,104 @@ namespace llaminar2::test::parity::qwen2
 
             return true;
         }
+
+        /**
+         * @brief Setup pipeline for LocalPP tests using MultiDeviceOrchestrator PP mode
+         *
+         * Creates a pipeline parallel configuration where layers are split across
+         * multiple devices. Uses MultiDeviceOrchestrator with PP mode which:
+         * - Creates per-stage DeviceGraphOrchestrator instances
+         * - Handles sequential forward execution through stages
+         * - Manages activation transfer via LocalPPContext
+         *
+         * @return true if setup succeeded, false on error
+         */
+        bool setupLocalPPPipeline()
+        {
+            // Delegate to model-agnostic base class implementation
+            return ParityTestBase::setupLocalPPPipeline();
+        }
+
+        /**
+         * @brief Setup pipeline for GlobalTP tests using MPI
+         *
+         * Creates a Global TP configuration where weights are sharded across
+         * multiple MPI ranks. Each rank participates in the TP domain and
+         * contributes to collective operations via MPI.
+         *
+         * Key features:
+         * - Uses GlobalTPContext for cross-rank collective operations
+         * - MPI_COMM_WORLD is used as the domain communicator
+         * - Each rank operates on its local CPU device
+         *
+         * @return true if setup succeeded, false on error
+         */
+        bool setupGlobalTPPipeline()
+        {
+            DeviceManager::instance().initialize(-1);
+
+            // For GlobalTP, weights are sharded across MPI ranks
+            model_ctx_ = ModelContext::create(
+                config_.model_path,
+                mpi_ctx_,
+                nullptr,
+                nullptr,
+                WeightDistributionStrategy::SHARDED);
+
+            if (!model_ctx_)
+            {
+                LOG_ERROR("[Parity] Failed to load model");
+                return false;
+            }
+
+            configureModel(model_ctx_);
+
+            // Get MPI info
+            int rank = mpi_ctx_->rank();
+            int world_size = mpi_ctx_->world_size();
+
+            LOG_INFO("[Parity] GlobalTP setup: rank " << rank << "/" << world_size);
+
+            // Build world_ranks vector (all ranks participate)
+            std::vector<int> world_ranks;
+            for (int r = 0; r < world_size; ++r)
+            {
+                world_ranks.push_back(r);
+            }
+
+            // Create GlobalTPContext using MPI_COMM_WORLD
+            // Domain ID 0, all ranks participate
+            global_tp_ctx_ = GlobalTPContext::createForTest(
+                MPI_COMM_WORLD,
+                0, // domain_id
+                world_ranks);
+
+            if (!global_tp_ctx_)
+            {
+                LOG_ERROR("[Parity] Failed to create GlobalTPContext");
+                return false;
+            }
+
+            LOG_INFO("[Parity] GlobalTPContext created: degree=" << global_tp_ctx_->degree()
+                                                                 << ", myIndex=" << global_tp_ctx_->myIndex());
+
+            // For GlobalTP parity test, we need to use the graph execution path
+            // similar to LocalTP, but with GlobalTPContext for collectives
+            // TODO: Implement GlobalTP graph runner when ready
+            // For now, GlobalTP parity tests will use a simplified approach
+            // where we verify the GlobalTPContext operations work correctly
+
+            // Placeholder: Use single-device execution on each rank for now
+            // The parity comparison happens per-rank
+            return ParityTestBase::setupPipeline();
+        }
+
+    protected:
+        // PP-specific storage (production DeviceGraphOrchestrator for unified PP)
+        std::unique_ptr<DeviceGraphOrchestrator> pp_orchestrator_;
+
+        // GlobalTP-specific storage
+        std::unique_ptr<GlobalTPContext> global_tp_ctx_;
     };
 
 } // namespace llaminar2::test::parity::qwen2

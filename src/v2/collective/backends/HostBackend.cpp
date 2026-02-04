@@ -608,6 +608,46 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // Device-to-Device Copy Operations
+    // =========================================================================
+
+    bool HostBackend::copy(
+        void *dst_ptr, DeviceId dst_device,
+        const void *src_ptr, DeviceId src_device,
+        size_t bytes)
+    {
+        // Only support CPU to CPU
+        if (!src_device.is_cpu() || !dst_device.is_cpu())
+        {
+            LOG_DEBUG("HostBackend::copy: Only CPU↔CPU supported, got "
+                      << src_device.toString() << " -> " << dst_device.toString());
+            return false;
+        }
+
+        if (bytes == 0)
+            return true;
+        if (!dst_ptr || !src_ptr)
+            return false;
+
+        std::memcpy(dst_ptr, src_ptr, bytes);
+        return true;
+    }
+
+    bool HostBackend::copyAsync(
+        void *dst_ptr, DeviceId dst_device,
+        const void *src_ptr, DeviceId src_device,
+        size_t bytes, void *stream)
+    {
+        (void)stream; // No streams on CPU
+        return copy(dst_ptr, dst_device, src_ptr, src_device, bytes);
+    }
+
+    bool HostBackend::supportsCopy(DeviceId src_device, DeviceId dst_device) const
+    {
+        return src_device.is_cpu() && dst_device.is_cpu();
+    }
+
+    // =========================================================================
     // Private Helpers
     // =========================================================================
 

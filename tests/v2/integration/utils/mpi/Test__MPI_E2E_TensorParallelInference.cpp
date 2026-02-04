@@ -342,8 +342,8 @@ TEST_F(Test__MPI_E2E_TensorParallelInference, InferenceRunnerCreatesWithTP)
     auto *orchestrator = dynamic_cast<DeviceGraphOrchestrator *>(runner.get());
     ASSERT_NE(orchestrator, nullptr) << "Runner should be a DeviceGraphOrchestrator";
 
-    // Verify TP configuration via graphBuilder
-    const auto *graph = orchestrator->graphBuilder();
+    // Verify TP configuration via graphBuilder (use const accessor)
+    const auto *graph = std::as_const(*orchestrator).graphBuilder();
     ASSERT_NE(graph, nullptr);
     const auto &config = graph->config();
 

@@ -7,12 +7,14 @@
  */
 
 #include "OrchestrationConfigParser.h"
+#include "execution/config/RuntimeConfig.h" // For parseFusedAttentionBackend
 #include "utils/Logger.h"
 #include <fstream>
 #include <sstream>
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
+#include <set>
 
 namespace llaminar2
 {
@@ -207,8 +209,30 @@ namespace llaminar2
         {
             const std::string &arg = args[i];
 
+            // ===== Help and info flags =====
+            if (arg == "-h" || arg == "--help")
+            {
+                config.show_help = true;
+            }
+            else if (arg == "-v")
+            {
+                config.verbose_level++;
+            }
+            else if (arg == "-vv")
+            {
+                config.verbose_level = 2;
+            }
+            else if (arg == "-vvv")
+            {
+                config.verbose_level = 3;
+            }
+            else if (arg == "--list-devices")
+            {
+                config.list_devices = true;
+            }
+
             // ===== Introspection flags =====
-            if (arg == "--dry-run")
+            else if (arg == "--dry-run")
             {
                 config.dry_run = true;
             }
@@ -227,6 +251,262 @@ namespace llaminar2
             else if (arg == "--validate-only")
             {
                 config.validate_only = true;
+            }
+
+            // ===== Model Configuration =====
+            else if (matchesFlag(arg, "-m", "--model"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--model requires a path");
+                }
+                config.model_path = value;
+            }
+            else if (matchesFlag(arg, "-c", "--context-length"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--context-length requires a value");
+                }
+                try
+                {
+                    config.max_seq_len = std::stoi(value);
+                }
+                catch (const std::exception &)
+                {
+                    throw std::invalid_argument("Invalid context length: '" + value + "'");
+                }
+            }
+            else if (arg == "--mmap")
+            {
+                config.use_mmap = true;
+            }
+            else if (arg == "--no-mmap")
+            {
+                config.use_mmap = false;
+            }
+
+            // ===== Inference Configuration =====
+            else if (matchesFlag(arg, "-p", "--prompt"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--prompt requires a value");
+                }
+                config.prompt = value;
+            }
+            else if (matchesFlag(arg, "-n", "--n-predict"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--n-predict requires a value");
+                }
+                try
+                {
+                    config.n_predict = std::stoi(value);
+                }
+                catch (const std::exception &)
+                {
+                    throw std::invalid_argument("Invalid n-predict value: '" + value + "'");
+                }
+            }
+            else if (matchesFlag(arg, "", "--batch-size"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--batch-size requires a value");
+                }
+                try
+                {
+                    config.batch_size = std::stoi(value);
+                }
+                catch (const std::exception &)
+                {
+                    throw std::invalid_argument("Invalid batch size: '" + value + "'");
+                }
+            }
+            else if (matchesFlag(arg, "", "--threads"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--threads requires a value");
+                }
+                try
+                {
+                    config.n_threads = std::stoi(value);
+                }
+                catch (const std::exception &)
+                {
+                    throw std::invalid_argument("Invalid threads value: '" + value + "'");
+                }
+            }
+            else if (matchesFlag(arg, "-s", "--seed"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--seed requires a value");
+                }
+                try
+                {
+                    config.seed = std::stoi(value);
+                }
+                catch (const std::exception &)
+                {
+                    throw std::invalid_argument("Invalid seed value: '" + value + "'");
+                }
+            }
+
+            // ===== Sampling Configuration =====
+            else if (matchesFlag(arg, "-t", "--temperature"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--temperature requires a value");
+                }
+                try
+                {
+                    config.temperature = std::stof(value);
+                }
+                catch (const std::exception &)
+                {
+                    throw std::invalid_argument("Invalid temperature value: '" + value + "'");
+                }
+            }
+            else if (matchesFlag(arg, "", "--top-k"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--top-k requires a value");
+                }
+                try
+                {
+                    config.top_k = std::stoi(value);
+                }
+                catch (const std::exception &)
+                {
+                    throw std::invalid_argument("Invalid top-k value: '" + value + "'");
+                }
+            }
+            else if (matchesFlag(arg, "", "--top-p"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--top-p requires a value");
+                }
+                try
+                {
+                    config.top_p = std::stof(value);
+                }
+                catch (const std::exception &)
+                {
+                    throw std::invalid_argument("Invalid top-p value: '" + value + "'");
+                }
+            }
+            else if (arg == "--deterministic")
+            {
+                config.deterministic = true;
+            }
+
+            // ===== Chat Configuration =====
+            else if (arg == "--chat")
+            {
+                config.chat_mode = true;
+            }
+            else if (arg == "--chat-single")
+            {
+                config.single_shot_chat = true;
+            }
+            else if (matchesFlag(arg, "", "--system"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--system requires a value");
+                }
+                config.system_prompt = value;
+            }
+            else if (matchesFlag(arg, "", "--chat-template"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--chat-template requires a value");
+                }
+                config.chat_template_override = value;
+            }
+
+            // ===== Benchmark Configuration =====
+            else if (arg == "--benchmark")
+            {
+                config.benchmark_mode = true;
+            }
+
+            // ===== Fused Attention Configuration =====
+            else if (arg == "--fused-attention")
+            {
+                config.use_fused_attention = true;
+            }
+            else if (matchesFlag(arg, "", "--fused-attention-backend"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--fused-attention-backend requires a value");
+                }
+                config.fused_attention_backend = parseFusedAttentionBackend(value);
+            }
+
+            // ===== MPI Bootstrap Configuration =====
+            else if (matchesFlag(arg, "", "--mpi-procs"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--mpi-procs requires a value");
+                }
+                try
+                {
+                    config.mpi_procs = std::stoi(value);
+                }
+                catch (const std::exception &)
+                {
+                    throw std::invalid_argument("Invalid mpi-procs value: '" + value + "'");
+                }
+            }
+            else if (matchesFlag(arg, "", "--hostfile"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--hostfile requires a path");
+                }
+                config.hostfile = value;
+            }
+            else if (arg == "--mpi-dry-run")
+            {
+                config.mpi_dry_run = true;
+            }
+            else if (arg == "--mpi-verbose")
+            {
+                config.mpi_verbose = true;
+            }
+            else if (arg == "--no-mpi-bootstrap")
+            {
+                config.mpi_no_bootstrap = true;
+            }
+            else if (arg == "--mpi-oversubscribe")
+            {
+                config.mpi_oversubscribe = true;
             }
 
             // ===== Device assignment =====
@@ -290,12 +570,12 @@ namespace llaminar2
             }
 
             // ===== Simple TP options =====
-            else if (matchesFlag(arg, "-t", "--tp"))
+            else if (matchesFlag(arg, "-tp", "--tensor-parallelism-degree"))
             {
                 std::string value = getFlagValue(args, i);
                 if (value.empty())
                 {
-                    throw std::invalid_argument("--tp requires a degree");
+                    throw std::invalid_argument("--tensor-parallelism-degree requires a degree");
                 }
                 try
                 {
@@ -372,12 +652,12 @@ namespace llaminar2
             }
 
             // ===== Simple PP options =====
-            else if (matchesFlag(arg, "-p", "--pp"))
+            else if (matchesFlag(arg, "-pp", "--pipeline-parallelism-degree"))
             {
                 std::string value = getFlagValue(args, i);
                 if (value.empty())
                 {
-                    throw std::invalid_argument("--pp requires a degree");
+                    throw std::invalid_argument("--pipeline-parallelism-degree requires a degree");
                 }
                 try
                 {
@@ -442,7 +722,7 @@ namespace llaminar2
             }
 
             // ===== Config file =====
-            else if (matchesFlag(arg, "-c", "--config"))
+            else if (matchesFlag(arg, "", "--config"))
             {
                 std::string value = getFlagValue(args, i);
                 if (value.empty())
@@ -460,7 +740,182 @@ namespace llaminar2
                 // (A more sophisticated merge would track which CLI flags were set)
             }
 
-            // Ignore unknown flags (they might be for other parts of the application)
+            // ===== Placement Strategy (legacy compatibility) =====
+            else if (matchesFlag(arg, "", "--strategy"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--strategy requires a value");
+                }
+                static const std::set<std::string> valid_strategies = {
+                    "auto", "all-gpu", "all-cpu", "layer-split", "memory-aware", "moe-optimized", "custom", "multi-gpu"
+                };
+                if (valid_strategies.find(value) == valid_strategies.end())
+                {
+                    throw std::invalid_argument("Invalid strategy: '" + value + "'. Valid: auto, all-gpu, all-cpu, layer-split, memory-aware, moe-optimized, custom, multi-gpu");
+                }
+                config.strategy = value;
+            }
+            else if (matchesFlag(arg, "", "--offload-layers"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--offload-layers requires a value");
+                }
+                config.offload_layers = std::stoi(value);
+            }
+
+            // ===== Memory Constraints =====
+            else if (matchesFlag(arg, "", "--max-gpu-memory"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--max-gpu-memory requires a value in MB");
+                }
+                config.max_gpu_memory_mb = std::stoull(value);
+            }
+            else if (matchesFlag(arg, "", "--max-cpu-memory"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--max-cpu-memory requires a value in MB");
+                }
+                config.max_cpu_memory_mb = std::stoull(value);
+            }
+
+            // ===== MoE Configuration =====
+            else if (arg == "--moe-shared-gpu")
+            {
+                config.moe_shared_experts_gpu = true;
+            }
+            else if (arg == "--moe-shared-cpu")
+            {
+                config.moe_shared_experts_gpu = false;
+            }
+            else if (arg == "--moe-sparse-gpu")
+            {
+                config.moe_sparse_experts_cpu = false;
+            }
+            else if (arg == "--moe-sparse-cpu")
+            {
+                config.moe_sparse_experts_cpu = true;
+            }
+
+            // ===== Multi-GPU Legacy =====
+            else if (arg == "--multi-gpu")
+            {
+                config.multi_gpu = true;
+            }
+            else if (matchesFlag(arg, "", "--gpu-split"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--gpu-split requires a value");
+                }
+                config.gpu_split = value;
+                config.multi_gpu = true;
+            }
+            else if (matchesFlag(arg, "", "--gpus"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--gpus requires comma-separated indices");
+                }
+                std::stringstream ss(value);
+                std::string token;
+                while (std::getline(ss, token, ','))
+                {
+                    config.gpu_devices.push_back(std::stoi(token));
+                }
+                if (!config.gpu_devices.empty())
+                {
+                    config.multi_gpu = true;
+                }
+            }
+
+            // ===== Activation Precision =====
+            else if (arg == "--activation-precision" || arg == "--activation-prec" || arg == "--act-prec")
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--activation-precision requires a value");
+                }
+                static const std::set<std::string> valid_precisions = {"fp32", "bf16", "fp16", "q8_1"};
+                if (valid_precisions.find(value) == valid_precisions.end())
+                {
+                    throw std::invalid_argument("Invalid activation precision: '" + value + "'. Valid: fp32, bf16, fp16, q8_1");
+                }
+                config.activation_precision = value;
+            }
+
+            // ===== Weight Sharding =====
+            else if (arg == "--shard-weights")
+            {
+                config.shard_weights = true;
+            }
+            else if (arg == "--no-shard-weights")
+            {
+                config.disable_weight_sharding = true;
+            }
+
+            // ===== Heterogeneous Mode =====
+            else if (arg == "--heterogeneous")
+            {
+                config.heterogeneous_mode = true;
+            }
+            else if (matchesFlag(arg, "", "--cpu-fraction"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--cpu-fraction requires a value");
+                }
+                config.cpu_compute_fraction = std::stof(value);
+                if (config.cpu_compute_fraction < 0.0f || config.cpu_compute_fraction > 1.0f)
+                {
+                    throw std::invalid_argument("--cpu-fraction must be between 0.0 and 1.0");
+                }
+            }
+            else if (arg == "--no-gpu-tp")
+            {
+                config.disable_gpu_tp = true;
+            }
+            else if (arg == "--no-cpu-tp")
+            {
+                config.disable_cpu_tp = true;
+            }
+            else if (matchesFlag(arg, "", "--min-layers-per-domain"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--min-layers-per-domain requires a value");
+                }
+                config.min_layers_per_domain = std::stoi(value);
+                if (config.min_layers_per_domain < 1)
+                {
+                    throw std::invalid_argument("--min-layers-per-domain must be >= 1");
+                }
+            }
+
+            // Unknown argument - throw error
+            else
+            {
+                throw std::invalid_argument("Unknown argument: '" + arg + "'. Use --help to see available options.");
+            }
+        }
+
+        // Validate heterogeneous mode
+        if (config.heterogeneous_mode && config.disable_gpu_tp && config.disable_cpu_tp)
+        {
+            throw std::invalid_argument("Cannot use --heterogeneous with both --no-gpu-tp and --no-cpu-tp");
         }
 
         return config;
@@ -647,7 +1102,77 @@ namespace llaminar2
     std::string OrchestrationConfigParser::getHelpText()
     {
         return R"(
-Orchestration Configuration Options:
+Llaminar V2 LLM Inference Engine
+
+Usage: llaminar2 [OPTIONS]
+
+Model Configuration:
+  -m, --model <path>     Path to GGUF model file (required)
+  -c, --context-length <n>  Maximum context/sequence length (default: 2048)
+  --mmap                 Use memory-mapped file loading (default)
+  --no-mmap              Disable memory-mapped file loading
+
+Inference Configuration:
+  -p, --prompt <text>    Input prompt text
+  -n, --n-predict <n>    Tokens to generate (-1 = until EOS, default: -1)
+  --batch-size <n>       Batch size (default: 1)
+  --threads <n>          Thread count (-1 = auto, default: -1)
+  -s, --seed <n>         Random seed (-1 = random, default: -1)
+
+Sampling Configuration:
+  -t, --temperature <f>  Sampling temperature (default: 0.8)
+  --top-k <n>            Top-K sampling (default: 40)
+  --top-p <f>            Top-P (nucleus) sampling (default: 0.9)
+  --deterministic        Force deterministic mode (temperature=0)
+
+Chat Configuration:
+  --chat                 Interactive chat mode
+  --chat-single          Single prompt with chat template applied
+  --system <text>        System prompt for chat
+  --chat-template <name> Override chat template (chatml, llama3, etc.)
+
+Benchmark Configuration:
+  --benchmark            Run benchmark (warmup + multiple timed runs)
+
+Fused Attention:
+  --fused-attention      Enable fused attention+Wo kernel
+  --fused-attention-backend <type>  Backend: jit (default), reference, tiled, q16
+
+MPI Bootstrap:
+  --mpi-procs <n>        Number of MPI processes (0 = auto)
+  --hostfile <path>      MPI hostfile path
+  --mpi-dry-run          Print MPI launch command and exit
+  --mpi-verbose          Verbose MPI output
+  --no-mpi-bootstrap     Disable automatic MPI bootstrap
+  --mpi-oversubscribe    Allow MPI oversubscription
+
+Device Assignment:
+  -d, --device <spec>    Device for this rank (e.g., cuda:0, rocm:0, cpu)
+  --device-mode <mode>   Assignment mode: auto, local_gpu, round_robin, explicit
+  --device-map <map>     Explicit mapping: "0=cuda:0,1=cuda:1"
+
+Tensor Parallelism:
+  -tp, --tensor-parallelism-degree <n>  TP parallelism degree
+  --tp-scope <scope>     Scope: auto, local, global, hybrid
+  --tp-devices <list>    Device list: "cuda:0,cuda:1"
+  --tp-weights <list>    Weight distribution: "0.73,0.27"
+  --tp-local <degree>    Local TP degree for hybrid
+  --tp-global <degree>   Global TP degree for hybrid
+
+Pipeline Parallelism:
+  -pp, --pipeline-parallelism-degree <n>  PP parallelism degree
+  --pp-split <mode>      Layer split: equal, weighted, manual
+
+Layer Placement:
+  --cpu-layers <n>       Number of layers on CPU
+  --cpu-layers-first     Put CPU layers at beginning (default: end)
+
+Named Domains (advanced):
+  --define-domain <spec> Define domain: "name=device1,device2[;weights=w1,w2][;backend=type]"
+  --pp-stage <spec>      Define PP stage: "stage_id=domain:first_layer-last_layer"
+
+Collective Backend:
+  -b, --backend <type>   Default collective: auto, nccl, rccl, pcie_bar, upi, mpi, host
 
 Introspection:
   --dry-run              Show configuration without executing
@@ -656,36 +1181,55 @@ Introspection:
   --show-numa            Show NUMA configuration and exit
   --validate-only        Validate configuration without running
 
-Device Assignment:
-  -d, --device <spec>    Device for this rank (e.g., cuda:0, rocm:0, cpu)
-  --device-mode <mode>   Assignment mode: auto, local_gpu, round_robin, explicit
-  --device-map <map>     Explicit mapping: "0=cuda:0,1=cuda:1"
-
-Named Domains (advanced):
-  --define-domain <spec> Define domain: "name=device1,device2[;weights=w1,w2][;backend=type]"
-  --pp-stage <spec>      Define PP stage: "stage_id=domain:first_layer-last_layer"
-
-Tensor Parallelism:
-  -t, --tp <degree>      TP parallelism degree
-  --tp-scope <scope>     Scope: auto, local, global, hybrid
-  --tp-devices <list>    Device list: "cuda:0,cuda:1"
-  --tp-weights <list>    Weight distribution: "0.73,0.27"
-  --tp-local <degree>    Local TP degree for hybrid
-  --tp-global <degree>   Global TP degree for hybrid
-
-Pipeline Parallelism:
-  -p, --pp <degree>      PP parallelism degree
-  --pp-split <mode>      Layer split: equal, weighted, manual
-
-Layer Placement:
-  --cpu-layers <n>       Number of layers on CPU
-  --cpu-layers-first     Put CPU layers at beginning (default: end)
-
-Backend:
-  -b, --backend <type>   Default collective: auto, nccl, rccl, pciebar, upi, mpi, host
-
 Config File:
-  -c, --config <path>    Load configuration from YAML file
+  --config <path>        Load configuration from YAML file
+
+Placement Strategy:
+  --strategy <mode>      Placement strategy: auto, all-gpu, all-cpu, layer-split,
+                         memory-aware, moe-optimized, custom, multi-gpu
+  --offload-layers <n>   Layers to offload (for layer-split strategy)
+
+Memory Constraints:
+  --max-gpu-memory <mb>  Maximum GPU memory in MB
+  --max-cpu-memory <mb>  Maximum CPU memory in MB
+
+MoE Configuration:
+  --moe-shared-gpu       Place shared experts on GPU (default)
+  --moe-shared-cpu       Place shared experts on CPU
+  --moe-sparse-gpu       Place sparse experts on GPU
+  --moe-sparse-cpu       Place sparse experts on CPU (default)
+
+Multi-GPU Legacy:
+  --multi-gpu            Enable multi-GPU mode
+  --gpu-split <mode>     GPU split strategy
+  --gpus <indices>       Comma-separated GPU indices (e.g., "0,1,2")
+
+Precision:
+  --activation-precision <type>  Activation precision: fp32, bf16, fp16, q8_1
+  --act-prec <type>      Alias for --activation-precision
+
+Weight Sharding:
+  --shard-weights        Enable weight sharding
+  --no-shard-weights     Disable weight sharding
+
+Heterogeneous Mode:
+  --heterogeneous        Enable heterogeneous mode
+  --cpu-fraction <f>     CPU compute fraction (0.0-1.0, default: 0.2)
+  --no-gpu-tp            Disable GPU tensor parallelism
+  --no-cpu-tp            Disable CPU tensor parallelism
+  --min-layers-per-domain <n>  Minimum layers per domain (default: 2)
+
+Verbosity:
+  -v                     Increase verbosity (-v = DEBUG, -vv = TRACE)
+  --list-devices         List available devices and exit
+  -h, --help             Show this help message
+
+Examples:
+  llaminar2 -m model.gguf -p "Hello world" -n 50
+  llaminar2 -m model.gguf --chat
+  llaminar2 -m model.gguf --benchmark -n 100
+  llaminar2 -m model.gguf --tp 2 --tp-devices "cuda:0,cuda:1"
+  llaminar2 -m model.gguf -d cuda:0 --fused-attention
 )";
     }
 

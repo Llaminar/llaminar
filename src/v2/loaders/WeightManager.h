@@ -42,9 +42,10 @@ namespace llaminar2
      */
     enum class WeightDistributionStrategy
     {
-        REPLICATED, ///< Full copy per rank (2x memory on 2-socket, no communication)
-        SHARDED,    ///< Partition across ranks (1x memory, Allreduce after matmul)
-        INTERLEAVED ///< NUMA-aware global (shared memory, remote access penalty)
+        REPLICATED,       ///< Full copy per rank (2x memory on 2-socket, no communication)
+        SHARDED,          ///< Partition across ranks (1x memory, Allreduce after matmul)
+        INTERLEAVED,      ///< NUMA-aware global (shared memory, remote access penalty)
+        LAYER_PARTITIONED ///< Load only weights for assigned layers (for Pipeline Parallelism)
     };
 
     /**
@@ -205,6 +206,84 @@ namespace llaminar2
             has_sharding_config_ = true;
             sharding_mode_cache_.clear(); // Invalidate cache
         }
+
+        /**
+         * @brief Set layer range for LAYER_PARTITIONED strategy
+         *
+         * For Pipeline Parallelism, restricts which layer weights are loaded.
+         * Weights outside this range will return nullptr from getWeight().
+         *
+         * Layer range is [first, last) - first is inclusive, last is exclusive.
+         *
+         * Special weights:
+         * - has_embedding: if true, token embedding weight is loaded
+         * - has_lm_head: if true, output norm and LM head weights are loaded
+         *
+         * @param first_layer First layer index (inclusive)
+         * @param last_layer Last layer index (exclusive)
+         * @param has_embedding True if this stage should load embedding
+         * @param has_lm_head True if this stage should load output norm and LM head
+         */
+        void setLayerRange(int first_layer, int last_layer, bool has_embedding, bool has_lm_head)
+        {
+            layer_first_ = first_layer;
+            layer_last_ = last_layer;
+            has_embedding_ = has_embedding;
+            has_lm_head_ = has_lm_head;
+            has_layer_range_ = true;
+            LOG_INFO("[WeightManager] Layer range set: layers [" << first_layer << ", " << last_layer
+                     << "), embedding=" << (has_embedding ? "yes" : "no")
+                     << ", lm_head=" << (has_lm_head ? "yes" : "no"));
+        }
+
+        /**
+         * @brief Set layer range without changing global weight flags
+         *
+         * Use setHasEmbedding() and setHasLmHead() separately if needed.
+         *
+         * @param first_layer First layer index (inclusive)
+         * @param last_layer Last layer index (exclusive, -1 = all remaining)
+         */
+        void setLayerRange(int first_layer, int last_layer)
+        {
+            layer_first_ = first_layer;
+            layer_last_ = last_layer;
+            has_layer_range_ = true;
+            LOG_DEBUG("[WeightManager] Layer range set: layers [" << first_layer << ", " << last_layer << ")");
+        }
+
+        /**
+         * @brief Check if a layer range is configured
+         */
+        bool hasLayerRange() const { return has_layer_range_; }
+
+        /**
+         * @brief Get configured layer range
+         * @return Pair of (first_layer, last_layer_exclusive)
+         */
+        std::pair<int, int> layerRange() const { return {layer_first_, layer_last_}; }
+
+        /**
+         * @brief Check if this stage has embedding
+         */
+        bool hasEmbedding() const { return has_embedding_; }
+
+        /**
+         * @brief Check if this stage has LM head
+         */
+        bool hasLMHead() const { return has_lm_head_; }
+
+        /**
+         * @brief Set whether this weight manager should provide embedding weights
+         * @param has_embedding True if embedding should be loaded
+         */
+        void setHasEmbedding(bool has_embedding);
+
+        /**
+         * @brief Set whether this weight manager should provide lm_head weights
+         * @param has_lm_head True if output_norm and lm_head should be loaded
+         */
+        void setHasLmHead(bool has_lm_head);
 
         /**
          * @brief Set tensor parallelism configuration for proportional slicing
@@ -423,6 +502,29 @@ namespace llaminar2
 
         // Decode weight shard cache (separate from prefill cache)
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> decode_cache_; ///< Decode shard cache
+
+        // =========================================================================
+        // Layer range for Pipeline Parallelism (LAYER_PARTITIONED strategy)
+        // =========================================================================
+
+        int layer_first_ = 0;         ///< First layer index (inclusive)
+        int layer_last_ = 0;          ///< Last layer index (exclusive)
+        bool has_embedding_ = true;   ///< True if this stage loads embedding
+        bool has_lm_head_ = true;     ///< True if this stage loads LM head
+        bool has_layer_range_ = false; ///< True if setLayerRange() was called
+
+        /**
+         * @brief Check if a weight should be loaded based on layer range
+         *
+         * When LAYER_PARTITIONED strategy is active, this filters weights:
+         * - "token_embd.weight" only if has_embedding_
+         * - "output_norm.weight", "output.weight" only if has_lm_head_
+         * - "blk.N.*" only if N is in [layer_first_, layer_last_)
+         *
+         * @param name Weight tensor name
+         * @return true if weight should be loaded, false if filtered out
+         */
+        bool isWeightInLayerRange(const std::string &name) const;
 
         // =========================================================================
         // Per-device tensor cache for multi-device scenarios (LOCAL TP)

@@ -51,6 +51,8 @@ namespace llaminar2
 
     // Forward declarations
     class ILocalTPContext;
+    class ILocalPPContext;
+    struct PipelineConfig;
 
     // Forward declarations
     class Qwen2Pipeline;
@@ -174,8 +176,8 @@ namespace llaminar2
         // LOCAL Tensor Parallelism (Intra-Rank Multi-Device)
         // =================================================================
         /// Optional ILocalTPContext for LOCAL tensor parallelism.
-        /// When set, collective operations use LocalTPAllreduceStage instead of
-        /// AllreduceStage. LOCAL TP runs on a single MPI rank with multiple devices,
+        /// When set, collective operations use TPAllreduceStage with the local
+        /// TP context. LOCAL TP runs on a single MPI rank with multiple devices,
         /// using high-bandwidth backends like NCCL, RCCL, or PCIeBAR for collectives.
         ///
         /// Distinction from GLOBAL TP:
@@ -189,6 +191,32 @@ namespace llaminar2
         /// Device index within the LOCAL TP context (0 to degree-1).
         /// Each device runs a separate graph instance with sharded weights.
         int local_tp_device_idx = 0;
+
+        // =================================================================
+        // Unified Pipeline Parallel Configuration (Phase 2)
+        // =================================================================
+        /// Pipeline configuration for PP + TP composition.
+        /// When set, graph building uses multi-stage PP-aware logic.
+        /// See docs/v2/UNIFIED_PP_GRAPH_ARCHITECTURE_PLAN.md
+        std::shared_ptr<PipelineConfig> pipeline_config = nullptr;
+
+        /// PP contexts for inter-stage activation transfers.
+        /// Key: {from_stage_id, to_stage_id}
+        /// Created by the orchestrator and passed to Qwen2Graph.
+        std::map<std::pair<int, int>, ILocalPPContext *> pp_contexts;
+
+        /// TP contexts for each domain (one per domain name).
+        /// Each domain may have internal tensor parallelism.
+        /// Created by the orchestrator and passed to Qwen2Graph.
+        std::map<std::string, ILocalTPContext *> domain_tp_contexts;
+
+        /// Helper: Check if unified PP mode is enabled
+        /// Implementation in Qwen2Graph.cpp (requires full PipelineConfig definition)
+        bool hasUnifiedPP() const;
+
+        /// Helper: Get the device for a specific layer in unified PP mode
+        /// Implementation in Qwen2Graph.cpp (requires full PipelineConfig definition)
+        DeviceId getDeviceForLayer(int layer_idx) const;
 
         /**
          * @brief Helper to get DeviceShardingAssignment for current rank
@@ -363,6 +391,18 @@ namespace llaminar2
         DeviceId device = DeviceId::cpu(); ///< Target device
         IKVCache *kv_cache = nullptr;      ///< KV cache for attention (optional)
 
+        /// Per-device KV caches for Pipeline Parallelism (PP).
+        /// When set (non-empty), each PP stage uses the KV cache for its device.
+        /// Key: DeviceId (e.g., cuda:0, cuda:1), Value: IKVCache* for that device.
+        /// Takes precedence over kv_cache when device is found in this map.
+        const std::unordered_map<DeviceId, IKVCache *> *pp_kv_caches = nullptr;
+
+        /// External hidden state input (for PP middle stages that don't have embedding)
+        /// When set, embedding is skipped and this tensor is used as initial hidden state.
+        /// For HybridQ16 mode: expected to be Q16_1 tensor
+        /// For FP32 mode: expected to be FP32 tensor
+        TensorBase *external_hidden_state = nullptr;
+
         /// Sequence lengths for variable-length batching (nullptr = all equal to seq_len)
         /// When set, this enables proper batch-separating attention masks that
         /// prevent cross-sequence attention in batched execution.
@@ -377,6 +417,22 @@ namespace llaminar2
         };
         const Batch *batches = nullptr;
         int num_batches = 0;
+
+        /// Get the KV cache for a specific device (PP) or the default (non-PP)
+        IKVCache *getKVCacheForDevice(const DeviceId &device) const
+        {
+            // For PP mode: look up per-device KV cache
+            if (pp_kv_caches && !pp_kv_caches->empty())
+            {
+                auto it = pp_kv_caches->find(device);
+                if (it != pp_kv_caches->end())
+                {
+                    return it->second;
+                }
+                // Fallback to default kv_cache if device not found
+            }
+            return kv_cache;
+        }
     };
 
     /**
@@ -439,6 +495,49 @@ namespace llaminar2
         // =====================================================================
 
         const Qwen2GraphConfig &config() const { return config_; }
+
+        // =====================================================================
+        // Unified PP Configuration Mutators (Phase 6)
+        // =====================================================================
+
+        /**
+         * @brief Set pipeline configuration for unified PP graph
+         *
+         * Enables buildUnifiedPipelineGraph() to create multi-stage graphs.
+         *
+         * @param pipeline_config Shared ownership of pipeline configuration
+         */
+        void setPipelineConfig(std::shared_ptr<PipelineConfig> pipeline_config)
+        {
+            config_.pipeline_config = std::move(pipeline_config);
+        }
+
+        /**
+         * @brief Register a PP context for inter-stage activation transfers
+         *
+         * Called by DeviceGraphOrchestrator after initializing LocalPPContexts.
+         *
+         * @param from_stage Source PP stage ID
+         * @param to_stage Destination PP stage ID
+         * @param pp_ctx Pointer to ILocalPPContext (must remain valid during graph execution)
+         */
+        void setPPContext(int from_stage, int to_stage, ILocalPPContext *pp_ctx)
+        {
+            config_.pp_contexts[{from_stage, to_stage}] = pp_ctx;
+        }
+
+        /**
+         * @brief Register a TP context for a named domain
+         *
+         * Called by DeviceGraphOrchestrator after initializing LocalTPContexts.
+         *
+         * @param domain_name Name of the TP domain
+         * @param tp_ctx Pointer to ILocalTPContext (must remain valid during graph execution)
+         */
+        void setTPContext(const std::string &domain_name, ILocalTPContext *tp_ctx)
+        {
+            config_.domain_tp_contexts[domain_name] = tp_ctx;
+        }
 
         /**
          * @brief Set weight accessors (called by pipeline)
@@ -555,6 +654,49 @@ namespace llaminar2
          * For new code, prefer buildForwardGraphFromSchema().
          */
         ComputeGraph buildFullForwardGraph(
+            const Qwen2ForwardInput &input,
+            Qwen2ForwardOutput &output);
+
+        /**
+         * @brief Build partial forward graph for Pipeline Parallelism
+         *
+         * Builds a compute graph for a subset of the model, enabling PP execution
+         * where each stage runs only its assigned components:
+         *
+         * Stage 0: [embedding] → layers[0, mid) → hidden output
+         * Stage 1: hidden input → layers[mid, n) → [LM head] → logits
+         *
+         * @param input Forward pass input (tokens for embedding stage, hidden for others)
+         * @param output Forward pass output (hidden for non-final stages, logits for final)
+         * @param first_layer First layer to include (inclusive)
+         * @param last_layer Last layer to include (exclusive)
+         * @param has_embedding Include embedding lookup stage
+         * @param has_lm_head Include final_norm and LM head projection
+         * @return ComputeGraph for partial forward pass
+         */
+        ComputeGraph buildPartialForwardGraph(
+            const Qwen2ForwardInput &input,
+            Qwen2ForwardOutput &output,
+            int first_layer,
+            int last_layer,
+            bool has_embedding,
+            bool has_lm_head);
+
+        /**
+         * @brief Build unified forward graph with PP + TP composition
+         *
+         * Creates a single ComputeGraph spanning all PP stages with:
+         * - Per-layer device assignment based on PP stage → TP domain mapping
+         * - TPAllreduceStage nodes within each TP domain
+         * - LocalPPTransferStage nodes at PP stage boundaries
+         *
+         * Requires: config_.pipeline_config must be set and valid
+         *
+         * @param input Forward pass input
+         * @param output Forward pass output (populated)
+         * @return ComputeGraph spanning all PP stages
+         */
+        ComputeGraph buildUnifiedPipelineGraph(
             const Qwen2ForwardInput &input,
             Qwen2ForwardOutput &output);
 
@@ -685,7 +827,7 @@ namespace llaminar2
         /**
          * @brief Create an allreduce stage appropriate for the active TP mode
          *
-         * Creates LocalTPAllreduceStage for LOCAL TP (single rank, multiple devices)
+         * Creates TPAllreduceStage for LOCAL TP (single rank, multiple devices)
          * or AllreduceStage for GLOBAL TP (multiple MPI ranks).
          *
          * @param buffer Tensor to reduce

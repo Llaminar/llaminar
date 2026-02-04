@@ -8,10 +8,8 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/BlockStructures.h"
-#include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
-#include "../../../interfaces/IWorkspaceConsumer.h"
 
 namespace llaminar2
 {
@@ -102,22 +100,15 @@ namespace llaminar2
                                                   << " hybrid_q16_mode=" << (hybrid_q16_mode ? "true" : "false")
                                                   << " k_is_q16_1=" << (k_is_q16_1 ? "true" : "false"));
 
-        // Get or create cached kernel via KernelFactory
-        // The kernel is cached in cached_kernel_ and bound to workspace via IWorkspaceConsumerStage
-        if (!cached_kernel_)
-        {
-            auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createRoPE(Q_base, dev_type);
-        }
-
-        if (!cached_kernel_)
+        // Create kernel via KernelFactory with automatic type dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+        auto kernel = llaminar::v2::kernels::KernelFactory::createRoPE(Q_base, dev_type);
+        if (!kernel)
         {
             LOG_ERROR("[RoPEStage] Failed to create RoPE kernel for type "
                       << Q_base->dtype_name());
             return false;
         }
-
-        ITensorRoPE *kernel = cached_kernel_.get();
 
         // Use provided position_ids if available (for batched execution with per-token positions)
         // Otherwise, generate contiguous position_ids from pos_offset
@@ -354,7 +345,7 @@ namespace llaminar2
         }
     }
 
-    StageDumpInfo RoPEStage::buildDumpInfoImpl() const
+    StageDumpInfo RoPEStage::getDumpInfo() const
     {
         StageDumpInfo info;
         if (!params_.Q)
@@ -376,113 +367,89 @@ namespace llaminar2
 
         const bool separate_output_mode = hybrid_mode || hybrid_q16_mode;
 
-        // OPTIMIZATION: For FP32 in-place RoPE (standard CUDA path), use tensor-based API
-        // to avoid GPU->host sync. The sync is deferred to ensureOutputsOnHost().
-        const bool is_fp32_inplace = !separate_output_mode &&
-                                     params_.Q->native_type() == TensorType::FP32;
-
-        if (is_fp32_inplace)
+        // Q input
+        const float *q_input_data = getSafeFp32Data(params_.Q);
+        if (q_input_data)
         {
-            // Fast path: tensor-based addInput/addOutput (no GPU sync)
-            info.addInput("Q", params_.Q, seq_len, params_.n_heads * params_.head_dim);
-            info.addOutput("Q", params_.Q, seq_len, params_.n_heads * params_.head_dim);
-
-            if (params_.K)
-            {
-                int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
-                info.addInput("K", params_.K, seq_len, n_kv_heads * params_.head_dim);
-                info.addOutput("K", params_.K, seq_len, n_kv_heads * params_.head_dim);
-            }
+            info.addInput("Q", q_input_data,
+                          seq_len, params_.n_heads * params_.head_dim);
         }
-        else
+
+        // Q output - use Q_out in Hybrid/HybridQ16 modes, otherwise same as input (in-place)
+        if (separate_output_mode && params_.Q_out)
         {
-            // Legacy path: Q8_1/Hybrid modes need data conversion, use getSafeFp32Data()
-            // This path is NOT used for standard CUDA FP32 inference
-
-            // Q input
-            const float *q_input_data = getSafeFp32Data(params_.Q);
-            if (q_input_data)
+            const float *q_out_data = getSafeFp32Data(params_.Q_out);
+            if (q_out_data)
             {
-                info.addInput("Q", q_input_data,
-                              seq_len, params_.n_heads * params_.head_dim);
-            }
-
-            // Q output - use Q_out in Hybrid/HybridQ16 modes, otherwise same as input (in-place)
-            if (separate_output_mode && params_.Q_out)
-            {
-                const float *q_out_data = getSafeFp32Data(params_.Q_out);
-                if (q_out_data)
+                // HybridQ16 RoPE outputs Q in head-major layout [n_heads, seq, dim]
+                // for the attention kernel. But snapshots expect seq-major [seq, n_heads * dim]
+                // to match FP32 reference. Convert layout for snapshot comparison.
+                if (hybrid_q16_mode)
                 {
-                    // HybridQ16 RoPE outputs Q in head-major layout [n_heads, seq, dim]
-                    // for the attention kernel. But snapshots expect seq-major [seq, n_heads * dim]
-                    // to match FP32 reference. Convert layout for snapshot comparison.
-                    if (hybrid_q16_mode)
+                    const int d_model = params_.n_heads * params_.head_dim;
+                    // Cache the converted buffer in the stage (lazy allocation)
+                    if (q_transposed_cache_.size() != static_cast<size_t>(seq_len * d_model))
                     {
-                        const int d_model = params_.n_heads * params_.head_dim;
-                        // Cache the converted buffer in the stage (lazy allocation)
-                        if (q_transposed_cache_.size() != static_cast<size_t>(seq_len * d_model))
+                        q_transposed_cache_.resize(seq_len * d_model);
+                    }
+                    // Convert [n_heads, seq, dim] -> [seq, n_heads * dim]
+                    for (int h = 0; h < params_.n_heads; ++h)
+                    {
+                        for (int s = 0; s < seq_len; ++s)
                         {
-                            q_transposed_cache_.resize(seq_len * d_model);
-                        }
-                        // Convert [n_heads, seq, dim] -> [seq, n_heads * dim]
-                        for (int h = 0; h < params_.n_heads; ++h)
-                        {
-                            for (int s = 0; s < seq_len; ++s)
+                            for (int d = 0; d < params_.head_dim; ++d)
                             {
-                                for (int d = 0; d < params_.head_dim; ++d)
-                                {
-                                    // Source: head-major [h][s][d]
-                                    const int src_idx = h * seq_len * params_.head_dim + s * params_.head_dim + d;
-                                    // Dest: seq-major [s][h*dim + d]
-                                    const int dst_idx = s * d_model + h * params_.head_dim + d;
-                                    q_transposed_cache_[dst_idx] = q_out_data[src_idx];
-                                }
+                                // Source: head-major [h][s][d]
+                                const int src_idx = h * seq_len * params_.head_dim + s * params_.head_dim + d;
+                                // Dest: seq-major [s][h*dim + d]
+                                const int dst_idx = s * d_model + h * params_.head_dim + d;
+                                q_transposed_cache_[dst_idx] = q_out_data[src_idx];
                             }
                         }
-                        info.addOutput("Q", q_transposed_cache_.data(),
-                                       seq_len, d_model);
                     }
-                    else
-                    {
-                        info.addOutput("Q", q_out_data,
-                                       seq_len, params_.n_heads * params_.head_dim);
-                    }
+                    info.addOutput("Q", q_transposed_cache_.data(),
+                                   seq_len, d_model);
+                }
+                else
+                {
+                    info.addOutput("Q", q_out_data,
+                                   seq_len, params_.n_heads * params_.head_dim);
                 }
             }
-            else if (q_input_data)
+        }
+        else if (q_input_data)
+        {
+            info.addOutput("Q", q_input_data,
+                           seq_len, params_.n_heads * params_.head_dim);
+        }
+
+        // K tensor (optional)
+        if (params_.K)
+        {
+            int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
+
+            // K input
+            const float *k_input_data = getSafeFp32Data(params_.K);
+            if (k_input_data)
             {
-                info.addOutput("Q", q_input_data,
-                               seq_len, params_.n_heads * params_.head_dim);
+                info.addInput("K", k_input_data,
+                              seq_len, n_kv_heads * params_.head_dim);
             }
 
-            // K tensor (optional)
-            if (params_.K)
+            // K output - use K_out in Hybrid/HybridQ16 modes, otherwise same as input (in-place)
+            if (separate_output_mode && params_.K_out)
             {
-                int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
-
-                // K input
-                const float *k_input_data = getSafeFp32Data(params_.K);
-                if (k_input_data)
+                const float *k_out_data = getSafeFp32Data(params_.K_out);
+                if (k_out_data)
                 {
-                    info.addInput("K", k_input_data,
-                                  seq_len, n_kv_heads * params_.head_dim);
-                }
-
-                // K output - use K_out in Hybrid/HybridQ16 modes, otherwise same as input (in-place)
-                if (separate_output_mode && params_.K_out)
-                {
-                    const float *k_out_data = getSafeFp32Data(params_.K_out);
-                    if (k_out_data)
-                    {
-                        info.addOutput("K", k_out_data,
-                                       seq_len, n_kv_heads * params_.head_dim);
-                    }
-                }
-                else if (k_input_data)
-                {
-                    info.addOutput("K", k_input_data,
+                    info.addOutput("K", k_out_data,
                                    seq_len, n_kv_heads * params_.head_dim);
                 }
+            }
+            else if (k_input_data)
+            {
+                info.addOutput("K", k_input_data,
+                               seq_len, n_kv_heads * params_.head_dim);
             }
         }
 
@@ -523,42 +490,6 @@ namespace llaminar2
         }
 
         return reqs;
-    }
-
-    // =============================================================================
-    // IWorkspaceConsumerStage Implementation
-    // =============================================================================
-
-    IWorkspaceConsumer *RoPEStage::getKernelAsWorkspaceConsumer()
-    {
-        // Create kernel if not already cached
-        if (!cached_kernel_)
-        {
-            if (!params_.Q)
-            {
-                LOG_WARN("[RoPEStage::getKernelAsWorkspaceConsumer] Q tensor not set");
-                return nullptr;
-            }
-
-            auto *Q_base = dynamic_cast<TensorBase *>(params_.Q);
-            if (!Q_base)
-            {
-                LOG_WARN("[RoPEStage::getKernelAsWorkspaceConsumer] Q is not TensorBase");
-                return nullptr;
-            }
-
-            auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createRoPE(Q_base, dev_type);
-
-            if (!cached_kernel_)
-            {
-                LOG_WARN("[RoPEStage::getKernelAsWorkspaceConsumer] Failed to create RoPE kernel");
-                return nullptr;
-            }
-        }
-
-        // Cast to IWorkspaceConsumer (CUDA/ROCm RoPE kernels implement both ITensorRoPE and IWorkspaceConsumer)
-        return dynamic_cast<IWorkspaceConsumer *>(cached_kernel_.get());
     }
 
 } // namespace llaminar2

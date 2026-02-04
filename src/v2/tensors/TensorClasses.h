@@ -98,6 +98,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <any>
+#include <unordered_map>
+#include <unordered_set>
 #include <mutex>
 #include <optional>
 
@@ -700,6 +702,72 @@ namespace llaminar2
          */
         std::optional<DeviceId> current_device() const { return gpu_device_; }
 
+        // ===== Multi-Device Coherence API =====
+
+        /**
+         * @brief Get the device that currently has authoritative data
+         * @return DeviceId if a GPU is authoritative, nullopt if host is authoritative
+         */
+        std::optional<DeviceId> getAuthoritativeDevice() const { return authoritative_device_; }
+
+        /**
+         * @brief Check if host memory is authoritative (has current data)
+         *
+         * Returns true when:
+         * - Tensor was just created (default state)
+         * - After ensureOnHost() synced from GPU
+         * - Tensor has never been uploaded to GPU
+         */
+        bool isHostAuthoritative() const { return !authoritative_device_.has_value(); }
+
+        /**
+         * @brief Check if a specific device is authoritative
+         * @param device Device to check
+         * @return true if that device has the authoritative data
+         */
+        bool isDeviceAuthoritative(DeviceId device) const
+        {
+            return authoritative_device_.has_value() && *authoritative_device_ == device;
+        }
+
+        /**
+         * @brief Transfer tensor data directly to another GPU device
+         *
+         * Uses ICollectiveBackend::copy() for direct P2P/BAR transfer.
+         * Does NOT go through host staging - this is a direct GPU-to-GPU copy.
+         *
+         * @param dst_device Target GPU device
+         * @return true on success, false if no backend supports this transfer
+         *
+         * @pre Tensor must have authoritative data on a GPU (call mark_device_dirty() first)
+         * @post getAuthoritativeDevice() == dst_device
+         * @post Source device buffer becomes stale
+         * @post Host buffer becomes stale (if it exists)
+         *
+         * @note Fails fast if no backend supports the transfer path.
+         *       Does NOT silently fall back to host staging.
+         *
+         * @example
+         *   tensor->ensureOnDevice(cuda0);
+         *   tensor->mark_device_dirty();  // GPU computed new values
+         *   tensor->transferTo(rocm0);    // Direct transfer, no host staging
+         */
+        bool transferTo(DeviceId dst_device);
+
+        /**
+         * @brief Copy tensor data to another GPU, keeping both devices valid
+         *
+         * Unlike transferTo(), this keeps the source device buffer valid.
+         * Useful for read-only sharing or when source needs to continue computing.
+         *
+         * @param dst_device Target GPU device
+         * @return true on success
+         *
+         * @post Both src and dst devices have valid data
+         * @post authoritative_device_ unchanged (source still authoritative)
+         */
+        bool copyTo(DeviceId dst_device);
+
         /**
          * @brief Check if tensor currently has valid data on the specified device
          *
@@ -831,6 +899,23 @@ namespace llaminar2
          * @note If event recording fails, falls back to eventless behavior
          */
         virtual void mark_device_dirty_with_event();
+
+        /**
+         * @brief Clear the device completion event without destroying it through the backend
+         *
+         * This is used during cross-device transfers (e.g., CUDA -> ROCm) where the
+         * event was created by a different backend. We can't destroy a CUDA event
+         * through the ROCm backend, so we just clear the pointer. The event will
+         * leak, but this only happens during PP transfers which are rare.
+         *
+         * @note Use this when transferring tensors between different GPU types
+         *       to avoid passing CUDA events to ROCm's hipEventRecord.
+         */
+        void clearCompletionEvent()
+        {
+            device_completion_event_ = nullptr;
+            event_device_.reset();
+        }
 
         /**
          * @brief Check if tensor data is currently resident on host (CPU)
@@ -1438,6 +1523,53 @@ namespace llaminar2
         bool device_valid_ = false;               // Device data is current (starts false - no GPU alloc)
         std::optional<DeviceId> gpu_device_;      // Which GPU device (nullopt = not on GPU)
         void *device_completion_event_ = nullptr; // Event marking last kernel write (for fine-grained sync)
+        std::optional<DeviceId> event_device_;    // Device where device_completion_event_ was created
+
+        // ===== Multi-Device Coherence Tracking =====
+        // Tracks which device has authoritative (current) data.
+        // - nullopt: Host is authoritative (default, backward compatible)
+        // - DeviceId: That GPU device is authoritative
+        // This enables direct GPU-to-GPU transfers without host staging.
+        std::optional<DeviceId> authoritative_device_;
+
+        // ===== Multi-Device Buffer Management =====
+
+        /**
+         * @brief Map of secondary device buffers (for multi-device scenarios)
+         *
+         * When a tensor has been on multiple GPUs, we keep the buffers around
+         * for potential reuse. Key is device type + ordinal packed into int.
+         *
+         * The primary GPU buffer is still stored in gpu_data_ptr_ and gpu_device_.
+         * This map stores buffers for other devices the tensor has visited.
+         */
+        std::unordered_map<int, void *> secondary_device_buffers_;
+
+        /**
+         * @brief Set of secondary buffer keys that were allocated in BAR region
+         *
+         * These buffers must NOT be freed with backend->free(), they're
+         * automatically reclaimed when PCIeBARBackend shuts down.
+         */
+        std::unordered_set<int> secondary_bar_allocated_keys_;
+
+        /**
+         * @brief Pack DeviceId into int for use as map key
+         */
+        static int packDeviceId(DeviceId device)
+        {
+            return (static_cast<int>(device.type) << 16) | device.ordinal;
+        }
+
+        /**
+         * @brief Get existing GPU buffer pointer for a device, or allocate new one
+         *
+         * Used by transferTo() and copyTo() to ensure destination buffer exists.
+         *
+         * @param device Target GPU device
+         * @return GPU pointer or nullptr if allocation failed
+         */
+        void *getOrAllocateDeviceBuffer(DeviceId device);
 
         // ===== Zero-Copy Mapped Memory =====
         // When a tensor uses mapped memory (hipHostMallocMapped/cudaHostAllocMapped):

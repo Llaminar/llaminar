@@ -11,11 +11,13 @@
  */
 
 #include "ROCmFlashAttentionKernelT.h"
+#include "../../../backends/IWorkerGPUContext.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KernelProfiler.h"
 #include <cstring>
+#include <stdexcept>
 
 // Extern "C" declarations for HIP kernel wrappers
 extern "C"
@@ -61,9 +63,37 @@ namespace llaminar2
         ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::ROCmFlashAttentionKernelT(int device_idx)
             : device_idx_(device_idx), stream_(nullptr),
               partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
-              workspace_size_(0), max_splits_(0)
+              workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
         {
             LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>] Created for device " << device_idx);
+        }
+
+        ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::ROCmFlashAttentionKernelT(
+            IWorkerGPUContext *ctx)
+            : stream_(nullptr),
+              partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
+              workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
+        {
+            if (!ctx)
+            {
+                throw std::runtime_error(
+                    "[ROCmFlashAttentionKernelT<FP32>] Device context is null");
+            }
+
+            if (!ctx->isInitialized())
+            {
+                throw std::runtime_error(
+                    "[ROCmFlashAttentionKernelT<FP32>] Device context is not initialized");
+            }
+
+            setDeviceContext(ctx);
+            device_idx_ = ctx->deviceOrdinal();
+
+            // Get stream from context
+            stream_ = ctx->defaultStream();
+
+            LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>] Created for device " << device_idx_
+                                                                              << " using device context");
         }
 
         ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::~ROCmFlashAttentionKernelT()
@@ -78,7 +108,9 @@ namespace llaminar2
               partial_m_buf_(other.partial_m_buf_),
               partial_l_buf_(other.partial_l_buf_),
               workspace_size_(other.workspace_size_),
-              max_splits_(other.max_splits_)
+              max_splits_(other.max_splits_),
+              workspace_(other.workspace_),
+              device_ctx_(other.device_ctx_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
@@ -86,6 +118,8 @@ namespace llaminar2
             other.partial_l_buf_ = nullptr;
             other.workspace_size_ = 0;
             other.max_splits_ = 0;
+            other.workspace_ = nullptr;
+            other.device_ctx_ = nullptr;
         }
 
         ROCmFlashAttentionKernelT<ActivationPrecision::FP32> &
@@ -102,6 +136,8 @@ namespace llaminar2
                 partial_l_buf_ = other.partial_l_buf_;
                 workspace_size_ = other.workspace_size_;
                 max_splits_ = other.max_splits_;
+                workspace_ = other.workspace_;
+                device_ctx_ = other.device_ctx_;
 
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
@@ -109,6 +145,8 @@ namespace llaminar2
                 other.partial_l_buf_ = nullptr;
                 other.workspace_size_ = 0;
                 other.max_splits_ = 0;
+                other.workspace_ = nullptr;
+                other.device_ctx_ = nullptr;
             }
             return *this;
         }
@@ -464,9 +502,35 @@ namespace llaminar2
         ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::ROCmFlashAttentionKernelT(int device_idx)
             : device_idx_(device_idx), stream_(nullptr),
               partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
-              workspace_size_(0), max_splits_(0)
+              workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
         {
             LOG_DEBUG("[ROCmFlashAttentionKernelT<FP16>] Created for device " << device_idx);
+        }
+
+        ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::ROCmFlashAttentionKernelT(
+            IWorkerGPUContext *ctx)
+            : stream_(nullptr),
+              partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
+              workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
+        {
+            if (!ctx)
+            {
+                throw std::runtime_error(
+                    "[ROCmFlashAttentionKernelT<FP16>] Device context is null");
+            }
+
+            if (!ctx->isInitialized())
+            {
+                throw std::runtime_error(
+                    "[ROCmFlashAttentionKernelT<FP16>] Device context is not initialized");
+            }
+
+            setDeviceContext(ctx);
+            device_idx_ = ctx->deviceOrdinal();
+            stream_ = ctx->defaultStream();
+
+            LOG_DEBUG("[ROCmFlashAttentionKernelT<FP16>] Created for device " << device_idx_
+                                                                              << " using device context");
         }
 
         ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::~ROCmFlashAttentionKernelT()
@@ -481,7 +545,9 @@ namespace llaminar2
               partial_m_buf_(other.partial_m_buf_),
               partial_l_buf_(other.partial_l_buf_),
               workspace_size_(other.workspace_size_),
-              max_splits_(other.max_splits_)
+              max_splits_(other.max_splits_),
+              workspace_(other.workspace_),
+              device_ctx_(other.device_ctx_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
@@ -489,6 +555,8 @@ namespace llaminar2
             other.partial_l_buf_ = nullptr;
             other.workspace_size_ = 0;
             other.max_splits_ = 0;
+            other.workspace_ = nullptr;
+            other.device_ctx_ = nullptr;
         }
 
         ROCmFlashAttentionKernelT<ActivationPrecision::FP16> &
@@ -505,6 +573,8 @@ namespace llaminar2
                 partial_l_buf_ = other.partial_l_buf_;
                 workspace_size_ = other.workspace_size_;
                 max_splits_ = other.max_splits_;
+                workspace_ = other.workspace_;
+                device_ctx_ = other.device_ctx_;
 
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
@@ -512,6 +582,8 @@ namespace llaminar2
                 other.partial_l_buf_ = nullptr;
                 other.workspace_size_ = 0;
                 other.max_splits_ = 0;
+                other.workspace_ = nullptr;
+                other.device_ctx_ = nullptr;
             }
             return *this;
         }
@@ -776,11 +848,32 @@ namespace llaminar2
         ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::ROCmFlashAttentionKernelT(int device_idx)
             : device_idx_(device_idx), stream_(nullptr),
               partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
-              workspace_size_(0), max_splits_(0)
+              workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
         {
             // Note: MI50 has limited BF16 support - may fall back to FP32
             LOG_DEBUG("[ROCmFlashAttentionKernelT<BF16>] Created for device " << device_idx
                                                                               << " (Note: MI50 has limited BF16 support)");
+        }
+
+        ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::ROCmFlashAttentionKernelT(IWorkerGPUContext *ctx)
+            : stream_(nullptr),
+              partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
+              workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
+        {
+            if (!ctx)
+            {
+                throw std::runtime_error("[ROCmFlashAttentionKernelT<BF16>] Device context is null");
+            }
+            if (!ctx->isInitialized())
+            {
+                throw std::runtime_error("[ROCmFlashAttentionKernelT<BF16>] Device context is not initialized");
+            }
+            setDeviceContext(ctx);
+            device_idx_ = ctx->deviceOrdinal();
+            stream_ = ctx->defaultStream();
+            // Note: MI50 has limited BF16 support - may fall back to FP32
+            LOG_DEBUG("[ROCmFlashAttentionKernelT<BF16>] Created for device " << device_idx_
+                                                                              << " using device context (Note: MI50 has limited BF16 support)");
         }
 
         ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::~ROCmFlashAttentionKernelT()
@@ -795,7 +888,9 @@ namespace llaminar2
               partial_m_buf_(other.partial_m_buf_),
               partial_l_buf_(other.partial_l_buf_),
               workspace_size_(other.workspace_size_),
-              max_splits_(other.max_splits_)
+              max_splits_(other.max_splits_),
+              workspace_(other.workspace_),
+              device_ctx_(other.device_ctx_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
@@ -803,6 +898,8 @@ namespace llaminar2
             other.partial_l_buf_ = nullptr;
             other.workspace_size_ = 0;
             other.max_splits_ = 0;
+            other.workspace_ = nullptr;
+            other.device_ctx_ = nullptr;
         }
 
         ROCmFlashAttentionKernelT<ActivationPrecision::BF16> &
@@ -819,6 +916,8 @@ namespace llaminar2
                 partial_l_buf_ = other.partial_l_buf_;
                 workspace_size_ = other.workspace_size_;
                 max_splits_ = other.max_splits_;
+                workspace_ = other.workspace_;
+                device_ctx_ = other.device_ctx_;
 
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
@@ -826,6 +925,8 @@ namespace llaminar2
                 other.partial_l_buf_ = nullptr;
                 other.workspace_size_ = 0;
                 other.max_splits_ = 0;
+                other.workspace_ = nullptr;
+                other.device_ctx_ = nullptr;
             }
             return *this;
         }

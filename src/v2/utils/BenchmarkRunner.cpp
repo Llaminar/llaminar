@@ -171,12 +171,12 @@ namespace llaminar2
         return {true, time_ms, tokens_generated, generated_text};
     }
 
-    BenchmarkResult BenchmarkRunner::run(const ArgContext &args)
+    BenchmarkResult BenchmarkRunner::run(const OrchestrationConfig &config)
     {
         BenchmarkResult result;
 
         // Determine prompt (use default if not provided or empty)
-        std::string prompt = args.prompt;
+        std::string prompt = config.prompt;
         if (prompt.empty() || prompt == "Hello, my name is")
         {
             prompt = generateDefaultPrompt();
@@ -223,7 +223,7 @@ namespace llaminar2
         // -1 means "use default" (128 for benchmark)
         // 0 means "skip decode phase"
         // >0 means use that value
-        int n_decode = args.n_predict;
+        int n_decode = config.n_predict;
         if (n_decode < 0)
         {
             n_decode = 128; // Default for benchmark

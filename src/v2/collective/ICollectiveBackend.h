@@ -495,6 +495,96 @@ namespace llaminar2
         }
 
         // =====================================================================
+        // Direct Device-to-Device Copy Operations
+        // =====================================================================
+        // These methods provide single-sided copy operations between devices,
+        // unlike send()/recv() which require matched rank pairs. Useful for
+        // weight streaming and buffer staging within a single process.
+
+        /**
+         * @brief Copy data between devices (same or different)
+         *
+         * Unlike send()/recv() which require matched rank pairs, copy() is a
+         * single-sided operation that works within a single process. Uses the
+         * optimal transfer mechanism for the device pair:
+         * - Same CUDA device: cudaMemcpy (no-op if same pointer)
+         * - Different CUDA devices: cudaMemcpyPeerAsync with P2P if available
+         * - Different ROCm devices: hipMemcpyPeerAsync with P2P if available
+         * - Cross-vendor (CUDA↔ROCm): PCIe BAR1 mapping
+         *
+         * FAIL-FAST: Returns false if the transfer cannot be performed optimally.
+         * No silent fallback to host staging - that's a performance bug.
+         *
+         * @param dst_ptr Destination pointer (must be valid on dst_device)
+         * @param dst_device Destination device
+         * @param src_ptr Source pointer (must be valid on src_device)
+         * @param src_device Source device
+         * @param bytes Number of bytes to copy
+         * @return true on success, false if unsupported or error
+         *
+         * @note Synchronous - blocks until copy completes
+         * @note Thread-safe with respect to other copy() calls
+         */
+        virtual bool copy(
+            void *dst_ptr, DeviceId dst_device,
+            const void *src_ptr, DeviceId src_device,
+            size_t bytes)
+        {
+            (void)dst_ptr;
+            (void)dst_device;
+            (void)src_ptr;
+            (void)src_device;
+            (void)bytes;
+            return false;
+        }
+
+        /**
+         * @brief Async copy data between devices
+         *
+         * Same semantics as copy() but returns immediately. Completion can be
+         * tracked via the stream or by calling synchronize().
+         *
+         * @param dst_ptr Destination pointer
+         * @param dst_device Destination device
+         * @param src_ptr Source pointer
+         * @param src_device Source device
+         * @param bytes Number of bytes to copy
+         * @param stream Device stream for ordering (nullptr for default stream)
+         * @return true if copy was successfully enqueued, false if unsupported
+         *
+         * @note Caller must synchronize before reading dst_ptr
+         */
+        virtual bool copyAsync(
+            void *dst_ptr, DeviceId dst_device,
+            const void *src_ptr, DeviceId src_device,
+            size_t bytes, void *stream = nullptr)
+        {
+            (void)dst_ptr;
+            (void)dst_device;
+            (void)src_ptr;
+            (void)src_device;
+            (void)bytes;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Check if this backend supports copy between given device pair
+         *
+         * Call this before copy() to check capability without attempting the operation.
+         *
+         * @param src_device Source device
+         * @param dst_device Destination device
+         * @return true if copy() will work for this device pair
+         */
+        virtual bool supportsCopy(DeviceId src_device, DeviceId dst_device) const
+        {
+            (void)src_device;
+            (void)dst_device;
+            return false;
+        }
+
+        // =====================================================================
         // Multi-GPU Single-Process Collective Operations
         // =====================================================================
         // These methods are for single-process scenarios managing multiple GPUs.

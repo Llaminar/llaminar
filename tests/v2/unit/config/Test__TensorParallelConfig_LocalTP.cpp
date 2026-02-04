@@ -64,6 +64,7 @@ namespace llaminar2
             const std::vector<float> &weights() const override { return weights_; }
             CollectiveBackendType backend() const override { return backend_; }
             int degree() const override { return static_cast<int>(devices_.size()); }
+            int myIndex() const override { return 0; }
 
             // =====================================================================
             // ILocalTPContext Implementation - Collective Operations (no-ops)
@@ -157,6 +158,11 @@ namespace llaminar2
             void clearBARBackedOutputs() override {}
             std::shared_ptr<DirectP2PEngine> getDirectP2PEngine() const override { return nullptr; }
             bool reserveTempBufferBytes(size_t /*bytes*/) override { return true; }
+
+            // =====================================================================
+            // ILocalTPContext Implementation - Broadcast (no-op)
+            // =====================================================================
+            bool broadcast(TensorBase* /*tensor*/, int /*source_device_index*/ = 0) override { return true; }
 
         private:
             std::vector<GlobalDeviceAddress> devices_;

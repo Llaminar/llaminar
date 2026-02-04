@@ -247,19 +247,11 @@ namespace llaminar2
         const float *data() const override { return inner()->data(); }
         float *mutable_data() override { return inner()->mutable_data(); }
         bool copyFrom(const TensorBase *src) override { return inner()->copyFrom(src); }
-        
-        // GPU coherence (critical: delegate to inner tensor, not TensorSlice's own gpu_data_ptr_)
-        bool ensureOnDevice(DeviceId device) override { return inner()->ensureOnDevice(device); }
-        bool allocateOnDevice(DeviceId device) override { return inner()->allocateOnDevice(device); }
-        void mark_device_dirty() override { inner()->mark_device_dirty(); }
-        void mark_device_dirty_with_event() override { inner()->mark_device_dirty_with_event(); }
-        void *gpu_data_ptr() override { return inner()->gpu_data_ptr(); }
-        const void *gpu_data_ptr() const override { return inner()->gpu_data_ptr(); }
 
         // =======================================================================
         // GPU Transfer Support (delegate to inner) - Required for ensureOnDevice()
         // =======================================================================
-        // Note: TensorSlice is a friend of TensorBase, so it can access
+        // Note: TensorSlice is a friend of CPUTensorBase, so it can access
         // protected methods like byte_size() and raw_host_data_ptr() on inner().
 
         size_t size_bytes() const override { return inner()->byte_size(); }
@@ -269,7 +261,7 @@ namespace llaminar2
          * @brief Get raw host data pointer for GPU transfer
          *
          * TensorSlice delegates directly to inner tensor's protected raw_host_data_ptr().
-         * This works because TensorSlice is a friend of TensorBase.
+         * This works because TensorSlice is a friend of CPUTensorBase.
          */
         void *raw_host_data_ptr() override
         {

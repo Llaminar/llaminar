@@ -148,6 +148,116 @@ namespace llaminar2
         return ctx;
     }
 
+    std::shared_ptr<ModelContext> ModelContext::create(
+        const std::string &model_path,
+        const ModelContextConfig &config)
+    {
+        // Validate config
+        auto errors = config.validate();
+        if (!errors.empty())
+        {
+            for (const auto &e : errors)
+            {
+                LOG_ERROR("[ModelContext] Config error: " << e);
+            }
+            return nullptr;
+        }
+
+        // Determine strategy - auto-select if layer partitioned
+        WeightDistributionStrategy strategy = config.strategy;
+        if (config.isLayerPartitioned() && strategy == WeightDistributionStrategy::REPLICATED)
+        {
+            strategy = WeightDistributionStrategy::LAYER_PARTITIONED;
+        }
+
+        // Create TensorFactory from MPI context if not provided
+        std::unique_ptr<TensorFactory> owned_factory;
+        TensorFactory *factory = config.factory;
+        if (!factory && config.mpi_ctx)
+        {
+            owned_factory = std::make_unique<TensorFactory>(*config.mpi_ctx);
+            factory = owned_factory.get();
+        }
+
+        // Create context
+        auto ctx = std::shared_ptr<ModelContext>(
+            new ModelContext(model_path, config.mpi_ctx, config.placement_map, factory, strategy));
+
+        // Store owned factory so it lives as long as the context
+        if (owned_factory)
+        {
+            ctx->owned_test_factory_ = std::move(owned_factory);
+        }
+
+        // Load model metadata
+        if (!ctx->loader_.loadModel(model_path))
+        {
+            LOG_ERROR("[ModelContext] Failed to load model: " << model_path);
+            return nullptr;
+        }
+
+        // Create WeightManager
+        ctx->weight_manager_ = std::make_shared<WeightManager>(
+            ctx->loader_, config.mpi_ctx, config.placement_map, strategy, config.weight_precision);
+
+        // Configure layer range if partitioned
+        if (strategy == WeightDistributionStrategy::LAYER_PARTITIONED)
+        {
+            ctx->weight_manager_->setLayerRange(config.first_layer, config.last_layer);
+            ctx->weight_manager_->setHasEmbedding(config.has_embedding);
+            ctx->weight_manager_->setHasLmHead(config.has_lm_head);
+        }
+
+        // Configure sharding if needed (TODO: implement setShardInfo in WeightManager)
+        // if (config.isSharded()) {
+        //     ctx->weight_manager_->setShardInfo(
+        //         config.shard_index, config.total_shards, config.work_fraction);
+        // }
+
+        // Set up interface wrappers
+        ctx->loader_interface_ = std::make_shared<ModelLoaderInterfaceWrapper>(ctx->loader_);
+
+        LOG_DEBUG("[ModelContext] Created with " << config.toString());
+        return ctx;
+    }
+
+    std::shared_ptr<ModelContext> ModelContext::createForPPStage(
+        const std::string &model_path,
+        int first_layer,
+        int last_layer,
+        bool has_embedding,
+        bool has_lm_head,
+        std::shared_ptr<MPIContext> mpi_ctx,
+        WeightPrecision weight_precision)
+    {
+        // Create context with LAYER_PARTITIONED strategy
+        auto ctx = std::shared_ptr<ModelContext>(
+            new ModelContext(model_path, mpi_ctx, nullptr, nullptr, WeightDistributionStrategy::LAYER_PARTITIONED));
+
+        // Load model metadata
+        if (!ctx->loader_.loadModel(model_path))
+        {
+            LOG_ERROR("[ModelContext] Failed to load model: " << model_path);
+            return nullptr;
+        }
+
+        // Create WeightManager with LAYER_PARTITIONED strategy
+        ctx->weight_manager_ = std::make_shared<WeightManager>(
+            ctx->loader_, mpi_ctx, nullptr, WeightDistributionStrategy::LAYER_PARTITIONED, weight_precision);
+
+        // Configure layer range for filtering
+        ctx->weight_manager_->setLayerRange(first_layer, last_layer, has_embedding, has_lm_head);
+
+        // Set up interface wrappers
+        ctx->loader_interface_ = std::make_shared<ModelLoaderInterfaceWrapper>(ctx->loader_);
+
+        LOG_INFO("[ModelContext] Created PP stage context for layers [" << first_layer << ", " << last_layer
+                 << "), embedding=" << (has_embedding ? "yes" : "no")
+                 << ", lm_head=" << (has_lm_head ? "yes" : "no"));
+
+        return ctx;
+    }
+
     std::shared_ptr<ModelContext> ModelContext::createForTesting(
         const std::string &model_path,
         std::shared_ptr<MPIContext> mpi_ctx,

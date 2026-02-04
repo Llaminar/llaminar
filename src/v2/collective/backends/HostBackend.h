@@ -222,6 +222,58 @@ namespace llaminar2
         bool synchronize() override { return true; }
 
         // =====================================================================
+        // Device-to-Device Copy Operations
+        // =====================================================================
+
+        /**
+         * @brief Copy data between devices (CPU↔CPU only)
+         *
+         * HostBackend ONLY supports CPU to CPU copies using memcpy.
+         * Returns false for any GPU-involved transfers (fail-fast, no silent staging).
+         *
+         * @param dst_ptr Destination pointer
+         * @param dst_device Destination device (must be CPU)
+         * @param src_ptr Source pointer
+         * @param src_device Source device (must be CPU)
+         * @param bytes Number of bytes to copy
+         * @return true on success, false if either device is not CPU
+         */
+        bool copy(
+            void *dst_ptr, DeviceId dst_device,
+            const void *src_ptr, DeviceId src_device,
+            size_t bytes) override;
+
+        /**
+         * @brief Async copy (delegates to synchronous copy for CPU)
+         *
+         * Since CPU operations are inherently synchronous, this just
+         * calls copy() and ignores the stream parameter.
+         *
+         * @param dst_ptr Destination pointer
+         * @param dst_device Destination device (must be CPU)
+         * @param src_ptr Source pointer
+         * @param src_device Source device (must be CPU)
+         * @param bytes Number of bytes to copy
+         * @param stream Ignored (no streams on CPU)
+         * @return true on success, false if either device is not CPU
+         */
+        bool copyAsync(
+            void *dst_ptr, DeviceId dst_device,
+            const void *src_ptr, DeviceId src_device,
+            size_t bytes, void *stream) override;
+
+        /**
+         * @brief Check if this backend supports copy between given device pair
+         *
+         * HostBackend only supports CPU↔CPU copies.
+         *
+         * @param src_device Source device
+         * @param dst_device Destination device
+         * @return true only if both devices are CPU
+         */
+        bool supportsCopy(DeviceId src_device, DeviceId dst_device) const override;
+
+        // =====================================================================
         // Diagnostics
         // =====================================================================
 

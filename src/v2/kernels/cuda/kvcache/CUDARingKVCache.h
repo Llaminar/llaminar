@@ -34,6 +34,7 @@
 #include "../../IKVCache.h"                          // Unified KVCache interface
 #include "../../../execution/config/RuntimeConfig.h" // For ActivationPrecision
 #include "../../../interfaces/IWorkspaceConsumer.h"  // Workspace management
+#include "../../../backends/IWorkerGPUContext.h"     // Device context support
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -350,6 +351,22 @@ namespace llaminar2
                         int n_kv_heads, int head_dim, int device_id = 0);
 
         /**
+         * @brief Construct CUDA ring buffer KV cache with device context
+         *
+         * Uses the device context's ordinal for device selection. The context
+         * provides the default stream when no explicit stream is passed to methods.
+         *
+         * @param n_layers Number of transformer layers
+         * @param batch_size Number of sequences (1 for single-sequence mode)
+         * @param max_seq_len Maximum sequence length (ring buffer capacity)
+         * @param n_kv_heads Number of KV heads (for GQA)
+         * @param head_dim Dimension per head
+         * @param ctx Device context (NOT owned, must outlive cache)
+         */
+        CUDARingKVCache(int n_layers, int batch_size, int max_seq_len,
+                        int n_kv_heads, int head_dim, IWorkerGPUContext *ctx);
+
+        /**
          * @brief Construct CUDA ring buffer KV cache with sharding (tensor parallelism)
          *
          * @param n_layers Number of transformer layers
@@ -364,6 +381,25 @@ namespace llaminar2
         CUDARingKVCache(int n_layers, int batch_size, int max_seq_len,
                         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
                         int head_dim, int device_id = 0);
+
+        /**
+         * @brief Construct sharded CUDA ring buffer KV cache with device context
+         *
+         * Uses the device context's ordinal for device selection. The context
+         * provides the default stream when no explicit stream is passed to methods.
+         *
+         * @param n_layers Number of transformer layers
+         * @param batch_size Number of sequences (1 for single-sequence mode)
+         * @param max_seq_len Maximum sequence length (ring buffer capacity)
+         * @param n_kv_heads Total number of KV heads (for GQA, across all ranks)
+         * @param local_n_kv_heads Number of KV heads stored on this rank
+         * @param kv_head_start Starting KV head index for this rank
+         * @param head_dim Dimension per head
+         * @param ctx Device context (NOT owned, must outlive cache)
+         */
+        CUDARingKVCache(int n_layers, int batch_size, int max_seq_len,
+                        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+                        int head_dim, IWorkerGPUContext *ctx);
 
         ~CUDARingKVCache();
 
@@ -495,6 +531,31 @@ namespace llaminar2
          */
         DeviceWorkspaceManager *getWorkspace() const override;
 
+        // =====================================================================
+        // Device Context Support
+        // =====================================================================
+
+        /**
+         * @brief Set device context for kernel launches
+         *
+         * When set, methods that take an optional stream parameter will use the
+         * context's default stream if no explicit stream is provided.
+         *
+         * @param ctx Device context (NOT owned, must outlive cache)
+         */
+        void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+
+        /**
+         * @brief Check if device context is set
+         */
+        bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+
+        /**
+         * @brief Get the current device context
+         * @return Device context pointer, or nullptr if not set
+         */
+        IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+
     private:
         int n_layers_;
         int batch_size_;
@@ -506,6 +567,10 @@ namespace llaminar2
         int kv_dim_; // local_n_kv_heads * head_dim (storage dimension)
         int device_id_;
         bool is_sharded_; // True if using local KV heads (TP enabled)
+
+        // Device context for kernel launches (optional)
+        // When set, provides default stream for methods that accept optional streams
+        IWorkerGPUContext *device_ctx_ = nullptr;
 
         // Workspace manager for batched gather operations
         // When bound, launch_gather_kernel() uses pre-allocated buffers instead of cudaMalloc/cudaFree
@@ -527,6 +592,21 @@ namespace llaminar2
         void allocate_entry(EntryT &entry);
         void free_entry(EntryT &entry);
         void linearize_entry(EntryT &entry, cudaStream_t stream);
+
+        /**
+         * @brief Get effective stream for kernel launches
+         *
+         * Returns the provided stream if non-null, otherwise returns the
+         * device context's default stream if available, or nullptr.
+         */
+        cudaStream_t getEffectiveStream(cudaStream_t stream) const
+        {
+            if (stream != nullptr)
+                return stream;
+            if (device_ctx_ != nullptr)
+                return static_cast<cudaStream_t>(device_ctx_->defaultStream());
+            return nullptr;
+        }
 
         // Kernel launchers
         void launch_append_kernel(EntryT &entry, const DataT *d_k, const DataT *d_v,

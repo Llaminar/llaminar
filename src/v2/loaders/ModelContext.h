@@ -13,6 +13,7 @@
 #include "ModelLoader.h"
 #include "WeightManager.h"
 #include "WeightPlacementMap.h"
+#include "ModelContextConfig.h"
 #include "../interfaces/IModelContext.h"
 #include "../backends/DeviceId.h"
 #include "../utils/MPIContext.h"
@@ -60,6 +61,54 @@ namespace llaminar2
             std::shared_ptr<WeightPlacementMap> placement_map = nullptr,
             TensorFactory *factory = nullptr,
             WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED,
+            WeightPrecision weight_precision = WeightPrecision::NATIVE);
+
+        /**
+         * @brief Create model context with unified configuration
+         *
+         * This is the preferred factory method. Supports all scenarios:
+         * - Single device (default config)
+         * - TP (config.total_shards > 1)
+         * - PP (config.first_layer != 0 or config.last_layer != -1)
+         * - Combined TP + PP
+         *
+         * @param model_path Path to GGUF model file
+         * @param config Configuration for weight loading
+         * @return Shared pointer to context, or nullptr on error
+         */
+        static std::shared_ptr<ModelContext> create(
+            const std::string &model_path,
+            const ModelContextConfig &config);
+
+        /**
+         * @brief Create model context for a Pipeline Parallelism stage
+         *
+         * Creates a ModelContext with LAYER_PARTITIONED strategy that only loads
+         * weights for the specified layer range. This reduces memory usage by
+         * ~50% for 2-stage PP.
+         *
+         * Layer range is [first_layer, last_layer) - first inclusive, last exclusive.
+         *
+         * Special weights:
+         * - has_embedding: if true, token embedding is loaded (typically stage 0)
+         * - has_lm_head: if true, output norm and LM head are loaded (typically last stage)
+         *
+         * @param model_path Path to GGUF model file
+         * @param first_layer First layer index (inclusive)
+         * @param last_layer Last layer index (exclusive)
+         * @param has_embedding True if this stage should load embedding
+         * @param has_lm_head True if this stage should load output norm and LM head
+         * @param mpi_ctx MPI context (optional)
+         * @param weight_precision Weight loading precision (default: NATIVE)
+         * @return Shared pointer to context, or nullptr on error
+         */
+        static std::shared_ptr<ModelContext> createForPPStage(
+            const std::string &model_path,
+            int first_layer,
+            int last_layer,
+            bool has_embedding,
+            bool has_lm_head,
+            std::shared_ptr<MPIContext> mpi_ctx = nullptr,
             WeightPrecision weight_precision = WeightPrecision::NATIVE);
 
         /**

@@ -26,8 +26,8 @@
 #include <iostream>
 
 #include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
-#include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "execution/factory/InferenceRunnerFactory.h"
 #include "collective/ILocalTPContext.h"
 #include "collective/LocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
@@ -476,8 +476,6 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_CUDA_TwoGPU_LogitsMatchSingleDevice)
     // =========================================================================
     InferenceRunnerConfig single_config;
     single_config.max_seq_len = 512;
-    single_config.activation_precision = ActivationPrecision::FP32;
-
     auto single_runner = createInferenceRunner(
         model_ctx, nullptr, DeviceId::cuda(0), single_config);
     ASSERT_NE(single_runner, nullptr) << "Failed to create single-device runner";
@@ -706,7 +704,6 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_ROCm_TwoGPU_LogitsMatchSingleDevice)
     // Single-device baseline (ROCm:0)
     InferenceRunnerConfig single_config;
     single_config.max_seq_len = 512;
-
     auto single_runner = createInferenceRunner(
         model_ctx, nullptr, DeviceId::rocm(0), single_config);
     ASSERT_NE(single_runner, nullptr);
@@ -846,7 +843,6 @@ TEST_F(Test__LocalTPMultiDevice, DISABLED_Heterogeneous_CUDAROCm_LogitsReasonabl
     // Single-device baseline (CUDA:0)
     InferenceRunnerConfig single_config;
     single_config.max_seq_len = 512;
-
     auto single_runner = createInferenceRunner(
         model_ctx, nullptr, DeviceId::cuda(0), single_config);
     ASSERT_NE(single_runner, nullptr);

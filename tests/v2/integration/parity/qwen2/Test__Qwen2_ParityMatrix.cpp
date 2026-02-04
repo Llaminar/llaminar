@@ -139,6 +139,102 @@ static const std::vector<TestConfig> kTestConfigs = {
             .excluded_stages = kTPExcludedStages,
         },
     },
+
+    // =========================================================================
+    // LOCAL Pipeline Parallelism
+    // =========================================================================
+    // PP splits layers across devices (unlike TP which shards weights).
+    // Each stage processes a subset of layers and transfers activations.
+    {
+        .name = "LocalPP_RCCL_2xROCm",
+        .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
+        .parallelism = Parallelism::LocalPP,
+        .collective = Collective::RCCL,
+        .thresholds = {
+            .cosine_threshold = 0.95f,
+            .decode_cosine_threshold = 0.90f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.20f,
+        },
+    },
+    {
+        .name = "LocalPP_NCCL_2xCUDA",
+        .devices = {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
+        .parallelism = Parallelism::LocalPP,
+        .collective = Collective::NCCL,
+        .thresholds = {
+            .cosine_threshold = 0.95f,
+            .decode_cosine_threshold = 0.90f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.20f,
+        },
+    },
+    {
+        .name = "LocalPP_PCIeBAR_CUDA_ROCm",
+        .devices = {ParityDeviceType::CUDA, ParityDeviceType::ROCm},
+        .parallelism = Parallelism::LocalPP,
+        .collective = Collective::PCIeBAR,
+        .thresholds = {
+            .cosine_threshold = 0.90f,
+            .decode_cosine_threshold = 0.85f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.30f, // Relaxed - cross-vendor PP adds variance
+        },
+    },
+    {
+        .name = "LocalPP_HOST_CUDA_CPU",
+        .devices = {ParityDeviceType::CUDA, ParityDeviceType::CPU},
+        .parallelism = Parallelism::LocalPP,
+        .collective = Collective::None, // HOST backend auto-selected for CPU
+        .thresholds = {
+            .cosine_threshold = 0.95f,
+            .decode_cosine_threshold = 0.90f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.20f,
+        },
+    },
+
+    // =========================================================================
+    // Hybrid: LOCAL PP of LOCAL TP domains
+    // =========================================================================
+    // These tests combine PP (layer split) with TP (weight shard) within stages.
+    // E.g., Stage 0 = TP(2xROCm), Stage 1 = single CUDA
+    {
+        .name = "LocalPP_TP2xROCm_CUDA",
+        .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm, ParityDeviceType::CUDA},
+        .parallelism = Parallelism::LocalPP, // PP between TP domain and CUDA
+        .collective = Collective::PCIeBAR,   // Cross-vendor transfer between stages
+        .thresholds = {
+            .cosine_threshold = 0.85f,
+            .decode_cosine_threshold = 0.80f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.50f,                // Relaxed - combined TP+PP adds variance
+            .excluded_stages = kTPExcludedStages, // TP excluded stages apply to stage 0
+        },
+        .pp_stage_sizes = {2, 1},          // Stage 0: 2 devices (TP), Stage 1: 1 device
+        .tp_collective = Collective::RCCL, // TP collective within stage 0 (ROCm-ROCm)
+    },
+    {
+        .name = "LocalPP_TP2xROCm_CPU",
+        .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm, ParityDeviceType::CPU},
+        .parallelism = Parallelism::LocalPP, // PP between TP domain and CPU
+        .collective = Collective::None,      // HOST backend for GPU→CPU transfer
+        .thresholds = {
+            .cosine_threshold = 0.85f,
+            .decode_cosine_threshold = 0.80f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.50f,                // Relaxed - combined TP+PP adds variance
+            .excluded_stages = kTPExcludedStages, // TP excluded stages apply to stage 0
+        },
+        .pp_stage_sizes = {2, 1},          // Stage 0: 2 devices (TP), Stage 1: 1 device
+        .tp_collective = Collective::RCCL, // TP collective within stage 0 (ROCm-ROCm)
+    },
 };
 
 // =============================================================================
@@ -161,7 +257,14 @@ public:
 
 TEST_P(Qwen2ParityMatrixTest, PrefillParity)
 {
-    if (cfg().is_local_tp())
+    if (cfg().is_local_pp())
+    {
+        // LocalPP parity test - setup PP pipeline, then run parity (don't overwrite runner_)
+        ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
+        auto summary = runPrefillParity();
+        assertParity(summary);
+    }
+    else if (cfg().is_local_tp())
     {
         ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
         auto summary = runTPPrefillParity();
@@ -176,7 +279,14 @@ TEST_P(Qwen2ParityMatrixTest, PrefillParity)
 
 TEST_P(Qwen2ParityMatrixTest, DecodeParity)
 {
-    if (cfg().is_local_tp())
+    if (cfg().is_local_pp())
+    {
+        // LocalPP decode parity test - setup PP pipeline, then run parity
+        ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
+        auto summary = runDecodeParity();
+        assertDecodeParity(summary);
+    }
+    else if (cfg().is_local_tp())
     {
         ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
         auto summary = runTPDecodeParity();

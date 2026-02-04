@@ -23,6 +23,7 @@
 #include "backends/IBackend.h"
 #include "utils/Logger.h"
 #include <cstring>
+#include <future>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -387,6 +388,53 @@ namespace llaminar2
                 (void)device_id;
                 // Mock: no actual GEMM computation
                 return true;
+            }
+
+            // =================================================================
+            // IBackend Async Operations (trivial mock implementations)
+            // =================================================================
+
+            std::future<bool> deviceToHostAsync(void *dst, const void *src, size_t bytes, int device_id) override
+            {
+                std::promise<bool> promise;
+                promise.set_value(deviceToHost(dst, src, bytes, device_id));
+                return promise.get_future();
+            }
+
+            std::future<bool> hostToDeviceAsync(void *dst, const void *src, size_t bytes, int device_id) override
+            {
+                std::promise<bool> promise;
+                promise.set_value(hostToDevice(dst, src, bytes, device_id));
+                return promise.get_future();
+            }
+
+            std::future<bool> synchronizeAsync(int device_id) override
+            {
+                std::promise<bool> promise;
+                promise.set_value(synchronize(device_id));
+                return promise.get_future();
+            }
+
+            std::future<void *> allocateAsync(size_t bytes, int device_id) override
+            {
+                std::promise<void *> promise;
+                promise.set_value(allocate(bytes, device_id));
+                return promise.get_future();
+            }
+
+            std::future<void> freeAsync(void *ptr, int device_id) override
+            {
+                free(ptr, device_id);
+                std::promise<void> promise;
+                promise.set_value();
+                return promise.get_future();
+            }
+
+            std::future<bool> memsetAsync(void *ptr, int value, size_t bytes, int device_id) override
+            {
+                std::promise<bool> promise;
+                promise.set_value(memset(ptr, value, bytes, device_id));
+                return promise.get_future();
             }
 
             // =================================================================

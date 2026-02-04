@@ -11,7 +11,7 @@
 #include "../local_execution/collective/CollectiveContext.h"
 #include "../mpi_orchestration/DeviceInventory.h"
 #include "../../models/qwen/Qwen2Graph.h"
-#include "../../models/qwen/Qwen2Schema.h"
+#include "../local_execution/graph/SchemaFactoryRegistry.h" // Model-agnostic sharding config
 #include "../local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "../../loaders/ModelContext.h"
 #include "../../loaders/ModelLoader.h"
@@ -20,6 +20,7 @@
 #include "../../collective/ILocalTPContext.h"
 #include "../local_execution/orchestrators/IMultiDeviceOrchestrator.h"
 #include "../local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "../../config/PipelineConfig.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 
@@ -158,19 +159,27 @@ namespace llaminar2
         const std::string &architecture)
     {
         // Currently only Qwen2 is supported
-        if (architecture != "qwen2")
+        if (!SchemaFactoryRegistry::isSupported(architecture))
         {
-            LOG_ERROR("[InferenceRunner] Only qwen2 architecture is supported, got: " << architecture);
+            LOG_ERROR("[InferenceRunner] Unsupported architecture: " << architecture
+                                                                     << ". Supported: " << [&]()
+                      {
+                          std::string s;
+                          for (const auto& a : SchemaFactoryRegistry::supportedArchitectures()) {
+                              if (!s.empty()) s += ", ";
+                              s += a;
+                          }
+                          return s; }());
             return nullptr;
         }
 
-        // Configure weight sharding from Qwen2 schema
+        // Configure weight sharding from architecture-specific schema (model-agnostic)
         auto weight_mgr = model_ctx->concreteWeightManager();
         if (weight_mgr)
         {
-            Qwen2SchemaFactory schema_factory;
-            weight_mgr->setWeightShardingConfig(schema_factory.getWeightShardingConfig());
-            LOG_DEBUG("[InferenceRunner] Applied Qwen2 sharding config to WeightManager");
+            auto sharding_config = SchemaFactoryRegistry::getWeightShardingConfig(architecture);
+            weight_mgr->setWeightShardingConfig(sharding_config);
+            LOG_DEBUG("[InferenceRunner] Applied " << architecture << " sharding config to WeightManager");
         }
 
         // Get model metadata
@@ -290,7 +299,21 @@ namespace llaminar2
         const TensorParallelConfig *tp_config = weight_mgr ? weight_mgr->tensorParallelConfig() : nullptr;
         const int current_rank = mpi_ctx ? mpi_ctx->rank() : 0;
 
-        if (local_tp_ctx && local_tp_ctx->degree() > 1 && weights_sharded)
+        // =====================================================================
+        // LOCAL TP ACTIVATION FIX (TP domain within PP stage)
+        // =====================================================================
+        // When a PP stage is a TP domain (multiple devices), the nested MDO:
+        // 1. Creates stage_ctx with LAYER_PARTITIONED strategy (for PP layer filtering)
+        // 2. Sets TensorParallelConfig on the WeightManager (for TP weight slicing)
+        // 3. Passes local_tp_ctx via runner config
+        //
+        // The original check `weights_sharded` fails because strategy is LAYER_PARTITIONED.
+        // Instead, we should activate LOCAL TP if tp_config is set on WeightManager,
+        // which indicates MDO configured it for TP weight slicing.
+        // =====================================================================
+        const bool local_tp_weights_configured = tp_config != nullptr;
+
+        if (local_tp_ctx && local_tp_ctx->degree() > 1 && (weights_sharded || local_tp_weights_configured))
         {
             // =====================================================================
             // LOCAL TP: Single rank with multiple devices via ILocalTPContext
@@ -658,7 +681,8 @@ namespace llaminar2
         // Use schema factory to determine which weights are required vs optional.
         // This ensures consistent handling: required weights fail if missing,
         // optional weights (like QKV biases) silently skip.
-        Qwen2SchemaFactory schema_factory;
+        const std::string arch = model_ctx->architecture();
+        auto schema_factory = SchemaFactoryRegistry::getFactory(arch);
 
         int n_layers = model_ctx->blockCount();
         LOG_DEBUG("[InferenceRunner] Eagerly loading " << n_layers << " layers of weights...");
@@ -687,7 +711,7 @@ namespace llaminar2
             for (const auto &weight_name : layer_weights)
             {
                 auto weight = weight_mgr->getWeight(weight_name);
-                bool is_optional = schema_factory.isWeightOptional(weight_name);
+                bool is_optional = schema_factory->isWeightOptional(weight_name);
 
                 if (!weight)
                 {
@@ -793,6 +817,701 @@ namespace llaminar2
         orchestrator->setWeights(weights);
         LOG_DEBUG("[InferenceRunner] Weights configured on orchestrator");
         return true;
+    }
+
+    // =========================================================================
+    // Pipeline Parallelism Weight Configuration
+    // =========================================================================
+
+    /**
+     * @brief Configure orchestrator weights for a Pipeline Parallelism stage
+     *
+     * Similar to configureOrchestratorWeightsImpl but only loads weights for the
+     * layers and components owned by this PP stage.
+     *
+     * @param orchestrator The DeviceGraphOrchestrator to configure
+     * @param model_ctx Model context with weights
+     * @param device Target device for weight packing/upload
+     * @param pp_config PP stage configuration specifying which layers/components to load
+     * @return true on success, false on failure
+     */
+    static bool configurePPStageWeightsImpl(
+        DeviceGraphOrchestrator *orchestrator,
+        std::shared_ptr<ModelContext> model_ctx,
+        DeviceId device,
+        const FactoryPPStageConfig &pp_config)
+    {
+        if (!orchestrator || !model_ctx)
+        {
+            return false;
+        }
+
+        auto weight_mgr = model_ctx->concreteWeightManager();
+        if (!weight_mgr)
+        {
+            LOG_ERROR("[PPStageRunner] No weight manager in model context");
+            return false;
+        }
+
+        // =====================================================================
+        // Set WeightManager and PlacementMap for phase-aware weight access
+        // =====================================================================
+        orchestrator->setWeightManager(weight_mgr);
+        if (auto placement_map = model_ctx->placementMap())
+        {
+            orchestrator->setWeightPlacementMap(placement_map);
+            LOG_DEBUG("[PPStageRunner] Phase-aware weight access configured with placement map");
+        }
+
+        // =====================================================================
+        // Determine target device type for preloading
+        // =====================================================================
+        DeviceType target_device = DeviceType::CPU;
+        if (device.is_gpu())
+        {
+            target_device = device.is_rocm() ? DeviceType::ROCm : DeviceType::CUDA;
+        }
+        const char *device_name = (target_device == DeviceType::CPU) ? "CPU" : (target_device == DeviceType::CUDA) ? "CUDA"
+                                                                                                                   : "ROCm";
+
+        // Build Qwen2ModelWeights for this PP stage
+        Qwen2ModelWeights weights;
+
+        // =====================================================================
+        // Global weights: Only load if this stage owns them
+        // =====================================================================
+        if (pp_config.has_embedding)
+        {
+            auto embedding = weight_mgr->getWeight("token_embd.weight");
+            if (!embedding)
+            {
+                LOG_ERROR("[PPStageRunner] Stage has_embedding=true but token_embd.weight missing");
+                return false;
+            }
+            weights.embedding_table = embedding.get();
+            LOG_DEBUG("[PPStageRunner] Loaded embedding table for stage");
+        }
+        else
+        {
+            weights.embedding_table = nullptr;
+            LOG_DEBUG("[PPStageRunner] Stage does not own embedding (has_embedding=false)");
+        }
+
+        if (pp_config.has_lm_head)
+        {
+            auto final_norm = weight_mgr->getWeight("output_norm.weight");
+            auto lm_head = weight_mgr->getWeight("output.weight");
+            if (!final_norm || !lm_head)
+            {
+                LOG_ERROR("[PPStageRunner] Stage has_lm_head=true but output_norm/output weights missing");
+                return false;
+            }
+            weights.final_norm = final_norm.get();
+            weights.lm_head = lm_head.get();
+            LOG_DEBUG("[PPStageRunner] Loaded final_norm and lm_head for stage");
+        }
+        else
+        {
+            weights.final_norm = nullptr;
+            weights.lm_head = nullptr;
+            LOG_DEBUG("[PPStageRunner] Stage does not own lm_head (has_lm_head=false)");
+        }
+
+        // =====================================================================
+        // Eagerly load ONLY this stage's layer weights into cache
+        // =====================================================================
+        const std::string arch = model_ctx->architecture();
+        auto schema_factory = SchemaFactoryRegistry::getFactory(arch);
+
+        const int first_layer = pp_config.first_layer;
+        const int last_layer = pp_config.last_layer;
+        LOG_DEBUG("[PPStageRunner] Eagerly loading layers [" << first_layer << ", " << last_layer
+                                                             << ") of weights...");
+
+        for (int layer_idx = first_layer; layer_idx < last_layer; ++layer_idx)
+        {
+            std::string prefix = "blk." + std::to_string(layer_idx) + ".";
+
+            // All possible layer weights (schema determines which are required)
+            const std::vector<std::string> layer_weights = {
+                // Attention weights (required)
+                prefix + "attn_q.weight",
+                prefix + "attn_k.weight",
+                prefix + "attn_v.weight",
+                prefix + "attn_output.weight",
+                prefix + "attn_norm.weight",
+                // Attention biases (optional per schema)
+                prefix + "attn_q.bias",
+                prefix + "attn_k.bias",
+                prefix + "attn_v.bias",
+                // FFN weights (required)
+                prefix + "ffn_gate.weight",
+                prefix + "ffn_up.weight",
+                prefix + "ffn_down.weight",
+                prefix + "ffn_norm.weight"};
+
+            for (const auto &weight_name : layer_weights)
+            {
+                auto weight = weight_mgr->getWeight(weight_name);
+                bool is_optional = schema_factory->isWeightOptional(weight_name);
+
+                if (!weight)
+                {
+                    if (is_optional)
+                    {
+                        LOG_TRACE("[PPStageRunner] Optional weight not present: " << weight_name);
+                    }
+                    else
+                    {
+                        LOG_ERROR("[PPStageRunner] Failed to load required weight: " << weight_name);
+                        return false;
+                    }
+                }
+            }
+        }
+        LOG_DEBUG("[PPStageRunner] All layer weights for stage loaded into cache");
+
+        // =====================================================================
+        // Preload weights for target device (GPU packing/upload)
+        // =====================================================================
+        if (!weight_mgr->packGemmWeights(device))
+        {
+            LOG_WARN("[PPStageRunner] Weight packing failed for device "
+                     << device_name << ", will use lazy kernel creation");
+        }
+        else
+        {
+            LOG_DEBUG("[PPStageRunner] Packed GEMM weights for " << device_name);
+        }
+
+        if (!weight_mgr->uploadNonGemmWeights(device))
+        {
+            LOG_WARN("[PPStageRunner] Non-GEMM weight upload failed for device " << device_name);
+        }
+        else
+        {
+            LOG_DEBUG("[PPStageRunner] Uploaded non-GEMM weights for " << device_name);
+        }
+
+        // =====================================================================
+        // Layer weight accessor - returns weights ONLY for this stage's layers
+        // =====================================================================
+        // Capture by value for lambda lifetime safety
+        const int stage_first_layer = first_layer;
+        const int stage_last_layer = last_layer;
+
+        weights.get_layer_weights = [weight_mgr, stage_first_layer, stage_last_layer](int layer_idx) -> Qwen2LayerWeights
+        {
+            Qwen2LayerWeights layer;
+
+            // Validate layer is within this stage's range
+            if (layer_idx < stage_first_layer || layer_idx >= stage_last_layer)
+            {
+                LOG_ERROR("[PPStageRunner] Layer " << layer_idx << " requested but stage only owns ["
+                                                   << stage_first_layer << ", " << stage_last_layer << ")");
+                return layer; // Return empty layer
+            }
+
+            std::string prefix = "blk." + std::to_string(layer_idx) + ".";
+
+            // Attention weights - all required
+            auto wq = weight_mgr->getWeight(prefix + "attn_q.weight");
+            auto wk = weight_mgr->getWeight(prefix + "attn_k.weight");
+            auto wv = weight_mgr->getWeight(prefix + "attn_v.weight");
+            auto wo = weight_mgr->getWeight(prefix + "attn_output.weight");
+            auto attn_norm = weight_mgr->getWeight(prefix + "attn_norm.weight");
+
+            if (!wq || !wk || !wv || !wo || !attn_norm)
+            {
+                LOG_ERROR("[PPStageRunner] Missing required attention weight for layer " << layer_idx);
+                return layer;
+            }
+
+            layer.wq = wq.get();
+            layer.wk = wk.get();
+            layer.wv = wv.get();
+            layer.wo = wo.get();
+            layer.attn_norm = attn_norm.get();
+
+            // Attention biases (may be null)
+            auto q_bias = weight_mgr->getWeight(prefix + "attn_q.bias");
+            auto k_bias = weight_mgr->getWeight(prefix + "attn_k.bias");
+            auto v_bias = weight_mgr->getWeight(prefix + "attn_v.bias");
+            layer.q_bias = q_bias ? q_bias.get() : nullptr;
+            layer.k_bias = k_bias ? k_bias.get() : nullptr;
+            layer.v_bias = v_bias ? v_bias.get() : nullptr;
+
+            // FFN weights - all required
+            auto gate_proj = weight_mgr->getWeight(prefix + "ffn_gate.weight");
+            auto up_proj = weight_mgr->getWeight(prefix + "ffn_up.weight");
+            auto down_proj = weight_mgr->getWeight(prefix + "ffn_down.weight");
+            auto ffn_norm = weight_mgr->getWeight(prefix + "ffn_norm.weight");
+
+            if (!gate_proj || !up_proj || !down_proj || !ffn_norm)
+            {
+                LOG_ERROR("[PPStageRunner] Missing required FFN weight for layer " << layer_idx);
+                return layer;
+            }
+
+            layer.gate_proj = gate_proj.get();
+            layer.up_proj = up_proj.get();
+            layer.down_proj = down_proj.get();
+            layer.ffn_norm = ffn_norm.get();
+
+            return layer;
+        };
+
+        orchestrator->setWeights(weights);
+        LOG_DEBUG("[PPStageRunner] Weights configured for PP stage [" << first_layer << ", " << last_layer << ")");
+        return true;
+    }
+
+    // =========================================================================
+    // Unified Pipeline Runner Factory
+    // =========================================================================
+
+    /**
+     * @brief Configure weights for a unified LOCAL PP pipeline
+     *
+     * Sets up Qwen2ModelWeights with device-aware weight loading based on
+     * the PipelineConfig. Each layer's weights are loaded for its assigned
+     * device (from getDeviceForLayer()).
+     *
+     * @param orchestrator Orchestrator to configure
+     * @param model_ctx Model context with weights
+     * @param pipeline_config Pipeline configuration with layer→device mapping
+     * @return true on success
+     */
+    static bool configureUnifiedPipelineWeightsImpl(
+        DeviceGraphOrchestrator *orchestrator,
+        std::shared_ptr<ModelContext> model_ctx,
+        std::shared_ptr<PipelineConfig> pipeline_config)
+    {
+        if (!orchestrator || !model_ctx || !pipeline_config)
+        {
+            LOG_ERROR("[UnifiedPipeline] Invalid arguments");
+            return false;
+        }
+
+        // Get primary device for embedding/lm_head (from first/last stage)
+        DeviceId embedding_device = pipeline_config->getDeviceForLayer(0);
+        DeviceId lm_head_device = pipeline_config->getDeviceForLayer(pipeline_config->total_layers - 1);
+
+        LOG_DEBUG("[UnifiedPipeline] Embedding device: " << embedding_device.to_string()
+                                                         << ", LM head device: " << lm_head_device.to_string());
+
+        // =====================================================================
+        // Global weights (embedding, final_norm, lm_head)
+        // =====================================================================
+        Qwen2ModelWeights weights;
+
+        auto embedding = model_ctx->getWeightForDevice("token_embd.weight", embedding_device);
+        auto final_norm = model_ctx->getWeightForDevice("output_norm.weight", lm_head_device);
+        auto lm_head = model_ctx->getWeightForDevice("output.weight", lm_head_device);
+
+        if (!embedding || !final_norm || !lm_head)
+        {
+            LOG_ERROR("[UnifiedPipeline] Missing global weights");
+            return false;
+        }
+
+        weights.embedding_table = embedding.get();
+        weights.final_norm = final_norm.get();
+        weights.lm_head = lm_head.get();
+
+        // =====================================================================
+        // Layer weight accessor - uses PipelineConfig to determine device
+        // =====================================================================
+        auto model_ctx_ptr = model_ctx;
+        auto pipeline_config_ptr = pipeline_config;
+
+        weights.get_layer_weights = [model_ctx_ptr, pipeline_config_ptr](int layer_idx) -> Qwen2LayerWeights
+        {
+            // Get device for this layer from pipeline config
+            DeviceId layer_device = pipeline_config_ptr->getDeviceForLayer(layer_idx);
+
+            Qwen2LayerWeights layer;
+            std::string prefix = "blk." + std::to_string(layer_idx) + ".";
+
+            // Attention weights - get for layer's specific device
+            layer.wq = model_ctx_ptr->getWeightForDevice(prefix + "attn_q.weight", layer_device).get();
+            layer.wk = model_ctx_ptr->getWeightForDevice(prefix + "attn_k.weight", layer_device).get();
+            layer.wv = model_ctx_ptr->getWeightForDevice(prefix + "attn_v.weight", layer_device).get();
+            layer.wo = model_ctx_ptr->getWeightForDevice(prefix + "attn_output.weight", layer_device).get();
+            layer.attn_norm = model_ctx_ptr->getWeightForDevice(prefix + "attn_norm.weight", layer_device).get();
+
+            // Attention biases (may be null for Qwen2)
+            auto q_bias = model_ctx_ptr->getWeightForDevice(prefix + "attn_q.bias", layer_device);
+            auto k_bias = model_ctx_ptr->getWeightForDevice(prefix + "attn_k.bias", layer_device);
+            auto v_bias = model_ctx_ptr->getWeightForDevice(prefix + "attn_v.bias", layer_device);
+            layer.q_bias = q_bias ? q_bias.get() : nullptr;
+            layer.k_bias = k_bias ? k_bias.get() : nullptr;
+            layer.v_bias = v_bias ? v_bias.get() : nullptr;
+
+            // FFN weights
+            layer.gate_proj = model_ctx_ptr->getWeightForDevice(prefix + "ffn_gate.weight", layer_device).get();
+            layer.up_proj = model_ctx_ptr->getWeightForDevice(prefix + "ffn_up.weight", layer_device).get();
+            layer.down_proj = model_ctx_ptr->getWeightForDevice(prefix + "ffn_down.weight", layer_device).get();
+            layer.ffn_norm = model_ctx_ptr->getWeightForDevice(prefix + "ffn_norm.weight", layer_device).get();
+
+            return layer;
+        };
+
+        orchestrator->setWeights(weights);
+        LOG_DEBUG("[UnifiedPipeline] Weights configured for " << pipeline_config->total_layers << " layers");
+        return true;
+    }
+
+    std::unique_ptr<IInferenceRunner> createUnifiedPipelineRunner(
+        std::shared_ptr<ModelContext> model_ctx,
+        std::shared_ptr<PipelineConfig> pipeline_config,
+        const InferenceRunnerConfig &config)
+    {
+        LOG_DEBUG("[UnifiedPipeline] createUnifiedPipelineRunner called");
+
+        // =====================================================================
+        // Validate inputs
+        // =====================================================================
+        if (!model_ctx)
+        {
+            LOG_ERROR("[UnifiedPipeline] model_ctx is null");
+            return nullptr;
+        }
+
+        if (!pipeline_config)
+        {
+            LOG_ERROR("[UnifiedPipeline] pipeline_config is null");
+            return nullptr;
+        }
+
+        std::string validation_error;
+        if (!pipeline_config->validate(&validation_error))
+        {
+            LOG_ERROR("[UnifiedPipeline] Invalid PipelineConfig: " << validation_error);
+            return nullptr;
+        }
+
+        // =====================================================================
+        // Validate architecture
+        // =====================================================================
+        std::string architecture = model_ctx->architecture();
+        if (architecture != "qwen2")
+        {
+            LOG_ERROR("[UnifiedPipeline] Only qwen2 architecture supported, got: " << architecture);
+            return nullptr;
+        }
+
+        // =====================================================================
+        // Build Qwen2GraphConfig from model metadata
+        // =====================================================================
+        auto loader = model_ctx->loader();
+        if (!loader)
+        {
+            LOG_ERROR("[UnifiedPipeline] Model loader is null");
+            return nullptr;
+        }
+
+        Qwen2GraphConfig graph_config;
+        graph_config.n_layers = loader->blockCount();
+        graph_config.d_model = loader->embeddingLength();
+        graph_config.n_heads = loader->headCount();
+        graph_config.n_kv_heads = loader->headCountKV();
+        graph_config.head_dim = graph_config.d_model / graph_config.n_heads;
+        graph_config.d_ff = loader->feedForwardLength();
+        graph_config.vocab_size = loader->vocabSize();
+        graph_config.rms_norm_eps = loader->rmsNormEps();
+        graph_config.rope_theta = loader->ropeTheta();
+        graph_config.max_seq_len = config.max_seq_len;
+        graph_config.activation_precision = config.activation_precision;
+
+        // Non-TP: use full dimensions
+        graph_config.d_ff_local = graph_config.d_ff;
+        graph_config.vocab_local = graph_config.vocab_size;
+        graph_config.local_n_heads = graph_config.n_heads;
+        graph_config.local_n_kv_heads = graph_config.n_kv_heads;
+
+        // Primary device is from first PP stage
+        DeviceId primary_device = pipeline_config->getDeviceForLayer(0);
+        graph_config.default_device = primary_device;
+
+        LOG_DEBUG("[UnifiedPipeline] GraphConfig: "
+                  << "n_layers=" << graph_config.n_layers
+                  << ", d_model=" << graph_config.d_model
+                  << ", primary_device=" << primary_device.to_string());
+
+        // =====================================================================
+        // Create DeviceGraphOrchestrator with injected dependencies
+        // =====================================================================
+        DeviceGraphOrchestrator::Dependencies deps;
+        deps.model_ctx = model_ctx;
+
+        auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
+            std::move(deps), graph_config);
+
+        // =====================================================================
+        // Set pipeline configuration (enables PP mode)
+        // =====================================================================
+        orchestrator->setPipelineConfig(pipeline_config);
+
+        // =====================================================================
+        // Initialize inference state
+        // =====================================================================
+        InferenceStateInitConfig init_config;
+        init_config.use_mapped_memory = config.use_mapped_memory;
+
+        if (!orchestrator->initializeInferenceState(
+                config.batch_size, config.max_seq_len, primary_device, init_config))
+        {
+            LOG_ERROR("[UnifiedPipeline] Failed to initialize inference state");
+            return nullptr;
+        }
+
+        // =====================================================================
+        // Configure weights (device-aware based on pipeline config)
+        // =====================================================================
+        if (!configureUnifiedPipelineWeightsImpl(orchestrator.get(), model_ctx, pipeline_config))
+        {
+            LOG_ERROR("[UnifiedPipeline] Failed to configure weights");
+            return nullptr;
+        }
+
+        LOG_INFO("[UnifiedPipeline] Created runner with "
+                 << pipeline_config->numStages() << " PP stages, "
+                 << pipeline_config->total_layers << " layers");
+
+        return orchestrator;
+    }
+
+    // =========================================================================
+    // Pipeline Parallelism Stage Runner Factory
+    // =========================================================================
+
+    std::unique_ptr<IInferenceRunner> createPPStageRunner(
+        std::shared_ptr<ModelContext> stage_ctx,
+        DeviceId device,
+        const FactoryPPStageConfig &pp_config,
+        const InferenceRunnerConfig &config)
+    {
+        LOG_DEBUG("[PPStageRunner] createPPStageRunner called: device=" << device.to_string()
+                                                                        << " layers=[" << pp_config.first_layer << ", " << pp_config.last_layer << ")"
+                                                                        << " has_embedding=" << pp_config.has_embedding
+                                                                        << " has_lm_head=" << pp_config.has_lm_head);
+
+        // =====================================================================
+        // Validate inputs
+        // =====================================================================
+        if (!stage_ctx)
+        {
+            LOG_ERROR("[PPStageRunner] stage_ctx is null");
+            return nullptr;
+        }
+
+        if (!device.is_valid())
+        {
+            LOG_ERROR("[PPStageRunner] Invalid device " << device << ". Use DeviceId::cpu() for CPU.");
+            return nullptr;
+        }
+
+        if (!pp_config.isValid())
+        {
+            LOG_ERROR("[PPStageRunner] Invalid FactoryPPStageConfig: first_layer=" << pp_config.first_layer
+                                                                                   << " last_layer=" << pp_config.last_layer);
+            return nullptr;
+        }
+
+        // =====================================================================
+        // Validate architecture
+        // =====================================================================
+        std::string architecture = stage_ctx->architecture();
+        if (!SchemaFactoryRegistry::isSupported(architecture))
+        {
+            LOG_ERROR("[PPStageRunner] Unsupported architecture: " << architecture);
+            return nullptr;
+        }
+
+        // =====================================================================
+        // Configure weight sharding from architecture-specific schema (model-agnostic)
+        // =====================================================================
+        auto weight_mgr = stage_ctx->concreteWeightManager();
+        if (weight_mgr)
+        {
+            auto sharding_config = SchemaFactoryRegistry::getWeightShardingConfig(architecture);
+            weight_mgr->setWeightShardingConfig(sharding_config);
+            LOG_DEBUG("[PPStageRunner] Applied " << architecture << " sharding config to WeightManager");
+        }
+
+        // =====================================================================
+        // Build Qwen2GraphConfig from model metadata
+        // =====================================================================
+        ModelLoader &loader = stage_ctx->concreteLoader();
+        const auto &model = loader.getModel();
+
+        Qwen2GraphConfig graph_config;
+        graph_config.vocab_size = static_cast<int>(model.vocab_size);
+        graph_config.d_model = static_cast<int>(model.embedding_length);
+        graph_config.n_layers = static_cast<int>(model.block_count);
+        graph_config.n_heads = static_cast<int>(model.head_count);
+        graph_config.n_kv_heads = static_cast<int>(model.head_count_kv);
+        graph_config.head_dim = graph_config.d_model / graph_config.n_heads;
+        graph_config.d_ff = 0;
+        graph_config.max_seq_len = config.max_seq_len;
+        graph_config.rope_theta = model.rope_theta;
+        graph_config.rms_norm_eps = model.rms_norm_eps;
+
+        // Set default device for kernel dispatch
+        graph_config.default_device = device;
+
+        // Propagate activation precision and fused attention backend
+        graph_config.activation_precision = config.activation_precision;
+
+        FusedAttentionBackend effective_backend = config.fused_attention_backend;
+        if (config.activation_precision == ActivationPrecision::HybridQ16 &&
+            config.fused_attention_backend == FusedAttentionBackend::JIT)
+        {
+            effective_backend = FusedAttentionBackend::Q16_INTEGER;
+            LOG_DEBUG("[PPStageRunner] HybridQ16 mode: auto-selecting Q16_INTEGER backend");
+        }
+        graph_config.fused_attention_backend = effective_backend;
+
+        // Propagate kv_cache_scale
+        graph_config.kv_cache_scale = config.kv_cache_scale;
+
+        // Note: For PP stages, n_layers stays at full model count in the config.
+        // The stage only executes pp_config.layerCount() layers, but the graph
+        // config represents the full model architecture. The stage runner knows
+        // which layers to actually execute via the PP config.
+
+        LOG_DEBUG("[PPStageRunner] GraphConfig: n_layers=" << graph_config.n_layers
+                                                           << " (PP stage owns layers ["
+                                                           << pp_config.first_layer << ", " << pp_config.last_layer << "))");
+
+        // =====================================================================
+        // Get d_ff from metadata
+        // =====================================================================
+        if (model.hasMetadata("llama.feed_forward_length"))
+        {
+            auto it = model.metadata.find("llama.feed_forward_length");
+            if (it != model.metadata.end())
+            {
+                if (it->second.type == GGUFValueType::UINT64)
+                {
+                    graph_config.d_ff = static_cast<int>(it->second.asUInt64());
+                }
+                else if (it->second.type == GGUFValueType::UINT32)
+                {
+                    graph_config.d_ff = static_cast<int>(it->second.asUInt32());
+                }
+            }
+        }
+        else if (model.hasMetadata("qwen2.feed_forward_length"))
+        {
+            auto it = model.metadata.find("qwen2.feed_forward_length");
+            if (it != model.metadata.end())
+            {
+                if (it->second.type == GGUFValueType::UINT64)
+                {
+                    graph_config.d_ff = static_cast<int>(it->second.asUInt64());
+                }
+                else if (it->second.type == GGUFValueType::UINT32)
+                {
+                    graph_config.d_ff = static_cast<int>(it->second.asUInt32());
+                }
+            }
+        }
+
+        if (graph_config.d_ff == 0)
+        {
+            graph_config.d_ff = graph_config.d_model * 4;
+            LOG_WARN("[PPStageRunner] Could not find feed_forward_length, using estimate: " << graph_config.d_ff);
+        }
+
+        // =====================================================================
+        // PP stages don't use tensor parallelism (TP) - they use full dimensions
+        // Inter-stage communication is handled by the PP orchestrator, not MPI collectives
+        // =====================================================================
+        graph_config.head_start = 0;
+        graph_config.local_n_heads = graph_config.n_heads;
+        graph_config.local_n_kv_heads = graph_config.n_kv_heads;
+        graph_config.qkv_column_parallel = false;
+        graph_config.local_rank = 0;
+
+        graph_config.d_ff_local = graph_config.d_ff;
+        graph_config.ffn_column_parallel = false;
+
+        graph_config.vocab_local = graph_config.vocab_size;
+        graph_config.lm_head_column_parallel = false;
+
+        LOG_DEBUG("[PPStageRunner] GraphConfig (no TP): "
+                  << "vocab=" << graph_config.vocab_size
+                  << ", d_model=" << graph_config.d_model
+                  << ", n_layers=" << graph_config.n_layers
+                  << ", n_heads=" << graph_config.n_heads
+                  << ", n_kv_heads=" << graph_config.n_kv_heads
+                  << ", d_ff=" << graph_config.d_ff
+                  << ", rope_theta=" << graph_config.rope_theta
+                  << ", rms_norm_eps=" << graph_config.rms_norm_eps
+                  << ", activation_precision=" << static_cast<int>(graph_config.activation_precision));
+
+        // =====================================================================
+        // Create DeviceGraphOrchestrator
+        // Note: No MPI context for PP stages - inter-stage comm handled externally
+        // =====================================================================
+        GraphCacheConfig cache_config;
+        cache_config.enabled = true;
+        cache_config.decode_seq_len = 1;
+
+        auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
+            graph_config, nullptr /* no mpi_ctx */, cache_config);
+
+        // =====================================================================
+        // Set PP stage configuration - CRITICAL for correct graph building
+        // This tells executeForward() to use buildPartialForwardGraph() instead
+        // of buildFullForwardGraph()
+        // =====================================================================
+        orchestrator->setPPStageConfig(pp_config);
+
+        // =====================================================================
+        // Initialize graph cache for ONLY this stage's layers
+        // =====================================================================
+        const int stage_layer_count = pp_config.layerCount();
+        orchestrator->initializeGraphCache(stage_layer_count);
+        LOG_DEBUG("[PPStageRunner] Graph cache initialized for " << stage_layer_count << " layers");
+
+        // =====================================================================
+        // Initialize inference state (allocates buffers)
+        // =====================================================================
+        InferenceStateInitConfig init_config;
+        init_config.use_mapped_memory = config.use_mapped_memory;
+        init_config.use_bar_backed_hidden = pp_config.use_bar_backed_hidden;
+
+        if (!orchestrator->initializeInferenceState(
+                config.batch_size, config.max_seq_len, device, init_config))
+        {
+            LOG_ERROR("[PPStageRunner] Failed to initialize inference state");
+            return nullptr;
+        }
+
+        // =====================================================================
+        // Load weights for this PP stage (partial weight loading)
+        // =====================================================================
+        if (!configurePPStageWeightsImpl(orchestrator.get(), stage_ctx, device, pp_config))
+        {
+            LOG_ERROR("[PPStageRunner] Failed to configure PP stage weights");
+            return nullptr;
+        }
+
+        // =====================================================================
+        // Note: No GPU collective setup for PP stages
+        // PP handles inter-stage communication externally (not via MPI collectives)
+        // =====================================================================
+
+        LOG_INFO("[PPStageRunner] PP stage runner created successfully: "
+                 << "layers=[" << pp_config.first_layer << ", " << pp_config.last_layer << ") "
+                 << "has_embedding=" << pp_config.has_embedding
+                 << " has_lm_head=" << pp_config.has_lm_head
+                 << " device=" << device.to_string());
+
+        return orchestrator;
     }
 
     // =========================================================================
@@ -978,6 +1697,7 @@ namespace llaminar2
         // Pass mapped memory config for GPU zero-copy access
         InferenceStateInitConfig init_config;
         init_config.use_mapped_memory = config.use_mapped_memory;
+        init_config.use_bar_backed_hidden = config.use_bar_backed_hidden;
 
         if (!orchestrator->initializeInferenceState(
                 config.batch_size, config.max_seq_len, device, init_config))

@@ -201,6 +201,119 @@ namespace llaminar2
         }
 
         // =========================================================================
+        // Device Memory Copy Operations
+        // =========================================================================
+
+        bool hipMemcpySameDevice(void *dst, const void *src, size_t bytes, int device_ordinal)
+        {
+            hipError_t err = hipSetDevice(device_ordinal);
+            if (err != hipSuccess)
+                return false;
+            err = hipMemcpy(dst, src, bytes, hipMemcpyDeviceToDevice);
+            return (err == hipSuccess);
+        }
+
+        bool hipMemcpyPeerDevice(void *dst, int dst_device, const void *src, int src_device, size_t bytes)
+        {
+            hipError_t err = hipSetDevice(dst_device);
+            if (err != hipSuccess)
+                return false;
+            err = hipMemcpyPeer(dst, dst_device, src, src_device, bytes);
+            return (err == hipSuccess);
+        }
+
+        bool hipMemcpyAsyncSameDevice(void *dst, const void *src, size_t bytes, int device_ordinal, void *stream)
+        {
+            hipError_t err = hipSetDevice(device_ordinal);
+            if (err != hipSuccess)
+                return false;
+            err = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, static_cast<hipStream_t>(stream));
+            return (err == hipSuccess);
+        }
+
+        bool hipMemcpyPeerAsyncDevice(void *dst, int dst_device, const void *src, int src_device, size_t bytes, void *stream)
+        {
+            hipError_t err = hipMemcpyPeerAsync(dst, dst_device, src, src_device, bytes, static_cast<hipStream_t>(stream));
+            return (err == hipSuccess);
+        }
+
+        bool hipCanAccessPeerDevice(int dst_device, int src_device)
+        {
+            int can_access = 0;
+            hipError_t err = hipDeviceCanAccessPeer(&can_access, dst_device, src_device);
+            return (err == hipSuccess && can_access != 0);
+        }
+
+        bool hipEnablePeerAccessDevice(int peer_device)
+        {
+            // hipDeviceEnablePeerAccess may return hipErrorPeerAccessAlreadyEnabled
+            // which is OK - it means P2P was already set up
+            hipError_t err = hipDeviceEnablePeerAccess(peer_device, 0);
+            return (err == hipSuccess || err == hipErrorPeerAccessAlreadyEnabled);
+        }
+
+        bool hipDeviceSynchronizeWrapper()
+        {
+            hipError_t err = hipDeviceSynchronize();
+            return (err == hipSuccess);
+        }
+
+        // =========================================================================
+        // Host Staging Memory Operations (for non-P2P fallback)
+        // =========================================================================
+
+        void *hipHostMallocWrapper(size_t bytes)
+        {
+            void *ptr = nullptr;
+            hipError_t err = hipHostMalloc(&ptr, bytes, hipHostMallocDefault);
+            return (err == hipSuccess) ? ptr : nullptr;
+        }
+
+        bool hipHostFreeWrapper(void *ptr)
+        {
+            if (!ptr)
+                return true;
+            hipError_t err = hipHostFree(ptr);
+            return (err == hipSuccess);
+        }
+
+        bool hipMemcpyD2H(void *dst_host, const void *src_device, size_t bytes, int src_device_ordinal)
+        {
+            hipError_t err = hipSetDevice(src_device_ordinal);
+            if (err != hipSuccess)
+                return false;
+            err = hipMemcpy(dst_host, src_device, bytes, ::hipMemcpyDeviceToHost);
+            return (err == hipSuccess);
+        }
+
+        bool hipMemcpyH2D(void *dst_device, const void *src_host, size_t bytes, int dst_device_ordinal)
+        {
+            hipError_t err = hipSetDevice(dst_device_ordinal);
+            if (err != hipSuccess)
+                return false;
+            err = hipMemcpy(dst_device, src_host, bytes, ::hipMemcpyHostToDevice);
+            return (err == hipSuccess);
+        }
+
+        bool hipMemcpyD2HAsync(void *dst_host, const void *src_device, size_t bytes, int src_device_ordinal, void *stream)
+        {
+            hipError_t err = hipSetDevice(src_device_ordinal);
+            if (err != hipSuccess)
+                return false;
+            err = hipMemcpyAsync(dst_host, src_device, bytes, ::hipMemcpyDeviceToHost, static_cast<hipStream_t>(stream));
+            return (err == hipSuccess);
+        }
+
+        bool hipMemcpyH2DAsync(void *dst_device, const void *src_host, size_t bytes, int dst_device_ordinal, void *stream)
+        {
+            hipError_t err = hipSetDevice(dst_device_ordinal);
+            if (err != hipSuccess)
+                return false;
+            err = hipMemcpyAsync(dst_device, src_host, bytes, ::hipMemcpyHostToDevice, static_cast<hipStream_t>(stream));
+            return (err == hipSuccess);
+        }
+
+        // =========================================================================
         // RCCL Pre-Initialization (P2P Check and Environment Setup)
         // =========================================================================
 

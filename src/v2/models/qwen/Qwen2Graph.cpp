@@ -13,15 +13,13 @@
 #include "../../utils/Logger.h"
 #include "../../utils/DebugEnv.h"
 #include "../../backends/ComputeBackend.h"
-#include "../../execution/config/InferenceMode.h"
+#include "../../execution/InferenceMode.h"
 #include "../../tensors/TensorSlice.h"
 #include "../../tensors/Tensors.h"
 #include "../../utils/MPIContext.h"
 #include "../../utils/MPIStrategy.h"
-#include "../../execution/local_execution/graph/GraphBuildUtils.h"
-#include "../../execution/config/RuntimeConfig.h"
-#include "../../collective/ILocalTPContext.h"
-#include "../../execution/compute_stages/stages/LocalTPAllreduceStage.h"
+#include "../../execution/GraphBuildUtils.h"
+#include "../../execution/RuntimeConfig.h"
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>
@@ -348,9 +346,6 @@ namespace llaminar2
             allgather_params.full_output = buffers_.logits;
             allgather_params.mpi_ctx = mpi_ctx_.get();
             allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
-            // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
-            // Multi-domain TP typically doesn't route LM head to a specific domain
-            allgather_params.domain = nullptr;
 
             graph.addNode("lm_head_allgather",
                           ComputeStageFactory::createAllGather(allgather_params),
@@ -663,8 +658,6 @@ namespace llaminar2
             allgather_params.full_output = output_logits;
             allgather_params.mpi_ctx = mpi_ctx_.get();
             allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
-            // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
-            allgather_params.domain = nullptr;
 
             graph.addNode("lm_head_allgather",
                           ComputeStageFactory::createAllGather(allgather_params),
@@ -819,7 +812,6 @@ namespace llaminar2
             int pos_offset = position_ids ? position_ids[0] : 0;
 
             RoPEStage::Params rope_params;
-            rope_params.device_id = device; // Use graph's target device for kernel dispatch
             rope_params.Q = buffers.Q;
             rope_params.K = buffers.K;
             rope_params.n_heads = local_n_heads;       // Use local head count for TP
@@ -842,7 +834,7 @@ namespace llaminar2
 
                 // HybridQ16 K precision fix: K from GEMM is Q16_1 (not Q8_1)
                 // RoPE will use Q16→Q16 dynamic scale path and output per-head scales
-                // Note: buffers.K is already Q16_1 for HybridQ16 (allocated by DeviceGraphOrchestrator)
+                // Note: buffers.K is already Q16_1 for HybridQ16 (allocated by GraphOrchestrator)
                 if (inference_mode.isHybridQ16() && buffers.K_head_scales)
                 {
                     rope_params.K_head_scales = buffers.K_head_scales;
@@ -1249,8 +1241,9 @@ namespace llaminar2
             if (env.execution.exec_gemm && layer.wo && !wo_producer_node.empty())
             {
                 bool wo_is_sharded = isRowParallelSharded(layer.wo);
+                bool has_multi_rank = hasMultipleRanks(mpi_ctx_.get());
 
-                if (wo_is_sharded && needsTPAllreduce())
+                if (wo_is_sharded && has_multi_rank)
                 {
                     // AllReduce the actual data, not full buffer capacity
                     size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
@@ -1261,20 +1254,21 @@ namespace llaminar2
                                                        ? buffers.residual
                                                        : buffers.attn_proj;
 
-                    std::string stage_name = prefix + "wo_allreduce";
-                    auto allreduce_stage = createTPAllreduceStage(
-                        allreduce_buffer, allreduce_count, device, layer_idx, /*is_attention=*/true, stage_name);
+                    graph.addNode(prefix + "wo_allreduce",
+                                  ComputeStageFactory::createAllreduce(
+                                      AllreduceStage::Params{
+                                          .device_id = device,
+                                          .mpi_ctx = mpi_ctx_.get(),
+                                          .buffer = allreduce_buffer,
+                                          .count = allreduce_count}),
+                                  device);
 
-                    if (allreduce_stage)
-                    {
-                        graph.addNode(stage_name, std::move(allreduce_stage), device);
-                        graph.addDependency(stage_name, wo_producer_node);
-                        wo_producer_node = stage_name;
+                    graph.addDependency(prefix + "wo_allreduce", wo_producer_node);
+                    wo_producer_node = prefix + "wo_allreduce";
 
-                        LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
-                                                        << " Wo: row-parallel sharded, adding allreduce"
-                                                        << (inference_mode.isHybridQ16() ? " (Q16_1 residual)" : " (FP32 proj)"));
-                    }
+                    LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
+                                                    << " Wo: row-parallel sharded, adding allreduce"
+                                                    << (inference_mode.isHybridQ16() ? " (Q16_1 residual)" : " (FP32 proj)"));
                 }
             }
         }
@@ -1284,7 +1278,6 @@ namespace llaminar2
         if (env.execution.exec_residual && !inference_mode.isHybridQ16())
         {
             ResidualAddStage::Params res_params;
-            res_params.device_id = device; // Use graph's target device for kernel dispatch
             res_params.input = buffers.attn_proj;
             res_params.residual = buffers.current_hidden;
             res_params.output = buffers.current_hidden;
@@ -1430,23 +1423,25 @@ namespace llaminar2
 
             bool down_is_row_sharded = isRowParallelSharded(layer.down_proj);
             bool needs_allreduce = (down_is_row_sharded || config_.ffn_column_parallel);
+            bool has_multi_rank = hasMultipleRanks(mpi_ctx_.get());
 
-            if (needs_allreduce && needsTPAllreduce())
+            if (needs_allreduce && has_multi_rank)
             {
                 size_t allreduce_count = static_cast<size_t>(total_tokens) * down_n;
                 LOG_DEBUG("[buildFFNGraph] Adding down_allreduce: ffn_column_parallel="
                           << config_.ffn_column_parallel << " down_is_row_sharded=" << down_is_row_sharded
                           << " count=" << allreduce_count);
 
-                std::string stage_name = prefix + "down_allreduce";
-                auto allreduce_stage = createTPAllreduceStage(
-                    buffers.attn_proj, allreduce_count, device, layer_idx, /*is_attention=*/false, stage_name);
+                graph.addNode(prefix + "down_allreduce",
+                              ComputeStageFactory::createAllreduce(
+                                  AllreduceStage::Params{
+                                      .device_id = device,
+                                      .mpi_ctx = mpi_ctx_.get(),
+                                      .buffer = buffers.attn_proj,
+                                      .count = allreduce_count}),
+                              device);
 
-                if (allreduce_stage)
-                {
-                    graph.addNode(stage_name, std::move(allreduce_stage), device);
-                    graph.addDependency(stage_name, prefix + "down_proj");
-                }
+                graph.addDependency(prefix + "down_allreduce", prefix + "down_proj");
             }
         }
 
@@ -1457,7 +1452,6 @@ namespace llaminar2
             InferenceMode inference_mode_ffn_res(config_.activation_precision);
 
             ResidualAddStage::Params res_params;
-            res_params.device_id = device; // Use graph's target device for kernel dispatch
             res_params.input = buffers.attn_proj;
             res_params.residual = (inference_mode_ffn_res.isHybridQ16() && buffers.residual)
                                       ? buffers.residual
@@ -1475,8 +1469,9 @@ namespace llaminar2
             {
                 bool down_is_row_sharded = isRowParallelSharded(layer.down_proj);
                 bool needs_allreduce = (down_is_row_sharded || config_.ffn_column_parallel);
+                bool has_multi_rank = hasMultipleRanks(mpi_ctx_.get());
 
-                if (needs_allreduce && needsTPAllreduce())
+                if (needs_allreduce && has_multi_rank)
                 {
                     graph.addDependency(prefix + "ffn_residual", prefix + "down_allreduce");
                 }
@@ -1611,109 +1606,6 @@ namespace llaminar2
         {
             graph.addDependency("final_norm", prev_node);
         }
-    }
-
-    const TPDomain *Qwen2Graph::getDomainForLayer(int layer_idx, bool is_attention) const
-    {
-        if (!config_.multi_domain_tp_config)
-        {
-            return nullptr; // No domain config - use legacy MPI path
-        }
-        return config_.multi_domain_tp_config->domainForLayer(layer_idx, is_attention);
-    }
-
-    // =========================================================================
-    // TP Allreduce Helpers
-    // =========================================================================
-
-    bool Qwen2Graph::needsTPAllreduce() const
-    {
-        // Check LOCAL TP first (takes precedence)
-        if (config_.local_tp_ctx && config_.local_tp_ctx->degree() > 1)
-        {
-            return true;
-        }
-        // Check GLOBAL TP
-        if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
-        {
-            return true;
-        }
-        return false;
-    }
-
-    std::unique_ptr<IComputeStage> Qwen2Graph::createTPAllreduceStage(
-        TensorBase *buffer,
-        size_t count,
-        DeviceId device,
-        int layer_idx,
-        bool is_attention,
-        const std::string &stage_name) const
-    {
-        // LOCAL TP takes precedence if configured
-        if (config_.local_tp_ctx && config_.local_tp_ctx->degree() > 1)
-        {
-            LOG_DEBUG("[Qwen2Graph] Creating LocalTPAllreduceStage: degree="
-                      << config_.local_tp_ctx->degree()
-                      << " device_idx=" << config_.local_tp_device_idx
-                      << " count=" << count
-                      << " backend=" << static_cast<int>(config_.local_tp_ctx->backend())
-                      << " stage_name=" << stage_name);
-
-            // =========================================================
-            // Register BAR-backed tensor for PCIeBAR allreduce
-            // =========================================================
-            // For PCIeBAR backend, row-parallel output tensors need to be
-            // registered with LocalTPContext so executePCIeBarAllreduce()
-            // can find them by stage name. The tensor was allocated as
-            // BAR-backed by GraphBufferManager if conditions were met.
-            //
-            // This registration is called for EACH device orchestrator,
-            // so each device registers its own tensor for this stage.
-            // =========================================================
-            if (config_.local_tp_ctx->backend() == CollectiveBackendType::PCIE_BAR &&
-                config_.local_tp_device_idx >= 0 &&
-                static_cast<size_t>(config_.local_tp_device_idx) < config_.local_tp_ctx->devices().size())
-            {
-                const GlobalDeviceAddress &device_addr =
-                    config_.local_tp_ctx->devices()[config_.local_tp_device_idx];
-
-                // Register the tensor with the stage name
-                // registerBARBackedOutput checks if tensor is BAR-backed and handles accordingly
-                config_.local_tp_ctx->registerBARBackedOutput(stage_name, device_addr, buffer);
-            }
-
-            LocalTPAllreduceStage::Params params;
-            params.device_id = device;
-            params.tp_ctx = config_.local_tp_ctx;
-            params.tensor = buffer;
-            params.count = count;
-            params.stage_name = stage_name;
-
-            return std::make_unique<LocalTPAllreduceStage>(params);
-        }
-
-        // Fall back to GLOBAL TP (MPI-based)
-        if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
-        {
-            LOG_DEBUG("[Qwen2Graph] Creating AllreduceStage (MPI): world_size="
-                      << mpi_ctx_->world_size()
-                      << " rank=" << mpi_ctx_->rank()
-                      << " count=" << count);
-
-            AllreduceStage::Params params;
-            params.device_id = device;
-            params.mpi_ctx = mpi_ctx_.get();
-            params.buffer = buffer;
-            params.count = count;
-            params.collective_ctx = nullptr;
-            params.domain = getDomainForLayer(layer_idx, is_attention);
-
-            return ComputeStageFactory::createAllreduce(params);
-        }
-
-        // No TP active - should not reach here (caller should check needsTPAllreduce())
-        LOG_WARN("[Qwen2Graph] createTPAllreduceStage called but no TP active");
-        return nullptr;
     }
 
 } // namespace llaminar2

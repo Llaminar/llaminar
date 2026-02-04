@@ -283,6 +283,47 @@ namespace llaminar2
         bool synchronize() override;
 
         // =====================================================================
+        // Direct Device-to-Device Copy Operations
+        // =====================================================================
+
+        /**
+         * @brief Copy data between devices (cross-vendor specialist)
+         *
+         * PCIeBARBackend handles cross-vendor CUDA↔ROCm transfers:
+         * - CUDA↔CUDA: Returns false (use NCCLBackend)
+         * - ROCm↔ROCm: Returns false (use RCCLBackend)
+         * - CUDA→ROCm: Uses PCIe BAR transfer (ROCm ptr must be in BAR region)
+         * - ROCm→CUDA: Uses PCIe BAR transfer (ROCm ptr must be in BAR region)
+         * - Host involved: Returns false (fail-fast, no silent staging)
+         *
+         * @param dst_ptr Destination pointer
+         * @param dst_device Destination device
+         * @param src_ptr Source pointer
+         * @param src_device Source device
+         * @param bytes Number of bytes to copy
+         * @return true on success, false if unsupported or error
+         */
+        bool copy(
+            void *dst_ptr, DeviceId dst_device,
+            const void *src_ptr, DeviceId src_device,
+            size_t bytes) override;
+
+        /**
+         * @brief Async copy (currently synchronous - BAR transfers block)
+         */
+        bool copyAsync(
+            void *dst_ptr, DeviceId dst_device,
+            const void *src_ptr, DeviceId src_device,
+            size_t bytes, void *stream = nullptr) override;
+
+        /**
+         * @brief Check if this backend supports copy between given device pair
+         *
+         * Returns true only for cross-vendor GPU↔GPU (CUDA↔ROCm).
+         */
+        bool supportsCopy(DeviceId src_device, DeviceId dst_device) const override;
+
+        // =====================================================================
         // Cross-Thread CUDA Event Synchronization
         // =====================================================================
 
@@ -634,6 +675,18 @@ namespace llaminar2
         bool transferROCmtoCUDA(size_t offset, void *cuda_dst, size_t bytes);
 
         /**
+         * @brief Find BAR offset for an ROCm pointer
+         *
+         * Returns the BAR offset if the pointer was allocated via allocateInBarRegion(),
+         * or std::nullopt if the pointer is not in the BAR region.
+         *
+         * @param ptr Pointer to look up
+         * @param size Expected size (for bounds checking)
+         * @return BAR offset or nullopt
+         */
+        std::optional<size_t> findBarOffset(const void *ptr, size_t size) const;
+
+        /**
          * @brief Pipelined allreduce for large buffers
          *
          * Uses triple-buffering with overlapped transfers:
@@ -736,6 +789,11 @@ namespace llaminar2
         bool sendrecv(void *, void *, size_t, CollectiveDataType, int) override { return false; }
         bool allreduceMultiPair(std::vector<void *> &, std::vector<void *> &, size_t, CollectiveDataType) { return false; }
         bool synchronize() override { return false; }
+
+        // Copy operations - stub returns false
+        bool copy(void *, DeviceId, const void *, DeviceId, size_t) override { return false; }
+        bool copyAsync(void *, DeviceId, const void *, DeviceId, size_t, void * = nullptr) override { return false; }
+        bool supportsCopy(DeviceId, DeviceId) const override { return false; }
 
         double getMeasuredBandwidthGBps() const { return 0.0; }
         bool isPCIeBarActive() const { return false; }

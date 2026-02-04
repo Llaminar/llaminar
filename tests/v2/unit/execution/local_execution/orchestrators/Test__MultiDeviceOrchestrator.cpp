@@ -208,6 +208,8 @@ public:
         return static_cast<int>(config_.devices.size());
     }
 
+    int myIndex() const override { return 0; }
+
     // =====================================================================
     // ILocalTPContext Collective Operations
     // =====================================================================
@@ -359,6 +361,15 @@ public:
     bool reserveTempBufferBytes(size_t /*bytes*/) override { return true; }
 
     // =====================================================================
+    // ILocalTPContext Broadcast (no-op)
+    // =====================================================================
+    bool broadcast(TensorBase* /*tensor*/, int /*source_device_index*/ = 0) override
+    {
+        broadcast_calls_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // =====================================================================
     // Test Utilities
     // =====================================================================
 
@@ -375,6 +386,11 @@ public:
     size_t allgather_call_count() const
     {
         return allgather_calls_.load(std::memory_order_relaxed);
+    }
+
+    size_t broadcast_call_count() const
+    {
+        return broadcast_calls_.load(std::memory_order_relaxed);
     }
 
     size_t gather_from_devices_call_count() const
@@ -399,6 +415,7 @@ private:
     mutable std::atomic<size_t> synchronize_calls_{0};
     mutable std::atomic<size_t> allreduce_calls_{0};
     mutable std::atomic<size_t> allgather_calls_{0};
+    mutable std::atomic<size_t> broadcast_calls_{0};
     mutable std::atomic<size_t> gather_from_devices_calls_{0};
     mutable std::atomic<size_t> reduce_scatter_calls_{0};
 };

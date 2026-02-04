@@ -391,4 +391,84 @@ namespace
         EXPECT_FALSE(result.is_complete);
     }
 
+    // =========================================================================
+    // Execution Plan Device Selection Tests
+    // =========================================================================
+    // These tests verify the OrchestrationRunner correctly uses execution plan
+    // device assignments. The fix ensures that when GPUs are enumerated in
+    // ClusterInventory, they are selected over CPU.
+
+    TEST_F(Test__OrchestrationRunner, ExecutionPlanWithGPU_UsesGPUAsPrimaryDevice)
+    {
+        // Create a plan with a CUDA GPU as primary device
+        RankExecutionPlan plan = createSimplePlan();
+        plan.primary_device = GlobalDeviceAddress::parse("0:cuda:0");
+
+        OrchestrationRunner runner(OrchestrationConfig{}, plan);
+
+        const auto &returned = runner.executionPlan();
+        EXPECT_EQ(returned.primary_device.device_type, DeviceType::CUDA);
+        EXPECT_FALSE(returned.primary_device.isCPU())
+            << "Primary device should be GPU when configured in plan";
+    }
+
+    TEST_F(Test__OrchestrationRunner, ExecutionPlanWithCPU_UsesCPU)
+    {
+        // Verify CPU plans work correctly (baseline case)
+        RankExecutionPlan plan = createSimplePlan();
+        plan.primary_device = GlobalDeviceAddress::cpu();
+
+        OrchestrationRunner runner(OrchestrationConfig{}, plan);
+
+        const auto &returned = runner.executionPlan();
+        EXPECT_TRUE(returned.primary_device.isCPU());
+    }
+
+    TEST_F(Test__OrchestrationRunner, ExecutionPlanWithROCm_UsesROCm)
+    {
+        // Verify ROCm devices are correctly preserved
+        RankExecutionPlan plan = createSimplePlan();
+        plan.primary_device = GlobalDeviceAddress::parse("0:rocm:0");
+
+        OrchestrationRunner runner(OrchestrationConfig{}, plan);
+
+        const auto &returned = runner.executionPlan();
+        EXPECT_EQ(returned.primary_device.device_type, DeviceType::ROCm);
+    }
+
+    TEST_F(Test__OrchestrationRunner, LocalTPPlan_HasGPUDevices)
+    {
+        // Verify LOCAL TP plans have GPU devices populated
+        RankExecutionPlan plan = createLocalTPPlan();
+
+        OrchestrationRunner runner(OrchestrationConfig{}, plan);
+
+        const auto &returned = runner.executionPlan();
+        ASSERT_FALSE(returned.local_tp_devices.empty());
+        // All LOCAL TP devices should be GPUs
+        for (const auto &dev : returned.local_tp_devices)
+        {
+            EXPECT_FALSE(dev.isCPU())
+                << "LOCAL TP devices should be GPUs, not CPU";
+        }
+    }
+
+    TEST_F(Test__OrchestrationRunner, ConfigWithTPDevices_PropagatesDevices)
+    {
+        // Verify tp_devices from config are propagated correctly
+        OrchestrationConfig config;
+        config.tp_devices.push_back(GlobalDeviceAddress::parse("0:cuda:0"));
+        config.tp_devices.push_back(GlobalDeviceAddress::parse("0:cuda:1"));
+        config.tp_degree = 2;
+        config.tp_scope = TPScope::LOCAL;
+
+        auto runner = factory_->createFromOrchestrationConfig(config);
+        ASSERT_NE(runner, nullptr);
+
+        const auto &returned_config = runner->config();
+        EXPECT_EQ(returned_config.tp_devices.size(), 2u);
+        EXPECT_EQ(returned_config.tp_devices[0].device_type, DeviceType::CUDA);
+        EXPECT_EQ(returned_config.tp_devices[1].device_type, DeviceType::CUDA);
+    }
+
 } // anonymous namespace

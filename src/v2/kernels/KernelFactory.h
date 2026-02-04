@@ -202,6 +202,13 @@ namespace llaminar
                 int local_n_kv_heads = 0; ///< 0 = use full n_kv_heads (no sharding)
                 int kv_head_start = 0;    ///< Starting KV head index for this rank
 
+                /// First layer index for Pipeline Parallelism (PP).
+                /// When set (non-zero), the KV cache remaps global layer indices:
+                /// - Incoming layer_idx is remapped to (layer_idx - first_layer_index)
+                /// - This allows PP stage 1 with layers [12,23] to use cache layers [0,11]
+                /// Default is 0 (no remapping).
+                int first_layer_index = 0;
+
                 // Layout mode - forward declared, defined in CPUKVCache.h
                 ::llaminar2::KVCacheLayoutMode layout_mode{}; // Default-initialized (POSITION_MAJOR = 0)
 

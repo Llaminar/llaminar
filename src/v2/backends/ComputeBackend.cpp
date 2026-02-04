@@ -569,6 +569,9 @@ namespace llaminar2
         // NOTE: This method selects a PRIMARY device for legacy single-device code paths.
         // For heterogeneous tensor-parallel execution, use all devices via devices() and
         // let the work distributor allocate work based on device capabilities.
+        //
+        // Current behavior: Returns CPU (index 0) since GPU kernels are not yet implemented.
+        // Future behavior: Will be deprecated in favor of multi-device orchestration.
 
         if (devices_.empty())
         {
@@ -576,32 +579,9 @@ namespace llaminar2
             return 0;
         }
 
-        // Prefer GPU over CPU when available
-        // Device ordering: [0] = CPU, [1...N] = GPUs (CUDA first, then ROCm, then Vulkan)
-        for (size_t i = 1; i < devices_.size(); ++i)
-        {
-            const auto &dev = devices_[i];
-            if (dev.type == ComputeBackendType::GPU_CUDA ||
-                dev.type == ComputeBackendType::GPU_ROCM)
-            {
-                // Check memory if estimate provided
-                if (estimated_memory_bytes > 0 && dev.total_memory_bytes > 0)
-                {
-                    if (dev.total_memory_bytes < estimated_memory_bytes)
-                    {
-                        LOG_DEBUG("[DeviceManager] Skipping " << dev.name << " (insufficient memory: "
-                                                              << dev.total_memory_bytes / (1024 * 1024) << "MB < "
-                                                              << estimated_memory_bytes / (1024 * 1024) << "MB required)");
-                        continue;
-                    }
-                }
-                LOG_DEBUG("[DeviceManager] Selected GPU: " << dev.name << " (device index " << i << ")");
-                return i;
-            }
-        }
-
-        // Fall back to CPU if no suitable GPU found
-        LOG_DEBUG("[DeviceManager] No suitable GPU found, falling back to CPU");
+        // For now, always use CPU backend since GPU kernels are under development
+        // All devices remain available for future heterogeneous work distribution
+        LOG_DEBUG("[DeviceManager] Using CPU backend (GPU kernels under development)");
         return 0; // CPU is always device 0
     }
 

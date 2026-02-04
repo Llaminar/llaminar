@@ -20,6 +20,7 @@
 #include "../backends/GlobalDeviceAddress.h"
 #include "../config/OrchestrationConfig.h"
 #include "../tensors/ITensor.h"
+#include "ITPContext.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -44,10 +45,16 @@ namespace llaminar2
      * Thread safety: All methods are thread-safe. Collective operations
      * must be called from all participating threads/devices.
      */
-    class ILocalTPContext
+    class ILocalTPContext : public ITPContext
     {
     public:
-        virtual ~ILocalTPContext() = default;
+        ~ILocalTPContext() override = default;
+
+        /**
+         * @brief LOCAL TP is always intra-rank
+         * @return Always true for LOCAL TP contexts
+         */
+        bool isLocal() const override { return true; }
 
         // =====================================================================
         // Configuration
@@ -85,7 +92,18 @@ namespace llaminar2
          * @brief Get total TP degree (number of devices)
          * @return Number of devices participating in LOCAL TP
          */
-        virtual int degree() const = 0;
+        int degree() const override = 0;
+
+        /**
+         * @brief Get the current device's index within the LOCAL TP domain
+         *
+         * For orchestrator-driven LOCAL TP, this returns the device index that
+         * the orchestrator is currently operating on behalf of. Must be set via
+         * setCurrentDeviceIndex() before calling sharding methods.
+         *
+         * @return Index in range [0, degree()) for the current device
+         */
+        int myIndex() const override = 0;
 
         // =====================================================================
         // Collective Operations
@@ -100,7 +118,7 @@ namespace llaminar2
          * @param tensor Tensor to all-reduce (modified in-place)
          * @return true on success, false on error
          */
-        virtual bool allreduce(TensorBase *tensor) = 0;
+        bool allreduce(TensorBase *tensor) override = 0;
 
         /**
          * @brief All-reduce across LOCAL devices with stage name (in-place)
@@ -137,7 +155,7 @@ namespace llaminar2
          * @param global_tensor Pre-allocated output for full tensor
          * @return true on success, false on error
          */
-        virtual bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) = 0;
+        bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) override = 0;
 
         /**
          * @brief Gather shards from multiple devices into a single output tensor
@@ -172,6 +190,21 @@ namespace llaminar2
          * @return true on success, false on error
          */
         virtual bool reduceScatter(const TensorBase *input, TensorBase *output_shard) = 0;
+
+        /**
+         * @brief Broadcast tensor from one device to all others in the TP domain
+         *
+         * Replicates data from a source device to all other devices in the TP group.
+         * Used when receiving PP activations that need to be available on all TP devices.
+         *
+         * For homogeneous backends (NCCL/RCCL), this uses the native broadcast.
+         * For heterogeneous backends (PCIeBAR), this may use staged transfers.
+         *
+         * @param tensor Tensor to broadcast (must be valid on source device)
+         * @param source_device_index Index of source device in devices() (0-based)
+         * @return true on success, false on error
+         */
+        bool broadcast(TensorBase *tensor, int source_device_index = 0) override = 0;
 
         // =====================================================================
         // Synchronization

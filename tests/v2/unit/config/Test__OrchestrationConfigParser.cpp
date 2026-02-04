@@ -5,8 +5,13 @@
  * Tests:
  * - CLI parsing for simple options (--tp, --pp, --device)
  * - CLI parsing for --define-domain and --pp-stage
+ * - Model and inference configuration options
+ * - Sampling configuration
+ * - Chat and benchmark modes
+ * - Heterogeneous mode options
  * - YAML parsing for domain-based config
  * - Error handling for malformed input
+ * - Validation of enum-type arguments
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -126,7 +131,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_ValidateOnly)
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_TPDegree_WithSpace)
 {
-    ArgvHelper args{"llaminar2", "--tp", "4"};
+    ArgvHelper args{"llaminar2", "--tensor-parallelism-degree", "4"};
     OrchestrationConfigParser parser;
 
     auto config = parser.parseArgs(args.argc(), args.argv());
@@ -136,7 +141,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_TPDegree_WithSpace)
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_TPDegree_WithEquals)
 {
-    ArgvHelper args{"llaminar2", "--tp=4"};
+    ArgvHelper args{"llaminar2", "--tensor-parallelism-degree=4"};
     OrchestrationConfigParser parser;
 
     auto config = parser.parseArgs(args.argc(), args.argv());
@@ -146,7 +151,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_TPDegree_WithEquals)
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_TPDegree_ShortFlag)
 {
-    ArgvHelper args{"llaminar2", "-t", "2"};
+    ArgvHelper args{"llaminar2", "-tp", "2"};
     OrchestrationConfigParser parser;
 
     auto config = parser.parseArgs(args.argc(), args.argv());
@@ -215,7 +220,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_TPGlobal)
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_PPDegree_WithSpace)
 {
-    ArgvHelper args{"llaminar2", "--pp", "2"};
+    ArgvHelper args{"llaminar2", "--pipeline-parallelism-degree", "2"};
     OrchestrationConfigParser parser;
 
     auto config = parser.parseArgs(args.argc(), args.argv());
@@ -225,7 +230,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_PPDegree_WithSpace)
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_PPDegree_ShortFlag)
 {
-    ArgvHelper args{"llaminar2", "-p", "3"};
+    ArgvHelper args{"llaminar2", "-pp", "3"};
     OrchestrationConfigParser parser;
 
     auto config = parser.parseArgs(args.argc(), args.argv());
@@ -427,8 +432,8 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_Backend_ShortFlag)
 TEST(Test__OrchestrationConfigParser, ParseArgs_ComplexConfig)
 {
     ArgvHelper args{"llaminar2",
-                    "--tp", "2",
-                    "--pp", "2",
+                    "--tensor-parallelism-degree", "2",
+                    "--pipeline-parallelism-degree", "2",
                     "--device", "cuda:0",
                     "--cpu-layers", "2",
                     "--backend", "nccl",
@@ -451,7 +456,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_ComplexConfig)
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_MissingTPValue_Throws)
 {
-    ArgvHelper args{"llaminar2", "--tp"};
+    ArgvHelper args{"llaminar2", "--tensor-parallelism-degree"};
     OrchestrationConfigParser parser;
 
     EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
@@ -459,7 +464,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MissingTPValue_Throws)
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_InvalidTPValue_Throws)
 {
-    ArgvHelper args{"llaminar2", "--tp", "abc"};
+    ArgvHelper args{"llaminar2", "--tensor-parallelism-degree", "abc"};
     OrchestrationConfigParser parser;
 
     EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
@@ -660,11 +665,736 @@ TEST(Test__OrchestrationConfigParser, GetHelpText_ContainsKeyOptions)
 {
     std::string help = OrchestrationConfigParser::getHelpText();
 
-    EXPECT_TRUE(help.find("--tp") != std::string::npos);
-    EXPECT_TRUE(help.find("--pp") != std::string::npos);
+    EXPECT_TRUE(help.find("--tensor-parallelism-degree") != std::string::npos);
+    EXPECT_TRUE(help.find("--pipeline-parallelism-degree") != std::string::npos);
     EXPECT_TRUE(help.find("--device") != std::string::npos);
     EXPECT_TRUE(help.find("--define-domain") != std::string::npos);
     EXPECT_TRUE(help.find("--pp-stage") != std::string::npos);
     EXPECT_TRUE(help.find("--backend") != std::string::npos);
     EXPECT_TRUE(help.find("--config") != std::string::npos);
+}
+// ============================================================================
+// CLI Parsing - Model Configuration
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_ModelPath)
+{
+    ArgvHelper args{"llaminar2", "-m", "models/test.gguf"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.model_path, "models/test.gguf");
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_ModelPath_LongForm)
+{
+    ArgvHelper args{"llaminar2", "--model", "path/to/model.gguf"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.model_path, "path/to/model.gguf");
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_ContextLength)
+{
+    ArgvHelper args{"llaminar2", "-c", "4096"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.max_seq_len, 4096);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MMap)
+{
+    ArgvHelper args{"llaminar2", "--no-mmap"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_FALSE(config.use_mmap);
+}
+
+// ============================================================================
+// CLI Parsing - Inference Configuration
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Prompt)
+{
+    ArgvHelper args{"llaminar2", "-p", "Hello, world!"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.prompt, "Hello, world!");
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Prompt_LongForm)
+{
+    ArgvHelper args{"llaminar2", "--prompt", "Test prompt"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.prompt, "Test prompt");
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_NPredict)
+{
+    ArgvHelper args{"llaminar2", "-n", "100"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.n_predict, 100);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_NPredict_LongForm)
+{
+    ArgvHelper args{"llaminar2", "--n-predict", "50"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.n_predict, 50);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_BatchSize)
+{
+    ArgvHelper args{"llaminar2", "--batch-size", "8"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.batch_size, 8);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Threads)
+{
+    ArgvHelper args{"llaminar2", "--threads", "16"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.n_threads, 16);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Seed)
+{
+    ArgvHelper args{"llaminar2", "-s", "42"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.seed, 42);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Seed_LongForm)
+{
+    ArgvHelper args{"llaminar2", "--seed", "12345"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.seed, 12345);
+}
+
+// ============================================================================
+// CLI Parsing - Sampling Configuration
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Temperature)
+{
+    ArgvHelper args{"llaminar2", "-t", "0.5"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_FLOAT_EQ(config.temperature, 0.5f);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Temperature_LongForm)
+{
+    ArgvHelper args{"llaminar2", "--temperature", "1.2"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_FLOAT_EQ(config.temperature, 1.2f);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_TopK)
+{
+    ArgvHelper args{"llaminar2", "--top-k", "50"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.top_k, 50);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_TopP)
+{
+    ArgvHelper args{"llaminar2", "--top-p", "0.95"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_FLOAT_EQ(config.top_p, 0.95f);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Deterministic)
+{
+    ArgvHelper args{"llaminar2", "--deterministic"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.deterministic);
+}
+
+// ============================================================================
+// CLI Parsing - Chat Configuration
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_ChatMode)
+{
+    ArgvHelper args{"llaminar2", "--chat"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.chat_mode);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_ChatSingle)
+{
+    ArgvHelper args{"llaminar2", "--chat-single"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.single_shot_chat);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_SystemPrompt)
+{
+    ArgvHelper args{"llaminar2", "--system", "You are a helpful assistant."};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.system_prompt, "You are a helpful assistant.");
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_ChatTemplate)
+{
+    ArgvHelper args{"llaminar2", "--chat-template", "chatml"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.chat_template_override, "chatml");
+}
+
+// ============================================================================
+// CLI Parsing - Benchmark Configuration
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_BenchmarkMode)
+{
+    ArgvHelper args{"llaminar2", "--benchmark"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.benchmark_mode);
+}
+
+// ============================================================================
+// CLI Parsing - Fused Attention
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_FusedAttention)
+{
+    ArgvHelper args{"llaminar2", "--fused-attention"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.use_fused_attention);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_FusedAttentionBackend)
+{
+    ArgvHelper args{"llaminar2", "--fused-attention-backend", "reference"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.fused_attention_backend, FusedAttentionBackend::REFERENCE);
+}
+
+// ============================================================================
+// CLI Parsing - MPI Bootstrap
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MPIProcs)
+{
+    ArgvHelper args{"llaminar2", "--mpi-procs", "4"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.mpi_procs, 4);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MPIDryRun)
+{
+    ArgvHelper args{"llaminar2", "--mpi-dry-run"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.mpi_dry_run);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MPIVerbose)
+{
+    ArgvHelper args{"llaminar2", "--mpi-verbose"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.mpi_verbose);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_NoMPIBootstrap)
+{
+    ArgvHelper args{"llaminar2", "--no-mpi-bootstrap"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.mpi_no_bootstrap);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MPIOversubscribe)
+{
+    ArgvHelper args{"llaminar2", "--mpi-oversubscribe"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.mpi_oversubscribe);
+}
+
+// ============================================================================
+// CLI Parsing - Verbosity
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_VerboseLevel1)
+{
+    ArgvHelper args{"llaminar2", "-v"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.verbose_level, 1);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_VerboseLevel2)
+{
+    ArgvHelper args{"llaminar2", "-vv"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.verbose_level, 2);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_ListDevices)
+{
+    ArgvHelper args{"llaminar2", "--list-devices"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.list_devices);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_ShowHelp)
+{
+    ArgvHelper args{"llaminar2", "-h"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.show_help);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_ShowHelp_LongForm)
+{
+    ArgvHelper args{"llaminar2", "--help"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.show_help);
+}
+
+// ============================================================================
+// CLI Parsing - Placement Strategy
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Strategy)
+{
+    ArgvHelper args{"llaminar2", "--strategy", "all-gpu"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.strategy, "all-gpu");
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_OffloadLayers)
+{
+    ArgvHelper args{"llaminar2", "--offload-layers", "10"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.offload_layers, 10);
+}
+
+// ============================================================================
+// CLI Parsing - Memory Constraints
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MaxGPUMemory)
+{
+    ArgvHelper args{"llaminar2", "--max-gpu-memory", "8000"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.max_gpu_memory_mb.has_value());
+    EXPECT_EQ(config.max_gpu_memory_mb.value(), 8000u);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MaxCPUMemory)
+{
+    ArgvHelper args{"llaminar2", "--max-cpu-memory", "16000"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.max_cpu_memory_mb.has_value());
+    EXPECT_EQ(config.max_cpu_memory_mb.value(), 16000u);
+}
+
+// ============================================================================
+// CLI Parsing - MoE Configuration
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MoESharedGPU)
+{
+    ArgvHelper args{"llaminar2", "--moe-shared-gpu"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.moe_shared_experts_gpu);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MoESharedCPU)
+{
+    ArgvHelper args{"llaminar2", "--moe-shared-cpu"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_FALSE(config.moe_shared_experts_gpu);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MoESparseGPU)
+{
+    ArgvHelper args{"llaminar2", "--moe-sparse-gpu"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_FALSE(config.moe_sparse_experts_cpu);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MoESparseCPU)
+{
+    ArgvHelper args{"llaminar2", "--moe-sparse-cpu"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.moe_sparse_experts_cpu);
+}
+
+// ============================================================================
+// CLI Parsing - Multi-GPU Legacy
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MultiGPU)
+{
+    ArgvHelper args{"llaminar2", "--multi-gpu"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.multi_gpu);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_GPUSplit)
+{
+    ArgvHelper args{"llaminar2", "--gpu-split", "weighted"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.gpu_split, "weighted");
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_GPUs)
+{
+    ArgvHelper args{"llaminar2", "--gpus", "0,1,2"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.gpu_devices.size(), 3u);
+    EXPECT_EQ(config.gpu_devices[0], 0);
+    EXPECT_EQ(config.gpu_devices[1], 1);
+    EXPECT_EQ(config.gpu_devices[2], 2);
+}
+
+// ============================================================================
+// CLI Parsing - Precision
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_ActivationPrecision)
+{
+    ArgvHelper args{"llaminar2", "--activation-precision", "bf16"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.activation_precision, "bf16");
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_ActivationPrecision_Alias)
+{
+    ArgvHelper args{"llaminar2", "--act-prec", "fp16"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.activation_precision, "fp16");
+}
+
+// ============================================================================
+// CLI Parsing - Weight Sharding
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_ShardWeights)
+{
+    ArgvHelper args{"llaminar2", "--shard-weights"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.shard_weights);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_NoShardWeights)
+{
+    ArgvHelper args{"llaminar2", "--no-shard-weights"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.disable_weight_sharding);
+}
+
+// ============================================================================
+// CLI Parsing - Heterogeneous Mode
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_HeterogeneousMode)
+{
+    ArgvHelper args{"llaminar2", "--heterogeneous"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.heterogeneous_mode);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_CPUFraction)
+{
+    ArgvHelper args{"llaminar2", "--cpu-fraction", "0.3"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_FLOAT_EQ(config.cpu_compute_fraction, 0.3f);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_NoGPUTP)
+{
+    ArgvHelper args{"llaminar2", "--no-gpu-tp"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.disable_gpu_tp);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_NoCPUTP)
+{
+    ArgvHelper args{"llaminar2", "--no-cpu-tp"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.disable_cpu_tp);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MinLayersPerDomain)
+{
+    ArgvHelper args{"llaminar2", "--min-layers-per-domain", "4"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.min_layers_per_domain, 4);
+}
+
+// ============================================================================
+// Validation Tests - Invalid Arguments
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_UnknownArgument_Throws)
+{
+    ArgvHelper args{"llaminar2", "--unknown-flag"};
+    OrchestrationConfigParser parser;
+
+    EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_InvalidStrategy_Throws)
+{
+    ArgvHelper args{"llaminar2", "--strategy", "invalid-strategy"};
+    OrchestrationConfigParser parser;
+
+    EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_InvalidActivationPrecision_Throws)
+{
+    ArgvHelper args{"llaminar2", "--activation-precision", "fp64"};
+    OrchestrationConfigParser parser;
+
+    EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_InvalidCPUFraction_TooHigh_Throws)
+{
+    ArgvHelper args{"llaminar2", "--cpu-fraction", "1.5"};
+    OrchestrationConfigParser parser;
+
+    EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_InvalidCPUFraction_Negative_Throws)
+{
+    ArgvHelper args{"llaminar2", "--cpu-fraction", "-0.1"};
+    OrchestrationConfigParser parser;
+
+    EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_HeterogeneousWithSingleRank_ValidationWarning)
+{
+    // This test checks that --heterogeneous with TP=1 produces a validation warning
+    // (heterogeneous mode requires TP >= 2 to be meaningful)
+    ArgvHelper args{"llaminar2", "--heterogeneous", "--tensor-parallelism-degree", "1"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    // Config should still parse, but validation would show issues
+    EXPECT_TRUE(config.heterogeneous_mode);
+    EXPECT_EQ(config.tp_degree, 1);
+}
+
+// ============================================================================
+// Combined Flags Test
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_FullInferenceConfig)
+{
+    ArgvHelper args{"llaminar2",
+                    "-m", "model.gguf",
+                    "-p", "Hello world",
+                    "-n", "100",
+                    "-t", "0.7",
+                    "--top-k", "50",
+                    "--top-p", "0.9",
+                    "-s", "42",
+                    "-d", "cuda:0",
+                    "-tp", "2"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.model_path, "model.gguf");
+    EXPECT_EQ(config.prompt, "Hello world");
+    EXPECT_EQ(config.n_predict, 100);
+    EXPECT_FLOAT_EQ(config.temperature, 0.7f);
+    EXPECT_EQ(config.top_k, 50);
+    EXPECT_FLOAT_EQ(config.top_p, 0.9f);
+    EXPECT_EQ(config.seed, 42);
+    EXPECT_TRUE(config.device_for_this_rank.has_value());
+    EXPECT_EQ(config.device_for_this_rank->device_type, DeviceType::CUDA);
+    EXPECT_EQ(config.tp_degree, 2);
+}
+
+// ============================================================================
+// Help Text Extended Tests
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, GetHelpText_ContainsAllShortFlags)
+{
+    std::string help = OrchestrationConfigParser::getHelpText();
+
+    // All documented short flags should be in help text
+    EXPECT_TRUE(help.find("-m") != std::string::npos);
+    EXPECT_TRUE(help.find("-p") != std::string::npos);
+    EXPECT_TRUE(help.find("-n") != std::string::npos);
+    EXPECT_TRUE(help.find("-t") != std::string::npos);
+    EXPECT_TRUE(help.find("-s") != std::string::npos);
+    EXPECT_TRUE(help.find("-d") != std::string::npos);
+    EXPECT_TRUE(help.find("-c") != std::string::npos);
+    EXPECT_TRUE(help.find("-tp") != std::string::npos);
+    EXPECT_TRUE(help.find("-pp") != std::string::npos);
+    EXPECT_TRUE(help.find("-b") != std::string::npos);
+    EXPECT_TRUE(help.find("-v") != std::string::npos);
+    EXPECT_TRUE(help.find("-h") != std::string::npos);
+}
+
+TEST(Test__OrchestrationConfigParser, GetHelpText_ContainsExamples)
+{
+    std::string help = OrchestrationConfigParser::getHelpText();
+
+    EXPECT_TRUE(help.find("Examples:") != std::string::npos);
+    EXPECT_TRUE(help.find("llaminar2") != std::string::npos);
 }

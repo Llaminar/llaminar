@@ -37,6 +37,7 @@
 #include "../device/DeviceContext.h"
 #include "../../mpi_orchestration/PlacementStrategy.h" // For InferencePhase
 #include "../../compute_stages/ComputeStages.h"        // For StageDumpInfo
+#include "../../factory/InferenceRunnerFactory.h"      // For FactoryPPStageConfig
 #include "../../../tensors/FP16Utils.h"                // For fp16_to_fp32, bf16_to_fp32
 #include "../../../tensors/BlockStructures.h"          // For Q8_1Block, Q16_1Block
 #include "../../../loaders/IWeightStreamer.h"          // For weight streaming (Option B)
@@ -44,8 +45,14 @@
 #include "../../../interfaces/IMPITopology.h"          // For interface-based construction
 #include "../../../interfaces/ICollectiveContext.h"    // For interface-based construction
 #include "../../../config/TPDomain.h"                  // For MultiDomainTPConfig (Phase 6.3)
+#include "../../../config/PipelineConfig.h"            // For unified PP+TP configuration (Phase 6)
+#include "../../../collective/ILocalPPContext.h"       // For unique_ptr<ILocalPPContext> in maps
+#include "../../../collective/ILocalTPContext.h"       // For unique_ptr<ILocalTPContext> in maps
+#include "../device/PerStageBufferPool.h"              // For PP stage buffer management (Phase 6)
 #include <memory>
+#include <optional>
 #include <unordered_map>
+#include <map>
 #include <vector>
 #include <string>
 #include <cstring>
@@ -122,6 +129,22 @@ namespace llaminar2
          * Default: false (use device memory for best GPU performance)
          */
         bool use_mapped_memory = false;
+
+        /**
+         * @brief Use BAR-backed memory for hidden state tensor
+         *
+         * When true and the device is ROCm, the hidden state output tensor will
+         * be allocated in PCIe BAR memory, enabling zero-copy reads from CUDA
+         * devices. This is required for cross-vendor PP transfers (ROCm→CUDA).
+         *
+         * Conditions for BAR-backed allocation:
+         * 1. Device is ROCm (source of cross-vendor transfer)
+         * 2. Next PP stage is CUDA (destination)
+         * 3. DirectP2PEngine is available with active BAR mapping
+         *
+         * Default: false (use standard VRAM allocation)
+         */
+        bool use_bar_backed_hidden = false;
     };
 
     /**
@@ -150,7 +173,13 @@ namespace llaminar2
         std::shared_ptr<TensorBase> logits_local;
 
         // === KV Cache ===
-        std::unique_ptr<IKVCache> kv_cache; ///< Attention KV history
+        std::unique_ptr<IKVCache> kv_cache; ///< Attention KV history (single-device mode)
+
+        /// Per-device KV caches for Pipeline Parallelism
+        /// When PP is enabled, each PP stage device has its own KV cache containing
+        /// only the layers processed by that stage. Key is DeviceId, value is the cache.
+        /// Only populated when pipeline_config->hasPP() is true.
+        std::unordered_map<DeviceId, std::unique_ptr<IKVCache>> pp_kv_caches;
 
         // === Position Tracking ===
         std::vector<int> positions;        ///< Per-sequence position offset
@@ -222,6 +251,11 @@ namespace llaminar2
         {
             if (kv_cache)
                 kv_cache->clear();
+            for (auto &[device, cache] : pp_kv_caches)
+            {
+                if (cache)
+                    cache->clear();
+            }
             std::fill(positions.begin(), positions.end(), 0);
             std::fill(sequence_lengths.begin(), sequence_lengths.end(), 0);
         }
@@ -646,6 +680,126 @@ namespace llaminar2
         bool isProportionalTPEnabled() const { return tp_config_ && tp_config_->isProportional(); }
 
         // =========================================================================
+        // Pipeline Parallelism Configuration
+        // =========================================================================
+
+        /**
+         * @brief Set pipeline parallelism stage configuration
+         *
+         * When set, this orchestrator runs as a PP stage, executing only a subset
+         * of transformer layers. The configuration specifies:
+         * - Layer range [first_layer, last_layer)
+         * - Whether this stage owns embedding lookup
+         * - Whether this stage owns final norm and LM head
+         *
+         * When PP config is set, executeForward() uses buildPartialForwardGraph()
+         * instead of buildFullForwardGraph().
+         *
+         * @param config PP stage configuration
+         */
+        void setPPStageConfig(const FactoryPPStageConfig &config);
+
+        /**
+         * @brief Get pipeline parallelism stage configuration
+         * @return Optional containing FactoryPPStageConfig if this is a PP stage
+         */
+        const std::optional<FactoryPPStageConfig> &ppStageConfig() const { return pp_stage_config_; }
+
+        /**
+         * @brief Check if this orchestrator is running as a PP stage
+         * @return true if PP stage configuration is set
+         */
+        bool isPPStage() const { return pp_stage_config_.has_value(); }
+
+        // =====================================================================
+        // Unified Pipeline Configuration (Phase 6: Full PP+TP Integration)
+        // =====================================================================
+
+        /**
+         * @brief Set unified pipeline configuration for PP+TP composition
+         *
+         * When set, the orchestrator can build and execute unified graphs that
+         * span multiple PP stages with internal TP. This replaces the need for
+         * external coordinators that manually sequence PP stages.
+         *
+         * The orchestrator will:
+         * - Create ILocalPPContext for each inter-stage transfer
+         * - Create ILocalTPContext for each TP domain
+         * - Build unified graphs via buildUnifiedPipelineGraph()
+         * - Execute the full pipeline in a single forward() call
+         *
+         * @param config PipelineConfig with TP domains and PP stages
+         */
+        void setPipelineConfig(std::shared_ptr<PipelineConfig> config);
+
+        /**
+         * @brief Get the unified pipeline configuration
+         * @return Shared pointer to PipelineConfig (may be nullptr)
+         */
+        std::shared_ptr<PipelineConfig> pipelineConfig() const { return pipeline_config_; }
+
+        /**
+         * @brief Check if unified PP mode is enabled
+         * @return true if PipelineConfig is set with multiple PP stages
+         */
+        bool hasUnifiedPP() const { return pipeline_config_ && pipeline_config_->hasPP(); }
+
+        /**
+         * @brief Initialize PP contexts for inter-stage activation transfers
+         *
+         * Creates ILocalPPContext instances for each pair of adjacent PP stages.
+         * Must be called after setPipelineConfig() and before forward().
+         *
+         * @return true if initialization succeeded
+         */
+        bool initializePPContexts();
+
+        /**
+         * @brief Initialize TP contexts for each domain
+         *
+         * Creates ILocalTPContext instances for each TP domain in the config.
+         * Must be called after setPipelineConfig() and before forward().
+         *
+         * @return true if initialization succeeded
+         */
+        bool initializeTPContexts();
+
+        /**
+         * @brief Initialize per-stage buffer pool for PP execution
+         *
+         * Allocates Qwen2ActivationBuffers for each PP stage, placing buffers
+         * on each stage's primary device. Must be called after setPipelineConfig()
+         * and requires a valid PipelineConfig with PP stages.
+         *
+         * @param spec Buffer specification (shapes, dtypes) for allocation
+         * @param mpi_ctx Optional MPI context for NUMA-aware allocation
+         * @return true if initialization succeeded
+         */
+        bool initializeBufferPool(const PPStageBufferSpec &spec, const MPIContext *mpi_ctx = nullptr);
+
+        /**
+         * @brief Get the per-stage buffer pool (if initialized)
+         * @return Pointer to PerStageBufferPool, or nullptr if not initialized
+         */
+        PerStageBufferPool *bufferPool() { return buffer_pool_.has_value() ? &buffer_pool_.value() : nullptr; }
+        const PerStageBufferPool *bufferPool() const { return buffer_pool_.has_value() ? &buffer_pool_.value() : nullptr; }
+
+        /**
+         * @brief Check if per-stage buffer pool is initialized
+         */
+        bool hasBufferPool() const { return buffer_pool_.has_value() && buffer_pool_->isInitialized(); }
+
+        // =====================================================================
+        // Hidden State API (for Pipeline Parallelism)
+        // =====================================================================
+
+        TensorBase *getHiddenState() override;
+        const TensorBase *getHiddenState() const override;
+        void setHiddenState(TensorBase *hidden_state) override;
+        bool hasHiddenStateInput() const override;
+        void clearHiddenStateInput() override;
+
+        // =========================================================================
         // Multi-Domain Tensor Parallel Configuration (Phase 6.3: Heterogeneous TP)
         // =========================================================================
 
@@ -897,6 +1051,264 @@ namespace llaminar2
          * @brief Clear inference state (reset positions, clear KV cache)
          */
         void clearInferenceState();
+
+        // =========================================================================
+        // Fluent Graph Building API
+        // =========================================================================
+
+        /**
+         * @brief Result of a graph build operation (nested class)
+         */
+        class GraphBuildResult
+        {
+        public:
+            GraphBuildResult() = default;
+            GraphBuildResult(ComputeGraph graph, Qwen2ForwardOutput output)
+                : graph_(std::move(graph)), output_(output), success_(true) {}
+            explicit GraphBuildResult(std::string error)
+                : error_(std::move(error)), success_(false) {}
+
+            [[nodiscard]] bool success() const { return success_; }
+            [[nodiscard]] bool failed() const { return !success_; }
+            [[nodiscard]] const std::string &error() const { return error_; }
+            [[nodiscard]] ComputeGraph &graph() { return graph_; }
+            [[nodiscard]] const ComputeGraph &graph() const { return graph_; }
+            [[nodiscard]] const Qwen2ForwardOutput &output() const { return output_; }
+            [[nodiscard]] ComputeGraph takeGraph() { return std::move(graph_); }
+            explicit operator bool() const { return success_; }
+
+        private:
+            ComputeGraph graph_;
+            Qwen2ForwardOutput output_{};
+            std::string error_;
+            bool success_ = false;
+        };
+
+        /**
+         * @brief Fluent builder for compute graph composition (nested class)
+         */
+        class GraphBuildSession
+        {
+        public:
+            explicit GraphBuildSession(DeviceGraphOrchestrator &orchestrator)
+                : orchestrator_(orchestrator) {}
+
+            // Input configuration
+            GraphBuildSession &forInput(const Qwen2ForwardInput &input);
+            GraphBuildSession &withPositionIds(const int *position_ids);
+            GraphBuildSession &withExternalHiddenState(TensorBase *hidden_state);
+
+            // Pipeline configuration
+            GraphBuildSession &withPipelineConfig(std::shared_ptr<PipelineConfig> config);
+            GraphBuildSession &forPPStage(int first_layer, int last_layer,
+                                          bool has_embedding = false, bool has_lm_head = false);
+            GraphBuildSession &withPPContext(int from_stage, int to_stage, ILocalPPContext *context);
+            GraphBuildSession &withTPContext(const std::string &domain_name, ILocalTPContext *context);
+
+            // Resource configuration
+            GraphBuildSession &withWeights(const Qwen2ModelWeights &weights);
+            GraphBuildSession &withBuffers(const Qwen2ModelBuffers &buffers);
+            GraphBuildSession &withKVCache(IKVCache *kv_cache);
+            GraphBuildSession &withBufferPool(PerStageBufferPool *pool);
+
+            // Build methods (terminal operations)
+            [[nodiscard]] GraphBuildResult buildForward();
+            [[nodiscard]] GraphBuildResult buildPartial();
+            [[nodiscard]] GraphBuildResult buildUnified();
+            [[nodiscard]] GraphBuildResult build();
+
+            // Validation
+            [[nodiscard]] bool isValid() const;
+            [[nodiscard]] std::string validationError() const;
+
+        private:
+            DeviceGraphOrchestrator &orchestrator_;
+            std::optional<Qwen2ForwardInput> input_;
+            const int *explicit_position_ids_ = nullptr;
+            TensorBase *external_hidden_state_ = nullptr;
+            std::shared_ptr<PipelineConfig> pipeline_config_;
+            struct PPStageSpec
+            {
+                int first_layer;
+                int last_layer;
+                bool has_embedding;
+                bool has_lm_head;
+            };
+            std::optional<PPStageSpec> pp_stage_;
+            std::map<std::pair<int, int>, ILocalPPContext *> pp_contexts_;
+            std::map<std::string, ILocalTPContext *> tp_contexts_;
+            std::optional<Qwen2ModelWeights> weights_;
+            std::optional<Qwen2ModelBuffers> buffers_;
+            IKVCache *kv_cache_ = nullptr;
+            PerStageBufferPool *buffer_pool_ = nullptr;
+
+            Qwen2ForwardInput prepareInput() const;
+            void applyConfiguration();
+        };
+
+        /**
+         * @brief Result of a sub-graph build operation (attention, FFN)
+         *
+         * Lightweight result type for sub-graph building that doesn't need output tracking.
+         */
+        class SubGraphBuildResult
+        {
+        public:
+            SubGraphBuildResult() = default;
+            explicit SubGraphBuildResult(ComputeGraph graph)
+                : graph_(std::move(graph)), success_(true) {}
+            explicit SubGraphBuildResult(std::string error)
+                : error_(std::move(error)), success_(false) {}
+
+            [[nodiscard]] bool success() const { return success_; }
+            [[nodiscard]] bool failed() const { return !success_; }
+            [[nodiscard]] const std::string &error() const { return error_; }
+            [[nodiscard]] ComputeGraph &graph() { return graph_; }
+            [[nodiscard]] const ComputeGraph &graph() const { return graph_; }
+            [[nodiscard]] ComputeGraph takeGraph() { return std::move(graph_); }
+            explicit operator bool() const { return success_; }
+
+        private:
+            ComputeGraph graph_;
+            std::string error_;
+            bool success_ = false;
+        };
+
+        /**
+         * @brief Fluent builder for attention sub-graph
+         *
+         * Provides a clear, chainable API for building attention block graphs.
+         *
+         * @code
+         * auto result = buildAttentionGraph()
+         *     .forLayer(layer, layer_idx)
+         *     .withBuffers(buffers)
+         *     .withSequence(seq_len)
+         *     .onDevice(device)
+         *     .withKVCache(kv_cache)
+         *     .withPositionIds(position_ids)
+         *     .build();
+         * @endcode
+         */
+        class AttentionGraphSession
+        {
+        public:
+            explicit AttentionGraphSession(DeviceGraphOrchestrator &orchestrator)
+                : orchestrator_(orchestrator) {}
+
+            // Required configuration
+            AttentionGraphSession &forLayer(const Qwen2LayerWeights &layer, int layer_idx);
+            AttentionGraphSession &withBuffers(Qwen2ActivationBuffers &buffers);
+            AttentionGraphSession &withSequence(int seq_len, int batch_size = 1);
+            AttentionGraphSession &onDevice(DeviceId device);
+
+            // Optional configuration
+            AttentionGraphSession &withKVCache(IKVCache *kv_cache);
+            AttentionGraphSession &withPositionIds(const int *position_ids);
+            AttentionGraphSession &withSequenceLengths(const std::vector<int> *lengths);
+
+            // Build (terminal operation)
+            [[nodiscard]] SubGraphBuildResult build();
+
+            // Validation
+            [[nodiscard]] bool isValid() const;
+            [[nodiscard]] std::string validationError() const;
+
+        private:
+            DeviceGraphOrchestrator &orchestrator_;
+
+            // Required
+            const Qwen2LayerWeights *layer_ = nullptr;
+            Qwen2ActivationBuffers *buffers_ = nullptr;
+            int layer_idx_ = -1;
+            int seq_len_ = 0;
+            int batch_size_ = 1;
+            std::optional<DeviceId> device_;
+
+            // Optional
+            IKVCache *kv_cache_ = nullptr;
+            const int *position_ids_ = nullptr;
+            const std::vector<int> *sequence_lengths_ = nullptr;
+        };
+
+        /**
+         * @brief Fluent builder for FFN sub-graph
+         *
+         * Provides a clear, chainable API for building FFN block graphs.
+         *
+         * @code
+         * auto result = buildFFNGraph()
+         *     .forLayer(layer, layer_idx)
+         *     .withBuffers(buffers)
+         *     .withSequence(seq_len)
+         *     .onDevice(device)
+         *     .build();
+         * @endcode
+         */
+        class FFNGraphSession
+        {
+        public:
+            explicit FFNGraphSession(DeviceGraphOrchestrator &orchestrator)
+                : orchestrator_(orchestrator) {}
+
+            // Required configuration
+            FFNGraphSession &forLayer(const Qwen2LayerWeights &layer, int layer_idx);
+            FFNGraphSession &withBuffers(Qwen2ActivationBuffers &buffers);
+            FFNGraphSession &withSequence(int seq_len, int batch_size = 1);
+            FFNGraphSession &onDevice(DeviceId device);
+
+            // Build (terminal operation)
+            [[nodiscard]] SubGraphBuildResult build();
+
+            // Validation
+            [[nodiscard]] bool isValid() const;
+            [[nodiscard]] std::string validationError() const;
+
+        private:
+            DeviceGraphOrchestrator &orchestrator_;
+
+            // Required
+            const Qwen2LayerWeights *layer_ = nullptr;
+            Qwen2ActivationBuffers *buffers_ = nullptr;
+            int layer_idx_ = -1;
+            int seq_len_ = 0;
+            int batch_size_ = 1;
+            std::optional<DeviceId> device_;
+        };
+
+        /**
+         * @brief Start a fluent graph build session
+         *
+         * Returns a GraphBuildSession for composing and building compute graphs
+         * with a clear, chainable API.
+         *
+         * @code
+         * auto result = buildGraph()
+         *     .forInput(input)
+         *     .build();
+         *
+         * if (result.success()) {
+         *     executor.execute(result.graph(), context);
+         * }
+         * @endcode
+         *
+         * @return GraphBuildSession for fluent configuration
+         */
+        [[nodiscard]] GraphBuildSession buildGraph() { return GraphBuildSession(*this); }
+
+        /**
+         * @brief Start a fluent attention graph build session
+         *
+         * @return AttentionGraphSession for fluent configuration
+         */
+        [[nodiscard]] AttentionGraphSession buildAttentionGraph() { return AttentionGraphSession(*this); }
+
+        /**
+         * @brief Start a fluent FFN graph build session
+         *
+         * @return FFNGraphSession for fluent configuration
+         */
+        [[nodiscard]] FFNGraphSession buildFFNGraph() { return FFNGraphSession(*this); }
 
         // =========================================================================
         // Accessors
@@ -1647,6 +2059,48 @@ namespace llaminar2
 
         /// Injected collective context (nullptr if using default)
         std::shared_ptr<ICollectiveContext> injected_collective_ctx_;
+
+        // =========================================================================
+        // Pipeline Parallelism Configuration (Legacy - Single Stage)
+        // =========================================================================
+
+        /// PP stage configuration (empty = full model, has value = PP stage)
+        /// When set, executeForward() uses buildPartialForwardGraph()
+        std::optional<FactoryPPStageConfig> pp_stage_config_;
+
+        /// External hidden state input for PP middle/final stages
+        TensorBase *external_hidden_state_input_ = nullptr;
+
+        // =========================================================================
+        // Unified Pipeline Configuration (Phase 6 - Full PP+TP)
+        // =========================================================================
+
+        /// Unified pipeline configuration for PP+TP composition
+        /// When set, orchestrator builds/executes unified graphs spanning all stages
+        std::shared_ptr<PipelineConfig> pipeline_config_;
+
+        /// PP contexts for inter-stage activation transfers
+        /// Key: {from_stage_id, to_stage_id}
+        std::map<std::pair<int, int>, std::unique_ptr<ILocalPPContext>> pp_contexts_;
+
+        /// TP contexts for each domain (one per domain name)
+        /// Each domain may have internal tensor parallelism
+        /// NOTE: Uses shared_ptr because PPStage can hold a reference to the TP context
+        std::map<std::string, std::shared_ptr<ILocalTPContext>> domain_tp_contexts_;
+
+        /// Whether PP contexts have been initialized
+        bool pp_contexts_initialized_ = false;
+
+        /// Whether TP contexts have been initialized
+        bool tp_contexts_initialized_ = false;
+
+        // =========================================================================
+        // Per-Stage Buffer Pool (Phase 6.4 - PP+TP Buffer Management)
+        // =========================================================================
+
+        /// Per-PP-stage activation buffer pool
+        /// When initialized, provides stage-specific buffers for heterogeneous PP execution
+        std::optional<PerStageBufferPool> buffer_pool_;
     };
 
 } // namespace llaminar2

@@ -336,19 +336,19 @@ TEST(Test__DeviceContext, NumThreads)
 // Note: These tests verify the GPU context interfaces compile and the base
 // class behaviors work. Actual GPU execution requires CUDA/ROCm hardware.
 
-TEST(Test__DeviceContext, IGPUDeviceContextInterface)
+TEST(Test__DeviceContext, IWorkerGPUContextInterface)
 {
-    // IGPUDeviceContext is an abstract base class - verify it's properly
+    // IWorkerGPUContext is an abstract base class - verify it's properly
     // inheriting from IDeviceContext
     // This is a compile-time test - if this compiles, the interface is correct
 
-    // IGPUDeviceContext exposes:
+    // IWorkerGPUContext exposes:
     // - isGPU() returning true
     // - workspace management (getWorkspace, allocateWorkspace, freeWorkspace)
     // - deviceToDevice transfers
     // - GPU-specific synchronization
 
-    // We can't instantiate IGPUDeviceContext directly, but we can verify
+    // We can't instantiate IWorkerGPUContext directly, but we can verify
     // the CPU context properly returns false for isGPU
     auto cpu_ctx = std::make_unique<CPUDeviceContext>(DeviceId::cpu());
     EXPECT_FALSE(cpu_ctx->isGPU());

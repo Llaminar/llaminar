@@ -8,11 +8,13 @@
 
 #pragma once
 
+#include "../../../backends/IWorkerGPUContext.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KernelProfiler.h"
 #include <cstdint>
+#include <stdexcept>
 
 // Forward declarations for HIP kernels (implemented in ROCmResidualAddKernels.hip)
 extern "C"
@@ -50,7 +52,28 @@ namespace llaminar2
         {
         public:
             explicit ROCmResidualAddKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+
+            /**
+             * @brief Construct with device context (Phase 4 pattern)
+             * @param ctx Device context for shared handles/streams
+             */
+            explicit ROCmResidualAddKernelT(IWorkerGPUContext *ctx)
+            {
+                if (!ctx)
+                    throw std::runtime_error("ROCmResidualAddKernelT<FP32>: Device context is null");
+                if (!ctx->isInitialized())
+                    throw std::runtime_error("ROCmResidualAddKernelT<FP32>: Device context not initialized");
+                device_ctx_ = ctx;
+                device_idx_ = ctx->deviceOrdinal();
+            }
+
             ~ROCmResidualAddKernelT() override = default;
+
+            // ===== Device Context Support (Phase 4) =====
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             bool supports_device(int device_idx) const override
             {
@@ -96,6 +119,7 @@ namespace llaminar2
 
         private:
             int device_idx_;
+            IWorkerGPUContext *device_ctx_ = nullptr;
         };
 
         // ============================================================================
@@ -107,7 +131,28 @@ namespace llaminar2
         {
         public:
             explicit ROCmResidualAddKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+
+            /**
+             * @brief Construct with device context (Phase 4 pattern)
+             * @param ctx Device context for shared handles/streams
+             */
+            explicit ROCmResidualAddKernelT(IWorkerGPUContext *ctx)
+            {
+                if (!ctx)
+                    throw std::runtime_error("ROCmResidualAddKernelT<BF16>: Device context is null");
+                if (!ctx->isInitialized())
+                    throw std::runtime_error("ROCmResidualAddKernelT<BF16>: Device context not initialized");
+                device_ctx_ = ctx;
+                device_idx_ = ctx->deviceOrdinal();
+            }
+
             ~ROCmResidualAddKernelT() override = default;
+
+            // ===== Device Context Support (Phase 4) =====
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             bool supports_device(int device_idx) const override
             {
@@ -167,6 +212,7 @@ namespace llaminar2
 
         private:
             int device_idx_;
+            IWorkerGPUContext *device_ctx_ = nullptr;
         };
 
         // ============================================================================
@@ -178,7 +224,28 @@ namespace llaminar2
         {
         public:
             explicit ROCmResidualAddKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+
+            /**
+             * @brief Construct with device context (Phase 4 pattern)
+             * @param ctx Device context for shared handles/streams
+             */
+            explicit ROCmResidualAddKernelT(IWorkerGPUContext *ctx)
+            {
+                if (!ctx)
+                    throw std::runtime_error("ROCmResidualAddKernelT<FP16>: Device context is null");
+                if (!ctx->isInitialized())
+                    throw std::runtime_error("ROCmResidualAddKernelT<FP16>: Device context not initialized");
+                device_ctx_ = ctx;
+                device_idx_ = ctx->deviceOrdinal();
+            }
+
             ~ROCmResidualAddKernelT() override = default;
+
+            // ===== Device Context Support (Phase 4) =====
+            void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+            IWorkerGPUContext *deviceContext() const { return device_ctx_; }
+            bool hasDeviceContext() const { return device_ctx_ != nullptr; }
+            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             bool supports_device(int device_idx) const override
             {
@@ -238,6 +305,7 @@ namespace llaminar2
 
         private:
             int device_idx_;
+            IWorkerGPUContext *device_ctx_ = nullptr;
         };
 
     } // namespace rocm

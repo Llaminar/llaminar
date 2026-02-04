@@ -27,6 +27,7 @@
 #pragma once
 
 #include "IBackend.h"
+#include <future>
 #include <memory>
 
 namespace llaminar2
@@ -176,6 +177,40 @@ namespace llaminar2
          * @return true
          */
         bool streamSynchronize(int device_id) override;
+
+        // ====================================================================
+        // Async Operations (Trivial for CPU - immediate completion)
+        // ====================================================================
+
+        /**
+         * @brief Async deviceToHost (returns immediately-completed future)
+         */
+        std::future<bool> deviceToHostAsync(void *dst, const void *src, size_t bytes, int device_id) override;
+
+        /**
+         * @brief Async hostToDevice (returns immediately-completed future)
+         */
+        std::future<bool> hostToDeviceAsync(void *dst, const void *src, size_t bytes, int device_id) override;
+
+        /**
+         * @brief Async synchronize (returns immediately-completed future)
+         */
+        std::future<bool> synchronizeAsync(int device_id) override;
+
+        /**
+         * @brief Async allocate (returns immediately-completed future)
+         */
+        std::future<void *> allocateAsync(size_t bytes, int device_id) override;
+
+        /**
+         * @brief Async free (returns immediately-completed future)
+         */
+        std::future<void> freeAsync(void *ptr, int device_id) override;
+
+        /**
+         * @brief Async memset (returns immediately-completed future)
+         */
+        std::future<bool> memsetAsync(void *ptr, int value, size_t bytes, int device_id) override;
 
         /**
          * @brief Set active device (no-op if device_id == 0)

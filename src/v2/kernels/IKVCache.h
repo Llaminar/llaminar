@@ -41,7 +41,7 @@ namespace llaminar2
 
         /**
          * @brief Get number of cached tokens for a layer/sequence
-         * @param layer Layer index
+         * @param layer Layer index (global, will be remapped if first_layer_index > 0)
          * @param seq_idx Sequence index (default 0 for single-sequence)
          * @return Number of tokens currently cached
          */
@@ -56,6 +56,36 @@ namespace llaminar2
          * @brief Get number of layers
          */
         virtual int n_layers() const = 0;
+
+        /**
+         * @brief Get the first layer index for this cache (Pipeline Parallelism)
+         *
+         * When > 0, this cache handles layers [first_layer_index, first_layer_index + n_layers()).
+         * Incoming global layer indices are remapped: local_idx = global_idx - first_layer_index.
+         *
+         * @return First layer index (0 for non-PP caches)
+         */
+        virtual int first_layer_index() const { return 0; }
+
+        /**
+         * @brief Remap a global layer index to a local cache index
+         *
+         * Handles Pipeline Parallelism where each device's cache covers a subset of layers.
+         * For example, PP stage 1 with layers [12, 23] uses cache with first_layer_index=12.
+         * Global layer 15 maps to local cache index 3.
+         *
+         * @param global_layer The global layer index (0-based across all layers)
+         * @return Local cache index (0-based within this cache), or -1 if out of range
+         */
+        int remapLayerIndex(int global_layer) const
+        {
+            int local_idx = global_layer - first_layer_index();
+            if (local_idx < 0 || local_idx >= n_layers())
+            {
+                return -1; // Out of range for this cache
+            }
+            return local_idx;
+        }
 
         /**
          * @brief Get KV cache tensor layout

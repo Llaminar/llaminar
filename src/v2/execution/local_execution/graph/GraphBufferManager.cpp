@@ -305,8 +305,8 @@ namespace llaminar2
             WorkspaceBudgetConfig workspace_config;
             if (!allocateDeviceWorkspace(all_stages, workspace_config))
             {
-                LOG_WARN("GraphBufferManager: GPU workspace allocation failed, kernels will use fallback path");
-                // Note: This is a warning, not an error - some kernels may fall back to host-path allocation
+                LOG_ERROR("GraphBufferManager: GPU workspace allocation failed!");
+                return false;            
             }
         }
 

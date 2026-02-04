@@ -16,6 +16,7 @@
 namespace llaminar2
 {
     // Forward declarations
+    class TensorBase;
     struct PlacementPlan;
     struct GraphExecutorStats;
 
@@ -186,6 +187,43 @@ namespace llaminar2
         {
             return {}; // No snapshots by default
         }
+
+        // =====================================================================
+        // Hidden State API (for Pipeline Parallelism)
+        // =====================================================================
+
+        /**
+         * @brief Get final hidden state from last forward pass
+         *
+         * Returns the hidden state tensor after all transformer layers have
+         * executed. This is used for Pipeline Parallelism to transfer
+         * activations between stages.
+         *
+         * @return Pointer to hidden state tensor [seq_len, d_model], or nullptr
+         */
+        virtual TensorBase* getHiddenState() { return nullptr; }
+        virtual const TensorBase* getHiddenState() const { return nullptr; }
+
+        /**
+         * @brief Set initial hidden state for forward pass
+         *
+         * For PP stages that don't have embedding (middle/final stages),
+         * this sets the hidden state that would normally come from embedding.
+         * The forward pass will skip embedding and use this tensor directly.
+         *
+         * @param hidden_state Tensor containing hidden state [seq_len, d_model]
+         */
+        virtual void setHiddenState(TensorBase* hidden_state) { (void)hidden_state; }
+
+        /**
+         * @brief Check if this runner has hidden state set for next forward
+         */
+        virtual bool hasHiddenStateInput() const { return false; }
+
+        /**
+         * @brief Clear hidden state input (reset to normal embedding mode)
+         */
+        virtual void clearHiddenStateInput() {}
 
         // =====================================================================
         // Profiling API

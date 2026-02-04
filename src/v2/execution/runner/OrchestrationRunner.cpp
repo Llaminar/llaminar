@@ -13,7 +13,10 @@
 #include "../factory/InferenceRunnerFactory.h"
 #include "../local_execution/orchestrators/MultiDeviceOrchestrator.h"
 #include "../../collective/LocalTPContext.h"
+#include "../../collective/ILocalPPContext.h"
 #include "../../loaders/ModelContext.h"
+#include "../../loaders/ModelContextConfig.h"
+#include "../../backends/ComputeBackend.h"
 #include "../../utils/Logger.h"
 
 namespace llaminar2
@@ -77,6 +80,12 @@ namespace llaminar2
                 return false;
             }
 
+            // Step 3.5: Setup LOCAL PP context
+            if (!setupLocalPPContext())
+            {
+                return false;
+            }
+
             // Step 4: Load model weights
             if (!loadWeights())
             {
@@ -114,6 +123,7 @@ namespace llaminar2
 
         // Release resources in reverse order
         runner_.reset();
+        local_pp_ctx_.reset();
         local_tp_ctx_.reset();
         model_ctx_.reset();
 
@@ -364,14 +374,17 @@ namespace llaminar2
 
     bool OrchestrationRunner::initializeMPI()
     {
-        // Check if MPI is needed
-        bool needs_mpi = config_.pp_degree > 1 ||
-                         config_.tp_scope == TPScope::GLOBAL ||
-                         config_.tp_scope == TPScope::HYBRID;
+        // Check if multi-rank MPI is needed
+        bool needs_multi_rank_mpi = config_.pp_degree > 1 ||
+                                    config_.tp_scope == TPScope::GLOBAL ||
+                                    config_.tp_scope == TPScope::HYBRID;
 
-        if (!needs_mpi)
+        if (!needs_multi_rank_mpi)
         {
-            LOG_DEBUG("MPI not needed, skipping initialization");
+            // For single-rank execution, create a local-only MPI context
+            // This is needed for TensorFactory creation in ModelContext
+            LOG_DEBUG("Creating single-rank MPI context for local execution");
+            mpi_ctx_ = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
             return true;
         }
 
@@ -448,6 +461,29 @@ namespace llaminar2
     {
         ClusterInventory inventory;
 
+        // Initialize DeviceManager to enumerate all available devices
+        DeviceManager::instance().initialize(-1); // -1 = no NUMA filtering, see all devices
+        const auto &devices = DeviceManager::instance().devices();
+
+        // Helper to convert ComputeBackendType to DeviceType
+        auto toDeviceType = [](ComputeBackendType backend) -> DeviceType
+        {
+            switch (backend)
+            {
+            case ComputeBackendType::GPU_CUDA:
+                return DeviceType::CUDA;
+            case ComputeBackendType::GPU_ROCM:
+                return DeviceType::ROCm;
+            case ComputeBackendType::GPU_VULKAN:
+                return DeviceType::Vulkan;
+            case ComputeBackendType::GPU_METAL:
+                return DeviceType::Metal;
+            case ComputeBackendType::CPU:
+            default:
+                return DeviceType::CPU;
+            }
+        };
+
         // For single-rank execution, create a simple inventory
         if (!mpi_ctx_ || mpi_ctx_->world_size() == 1)
         {
@@ -455,33 +491,76 @@ namespace llaminar2
             rank_inv.rank = 0;
             rank_inv.hostname = "localhost";
             rank_inv.numa_nodes = 1;
+            rank_inv.node_id = 0;
+            rank_inv.local_rank = 0;
 
             // Add CPU by default
             rank_inv.cpu.type = DeviceType::CPU;
             rank_inv.cpu.local_device_id = 0;
             rank_inv.cpu_cores = 1;
 
-            // Add GPUs from config if specified
+            // Enumerate actual GPUs from DeviceManager
+            int gpu_idx = 0;
+            for (const auto &dev : devices)
+            {
+                if (dev.type != ComputeBackendType::CPU)
+                {
+                    DeviceInfo gpu;
+                    gpu.type = toDeviceType(dev.type);
+                    gpu.local_device_id = gpu_idx++;
+                    gpu.memory_bytes = dev.total_memory_bytes;
+                    gpu.free_memory_bytes = dev.free_memory_bytes;
+                    gpu.name = dev.name;
+                    gpu.numa_node = dev.numa_node;
+                    gpu.compute_capability_major = dev.compute_capability / 10;
+                    gpu.compute_capability_minor = dev.compute_capability % 10;
+                    rank_inv.gpus.push_back(gpu);
+
+                    LOG_DEBUG("[gatherClusterInventory] Found GPU: " << dev.name
+                                                                     << " (" << dev.total_memory_bytes / (1024 * 1024 * 1024) << " GB)");
+                }
+            }
+
+            // If explicit tp_devices are configured, use those instead (override)
             if (!config_.tp_devices.empty())
             {
+                LOG_DEBUG("[gatherClusterInventory] Using explicitly configured TP devices (count="
+                          << config_.tp_devices.size() << ")");
+                rank_inv.gpus.clear();
                 for (size_t i = 0; i < config_.tp_devices.size(); ++i)
                 {
                     const auto &addr = config_.tp_devices[i];
                     DeviceInfo gpu;
-                    gpu.type = addr.device_type; // Member access, not function call
+                    gpu.type = addr.device_type;
                     gpu.local_device_id = static_cast<int>(i);
-                    gpu.memory_bytes = 0; // Unknown
+                    gpu.memory_bytes = 0; // Unknown without actual enumeration
                     rank_inv.gpus.push_back(gpu);
                 }
             }
 
             inventory.ranks.push_back(rank_inv);
+            inventory.world_size = 1;
+            inventory.node_count = 1;
+            inventory.total_gpus = static_cast<int>(rank_inv.gpus.size());
+
+            LOG_INFO("[gatherClusterInventory] Discovered " << inventory.total_gpus << " GPU(s)");
             return inventory;
         }
 
         // For multi-rank: would gather from all ranks via MPI_Allgather
         // For now, assume homogeneous setup based on this rank's devices
         int world_size = mpi_ctx_->world_size();
+        int gpus_per_rank = 0;
+
+        // Count GPUs from DeviceManager
+        for (const auto &dev : devices)
+        {
+            if (dev.type != ComputeBackendType::CPU)
+            {
+                gpus_per_rank++;
+            }
+        }
+
         for (int r = 0; r < world_size; ++r)
         {
             RankInventory rank_inv;
@@ -496,23 +575,51 @@ namespace llaminar2
             rank_inv.cpu.local_device_id = 0;
             rank_inv.cpu_cores = 1;
 
-            // Mirror this rank's device setup
+            // Add GPUs from DeviceManager enumeration
+            int gpu_idx = 0;
+            for (const auto &dev : devices)
+            {
+                if (dev.type != ComputeBackendType::CPU)
+                {
+                    DeviceInfo gpu;
+                    gpu.type = toDeviceType(dev.type);
+                    gpu.local_device_id = gpu_idx++;
+                    gpu.memory_bytes = dev.total_memory_bytes;
+                    gpu.free_memory_bytes = dev.free_memory_bytes;
+                    gpu.name = dev.name;
+                    gpu.numa_node = dev.numa_node;
+                    gpu.compute_capability_major = dev.compute_capability / 10;
+                    gpu.compute_capability_minor = dev.compute_capability % 10;
+                    rank_inv.gpus.push_back(gpu);
+                }
+            }
+
+            // Override with explicit tp_devices if configured
             if (!config_.tp_devices.empty())
             {
+                rank_inv.gpus.clear();
                 for (size_t i = 0; i < config_.tp_devices.size(); ++i)
                 {
                     const auto &addr = config_.tp_devices[i];
                     DeviceInfo gpu;
-                    gpu.type = addr.device_type; // Member access, not function call
+                    gpu.type = addr.device_type;
                     gpu.local_device_id = static_cast<int>(i);
                     gpu.memory_bytes = 0;
                     rank_inv.gpus.push_back(gpu);
                 }
+                gpus_per_rank = static_cast<int>(config_.tp_devices.size());
             }
 
             inventory.ranks.push_back(rank_inv);
         }
 
+        // Set cluster-level fields
+        inventory.world_size = world_size;
+        inventory.node_count = (world_size + 1) / 2; // Assume 2 ranks per node
+        inventory.total_gpus = world_size * gpus_per_rank;
+
+        LOG_INFO("[gatherClusterInventory] Discovered " << inventory.total_gpus
+                                                        << " GPU(s) across " << world_size << " ranks");
         return inventory;
     }
 
@@ -539,10 +646,42 @@ namespace llaminar2
         return true;
     }
 
+    bool OrchestrationRunner::setupLocalPPContext()
+    {
+        // Check if LOCAL PP is configured
+        if (plan_.local_pp_devices.size() <= 1)
+        {
+            LOG_DEBUG("No LOCAL PP devices configured (or only single device)");
+            return true;
+        }
+
+        // Build LocalPPConfig from execution plan
+        LocalPPConfig pp_config;
+        pp_config.stage_devices = plan_.local_pp_devices;
+        pp_config.layer_boundaries = plan_.local_pp_layer_boundaries;
+
+        // Validate configuration
+        if (!pp_config.isValid())
+        {
+            return setError("Invalid LOCAL PP configuration");
+        }
+
+        // Create LOCAL PP context using factory function
+        local_pp_ctx_ = createLocalPPContext(pp_config);
+        if (!local_pp_ctx_)
+        {
+            return setError("Failed to create LOCAL PP context");
+        }
+
+        LOG_INFO("LOCAL PP context created with " << pp_config.numStages()
+                 << " stages on " << plan_.local_pp_devices.size() << " devices");
+        return true;
+    }
+
     bool OrchestrationRunner::loadWeights()
     {
         // Get model path from config
-        std::string model_path = config_.config_file_path; // TODO: Add model_path to OrchestrationConfig
+        std::string model_path = config_.model_path;
 
         // Skip weight loading if no model path (for testing)
         if (model_path.empty())
@@ -551,21 +690,52 @@ namespace llaminar2
             return true;
         }
 
-        // Create ModelContext using factory method
-        model_ctx_ = ModelContext::create(
-            model_path,
-            mpi_ctx_,
-            nullptr, // No placement map
-            nullptr, // No custom TensorFactory
-            WeightDistributionStrategy::REPLICATED,
-            WeightPrecision::CONVERT_TO_FP32);
+        // Create ModelContextConfig from the execution plan
+        // This automatically configures:
+        // - Layer range (first_layer, last_layer) for PP
+        // - Global weight flags (has_embedding, has_lm_head) for PP
+        // - Shard info (shard_index, total_shards, work_fraction) for TP
+        // - Appropriate strategy (REPLICATED, SHARDED, or layer-partitioned)
+        ModelContextConfig weight_config = ModelContextConfig::fromExecutionPlan(plan_);
+        weight_config.mpi_ctx = mpi_ctx_;
+        weight_config.weight_precision = WeightPrecision::NATIVE;
+
+        // Validate config
+        auto errors = weight_config.validate();
+        if (!errors.empty())
+        {
+            std::ostringstream oss;
+            oss << "Invalid ModelContextConfig from execution plan:\n";
+            for (const auto &err : errors)
+            {
+                oss << "  - " << err << "\n";
+            }
+            return setError(oss.str());
+        }
+
+        LOG_DEBUG("Weight loading config: " << weight_config.toString());
+
+        // Create ModelContext using the unified config-based factory method
+        // Use NATIVE weight precision to preserve quantization (Q4_0, Q8_0, etc.)
+        // for efficient GPU kernels rather than dequantizing to FP32
+        model_ctx_ = ModelContext::create(model_path, weight_config);
 
         if (!model_ctx_)
         {
             return setError("Failed to create ModelContext for: " + model_path);
         }
 
-        LOG_INFO("Model context created from: " << model_path);
+        // Create tokenizer from model context
+        tokenizer_ = createTokenizer(model_ctx_);
+        if (!tokenizer_)
+        {
+            LOG_WARN("Failed to create tokenizer from model context");
+        }
+
+        LOG_INFO("Model context created from: " << model_path
+                 << " (layers " << weight_config.first_layer << "-" << weight_config.last_layer
+                 << ", embedding=" << weight_config.has_embedding
+                 << ", lm_head=" << weight_config.has_lm_head << ")");
         return true;
     }
 
@@ -637,17 +807,34 @@ namespace llaminar2
         config.backend = plan_.local_tp_backend;
 
         // Copy runtime settings from orchestration config
-        config.max_seq_len = 4096; // Could be from config_
+        config.max_seq_len = config_.max_seq_len;
         config.batch_size = 1;
         config.activation_precision = ActivationPrecision::FP32;
 
         return config;
     }
 
+    std::shared_ptr<ITokenizer> OrchestrationRunner::tokenizer() const
+    {
+        return tokenizer_;
+    }
+
     bool OrchestrationRunner::buildMultiDeviceComputeGraph()
     {
-        LOG_INFO("Building multi-device compute graph with LOCAL TP ("
-                 << plan_.local_tp_devices.size() << " devices)");
+        LOG_INFO("[OrchestrationRunner] Execution strategy: MULTI-DEVICE (LOCAL TP)");
+        LOG_INFO("[OrchestrationRunner]   TP degree: " << plan_.local_tp_devices.size());
+
+        // Log each device
+        for (size_t i = 0; i < plan_.local_tp_devices.size(); ++i)
+        {
+            const auto &dev = plan_.local_tp_devices[i];
+            std::string weight_str = "";
+            if (i < plan_.local_tp_weights.size())
+            {
+                weight_str = " (weight=" + std::to_string(plan_.local_tp_weights[i]) + ")";
+            }
+            LOG_INFO("[OrchestrationRunner]   Device " << i << ": " << dev.toString() << weight_str);
+        }
 
         // Build multi-device config from execution plan
         auto mdo_config = buildMultiDeviceConfig();
@@ -679,20 +866,41 @@ namespace llaminar2
 
     bool OrchestrationRunner::buildSingleDeviceComputeGraph()
     {
-        // Determine target device
+        // Determine target device from execution plan
         DeviceId device = DeviceId::cpu();
+        std::string device_source = "default (CPU)";
+
         if (!plan_.local_tp_devices.empty())
         {
             device = plan_.primary_device.toLocalDeviceId();
+            device_source = "plan.local_tp_devices[0]";
         }
         else if (!plan_.primary_device.hostname.empty())
         {
             device = plan_.primary_device.toLocalDeviceId();
+            device_source = "plan.primary_device";
+        }
+
+        // Log execution strategy decision
+        LOG_INFO("[OrchestrationRunner] Execution strategy: SINGLE-DEVICE");
+        LOG_INFO("[OrchestrationRunner]   Target device: " << device.toString());
+        LOG_INFO("[OrchestrationRunner]   Device source: " << device_source);
+        if (device.is_cpu())
+        {
+            LOG_INFO("[OrchestrationRunner]   Backend: CPU (OpenBLAS/AVX-512)");
+        }
+        else if (device.is_cuda())
+        {
+            LOG_INFO("[OrchestrationRunner]   Backend: CUDA (GPU " << device.ordinal << ")");
+        }
+        else if (device.is_rocm())
+        {
+            LOG_INFO("[OrchestrationRunner]   Backend: ROCm (GPU " << device.ordinal << ")");
         }
 
         // Configure inference runner
         InferenceRunnerConfig runner_config;
-        runner_config.max_seq_len = 4096;
+        runner_config.max_seq_len = config_.max_seq_len;
         runner_config.batch_size = 1;
 
         // Create runner via factory (returns IInferenceRunner)
@@ -710,7 +918,7 @@ namespace llaminar2
             return setError("Failed to create inference runner");
         }
 
-        LOG_DEBUG("Compute graph built for device: " << device.toString());
+        LOG_INFO("[OrchestrationRunner] Compute graph built successfully");
         return true;
     }
 
@@ -762,6 +970,48 @@ namespace llaminar2
         last_error_ = error;
         LOG_ERROR(error);
         return false;
+    }
+
+    // =========================================================================
+    // Snapshot API
+    // =========================================================================
+
+    void OrchestrationRunner::enableSnapshotCapture(const std::string& output_dir)
+    {
+        if (runner_) {
+            runner_->enableSnapshotCapture(output_dir);
+        }
+    }
+
+    void OrchestrationRunner::disableSnapshotCapture()
+    {
+        if (runner_) {
+            runner_->disableSnapshotCapture();
+        }
+    }
+
+    void OrchestrationRunner::clearSnapshots()
+    {
+        if (runner_) {
+            runner_->clearSnapshots();
+        }
+    }
+
+    const float* OrchestrationRunner::getSnapshot(const std::string& key, size_t& out_size) const
+    {
+        if (runner_) {
+            return runner_->getSnapshot(key, out_size);
+        }
+        out_size = 0;
+        return nullptr;
+    }
+
+    std::vector<std::string> OrchestrationRunner::getSnapshotKeys() const
+    {
+        if (runner_) {
+            return runner_->getSnapshotKeys();
+        }
+        return {};
     }
 
 } // namespace llaminar2

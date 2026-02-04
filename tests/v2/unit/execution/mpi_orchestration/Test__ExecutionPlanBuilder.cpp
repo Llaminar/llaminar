@@ -618,3 +618,108 @@ TEST(Test__ModelConfig, ToString_ContainsName)
     auto str = config.toString();
     EXPECT_NE(str.find("Qwen2-7B"), std::string::npos);
 }
+
+// ============================================================================
+// GPU Selection Priority Tests
+// ============================================================================
+// These tests verify the critical fix where GPU is selected as primary_device
+// when GPUs are available in ClusterInventory, rather than defaulting to CPU.
+
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_WithGPUs_SelectsGPUAsPrimary)
+{
+    // Regression test: Ensure GPU is selected when available in inventory
+    // This was broken when gatherClusterInventory() didn't enumerate GPUs
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0, {{DeviceType::CUDA, 0}})
+                       .build();
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+
+    ASSERT_EQ(plans.size(), 1);
+    const auto &plan = plans[0];
+
+    // GPU must be selected as primary device, not CPU
+    EXPECT_FALSE(plan.primary_device.isCPU())
+        << "GPU should be selected as primary_device when available in ClusterInventory";
+    EXPECT_EQ(plan.primary_device.device_type, DeviceType::CUDA);
+}
+
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_WithMultipleGPUs_NoTPConfig_SelectsFirstGPU)
+{
+    // When multiple GPUs exist but no TP is configured, first GPU should be primary
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0,
+                                {{DeviceType::CUDA, 0}, {DeviceType::CUDA, 1}, {DeviceType::ROCm, 0}})
+                       .build();
+
+    // No TP configuration - single device mode
+    config.tp_degree = 1;
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+
+    ASSERT_EQ(plans.size(), 1);
+    const auto &plan = plans[0];
+
+    EXPECT_FALSE(plan.primary_device.isCPU());
+    EXPECT_EQ(plan.primary_device.device_type, DeviceType::CUDA);
+    EXPECT_EQ(plan.primary_device.device_ordinal, 0);
+}
+
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_EmptyInventory_FallsBackToCPU)
+{
+    // When ClusterInventory has no GPUs, CPU must be selected
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0, {}) // No GPUs
+                       .build();
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+
+    ASSERT_EQ(plans.size(), 1);
+    const auto &plan = plans[0];
+
+    EXPECT_TRUE(plan.primary_device.isCPU())
+        << "CPU fallback should be used when no GPUs in ClusterInventory";
+}
+
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_MixedVendorGPUs_SelectsFirstAvailable)
+{
+    // Mixed vendor scenario (CUDA + ROCm) - should select first GPU
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0,
+                                {{DeviceType::CUDA, 0}, {DeviceType::ROCm, 0}})
+                       .build();
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+
+    ASSERT_EQ(plans.size(), 1);
+    const auto &plan = plans[0];
+
+    // Primary device should be the first GPU (CUDA:0)
+    EXPECT_FALSE(plan.primary_device.isCPU());
+    // Either vendor is acceptable as long as it's a GPU
+    EXPECT_TRUE(plan.primary_device.device_type == DeviceType::CUDA ||
+                plan.primary_device.device_type == DeviceType::ROCm);
+}
+
+TEST_F(Test__ExecutionPlanBuilder, ClusterInventory_TotalGPUs_MatchesAddedDevices)
+{
+    // Verify ClusterInventory correctly counts total GPUs
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0,
+                                {{DeviceType::CUDA, 0}, {DeviceType::CUDA, 1}})
+                       .addRank(1, "remotehost", 1,
+                                {{DeviceType::ROCm, 0}})
+                       .build();
+
+    EXPECT_EQ(cluster.world_size, 2);
+    EXPECT_EQ(cluster.ranks[0].gpus.size(), 2);
+    EXPECT_EQ(cluster.ranks[1].gpus.size(), 1);
+
+    // Total GPUs across cluster
+    int total_gpus = 0;
+    for (const auto &rank : cluster.ranks)
+    {
+        total_gpus += static_cast<int>(rank.gpus.size());
+    }
+    EXPECT_EQ(total_gpus, 3);
+}

@@ -66,6 +66,32 @@ namespace llaminar2
         CollectiveBackendType backend() const override;
         int degree() const override;
 
+        /**
+         * @brief Get the current device index for orchestrator-driven LOCAL TP
+         *
+         * In LOCAL TP, a single orchestrator thread calls collective operations on behalf
+         * of multiple devices. This method returns the device index that was set via
+         * setCurrentDeviceIndex().
+         *
+         * For stages that need to know "which device am I?", call setCurrentDeviceIndex()
+         * before calling methods that use myIndex() for sharding calculations.
+         *
+         * @return Current device index (0 to degree-1)
+         * @throws std::runtime_error if setCurrentDeviceIndex() was never called
+         */
+        int myIndex() const override;
+
+        /**
+         * @brief Set the current device index for orchestrator-driven LOCAL TP
+         *
+         * Called by the orchestrator before invoking operations that need to know
+         * which device they're operating on behalf of.
+         *
+         * @param index Device index (0 to degree-1)
+         * @throws std::out_of_range if index >= degree()
+         */
+        void setCurrentDeviceIndex(int index);
+
         // =====================================================================
         // Collective Operations (ILocalTPContext)
         // =====================================================================
@@ -78,6 +104,7 @@ namespace llaminar2
             const std::vector<const TensorBase *> &shards,
             TensorBase *output) override;
         bool reduceScatter(const TensorBase *input, TensorBase *output_shard) override;
+        bool broadcast(TensorBase *tensor, int source_device_index = 0) override;
 
         // =====================================================================
         // Synchronization (ILocalTPContext)
@@ -174,6 +201,9 @@ namespace llaminar2
         std::vector<float> weights_; ///< Normalized weights (sum to 1.0)
         CollectiveBackendType backend_;
         std::unordered_map<GlobalDeviceAddress, int> device_to_index_;
+
+        /// Current device index for orchestrator-driven operations (-1 = not set)
+        int current_device_index_ = -1;
 
         mutable std::mutex mutex_; ///< Protects collective operations
 
