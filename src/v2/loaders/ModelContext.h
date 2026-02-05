@@ -211,7 +211,15 @@ namespace llaminar2
         // Convenience Hyperparameter Accessors (IModelContext)
         // =========================================================================
 
-        int blockCount() const override { return static_cast<int>(loader_.blockCount()); }
+        int blockCount() const override
+        {
+            // For PP stages, return the layer count for this stage (not total model layers)
+            if (pp_block_count_override_ >= 0)
+            {
+                return pp_block_count_override_;
+            }
+            return static_cast<int>(loader_.blockCount());
+        }
         int embeddingLength() const override { return static_cast<int>(loader_.embeddingLength()); }
         int headCount() const override { return static_cast<int>(loader_.headCount()); }
         int headCountKV() const override { return static_cast<int>(loader_.headCountKV()); }
@@ -249,6 +257,10 @@ namespace llaminar2
 
         // Interface wrapper for loader (since loader_ is stored by value, not as shared_ptr)
         std::shared_ptr<IModelLoader> loader_interface_;
+
+        // PP stage layer count override (-1 = use loader's blockCount)
+        // Set by createForPPStage() to return correct layer count for nested MDO graph building
+        int pp_block_count_override_ = -1;
     };
 
 } // namespace llaminar2

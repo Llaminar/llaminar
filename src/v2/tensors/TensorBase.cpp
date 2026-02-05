@@ -27,6 +27,10 @@
 #include <chrono>
 #include <omp.h>
 
+#ifdef HAVE_ROCM
+#include <hip/hip_runtime.h>
+#endif
+
 // Forward declare pinned memory registration functions from HostBackend implementations
 // These are defined in HostBackendROCm.cpp and HostBackendCUDA.cu
 namespace llaminar2
@@ -429,15 +433,6 @@ namespace llaminar2
         bar_accessor_device_ = cuda_device;
         bar_backend_ = nullptr; // No backend - memory managed externally
 
-        // Set up GPU pointer for CUDA kernel dispatch
-        gpu_data_ptr_ = cuda_ptr;
-        gpu_device_ = cuda_device;
-
-        // Both host and device are always "valid" for BAR-backed tensors
-        // since they share the same physical memory
-        host_valid_ = true;
-        device_valid_ = true;
-
         // ===== Allocate HIP staging buffer for ROCm kernel writes =====
         // CRITICAL: HIP kernels CANNOT directly dereference BAR mmap addresses!
         // We must allocate a real HIP device buffer for kernel writes, then
@@ -476,6 +471,35 @@ namespace llaminar2
         owns_hip_staging_ = false;
         LOG_DEBUG("[TensorBase::initBARBackedDirect] ROCm not available, no HIP staging buffer allocated");
 #endif
+
+        // Set up GPU pointer and device for ROCm kernel execution
+        // The HIP staging buffer is where ROCm kernels read/write data.
+        // For BAR-backed tensors, the flow is:
+        //   1. ROCm kernels operate on hip_staging_ptr_
+        //   2. When transferTo(CUDA) is called, data is copied:
+        //      hip_staging_ptr_ → bar_rocm_ptr_ (BAR) → bar_cuda_device_ptr_ (CUDA)
+        //   3. After transfer, CUDA becomes authoritative
+#if defined(HAVE_ROCM)
+        if (hip_staging_ptr_)
+        {
+            gpu_data_ptr_ = hip_staging_ptr_;
+            gpu_device_ = rocm_device;
+        }
+        else
+        {
+            // Fallback: use CUDA pointers if no staging buffer
+            gpu_data_ptr_ = cuda_ptr;
+            gpu_device_ = cuda_device;
+        }
+#else
+        gpu_data_ptr_ = cuda_ptr;
+        gpu_device_ = cuda_device;
+#endif
+
+        // Both host and device are always "valid" for BAR-backed tensors
+        // since they share the same physical memory
+        host_valid_ = true;
+        device_valid_ = true;
 
         LOG_DEBUG("[TensorBase::initBARBackedDirect] Configured BAR-backed tensor: "
                   << bytes << " bytes"
@@ -2462,11 +2486,61 @@ namespace llaminar2
         LOG_DEBUG("[TensorBase::transferTo] " << src_device.toString() << " -> "
                                               << dst_device.toString() << " (" << bytes << " bytes)");
 
-        // 6. Perform direct GPU-to-GPU copy
-        if (!backend->copy(dst_ptr, dst_device, src_ptr, src_device, bytes))
+        // 6. Perform transfer - special handling for BAR-backed tensors
+        // For BAR-backed ROCm → CUDA transfers:
+        //   1. Copy from HIP staging buffer to BAR region (hipMemcpy D2D)
+        //   2. CUDA already has access to BAR via bar_cuda_device_ptr_
+        if (is_bar_backed_ && src_device.is_rocm() && dst_device.is_cuda() &&
+            hip_staging_ptr_ && bar_rocm_ptr_)
         {
-            LOG_ERROR("[TensorBase::transferTo] Backend copy failed");
+            LOG_DEBUG("[TensorBase::transferTo] BAR-backed ROCm→CUDA: copying staging→BAR");
+
+            // Step 1: Copy from HIP staging buffer to BAR region
+            // This uses hipMemcpy D2D which works because the BAR mmap address
+            // is recognized by the HIP runtime as device memory
+#if defined(HAVE_ROCM)
+            hipError_t hip_err = hipSetDevice(src_device.rocm_ordinal());
+            if (hip_err != hipSuccess)
+            {
+                LOG_ERROR("[TensorBase::transferTo] hipSetDevice failed: " << hipGetErrorString(hip_err));
+                return false;
+            }
+
+            hip_err = hipMemcpy(bar_rocm_ptr_, hip_staging_ptr_, bytes, hipMemcpyDeviceToDevice);
+            if (hip_err != hipSuccess)
+            {
+                LOG_ERROR("[TensorBase::transferTo] hipMemcpy staging→BAR failed: " << hipGetErrorString(hip_err));
+                return false;
+            }
+
+            // hipDeviceSynchronize to ensure the copy completes before CUDA reads
+            hip_err = hipDeviceSynchronize();
+            if (hip_err != hipSuccess)
+            {
+                LOG_ERROR("[TensorBase::transferTo] hipDeviceSynchronize failed: " << hipGetErrorString(hip_err));
+                return false;
+            }
+
+            LOG_DEBUG("[TensorBase::transferTo] BAR-backed ROCm→CUDA: staging→BAR complete, "
+                      << "CUDA can now read from BAR at " << bar_cuda_device_ptr_);
+
+            // Step 2: Update destination to point to BAR-accessible CUDA pointer
+            // The CUDA device can directly read from bar_cuda_device_ptr_
+            dst_ptr = bar_cuda_device_ptr_;
+            dst_is_bar_backed = true;
+#else
+            LOG_ERROR("[TensorBase::transferTo] BAR-backed transfer requires HAVE_ROCM");
             return false;
+#endif
+        }
+        else
+        {
+            // Standard backend copy for non-BAR or same-vendor transfers
+            if (!backend->copy(dst_ptr, dst_device, src_ptr, src_device, bytes))
+            {
+                LOG_ERROR("[TensorBase::transferTo] Backend copy failed");
+                return false;
+            }
         }
 
         // 7. Update coherence state

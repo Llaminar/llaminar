@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 #include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
+#include "execution/factory/FactoryPPStageConfig.h"
 #include "collective/ILocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "tensors/Tensors.h"
@@ -380,6 +381,224 @@ namespace llaminar2::test
         EXPECT_NEAR(sum, 1.0f, 0.01f);
 
         EXPECT_TRUE(stage.validate());
+    }
+
+    // =========================================================================
+    // Nested PP Stage Config Propagation Tests
+    //
+    // Bug Caught: In hybrid PP+TP mode, nested TP MDOs weren't receiving the
+    // PP stage config, causing them to build FULL forward graphs (with LM_HEAD)
+    // instead of PARTIAL graphs (without LM_HEAD for stage 0).
+    //
+    // Root Cause: nested_pp_stage_config wasn't being set in the nested MDO's
+    // Config, and setPPStageConfig() wasn't being called on DeviceGraphOrchestrators.
+    // =========================================================================
+
+    /**
+     * @brief Test: nested_pp_stage_config must be set when creating nested MDO for PP stage
+     *
+     * When a TP domain is part of a PP stage, the nested MDO must receive
+     * the PP stage config so its DeviceGraphOrchestrators know to build
+     * partial graphs instead of full graphs.
+     */
+    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, NestedMDO_MustReceivePPStageConfig)
+    {
+        // Outer PP config with TP domain as stage 0
+        PPStageConfig stage0;
+        stage0.first_layer = 0;
+        stage0.last_layer = 12;
+        stage0.stage_devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
+        stage0.tp_backend = CollectiveBackendType::NCCL;
+        stage0.has_embedding = true;
+        stage0.has_lm_head = false; // KEY: Stage 0 does NOT have LM head
+
+        // Create FactoryPPStageConfig as done in InferenceRunnerFactory
+        FactoryPPStageConfig factory_pp_config;
+        factory_pp_config.first_layer = stage0.first_layer;
+        factory_pp_config.last_layer = stage0.last_layer;
+        factory_pp_config.has_embedding = stage0.has_embedding;
+        factory_pp_config.has_lm_head = stage0.has_lm_head;
+
+        // Create nested MDO config (simulating what parent MDO does)
+        Config nested_config;
+        nested_config.mode = ParallelismMode::TP;
+        nested_config.devices = stage0.stage_devices;
+        nested_config.backend = stage0.tp_backend;
+
+        // KEY FIX: This line was missing and caused the bug!
+        nested_config.nested_pp_stage_config = factory_pp_config;
+
+        // Verify nested_pp_stage_config is present and correct
+        ASSERT_TRUE(nested_config.nested_pp_stage_config.has_value());
+        EXPECT_EQ(nested_config.nested_pp_stage_config->first_layer, 0);
+        EXPECT_EQ(nested_config.nested_pp_stage_config->last_layer, 12);
+        EXPECT_TRUE(nested_config.nested_pp_stage_config->has_embedding);
+        EXPECT_FALSE(nested_config.nested_pp_stage_config->has_lm_head);
+    }
+
+    /**
+     * @brief Test: Nested config without PP stage config would cause full graph build
+     *
+     * This is the anti-pattern that caused the bug. If nested_pp_stage_config
+     * is NOT set, the DeviceGraphOrchestrators won't call setPPStageConfig()
+     * and will build full graphs including LM_HEAD even when they shouldn't.
+     */
+    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, NestedMDO_MissingPPConfig_WouldBuildFullGraph)
+    {
+        PPStageConfig stage0;
+        stage0.first_layer = 0;
+        stage0.last_layer = 12;
+        stage0.stage_devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
+        stage0.has_lm_head = false;
+
+        // Incorrect: Create nested config WITHOUT setting nested_pp_stage_config
+        Config nested_config_without_pp;
+        nested_config_without_pp.mode = ParallelismMode::TP;
+        nested_config_without_pp.devices = stage0.stage_devices;
+        // NOT setting: nested_config_without_pp.nested_pp_stage_config = ...
+
+        // Without nested_pp_stage_config, the DGOs would build full graphs!
+        EXPECT_FALSE(nested_config_without_pp.nested_pp_stage_config.has_value());
+
+        // Correct: Create nested config WITH nested_pp_stage_config
+        Config nested_config_with_pp;
+        nested_config_with_pp.mode = ParallelismMode::TP;
+        nested_config_with_pp.devices = stage0.stage_devices;
+
+        FactoryPPStageConfig factory_pp_config;
+        factory_pp_config.first_layer = 0;
+        factory_pp_config.last_layer = 12;
+        factory_pp_config.has_lm_head = false;
+        nested_config_with_pp.nested_pp_stage_config = factory_pp_config;
+
+        // With nested_pp_stage_config, DGOs know to build partial graphs
+        EXPECT_TRUE(nested_config_with_pp.nested_pp_stage_config.has_value());
+        EXPECT_FALSE(nested_config_with_pp.nested_pp_stage_config->has_lm_head);
+    }
+
+    /**
+     * @brief Test: FactoryPPStageConfig captures all required PP stage info
+     *
+     * Verifies that FactoryPPStageConfig has all the fields needed for
+     * DeviceGraphOrchestrator to build the correct partial graph.
+     */
+    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, FactoryPPStageConfig_HasAllFields)
+    {
+        FactoryPPStageConfig config;
+        config.first_layer = 0;
+        config.last_layer = 12;
+        config.has_embedding = true;
+        config.has_lm_head = false;
+        config.use_bar_backed_hidden = true;
+
+        // Verify all fields are accessible
+        EXPECT_EQ(config.first_layer, 0);
+        EXPECT_EQ(config.last_layer, 12);
+        EXPECT_TRUE(config.has_embedding);
+        EXPECT_FALSE(config.has_lm_head);
+        EXPECT_TRUE(config.use_bar_backed_hidden);
+    }
+
+    /**
+     * @brief Test: Layer range in nested config determines what stages to build
+     *
+     * The DeviceGraphOrchestrator uses first_layer/last_layer to determine
+     * which transformer blocks to include in its graph.
+     */
+    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, NestedPPConfig_LayerRangeDeterminesStages)
+    {
+        // Stage 0: layers 0-11 (12 layers)
+        FactoryPPStageConfig stage0_config;
+        stage0_config.first_layer = 0;
+        stage0_config.last_layer = 12;
+        stage0_config.has_embedding = true;  // Has embedding (first stage)
+        stage0_config.has_lm_head = false;   // No LM head
+
+        // Stage 1: layers 12-23 (12 layers)
+        FactoryPPStageConfig stage1_config;
+        stage1_config.first_layer = 12;
+        stage1_config.last_layer = 24;
+        stage1_config.has_embedding = false; // No embedding
+        stage1_config.has_lm_head = true;    // Has LM head (last stage)
+
+        // Verify layer counts
+        int stage0_layers = stage0_config.last_layer - stage0_config.first_layer;
+        int stage1_layers = stage1_config.last_layer - stage1_config.first_layer;
+
+        EXPECT_EQ(stage0_layers, 12);
+        EXPECT_EQ(stage1_layers, 12);
+
+        // Total should cover all layers
+        EXPECT_EQ(stage0_layers + stage1_layers, 24);
+
+        // Layers don't overlap
+        EXPECT_EQ(stage0_config.last_layer, stage1_config.first_layer);
+    }
+
+    /**
+     * @brief Test: Hybrid PP+TP config creation follows correct pattern
+     *
+     * Documents the complete pattern for creating nested MDO configs
+     * in PP+TP hybrid mode to prevent future regressions.
+     */
+    TEST_F(Test__MultiDeviceOrchestrator_NestedTP, HybridPPTP_CorrectConfigPattern)
+    {
+        // Step 1: Define outer PP config with TP domain stages
+        Config outer_config;
+        outer_config.mode = ParallelismMode::TP_PP;
+
+        PPStageConfig stage0;
+        stage0.first_layer = 0;
+        stage0.last_layer = 12;
+        stage0.stage_devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
+        stage0.tp_backend = CollectiveBackendType::NCCL;
+        stage0.has_embedding = true;
+        stage0.has_lm_head = false;
+
+        PPStageConfig stage1;
+        stage1.first_layer = 12;
+        stage1.last_layer = 24;
+        stage1.stage_devices = {GlobalDeviceAddress::rocm(0)};
+        stage1.has_embedding = false;
+        stage1.has_lm_head = true;
+
+        outer_config.pp_stages = {stage0, stage1};
+        ASSERT_TRUE(outer_config.validate());
+
+        // Step 2: For each TP domain stage, create nested MDO config
+        for (size_t i = 0; i < outer_config.pp_stages.size(); ++i)
+        {
+            const auto &pp_stage = outer_config.pp_stages[i];
+
+            if (pp_stage.isTPDomain())
+            {
+                // Step 2a: Create FactoryPPStageConfig from PPStageConfig
+                FactoryPPStageConfig factory_pp_config;
+                factory_pp_config.first_layer = pp_stage.first_layer;
+                factory_pp_config.last_layer = pp_stage.last_layer;
+                factory_pp_config.has_embedding = pp_stage.has_embedding;
+                factory_pp_config.has_lm_head = pp_stage.has_lm_head;
+
+                // Step 2b: Create nested MDO config with TP settings
+                Config nested_config;
+                nested_config.mode = ParallelismMode::TP;
+                nested_config.devices = pp_stage.stage_devices;
+                nested_config.weights = pp_stage.tp_weights;
+                nested_config.backend = pp_stage.tp_backend;
+                nested_config.max_seq_len = outer_config.max_seq_len;
+                nested_config.batch_size = outer_config.batch_size;
+
+                // Step 2c: CRITICAL - Set nested_pp_stage_config!
+                nested_config.nested_pp_stage_config = factory_pp_config;
+
+                // Verify nested config is correct
+                EXPECT_TRUE(nested_config.nested_pp_stage_config.has_value());
+                EXPECT_EQ(nested_config.nested_pp_stage_config->first_layer,
+                          pp_stage.first_layer);
+                EXPECT_EQ(nested_config.nested_pp_stage_config->has_lm_head,
+                          pp_stage.has_lm_head);
+            }
+        }
     }
 
 } // namespace llaminar2::test

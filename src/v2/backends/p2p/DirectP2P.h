@@ -57,6 +57,7 @@
 #include "../DeviceId.h"
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -253,6 +254,19 @@ namespace llaminar2
         void *getBarHostPtr() const;
 
         /**
+         * @brief Allocate a region within the BAR using bump allocation
+         *
+         * Thread-safe bump allocator for BAR region. Each allocation returns
+         * a unique offset within the BAR, preventing multiple tensors from
+         * aliasing the same memory.
+         *
+         * @param size Number of bytes to allocate
+         * @param alignment Alignment requirement (default 256 for GPU alignment)
+         * @return Pair of (rocm_ptr, cuda_ptr) at the allocated offset, or nullopt if OOM
+         */
+        std::optional<std::pair<void *, void *>> allocateInBar(size_t size, size_t alignment = 256);
+
+        /**
          * @brief Get the BAR offset used during initialization
          *
          * @return The bar_offset parameter passed to initializePCIeBar()
@@ -447,6 +461,7 @@ namespace llaminar2
         void *getCudaBarPointer() const { return nullptr; }
         size_t getBarMappedSize() const { return 0; }
         void *getBarHostPtr() const { return nullptr; }
+        std::optional<std::pair<void *, void *>> allocateInBar(size_t, size_t = 256) { return std::nullopt; }
         size_t getBarOffset() const { return 0; }
         size_t getNumMappedBars() const { return 0; }
         void *getCudaBarPointerForDevice(int) const { return nullptr; }

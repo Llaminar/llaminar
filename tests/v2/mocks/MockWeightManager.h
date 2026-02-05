@@ -122,6 +122,12 @@ namespace llaminar2::test
 
         WeightDistributionStrategy strategy() const override { return strategy_; }
 
+        bool hasLMHead() const override { return has_lm_head_; }
+        bool hasEmbedding() const override { return has_embedding_; }
+
+        void setHasLMHead(bool has_lm_head) { has_lm_head_ = has_lm_head; }
+        void setHasEmbedding(bool has_embedding) { has_embedding_ = has_embedding; }
+
         size_t cacheSize() const override { return weights_.size(); }
         void clearCache() override { weights_.clear(); }
         size_t decodeCacheSize() const override { return decode_weights_.size(); }
@@ -287,6 +293,10 @@ namespace llaminar2::test
     private:
         // Distribution strategy
         WeightDistributionStrategy strategy_ = WeightDistributionStrategy::REPLICATED;
+
+        // Layer range flags (for PP stages)
+        bool has_lm_head_ = true;   // Default to true for non-PP scenarios
+        bool has_embedding_ = true; // Default to true for non-PP scenarios
 
         // Weight storage
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> weights_;

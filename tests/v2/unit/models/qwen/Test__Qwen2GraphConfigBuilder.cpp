@@ -83,6 +83,9 @@ namespace
             return WeightDistributionStrategy::REPLICATED;
         }
 
+        bool hasLMHead() const override { return true; }
+        bool hasEmbedding() const override { return true; }
+
         size_t cacheSize() const override { return 0; }
         void clearCache() override {}
         size_t decodeCacheSize() const override { return 0; }

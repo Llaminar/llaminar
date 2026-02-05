@@ -232,8 +232,8 @@ namespace llaminar2
             has_lm_head_ = has_lm_head;
             has_layer_range_ = true;
             LOG_INFO("[WeightManager] Layer range set: layers [" << first_layer << ", " << last_layer
-                     << "), embedding=" << (has_embedding ? "yes" : "no")
-                     << ", lm_head=" << (has_lm_head ? "yes" : "no"));
+                                                                 << "), embedding=" << (has_embedding ? "yes" : "no")
+                                                                 << ", lm_head=" << (has_lm_head ? "yes" : "no"));
         }
 
         /**
@@ -266,12 +266,12 @@ namespace llaminar2
         /**
          * @brief Check if this stage has embedding
          */
-        bool hasEmbedding() const { return has_embedding_; }
+        bool hasEmbedding() const override { return has_embedding_; }
 
         /**
          * @brief Check if this stage has LM head
          */
-        bool hasLMHead() const { return has_lm_head_; }
+        bool hasLMHead() const override { return has_lm_head_; }
 
         /**
          * @brief Set whether this weight manager should provide embedding weights
@@ -507,10 +507,10 @@ namespace llaminar2
         // Layer range for Pipeline Parallelism (LAYER_PARTITIONED strategy)
         // =========================================================================
 
-        int layer_first_ = 0;         ///< First layer index (inclusive)
-        int layer_last_ = 0;          ///< Last layer index (exclusive)
-        bool has_embedding_ = true;   ///< True if this stage loads embedding
-        bool has_lm_head_ = true;     ///< True if this stage loads LM head
+        int layer_first_ = 0;          ///< First layer index (inclusive)
+        int layer_last_ = 0;           ///< Last layer index (exclusive)
+        bool has_embedding_ = true;    ///< True if this stage loads embedding
+        bool has_lm_head_ = true;      ///< True if this stage loads LM head
         bool has_layer_range_ = false; ///< True if setLayerRange() was called
 
         /**

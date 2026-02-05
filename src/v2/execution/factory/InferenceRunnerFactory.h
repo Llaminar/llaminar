@@ -67,6 +67,7 @@
 #include "../../utils/MPIContext.h"
 #include "../mpi_orchestration/PlacementPlan.h"
 #include "../../config/PipelineConfig.h"
+#include "FactoryPPStageConfig.h"
 #include <memory>
 #include <optional>
 
@@ -77,77 +78,8 @@ namespace llaminar2
     class ILocalTPContext;
     class IMultiDeviceOrchestrator;
 
-    /**
-     * @brief Legacy configuration for a Pipeline Parallelism (PP) stage
-     *
-     * @deprecated Use PPStageConfig from config/PPStageConfig.h instead.
-     *             This legacy struct is retained for backward compatibility with
-     *             DeviceGraphOrchestrator. New code should use the unified
-     *             PPStageConfig from the config/ directory.
-     *
-     * Pipeline Parallelism splits the model's transformer layers across multiple
-     * stages (typically on different devices or ranks). Each FactoryPPStageConfig
-     * defines which subset of layers a particular stage executes.
-     *
-     * ## Layer Range Semantics
-     * - Layer range is [first_layer, last_layer) - first is inclusive, last is exclusive
-     * - For a 24-layer model with 2 stages:
-     *   - Stage 0: first_layer=0, last_layer=12 (executes layers 0-11)
-     *   - Stage 1: first_layer=12, last_layer=24 (executes layers 12-23)
-     *
-     * ## Embedding and LM Head Ownership
-     * - Stage 0 (first stage) typically owns the token embedding lookup (has_embedding=true)
-     * - Final stage typically owns output_norm and LM head projection (has_lm_head=true)
-     * - Middle stages have both flags set to false
-     */
-    struct FactoryPPStageConfig
-    {
-        int first_layer = 0;                ///< First layer index this stage executes (inclusive)
-        int last_layer = 0;                 ///< Last layer index this stage executes (exclusive)
-        bool has_embedding = false;         ///< True if this stage owns the token embedding lookup
-        bool has_lm_head = false;           ///< True if this stage owns output_norm and LM head projection
-        bool use_bar_backed_hidden = false; ///< True if hidden state should use BAR-backed memory for cross-vendor PP
-
-        /**
-         * @brief Validate the PP stage configuration
-         *
-         * Checks that:
-         * - first_layer >= 0 (valid layer index)
-         * - last_layer > first_layer (at least one layer in range)
-         * - Edge stages have appropriate ownership flags (first stage should have
-         *   embedding OR last stage should have lm_head, but this is advisory)
-         *
-         * @return true if configuration is valid, false otherwise
-         */
-        [[nodiscard]] bool isValid() const
-        {
-            // Basic range validation
-            if (first_layer < 0)
-                return false;
-            if (last_layer <= first_layer)
-                return false;
-
-            // Note: We don't enforce has_embedding/has_lm_head here since the
-            // caller may be constructing a middle stage. The orchestrator
-            // validates that exactly one stage has each flag across all stages.
-            return true;
-        }
-
-        /**
-         * @brief Get the number of layers this stage executes
-         * @return Layer count (last_layer - first_layer)
-         */
-        [[nodiscard]] int layerCount() const
-        {
-            return last_layer - first_layer;
-        }
-    };
-
-    // Backward compatibility alias (deprecated - use FactoryPPStageConfig or config/PPStageConfig.h)
-    // Note: This is temporarily removed to avoid conflict with config/PPStageConfig.h
-    // Code using the legacy PPStageConfig from this file should migrate to either:
-    // 1. FactoryPPStageConfig (simple layer ranges for DeviceGraphOrchestrator)
-    // 2. config/PPStageConfig.h (full-featured with domain_name, stage_id for unified PP graphs)
+    // Note: FactoryPPStageConfig is now defined in FactoryPPStageConfig.h
+    // to avoid circular dependencies with MultiDeviceOrchestrator.h
 
     /**
      * @brief Configuration for inference runner creation

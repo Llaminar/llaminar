@@ -251,9 +251,13 @@ namespace llaminar2
         // Set up interface wrappers
         ctx->loader_interface_ = std::make_shared<ModelLoaderInterfaceWrapper>(ctx->loader_);
 
+        // CRITICAL: Override blockCount() to return the layer count for THIS stage
+        // This ensures nested MDO (TP within PP) builds graphs with correct layer count
+        ctx->pp_block_count_override_ = last_layer - first_layer;
+
         LOG_INFO("[ModelContext] Created PP stage context for layers [" << first_layer << ", " << last_layer
-                 << "), embedding=" << (has_embedding ? "yes" : "no")
-                 << ", lm_head=" << (has_lm_head ? "yes" : "no"));
+                                                                        << "), embedding=" << (has_embedding ? "yes" : "no")
+                                                                        << ", lm_head=" << (has_lm_head ? "yes" : "no"));
 
         return ctx;
     }

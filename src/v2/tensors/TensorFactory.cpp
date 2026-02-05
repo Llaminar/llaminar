@@ -405,35 +405,29 @@ namespace llaminar2
         }
         size_t byte_size = element_count * sizeof(float);
 
-        // Get BAR pointers from DirectP2P engine
-        // The BAR is mapped starting from the host pointer
-        void *bar_host_ptr = direct_p2p_->getBarHostPtr();
-        void *cuda_bar_ptr = direct_p2p_->getCudaBarPointer();
-        size_t bar_mapped_size = direct_p2p_->getBarMappedSize();
-
-        if (!bar_host_ptr || !cuda_bar_ptr)
+        // Allocate from BAR region using bump allocator
+        // This ensures each tensor gets a unique offset in the BAR region
+        auto alloc = direct_p2p_->allocateInBar(byte_size, 256); // 256-byte alignment for GPU
+        if (!alloc)
         {
-            LOG_ERROR("TensorFactory::createFP32BARBacked: BAR pointers not available");
-            throw std::runtime_error("TensorFactory::createFP32BARBacked: BAR pointers unavailable");
+            LOG_ERROR("TensorFactory::createFP32BARBacked: Failed to allocate " << byte_size
+                                                                                << " bytes from BAR region (may be out of space)");
+            throw std::runtime_error("TensorFactory::createFP32BARBacked: BAR allocation failed");
         }
 
-        if (byte_size > bar_mapped_size)
-        {
-            LOG_ERROR("TensorFactory::createFP32BARBacked: Tensor size (" << byte_size
-                                                                          << " bytes) exceeds BAR mapped size (" << bar_mapped_size << " bytes)");
-            throw std::runtime_error("TensorFactory::createFP32BARBacked: Tensor too large for BAR region");
-        }
+        void *bar_host_ptr = alloc->first;  // ROCm BAR mmap pointer at allocated offset
+        void *cuda_bar_ptr = alloc->second; // CUDA device pointer at allocated offset
 
         // KEY INSIGHT: The BAR mmap address is AMD GPU VRAM mapped to CPU virtual address space.
-        // We discovered through testing (TestZeroCopyBidirectional) that hipMemcpy(D2D) 
+        // We discovered through testing (TestZeroCopyBidirectional) that hipMemcpy(D2D)
         // accepts this mmap CPU address directly as a "device" pointer - the ROCm driver
         // recognizes it as device memory without needing hipHostRegister.
         //
         // DO NOT use hipHostRegister here - it fails with "invalid argument" because
         // the BAR mmap is not normal host memory. Instead, just use the mmap address
         // directly as the ROCm pointer.
-        void *hip_device_ptr = bar_host_ptr;  // BAR mmap works directly with hipMemcpy D2D
-        
+        void *hip_device_ptr = bar_host_ptr; // BAR mmap works directly with hipMemcpy D2D
+
         LOG_DEBUG("TensorFactory::createFP32BARBacked: Using BAR mmap directly for HIP: "
                   << "bar_host_ptr=" << bar_host_ptr << " (works with hipMemcpy D2D)");
 
@@ -447,11 +441,11 @@ namespace llaminar2
         // - rocm_ptr: HIP device pointer (from hipHostGetDevicePointer)
         // - cuda_ptr: CUDA device pointer (from cuMemHostGetDevicePointer)
         tensor->initBARBackedDirect(
-            hip_device_ptr,         // rocm_ptr - HIP device pointer for ROCm kernels
-            cuda_bar_ptr,           // cuda_ptr - CUDA reads/writes via PCIe
-            rocm_device,            // host device (owns the BAR memory)
-            cuda_device,            // accessor device (reads via PCIe)
-            byte_size               // allocation size
+            hip_device_ptr, // rocm_ptr - HIP device pointer for ROCm kernels
+            cuda_bar_ptr,   // cuda_ptr - CUDA reads/writes via PCIe
+            rocm_device,    // host device (owns the BAR memory)
+            cuda_device,    // accessor device (reads via PCIe)
+            byte_size       // allocation size
         );
 
         LOG_DEBUG("TensorFactory::createFP32BARBacked: Created BAR-backed tensor "

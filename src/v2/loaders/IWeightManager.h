@@ -187,6 +187,30 @@ namespace llaminar2
         virtual WeightDistributionStrategy strategy() const = 0;
 
         // =========================================================================
+        // Layer Range Info (for PP stages)
+        // =========================================================================
+
+        /**
+         * @brief Check if this weight manager owns the LM head
+         *
+         * For pipeline parallelism, only the last PP stage has the LM head.
+         * This is used by MultiDeviceOrchestrator to determine which stage
+         * should return LM_HEAD snapshot data.
+         *
+         * @return true if this stage has the LM head
+         */
+        virtual bool hasLMHead() const = 0;
+
+        /**
+         * @brief Check if this weight manager owns the token embedding
+         *
+         * For pipeline parallelism, only the first PP stage has the embedding.
+         *
+         * @return true if this stage has the token embedding
+         */
+        virtual bool hasEmbedding() const = 0;
+
+        // =========================================================================
         // Cache Management
         // =========================================================================
 

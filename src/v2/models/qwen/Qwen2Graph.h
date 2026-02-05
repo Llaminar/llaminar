@@ -69,13 +69,20 @@ namespace llaminar2
     struct Qwen2GraphConfig
     {
         // Model architecture
-        int n_layers = 0;   ///< Number of transformer layers
+        int n_layers = 0;   ///< Number of transformer layers (full model count for validation)
         int d_model = 0;    ///< Model hidden dimension
         int n_heads = 0;    ///< Number of attention heads
         int n_kv_heads = 0; ///< Number of KV heads (GQA)
         int head_dim = 0;   ///< Dimension per head
         int d_ff = 0;       ///< FFN intermediate dimension
         int vocab_size = 0; ///< Vocabulary size
+
+        /// Pipeline Parallelism layer offset for KV cache indexing.
+        /// When building graphs for PP stage [first_layer, last_layer), this offset
+        /// is subtracted from the global layer index to get the local KV cache index.
+        /// E.g., for PP stage 1 with layers [12, 24), pp_layer_offset=12, so layer 12
+        /// maps to KV cache layer 0.
+        int pp_layer_offset = 0;
 
         // FFN sharding (for tensor parallelism)
         int d_ff_local = 0; ///< Local FFN dim per rank

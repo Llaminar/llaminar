@@ -24,6 +24,7 @@
 #include "../graph/SchemaFactoryRegistry.h" // Model-agnostic sharding config access
 #include "../../../tensors/TensorClasses.h"
 #include "../../../tensors/TensorFactory.h"
+#include "../../../backends/p2p/DirectP2P.h" // DirectP2PEngine for BAR pre-init in cross-vendor PP
 #include "../../../utils/Logger.h"
 #include <algorithm>
 #include <future>
@@ -529,6 +530,18 @@ namespace llaminar2
                                          std::to_string(device_idx));
             }
 
+            // CRITICAL: For nested TP-in-PP, set PP stage config on the DeviceGraphOrchestrator
+            // so it builds a partial graph instead of a full graph. Without this, the TP devices
+            // would include LM_HEAD even when this PP stage doesn't own it.
+            if (config_.nested_pp_stage_config.has_value())
+            {
+                device_orchestrator->setPPStageConfig(config_.nested_pp_stage_config.value());
+                LOG_DEBUG("MultiDeviceOrchestrator: Set PP stage config on device " << device_idx
+                                                                                    << " (layers " << config_.nested_pp_stage_config->first_layer
+                                                                                    << "-" << config_.nested_pp_stage_config->last_layer
+                                                                                    << " has_lm_head=" << config_.nested_pp_stage_config->has_lm_head << ")");
+            }
+
             // Transfer ownership
             runner.release();
             device_runners_.push_back(std::unique_ptr<DeviceGraphOrchestrator>(device_orchestrator));
@@ -607,6 +620,51 @@ namespace llaminar2
                 LOG_INFO("MultiDeviceOrchestrator: PP stage " << i
                                                               << " outputs to cross-vendor stage " << (i + 1)
                                                               << " - will use BAR-backed hidden state");
+            }
+        }
+
+        // =========================================================================
+        // Pre-initialize PCIe BAR for Cross-Vendor PP
+        // =========================================================================
+        // If any stage needs BAR-backed hidden state, we must initialize the
+        // DirectP2PEngine's BAR mapping NOW, before creating device runners.
+        // Otherwise, when DeviceGraphOrchestrator calls initializeInferenceState(),
+        // isPCIeBarActive() will return false and it will fall back to standard
+        // allocation (which will fail during cross-vendor transfer).
+        // =========================================================================
+        for (size_t i = 0; i < num_stages; ++i)
+        {
+            if (needs_bar_backed[i] && i + 1 < num_stages)
+            {
+                const auto &src_stage = config_.pp_stages[i];
+                const auto &dst_stage = config_.pp_stages[i + 1];
+
+                if (!src_stage.stage_devices.empty() && !dst_stage.stage_devices.empty())
+                {
+                    DeviceId src_dev = src_stage.stage_devices[0].toLocalDeviceId();
+                    DeviceId dst_dev = dst_stage.stage_devices[0].toLocalDeviceId();
+
+                    DeviceId cuda_dev = src_dev.is_cuda() ? src_dev : dst_dev;
+                    DeviceId rocm_dev = src_dev.is_rocm() ? src_dev : dst_dev;
+
+                    auto p2p = DirectP2PEngine::getSharedInstance();
+                    if (!p2p->isPCIeBarActive())
+                    {
+                        LOG_INFO("MultiDeviceOrchestrator: Pre-initializing PCIe BAR for cross-vendor PP "
+                                 << "(CUDA:" << cuda_dev.cuda_ordinal() << " <-> ROCm:" << rocm_dev.rocm_ordinal() << ")");
+
+                        constexpr size_t bar_map_size = 1024 * 1024 * 1024; // 1GB BAR region
+                        if (!p2p->initializePCIeBar(cuda_dev, rocm_dev, 0, bar_map_size))
+                        {
+                            LOG_ERROR("MultiDeviceOrchestrator: Failed to pre-initialize PCIe BAR. "
+                                      "Cross-vendor PP transfer will fail.");
+                            throw std::runtime_error("Failed to initialize PCIe BAR for cross-vendor PP");
+                        }
+
+                        LOG_INFO("MultiDeviceOrchestrator: PCIe BAR pre-initialized successfully");
+                        break; // Only need to initialize once
+                    }
+                }
             }
         }
 
@@ -692,6 +750,11 @@ namespace llaminar2
                 nested_config.kv_cache_scale = config_.kv_cache_scale;
                 nested_config.use_mapped_memory = config_.use_mapped_memory;
                 nested_config.use_bar_backed_hidden = needs_bar_backed[stage_idx] || stage_config.requires_bar_backed_hidden;
+
+                // CRITICAL: Pass PP stage config to nested TP MDO so its DeviceGraphOrchestrators
+                // build partial graphs instead of full graphs. Without this, the TP devices would
+                // build LM_HEAD stages even though this PP stage doesn't own LM_HEAD.
+                nested_config.nested_pp_stage_config = factory_pp_config;
 
                 // Create the nested MultiDeviceOrchestrator
                 // Note: stage_ctx contains weights only for this stage's layers
@@ -1744,34 +1807,49 @@ namespace llaminar2
         // For LM_HEAD with multi-device TP, return the gathered combined_logits
         // This is necessary because each device only has logits_local with vocab_local entries,
         // but tests expect the full vocab_size logits.
+        //
+        // CRITICAL: For hybrid PP+TP, only the stage that actually HAS the LM head should
+        // return combined_logits. Otherwise, a nested TP stage (like PP stage 0) that has
+        // logits_local buffers allocated but never computes LM_HEAD would return stale data.
         if (key == "LM_HEAD" && device_runners_.size() > 1 && combined_logits_ && tp_ctx_)
         {
-            // Check if we have column-parallel LM head
-            bool has_column_parallel_lm_head = false;
-            for (const auto &runner : device_runners_)
+            // First, verify this stage actually owns the LM_HEAD
+            auto wm = model_ctx_->weightManager();
+            if (!wm || !wm->hasLMHead())
             {
-                if (runner)
+                LOG_DEBUG("MultiDeviceOrchestrator::getSnapshot LM_HEAD: this stage doesn't own LM_HEAD, "
+                          << "falling through to PP stage search (hasLMHead=" << (wm ? wm->hasLMHead() : false) << ")");
+                // Fall through to PP stage search or return nullptr
+            }
+            else
+            {
+                // Check if we have column-parallel LM head
+                bool has_column_parallel_lm_head = false;
+                for (const auto &runner : device_runners_)
                 {
-                    const auto &state = runner->inferenceState();
-                    if (state.logits_local)
+                    if (runner)
                     {
-                        has_column_parallel_lm_head = true;
-                        break;
+                        const auto &state = runner->inferenceState();
+                        if (state.logits_local)
+                        {
+                            has_column_parallel_lm_head = true;
+                            break;
+                        }
                     }
                 }
-            }
 
-            if (has_column_parallel_lm_head)
-            {
-                // Return the combined logits which have full vocab_size
-                // Use the actual gathered size from last gatherLogits() call,
-                // NOT the buffer capacity (which is pre-allocated for max_seq_len)
-                out_size = last_gathered_logits_size_;
-                const float *ptr = combined_logits_->data();
-                LOG_DEBUG("MultiDeviceOrchestrator::getSnapshot LM_HEAD returning combined_logits with "
-                          << out_size << " elements (column-parallel gathering), ptr=" << (void *)ptr
-                          << " first_element=" << (ptr ? ptr[0] : -999999.0f));
-                return ptr;
+                if (has_column_parallel_lm_head)
+                {
+                    // Return the combined logits which have full vocab_size
+                    // Use the actual gathered size from last gatherLogits() call,
+                    // NOT the buffer capacity (which is pre-allocated for max_seq_len)
+                    out_size = last_gathered_logits_size_;
+                    const float *ptr = combined_logits_->data();
+                    LOG_DEBUG("MultiDeviceOrchestrator::getSnapshot LM_HEAD returning combined_logits with "
+                              << out_size << " elements (column-parallel gathering), ptr=" << (void *)ptr
+                              << " first_element=" << (ptr ? ptr[0] : -999999.0f));
+                    return ptr;
+                }
             }
         }
 
@@ -1841,6 +1919,72 @@ namespace llaminar2
                                                                  << " mode=" << shardingModeToString(result.mode)
                                                                  << " tp_degree=" << result.tp_degree);
 
+        // =========================================================================
+        // PP Mode: Delegate to appropriate PP stage runner
+        // For PP+TP hybrid, each PP stage runner may be an MDO for TP
+        // =========================================================================
+        if (!pp_stage_runners_.empty())
+        {
+            // Find which PP stage owns this snapshot key
+            for (size_t stage_idx = 0; stage_idx < pp_stage_runners_.size(); ++stage_idx)
+            {
+                if (!pp_stage_runners_[stage_idx])
+                    continue;
+
+                // Check if this stage has the snapshot
+                size_t temp_size = 0;
+                const float *temp_data = pp_stage_runners_[stage_idx]->getSnapshot(key, temp_size);
+                if (!temp_data || temp_size == 0)
+                    continue;
+
+                // Found the owning stage - check if it's a TP domain (MultiDeviceOrchestrator)
+                auto *inner_mdo = dynamic_cast<const MultiDeviceOrchestrator *>(
+                    pp_stage_runners_[stage_idx].get());
+
+                if (inner_mdo)
+                {
+                    // This PP stage is a TP domain - delegate to its getTPSnapshot
+                    LOG_DEBUG("MultiDeviceOrchestrator::getTPSnapshot: PP stage " << stage_idx
+                                                                                  << " is TP domain, delegating getTPSnapshot for key=" << key);
+                    return inner_mdo->getTPSnapshot(key);
+                }
+                else
+                {
+                    // Single-device PP stage - wrap the snapshot as non-TP
+                    LOG_DEBUG("MultiDeviceOrchestrator::getTPSnapshot: PP stage " << stage_idx
+                                                                                  << " is single device for key=" << key);
+
+                    result.tp_degree = 1;
+                    result.mode = SnapshotShardingMode::REPLICATED;
+
+                    DeviceSnapshotData dev_data;
+                    dev_data.device_index = 0;
+                    dev_data.rows = 1;
+                    dev_data.cols = temp_size;
+                    dev_data.global_start_col = 0;
+                    dev_data.global_total_cols = temp_size;
+                    dev_data.data.assign(temp_data, temp_data + temp_size);
+
+                    result.device_data.push_back(std::move(dev_data));
+                    result.combined_valid = true;
+                    result.combined_data = result.device_data[0].data;
+                    result.combined_rows = 1;
+                    result.combined_cols = temp_size;
+
+                    return result;
+                }
+            }
+
+            // Key not found in any PP stage
+            LOG_DEBUG("MultiDeviceOrchestrator::getTPSnapshot: key=" << key
+                                                                     << " not found in any PP stage");
+            return result;
+        }
+
+        // =========================================================================
+        // TP Mode (non-PP): Collect from device_runners_
+        // =========================================================================
+
         // Special case: LM_HEAD with combined_logits_ already gathered
         if (key == "LM_HEAD" && device_runners_.size() > 1 && combined_logits_ && tp_ctx_)
         {
@@ -1899,6 +2043,12 @@ namespace llaminar2
                                                                             << " has no data for key=" << key);
                 continue;
             }
+
+            // Debug: log data pointer and first 4 values to verify each device has different data
+            LOG_INFO("MultiDeviceOrchestrator::getTPSnapshot: device " << i
+                                                                       << " key=" << key << " ptr=" << static_cast<const void *>(data)
+                                                                       << " size=" << size
+                                                                       << " val[0-3]=" << data[0] << "," << data[1] << "," << data[2] << "," << data[3]);
 
             DeviceSnapshotData dev_data;
             // Use device type from config if available, otherwise default to CUDA

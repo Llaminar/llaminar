@@ -202,6 +202,23 @@ static const std::vector<TestConfig> kTestConfigs = {
     // Hybrid: LOCAL PP of LOCAL TP domains
     // =========================================================================
     // These tests combine PP (layer split) with TP (weight shard) within stages.
+    // E.g., Stage 0 = TP(2xCUDA), Stage 1 = ROCm
+    {
+        .name = "LocalPP_TP2xCUDA_ROCm",
+        .devices = {ParityDeviceType::CUDA, ParityDeviceType::CUDA, ParityDeviceType::ROCm},
+        .parallelism = Parallelism::LocalPP, // PP between TP domain and ROCm
+        .collective = Collective::PCIeBAR,   // Cross-vendor transfer between stages
+        .thresholds = {
+            .cosine_threshold = 0.85f,
+            .decode_cosine_threshold = 0.80f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.50f,                // Relaxed - combined TP+PP adds variance
+            .excluded_stages = kTPExcludedStages, // TP excluded stages apply to stage 0
+        },
+        .pp_stage_sizes = {2, 1},          // Stage 0: 2 devices (TP), Stage 1: 1 device
+        .tp_collective = Collective::NCCL, // TP collective within stage 0 (CUDA-CUDA)
+    },
     // E.g., Stage 0 = TP(2xROCm), Stage 1 = single CUDA
     {
         .name = "LocalPP_TP2xROCm_CUDA",
@@ -257,7 +274,14 @@ public:
 
 TEST_P(Qwen2ParityMatrixTest, PrefillParity)
 {
-    if (cfg().is_local_pp())
+    if (cfg().is_hybrid_pp_tp())
+    {
+        // Hybrid PP+TP: setup PP pipeline with nested TP domains, use TP parity comparison
+        ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
+        auto summary = runTPPrefillParity();
+        assertTPParity(summary);
+    }
+    else if (cfg().is_local_pp())
     {
         // LocalPP parity test - setup PP pipeline, then run parity (don't overwrite runner_)
         ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
@@ -279,7 +303,14 @@ TEST_P(Qwen2ParityMatrixTest, PrefillParity)
 
 TEST_P(Qwen2ParityMatrixTest, DecodeParity)
 {
-    if (cfg().is_local_pp())
+    if (cfg().is_hybrid_pp_tp())
+    {
+        // Hybrid PP+TP: setup PP pipeline with nested TP domains, use TP decode parity comparison
+        ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
+        auto summary = runTPDecodeParity();
+        assertDecodeParity(summary);
+    }
+    else if (cfg().is_local_pp())
     {
         // LocalPP decode parity test - setup PP pipeline, then run parity
         ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";

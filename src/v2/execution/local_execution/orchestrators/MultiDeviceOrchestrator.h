@@ -51,6 +51,7 @@
 #include "../../../collective/ILocalPPContext.h"
 #include "../../config/RuntimeConfig.h"
 #include "../../debug/TPSnapshot.h"
+#include "../../factory/FactoryPPStageConfig.h" // For FactoryPPStageConfig (circular-dependency-safe)
 #include <memory>
 #include <vector>
 #include <string>
@@ -207,6 +208,15 @@ namespace llaminar2
             /// When enabled, hidden state tensors are allocated in BAR region
             /// so that CUDA can access them for P2P transfers.
             bool use_bar_backed_hidden = false;
+
+            // =================================================================
+            // Nested TP-in-PP Configuration
+            // =================================================================
+
+            /// For TP domains that are part of a PP stage, this holds the PP stage config.
+            /// When set, the TP device runners will build partial graphs instead of full graphs.
+            /// Set by the parent MDO when creating a nested TP MDO for a PP stage.
+            std::optional<FactoryPPStageConfig> nested_pp_stage_config;
 
             // =================================================================
             // Helper Methods

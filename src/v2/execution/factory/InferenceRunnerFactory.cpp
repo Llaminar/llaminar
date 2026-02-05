@@ -1349,6 +1349,8 @@ namespace llaminar2
         Qwen2GraphConfig graph_config;
         graph_config.vocab_size = static_cast<int>(model.vocab_size);
         graph_config.d_model = static_cast<int>(model.embedding_length);
+        // For PP stages: n_layers is the FULL model layer count (needed for layer range validation)
+        // The actual layer count for this stage is in pp_config.layerCount()
         graph_config.n_layers = static_cast<int>(model.block_count);
         graph_config.n_heads = static_cast<int>(model.head_count);
         graph_config.n_kv_heads = static_cast<int>(model.head_count_kv);
@@ -1376,6 +1378,11 @@ namespace llaminar2
         // Propagate kv_cache_scale
         graph_config.kv_cache_scale = config.kv_cache_scale;
 
+        // PP layer offset for KV cache indexing:
+        // When building graphs for PP stage [first_layer, last_layer), this offset
+        // is subtracted from global layer index to get local KV cache index.
+        graph_config.pp_layer_offset = pp_config.first_layer;
+
         // Note: For PP stages, n_layers stays at full model count in the config.
         // The stage only executes pp_config.layerCount() layers, but the graph
         // config represents the full model architecture. The stage runner knows
@@ -1383,7 +1390,8 @@ namespace llaminar2
 
         LOG_DEBUG("[PPStageRunner] GraphConfig: n_layers=" << graph_config.n_layers
                                                            << " (PP stage owns layers ["
-                                                           << pp_config.first_layer << ", " << pp_config.last_layer << "))");
+                                                           << pp_config.first_layer << ", " << pp_config.last_layer << "))"
+                                                           << " pp_layer_offset=" << graph_config.pp_layer_offset);
 
         // =====================================================================
         // Get d_ff from metadata

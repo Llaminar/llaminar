@@ -1674,7 +1674,8 @@ namespace llaminar2
 
                 kv_append_params.V = buffers.V;
                 kv_append_params.kv_cache = kv_cache;
-                kv_append_params.layer_idx = layer_idx;
+                // For PP stages: map global layer index to local KV cache index
+                kv_append_params.layer_idx = layer_idx - config_.pp_layer_offset;
                 kv_append_params.seq_idx = 0; // Starting seq_idx
                 kv_append_params.num_tokens = total_tokens;
                 kv_append_params.batch_size = batch_size; // Phase 3: Per-sequence append
@@ -1784,7 +1785,8 @@ namespace llaminar2
             {
                 KVCacheGatherStage::Params gather_params;
                 gather_params.kv_cache = kv_cache;
-                gather_params.layer_idx = layer_idx;
+                // For PP stages: map global layer index to local KV cache index
+                gather_params.layer_idx = layer_idx - config_.pp_layer_offset;
                 gather_params.batch_size = batch_size;
                 gather_params.out_K = buffers.gathered_K;
                 gather_params.out_V = buffers.gathered_V;
@@ -1881,7 +1883,8 @@ namespace llaminar2
                 fused_params.position_offset = position_ids ? position_ids[0] : 0;
                 fused_params.backend = config_.fused_attention_backend; // Use configured backend
                 fused_params.kv_cache = kv_cache;
-                fused_params.layer_idx = layer_idx;
+                // For PP stages: map global layer index to local KV cache index
+                fused_params.layer_idx = layer_idx - config_.pp_layer_offset;
                 fused_params.mpi_ctx = mpi_ctx_.get();
                 fused_params.device_id = device;
 
@@ -1971,7 +1974,8 @@ namespace llaminar2
                     attn_params.workspace_context = buffers.workspace_context;
                     attn_params.workspace_mask = buffers.workspace_mask;
                     attn_params.kv_cache = kv_cache; // Pass for dynamic kv_len query at execution
-                    attn_params.layer_idx = layer_idx;
+                    // For PP stages: map global layer index to local KV cache index
+                    attn_params.layer_idx = layer_idx - config_.pp_layer_offset;
                     attn_params.position_offset = position_ids ? position_ids[0] : 0;
                     attn_params.mpi_ctx = mpi_ctx_.get();
                     attn_params.device_id = device;

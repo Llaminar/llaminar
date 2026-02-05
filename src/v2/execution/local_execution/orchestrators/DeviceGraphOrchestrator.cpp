@@ -1346,7 +1346,10 @@ namespace llaminar2
         const auto &config = graph_builder_->config();
         int d_model = config.d_model;
         int vocab_size = config.vocab_size;
-        int n_layers = config.n_layers;
+        // For PP stages, use the stage's layer count (not full model) for KV cache allocation
+        int n_layers = pp_stage_config_.has_value()
+                           ? pp_stage_config_.value().layerCount()
+                           : config.n_layers;
         int n_heads = config.n_heads;
         int n_kv_heads = config.n_kv_heads;
         int head_dim = config.head_dim;
@@ -1462,13 +1465,15 @@ namespace llaminar2
         // state in PCIe BAR memory. This enables zero-copy reads from CUDA devices
         // during PP activation transfer (ROCm stage → CUDA stage).
         // =========================================================================
-        if (init_config.use_bar_backed_hidden && device.is_rocm() && factory.canCreateBARBacked())
+        if (init_config.use_bar_backed_hidden && device.is_rocm())
         {
-            // Find the CUDA device in the system for BAR-backed allocation
-            // The DirectP2PEngine singleton should have been initialized with the CUDA device
+            // Get DirectP2PEngine for BAR allocation (may be shared singleton)
             auto p2p = DirectP2PEngine::getSharedInstance();
             if (p2p && p2p->isPCIeBarActive())
             {
+                // Set P2P on factory so it can create BAR-backed tensors
+                factory.setDirectP2P(p2p);
+
                 // Use cuda:0 as the default CUDA device for BAR allocation
                 // In typical cross-vendor PP setups, there's usually one CUDA device
                 DeviceId cuda_device_for_bar = DeviceId::cuda(0);

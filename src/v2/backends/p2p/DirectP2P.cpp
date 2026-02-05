@@ -282,6 +282,10 @@ namespace llaminar2
         std::vector<PCIeBarInfo> mapped_bars;          // All mapped AMD GPU BARs
         std::map<int, size_t> rocm_ordinal_to_bar_idx; // Map ordinal to bar index
 
+        // Bump allocator for BAR region - tracks next allocation offset
+        size_t bar_alloc_offset = 0; // Current allocation offset within BAR
+        std::mutex bar_alloc_mutex;  // Thread-safe bump allocation
+
         // CUDA context (retained)
         CUcontext cuda_ctx = nullptr;
         CUdevice cu_device = 0;
@@ -697,6 +701,39 @@ namespace llaminar2
     void *DirectP2PEngine::getBarHostPtr() const
     {
         return impl_->bar_info.mapped_ptr;
+    }
+
+    std::optional<std::pair<void *, void *>> DirectP2PEngine::allocateInBar(size_t size, size_t alignment)
+    {
+        if (!impl_ || !impl_->bar_mapped)
+        {
+            return std::nullopt;
+        }
+
+        std::lock_guard<std::mutex> lock(impl_->bar_alloc_mutex);
+
+        // Align the current offset
+        size_t aligned_offset = (impl_->bar_alloc_offset + alignment - 1) & ~(alignment - 1);
+
+        // Check if we have enough space
+        if (aligned_offset + size > impl_->bar_info.mapped_size)
+        {
+            LOG_ERROR("BAR allocation failed: requested " << size << " bytes at offset "
+                                                          << aligned_offset << " exceeds mapped size " << impl_->bar_info.mapped_size);
+            return std::nullopt;
+        }
+
+        // Calculate pointers at the allocated offset
+        void *rocm_ptr = static_cast<char *>(impl_->bar_info.mapped_ptr) + aligned_offset;
+        void *cuda_ptr = reinterpret_cast<void *>(impl_->cuda_bar_ptr + aligned_offset);
+
+        // Bump the allocation offset
+        impl_->bar_alloc_offset = aligned_offset + size;
+
+        LOG_DEBUG("BAR allocation: " << size << " bytes at offset " << aligned_offset
+                                     << " (rocm=" << rocm_ptr << ", cuda=" << cuda_ptr << ")");
+
+        return std::make_pair(rocm_ptr, cuda_ptr);
     }
 
     size_t DirectP2PEngine::getBarOffset() const

@@ -4831,6 +4831,21 @@ add_v2_test(V2_Unit_MultiDeviceOrchestrator_NestedTP
     MPI_PROCS 1
 )
 
+# Test: MultiDeviceOrchestrator getSnapshot in PP+TP mode (ownership-aware LM_HEAD retrieval)
+# Tests that getSnapshot("LM_HEAD") respects hasLMHead() ownership in hybrid PP+TP mode.
+# Bug Caught: Stage 0 returned stale combined_logits_ even though it didn't own LM_HEAD.
+# Root Cause: Missing hasLMHead() check before returning combined_logits_.
+add_executable(v2_test_multi_device_orchestrator_get_snapshot_pptp unit/orchestrators/Test__MultiDeviceOrchestrator_GetSnapshotPPTP.cpp)
+target_include_directories(v2_test_multi_device_orchestrator_get_snapshot_pptp PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_test_multi_device_orchestrator_get_snapshot_pptp llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MultiDeviceOrchestrator_GetSnapshotPPTP
+    COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator_get_snapshot_pptp>
+    LABELS "V2;Unit;LocalPP;MultiDevice;IMultiDeviceOrchestrator;PipelineParallelism;TP_PP;Snapshot;LMHead"
+    MPI_PROCS 1
+)
+
 # Test: MultiDeviceOrchestrator PP Integration (Pipeline Parallelism end-to-end)
 # Tests PP mode construction, forward execution, and parity with single-device mode.
 # Phase 2 of MultiDeviceOrchestrator PP support implementation.

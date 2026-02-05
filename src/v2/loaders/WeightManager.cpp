@@ -1317,11 +1317,15 @@ namespace llaminar2
         // =======================================================================
         // LOCAL TP support: Check TensorParallelConfig FIRST for device-specific slicing
         // =======================================================================
-        // When tp_config_ is set and we're using SHARDED strategy, each device gets
-        // a DIFFERENT slice of the weights based on its DeviceShardingAssignment.
-        // This is different from the original code path which gave all devices the
-        // same sharded weight (bug for LOCAL TP with world_size == 1).
-        if (tp_config_ && strategy_ == WeightDistributionStrategy::SHARDED)
+        // When tp_config_ is set, each device gets a DIFFERENT slice of the weights
+        // based on its DeviceShardingAssignment. This applies regardless of the
+        // distribution strategy (SHARDED, REPLICATED, or LAYER_PARTITIONED).
+        //
+        // For hybrid PP+TP mode:
+        // - The PP stage context uses LAYER_PARTITIONED strategy for layer filtering
+        // - But the nested MDO still needs TP column-parallel slicing within those layers
+        // - So we check tp_config_ alone, not strategy_
+        if (tp_config_)
         {
             try
             {
@@ -1371,6 +1375,9 @@ namespace llaminar2
             switch (strategy_)
             {
             case WeightDistributionStrategy::REPLICATED:
+            case WeightDistributionStrategy::LAYER_PARTITIONED:
+                // LAYER_PARTITIONED uses same loading as REPLICATED, but getWeight()
+                // filters which weights are allowed based on layer range
                 tensor = getReplicatedWeight(name, target_device);
                 break;
             case WeightDistributionStrategy::SHARDED:
