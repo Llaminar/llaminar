@@ -564,6 +564,72 @@ namespace llaminar2
         return -1; // Not found
     }
 
+    bool DeviceManager::deviceExists(const DeviceId &device) const
+    {
+        if (!device.is_valid())
+        {
+            return false;
+        }
+
+        if (device.is_cpu())
+        {
+            // CPU is always available
+            return true;
+        }
+
+        // Map DeviceId type to ComputeBackendType
+        ComputeBackendType backend_type;
+        switch (device.type)
+        {
+        case DeviceType::CUDA:
+            backend_type = ComputeBackendType::GPU_CUDA;
+            break;
+        case DeviceType::ROCm:
+            backend_type = ComputeBackendType::GPU_ROCM;
+            break;
+        default:
+            return false;
+        }
+
+        return find_device(backend_type, device.ordinal) >= 0;
+    }
+
+    std::string DeviceManager::availableDevicesString() const
+    {
+        std::string result;
+        for (const auto &dev : devices_)
+        {
+            if (!result.empty())
+            {
+                result += ", ";
+            }
+            switch (dev.type)
+            {
+            case ComputeBackendType::CPU:
+                result += "CPU";
+                break;
+            case ComputeBackendType::GPU_CUDA:
+                result += "CUDA:" + std::to_string(dev.device_id);
+                if (!dev.name.empty())
+                {
+                    result += " (" + dev.name + ")";
+                }
+                break;
+            case ComputeBackendType::GPU_ROCM:
+                result += "ROCm:" + std::to_string(dev.device_id);
+                if (!dev.name.empty())
+                {
+                    result += " (" + dev.name + ")";
+                }
+                break;
+            default:
+                result += "Unknown:" + std::to_string(dev.device_id);
+                break;
+            }
+        }
+        return result.empty() ? "(none)" : result;
+    }
+
     size_t DeviceManager::select_device(size_t estimated_memory_bytes)
     {
         // NOTE: This method selects a PRIMARY device for legacy single-device code paths.

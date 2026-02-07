@@ -83,11 +83,16 @@
 #include "kernels/SlabGemmConfig.h"
 #include "utils/Logger.h"
 #include "utils/KernelProfiler.h"
+#include "utils/DebugEnv.h"
 
 #include <stdexcept>
 #include <vector>
 #include <cmath>
 #include <algorithm>
+
+#ifdef HAVE_ROCM
+#include <hip/hip_runtime.h>
+#endif
 #include <cstring>
 #include <chrono>
 
@@ -230,6 +235,74 @@ namespace llaminar2
                 const float *d_bias, // [N] bias vector
                 int M, int N,
                 int rocm_device_id);
+
+            // =========================================================================
+            // GEMV kernel for decode (M=1) - bypasses CK INT8 GEMM entirely
+            // Defined in ROCmGemvKernel.hip
+            // =========================================================================
+
+            // Direct FP32×INT8 GEMV: output[N] = A[K] × B[K×N] × scale_B[N]
+            bool rocmGemv_int8_fp32(
+                const float *d_A,       // [K] FP32 activation vector
+                const int8_t *d_B,      // [K × N] INT8 weights, row-major
+                const float *d_scale_B, // [N] per-column weight scales
+                float *d_C,             // [N] FP32 output vector
+                int N, int K,
+                int device_id);
+
+            // Direct FP16 GEMV: output[N] = A[K] × B[K×N] × scale_B[N]
+            bool rocmGemv_int8_fp16(
+                const float *d_A,       // [K] FP32 activation vector
+                const int8_t *d_B,      // [K × N] INT8 weights, row-major
+                const float *d_scale_B, // [N] per-column weight scales
+                float *d_C,             // [N] FP32 output vector
+                int N, int K,
+                int device_id);
+
+            // Direct FP32×INT8 GEMV with fused bias: output[N] = A[K] × B[K×N] × scale_B[N] + bias[N]
+            bool rocmGemv_int8_fp32_bias(
+                const float *d_A,       // [K] FP32 activation vector
+                const int8_t *d_B,      // [K × N] INT8 weights, row-major
+                const float *d_scale_B, // [N] per-column weight scales
+                const float *d_bias,    // [N] bias vector
+                float *d_C,             // [N] FP32 output vector
+                int N, int K,
+                int device_id);
+
+            // Direct FP16 GEMV with fused bias
+            bool rocmGemv_int8_fp16_bias(
+                const float *d_A,       // [K] FP32 activation vector
+                const int8_t *d_B,      // [K × N] INT8 weights, row-major
+                const float *d_scale_B, // [N] per-column weight scales
+                const float *d_bias,    // [N] bias vector
+                float *d_C,             // [N] FP32 output vector
+                int N, int K,
+                int device_id);
+
+            // INT8×INT8 GEMV: output_int32[N] = A_int8[K] × B_int8[K×N]
+            bool rocmGemv_int8_int8_int32(
+                const int8_t *d_A_int8, // [K] INT8 activation vector
+                const int8_t *d_B_int8, // [K × N] INT8 weights, row-major
+                int32_t *d_C_int32,     // [N] INT32 output vector
+                int N, int K,
+                int device_id);
+
+            // INT8×INT8 GEMV with VNNI-packed weights: B is [K/4 × N × 4]
+            bool rocmGemv_int8_int8_int32_vnni(
+                const int8_t *d_A_int8,      // [K] INT8 activation vector
+                const int8_t *d_B_int8_vnni, // [K/4 × N × 4] VNNI-packed weights
+                int32_t *d_C_int32,          // [N] INT32 output vector
+                int N, int K,
+                int device_id);
+
+            // Repack VNNI [K/4][N][4] → row-major [N×K] into scratch buffer
+            // Used for CK GEMM prefill and legacy fp16/fp32 GEMV modes.
+            // Cost: ~65-200μs for 18944×3584 (amortized over prefill).
+            bool rocmGemv_repackVNNI_to_rowmajor(
+                const int8_t *d_B_vnni, // [K/4][N][4] VNNI input
+                int8_t *d_B_rowmajor,   // [N×K] row-major output (scratch buffer)
+                int N, int K,
+                int device_id);
         }
 
         // =====================================================================
@@ -285,8 +358,10 @@ namespace llaminar2
         struct ROCmQuantisedGemmKernel::Impl
         {
             // Device memory for converted weights (only used when owns_weight_memory_ = true)
-            int8_t *d_weights_int8 = nullptr; // [K x N] ColumnMajor
-            float *d_scales_B = nullptr;      // [N] per-column scales
+            // Option B: Only VNNI layout is persistent on device. Row-major is repacked
+            // on-demand from VNNI into d_B_rowmajor_scratch (workspace buffer).
+            int8_t *d_weights_int8_vnni = nullptr; // [K/4 x N x 4] VNNI layout (sole device copy)
+            float *d_scales_B = nullptr;           // [N] per-column scales
 
             // Work buffer pointers - obtained from workspace at execution time
             // These are NOT owned by the kernel - they point into workspace-managed memory
@@ -301,6 +376,9 @@ namespace llaminar2
             int8_t *d_A_padded = nullptr;      // [padded_m x K] padded activations
             float *d_scale_A_padded = nullptr; // [padded_m] padded scales
             float *d_E_padded = nullptr;       // [padded_m x N] padded output
+
+            // Option B: shared scratch buffer for VNNI→row-major repacking (from workspace)
+            int8_t *d_B_rowmajor_scratch = nullptr; // [N x K] temporary row-major weights
 
             // Capacity tracking for workspace buffers (set during validateWorkspace)
             size_t d_CK_int32_capacity = 0;
@@ -321,12 +399,13 @@ namespace llaminar2
                 // Only free weight memory if we own it (not from ROCmPackedWeights cache)
                 if (owns_weight_memory)
                 {
-                    if (d_weights_int8)
-                        rocmQuantGemm_freeDevice(d_weights_int8, rocm_device_id);
+                    if (d_weights_int8_vnni)
+                        rocmQuantGemm_freeDevice(d_weights_int8_vnni, rocm_device_id);
                     if (d_scales_B)
                         rocmQuantGemm_freeDevice(d_scales_B, rocm_device_id);
                 }
-                // Work buffers are NOT freed - they are owned by workspace
+                // Work buffers (including d_B_rowmajor_scratch) are NOT freed -
+                // they are owned by workspace
             }
         };
 
@@ -336,15 +415,15 @@ namespace llaminar2
 
         ROCmPackedWeights::~ROCmPackedWeights()
         {
-            if (d_int8_data || d_scales)
+            if (d_int8_data_vnni || d_scales)
             {
                 LOG_TRACE("[ROCmPackedWeights::~] Freeing device memory: "
-                          << "d_int8_data=" << (void *)d_int8_data
+                          << "d_int8_data_vnni=" << (void *)d_int8_data_vnni
                           << " d_scales=" << (void *)d_scales
                           << " rocm_device_id=" << rocm_device_id);
             }
-            if (d_int8_data)
-                rocmQuantGemm_freeDevice(d_int8_data, rocm_device_id);
+            if (d_int8_data_vnni)
+                rocmQuantGemm_freeDevice(d_int8_data_vnni, rocm_device_id);
             if (d_scales)
                 rocmQuantGemm_freeDevice(d_scales, rocm_device_id);
         }
@@ -445,7 +524,29 @@ namespace llaminar2
                 }
             }
 
-            LOG_DEBUG("[packWeightsToROCm] Packed " << N << "x" << K << " weights to INT8 (mk_nk_mn layout)");
+            // Optional VNNI layout: [K/4][N][4] for GEMV experimentation
+            out.int8_data_vnni.clear();
+            if ((K % 4) == 0)
+            {
+                const size_t k_groups = static_cast<size_t>(K) / 4;
+                out.int8_data_vnni.resize(k_groups * static_cast<size_t>(N) * 4);
+                for (int n = 0; n < N; ++n)
+                {
+                    const size_t row_base = static_cast<size_t>(n) * K;
+                    for (size_t kg = 0; kg < k_groups; ++kg)
+                    {
+                        const size_t src = row_base + kg * 4;
+                        const size_t dst = (kg * static_cast<size_t>(N) + static_cast<size_t>(n)) * 4;
+                        out.int8_data_vnni[dst + 0] = out.int8_data[src + 0];
+                        out.int8_data_vnni[dst + 1] = out.int8_data[src + 1];
+                        out.int8_data_vnni[dst + 2] = out.int8_data[src + 2];
+                        out.int8_data_vnni[dst + 3] = out.int8_data[src + 3];
+                    }
+                }
+            }
+
+            LOG_DEBUG("[packWeightsToROCm] Packed " << N << "x" << K << " weights to INT8 (mk_nk_mn layout)"
+                                                    << (out.int8_data_vnni.empty() ? "" : " + VNNI"));
             return true;
         }
 
@@ -661,7 +762,191 @@ namespace llaminar2
             auto phase_start = std::chrono::high_resolution_clock::now();
             auto phase_end = phase_start;
 
-            // Fast path: if bias is present and we're on GPU, use multiply_fp32_to_fp32_with_bias
+            if (use_gpu_path)
+            {
+                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using GPU-to-GPU path (d_input="
+                          << d_input << ", d_output=" << d_output << ")");
+            }
+
+            // =========================================================================
+            // DECODE FAST PATH: M=1 GEMV (skips activation quantization + CK GEMM)
+            //
+            // For M=1 (single-token decode), the CK INT8 GEMM is catastrophically
+            // inefficient (2.4 TFLOPS = 8% of MI60 peak) because decode is
+            // bandwidth-bound, not compute-bound. Our custom GEMV kernel reads
+            // INT8 weights directly and multiplies with FP32 activations,
+            // eliminating:
+            //   1. FP32→INT8 activation quantization kernel
+            //   2. M-padding (hipMemset + hipMemcpy)
+            //   3. CK 32×32 tile overhead (wastes 31 of 32 rows)
+            //   4. INT32→FP32 scale application kernel
+            //
+            // Handles optional bias in a single fused kernel launch.
+            // =========================================================================
+            if (use_gpu_path && m == 1)
+            {
+                const auto &env = debugEnv();
+                const std::string &gemv_mode = env.rocm.gemv_mode;
+
+                // Ensure weights are on device
+                ensureWeightsConverted();
+
+                // Option B: weights are stored as VNNI only on device
+                int8_t *d_weights_vnni = impl_ ? impl_->d_weights_int8_vnni : nullptr;
+                float *d_scales_B = nullptr;
+                if (packed_)
+                {
+                    d_scales_B = packed_->d_scales;
+                }
+                else if (impl_)
+                {
+                    d_scales_B = impl_->d_scales_B;
+                }
+
+                if (d_weights_vnni && d_scales_B)
+                {
+                    // Resolve bias device pointer if present
+                    const float *d_bias = nullptr;
+                    if (bias)
+                    {
+                        if (bias->isBARBacked())
+                            d_bias = static_cast<const float *>(bias->rocm_data_ptr());
+                        else
+                            d_bias = static_cast<const float *>(bias->gpu_data_ptr());
+                    }
+
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] GEMV fast path M=1 N=" << n << " K=" << k
+                                                                                                 << " mode=" << gemv_mode << (d_bias ? " +bias" : ""));
+
+                    bool result = false;
+                    if (gemv_mode == "fp16")
+                    {
+                        // fp16 GEMV needs row-major weights — repack from VNNI into scratch
+                        if (!impl_)
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] FP16 GEMV requires impl_ buffers");
+                            return false;
+                        }
+                        validateWorkspace();
+                        if (!rocmGemv_repackVNNI_to_rowmajor(
+                                d_weights_vnni, impl_->d_B_rowmajor_scratch,
+                                n, k, rocm_device_id_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] FP16 GEMV: VNNI→row-major repack failed");
+                            return false;
+                        }
+                        if (d_bias)
+                        {
+                            result = rocmGemv_int8_fp16_bias(
+                                d_input, impl_->d_B_rowmajor_scratch, d_scales_B, d_bias,
+                                d_output, n, k, rocm_device_id_);
+                        }
+                        else
+                        {
+                            result = rocmGemv_int8_fp16(
+                                d_input, impl_->d_B_rowmajor_scratch, d_scales_B,
+                                d_output, n, k, rocm_device_id_);
+                        }
+                    }
+                    else if (gemv_mode == "int8")
+                    {
+                        if (!impl_)
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV requires impl_ buffers");
+                            return false;
+                        }
+
+                        validateWorkspace();
+                        if (!rocmQuantGemm_quantizeActivations(
+                                d_input, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Activation quantization failed");
+                            return false;
+                        }
+
+                        const bool use_vnni = (env.rocm.gemv_layout == "vnni") &&
+                                              (d_weights_vnni != nullptr) &&
+                                              ((k % 4) == 0);
+
+                        if (use_vnni)
+                        {
+                            // Hot path: flat VNNI GEMV (no repack needed)
+                            if (!rocmGemv_int8_int8_int32_vnni(
+                                    impl_->d_A_int8, d_weights_vnni, impl_->d_C_int32,
+                                    n, k, rocm_device_id_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV (VNNI) failed");
+                                return false;
+                            }
+                        }
+                        else
+                        {
+                            // Fallback: repack VNNI→row-major for non-VNNI int8 GEMV
+                            if (!rocmGemv_repackVNNI_to_rowmajor(
+                                    d_weights_vnni, impl_->d_B_rowmajor_scratch,
+                                    n, k, rocm_device_id_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV fallback: VNNI→row-major repack failed");
+                                return false;
+                            }
+                            if (!rocmGemv_int8_int8_int32(
+                                    impl_->d_A_int8, impl_->d_B_rowmajor_scratch, impl_->d_C_int32,
+                                    n, k, rocm_device_id_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV failed");
+                                return false;
+                            }
+                        }
+
+                        const float *d_existing = (beta != 0.0f) ? d_output : nullptr;
+                        if (!rocmQuantGemm_applyScaling(
+                                impl_->d_C_int32, d_output, impl_->d_scales_A, d_scales_B,
+                                m, n, alpha, beta, d_existing, d_bias, rocm_device_id_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV scaling failed");
+                            return false;
+                        }
+
+                        result = true;
+                    }
+                    else
+                    {
+                        // fp32 GEMV needs row-major weights — repack from VNNI into scratch
+                        if (!impl_)
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] FP32 GEMV requires impl_ buffers");
+                            return false;
+                        }
+                        validateWorkspace();
+                        if (!rocmGemv_repackVNNI_to_rowmajor(
+                                d_weights_vnni, impl_->d_B_rowmajor_scratch,
+                                n, k, rocm_device_id_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] FP32 GEMV: VNNI→row-major repack failed");
+                            return false;
+                        }
+                        if (d_bias)
+                        {
+                            result = rocmGemv_int8_fp32_bias(
+                                d_input, impl_->d_B_rowmajor_scratch, d_scales_B, d_bias,
+                                d_output, n, k, rocm_device_id_);
+                        }
+                        else
+                        {
+                            result = rocmGemv_int8_fp32(
+                                d_input, impl_->d_B_rowmajor_scratch, d_scales_B,
+                                d_output, n, k, rocm_device_id_);
+                        }
+                    }
+
+                    if (ws && ws != saved_workspace)
+                        workspace_ = saved_workspace;
+                    return result;
+                }
+                // Fall through to CK path if weight pointers unavailable
+            }
+
+            // CK path: if bias is present and we're on GPU, use multiply_fp32_to_fp32_with_bias
             if (bias && use_gpu_path)
             {
                 // Get bias device pointer - check BAR-backed status
@@ -677,22 +962,15 @@ namespace llaminar2
 
                 if (d_bias)
                 {
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using bias path (d_input="
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using CK bias path (d_input="
                               << d_input << ", d_output=" << d_output << ", d_bias=" << d_bias << ")");
                     bool result = multiply_fp32_to_fp32_with_bias(d_input, d_output, d_bias, m, n, k, alpha, beta);
-                    // Restore original workspace binding
                     if (ws && ws != saved_workspace)
                     {
                         workspace_ = saved_workspace;
                     }
                     return result;
                 }
-            }
-
-            if (use_gpu_path)
-            {
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using GPU-to-GPU path (d_input="
-                          << d_input << ", d_output=" << d_output << ")");
             }
 
             // Ensure weights are uploaded to device
@@ -704,35 +982,58 @@ namespace llaminar2
                 LOG_TRACE("[ROCmGEMM::PHASES] ensureWeightsConverted: " << weights_ms << "ms");
 
             // Get weight device pointers
-            int8_t *d_weights_int8 = nullptr;
+            // Option B: weights are stored as VNNI only. For CK GEMM (needs row-major),
+            // we repack VNNI→row-major into a shared workspace scratch buffer.
             float *d_scales_B = nullptr;
 
             if (packed_)
             {
-                d_weights_int8 = packed_->d_int8_data;
                 d_scales_B = packed_->d_scales;
             }
             else if (impl_)
             {
-                d_weights_int8 = impl_->d_weights_int8;
                 d_scales_B = impl_->d_scales_B;
             }
 
-            if (!d_weights_int8 || !d_scales_B)
+            if (!d_scales_B)
             {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Weights not uploaded to device");
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Weight scales not uploaded to device");
                 return false;
             }
 
-            LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Weight ptrs: int8=" << (void *)d_weights_int8 << " scales=" << (void *)d_scales_B);
-
-            // Validate and populate workspace pointers
+            // Validate and populate workspace pointers (includes d_B_rowmajor_scratch)
             phase_start = std::chrono::high_resolution_clock::now();
             validateWorkspace();
             phase_end = std::chrono::high_resolution_clock::now();
             double workbuf_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
             if (workbuf_ms > 1.0)
                 LOG_TRACE("[ROCmGEMM::PHASES] validateWorkspace: " << workbuf_ms << "ms");
+
+            // Option B: Repack VNNI→row-major into workspace scratch for CK GEMM
+            int8_t *d_weights_int8 = nullptr;
+            if (impl_->d_weights_int8_vnni && impl_->d_B_rowmajor_scratch)
+            {
+                phase_start = std::chrono::high_resolution_clock::now();
+                if (!rocmGemv_repackVNNI_to_rowmajor(
+                        impl_->d_weights_int8_vnni, impl_->d_B_rowmajor_scratch,
+                        n, k, rocm_device_id_))
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] VNNI→row-major repack failed");
+                    return false;
+                }
+                d_weights_int8 = impl_->d_B_rowmajor_scratch;
+                phase_end = std::chrono::high_resolution_clock::now();
+                double repack_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                LOG_TRACE("[ROCmGEMM::PHASES] VNNI→rowmajor repack: " << repack_ms << "ms");
+            }
+
+            if (!d_weights_int8)
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] No VNNI weights for CK GEMM repack");
+                return false;
+            }
+
+            LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Weight ptrs: int8(scratch)=" << (void *)d_weights_int8 << " scales=" << (void *)d_scales_B);
 
             int8_t *d_A_int8 = impl_->d_A_int8;
             float *d_scales_A = impl_->d_scales_A;
@@ -986,17 +1287,28 @@ namespace llaminar2
                 return false;
             }
 
-            // Get weight device pointers
-            int8_t *d_weights_int8 = impl_->d_weights_int8;
+            // Get weight device pointers — Option B: VNNI-only, repack to scratch
+            validateWorkspace();
+            if (!impl_->d_weights_int8_vnni || !impl_->d_B_rowmajor_scratch)
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] No VNNI weights or repack scratch");
+                return false;
+            }
             float *d_scales_B = impl_->d_scales_B;
-            if (!d_weights_int8 || !d_scales_B)
+            if (!d_scales_B)
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Weights not uploaded");
                 return false;
             }
-
-            // Validate and populate workspace pointers
-            validateWorkspace();
+            // Repack VNNI→row-major into scratch for CK GEMM
+            if (!rocmGemv_repackVNNI_to_rowmajor(
+                    impl_->d_weights_int8_vnni, impl_->d_B_rowmajor_scratch,
+                    n, k, rocm_device_id_))
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] VNNI→row-major repack failed");
+                return false;
+            }
+            int8_t *d_weights_int8 = impl_->d_B_rowmajor_scratch;
 
             int8_t *d_A_int8 = impl_->d_A_int8;
             float *d_scales_A = impl_->d_scales_A;
@@ -1177,7 +1489,8 @@ namespace llaminar2
                 {
                     d_input = static_cast<const float *>(fp32_input->gpu_data_ptr());
                 }
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input << " cpu_ptr=" << fp32_input->data());
+                // NOTE: Don't log fp32_input->data() here - it triggers D2H transfer!
+                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input);
             }
             else
             {
@@ -1278,18 +1591,32 @@ namespace llaminar2
                 }
 
                 // Get weight device pointers from this projection's kernel
+                // Option B: Repack VNNI→row-major into workspace scratch for CK GEMM
                 int8_t *d_weights_int8 = nullptr;
                 float *d_scales_B = nullptr;
 
                 if (rocm_kernel->packed_)
                 {
-                    d_weights_int8 = rocm_kernel->packed_->d_int8_data;
                     d_scales_B = rocm_kernel->packed_->d_scales;
                 }
                 else if (rocm_kernel->impl_)
                 {
-                    d_weights_int8 = rocm_kernel->impl_->d_weights_int8;
                     d_scales_B = rocm_kernel->impl_->d_scales_B;
+                }
+
+                // Repack VNNI→row-major into this kernel's workspace scratch
+                int8_t *d_vnni = rocm_kernel->impl_ ? rocm_kernel->impl_->d_weights_int8_vnni : nullptr;
+                int8_t *d_scratch = rocm_kernel->impl_ ? rocm_kernel->impl_->d_B_rowmajor_scratch : nullptr;
+
+                if (d_vnni && d_scratch)
+                {
+                    if (!rocmGemv_repackVNNI_to_rowmajor(d_vnni, d_scratch, n, k, rocm_device_id_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " VNNI→row-major repack failed");
+                        all_success = false;
+                        break;
+                    }
+                    d_weights_int8 = d_scratch;
                 }
 
                 if (!d_weights_int8 || !d_scales_B)
@@ -1610,11 +1937,20 @@ namespace llaminar2
             reqs.buffers.push_back({GemmWorkspaceBuffers::ROCM_SCALE_A_PADDED, scale_a_padded_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::ROCM_E_PADDED, e_padded_bytes, 256, true});
 
+            // Option B: shared scratch buffer for VNNI→row-major repacking
+            // Sized to N×K for this kernel's weight matrix. The workspace manager
+            // allocates max(N×K) across all kernel instances, so the largest weight
+            // matrix (Gate/Up: 18944×3584 ≈ 65MB) determines the actual allocation.
+            // This buffer is reused across layers since they execute sequentially.
+            size_t repack_bytes = static_cast<size_t>(n) * k * sizeof(int8_t);
+            reqs.buffers.push_back({GemmWorkspaceBuffers::ROCM_B_REPACK, repack_bytes, 256, true});
+
             LOG_DEBUG("[ROCmQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
                       << "quant_a=" << (quant_a_bytes / 1024) << "KB, "
                       << "scales_a=" << (scales_a_bytes) << "B, "
                       << "acc=" << (acc_int32_bytes / 1024) << "KB, "
-                      << "ck_int32=" << (ck_int32_bytes / 1024) << "KB (padded)");
+                      << "ck_int32=" << (ck_int32_bytes / 1024) << "KB (padded), "
+                      << "repack=" << (repack_bytes / 1024) << "KB");
 
             return reqs;
         }
@@ -1659,30 +1995,72 @@ namespace llaminar2
             {
                 if (!packed_->uploaded)
                 {
-                    // Upload to device
-                    bool ok = rocmQuantGemm_uploadWeights(
-                        packed_->int8_data.data(),
-                        packed_->scales.data(),
-                        &packed_->d_int8_data,
-                        &packed_->d_scales,
-                        packed_->K,
-                        packed_->N,
-                        rocm_device_id_);
+                    // Option B: Upload ONLY VNNI layout + scales to device.
+                    // Row-major weights are repacked on-demand from VNNI into a
+                    // shared workspace scratch buffer for CK GEMM prefill.
 
-                    if (!ok)
+                    // Upload scales
+                    rocmQuantGemm_setDevice(rocm_device_id_);
+                    if (!rocmQuantGemm_allocFloat(&packed_->d_scales,
+                                                  static_cast<size_t>(packed_->N),
+                                                  rocm_device_id_))
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload pre-packed weights");
+                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc scales");
                         return;
+                    }
+
+                    hipError_t err = hipMemcpy(packed_->d_scales,
+                                               packed_->scales.data(),
+                                               static_cast<size_t>(packed_->N) * sizeof(float),
+                                               hipMemcpyHostToDevice);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload scales: "
+                                  << hipGetErrorString(err));
+                        return;
+                    }
+
+                    // Upload VNNI layout (sole weight copy on device)
+                    if (!packed_->int8_data_vnni.empty())
+                    {
+                        if (!rocmQuantGemm_allocInt8(&packed_->d_int8_data_vnni,
+                                                     packed_->int8_data_vnni.size(),
+                                                     rocm_device_id_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc VNNI weights");
+                            return;
+                        }
+
+                        err = hipMemcpy(packed_->d_int8_data_vnni,
+                                        packed_->int8_data_vnni.data(),
+                                        packed_->int8_data_vnni.size() * sizeof(int8_t),
+                                        hipMemcpyHostToDevice);
+                        if (err != hipSuccess)
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload VNNI weights: "
+                                      << hipGetErrorString(err));
+                            return;
+                        }
+
+                        LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded VNNI weights (Option B, sole device copy): "
+                                  << (packed_->int8_data_vnni.size() / 1024) << " KB");
+                    }
+                    else
+                    {
+                        LOG_WARN("[ROCmQuantisedGemmKernel] No VNNI layout available (K%4!=0?). "
+                                 "CK GEMM and legacy GEMV modes will not work.");
                     }
 
                     packed_->uploaded = true;
                     packed_->rocm_device_id = rocm_device_id_;
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded pre-packed weights: "
-                              << packed_->N << "x" << packed_->K);
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded pre-packed weights (Option B): "
+                              << packed_->N << "x" << packed_->K
+                              << " VRAM: " << (packed_->int8_data_vnni.size() / 1024) << " KB"
+                              << " (was " << (packed_->int8_data_vnni.size() * 2 / 1024) << " KB with row-major)");
                 }
 
                 // Point impl_ to packed_ device pointers
-                impl_->d_weights_int8 = packed_->d_int8_data;
+                impl_->d_weights_int8_vnni = packed_->d_int8_data_vnni;
                 impl_->d_scales_B = packed_->d_scales;
                 weights_converted_ = true;
                 return;
@@ -1703,20 +2081,50 @@ namespace llaminar2
                 return;
             }
 
-            // Upload to device
-            bool ok = rocmQuantGemm_uploadWeights(
-                host_packed.int8_data.data(),
-                host_packed.scales.data(),
-                &impl_->d_weights_int8,
-                &impl_->d_scales_B,
-                host_packed.K,
-                host_packed.N,
-                rocm_device_id_);
+            // Option B (legacy path): Upload only VNNI + scales
+            rocmQuantGemm_setDevice(rocm_device_id_);
 
-            if (!ok)
+            // Upload scales
+            if (!rocmQuantGemm_allocFloat(&impl_->d_scales_B,
+                                          static_cast<size_t>(host_packed.N),
+                                          rocm_device_id_))
             {
-                LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload weights to device");
+                LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc scales");
                 return;
+            }
+
+            hipError_t err = hipMemcpy(impl_->d_scales_B,
+                                       host_packed.scales.data(),
+                                       static_cast<size_t>(host_packed.N) * sizeof(float),
+                                       hipMemcpyHostToDevice);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload scales: "
+                          << hipGetErrorString(err));
+                return;
+            }
+
+            // Upload VNNI layout
+            if (!host_packed.int8_data_vnni.empty())
+            {
+                if (!rocmQuantGemm_allocInt8(&impl_->d_weights_int8_vnni,
+                                             host_packed.int8_data_vnni.size(),
+                                             rocm_device_id_))
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc VNNI weights");
+                    return;
+                }
+
+                err = hipMemcpy(impl_->d_weights_int8_vnni,
+                                host_packed.int8_data_vnni.data(),
+                                host_packed.int8_data_vnni.size() * sizeof(int8_t),
+                                hipMemcpyHostToDevice);
+                if (err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload VNNI weights: "
+                              << hipGetErrorString(err));
+                    return;
+                }
             }
 
             impl_->owns_weight_memory = true; // We now own the device memory
@@ -1785,6 +2193,11 @@ namespace llaminar2
                 throw std::runtime_error(
                     "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ROCM_E_PADDED");
             }
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ROCM_B_REPACK))
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ROCM_B_REPACK");
+            }
 
             // Populate impl_ pointers from workspace
             impl_->d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
@@ -1796,6 +2209,7 @@ namespace llaminar2
             impl_->d_A_padded = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_A_PADDED));
             impl_->d_scale_A_padded = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_SCALE_A_PADDED));
             impl_->d_E_padded = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_E_PADDED));
+            impl_->d_B_rowmajor_scratch = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_B_REPACK));
 
             // Set capacity values to max (workspace is pre-sized for maximum dimensions)
             // These are used by code paths that check capacity before use
@@ -1839,9 +2253,124 @@ namespace llaminar2
                                                                             << " d_A=" << static_cast<const void *>(d_A)
                                                                             << " d_C=" << static_cast<void *>(d_C));
 
+            // DECODE FAST PATH: M=1 GEMV
+            if (m == 1)
+            {
+                const auto &env = debugEnv();
+                const std::string &gemv_mode = env.rocm.gemv_mode;
+
+                ensureWeightsConverted();
+                // Option B: weights are VNNI-only on device
+                int8_t *d_vnni = impl_ ? impl_->d_weights_int8_vnni : nullptr;
+                float *d_s = packed_ ? packed_->d_scales : (impl_ ? impl_->d_scales_B : nullptr);
+                if (d_vnni && d_s)
+                {
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] GEMV fast path M=1 mode=" << gemv_mode);
+
+                    if (gemv_mode == "fp16")
+                    {
+                        // fp16 needs row-major — repack into scratch
+                        if (!impl_)
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] FP16 GEMV requires impl_ buffers");
+                            return false;
+                        }
+                        validateWorkspace();
+                        if (!rocmGemv_repackVNNI_to_rowmajor(d_vnni, impl_->d_B_rowmajor_scratch, n, k, rocm_device_id_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] FP16 GEMV: repack failed");
+                            return false;
+                        }
+                        return rocmGemv_int8_fp16(d_A, impl_->d_B_rowmajor_scratch, d_s, d_C, n, k, rocm_device_id_);
+                    }
+
+                    if (gemv_mode == "int8")
+                    {
+                        if (!impl_)
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 GEMV requires impl_ buffers");
+                            return false;
+                        }
+
+                        validateWorkspace();
+                        if (!rocmQuantGemm_quantizeActivations(
+                                d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] Activation quantization failed");
+                            return false;
+                        }
+
+                        const bool use_vnni = (env.rocm.gemv_layout == "vnni") &&
+                                              (d_vnni != nullptr) &&
+                                              ((k % 4) == 0);
+
+                        if (use_vnni)
+                        {
+                            // Hot path: flat VNNI GEMV (no repack needed)
+                            if (!rocmGemv_int8_int8_int32_vnni(
+                                    impl_->d_A_int8, d_vnni, impl_->d_C_int32,
+                                    n, k, rocm_device_id_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 GEMV (VNNI) failed");
+                                return false;
+                            }
+                        }
+                        else
+                        {
+                            // Fallback: repack VNNI→row-major
+                            if (!rocmGemv_repackVNNI_to_rowmajor(d_vnni, impl_->d_B_rowmajor_scratch, n, k, rocm_device_id_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 GEMV fallback: repack failed");
+                                return false;
+                            }
+                            if (!rocmGemv_int8_int8_int32(
+                                    impl_->d_A_int8, impl_->d_B_rowmajor_scratch, impl_->d_C_int32,
+                                    n, k, rocm_device_id_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 GEMV failed");
+                                return false;
+                            }
+                        }
+
+                        const float *d_existing = (beta != 0.0f) ? d_C : nullptr;
+                        return rocmQuantGemm_applyScaling(
+                            impl_->d_C_int32, d_C, impl_->d_scales_A, d_s,
+                            m, n, alpha, beta, d_existing, nullptr, rocm_device_id_);
+                    }
+
+                    // fp32 GEMV: repack into scratch
+                    if (!impl_)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] FP32 GEMV requires impl_ buffers");
+                        return false;
+                    }
+                    validateWorkspace();
+                    if (!rocmGemv_repackVNNI_to_rowmajor(d_vnni, impl_->d_B_rowmajor_scratch, n, k, rocm_device_id_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] FP32 GEMV: repack failed");
+                        return false;
+                    }
+                    return rocmGemv_int8_fp32(d_A, impl_->d_B_rowmajor_scratch, d_s, d_C, n, k, rocm_device_id_);
+                }
+            }
+
             // Ensure weights converted and validate workspace
             ensureWeightsConverted();
             validateWorkspace();
+
+            // Option B: Repack VNNI→row-major into workspace scratch for CK GEMM
+            if (!impl_->d_weights_int8_vnni || !impl_->d_B_rowmajor_scratch)
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] No VNNI weights or repack scratch for CK GEMM");
+                return false;
+            }
+            if (!rocmGemv_repackVNNI_to_rowmajor(
+                    impl_->d_weights_int8_vnni, impl_->d_B_rowmajor_scratch,
+                    n, k, rocm_device_id_))
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] VNNI→row-major repack failed");
+                return false;
+            }
 
             // Step 1: Quantize FP32 activations to INT8
             if (!rocmQuantGemm_quantizeActivations(
@@ -1854,7 +2383,7 @@ namespace llaminar2
             // Step 2: Execute CK INT8 GEMM (two-kernel approach: GEMM + scaling separately)
             // The two-kernel cached version takes a pre-allocated INT32 buffer
             if (!rocmQuantGemm_executeTwoKernel_cached(
-                    impl_->d_A_int8, impl_->d_weights_int8,
+                    impl_->d_A_int8, impl_->d_B_rowmajor_scratch,
                     d_C, // Output FP32
                     impl_->d_scales_A, impl_->d_scales_B,
                     impl_->d_C_int32, // Pre-allocated INT32 accumulator
@@ -1889,9 +2418,124 @@ namespace llaminar2
                                                                                       << " d_C=" << static_cast<void *>(d_C)
                                                                                       << " d_bias=" << static_cast<const void *>(d_bias));
 
+            // DECODE FAST PATH: M=1 GEMV with fused bias
+            if (m == 1)
+            {
+                const auto &env = debugEnv();
+                const std::string &gemv_mode = env.rocm.gemv_mode;
+
+                ensureWeightsConverted();
+                // Option B: weights are VNNI-only on device
+                int8_t *d_vnni = impl_ ? impl_->d_weights_int8_vnni : nullptr;
+                float *d_s = packed_ ? packed_->d_scales : (impl_ ? impl_->d_scales_B : nullptr);
+                if (d_vnni && d_s)
+                {
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] GEMV fast path M=1 +bias mode=" << gemv_mode);
+
+                    if (gemv_mode == "fp16")
+                    {
+                        // fp16 needs row-major — repack into scratch
+                        if (!impl_)
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] FP16 GEMV requires impl_ buffers");
+                            return false;
+                        }
+                        validateWorkspace();
+                        if (!rocmGemv_repackVNNI_to_rowmajor(d_vnni, impl_->d_B_rowmajor_scratch, n, k, rocm_device_id_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] FP16 GEMV: repack failed");
+                            return false;
+                        }
+                        return rocmGemv_int8_fp16_bias(d_A, impl_->d_B_rowmajor_scratch, d_s, d_bias, d_C, n, k, rocm_device_id_);
+                    }
+
+                    if (gemv_mode == "int8")
+                    {
+                        if (!impl_)
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 GEMV requires impl_ buffers");
+                            return false;
+                        }
+
+                        validateWorkspace();
+                        if (!rocmQuantGemm_quantizeActivations(
+                                d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Activation quantization failed");
+                            return false;
+                        }
+
+                        const bool use_vnni = (env.rocm.gemv_layout == "vnni") &&
+                                              (d_vnni != nullptr) &&
+                                              ((k % 4) == 0);
+
+                        if (use_vnni)
+                        {
+                            // Hot path: flat VNNI GEMV (no repack needed)
+                            if (!rocmGemv_int8_int8_int32_vnni(
+                                    impl_->d_A_int8, d_vnni, impl_->d_C_int32,
+                                    n, k, rocm_device_id_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 GEMV (VNNI) failed");
+                                return false;
+                            }
+                        }
+                        else
+                        {
+                            // Fallback: repack VNNI→row-major
+                            if (!rocmGemv_repackVNNI_to_rowmajor(d_vnni, impl_->d_B_rowmajor_scratch, n, k, rocm_device_id_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 GEMV fallback: repack failed");
+                                return false;
+                            }
+                            if (!rocmGemv_int8_int8_int32(
+                                    impl_->d_A_int8, impl_->d_B_rowmajor_scratch, impl_->d_C_int32,
+                                    n, k, rocm_device_id_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 GEMV failed");
+                                return false;
+                            }
+                        }
+
+                        const float *d_existing = (beta != 0.0f) ? d_C : nullptr;
+                        return rocmQuantGemm_applyScaling(
+                            impl_->d_C_int32, d_C, impl_->d_scales_A, d_s,
+                            m, n, alpha, beta, d_existing, d_bias, rocm_device_id_);
+                    }
+
+                    // fp32 GEMV: repack into scratch
+                    if (!impl_)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] FP32 GEMV requires impl_ buffers");
+                        return false;
+                    }
+                    validateWorkspace();
+                    if (!rocmGemv_repackVNNI_to_rowmajor(d_vnni, impl_->d_B_rowmajor_scratch, n, k, rocm_device_id_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] FP32 GEMV: repack failed");
+                        return false;
+                    }
+                    return rocmGemv_int8_fp32_bias(d_A, impl_->d_B_rowmajor_scratch, d_s, d_bias, d_C, n, k, rocm_device_id_);
+                }
+            }
+
             // Ensure weights converted and validate workspace
             ensureWeightsConverted();
             validateWorkspace();
+
+            // Option B: Repack VNNI→row-major into workspace scratch for CK GEMM
+            if (!impl_->d_weights_int8_vnni || !impl_->d_B_rowmajor_scratch)
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] No VNNI weights or repack scratch for CK GEMM");
+                return false;
+            }
+            if (!rocmGemv_repackVNNI_to_rowmajor(
+                    impl_->d_weights_int8_vnni, impl_->d_B_rowmajor_scratch,
+                    n, k, rocm_device_id_))
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] VNNI→row-major repack failed");
+                return false;
+            }
 
             // Step 1: Quantize FP32 activations to INT8
             if (!rocmQuantGemm_quantizeActivations(
@@ -1903,7 +2547,7 @@ namespace llaminar2
 
             // Step 2: Execute CK INT8 GEMM → INT32 (no scaling)
             if (!rocmQuantGemm_executeNoScale(
-                    impl_->d_A_int8, impl_->d_weights_int8, impl_->d_C_int32,
+                    impl_->d_A_int8, impl_->d_B_rowmajor_scratch, impl_->d_C_int32,
                     m, n, k, rocm_device_id_))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel] CK NoScale GEMM failed");

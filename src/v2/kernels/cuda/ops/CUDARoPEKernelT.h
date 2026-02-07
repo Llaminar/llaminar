@@ -92,9 +92,13 @@ namespace llaminar2
 
             void bindWorkspace(DeviceWorkspaceManager *workspace) override
             {
+                // Only reset inv_freq state when workspace ACTUALLY changes.
+                // See ROCmRoPEKernelT<FP32>::bindWorkspace() for full rationale.
+                if (workspace_ != workspace)
+                {
+                    inv_freq_initialized_ = false;
+                }
                 workspace_ = workspace;
-                // Reset inv_freq state when workspace changes
-                inv_freq_initialized_ = false;
             }
             bool hasWorkspace() const override { return workspace_ != nullptr; }
             DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
@@ -340,9 +344,13 @@ namespace llaminar2
 
             void bindWorkspace(DeviceWorkspaceManager *workspace) override
             {
+                // Only reset inv_freq state when workspace ACTUALLY changes.
+                // See ROCmRoPEKernelT<FP32>::bindWorkspace() for full rationale.
+                if (workspace_ != workspace)
+                {
+                    inv_freq_initialized_ = false;
+                }
                 workspace_ = workspace;
-                // Reset inv_freq state when workspace changes
-                inv_freq_initialized_ = false;
             }
             bool hasWorkspace() const override { return workspace_ != nullptr; }
             DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
@@ -586,9 +594,13 @@ namespace llaminar2
 
             void bindWorkspace(DeviceWorkspaceManager *workspace) override
             {
+                // Only reset inv_freq state when workspace ACTUALLY changes.
+                // See ROCmRoPEKernelT<FP32>::bindWorkspace() for full rationale.
+                if (workspace_ != workspace)
+                {
+                    inv_freq_initialized_ = false;
+                }
                 workspace_ = workspace;
-                // Reset inv_freq state when workspace changes
-                inv_freq_initialized_ = false;
             }
             bool hasWorkspace() const override { return workspace_ != nullptr; }
             DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }

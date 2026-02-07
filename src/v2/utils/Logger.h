@@ -72,13 +72,13 @@ namespace llaminar2
 
         /**
          * @brief Set a thread-local device prefix for log messages
-         * 
+         *
          * This prefix is automatically included in all log messages from the
          * calling thread. Use ScopedDeviceLog for RAII-style management.
-         * 
+         *
          * @param prefix The device prefix (e.g., "rocm:0", "cuda:1")
          */
-        static void setThreadDevicePrefix(const std::string& prefix)
+        static void setThreadDevicePrefix(const std::string &prefix)
         {
             thread_device_prefix() = prefix;
         }
@@ -95,7 +95,7 @@ namespace llaminar2
          * @brief Get the current thread-local device prefix
          * @return The device prefix, or empty string if not set
          */
-        static const std::string& getThreadDevicePrefix()
+        static const std::string &getThreadDevicePrefix()
         {
             return thread_device_prefix();
         }
@@ -133,7 +133,7 @@ namespace llaminar2
             }
 
             // Add thread-local device prefix if set
-            const std::string& device_prefix = thread_device_prefix();
+            const std::string &device_prefix = thread_device_prefix();
             if (!device_prefix.empty())
             {
                 full_line += " [" + device_prefix + "]";
@@ -231,11 +231,11 @@ namespace llaminar2
 
         /**
          * @brief Thread-local storage for device prefix
-         * 
+         *
          * Each thread can have its own device prefix, enabling multi-device
          * parallel execution with clear log attribution.
          */
-        static std::string& thread_device_prefix()
+        static std::string &thread_device_prefix()
         {
             thread_local std::string prefix;
             return prefix;
@@ -251,10 +251,10 @@ namespace llaminar2
 
     /**
      * @brief RAII helper for scoped device logging
-     * 
+     *
      * Sets the thread-local device prefix on construction and clears it on destruction.
      * Use this to automatically tag all log messages within a scope with the device ID.
-     * 
+     *
      * Example:
      * @code
      * void executeOnDevice(DeviceId device) {
@@ -271,7 +271,7 @@ namespace llaminar2
          * @brief Construct with device ID string
          * @param device_str The device string (e.g., "rocm:0", "cuda:1", "cpu")
          */
-        explicit ScopedDeviceLog(const std::string& device_str)
+        explicit ScopedDeviceLog(const std::string &device_str)
             : previous_prefix_(Logger::getThreadDevicePrefix())
         {
             Logger::setThreadDevicePrefix(device_str);
@@ -281,8 +281,8 @@ namespace llaminar2
          * @brief Construct with DeviceId object
          * @param device The DeviceId to use for logging
          */
-        template<typename DeviceIdType>
-        explicit ScopedDeviceLog(const DeviceIdType& device)
+        template <typename DeviceIdType>
+        explicit ScopedDeviceLog(const DeviceIdType &device)
             : previous_prefix_(Logger::getThreadDevicePrefix())
         {
             Logger::setThreadDevicePrefix(device.to_string());
@@ -295,10 +295,10 @@ namespace llaminar2
         }
 
         // Non-copyable, non-movable
-        ScopedDeviceLog(const ScopedDeviceLog&) = delete;
-        ScopedDeviceLog& operator=(const ScopedDeviceLog&) = delete;
-        ScopedDeviceLog(ScopedDeviceLog&&) = delete;
-        ScopedDeviceLog& operator=(ScopedDeviceLog&&) = delete;
+        ScopedDeviceLog(const ScopedDeviceLog &) = delete;
+        ScopedDeviceLog &operator=(const ScopedDeviceLog &) = delete;
+        ScopedDeviceLog(ScopedDeviceLog &&) = delete;
+        ScopedDeviceLog &operator=(ScopedDeviceLog &&) = delete;
 
     private:
         std::string previous_prefix_;
@@ -331,20 +331,26 @@ namespace llaminar2
         ::llaminar2::Logger::getInstance().log(::llaminar2::LogLevel::INFO, oss.str(), __FILE__, __LINE__); \
     } while (0)
 
-#define LOG_DEBUG(msg)                                                                                                 \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        std::ostringstream oss;                                                                                        \
-        oss << msg;                                                                                                    \
-        ::llaminar2::Logger::getInstance().log(::llaminar2::LogLevel::VERBOSITY_DEBUG, oss.str(), __FILE__, __LINE__); \
+#define LOG_DEBUG(msg)                                                                                                     \
+    do                                                                                                                     \
+    {                                                                                                                      \
+        if (::llaminar2::Logger::getInstance().shouldLog(::llaminar2::LogLevel::VERBOSITY_DEBUG))                          \
+        {                                                                                                                  \
+            std::ostringstream oss;                                                                                        \
+            oss << msg;                                                                                                    \
+            ::llaminar2::Logger::getInstance().log(::llaminar2::LogLevel::VERBOSITY_DEBUG, oss.str(), __FILE__, __LINE__); \
+        }                                                                                                                  \
     } while (0)
 
-#define LOG_TRACE(msg)                                                                                       \
-    do                                                                                                       \
-    {                                                                                                        \
-        std::ostringstream oss;                                                                              \
-        oss << msg;                                                                                          \
-        ::llaminar2::Logger::getInstance().log(::llaminar2::LogLevel::TRACE, oss.str(), __FILE__, __LINE__); \
+#define LOG_TRACE(msg)                                                                                           \
+    do                                                                                                           \
+    {                                                                                                            \
+        if (::llaminar2::Logger::getInstance().shouldLog(::llaminar2::LogLevel::TRACE))                          \
+        {                                                                                                        \
+            std::ostringstream oss;                                                                              \
+            oss << msg;                                                                                          \
+            ::llaminar2::Logger::getInstance().log(::llaminar2::LogLevel::TRACE, oss.str(), __FILE__, __LINE__); \
+        }                                                                                                        \
     } while (0)
 
 // Simple logging without location info

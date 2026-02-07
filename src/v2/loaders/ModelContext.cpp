@@ -7,6 +7,7 @@
 #include "ModelContext.h"
 #include "../utils/Logger.h"
 #include <iostream>
+#include <limits>
 
 namespace llaminar2
 {
@@ -203,7 +204,18 @@ namespace llaminar2
         // Configure layer range if partitioned
         if (strategy == WeightDistributionStrategy::LAYER_PARTITIONED)
         {
-            ctx->weight_manager_->setLayerRange(config.first_layer, config.last_layer);
+            // ModelContextConfig uses inclusive last_layer (-1 = all layers)
+            // WeightManager uses exclusive last_layer [first, last)
+            if (config.last_layer >= 0)
+            {
+                ctx->weight_manager_->setLayerRange(config.first_layer, config.last_layer + 1);
+            }
+            else if (config.first_layer > 0)
+            {
+                // Has offset but no upper limit — shouldn't happen, but handle gracefully
+                ctx->weight_manager_->setLayerRange(config.first_layer, std::numeric_limits<int>::max());
+            }
+            // If first_layer==0 and last_layer==-1, skip setLayerRange (all layers pass through)
             ctx->weight_manager_->setHasEmbedding(config.has_embedding);
             ctx->weight_manager_->setHasLmHead(config.has_lm_head);
         }

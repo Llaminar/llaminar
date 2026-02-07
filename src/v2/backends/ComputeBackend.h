@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include "DeviceId.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -367,6 +368,28 @@ public:
          * @return The backend-specific device_id, or -1 if index out of range
          */
         int get_device_id_for_type(ComputeBackendType type, int local_index) const;
+
+        /**
+         * @brief Check if a device with the given DeviceId actually exists
+         *
+         * Validates that the hardware device is enumerated and available.
+         * Use this to fail early with a clear error message instead of
+         * cascading failures deep in the stack.
+         *
+         * @param device DeviceId to validate
+         * @return true if a matching device was found in the inventory
+         */
+        bool deviceExists(const DeviceId &device) const;
+
+        /**
+         * @brief Get a formatted string listing all available devices
+         *
+         * Useful for error messages when a requested device doesn't exist.
+         * Format: "CPU, CUDA:0 (NVIDIA A100), ROCm:0 (AMD MI300X)"
+         *
+         * @return Comma-separated list of available devices
+         */
+        std::string availableDevicesString() const;
 
     private:
         DeviceManager() = default;

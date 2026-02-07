@@ -297,6 +297,14 @@ namespace llaminar2
         }
 
         // Standard path: Apply RoPE via kernel's apply_tensor method (in-place)
+        //
+        // NOTE: On GPU, the non-contiguous path uses hipMemcpy to upload position_ids,
+        // which is synchronous and drains the GPU pipeline. This inflates RoPE's
+        // wall-clock profiling time by ~100ms during prefill (capturing pending GEMM
+        // execution time). This is a PROFILING ARTIFACT — actual RoPE GPU compute is
+        // negligible (~3.6µs per decode call). Do NOT try to "fix" this by switching
+        // to the contiguous kernel path (nullptr position_ids) — removing the hipMemcpy
+        // sync point changes GPU pipeline scheduling and causes a ~28% prefill regression.
         return kernel->apply_tensor(
             Q_base,
             K_base, // May be nullptr

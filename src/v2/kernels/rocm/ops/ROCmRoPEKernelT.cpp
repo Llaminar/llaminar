@@ -281,9 +281,16 @@ namespace llaminar2
 
         void ROCmRoPEKernelT<ActivationPrecision::FP32>::bindWorkspace(DeviceWorkspaceManager *ws)
         {
+            // Only reset inv_freq state when workspace ACTUALLY changes.
+            // The graph is rebuilt every forward() call with new stage objects,
+            // but the workspace pointer stays the same. Resetting unconditionally
+            // forces a synchronous hipMemcpy every RoPE call, which blocks until
+            // all pending GPU work (GEMM) completes — causing ~4ms overhead per call.
+            if (workspace_ != ws)
+            {
+                inv_freq_initialized_ = false;
+            }
             workspace_ = ws;
-            // Reset inv_freq state when workspace changes
-            inv_freq_initialized_ = false;
         }
 
         bool ROCmRoPEKernelT<ActivationPrecision::FP32>::hasWorkspace() const
@@ -531,9 +538,13 @@ namespace llaminar2
 
         void ROCmRoPEKernelT<ActivationPrecision::BF16>::bindWorkspace(DeviceWorkspaceManager *ws)
         {
+            // Only reset inv_freq state when workspace ACTUALLY changes.
+            // See FP32 bindWorkspace() for detailed explanation.
+            if (workspace_ != ws)
+            {
+                inv_freq_initialized_ = false;
+            }
             workspace_ = ws;
-            // Reset inv_freq state when workspace changes
-            inv_freq_initialized_ = false;
         }
 
         bool ROCmRoPEKernelT<ActivationPrecision::BF16>::hasWorkspace() const
@@ -776,9 +787,13 @@ namespace llaminar2
 
         void ROCmRoPEKernelT<ActivationPrecision::FP16>::bindWorkspace(DeviceWorkspaceManager *ws)
         {
+            // Only reset inv_freq state when workspace ACTUALLY changes.
+            // See FP32 bindWorkspace() for detailed explanation.
+            if (workspace_ != ws)
+            {
+                inv_freq_initialized_ = false;
+            }
             workspace_ = ws;
-            // Reset inv_freq state when workspace changes
-            inv_freq_initialized_ = false;
         }
 
         bool ROCmRoPEKernelT<ActivationPrecision::FP16>::hasWorkspace() const

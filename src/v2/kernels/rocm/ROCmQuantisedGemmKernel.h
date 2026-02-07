@@ -125,6 +125,9 @@ namespace llaminar2
          *
          * This is the **transpose** of the original model weights which are [N × K].
          *
+         * Optional VNNI layout is also stored for GEMV experiments:
+         *   - int8_data_vnni: [K/4][N][4] where each group stores 4 contiguous K values per column.
+         *
          * ## Quantization Formula
          *
          * Per-column symmetric quantization:
@@ -146,16 +149,19 @@ namespace llaminar2
          */
         struct ROCmPackedWeights
         {
-            std::vector<int8_t> int8_data; ///< [K × N] RowMajor INT8 weights (transposed from model [N×K])
-            std::vector<float> scales;     ///< [N] per-column (per-output-feature) scale factors
-            int K = 0;                     ///< Input features (rows in CK B matrix)
-            int N = 0;                     ///< Output features (cols in CK B matrix)
+            std::vector<int8_t> int8_data;      ///< [K × N] RowMajor INT8 weights (host only, not uploaded to device)
+            std::vector<int8_t> int8_data_vnni; ///< [K/4 × N × 4] VNNI layout (the sole device layout)
+            std::vector<float> scales;          ///< [N] per-column (per-output-feature) scale factors
+            int K = 0;                          ///< Input features (rows in CK B matrix)
+            int N = 0;                          ///< Output features (cols in CK B matrix)
 
             // Device memory pointers (uploaded once, cached)
-            int8_t *d_int8_data = nullptr; ///< Device pointer to INT8 weights
-            float *d_scales = nullptr;     ///< Device pointer to scales
-            int rocm_device_id = -1;       ///< Device where data is uploaded
-            bool uploaded = false;         ///< Whether device memory is allocated
+            // Option B: Only VNNI layout is uploaded to device. Row-major is repacked
+            // on-demand into a shared workspace scratch buffer for CK GEMM prefill.
+            int8_t *d_int8_data_vnni = nullptr; ///< Device pointer to VNNI-packed weights (sole device copy)
+            float *d_scales = nullptr;          ///< Device pointer to scales
+            int rocm_device_id = -1;            ///< Device where data is uploaded
+            bool uploaded = false;              ///< Whether device memory is allocated
 
             ~ROCmPackedWeights();
         };
@@ -585,8 +591,9 @@ namespace llaminar2
             size_t K_; // Input features (weight cols)
 
             // Converted INT8 weight representation (cached) - only used with legacy constructor
-            // When packed_ is set, these are unused (data comes from packed_->d_int8_data/d_scales)
-            int8_t *d_weights_int8_ = nullptr; // [K × N] RowMajor (transposed from model [N×K])
+            // When packed_ is set, these are unused (data comes from packed_->d_int8_data_vnni/d_scales)
+            // Option B: Only VNNI layout stored on device; row-major repacked on-demand into workspace scratch
+            int8_t *d_weights_int8_ = nullptr; // [K × N] RowMajor (legacy only, not uploaded to device with Option B)
             float *d_scales_B_ = nullptr;      // [N] per-column (per-output-feature) scales
             bool weights_converted_ = false;
             bool owns_weight_memory_ = false; // true if we allocated d_weights_int8_/d_scales_B_

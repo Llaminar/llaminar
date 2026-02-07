@@ -1959,6 +1959,42 @@ namespace llaminar2
         /// Inference state (Phase 5 - owned buffers)
         InferenceState state_;
 
+        // =========================================================================
+        // Full Forward Graph Cache (Decode Optimization)
+        // =========================================================================
+
+        /**
+         * @brief Cached full forward graph for decode mode
+         *
+         * During decode (seq_len=1), the graph structure is identical between
+         * steps — only token_ids, position_ids, and position_offset change.
+         * Instead of rebuilding hundreds of stage objects every forward() call,
+         * we cache the graph and its stages after the first decode step.
+         *
+         * Stable buffers (token_ids, position_ids) are owned here so that
+         * cached stages' pointers remain valid across calls.
+         */
+        struct ForwardGraphCache
+        {
+            std::unique_ptr<ComputeGraph> graph; ///< Cached compute graph
+            Qwen2ForwardOutput output;           ///< Cached output (logits pointer)
+            bool valid = false;                  ///< Whether cache is usable
+
+            // Stable buffers — stages point to these, contents updated each step
+            std::vector<int> token_ids;    ///< Persistent decode token storage
+            std::vector<int> position_ids; ///< Persistent decode position IDs
+
+            void invalidate()
+            {
+                graph.reset();
+                valid = false;
+                token_ids.clear();
+                position_ids.clear();
+            }
+        };
+
+        ForwardGraphCache forward_cache_;
+
         /// Padded sequence length from last forward_batch() call
         int padded_seq_len_ = 0;
 

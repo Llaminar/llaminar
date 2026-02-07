@@ -561,6 +561,93 @@ namespace llaminar2
             external_hidden_state_input_ = nullptr;
         }
 
+        // =====================================================================
+        // Decode Graph Cache: Reuse cached graph for decode mode (seq_len=1)
+        // =====================================================================
+        // During decode, the graph structure is identical between steps —
+        // only token_ids, position_ids, and position_offset change.
+        // Instead of rebuilding hundreds of stage objects every forward() call,
+        // we cache the graph after the first decode step and reuse it.
+        //
+        // Benefits:
+        // - Eliminates stage object construction/destruction (~100s of allocs)
+        // - Preserves kernel caches in stages (JIT attention, RoPE inv_freq)
+        // - Avoids workspace re-binding (bindWorkspace → inv_freq reset)
+        // - Skips graph traversal in ensureDeviceWorkspaceAllocated()
+        // =====================================================================
+
+        bool is_decode = (effective_input.seq_len == 1 && effective_input.batch_size <= 1);
+        bool is_standard_path = !pipeline_config_ && !pp_stage_config_.has_value();
+        bool use_cached_forward = is_decode && is_standard_path && forward_cache_.valid && cache_config_.enabled;
+
+        if (use_cached_forward)
+        {
+            // ===== CACHE HIT: Reuse cached decode graph =====
+
+            // Update stable buffers — stages hold pointers to these, so the
+            // pointed-to values change but the pointers remain valid
+            forward_cache_.token_ids[0] = effective_input.token_ids[0];
+            forward_cache_.position_ids[0] = effective_input.position_ids[0];
+
+            // Update position-dependent params in all cached stages
+            // (RoPEStage.pos_offset, AttentionComputeStage.position_offset, etc.)
+            updateCachedGraphParams(*forward_cache_.graph,
+                                    effective_input.position_offset,
+                                    effective_input.seq_len);
+
+            // Reset execution state (clear completion flags, preserve stages)
+            forward_cache_.graph->reset();
+
+            output = forward_cache_.output;
+
+            // Execute with single device context (standard path, no PP)
+            IDeviceContext *ctx = getDeviceContext(input.device);
+            if (!ctx)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to get device context");
+                return false;
+            }
+
+            bool success = executor_.execute(*forward_cache_.graph, ctx);
+
+            auto end = std::chrono::high_resolution_clock::now();
+            double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+
+            LOG_TRACE("[DeviceGraphOrchestrator] Forward (cached decode) completed in "
+                      << ms << "ms, success=" << success);
+
+            return success;
+        }
+
+        // ===== CACHE MISS: Build new graph =====
+
+        // Invalidate decode cache on phase transition (e.g., prefill → decode → prefill)
+        if (forward_cache_.valid && (!is_decode || !is_standard_path))
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Invalidating forward graph cache "
+                      << "(seq_len=" << effective_input.seq_len
+                      << ", batch_size=" << effective_input.batch_size << ")");
+            forward_cache_.invalidate();
+        }
+
+        // For the first decode step on the standard path: redirect token_ids and
+        // position_ids to stable buffers so that cached stages' pointers survive.
+        bool should_cache_after_build = is_decode && is_standard_path && cache_config_.enabled && !forward_cache_.valid;
+        if (should_cache_after_build)
+        {
+            int total_tokens = effective_input.batch_size * effective_input.seq_len;
+            forward_cache_.token_ids.assign(
+                effective_input.token_ids,
+                effective_input.token_ids + total_tokens);
+            forward_cache_.position_ids.assign(
+                effective_input.position_ids,
+                effective_input.position_ids + total_tokens);
+
+            // Redirect input to stable buffers before graph build
+            effective_input.token_ids = forward_cache_.token_ids.data();
+            effective_input.position_ids = forward_cache_.position_ids.data();
+        }
+
         // Build forward graph via fluent builder API
         // Priority is auto-selected: unified PP > partial PP stage > full forward
         GraphBuildResult build_result = [&]() -> GraphBuildResult
@@ -684,6 +771,16 @@ namespace llaminar2
             LOG_DEBUG("[DeviceGraphOrchestrator] Got device context, starting execution...");
 
             success = executor_.execute(graph, ctx);
+        }
+
+        // Cache the graph for future decode steps (first decode step only)
+        if (should_cache_after_build && success)
+        {
+            forward_cache_.graph = std::make_unique<ComputeGraph>(std::move(graph));
+            forward_cache_.output = output;
+            forward_cache_.valid = true;
+            LOG_INFO("[DeviceGraphOrchestrator] Cached forward graph for decode mode ("
+                     << forward_cache_.graph->size() << " stages)");
         }
 
         auto end = std::chrono::high_resolution_clock::now();
@@ -1260,6 +1357,9 @@ namespace llaminar2
         {
             cache.invalidate();
         }
+
+        // Clear forward graph cache
+        forward_cache_.invalidate();
 
         // Clear device contexts
         device_contexts_.clear();
@@ -2212,6 +2312,7 @@ namespace llaminar2
     void DeviceGraphOrchestrator::clearInferenceState()
     {
         state_.clear();
+        forward_cache_.invalidate();
         LOG_DEBUG("[DeviceGraphOrchestrator] Inference state cleared");
     }
 

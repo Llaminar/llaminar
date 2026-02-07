@@ -7821,6 +7821,24 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added CK GEMM isolation performance test")
 
+    # Performance Test: ROCm GEMV Kernel (bandwidth-optimized M=1 decode)
+    # Benchmarks and validates the INT8 GEMV kernel against CPU reference
+    # for Qwen2.5-0.5B and 7B decode workloads
+    add_executable(v2_perf_rocm_gemv_kernel
+        performance/kernels/rocm/Perf__ROCmGemvKernel.cpp
+    )
+    target_link_libraries(v2_perf_rocm_gemv_kernel
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_ROCmGemvKernel
+        COMMAND $<TARGET_FILE:v2_perf_rocm_gemv_kernel>
+        LABELS "V2;Performance;ROCm;GEMV;INT8;Decode;gfx906;Qwen2;Benchmark"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm GEMV kernel performance benchmarks")
+
     # NOTE: FP16 vs INT8 benchmark removed (January 2026) - INT8 proven faster for all sizes.
     # Results documented in changelog/2026-01-10-rocm-int8-gemm-optimization.md
 

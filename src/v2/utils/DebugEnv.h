@@ -7,6 +7,7 @@
 #include <sstream>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 
 /**
  * @file DebugEnv.h
@@ -1806,6 +1807,7 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_TRACE_COHERENCE=1` - Enable detailed coherence timing logs
      * - `LLAMINAR_ROCM_TRACE_KERNELS=1` - Enable per-kernel timing breakdown
      * - `LLAMINAR_ROCM_SYNC_AFTER_KERNEL=1` - Force hipDeviceSynchronize after each kernel
+     * - `LLAMINAR_ROCM_GEMV_LAYOUT=vnni` - Use VNNI-packed weights for GEMV when available
      *
      * @code
      *   LLAMINAR_ROCM_TRACE_COHERENCE=1 \
@@ -1814,9 +1816,11 @@ namespace llaminar2
      */
     struct ROCmConfig
     {
-        bool trace_coherence = false;   ///< Log detailed coherence timings (LLAMINAR_ROCM_TRACE_COHERENCE)
-        bool trace_kernels = false;     ///< Log per-kernel timing breakdown (LLAMINAR_ROCM_TRACE_KERNELS)
-        bool sync_after_kernel = false; ///< Force sync after each kernel (LLAMINAR_ROCM_SYNC_AFTER_KERNEL)
+        bool trace_coherence = false;    ///< Log detailed coherence timings (LLAMINAR_ROCM_TRACE_COHERENCE)
+        bool trace_kernels = false;      ///< Log per-kernel timing breakdown (LLAMINAR_ROCM_TRACE_KERNELS)
+        bool sync_after_kernel = false;  ///< Force sync after each kernel (LLAMINAR_ROCM_SYNC_AFTER_KERNEL)
+        std::string gemv_mode = "fp32";  ///< GEMV mode: fp32 (default), fp16, int8
+        std::string gemv_layout = "row"; ///< GEMV weight layout: row (default), vnni
 
         ROCmConfig()
         {
@@ -1828,6 +1832,8 @@ namespace llaminar2
             trace_coherence = false;
             trace_kernels = false;
             sync_after_kernel = false;
+            gemv_mode = "fp32";
+            gemv_layout = "row";
 
             const char *trace_coh_env = std::getenv("LLAMINAR_ROCM_TRACE_COHERENCE");
             if (trace_coh_env)
@@ -1845,6 +1851,24 @@ namespace llaminar2
             if (sync_env)
             {
                 sync_after_kernel = (std::atoi(sync_env) != 0);
+            }
+
+            const char *gemv_env = std::getenv("LLAMINAR_ROCM_GEMV_MODE");
+            if (gemv_env)
+            {
+                gemv_mode = gemv_env;
+                std::transform(gemv_mode.begin(), gemv_mode.end(), gemv_mode.begin(),
+                               [](unsigned char c)
+                               { return static_cast<char>(std::tolower(c)); });
+            }
+
+            const char *gemv_layout_env = std::getenv("LLAMINAR_ROCM_GEMV_LAYOUT");
+            if (gemv_layout_env)
+            {
+                gemv_layout = gemv_layout_env;
+                std::transform(gemv_layout.begin(), gemv_layout.end(), gemv_layout.begin(),
+                               [](unsigned char c)
+                               { return static_cast<char>(std::tolower(c)); });
             }
         }
     };

@@ -17,6 +17,7 @@
 #include "../../collective/ILocalPPContext.h"
 #include "../../loaders/ModelContext.h"
 #include "../../loaders/ModelContextConfig.h"
+#include "../../loaders/ModelLoader.h"
 #include "../../backends/ComputeBackend.h"
 #include "../../utils/Logger.h"
 
@@ -419,12 +420,40 @@ namespace llaminar2
         ClusterInventory inventory = gatherClusterInventory();
 
         // Get model config (need to load model metadata first)
-        // For now, create a minimal config - will be updated after model load
+        // Read actual model metadata from the GGUF file for accurate plan building
         ModelConfig model_config;
-        model_config.n_layers = 24; // Will be overwritten
-        model_config.n_heads = 32;
-        model_config.n_kv_heads = 8;
-        model_config.hidden_size = 4096;
+        if (!config_.model_path.empty())
+        {
+            ModelLoader metadata_loader;
+            if (metadata_loader.loadModel(config_.model_path))
+            {
+                model_config.n_layers = static_cast<int>(metadata_loader.blockCount());
+                model_config.n_heads = static_cast<int>(metadata_loader.headCount());
+                model_config.n_kv_heads = static_cast<int>(metadata_loader.headCountKV());
+                model_config.hidden_size = static_cast<int>(metadata_loader.embeddingLength());
+                LOG_DEBUG("Model metadata for plan building: n_layers=" << model_config.n_layers
+                                                                        << " n_heads=" << model_config.n_heads
+                                                                        << " n_kv_heads=" << model_config.n_kv_heads
+                                                                        << " hidden_size=" << model_config.hidden_size);
+            }
+            else
+            {
+                LOG_WARN("Failed to read model metadata from " << config_.model_path
+                                                               << ", using defaults for plan building");
+                model_config.n_layers = 24;
+                model_config.n_heads = 32;
+                model_config.n_kv_heads = 8;
+                model_config.hidden_size = 4096;
+            }
+        }
+        else
+        {
+            // No model path (testing) - use defaults
+            model_config.n_layers = 24;
+            model_config.n_heads = 32;
+            model_config.n_kv_heads = 8;
+            model_config.hidden_size = 4096;
+        }
 
         // Validate config
         auto errors = plan_builder_->validateConfig(config_, model_config, inventory);
@@ -675,7 +704,7 @@ namespace llaminar2
         }
 
         LOG_INFO("LOCAL PP context created with " << pp_config.numStages()
-                 << " stages on " << plan_.local_pp_devices.size() << " devices");
+                                                  << " stages on " << plan_.local_pp_devices.size() << " devices");
         return true;
     }
 
@@ -734,9 +763,9 @@ namespace llaminar2
         }
 
         LOG_INFO("Model context created from: " << model_path
-                 << " (layers " << weight_config.first_layer << "-" << weight_config.last_layer
-                 << ", embedding=" << weight_config.has_embedding
-                 << ", lm_head=" << weight_config.has_lm_head << ")");
+                                                << " (layers " << weight_config.first_layer << "-" << weight_config.last_layer
+                                                << ", embedding=" << weight_config.has_embedding
+                                                << ", lm_head=" << weight_config.has_lm_head << ")");
         return true;
     }
 
@@ -822,6 +851,20 @@ namespace llaminar2
 
     bool OrchestrationRunner::buildMultiDeviceComputeGraph()
     {
+        // Validate that all requested devices actually exist in hardware
+        const auto &dm = DeviceManager::instance();
+        for (size_t i = 0; i < plan_.local_tp_devices.size(); ++i)
+        {
+            auto local_device = plan_.local_tp_devices[i].toLocalDeviceId();
+            if (!dm.deviceExists(local_device))
+            {
+                return setError("TP device " + std::to_string(i) + " (" +
+                                local_device.toString() +
+                                ") is not available. Available devices: " +
+                                dm.availableDevicesString());
+            }
+        }
+
         LOG_INFO("[OrchestrationRunner] Execution strategy: MULTI-DEVICE (LOCAL TP)");
         LOG_INFO("[OrchestrationRunner]   TP degree: " << plan_.local_tp_devices.size());
 
@@ -880,6 +923,15 @@ namespace llaminar2
         {
             device = plan_.primary_device.toLocalDeviceId();
             device_source = "plan.primary_device";
+        }
+
+        // Validate that the requested device actually exists in hardware
+        const auto &dm = DeviceManager::instance();
+        if (!dm.deviceExists(device))
+        {
+            return setError("Requested device " + device.toString() +
+                            " is not available. Available devices: " +
+                            dm.availableDevicesString());
         }
 
         // Log execution strategy decision
@@ -977,30 +1029,34 @@ namespace llaminar2
     // Snapshot API
     // =========================================================================
 
-    void OrchestrationRunner::enableSnapshotCapture(const std::string& output_dir)
+    void OrchestrationRunner::enableSnapshotCapture(const std::string &output_dir)
     {
-        if (runner_) {
+        if (runner_)
+        {
             runner_->enableSnapshotCapture(output_dir);
         }
     }
 
     void OrchestrationRunner::disableSnapshotCapture()
     {
-        if (runner_) {
+        if (runner_)
+        {
             runner_->disableSnapshotCapture();
         }
     }
 
     void OrchestrationRunner::clearSnapshots()
     {
-        if (runner_) {
+        if (runner_)
+        {
             runner_->clearSnapshots();
         }
     }
 
-    const float* OrchestrationRunner::getSnapshot(const std::string& key, size_t& out_size) const
+    const float *OrchestrationRunner::getSnapshot(const std::string &key, size_t &out_size) const
     {
-        if (runner_) {
+        if (runner_)
+        {
             return runner_->getSnapshot(key, out_size);
         }
         out_size = 0;
@@ -1009,7 +1065,8 @@ namespace llaminar2
 
     std::vector<std::string> OrchestrationRunner::getSnapshotKeys() const
     {
-        if (runner_) {
+        if (runner_)
+        {
             return runner_->getSnapshotKeys();
         }
         return {};
