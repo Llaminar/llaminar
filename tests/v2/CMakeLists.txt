@@ -261,6 +261,14 @@ function(add_v2_test TEST_NAME)
     )
     
     # Add RESOURCE_LOCK if specified (prevents parallel execution of tests needing same resource)
+    # Also: integration tests that touch GPU hardware share a lock to prevent
+    # GPU resource contention when running with `ctest --parallel`.
+    # CPU-only integration tests (quantization GEMM, tokenization, etc.) are unaffected.
+    if("${ARG_LABELS}" MATCHES "Integration")
+        if("${ARG_LABELS}" MATCHES "CUDA|ROCm|GPU|HIP|NCCL|RCCL|PCIeBAR|P2P|CrossVendor|MultiGPU|cuBLAS|hipBLAS")
+            list(APPEND ARG_RESOURCE_LOCK "GPU_Hardware")
+        endif()
+    endif()
     if(ARG_RESOURCE_LOCK)
         set_tests_properties(${TEST_NAME} PROPERTIES
             RESOURCE_LOCK "${ARG_RESOURCE_LOCK}"
@@ -8105,19 +8113,58 @@ endif()
 # =============================================================================
 # CollectiveContext GPU Integration Tests
 # =============================================================================
-# Tests CollectiveContext with GPU backends (NCCL/RCCL)
-# Validates backend selection, AllReduce, AllGather, and Broadcast on GPU tensors
+# CollectiveContext GPU integration tests
+# Split into separate binaries per vendor to avoid ROCm CLR state corruption
+# from repeated RCCL init/destroy cycles within a single process.
 
+# --- CUDA-specific CollectiveContext tests ---
+if(HAVE_CUDA)
+    add_executable(v2_integration_collective_context_cuda
+        integration/collective/Test__CollectiveContext_CUDA.cpp
+    )
+    target_link_libraries(v2_integration_collective_context_cuda PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+        CUDA::cudart
+    )
+    add_v2_test(V2_Integration_CollectiveContext_CUDA
+        COMMAND $<TARGET_FILE:v2_integration_collective_context_cuda>
+        LABELS "V2;Integration;Collective;CollectiveContext;GPU;CUDA;NCCL;AllReduce;AllGather;Broadcast"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added CollectiveContext CUDA integration tests")
+endif()
+
+# --- ROCm-specific CollectiveContext tests ---
+if(HAVE_ROCM)
+    add_executable(v2_integration_collective_context_rocm
+        integration/collective/Test__CollectiveContext_ROCm.cpp
+    )
+    target_link_libraries(v2_integration_collective_context_rocm PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+        hip::host
+    )
+    add_v2_test(V2_Integration_CollectiveContext_ROCm
+        COMMAND $<TARGET_FILE:v2_integration_collective_context_rocm>
+        LABELS "V2;Integration;Collective;CollectiveContext;GPU;ROCm;RCCL;AllReduce;AllGather;Broadcast"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added CollectiveContext ROCm integration tests")
+endif()
+
+# --- Metadata / routing tests (backend-agnostic) ---
 if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_collective_context_gpu
-        integration/collective/Test__CollectiveContext_GPU.cpp
+        integration/collective/Test__CollectiveContext_GPU_Metadata.cpp
     )
     target_link_libraries(v2_integration_collective_context_gpu PRIVATE
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
     )
-    # Conditionally link GPU libraries
     if(HAVE_CUDA)
         target_link_libraries(v2_integration_collective_context_gpu PRIVATE CUDA::cudart)
     endif()
@@ -8126,10 +8173,10 @@ if(HAVE_CUDA OR HAVE_ROCM)
     endif()
     add_v2_test(V2_Integration_CollectiveContext_GPU
         COMMAND $<TARGET_FILE:v2_integration_collective_context_gpu>
-        LABELS "V2;Integration;Collective;CollectiveContext;GPU;NCCL;RCCL;AllReduce;AllGather;Broadcast"
+        LABELS "V2;Integration;Collective;CollectiveContext;GPU;Metadata;Router"
         MPI_PROCS 1
     )
-    message(STATUS "V2 Tests: Added CollectiveContext GPU integration tests")
+    message(STATUS "V2 Tests: Added CollectiveContext GPU metadata integration tests")
 endif()
 
 # =============================================================================

@@ -35,6 +35,7 @@ namespace llaminar2
             using ncclCommInitRank_t = ncclResult_t (*)(ncclComm_t *, int, ncclUniqueId, int);
             using ncclCommInitAll_t = ncclResult_t (*)(ncclComm_t *, int, const int *);
             using ncclCommDestroy_t = ncclResult_t (*)(ncclComm_t);
+            using ncclCommAbort_t = ncclResult_t (*)(ncclComm_t);
             using ncclCommCount_t = ncclResult_t (*)(const ncclComm_t, int *);
             using ncclCommCuDevice_t = ncclResult_t (*)(const ncclComm_t, int *);
             using ncclCommUserRank_t = ncclResult_t (*)(const ncclComm_t, int *);
@@ -62,6 +63,7 @@ namespace llaminar2
             ncclCommInitRank_t fp_ncclCommInitRank = nullptr;
             ncclCommInitAll_t fp_ncclCommInitAll = nullptr;
             ncclCommDestroy_t fp_ncclCommDestroy = nullptr;
+            ncclCommAbort_t fp_ncclCommAbort = nullptr; // Optional - may not exist in older RCCL
             ncclCommCount_t fp_ncclCommCount = nullptr;
             ncclCommCuDevice_t fp_ncclCommCuDevice = nullptr;
             ncclCommUserRank_t fp_ncclCommUserRank = nullptr;
@@ -156,6 +158,14 @@ namespace llaminar2
             success = success && loadSymbol(fp_ncclCommInitRank, "ncclCommInitRank");
             success = success && loadSymbol(fp_ncclCommInitAll, "ncclCommInitAll");
             success = success && loadSymbol(fp_ncclCommDestroy, "ncclCommDestroy");
+
+            // ncclCommAbort is optional - don't fail if not found
+            // It's available in RCCL 2.13+ and provides safer cleanup for unused communicators
+            if (!loadSymbol(fp_ncclCommAbort, "ncclCommAbort"))
+            {
+                LOG_DEBUG("RCCL Dynamic Loader: ncclCommAbort not available (optional, RCCL 2.13+)");
+                fp_ncclCommAbort = nullptr;
+            }
             success = success && loadSymbol(fp_ncclCommCount, "ncclCommCount");
             success = success && loadSymbol(fp_ncclCommCuDevice, "ncclCommCuDevice");
             success = success && loadSymbol(fp_ncclCommUserRank, "ncclCommUserRank");
@@ -196,6 +206,7 @@ namespace llaminar2
                 fp_ncclCommInitRank = nullptr;
                 fp_ncclCommInitAll = nullptr;
                 fp_ncclCommDestroy = nullptr;
+                fp_ncclCommAbort = nullptr;
                 fp_ncclCommCount = nullptr;
                 fp_ncclCommCuDevice = nullptr;
                 fp_ncclCommUserRank = nullptr;
@@ -268,6 +279,21 @@ namespace llaminar2
                 return ncclInternalError;
             }
             return fp_ncclCommDestroy(comm);
+        }
+
+        ncclResult_t ncclCommAbort(ncclComm_t comm)
+        {
+            if (!fp_ncclCommAbort)
+            {
+                LOG_WARN("RCCL: ncclCommAbort not available, falling back to ncclCommDestroy");
+                return ncclCommDestroy(comm);
+            }
+            return fp_ncclCommAbort(comm);
+        }
+
+        bool isCommAbortAvailable()
+        {
+            return fp_ncclCommAbort != nullptr;
         }
 
         ncclResult_t ncclCommCount(const ncclComm_t comm, int *count)

@@ -448,6 +448,58 @@ namespace llaminar2
             }
         }
 
+        void rcclCommAbortWrapper(void *comm)
+        {
+            if (comm && rccl::isLoaded())
+            {
+                rccl::ncclCommAbort(static_cast<rccl::ncclComm_t>(comm));
+            }
+        }
+
+        void rcclPrimeAndDestroyComm(void *comm, void *stream)
+        {
+            if (!comm || !rccl::isLoaded())
+            {
+                return;
+            }
+
+            // RCCL lazily allocates internal work buffers on first collective use.
+            // Both ncclCommDestroy and ncclCommAbort crash on unused communicators
+            // because the ROCm CLR tries to unmap memory that was never mapped
+            // ("Memobj map does not have ptr: 0x0"). Even ncclCommAbort on used
+            // communicators corrupts ROCm CLR state across repeated cycles.
+            //
+            // Solution: perform a trivial 1-element allreduce to force RCCL to
+            // allocate its internal buffers, then ncclCommDestroy can safely
+            // clean them up without corrupting ROCm CLR state.
+            void *prime_buf = nullptr;
+            hipError_t err = hipMalloc(&prime_buf, sizeof(float));
+            if (err == hipSuccess && prime_buf)
+            {
+                hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+                rccl::ncclComm_t rccl_comm = static_cast<rccl::ncclComm_t>(comm);
+
+                rccl::ncclResult_t r = rccl::ncclAllReduce(
+                    prime_buf, prime_buf, 1,
+                    rccl::ncclFloat, rccl::ncclSum,
+                    rccl_comm, hip_stream);
+
+                if (r == rccl::ncclSuccess && hip_stream)
+                {
+                    (void)hipStreamSynchronize(hip_stream);
+                }
+
+                (void)hipFree(prime_buf);
+                LOG_DEBUG("[RCCL] Primed single-GPU communicator for safe cleanup");
+            }
+            else
+            {
+                LOG_WARN("[RCCL] Failed to allocate prime buffer - comm destroy may crash");
+            }
+
+            rccl::ncclCommDestroy(static_cast<rccl::ncclComm_t>(comm));
+        }
+
         // =========================================================================
         // RCCL Data Type Conversion
         // =========================================================================

@@ -49,6 +49,8 @@ namespace llaminar2
         bool rcclCommInitRankWrapper(void **comm_out, int nranks, void *unique_id, int rank, std::string &error_out);
         bool rcclCommInitAllWrapper(void **comms_out, int ndevs, const int *devlist, std::string &error_out);
         void rcclCommDestroyWrapper(void *comm);
+        void rcclCommAbortWrapper(void *comm);
+        void rcclPrimeAndDestroyComm(void *comm, void *stream);
 
         // RCCL collective operations
         bool rcclAllReduceWrapper(void *sendbuff, void *recvbuff, size_t count,
@@ -319,6 +321,14 @@ namespace llaminar2
 
             is_multi_gpu_single_process_ = true;
 
+            // The coordinator owns its own streams, so the stream_ created above
+            // is not needed in multi-GPU mode. Destroy it to avoid orphaned resources.
+            if (stream_)
+            {
+                rccl_backend_detail::hipDestroyStream(stream_);
+                stream_ = nullptr;
+            }
+
             // Store device ordinals from the group
             device_ordinals_.clear();
             for (const auto &device : group.devices)
@@ -333,8 +343,6 @@ namespace llaminar2
                 last_error_ = "RCCLCoordinator initialization failed: " + coordinator_->lastError();
                 LOG_ERROR(last_error_);
                 coordinator_.reset();
-                rccl_backend_detail::hipDestroyStream(stream_);
-                stream_ = nullptr;
                 return false;
             }
 
@@ -373,9 +381,19 @@ namespace llaminar2
             is_multi_gpu_single_process_ = false;
         }
 
+        // Destroy single-process communicator.
+        // Use rcclPrimeAndDestroyComm which performs a trivial allreduce to force
+        // RCCL to allocate its internal buffers, then uses ncclCommDestroy for
+        // graceful cleanup. This avoids ROCm CLR crashes from both:
+        // - ncclCommAbort/Destroy on unused communicators ("Memobj map" error)
+        // - ncclCommAbort corrupting ROCm CLR state across repeated cycles
         if (comm_)
         {
-            rccl_backend_detail::rcclCommDestroyWrapper(comm_);
+            if (stream_)
+            {
+                rccl_backend_detail::hipSynchronizeStream(stream_);
+            }
+            rccl_backend_detail::rcclPrimeAndDestroyComm(comm_, stream_);
             comm_ = nullptr;
         }
 

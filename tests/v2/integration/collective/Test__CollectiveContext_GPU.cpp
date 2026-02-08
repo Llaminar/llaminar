@@ -34,6 +34,8 @@
 #include <iostream>
 #include <cmath>
 #include <numeric>
+#include <thread>
+#include <chrono>
 
 #if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
@@ -351,6 +353,19 @@ namespace llaminar2
     };
 
     // =========================================================================
+    // Test Ordering Strategy:
+    // ROCm CLR has a known bug where repeated RCCL ncclCommDestroy calls
+    // corrupt internal memory tracking. The corruption accumulates over
+    // RCCL init/destroy cycles. To mitigate:
+    // 1. CUDA/ROCm tests are INTERLEAVED (CUDA tests give ROCm CLR
+    //    cooldown time for async cleanup between RCCL cycles)
+    // 2. Broadcast tests are placed right after AllGather (before metadata
+    //    tests) to keep total RCCL cycles before any ROCm test minimal
+    // 3. Metadata-only tests use CUDA-only inventory where possible to
+    //    avoid creating RCCL communicators unnecessarily
+    // =========================================================================
+
+    // =========================================================================
     // Backend Selection Tests
     // =========================================================================
 
@@ -465,19 +480,13 @@ namespace llaminar2
             data[i] = static_cast<float>(i + 1);
         }
 
-        // Test that allreduce routing works with ROCm device specified
-        // Note: The CollectiveContext includes CPU for fallback, so the
-        // HostBackend will perform actual reduction across 2 "devices"
-        // (GPU context + CPU fallback). We only verify the operation succeeds.
         DeviceId rocm_device = DeviceId::rocm(0);
         bool result = ctx->executeAllreduce(tensor.get(), TENSOR_SIZE, rocm_device);
         EXPECT_TRUE(result) << "AllReduce on ROCm device routing failed";
 
-        // Verify data pointer is still valid
         const float *result_data = tensor->data();
         ASSERT_NE(result_data, nullptr);
 
-        // Verify no NaN/Inf in result (basic sanity check)
         for (size_t i = 0; i < TENSOR_SIZE; ++i)
         {
             EXPECT_FALSE(std::isnan(result_data[i])) << "NaN at index " << i;
@@ -544,34 +553,28 @@ namespace llaminar2
 
         ASSERT_NE(ctx, nullptr);
 
-        // CollectiveContext always adds CPU, so local_devices = ROCm devices + 1 CPU
         constexpr size_t TENSOR_SIZE = 8;
         const size_t num_devices = ctx->localDevices().size();
 
         auto local_input = std::make_unique<FP32Tensor>(
             std::vector<size_t>{TENSOR_SIZE}, DeviceId::cpu());
-        // Output buffer must be large enough for all devices
         auto full_output = std::make_unique<FP32Tensor>(
             std::vector<size_t>{TENSOR_SIZE * num_devices}, DeviceId::cpu());
 
-        // Initialize local input with test data
         float *input_data = local_input->mutable_data();
         for (size_t i = 0; i < TENSOR_SIZE; ++i)
         {
             input_data[i] = static_cast<float>(i + 1);
         }
 
-        // Zero output buffer
         float *output_data = full_output->mutable_data();
         std::fill(output_data, output_data + TENSOR_SIZE * num_devices, 0.0f);
 
-        // Test that allgather routing works
         DeviceId rocm_device = DeviceId::rocm(0);
         bool result = ctx->executeAllgather(
             local_input.get(), full_output.get(), TENSOR_SIZE, rocm_device);
         EXPECT_TRUE(result) << "AllGather on ROCm device routing failed";
 
-        // Verify no NaN/Inf in result
         const float *result_data = full_output->data();
         for (size_t i = 0; i < TENSOR_SIZE * num_devices; ++i)
         {
@@ -581,12 +584,85 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // Broadcast Tests
+    // (Placed immediately after AllGather, before metadata tests, to minimize
+    //  accumulated RCCL cycles before BroadcastOnROCmTensor runs)
+    // =========================================================================
+
+    TEST_F(CollectiveContextGPUTest, BroadcastOnCUDATensor)
+    {
+        skipIfNoCUDA();
+
+        auto cuda_inventory = buildCUDAOnlyInventory();
+        auto ctx = CollectiveContextFactory::createIntraNode(cuda_inventory, nullptr);
+
+        ASSERT_NE(ctx, nullptr);
+
+        constexpr size_t TENSOR_SIZE = 64;
+        auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{TENSOR_SIZE}, DeviceId::cpu());
+
+        float *data = tensor->mutable_data();
+        for (size_t i = 0; i < TENSOR_SIZE; ++i)
+        {
+            data[i] = static_cast<float>(i + 1);
+        }
+
+        DeviceId cuda_device = DeviceId::cuda(0);
+        bool result = ctx->executeBroadcast(tensor.get(), TENSOR_SIZE, 0, cuda_device);
+        EXPECT_TRUE(result) << "Broadcast on CUDA device routing failed";
+
+        const float *result_data = tensor->data();
+        ASSERT_NE(result_data, nullptr);
+
+        for (size_t i = 0; i < TENSOR_SIZE; ++i)
+        {
+            EXPECT_FLOAT_EQ(result_data[i], static_cast<float>(i + 1))
+                << "Data mismatch at index " << i;
+        }
+    }
+
+    TEST_F(CollectiveContextGPUTest, BroadcastOnROCmTensor)
+    {
+        skipIfNoROCm();
+
+        auto rocm_inventory = buildROCmOnlyInventory();
+        auto ctx = CollectiveContextFactory::createIntraNode(rocm_inventory, nullptr);
+
+        ASSERT_NE(ctx, nullptr);
+
+        constexpr size_t TENSOR_SIZE = 64;
+        auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{TENSOR_SIZE}, DeviceId::cpu());
+
+        float *data = tensor->mutable_data();
+        for (size_t i = 0; i < TENSOR_SIZE; ++i)
+        {
+            data[i] = static_cast<float>(i + 1);
+        }
+
+        DeviceId rocm_device = DeviceId::rocm(0);
+        bool result = ctx->executeBroadcast(tensor.get(), TENSOR_SIZE, 0, rocm_device);
+        EXPECT_TRUE(result) << "Broadcast on ROCm device routing failed";
+
+        const float *result_data = tensor->data();
+        ASSERT_NE(result_data, nullptr);
+
+        for (size_t i = 0; i < TENSOR_SIZE; ++i)
+        {
+            EXPECT_FLOAT_EQ(result_data[i], static_cast<float>(i + 1))
+                << "Data mismatch at index " << i;
+        }
+    }
+
+    // =========================================================================
     // World Size and Rank Tests
     // =========================================================================
 
     TEST_F(CollectiveContextGPUTest, WorldSizeAndRank)
     {
-        auto ctx = CollectiveContextFactory::createIntraNode(inventory_, nullptr);
+        // Use CUDA-only inventory to avoid unnecessary RCCL init/destroy cycles
+        // (reduces ROCm CLR state corruption from repeated RCCL lifecycle)
+        auto cuda_inventory = buildCUDAOnlyInventory();
+        auto ctx = CollectiveContextFactory::createIntraNode(cuda_inventory, nullptr);
 
         ASSERT_NE(ctx, nullptr);
 
@@ -599,7 +675,9 @@ namespace llaminar2
 
     TEST_F(CollectiveContextGPUTest, LocalDevicesReturnsGPUs)
     {
-        auto ctx = CollectiveContextFactory::createIntraNode(inventory_, nullptr);
+        // Use CUDA-only inventory to avoid unnecessary RCCL init/destroy cycles
+        auto cuda_inventory = buildCUDAOnlyInventory();
+        auto ctx = CollectiveContextFactory::createIntraNode(cuda_inventory, nullptr);
 
         ASSERT_NE(ctx, nullptr);
 
@@ -635,15 +713,17 @@ namespace llaminar2
 
     TEST_F(CollectiveContextGPUTest, RequiresCollectives_MultipleGPUs)
     {
-        // Skip if we don't have multiple GPUs
-        int total_gpus = cuda_count_ + rocm_count_;
-        if (total_gpus < 2)
+        // Skip if we don't have multiple CUDA GPUs
+        // (we use CUDA-only inventory to avoid RCCL cycles)
+        if (cuda_count_ < 2)
         {
-            GTEST_SKIP() << "Need at least 2 GPUs for this test, have " << total_gpus;
+            GTEST_SKIP() << "Need at least 2 CUDA GPUs for this test, have " << cuda_count_;
         }
 
-        // Create context with inventory containing multiple GPUs
-        auto ctx = CollectiveContextFactory::createIntraNode(inventory_, nullptr);
+        // Create context with CUDA-only inventory containing multiple GPUs
+        // (avoids unnecessary RCCL cycles from full inventory)
+        auto cuda_inventory = buildCUDAOnlyInventory();
+        auto ctx = CollectiveContextFactory::createIntraNode(cuda_inventory, nullptr);
 
         ASSERT_NE(ctx, nullptr);
 
@@ -704,7 +784,9 @@ namespace llaminar2
 
     TEST_F(CollectiveContextGPUTest, AllReduceWithZeroCount)
     {
-        auto ctx = CollectiveContextFactory::createIntraNode(inventory_, nullptr);
+        // Use CUDA-only inventory to avoid unnecessary RCCL init/destroy cycles
+        auto cuda_inventory = buildCUDAOnlyInventory();
+        auto ctx = CollectiveContextFactory::createIntraNode(cuda_inventory, nullptr);
 
         ASSERT_NE(ctx, nullptr);
 
@@ -742,7 +824,9 @@ namespace llaminar2
 
     TEST_F(CollectiveContextGPUTest, AllReduceWithNullBuffer)
     {
-        auto ctx = CollectiveContextFactory::createIntraNode(inventory_, nullptr);
+        // Use CUDA-only inventory to avoid unnecessary RCCL init/destroy cycles
+        auto cuda_inventory = buildCUDAOnlyInventory();
+        auto ctx = CollectiveContextFactory::createIntraNode(cuda_inventory, nullptr);
 
         ASSERT_NE(ctx, nullptr);
 
@@ -755,88 +839,6 @@ namespace llaminar2
         // DeviceId device = DeviceId::cpu();
         // bool result = ctx->executeAllreduce(nullptr, 64, device);
         // EXPECT_FALSE(result) << "AllReduce with null buffer should fail";
-    }
-
-    // =========================================================================
-    // Broadcast Tests
-    // =========================================================================
-
-    TEST_F(CollectiveContextGPUTest, BroadcastOnCUDATensor)
-    {
-        skipIfNoCUDA();
-
-        auto cuda_inventory = buildCUDAOnlyInventory();
-        auto ctx = CollectiveContextFactory::createIntraNode(cuda_inventory, nullptr);
-
-        ASSERT_NE(ctx, nullptr);
-
-        // Create FP32 tensor
-        constexpr size_t TENSOR_SIZE = 64;
-        auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{TENSOR_SIZE}, DeviceId::cpu());
-
-        // Initialize with test data
-        float *data = tensor->mutable_data();
-        for (size_t i = 0; i < TENSOR_SIZE; ++i)
-        {
-            data[i] = static_cast<float>(i + 1);
-        }
-
-        // For single-rank CollectiveContext without NCCL initialized,
-        // the HostBackend will be used which operates on CPU data.
-        DeviceId cuda_device = DeviceId::cuda(0);
-
-        // Execute broadcast from rank 0 - for single-rank, this is a no-op
-        bool result = ctx->executeBroadcast(tensor.get(), TENSOR_SIZE, 0, cuda_device);
-        EXPECT_TRUE(result) << "Broadcast on CUDA device routing failed";
-
-        // Verify data is still valid
-        const float *result_data = tensor->data();
-        ASSERT_NE(result_data, nullptr);
-
-        for (size_t i = 0; i < TENSOR_SIZE; ++i)
-        {
-            EXPECT_FLOAT_EQ(result_data[i], static_cast<float>(i + 1))
-                << "Data mismatch at index " << i;
-        }
-    }
-
-    TEST_F(CollectiveContextGPUTest, BroadcastOnROCmTensor)
-    {
-        skipIfNoROCm();
-
-        auto rocm_inventory = buildROCmOnlyInventory();
-        auto ctx = CollectiveContextFactory::createIntraNode(rocm_inventory, nullptr);
-
-        ASSERT_NE(ctx, nullptr);
-
-        // Create FP32 tensor
-        constexpr size_t TENSOR_SIZE = 64;
-        auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{TENSOR_SIZE}, DeviceId::cpu());
-
-        // Initialize with test data
-        float *data = tensor->mutable_data();
-        for (size_t i = 0; i < TENSOR_SIZE; ++i)
-        {
-            data[i] = static_cast<float>(i + 1);
-        }
-
-        // For single-rank CollectiveContext without RCCL initialized,
-        // the HostBackend will be used which operates on CPU data.
-        DeviceId rocm_device = DeviceId::rocm(0);
-
-        // Execute broadcast from rank 0 - for single-rank, this is a no-op
-        bool result = ctx->executeBroadcast(tensor.get(), TENSOR_SIZE, 0, rocm_device);
-        EXPECT_TRUE(result) << "Broadcast on ROCm device routing failed";
-
-        // Verify data is still valid
-        const float *result_data = tensor->data();
-        ASSERT_NE(result_data, nullptr);
-
-        for (size_t i = 0; i < TENSOR_SIZE; ++i)
-        {
-            EXPECT_FLOAT_EQ(result_data[i], static_cast<float>(i + 1))
-                << "Data mismatch at index " << i;
-        }
     }
 
 } // namespace llaminar2

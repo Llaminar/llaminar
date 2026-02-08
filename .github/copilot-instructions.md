@@ -54,7 +54,7 @@ See `.github/instructions/llaminar-architecture-v2.instructions.md` for a full-s
 ### Build Commands
 
 ```bash
-# Debug build (for development and "V2_Unit*" unit tests)
+# Debug build (for development and debugging only)
 cmake -B build_v2 -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 cmake --build build_v2 --parallel
 
@@ -62,7 +62,7 @@ cmake --build build_v2 --parallel
 cmake -B build_v2_release -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build_v2_release --parallel
 
-# Integration build (for "V2_Integration*" integration tests with snapshots + debug symbols)
+# Integration build (for "V2_Unit*" unit tests and "V2_Integration*" integration tests with snapshots + debug symbols)
 cmake -B build_v2_integration -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Integration
 cmake --build build_v2_integration --parallel
 ```
@@ -76,7 +76,7 @@ cmake --build build_v2_integration --parallel
 |------------|-------------|---------------|-----------|----------|
 | `Debug` | Off | Yes | Yes | Development, debugging |
 | `Release` | Full (-O3) | No | No | Production, benchmarks |
-| `Integration` | Full (-O3) | Yes | Yes | Integration tests, parity tests |
+| `Integration` | Full (-O3) | Yes | Yes | Unit tests, integration tests, parity tests |
 
 **CMake Options**:
 | Option | Default | Description |
@@ -272,7 +272,7 @@ LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -n 5
 
 | Test Type | Build Directory | CTest Filter |
 |-----------|-----------------|--------------|
-| Unit tests (`V2_Unit_*`) | `build_v2` | `-R "^V2_Unit_"` |
+| Unit tests (`V2_Unit_*`) | `build_v2_integration` | `-R "^V2_Unit_"` |
 | Integration tests (`V2_Integration_*`) | `build_v2_integration` | `-R "^V2_Integration_"` |
 | Parity tests (`V2_Integration_Parity_*`) | `build_v2_integration` | `-R "^V2_Integration_Parity_"` |
 | Performance tests (`V2_Perf_*`) | `build_v2_release` | `-R "^V2_Perf_"` |
@@ -283,20 +283,20 @@ Agents must NEVER artificially limit build or test parallelism:
 
 ```bash
 # ❌ WRONG - Do NOT limit parallelism
-cmake --build build_v2 -j8
-cmake --build build_v2 --parallel 4
-ctest --test-dir build_v2 -j4
+cmake --build build_v2_integration -j8
+cmake --build build_v2_integration --parallel 4
+ctest --test-dir build_v2_integration -j4
 
 # ✅ CORRECT - Use full parallelism
-cmake --build build_v2 --parallel
-ctest --test-dir build_v2 --parallel
+cmake --build build_v2_integration --parallel
+ctest --test-dir build_v2_integration --parallel
 ```
 
 **Example Commands**:
 
 ```bash
-# Unit tests (Debug build)
-ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure --parallel
+# Unit tests (Integration build - Release optimizations + debug symbols)
+ctest --test-dir build_v2_integration -R "^V2_Unit_" --output-on-failure --parallel
 
 # Integration tests (Integration build - has snapshots + debug symbols)
 ctest --test-dir build_v2_integration -R "^V2_Integration_" --output-on-failure

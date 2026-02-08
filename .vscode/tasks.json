@@ -11,7 +11,7 @@
                 "-S",
                 "${workspaceFolder}/src/v2",
                 "-G",
-                "Unix Makefiles",
+                "Ninja",
                 "-DCMAKE_BUILD_TYPE=Debug",
                 "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
                 "-DHAVE_CUDA=ON",
@@ -42,7 +42,7 @@
                 "-S",
                 "${workspaceFolder}/src/v2",
                 "-G",
-                "Unix Makefiles",
+                "Ninja",
                 "-DCMAKE_BUILD_TYPE=Release",
                 "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
                 "-DHAVE_CUDA=ON",
@@ -70,7 +70,7 @@
                 "-S",
                 "${workspaceFolder}/src/v2",
                 "-G",
-                "Unix Makefiles",
+                "Ninja",
                 "-DCMAKE_BUILD_TYPE=E2ERelease",
                 "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
                 "-DHAVE_CUDA=ON",
@@ -98,7 +98,7 @@
                 "-S",
                 "${workspaceFolder}/src/v2",
                 "-G",
-                "Unix Makefiles",
+                "Ninja",
                 "-DCMAKE_BUILD_TYPE=Integration",
                 "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
                 "-DHAVE_CUDA=ON",
@@ -305,7 +305,7 @@
             "command": "bash",
             "args": [
                 "-c",
-                "ctest --test-dir ${workspaceFolder}/build_v2 --output-on-failure --parallel && ${workspaceFolder}/.vscode/show-coverage-v2.sh"
+                "ctest --test-dir ${workspaceFolder}/build_v2_integration --output-on-failure --parallel && ${workspaceFolder}/.vscode/show-coverage-v2.sh"
             ],
             "group": "test",
             "presentation": {
@@ -316,8 +316,8 @@
                 "showReuseMessage": true,
                 "clear": false
             },
-            "dependsOn": "Debug Build",
-            "detail": "Run all V2 tests + show coverage report"
+            "dependsOn": "Integration Build",
+            "detail": "Run all V2 tests (Integration build) + show coverage report"
         },
         {
             "label": "Run Unit Tests",
@@ -325,7 +325,7 @@
             "command": "bash",
             "args": [
                 "-c",
-                "ctest --test-dir ${workspaceFolder}/build_v2 --output-on-failure --parallel -R '^V2_Unit_' && ${workspaceFolder}/.vscode/show-coverage-v2.sh"
+                "ctest --test-dir ${workspaceFolder}/build_v2_integration --output-on-failure --parallel -R '^V2_Unit_' && ${workspaceFolder}/.vscode/show-coverage-v2.sh"
             ],
             "group": "test",
             "presentation": {
@@ -336,8 +336,8 @@
                 "showReuseMessage": true,
                 "clear": false
             },
-            "dependsOn": "Debug Build",
-            "detail": "Run V2 unit tests (Debug build) + show coverage report"
+            "dependsOn": "Integration Build",
+            "detail": "Run V2 unit tests (Integration build) + show coverage report"
         },
         {
             "label": "Run Integration Tests",
@@ -416,7 +416,7 @@
             "command": "ctest",
             "args": [
                 "--test-dir",
-                "${workspaceFolder}/build_v2",
+                "${workspaceFolder}/build_v2_integration",
                 "--output-on-failure",
                 "--verbose",
                 "-R",
@@ -431,8 +431,8 @@
                 "showReuseMessage": true,
                 "clear": false
             },
-            "dependsOn": "Debug Build",
-            "detail": "Run V2 parity tests (future: tests/v2/parity/)"
+            "dependsOn": "Integration Build",
+            "detail": "Run V2 parity tests (Integration build)"
         }
     ]
 }

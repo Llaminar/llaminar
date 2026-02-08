@@ -316,6 +316,11 @@ namespace llaminar2
         std::atomic<bool> init_success_{false};
         std::atomic<bool> init_complete_{false};
 
+        // Tracks whether any collective operation was performed.
+        // Used to skip ncclCommAbort on unused communicators, which can crash
+        // in the ROCm CLR runtime ("Memobj map does not have ptr: 0x0").
+        std::atomic<bool> collective_performed_{false};
+
         // Work queue
         std::queue<std::function<void()>> work_queue_;
         mutable std::mutex queue_mutex_;

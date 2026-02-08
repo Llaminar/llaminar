@@ -540,22 +540,146 @@ namespace llaminar2
 #ifdef HAVE_RCCL
         LOG_TRACE("[RCCLCoordinator] Cleaning up RCCL resources on coordinator thread");
 
-        // Destroy RCCL communicators
-        for (int i = 0; i < static_cast<int>(comms_.size()); ++i)
+        // Step 1: Synchronize all streams before destroying any resources.
+        // This ensures any internally-queued RCCL/HIP work completes before we
+        // free communicators, events, or streams.
+        for (int i = 0; i < static_cast<int>(streams_.size()); ++i)
         {
-            if (comms_[i] != nullptr)
+            if (streams_[i] != nullptr)
             {
                 if (i < static_cast<int>(device_ordinals_.size()))
                 {
                     hipSetDevice(device_ordinals_[i]);
                 }
-                rccl::ncclCommDestroy(static_cast<rccl::ncclComm_t>(comms_[i]));
+                HIP_CHECK_VOID(hipStreamSynchronize(static_cast<hipStream_t>(streams_[i])));
+            }
+        }
+
+        // Step 2: Prime communicators if no collective was ever performed.
+        // RCCL lazily allocates internal work buffers on first collective use.
+        // Both ncclCommDestroy and ncclCommAbort on unused communicators trigger
+        // crashes in the ROCm CLR ("Memobj map does not have ptr: 0x0") because
+        // they try to unmap memory that was never mapped. Simply skipping cleanup
+        // leaks RCCL internal state, causing subsequent ncclCommInitRank calls to
+        // fail with GPU memory access faults.
+        //
+        // Solution: perform a trivial 1-element allreduce to force RCCL to allocate
+        // its internal buffers, then ncclCommDestroy can safely clean them up.
+        if (!collective_performed_.load() && !comms_.empty() && comms_[0] != nullptr)
+        {
+            LOG_DEBUG("[RCCLCoordinator] Priming " << num_devices_
+                                                   << " unused communicators with trivial allreduce before cleanup");
+
+            // Allocate tiny device buffers on each GPU
+            std::vector<void *> prime_bufs(num_devices_, nullptr);
+            bool alloc_ok = true;
+            for (int i = 0; i < num_devices_ && alloc_ok; ++i)
+            {
+                hipSetDevice(device_ordinals_[i]);
+                if (hipMalloc(&prime_bufs[i], sizeof(float)) != hipSuccess)
+                {
+                    LOG_WARN("[RCCLCoordinator] hipMalloc for prime buffer failed on device "
+                             << device_ordinals_[i]);
+                    alloc_ok = false;
+                }
+            }
+
+            if (alloc_ok)
+            {
+                // Perform trivial allreduce to initialize RCCL internal buffers
+                rccl::ncclResult_t r = rccl::ncclGroupStart();
+                if (r == rccl::ncclSuccess)
+                {
+                    bool ops_ok = true;
+                    for (int i = 0; i < num_devices_ && ops_ok; ++i)
+                    {
+                        hipSetDevice(device_ordinals_[i]);
+                        r = rccl::ncclAllReduce(
+                            prime_bufs[i], prime_bufs[i], 1,
+                            rccl::ncclFloat, rccl::ncclSum,
+                            static_cast<rccl::ncclComm_t>(comms_[i]),
+                            static_cast<hipStream_t>(streams_[i]));
+                        if (r != rccl::ncclSuccess)
+                        {
+                            LOG_WARN("[RCCLCoordinator] Prime allreduce failed: "
+                                     << rccl::ncclGetErrorString(r));
+                            ops_ok = false;
+                        }
+                    }
+                    rccl::ncclGroupEnd();
+
+                    if (ops_ok)
+                    {
+                        // Synchronize all streams to ensure the trivial op completes
+                        for (int i = 0; i < num_devices_; ++i)
+                        {
+                            hipSetDevice(device_ordinals_[i]);
+                            hipStreamSynchronize(static_cast<hipStream_t>(streams_[i]));
+                        }
+                        collective_performed_.store(true);
+                        LOG_DEBUG("[RCCLCoordinator] Communicators primed successfully");
+                    }
+                }
+            }
+
+            // Free temporary buffers
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                if (prime_bufs[i] != nullptr)
+                {
+                    hipSetDevice(device_ordinals_[i]);
+                    hipFree(prime_bufs[i]);
+                }
+            }
+        }
+
+        // Step 3: Destroy RCCL communicators.
+        // After priming (Step 2), all communicators have initialized internal
+        // buffers. We use ncclCommDestroy (graceful) rather than ncclCommAbort
+        // (aggressive) because ncclCommAbort tears down internal RCCL/ROCm CLR
+        // tracking structures in a way that leaves the HIP runtime in an
+        // inconsistent state, causing "Memobj map does not have ptr" errors
+        // on subsequent communicator creation.
+        //
+        // NOTE: Even ncclCommDestroy causes slight ROCm CLR state accumulation
+        // over many repeated init/destroy cycles (a known ROCm CLR bug). In
+        // production inference this is not an issue (single lifecycle). In tests,
+        // this can cause crashes after ~14+ cycles. See test fixture caching for
+        // the test-side mitigation.
+        if (collective_performed_.load())
+        {
+            for (int i = 0; i < static_cast<int>(comms_.size()); ++i)
+            {
+                if (comms_[i] != nullptr)
+                {
+                    if (i < static_cast<int>(device_ordinals_.size()))
+                    {
+                        hipSetDevice(device_ordinals_[i]);
+                    }
+                    rccl::ncclResult_t r = rccl::ncclCommDestroy(static_cast<rccl::ncclComm_t>(comms_[i]));
+                    if (r != rccl::ncclSuccess)
+                    {
+                        LOG_WARN("[RCCLCoordinator] ncclCommDestroy failed for device "
+                                 << (i < static_cast<int>(device_ordinals_.size()) ? device_ordinals_[i] : -1)
+                                 << ": " << rccl::ncclGetErrorString(r));
+                    }
+                    comms_[i] = nullptr;
+                }
+            }
+        }
+        else
+        {
+            // Priming failed - last resort: null pointers (leaks RCCL state but avoids crash)
+            LOG_WARN("[RCCLCoordinator] Cannot properly clean up communicators - "
+                     "priming failed, nulling pointers (may leak RCCL state)");
+            for (int i = 0; i < static_cast<int>(comms_.size()); ++i)
+            {
                 comms_[i] = nullptr;
             }
         }
         comms_.clear();
 
-        // Destroy completion events
+        // Step 3: Destroy completion events
         for (int i = 0; i < static_cast<int>(completion_events_.size()); ++i)
         {
             if (completion_events_[i] != nullptr)
@@ -570,7 +694,7 @@ namespace llaminar2
         }
         completion_events_.clear();
 
-        // Destroy streams
+        // Step 4: Destroy streams (after comms and events are already gone)
         for (int i = 0; i < static_cast<int>(streams_.size()); ++i)
         {
             if (streams_[i] != nullptr)
@@ -1000,6 +1124,7 @@ namespace llaminar2
         }
 
         LOG_TRACE("[RCCLCoordinator] AllreduceMulti completed: " << count << " elements");
+        collective_performed_.store(true);
         return true;
 #else
         last_error_ = "RCCL not available";
@@ -1073,6 +1198,7 @@ namespace llaminar2
         }
 
         LOG_TRACE("[RCCLCoordinator] AllgatherMulti completed: " << send_count << " elements per device");
+        collective_performed_.store(true);
         return true;
 #else
         last_error_ = "RCCL not available";
@@ -1146,6 +1272,7 @@ namespace llaminar2
         }
 
         LOG_TRACE("[RCCLCoordinator] BroadcastMulti completed: " << count << " elements from root " << root);
+        collective_performed_.store(true);
         return true;
 #else
         last_error_ = "RCCL not available";
@@ -1220,6 +1347,7 @@ namespace llaminar2
         }
 
         LOG_TRACE("[RCCLCoordinator] ReduceScatterMulti completed: " << recv_count << " elements per device");
+        collective_performed_.store(true);
         return true;
 #else
         last_error_ = "RCCL not available";
@@ -1335,6 +1463,7 @@ namespace llaminar2
         LOG_DEBUG("[RCCLCoordinator] Copy " << (wait_for_completion ? "completed" : "enqueued")
                                             << ": " << bytes << " bytes from device "
                                             << device_ordinals_[src_device_idx] << " to device " << device_ordinals_[dst_device_idx]);
+        collective_performed_.store(true);
         return true;
 #else
         (void)dst_ptr;

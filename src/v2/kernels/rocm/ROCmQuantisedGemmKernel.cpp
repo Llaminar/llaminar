@@ -241,52 +241,6 @@ namespace llaminar2
             // Defined in ROCmGemvKernel.hip
             // =========================================================================
 
-            // Direct FP32×INT8 GEMV: output[N] = A[K] × B[K×N] × scale_B[N]
-            bool rocmGemv_int8_fp32(
-                const float *d_A,       // [K] FP32 activation vector
-                const int8_t *d_B,      // [K × N] INT8 weights, row-major
-                const float *d_scale_B, // [N] per-column weight scales
-                float *d_C,             // [N] FP32 output vector
-                int N, int K,
-                int device_id);
-
-            // Direct FP16 GEMV: output[N] = A[K] × B[K×N] × scale_B[N]
-            bool rocmGemv_int8_fp16(
-                const float *d_A,       // [K] FP32 activation vector
-                const int8_t *d_B,      // [K × N] INT8 weights, row-major
-                const float *d_scale_B, // [N] per-column weight scales
-                float *d_C,             // [N] FP32 output vector
-                int N, int K,
-                int device_id);
-
-            // Direct FP32×INT8 GEMV with fused bias: output[N] = A[K] × B[K×N] × scale_B[N] + bias[N]
-            bool rocmGemv_int8_fp32_bias(
-                const float *d_A,       // [K] FP32 activation vector
-                const int8_t *d_B,      // [K × N] INT8 weights, row-major
-                const float *d_scale_B, // [N] per-column weight scales
-                const float *d_bias,    // [N] bias vector
-                float *d_C,             // [N] FP32 output vector
-                int N, int K,
-                int device_id);
-
-            // Direct FP16 GEMV with fused bias
-            bool rocmGemv_int8_fp16_bias(
-                const float *d_A,       // [K] FP32 activation vector
-                const int8_t *d_B,      // [K × N] INT8 weights, row-major
-                const float *d_scale_B, // [N] per-column weight scales
-                const float *d_bias,    // [N] bias vector
-                float *d_C,             // [N] FP32 output vector
-                int N, int K,
-                int device_id);
-
-            // INT8×INT8 GEMV: output_int32[N] = A_int8[K] × B_int8[K×N]
-            bool rocmGemv_int8_int8_int32(
-                const int8_t *d_A_int8, // [K] INT8 activation vector
-                const int8_t *d_B_int8, // [K × N] INT8 weights, row-major
-                int32_t *d_C_int32,     // [N] INT32 output vector
-                int N, int K,
-                int device_id);
-
             // INT8×INT8 GEMV with VNNI-packed weights: B is [K/4 × N × 4]
             bool rocmGemv_int8_int8_int32_vnni(
                 const int8_t *d_A_int8,      // [K] INT8 activation vector
@@ -785,9 +739,6 @@ namespace llaminar2
             // =========================================================================
             if (use_gpu_path && m == 1)
             {
-                const auto &env = debugEnv();
-                const std::string &gemv_mode = env.rocm.gemv_mode;
-
                 // Ensure weights are on device
                 ensureWeightsConverted();
 
@@ -816,132 +767,43 @@ namespace llaminar2
                     }
 
                     LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] GEMV fast path M=1 N=" << n << " K=" << k
-                                                                                                 << " mode=" << gemv_mode << (d_bias ? " +bias" : ""));
+                                                                                                 << (d_bias ? " +bias" : ""));
 
-                    bool result = false;
-                    if (gemv_mode == "fp16")
+                    // INT8 VNNI GEMV (only path — fp16/fp32 modes removed)
+                    if (!impl_)
                     {
-                        // fp16 GEMV needs row-major weights — repack from VNNI into scratch
-                        if (!impl_)
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] FP16 GEMV requires impl_ buffers");
-                            return false;
-                        }
-                        validateWorkspace();
-                        if (!rocmGemv_repackVNNI_to_rowmajor(
-                                d_weights_vnni, impl_->d_B_rowmajor_scratch,
-                                n, k, rocm_device_id_))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] FP16 GEMV: VNNI→row-major repack failed");
-                            return false;
-                        }
-                        if (d_bias)
-                        {
-                            result = rocmGemv_int8_fp16_bias(
-                                d_input, impl_->d_B_rowmajor_scratch, d_scales_B, d_bias,
-                                d_output, n, k, rocm_device_id_);
-                        }
-                        else
-                        {
-                            result = rocmGemv_int8_fp16(
-                                d_input, impl_->d_B_rowmajor_scratch, d_scales_B,
-                                d_output, n, k, rocm_device_id_);
-                        }
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV requires impl_ buffers");
+                        return false;
                     }
-                    else if (gemv_mode == "int8")
+
+                    validateWorkspace();
+                    if (!rocmQuantGemm_quantizeActivations(
+                            d_input, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_))
                     {
-                        if (!impl_)
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV requires impl_ buffers");
-                            return false;
-                        }
-
-                        validateWorkspace();
-                        if (!rocmQuantGemm_quantizeActivations(
-                                d_input, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Activation quantization failed");
-                            return false;
-                        }
-
-                        const bool use_vnni = (env.rocm.gemv_layout == "vnni") &&
-                                              (d_weights_vnni != nullptr) &&
-                                              ((k % 4) == 0);
-
-                        if (use_vnni)
-                        {
-                            // Hot path: flat VNNI GEMV (no repack needed)
-                            if (!rocmGemv_int8_int8_int32_vnni(
-                                    impl_->d_A_int8, d_weights_vnni, impl_->d_C_int32,
-                                    n, k, rocm_device_id_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV (VNNI) failed");
-                                return false;
-                            }
-                        }
-                        else
-                        {
-                            // Fallback: repack VNNI→row-major for non-VNNI int8 GEMV
-                            if (!rocmGemv_repackVNNI_to_rowmajor(
-                                    d_weights_vnni, impl_->d_B_rowmajor_scratch,
-                                    n, k, rocm_device_id_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV fallback: VNNI→row-major repack failed");
-                                return false;
-                            }
-                            if (!rocmGemv_int8_int8_int32(
-                                    impl_->d_A_int8, impl_->d_B_rowmajor_scratch, impl_->d_C_int32,
-                                    n, k, rocm_device_id_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV failed");
-                                return false;
-                            }
-                        }
-
-                        const float *d_existing = (beta != 0.0f) ? d_output : nullptr;
-                        if (!rocmQuantGemm_applyScaling(
-                                impl_->d_C_int32, d_output, impl_->d_scales_A, d_scales_B,
-                                m, n, alpha, beta, d_existing, d_bias, rocm_device_id_))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV scaling failed");
-                            return false;
-                        }
-
-                        result = true;
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Activation quantization failed");
+                        return false;
                     }
-                    else
+
+                    if (!rocmGemv_int8_int8_int32_vnni(
+                            impl_->d_A_int8, d_weights_vnni, impl_->d_C_int32,
+                            n, k, rocm_device_id_))
                     {
-                        // fp32 GEMV needs row-major weights — repack from VNNI into scratch
-                        if (!impl_)
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] FP32 GEMV requires impl_ buffers");
-                            return false;
-                        }
-                        validateWorkspace();
-                        if (!rocmGemv_repackVNNI_to_rowmajor(
-                                d_weights_vnni, impl_->d_B_rowmajor_scratch,
-                                n, k, rocm_device_id_))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] FP32 GEMV: VNNI→row-major repack failed");
-                            return false;
-                        }
-                        if (d_bias)
-                        {
-                            result = rocmGemv_int8_fp32_bias(
-                                d_input, impl_->d_B_rowmajor_scratch, d_scales_B, d_bias,
-                                d_output, n, k, rocm_device_id_);
-                        }
-                        else
-                        {
-                            result = rocmGemv_int8_fp32(
-                                d_input, impl_->d_B_rowmajor_scratch, d_scales_B,
-                                d_output, n, k, rocm_device_id_);
-                        }
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV (VNNI) failed");
+                        return false;
+                    }
+
+                    const float *d_existing = (beta != 0.0f) ? d_output : nullptr;
+                    if (!rocmQuantGemm_applyScaling(
+                            impl_->d_C_int32, d_output, impl_->d_scales_A, d_scales_B,
+                            m, n, alpha, beta, d_existing, d_bias, rocm_device_id_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV scaling failed");
+                        return false;
                     }
 
                     if (ws && ws != saved_workspace)
                         workspace_ = saved_workspace;
-                    return result;
+                    return true;
                 }
                 // Fall through to CK path if weight pointers unavailable
             }
@@ -2256,101 +2118,40 @@ namespace llaminar2
             // DECODE FAST PATH: M=1 GEMV
             if (m == 1)
             {
-                const auto &env = debugEnv();
-                const std::string &gemv_mode = env.rocm.gemv_mode;
-
                 ensureWeightsConverted();
                 // Option B: weights are VNNI-only on device
                 int8_t *d_vnni = impl_ ? impl_->d_weights_int8_vnni : nullptr;
                 float *d_s = packed_ ? packed_->d_scales : (impl_ ? impl_->d_scales_B : nullptr);
                 if (d_vnni && d_s)
                 {
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] GEMV fast path M=1 mode=" << gemv_mode);
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] GEMV fast path M=1");
 
-                    if (gemv_mode == "fp16")
-                    {
-                        // fp16 needs row-major — repack into scratch
-                        if (!impl_)
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] FP16 GEMV requires impl_ buffers");
-                            return false;
-                        }
-                        validateWorkspace();
-                        if (!rocmGemv_repackVNNI_to_rowmajor(d_vnni, impl_->d_B_rowmajor_scratch, n, k, rocm_device_id_))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] FP16 GEMV: repack failed");
-                            return false;
-                        }
-                        return rocmGemv_int8_fp16(d_A, impl_->d_B_rowmajor_scratch, d_s, d_C, n, k, rocm_device_id_);
-                    }
-
-                    if (gemv_mode == "int8")
-                    {
-                        if (!impl_)
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 GEMV requires impl_ buffers");
-                            return false;
-                        }
-
-                        validateWorkspace();
-                        if (!rocmQuantGemm_quantizeActivations(
-                                d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] Activation quantization failed");
-                            return false;
-                        }
-
-                        const bool use_vnni = (env.rocm.gemv_layout == "vnni") &&
-                                              (d_vnni != nullptr) &&
-                                              ((k % 4) == 0);
-
-                        if (use_vnni)
-                        {
-                            // Hot path: flat VNNI GEMV (no repack needed)
-                            if (!rocmGemv_int8_int8_int32_vnni(
-                                    impl_->d_A_int8, d_vnni, impl_->d_C_int32,
-                                    n, k, rocm_device_id_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 GEMV (VNNI) failed");
-                                return false;
-                            }
-                        }
-                        else
-                        {
-                            // Fallback: repack VNNI→row-major
-                            if (!rocmGemv_repackVNNI_to_rowmajor(d_vnni, impl_->d_B_rowmajor_scratch, n, k, rocm_device_id_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 GEMV fallback: repack failed");
-                                return false;
-                            }
-                            if (!rocmGemv_int8_int8_int32(
-                                    impl_->d_A_int8, impl_->d_B_rowmajor_scratch, impl_->d_C_int32,
-                                    n, k, rocm_device_id_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 GEMV failed");
-                                return false;
-                            }
-                        }
-
-                        const float *d_existing = (beta != 0.0f) ? d_C : nullptr;
-                        return rocmQuantGemm_applyScaling(
-                            impl_->d_C_int32, d_C, impl_->d_scales_A, d_s,
-                            m, n, alpha, beta, d_existing, nullptr, rocm_device_id_);
-                    }
-
-                    // fp32 GEMV: repack into scratch
                     if (!impl_)
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] FP32 GEMV requires impl_ buffers");
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 GEMV requires impl_ buffers");
                         return false;
                     }
+
                     validateWorkspace();
-                    if (!rocmGemv_repackVNNI_to_rowmajor(d_vnni, impl_->d_B_rowmajor_scratch, n, k, rocm_device_id_))
+                    if (!rocmQuantGemm_quantizeActivations(
+                            d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_))
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] FP32 GEMV: repack failed");
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] Activation quantization failed");
                         return false;
                     }
-                    return rocmGemv_int8_fp32(d_A, impl_->d_B_rowmajor_scratch, d_s, d_C, n, k, rocm_device_id_);
+
+                    if (!rocmGemv_int8_int8_int32_vnni(
+                            impl_->d_A_int8, d_vnni, impl_->d_C_int32,
+                            n, k, rocm_device_id_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 GEMV (VNNI) failed");
+                        return false;
+                    }
+
+                    const float *d_existing = (beta != 0.0f) ? d_C : nullptr;
+                    return rocmQuantGemm_applyScaling(
+                        impl_->d_C_int32, d_C, impl_->d_scales_A, d_s,
+                        m, n, alpha, beta, d_existing, nullptr, rocm_device_id_);
                 }
             }
 
@@ -2421,101 +2222,40 @@ namespace llaminar2
             // DECODE FAST PATH: M=1 GEMV with fused bias
             if (m == 1)
             {
-                const auto &env = debugEnv();
-                const std::string &gemv_mode = env.rocm.gemv_mode;
-
                 ensureWeightsConverted();
                 // Option B: weights are VNNI-only on device
                 int8_t *d_vnni = impl_ ? impl_->d_weights_int8_vnni : nullptr;
                 float *d_s = packed_ ? packed_->d_scales : (impl_ ? impl_->d_scales_B : nullptr);
                 if (d_vnni && d_s)
                 {
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] GEMV fast path M=1 +bias mode=" << gemv_mode);
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] GEMV fast path M=1 +bias");
 
-                    if (gemv_mode == "fp16")
-                    {
-                        // fp16 needs row-major — repack into scratch
-                        if (!impl_)
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] FP16 GEMV requires impl_ buffers");
-                            return false;
-                        }
-                        validateWorkspace();
-                        if (!rocmGemv_repackVNNI_to_rowmajor(d_vnni, impl_->d_B_rowmajor_scratch, n, k, rocm_device_id_))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] FP16 GEMV: repack failed");
-                            return false;
-                        }
-                        return rocmGemv_int8_fp16_bias(d_A, impl_->d_B_rowmajor_scratch, d_s, d_bias, d_C, n, k, rocm_device_id_);
-                    }
-
-                    if (gemv_mode == "int8")
-                    {
-                        if (!impl_)
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 GEMV requires impl_ buffers");
-                            return false;
-                        }
-
-                        validateWorkspace();
-                        if (!rocmQuantGemm_quantizeActivations(
-                                d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Activation quantization failed");
-                            return false;
-                        }
-
-                        const bool use_vnni = (env.rocm.gemv_layout == "vnni") &&
-                                              (d_vnni != nullptr) &&
-                                              ((k % 4) == 0);
-
-                        if (use_vnni)
-                        {
-                            // Hot path: flat VNNI GEMV (no repack needed)
-                            if (!rocmGemv_int8_int8_int32_vnni(
-                                    impl_->d_A_int8, d_vnni, impl_->d_C_int32,
-                                    n, k, rocm_device_id_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 GEMV (VNNI) failed");
-                                return false;
-                            }
-                        }
-                        else
-                        {
-                            // Fallback: repack VNNI→row-major
-                            if (!rocmGemv_repackVNNI_to_rowmajor(d_vnni, impl_->d_B_rowmajor_scratch, n, k, rocm_device_id_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 GEMV fallback: repack failed");
-                                return false;
-                            }
-                            if (!rocmGemv_int8_int8_int32(
-                                    impl_->d_A_int8, impl_->d_B_rowmajor_scratch, impl_->d_C_int32,
-                                    n, k, rocm_device_id_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 GEMV failed");
-                                return false;
-                            }
-                        }
-
-                        const float *d_existing = (beta != 0.0f) ? d_C : nullptr;
-                        return rocmQuantGemm_applyScaling(
-                            impl_->d_C_int32, d_C, impl_->d_scales_A, d_s,
-                            m, n, alpha, beta, d_existing, d_bias, rocm_device_id_);
-                    }
-
-                    // fp32 GEMV: repack into scratch
                     if (!impl_)
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] FP32 GEMV requires impl_ buffers");
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 GEMV requires impl_ buffers");
                         return false;
                     }
+
                     validateWorkspace();
-                    if (!rocmGemv_repackVNNI_to_rowmajor(d_vnni, impl_->d_B_rowmajor_scratch, n, k, rocm_device_id_))
+                    if (!rocmQuantGemm_quantizeActivations(
+                            d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_))
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] FP32 GEMV: repack failed");
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Activation quantization failed");
                         return false;
                     }
-                    return rocmGemv_int8_fp32_bias(d_A, impl_->d_B_rowmajor_scratch, d_s, d_bias, d_C, n, k, rocm_device_id_);
+
+                    if (!rocmGemv_int8_int8_int32_vnni(
+                            impl_->d_A_int8, d_vnni, impl_->d_C_int32,
+                            n, k, rocm_device_id_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 GEMV (VNNI) failed");
+                        return false;
+                    }
+
+                    const float *d_existing = (beta != 0.0f) ? d_C : nullptr;
+                    return rocmQuantGemm_applyScaling(
+                        impl_->d_C_int32, d_C, impl_->d_scales_A, d_s,
+                        m, n, alpha, beta, d_existing, d_bias, rocm_device_id_);
                 }
             }
 

@@ -119,6 +119,27 @@ namespace llaminar2
         ncclResult_t ncclCommInitRank(ncclComm_t *comm, int nranks, ncclUniqueId commId, int rank);
         ncclResult_t ncclCommInitAll(ncclComm_t *comms, int ndev, const int *devlist);
         ncclResult_t ncclCommDestroy(ncclComm_t comm);
+
+        /**
+         * @brief Abort and destroy a communicator without coordinated shutdown
+         *
+         * Unlike ncclCommDestroy, ncclCommAbort does not require coordination
+         * with other ranks and safely handles partially-initialized or unused
+         * communicators. This avoids null-pointer dereferences in the ROCm CLR
+         * runtime when destroying communicators that never performed operations.
+         *
+         * @param comm Communicator to abort (may be unused/partially initialized)
+         * @return ncclSuccess on success
+         * @note Optional symbol - may not be available in older RCCL versions.
+         *       Use isCommAbortAvailable() to check before calling.
+         */
+        ncclResult_t ncclCommAbort(ncclComm_t comm);
+
+        /**
+         * @brief Check if ncclCommAbort is available in the loaded RCCL library
+         */
+        bool isCommAbortAvailable();
+
         ncclResult_t ncclCommCount(const ncclComm_t comm, int *count);
         ncclResult_t ncclCommCuDevice(const ncclComm_t comm, int *device);
         ncclResult_t ncclCommUserRank(const ncclComm_t comm, int *rank);

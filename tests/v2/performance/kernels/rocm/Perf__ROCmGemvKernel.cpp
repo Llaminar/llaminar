@@ -35,36 +35,7 @@
 #include <hip/hip_runtime.h>
 #endif
 
-// GEMV kernel C API
-extern "C"
-{
-    bool rocmGemv_int8_fp32(
-        const float *d_A,
-        const int8_t *d_B,
-        const float *d_scale_B,
-        float *d_C,
-        int N, int K,
-        int device_id);
-
-    bool rocmGemv_int8_fp16(
-        const float *d_A,
-        const int8_t *d_B,
-        const float *d_scale_B,
-        float *d_C,
-        int N, int K,
-        int device_id);
-
-    bool rocmGemv_int8_fp32_bias(
-        const float *d_A,
-        const int8_t *d_B,
-        const float *d_scale_B,
-        const float *d_bias,
-        float *d_C,
-        int N, int K,
-        int device_id);
-}
-
-// CK GEMM kernel C API (for A/B comparison)
+// GEMV + CK GEMM kernel C API
 extern "C"
 {
     bool rocmQuantGemm_quantizeActivations(
@@ -85,58 +56,11 @@ extern "C"
         const float *d_bias,
         int rocm_device_id);
 
-    bool rocmGemv_int8_int8_int32(
-        const int8_t *d_A_int8,
-        const int8_t *d_B_int8,
-        int32_t *d_C_int32,
-        int N, int K,
-        int device_id);
-
     bool rocmGemv_int8_int8_int32_vnni(
         const int8_t *d_A_int8,
         const int8_t *d_B_int8_vnni,
         int32_t *d_C_int32,
         int N, int K,
-        int device_id);
-
-    bool rocmGemv_int8_int8_ffn_down_variant(
-        const int8_t *d_A_int8,
-        const int8_t *d_B_int8,
-        int32_t *d_C_int32,
-        int N, int K,
-        int tile_n, int split,
-        int device_id);
-
-    bool rocmGemv_int8_int8_ffn_down_vnni_variant(
-        const int8_t *d_A_int8,
-        const int8_t *d_B_int8_vnni,
-        int32_t *d_C_int32,
-        int N, int K,
-        int tile_n, int split,
-        int device_id);
-
-    bool rocmGemv_int8_int8_vnni_kpar_variant(
-        const int8_t *d_A_int8,
-        const int8_t *d_B_int8_vnni,
-        int32_t *d_C_int32,
-        int N, int K,
-        int tile_n, int split,
-        int device_id);
-
-    bool rocmGemv_int8_int8_vnni_wide_vec4_variant(
-        const int8_t *d_A_int8,
-        const int8_t *d_B_int8_vnni,
-        int32_t *d_C_int32,
-        int N, int K,
-        int tile_n,
-        int device_id);
-
-    bool rocmGemv_int8_int8_vnni_wide2_variant(
-        const int8_t *d_A_int8,
-        const int8_t *d_B_int8_vnni,
-        int32_t *d_C_int32,
-        int N, int K,
-        int tile_n,
         int device_id);
 
     bool rocmQuantGemm_executeTwoKernel_cached(
@@ -252,13 +176,6 @@ namespace
         std::string device_name_;
         bool has_device_ = false;
 
-        enum class GemvMode
-        {
-            FP32,
-            FP16,
-            INT8,
-        };
-
         void SetUp() override
         {
 #ifdef HAVE_ROCM
@@ -274,40 +191,8 @@ namespace
 #endif
         }
 
-        static GemvMode getGemvModeFromEnv()
-        {
-            const char *env = std::getenv("LLAMINAR_ROCM_GEMV_MODE");
-            if (!env)
-                return GemvMode::FP32;
-
-            std::string mode(env);
-            std::transform(mode.begin(), mode.end(), mode.begin(),
-                           [](unsigned char c)
-                           { return static_cast<char>(std::tolower(c)); });
-
-            if (mode == "fp16")
-                return GemvMode::FP16;
-            if (mode == "int8")
-                return GemvMode::INT8;
-            return GemvMode::FP32;
-        }
-
-        static const char *gemvModeName(GemvMode mode)
-        {
-            switch (mode)
-            {
-            case GemvMode::FP16:
-                return "fp16";
-            case GemvMode::INT8:
-                return "int8";
-            case GemvMode::FP32:
-            default:
-                return "fp32";
-            }
-        }
-
         // =========================================================================
-        // CPU reference: exact same computation as the GEMV kernel
+        // CPU reference: FP32×INT8 reference (used to validate INT8 VNNI path)
         //
         //   output[n] = scale_B[n] * sum_k( A[k] * B_int8[k * N + n] )
         //
@@ -396,7 +281,7 @@ namespace
             r.max_abs_error = max_abs_err;
             r.mean_abs_error = sum_abs_err / N;
             r.cosine_sim = dot / (std::sqrt(norm_a) * std::sqrt(norm_b) + 1e-12);
-            r.pass = (r.cosine_sim > 0.9999); // very tight — same math, just FP rounding
+            r.pass = (r.cosine_sim > 0.998); // slightly relaxed — GPU quantizes activations to INT8
             return r;
         }
 
@@ -433,7 +318,6 @@ namespace
 
         BenchSplitResult benchmarkGemvSplit(
             int N, int K,
-            GemvMode mode,
             int warmup_runs = 5,
             int bench_runs = 20)
         {
@@ -459,66 +343,36 @@ namespace
             for (auto &v : h_scale)
                 v = dist_s(rng);
 
+            // --- Pack VNNI weights ---
+            packVnniWeights(h_B, N, K, h_B_vnni);
+
             // --- Allocate device memory ---
             float *d_A = nullptr, *d_scale = nullptr, *d_C = nullptr;
-            int8_t *d_B = nullptr;
             int8_t *d_B_vnni = nullptr;
             int8_t *d_A_int8 = nullptr;
             float *d_scale_A = nullptr;
             int32_t *d_C_int32 = nullptr;
 
             hipMalloc(&d_A, K * sizeof(float));
-            hipMalloc(&d_B, static_cast<size_t>(K) * N * sizeof(int8_t));
             hipMalloc(&d_scale, N * sizeof(float));
             hipMalloc(&d_C, N * sizeof(float));
-
-            if (mode == GemvMode::INT8)
-            {
-                hipMalloc(&d_A_int8, K * sizeof(int8_t));
-                hipMalloc(&d_scale_A, sizeof(float));
-                hipMalloc(&d_C_int32, N * sizeof(int32_t));
-
-                packVnniWeights(h_B, N, K, h_B_vnni);
-                if (!h_B_vnni.empty())
-                {
-                    hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
-                }
-            }
+            hipMalloc(&d_A_int8, K * sizeof(int8_t));
+            hipMalloc(&d_scale_A, sizeof(float));
+            hipMalloc(&d_C_int32, N * sizeof(int32_t));
+            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
 
             hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
-            hipMemcpy(d_B, h_B.data(), static_cast<size_t>(K) * N * sizeof(int8_t), hipMemcpyHostToDevice);
-            if (d_B_vnni)
-            {
-                hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
-            }
+            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
             hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
             hipDeviceSynchronize();
 
-            // --- Warmup ---
+            // --- Warmup (INT8 VNNI pipeline) ---
             for (int i = 0; i < warmup_runs; ++i)
             {
-                if (mode == GemvMode::FP16)
-                {
-                    rocmGemv_int8_fp16(d_A, d_B, d_scale, d_C, N, K, device_id_);
-                }
-                else if (mode == GemvMode::INT8)
-                {
-                    rocmQuantGemm_quantizeActivations(d_A, d_A_int8, d_scale_A, 1, K, device_id_);
-                    if (d_B_vnni)
-                    {
-                        rocmGemv_int8_int8_int32_vnni(d_A_int8, d_B_vnni, d_C_int32, N, K, device_id_);
-                    }
-                    else
-                    {
-                        rocmGemv_int8_int8_int32(d_A_int8, d_B, d_C_int32, N, K, device_id_);
-                    }
-                    rocmQuantGemm_applyScaling(d_C_int32, d_C, d_scale_A, d_scale,
-                                               1, N, 1.0f, 0.0f, nullptr, nullptr, device_id_);
-                }
-                else
-                {
-                    rocmGemv_int8_fp32(d_A, d_B, d_scale, d_C, N, K, device_id_);
-                }
+                rocmQuantGemm_quantizeActivations(d_A, d_A_int8, d_scale_A, 1, K, device_id_);
+                rocmGemv_int8_int8_int32_vnni(d_A_int8, d_B_vnni, d_C_int32, N, K, device_id_);
+                rocmQuantGemm_applyScaling(d_C_int32, d_C, d_scale_A, d_scale,
+                                           1, N, 1.0f, 0.0f, nullptr, nullptr, device_id_);
             }
             hipDeviceSynchronize();
 
@@ -539,15 +393,12 @@ namespace
             hipEvent_t scale_start, scale_stop;
             hipEventCreate(&total_start);
             hipEventCreate(&total_stop);
+            hipEventCreate(&quant_start);
+            hipEventCreate(&quant_stop);
             hipEventCreate(&gemv_start);
             hipEventCreate(&gemv_stop);
-            if (mode == GemvMode::INT8)
-            {
-                hipEventCreate(&quant_start);
-                hipEventCreate(&quant_stop);
-                hipEventCreate(&scale_start);
-                hipEventCreate(&scale_stop);
-            }
+            hipEventCreate(&scale_start);
+            hipEventCreate(&scale_stop);
 
             for (int i = 0; i < bench_runs; ++i)
             {
@@ -559,55 +410,32 @@ namespace
                 float gemv_ms = 0.0f;
                 float scale_ms = 0.0f;
 
-                if (mode == GemvMode::FP16)
+                // Step 1: Quantize activations FP32 → INT8
+                hipEventRecord(quant_start, 0);
+                ok = rocmQuantGemm_quantizeActivations(d_A, d_A_int8, d_scale_A, 1, K, device_id_);
+                hipEventRecord(quant_stop, 0);
+                hipEventSynchronize(quant_stop);
+                hipEventElapsedTime(&quant_ms, quant_start, quant_stop);
+
+                // Step 2: INT8 VNNI GEMV
+                if (ok)
                 {
                     hipEventRecord(gemv_start, 0);
-                    ok = rocmGemv_int8_fp16(d_A, d_B, d_scale, d_C, N, K, device_id_);
+                    ok = rocmGemv_int8_int8_int32_vnni(d_A_int8, d_B_vnni, d_C_int32, N, K, device_id_);
                     hipEventRecord(gemv_stop, 0);
                     hipEventSynchronize(gemv_stop);
                     hipEventElapsedTime(&gemv_ms, gemv_start, gemv_stop);
                 }
-                else if (mode == GemvMode::INT8)
-                {
-                    hipEventRecord(quant_start, 0);
-                    ok = rocmQuantGemm_quantizeActivations(d_A, d_A_int8, d_scale_A, 1, K, device_id_);
-                    hipEventRecord(quant_stop, 0);
-                    hipEventSynchronize(quant_stop);
-                    hipEventElapsedTime(&quant_ms, quant_start, quant_stop);
 
-                    if (ok)
-                    {
-                        hipEventRecord(gemv_start, 0);
-                        if (d_B_vnni)
-                        {
-                            ok = rocmGemv_int8_int8_int32_vnni(d_A_int8, d_B_vnni, d_C_int32, N, K, device_id_);
-                        }
-                        else
-                        {
-                            ok = rocmGemv_int8_int8_int32(d_A_int8, d_B, d_C_int32, N, K, device_id_);
-                        }
-                        hipEventRecord(gemv_stop, 0);
-                        hipEventSynchronize(gemv_stop);
-                        hipEventElapsedTime(&gemv_ms, gemv_start, gemv_stop);
-                    }
-
-                    if (ok)
-                    {
-                        hipEventRecord(scale_start, 0);
-                        ok = rocmQuantGemm_applyScaling(d_C_int32, d_C, d_scale_A, d_scale,
-                                                        1, N, 1.0f, 0.0f, nullptr, nullptr, device_id_);
-                        hipEventRecord(scale_stop, 0);
-                        hipEventSynchronize(scale_stop);
-                        hipEventElapsedTime(&scale_ms, scale_start, scale_stop);
-                    }
-                }
-                else
+                // Step 3: Apply scaling INT32 → FP32
+                if (ok)
                 {
-                    hipEventRecord(gemv_start, 0);
-                    ok = rocmGemv_int8_fp32(d_A, d_B, d_scale, d_C, N, K, device_id_);
-                    hipEventRecord(gemv_stop, 0);
-                    hipEventSynchronize(gemv_stop);
-                    hipEventElapsedTime(&gemv_ms, gemv_start, gemv_stop);
+                    hipEventRecord(scale_start, 0);
+                    ok = rocmQuantGemm_applyScaling(d_C_int32, d_C, d_scale_A, d_scale,
+                                                    1, N, 1.0f, 0.0f, nullptr, nullptr, device_id_);
+                    hipEventRecord(scale_stop, 0);
+                    hipEventSynchronize(scale_stop);
+                    hipEventElapsedTime(&scale_ms, scale_start, scale_stop);
                 }
 
                 hipEventRecord(total_stop, 0);
@@ -618,55 +446,37 @@ namespace
                 if (!ok)
                 {
                     hipFree(d_A);
-                    hipFree(d_B);
                     hipFree(d_scale);
                     hipFree(d_C);
-                    if (d_A_int8)
-                        hipFree(d_A_int8);
-                    if (d_scale_A)
-                        hipFree(d_scale_A);
-                    if (d_C_int32)
-                        hipFree(d_C_int32);
+                    hipFree(d_A_int8);
+                    hipFree(d_scale_A);
+                    hipFree(d_C_int32);
+                    hipFree(d_B_vnni);
                     return result;
                 }
 
                 total_times.push_back(static_cast<double>(total_ms));
-                if (mode == GemvMode::INT8)
-                {
-                    quant_times.push_back(static_cast<double>(quant_ms));
-                    gemv_times.push_back(static_cast<double>(gemv_ms));
-                    scale_times.push_back(static_cast<double>(scale_ms));
-                }
-                else
-                {
-                    gemv_times.push_back(static_cast<double>(gemv_ms));
-                }
+                quant_times.push_back(static_cast<double>(quant_ms));
+                gemv_times.push_back(static_cast<double>(gemv_ms));
+                scale_times.push_back(static_cast<double>(scale_ms));
             }
 
             hipEventDestroy(total_start);
             hipEventDestroy(total_stop);
+            hipEventDestroy(quant_start);
+            hipEventDestroy(quant_stop);
             hipEventDestroy(gemv_start);
             hipEventDestroy(gemv_stop);
-            if (mode == GemvMode::INT8)
-            {
-                hipEventDestroy(quant_start);
-                hipEventDestroy(quant_stop);
-                hipEventDestroy(scale_start);
-                hipEventDestroy(scale_stop);
-            }
+            hipEventDestroy(scale_start);
+            hipEventDestroy(scale_stop);
 
             hipFree(d_A);
-            hipFree(d_B);
             hipFree(d_scale);
             hipFree(d_C);
-            if (d_B_vnni)
-                hipFree(d_B_vnni);
-            if (d_A_int8)
-                hipFree(d_A_int8);
-            if (d_scale_A)
-                hipFree(d_scale_A);
-            if (d_C_int32)
-                hipFree(d_C_int32);
+            hipFree(d_B_vnni);
+            hipFree(d_A_int8);
+            hipFree(d_scale_A);
+            hipFree(d_C_int32);
 
             // --- Statistics ---
             computeStats(total_times, result.total.mean_ms, result.total.min_ms,
@@ -676,25 +486,16 @@ namespace
             double gemv_stddev_ms = 0.0;
             computeStats(gemv_times, result.gemv_mean_ms, result.gemv_min_ms,
                          gemv_max_ms, gemv_stddev_ms);
-            if (mode == GemvMode::INT8)
-            {
-                double quant_max_ms = 0.0;
-                double quant_stddev_ms = 0.0;
-                computeStats(quant_times, result.quant_mean_ms, result.quant_min_ms,
-                             quant_max_ms, quant_stddev_ms);
 
-                double scale_max_ms = 0.0;
-                double scale_stddev_ms = 0.0;
-                computeStats(scale_times, result.scale_mean_ms, result.scale_min_ms,
-                             scale_max_ms, scale_stddev_ms);
-            }
-            else
-            {
-                result.quant_mean_ms = 0.0;
-                result.quant_min_ms = 0.0;
-                result.scale_mean_ms = 0.0;
-                result.scale_min_ms = 0.0;
-            }
+            double quant_max_ms = 0.0;
+            double quant_stddev_ms = 0.0;
+            computeStats(quant_times, result.quant_mean_ms, result.quant_min_ms,
+                         quant_max_ms, quant_stddev_ms);
+
+            double scale_max_ms = 0.0;
+            double scale_stddev_ms = 0.0;
+            computeStats(scale_times, result.scale_mean_ms, result.scale_min_ms,
+                         scale_max_ms, scale_stddev_ms);
 
             // Effective bandwidth: INT8 weights [K*N] + FP32 activations [K] + scales [N] + output [N]
             double bytes = static_cast<double>(K) * N * 1 // INT8 weights
@@ -710,409 +511,10 @@ namespace
 
         BenchResult benchmarkGemv(int N, int K, int warmup_runs = 5, int bench_runs = 20)
         {
-            auto split = benchmarkGemvSplit(N, K, getGemvModeFromEnv(), warmup_runs, bench_runs);
+            auto split = benchmarkGemvSplit(N, K, warmup_runs, bench_runs);
             return split.total;
         }
 
-        BenchResult benchmarkFfnDownVariant(
-            int N, int K,
-            int tile_n, int split,
-            int warmup_runs = 5, int bench_runs = 20)
-        {
-            BenchResult result{0, 0, 1e12, 0, 0, false};
-#ifndef HAVE_ROCM
-            return result;
-#else
-            std::mt19937 rng(777);
-            std::uniform_int_distribution<int> dist_int8(-127, 127);
-
-            std::vector<int8_t> h_A(static_cast<size_t>(K));
-            std::vector<int8_t> h_B(static_cast<size_t>(K) * N);
-
-            for (auto &v : h_A)
-                v = static_cast<int8_t>(dist_int8(rng));
-            for (auto &v : h_B)
-                v = static_cast<int8_t>(dist_int8(rng));
-
-            int8_t *d_A = nullptr, *d_B = nullptr;
-            int32_t *d_C = nullptr;
-
-            hipMalloc(&d_A, K * sizeof(int8_t));
-            hipMalloc(&d_B, static_cast<size_t>(K) * N * sizeof(int8_t));
-            hipMalloc(&d_C, N * sizeof(int32_t));
-
-            hipMemcpy(d_A, h_A.data(), K * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipMemcpy(d_B, h_B.data(), static_cast<size_t>(K) * N * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
-
-            for (int i = 0; i < warmup_runs; ++i)
-            {
-                rocmGemv_int8_int8_ffn_down_variant(d_A, d_B, d_C, N, K, tile_n, split, device_id_);
-            }
-            hipDeviceSynchronize();
-
-            std::vector<double> times;
-            times.reserve(bench_runs);
-
-            for (int i = 0; i < bench_runs; ++i)
-            {
-                hipDeviceSynchronize();
-                auto t0 = std::chrono::high_resolution_clock::now();
-                bool ok = rocmGemv_int8_int8_ffn_down_variant(d_A, d_B, d_C, N, K, tile_n, split, device_id_);
-                hipDeviceSynchronize();
-                auto t1 = std::chrono::high_resolution_clock::now();
-
-                if (!ok)
-                {
-                    hipFree(d_A);
-                    hipFree(d_B);
-                    hipFree(d_C);
-                    return result;
-                }
-
-                double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                times.push_back(ms);
-            }
-
-            hipFree(d_A);
-            hipFree(d_B);
-            hipFree(d_C);
-
-            computeStats(times, result.mean_ms, result.min_ms, result.max_ms, result.stddev_ms);
-            double bytes = static_cast<double>(K) * N * 1 + K * 1 + N * 4;
-            result.gbps = (bytes / (result.min_ms * 1e-3)) / 1e9;
-            result.success = true;
-            return result;
-#endif
-        }
-
-        BenchResult benchmarkFfnDownVnniVariant(
-            int N, int K,
-            int tile_n, int split,
-            int warmup_runs = 5, int bench_runs = 20)
-        {
-            BenchResult result{0, 0, 1e12, 0, 0, false};
-#ifndef HAVE_ROCM
-            return result;
-#else
-            if ((K % 4) != 0 || (N % 4) != 0)
-                return result;
-
-            std::mt19937 rng(777);
-            std::uniform_int_distribution<int> dist_int8(-127, 127);
-
-            std::vector<int8_t> h_A(static_cast<size_t>(K));
-            std::vector<int8_t> h_B(static_cast<size_t>(K) * N);
-            std::vector<int8_t> h_B_vnni;
-
-            for (auto &v : h_A)
-                v = static_cast<int8_t>(dist_int8(rng));
-            for (auto &v : h_B)
-                v = static_cast<int8_t>(dist_int8(rng));
-            packVnniWeights(h_B, N, K, h_B_vnni);
-
-            if (h_B_vnni.empty())
-                return result;
-
-            int8_t *d_A = nullptr, *d_B_vnni = nullptr;
-            int32_t *d_C = nullptr;
-
-            hipMalloc(&d_A, K * sizeof(int8_t));
-            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
-            hipMalloc(&d_C, N * sizeof(int32_t));
-
-            hipMemcpy(d_A, h_A.data(), K * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
-
-            for (int i = 0; i < warmup_runs; ++i)
-            {
-                rocmGemv_int8_int8_ffn_down_vnni_variant(
-                    d_A, d_B_vnni, d_C, N, K, tile_n, split, device_id_);
-            }
-            hipDeviceSynchronize();
-
-            std::vector<double> times;
-            times.reserve(bench_runs);
-
-            for (int i = 0; i < bench_runs; ++i)
-            {
-                hipDeviceSynchronize();
-                auto t0 = std::chrono::high_resolution_clock::now();
-                bool ok = rocmGemv_int8_int8_ffn_down_vnni_variant(
-                    d_A, d_B_vnni, d_C, N, K, tile_n, split, device_id_);
-                hipDeviceSynchronize();
-                auto t1 = std::chrono::high_resolution_clock::now();
-
-                if (!ok)
-                {
-                    hipFree(d_A);
-                    hipFree(d_B_vnni);
-                    hipFree(d_C);
-                    return result;
-                }
-
-                double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                times.push_back(ms);
-            }
-
-            hipFree(d_A);
-            hipFree(d_B_vnni);
-            hipFree(d_C);
-
-            computeStats(times, result.mean_ms, result.min_ms, result.max_ms, result.stddev_ms);
-            double bytes = static_cast<double>(K) * N * 1 + K * 1 + N * 4;
-            result.gbps = (bytes / (result.min_ms * 1e-3)) / 1e9;
-            result.success = true;
-            return result;
-#endif
-        }
-
-        BenchResult benchmarkVnniKparVariant(
-            int N, int K,
-            int tile_n, int split,
-            int warmup_runs = 5, int bench_runs = 20)
-        {
-            BenchResult result{0, 0, 1e12, 0, 0, false};
-#ifndef HAVE_ROCM
-            return result;
-#else
-            if ((K % 4) != 0 || (N % 4) != 0)
-                return result;
-
-            std::mt19937 rng(777);
-            std::uniform_int_distribution<int> dist_int8(-127, 127);
-
-            std::vector<int8_t> h_A(static_cast<size_t>(K));
-            std::vector<int8_t> h_B(static_cast<size_t>(K) * N);
-            std::vector<int8_t> h_B_vnni;
-
-            for (auto &v : h_A)
-                v = static_cast<int8_t>(dist_int8(rng));
-            for (auto &v : h_B)
-                v = static_cast<int8_t>(dist_int8(rng));
-            packVnniWeights(h_B, N, K, h_B_vnni);
-
-            if (h_B_vnni.empty())
-                return result;
-
-            int8_t *d_A = nullptr, *d_B_vnni = nullptr;
-            int32_t *d_C = nullptr;
-
-            hipMalloc(&d_A, K * sizeof(int8_t));
-            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
-            hipMalloc(&d_C, N * sizeof(int32_t));
-
-            hipMemcpy(d_A, h_A.data(), K * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
-
-            for (int i = 0; i < warmup_runs; ++i)
-            {
-                rocmGemv_int8_int8_vnni_kpar_variant(
-                    d_A, d_B_vnni, d_C, N, K, tile_n, split, device_id_);
-            }
-            hipDeviceSynchronize();
-
-            std::vector<double> times;
-            times.reserve(bench_runs);
-
-            for (int i = 0; i < bench_runs; ++i)
-            {
-                hipDeviceSynchronize();
-                auto t0 = std::chrono::high_resolution_clock::now();
-                bool ok = rocmGemv_int8_int8_vnni_kpar_variant(
-                    d_A, d_B_vnni, d_C, N, K, tile_n, split, device_id_);
-                hipDeviceSynchronize();
-                auto t1 = std::chrono::high_resolution_clock::now();
-
-                if (!ok)
-                {
-                    hipFree(d_A);
-                    hipFree(d_B_vnni);
-                    hipFree(d_C);
-                    return result;
-                }
-
-                double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                times.push_back(ms);
-            }
-
-            hipFree(d_A);
-            hipFree(d_B_vnni);
-            hipFree(d_C);
-
-            computeStats(times, result.mean_ms, result.min_ms, result.max_ms, result.stddev_ms);
-            double bytes = static_cast<double>(K) * N * 1 + K * 1 + N * 4;
-            result.gbps = (bytes / (result.min_ms * 1e-3)) / 1e9;
-            result.success = true;
-            return result;
-#endif
-        }
-
-        BenchResult benchmarkVnniWideVariant(
-            int N, int K,
-            int tile_n,
-            int warmup_runs = 5, int bench_runs = 20)
-        {
-            BenchResult result{0, 0, 1e12, 0, 0, false};
-#ifndef HAVE_ROCM
-            return result;
-#else
-            if ((K % 4) != 0 || (N % 4) != 0)
-                return result;
-
-            std::mt19937 rng(777);
-            std::uniform_int_distribution<int> dist_int8(-127, 127);
-
-            std::vector<int8_t> h_A(static_cast<size_t>(K));
-            std::vector<int8_t> h_B(static_cast<size_t>(K) * N);
-            std::vector<int8_t> h_B_vnni;
-
-            for (auto &v : h_A)
-                v = static_cast<int8_t>(dist_int8(rng));
-            for (auto &v : h_B)
-                v = static_cast<int8_t>(dist_int8(rng));
-            packVnniWeights(h_B, N, K, h_B_vnni);
-
-            if (h_B_vnni.empty())
-                return result;
-
-            int8_t *d_A = nullptr, *d_B_vnni = nullptr;
-            int32_t *d_C = nullptr;
-
-            hipMalloc(&d_A, K * sizeof(int8_t));
-            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
-            hipMalloc(&d_C, N * sizeof(int32_t));
-
-            hipMemcpy(d_A, h_A.data(), K * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
-
-            for (int i = 0; i < warmup_runs; ++i)
-            {
-                rocmGemv_int8_int8_vnni_wide_vec4_variant(
-                    d_A, d_B_vnni, d_C, N, K, tile_n, device_id_);
-            }
-            hipDeviceSynchronize();
-
-            std::vector<double> times;
-            times.reserve(bench_runs);
-
-            for (int i = 0; i < bench_runs; ++i)
-            {
-                hipDeviceSynchronize();
-                auto t0 = std::chrono::high_resolution_clock::now();
-                bool ok = rocmGemv_int8_int8_vnni_wide_vec4_variant(
-                    d_A, d_B_vnni, d_C, N, K, tile_n, device_id_);
-                hipDeviceSynchronize();
-                auto t1 = std::chrono::high_resolution_clock::now();
-
-                if (!ok)
-                {
-                    hipFree(d_A);
-                    hipFree(d_B_vnni);
-                    hipFree(d_C);
-                    return result;
-                }
-
-                double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                times.push_back(ms);
-            }
-
-            hipFree(d_A);
-            hipFree(d_B_vnni);
-            hipFree(d_C);
-
-            computeStats(times, result.mean_ms, result.min_ms, result.max_ms, result.stddev_ms);
-            double bytes = static_cast<double>(K) * N * 1 + K * 1 + N * 4;
-            result.gbps = (bytes / (result.min_ms * 1e-3)) / 1e9;
-            result.success = true;
-            return result;
-#endif
-        }
-
-        BenchResult benchmarkVnniWide2Variant(
-            int N, int K,
-            int tile_n,
-            int warmup_runs = 5, int bench_runs = 20)
-        {
-            BenchResult result{0, 0, 1e12, 0, 0, false};
-#ifndef HAVE_ROCM
-            return result;
-#else
-            if ((K % 4) != 0 || (N % 2) != 0)
-                return result;
-
-            std::mt19937 rng(777);
-            std::uniform_int_distribution<int> dist_int8(-127, 127);
-
-            std::vector<int8_t> h_A(static_cast<size_t>(K));
-            std::vector<int8_t> h_B(static_cast<size_t>(K) * N);
-            std::vector<int8_t> h_B_vnni;
-
-            for (auto &v : h_A)
-                v = static_cast<int8_t>(dist_int8(rng));
-            for (auto &v : h_B)
-                v = static_cast<int8_t>(dist_int8(rng));
-            packVnniWeights(h_B, N, K, h_B_vnni);
-
-            if (h_B_vnni.empty())
-                return result;
-
-            int8_t *d_A = nullptr, *d_B_vnni = nullptr;
-            int32_t *d_C = nullptr;
-
-            hipMalloc(&d_A, K * sizeof(int8_t));
-            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
-            hipMalloc(&d_C, N * sizeof(int32_t));
-
-            hipMemcpy(d_A, h_A.data(), K * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
-
-            for (int i = 0; i < warmup_runs; ++i)
-            {
-                rocmGemv_int8_int8_vnni_wide2_variant(
-                    d_A, d_B_vnni, d_C, N, K, tile_n, device_id_);
-            }
-            hipDeviceSynchronize();
-
-            std::vector<double> times;
-            times.reserve(bench_runs);
-
-            for (int i = 0; i < bench_runs; ++i)
-            {
-                hipDeviceSynchronize();
-                auto t0 = std::chrono::high_resolution_clock::now();
-                bool ok = rocmGemv_int8_int8_vnni_wide2_variant(
-                    d_A, d_B_vnni, d_C, N, K, tile_n, device_id_);
-                hipDeviceSynchronize();
-                auto t1 = std::chrono::high_resolution_clock::now();
-
-                if (!ok)
-                {
-                    hipFree(d_A);
-                    hipFree(d_B_vnni);
-                    hipFree(d_C);
-                    return result;
-                }
-
-                double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                times.push_back(ms);
-            }
-
-            hipFree(d_A);
-            hipFree(d_B_vnni);
-            hipFree(d_C);
-
-            computeStats(times, result.mean_ms, result.min_ms, result.max_ms, result.stddev_ms);
-            double bytes = static_cast<double>(K) * N * 1 + K * 1 + N * 4;
-            result.gbps = (bytes / (result.min_ms * 1e-3)) / 1e9;
-            result.success = true;
-            return result;
-#endif
-        }
 
         // =========================================================================
         // Run correctness test for a single shape
@@ -1139,34 +541,51 @@ namespace
             for (auto &v : h_scale)
                 v = dist_s(rng);
 
-            // CPU reference
+            // CPU reference (FP32×INT8 — slightly different from GPU INT8×INT8
+            // due to activation quantization, but cosine sim should be >0.998)
             std::vector<float> ref(N);
             cpuReferenceGemv(h_A.data(), h_B.data(), h_scale.data(), ref.data(), N, K);
 
-            // GPU
+            // Pack VNNI weights on host
+            std::vector<int8_t> h_B_vnni;
+            packVnniWeights(h_B, N, K, h_B_vnni);
+
+            // GPU: INT8 VNNI pipeline (quantize → VNNI GEMV → scale)
             float *d_A = nullptr, *d_scale = nullptr, *d_C = nullptr;
-            int8_t *d_B = nullptr;
+            int8_t *d_B_vnni = nullptr;
+            int8_t *d_A_int8 = nullptr;
+            float *d_scale_A = nullptr;
+            int32_t *d_C_int32 = nullptr;
 
             hipMalloc(&d_A, K * sizeof(float));
-            hipMalloc(&d_B, static_cast<size_t>(K) * N * sizeof(int8_t));
             hipMalloc(&d_scale, N * sizeof(float));
             hipMalloc(&d_C, N * sizeof(float));
+            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+            hipMalloc(&d_A_int8, K * sizeof(int8_t));
+            hipMalloc(&d_scale_A, sizeof(float));
+            hipMalloc(&d_C_int32, N * sizeof(int32_t));
 
             hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
-            hipMemcpy(d_B, h_B.data(), static_cast<size_t>(K) * N * sizeof(int8_t), hipMemcpyHostToDevice);
+            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
             hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
             hipDeviceSynchronize();
 
-            rocmGemv_int8_fp32(d_A, d_B, d_scale, d_C, N, K, device_id_);
+            rocmQuantGemm_quantizeActivations(d_A, d_A_int8, d_scale_A, 1, K, device_id_);
+            rocmGemv_int8_int8_int32_vnni(d_A_int8, d_B_vnni, d_C_int32, N, K, device_id_);
+            rocmQuantGemm_applyScaling(d_C_int32, d_C, d_scale_A, d_scale,
+                                       1, N, 1.0f, 0.0f, nullptr, nullptr, device_id_);
             hipDeviceSynchronize();
 
             std::vector<float> gpu_out(N);
             hipMemcpy(gpu_out.data(), d_C, N * sizeof(float), hipMemcpyDeviceToHost);
 
             hipFree(d_A);
-            hipFree(d_B);
             hipFree(d_scale);
             hipFree(d_C);
+            hipFree(d_B_vnni);
+            hipFree(d_A_int8);
+            hipFree(d_scale_A);
+            hipFree(d_C_int32);
 
             return checkCorrectness(gpu_out.data(), ref.data(), N);
 #endif
@@ -1201,38 +620,54 @@ namespace
             for (auto &v : h_bias)
                 v = dist_bias(rng);
 
-            // CPU reference with bias
+            // CPU reference with bias (FP32×INT8 + bias)
             std::vector<float> ref(N);
             cpuReferenceGemvBias(h_A.data(), h_B.data(), h_scale.data(),
                                  h_bias.data(), ref.data(), N, K);
 
-            // GPU
+            // Pack VNNI weights on host
+            std::vector<int8_t> h_B_vnni;
+            packVnniWeights(h_B, N, K, h_B_vnni);
+
+            // GPU: INT8 VNNI pipeline with bias (quantize → VNNI GEMV → scale+bias)
             float *d_A = nullptr, *d_scale = nullptr, *d_bias = nullptr, *d_C = nullptr;
-            int8_t *d_B = nullptr;
+            int8_t *d_B_vnni = nullptr;
+            int8_t *d_A_int8 = nullptr;
+            float *d_scale_A = nullptr;
+            int32_t *d_C_int32 = nullptr;
 
             hipMalloc(&d_A, K * sizeof(float));
-            hipMalloc(&d_B, static_cast<size_t>(K) * N * sizeof(int8_t));
             hipMalloc(&d_scale, N * sizeof(float));
             hipMalloc(&d_bias, N * sizeof(float));
             hipMalloc(&d_C, N * sizeof(float));
+            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+            hipMalloc(&d_A_int8, K * sizeof(int8_t));
+            hipMalloc(&d_scale_A, sizeof(float));
+            hipMalloc(&d_C_int32, N * sizeof(int32_t));
 
             hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
-            hipMemcpy(d_B, h_B.data(), static_cast<size_t>(K) * N * sizeof(int8_t), hipMemcpyHostToDevice);
+            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
             hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
             hipMemcpy(d_bias, h_bias.data(), N * sizeof(float), hipMemcpyHostToDevice);
             hipDeviceSynchronize();
 
-            rocmGemv_int8_fp32_bias(d_A, d_B, d_scale, d_bias, d_C, N, K, device_id_);
+            rocmQuantGemm_quantizeActivations(d_A, d_A_int8, d_scale_A, 1, K, device_id_);
+            rocmGemv_int8_int8_int32_vnni(d_A_int8, d_B_vnni, d_C_int32, N, K, device_id_);
+            rocmQuantGemm_applyScaling(d_C_int32, d_C, d_scale_A, d_scale,
+                                       1, N, 1.0f, 0.0f, nullptr, d_bias, device_id_);
             hipDeviceSynchronize();
 
             std::vector<float> gpu_out(N);
             hipMemcpy(gpu_out.data(), d_C, N * sizeof(float), hipMemcpyDeviceToHost);
 
             hipFree(d_A);
-            hipFree(d_B);
             hipFree(d_scale);
             hipFree(d_bias);
             hipFree(d_C);
+            hipFree(d_B_vnni);
+            hipFree(d_A_int8);
+            hipFree(d_scale_A);
+            hipFree(d_C_int32);
 
             return checkCorrectness(gpu_out.data(), ref.data(), N);
 #endif
@@ -1436,13 +871,12 @@ namespace
         fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
 
         auto shapes = getDecodeShapes(kQwen05B);
-        auto mode = getGemvModeFromEnv();
 
         // Header with model summary
         char title[128];
         snprintf(title, sizeof(title),
-                 "GEMV Benchmark: %s (M=1 decode, %d layers, mode=%s)",
-                 kQwen05B.name, kQwen05B.num_layers, gemvModeName(mode));
+                 "GEMV Benchmark: %s (M=1 decode, %d layers, INT8 VNNI)",
+                 kQwen05B.name, kQwen05B.num_layers);
         printBenchHeader(title);
 
         double total_layer_ms = 0;
@@ -1453,7 +887,7 @@ namespace
 
         for (const auto &s : shapes)
         {
-            auto split = benchmarkGemvSplit(s.N, s.K, mode);
+            auto split = benchmarkGemvSplit(s.N, s.K);
             split_results.push_back(split);
             printBenchRow(s.name, s.N, s.K, split.total);
             EXPECT_TRUE(split.total.success);
@@ -1463,7 +897,7 @@ namespace
 
         // LM Head (runs once per token, not per layer)
         auto lm = getLMHeadShape(kQwen05B);
-        auto split_lm = benchmarkGemvSplit(lm.N, lm.K, mode);
+        auto split_lm = benchmarkGemvSplit(lm.N, lm.K);
         split_results.push_back(split_lm);
         printBenchRow(lm.name, lm.N, lm.K, split_lm.total);
         EXPECT_TRUE(split_lm.total.success);
@@ -1484,10 +918,7 @@ namespace
 
         auto shapes_with_lm = shapes;
         shapes_with_lm.push_back(lm);
-        char split_title[128];
-        snprintf(split_title, sizeof(split_title),
-                 "GEMV Split Timing (mode=%s)", gemvModeName(mode));
-        printSplitBenchTable(split_title, shapes_with_lm, split_results);
+        printSplitBenchTable("GEMV Split Timing (INT8 VNNI)", shapes_with_lm, split_results);
 #endif
     }
 
@@ -1506,12 +937,11 @@ namespace
         fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
 
         auto shapes = getDecodeShapes(kQwen7B);
-        auto mode = getGemvModeFromEnv();
 
         char title[128];
         snprintf(title, sizeof(title),
-                 "GEMV Benchmark: %s (M=1 decode, %d layers, mode=%s)",
-                 kQwen7B.name, kQwen7B.num_layers, gemvModeName(mode));
+                 "GEMV Benchmark: %s (M=1 decode, %d layers, INT8 VNNI)",
+                 kQwen7B.name, kQwen7B.num_layers);
         printBenchHeader(title);
 
         double total_layer_ms = 0;
@@ -1522,7 +952,7 @@ namespace
 
         for (const auto &s : shapes)
         {
-            auto split = benchmarkGemvSplit(s.N, s.K, mode);
+            auto split = benchmarkGemvSplit(s.N, s.K);
             split_results.push_back(split);
             printBenchRow(s.name, s.N, s.K, split.total);
             EXPECT_TRUE(split.total.success);
@@ -1531,7 +961,7 @@ namespace
         }
 
         auto lm = getLMHeadShape(kQwen7B);
-        auto split_lm = benchmarkGemvSplit(lm.N, lm.K, mode);
+        auto split_lm = benchmarkGemvSplit(lm.N, lm.K);
         split_results.push_back(split_lm);
         printBenchRow(lm.name, lm.N, lm.K, split_lm.total);
         EXPECT_TRUE(split_lm.total.success);
@@ -1551,10 +981,7 @@ namespace
 
         auto shapes_with_lm = shapes;
         shapes_with_lm.push_back(lm);
-        char split_title[128];
-        snprintf(split_title, sizeof(split_title),
-                 "GEMV Split Timing (mode=%s)", gemvModeName(mode));
-        printSplitBenchTable(split_title, shapes_with_lm, split_results);
+        printSplitBenchTable("GEMV Split Timing (INT8 VNNI)", shapes_with_lm, split_results);
 #endif
     }
 
@@ -1724,248 +1151,4 @@ namespace
         fprintf(stderr, "╚═══════════════════╩════════════╩════════════╩══════════╩═════════════════════════╝\n\n");
 #endif
     }
-
-    // ============================================================================
-    // TEST: FFN Down sweep (INT8 kernel variants)
-    // ============================================================================
-
-    TEST_F(ROCmGemvPerfTest, Benchmark_FFND_Sweep)
-    {
-#ifndef HAVE_ROCM
-        GTEST_SKIP() << "No ROCm support";
-#else
-        if (!has_device_)
-            GTEST_SKIP() << "No ROCm device";
-
-        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
-
-        struct SweepCfg
-        {
-            int tile_n;
-            int split;
-        };
-        const std::vector<SweepCfg> configs = {
-            {128, 4},
-            {128, 8},
-            {128, 16},
-            {256, 4},
-            {256, 8},
-            {256, 16},
-        };
-
-        fort::utf8_table table;
-        table.set_border_style(FT_DOUBLE2_STYLE);
-        table << fort::header << "TileN" << "Split" << "0.5B FFN Down min(ms)" << "7B FFN Down min(ms)" << fort::endr;
-        table.column(0).set_cell_text_align(fort::text_align::right);
-        table.column(1).set_cell_text_align(fort::text_align::right);
-        table.column(2).set_cell_text_align(fort::text_align::right);
-        table.column(3).set_cell_text_align(fort::text_align::right);
-
-        for (const auto &cfg : configs)
-        {
-            auto r_05b = benchmarkFfnDownVariant(kQwen05B.hidden, kQwen05B.intermediate, cfg.tile_n, cfg.split, 5, 20);
-            auto r_7b = benchmarkFfnDownVariant(kQwen7B.hidden, kQwen7B.intermediate, cfg.tile_n, cfg.split, 5, 20);
-
-            table << cfg.tile_n
-                  << cfg.split
-                  << formatMs(r_05b.min_ms)
-                  << formatMs(r_7b.min_ms)
-                  << fort::endr;
-        }
-
-        fprintf(stderr, "\nFFN Down Sweep (INT8 kernel variants)\n%s\n", table.to_string().c_str());
-#endif
-    }
-
-    TEST_F(ROCmGemvPerfTest, Benchmark_FFND_VNNI_Sweep)
-    {
-#ifndef HAVE_ROCM
-        GTEST_SKIP() << "No ROCm support";
-#else
-        if (!has_device_)
-            GTEST_SKIP() << "No ROCm device";
-
-        if ((kQwen05B.hidden % 4) != 0 || (kQwen05B.intermediate % 4) != 0)
-            GTEST_SKIP() << "VNNI sweep requires K and N divisible by 4";
-
-        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
-
-        struct SweepCfg
-        {
-            int tile_n;
-            int split;
-        };
-        const std::vector<SweepCfg> configs = {
-            {128, 4},
-            {128, 8},
-            {128, 16},
-            {256, 4},
-            {256, 8},
-            {256, 16},
-        };
-
-        fort::utf8_table table;
-        table.set_border_style(FT_DOUBLE2_STYLE);
-        table << fort::header << "TileN" << "Split" << "0.5B FFN Down min(ms)" << "7B FFN Down min(ms)" << fort::endr;
-        table.column(0).set_cell_text_align(fort::text_align::right);
-        table.column(1).set_cell_text_align(fort::text_align::right);
-        table.column(2).set_cell_text_align(fort::text_align::right);
-        table.column(3).set_cell_text_align(fort::text_align::right);
-
-        for (const auto &cfg : configs)
-        {
-            auto r_05b = benchmarkFfnDownVnniVariant(kQwen05B.hidden, kQwen05B.intermediate,
-                                                     cfg.tile_n, cfg.split, 5, 20);
-            auto r_7b = benchmarkFfnDownVnniVariant(kQwen7B.hidden, kQwen7B.intermediate,
-                                                    cfg.tile_n, cfg.split, 5, 20);
-
-            table << cfg.tile_n
-                  << cfg.split
-                  << formatMs(r_05b.min_ms)
-                  << formatMs(r_7b.min_ms)
-                  << fort::endr;
-        }
-
-        fprintf(stderr, "\nFFN Down Sweep (VNNI INT8 kernel variants)\n%s\n", table.to_string().c_str());
-#endif
-    }
-
-    TEST_F(ROCmGemvPerfTest, Benchmark_VNNI_KPAR_Sweep)
-    {
-#ifndef HAVE_ROCM
-        GTEST_SKIP() << "No ROCm support";
-#else
-        if (!has_device_)
-            GTEST_SKIP() << "No ROCm device";
-
-        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
-
-        struct SweepCfg
-        {
-            int tile_n;
-            int split;
-        };
-        const std::vector<SweepCfg> configs = {
-            {64, 4},
-            {64, 8},
-            {64, 16},
-            {128, 4},
-            {128, 8},
-            {128, 16},
-        };
-
-        const int N0 = 512;
-        const int K0 = 3584;
-        const int N1 = 896;
-        const int K1 = 3584;
-
-        if ((K0 % 4) != 0 || (K1 % 4) != 0)
-            GTEST_SKIP() << "VNNI k-parallel sweep requires K divisible by 4";
-
-        fort::utf8_table table;
-        table.set_border_style(FT_DOUBLE2_STYLE);
-        table << fort::header << "TileN" << "Split" << "N=512 K=3584 min(ms)" << "N=896 K=3584 min(ms)" << fort::endr;
-        table.column(0).set_cell_text_align(fort::text_align::right);
-        table.column(1).set_cell_text_align(fort::text_align::right);
-        table.column(2).set_cell_text_align(fort::text_align::right);
-        table.column(3).set_cell_text_align(fort::text_align::right);
-
-        for (const auto &cfg : configs)
-        {
-            auto r0 = benchmarkVnniKparVariant(N0, K0, cfg.tile_n, cfg.split, 5, 20);
-            auto r1 = benchmarkVnniKparVariant(N1, K1, cfg.tile_n, cfg.split, 5, 20);
-
-            table << cfg.tile_n
-                  << cfg.split
-                  << formatMs(r0.min_ms)
-                  << formatMs(r1.min_ms)
-                  << fort::endr;
-        }
-
-        fprintf(stderr, "\nVNNI K-parallel Sweep (INT8 kernel variants)\n%s\n", table.to_string().c_str());
-#endif
-    }
-
-    TEST_F(ROCmGemvPerfTest, Benchmark_VNNI_Wide_Sweep)
-    {
-#ifndef HAVE_ROCM
-        GTEST_SKIP() << "No ROCm support";
-#else
-        if (!has_device_)
-            GTEST_SKIP() << "No ROCm device";
-
-        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
-
-        const std::vector<int> tile_ns = {256, 512, 1024};
-        const int N0 = kQwen05B.vocab;
-        const int K0 = kQwen05B.hidden;
-        const int N1 = kQwen7B.vocab;
-        const int K1 = kQwen7B.hidden;
-
-        if ((K0 % 4) != 0 || (K1 % 4) != 0)
-            GTEST_SKIP() << "VNNI wide sweep requires K divisible by 4";
-
-        fort::utf8_table table;
-        table.set_border_style(FT_DOUBLE2_STYLE);
-        table << fort::header << "TileN" << "0.5B LM Head min(ms)" << "7B LM Head min(ms)" << fort::endr;
-        table.column(0).set_cell_text_align(fort::text_align::right);
-        table.column(1).set_cell_text_align(fort::text_align::right);
-        table.column(2).set_cell_text_align(fort::text_align::right);
-
-        for (int tile_n : tile_ns)
-        {
-            auto r0 = benchmarkVnniWideVariant(N0, K0, tile_n, 5, 20);
-            auto r1 = benchmarkVnniWideVariant(N1, K1, tile_n, 5, 20);
-
-            table << tile_n
-                  << formatMs(r0.min_ms)
-                  << formatMs(r1.min_ms)
-                  << fort::endr;
-        }
-
-        fprintf(stderr, "\nVNNI Wide Sweep (vec4)\n%s\n", table.to_string().c_str());
-#endif
-    }
-
-    TEST_F(ROCmGemvPerfTest, Benchmark_VNNI_Wide2_Sweep)
-    {
-#ifndef HAVE_ROCM
-        GTEST_SKIP() << "No ROCm support";
-#else
-        if (!has_device_)
-            GTEST_SKIP() << "No ROCm device";
-
-        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
-
-        const std::vector<int> tile_ns = {256, 512, 1024};
-        const int N0 = kQwen05B.vocab;
-        const int K0 = kQwen05B.hidden;
-        const int N1 = kQwen7B.vocab;
-        const int K1 = kQwen7B.hidden;
-
-        if ((K0 % 4) != 0 || (K1 % 4) != 0)
-            GTEST_SKIP() << "VNNI wide2 sweep requires K divisible by 4";
-
-        fort::utf8_table table;
-        table.set_border_style(FT_DOUBLE2_STYLE);
-        table << fort::header << "TileN" << "0.5B LM Head min(ms)" << "7B LM Head min(ms)" << fort::endr;
-        table.column(0).set_cell_text_align(fort::text_align::right);
-        table.column(1).set_cell_text_align(fort::text_align::right);
-        table.column(2).set_cell_text_align(fort::text_align::right);
-
-        for (int tile_n : tile_ns)
-        {
-            auto r0 = benchmarkVnniWide2Variant(N0, K0, tile_n, 5, 20);
-            auto r1 = benchmarkVnniWide2Variant(N1, K1, tile_n, 5, 20);
-
-            table << tile_n
-                  << formatMs(r0.min_ms)
-                  << formatMs(r1.min_ms)
-                  << fort::endr;
-        }
-
-        fprintf(stderr, "\nVNNI Wide2 Sweep (2-col)\n%s\n", table.to_string().c_str());
-#endif
-    }
-
 } // namespace
