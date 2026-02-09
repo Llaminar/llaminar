@@ -347,33 +347,54 @@ bool rocmGemv_int8_int8_int32_vnni(
         // Grid-level K-parallel with atomicAdd: KB independent blocks per output tile
         // Each block processes K/KB fraction; output must be zeroed before launch
         //
-        // KB heuristic: adapt based on N-tile count and K size
-        //   - Large K (>8192): few KB, plenty of work per thread naturally
-        //   - Small K, many N-tiles (grid_n≥64): cap KB so each thread does ≥32
-        //     k-groups (128 elements), reducing atomicAdd contention. N-tiles
-        //     already provide enough blocks for GPU occupancy.
-        //   - Small K, few N-tiles (grid_n<64): use more KB for parallelism
-        //     (accept shorter inner loops to get enough blocks on the CUs)
-        constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;
-        constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;
+        // KB heuristic: adapt based on N-tile count and K size.
+        // Key insight from PMC profiling: inner loop length (k-groups/wave) is the
+        // dominant factor for BW efficiency. Longer loops amortize per-block overhead
+        // (index calc, atomicAdd, wave scheduling). At ≥10 waves/CU, adding more
+        // waves doesn't help — it just shortens loops and adds overhead.
+        //
+        // Empirical targets (MI50 gfx906):
+        //   FFN Down: 148 kgrps/wave, 14.9 w/CU → 62% peak BW (best)
+        //   FFN Gate/Up: 32 kgrps/wave, 69.1 w/CU → 57% peak (too many waves)
+        //   Q/Wo: 16 kgrps/wave, 26.1 w/CU → 50% peak (inner loop too short)
+        //
+        // Strategy: target ≥ MIN_KGROUPS_PER_BLOCK kgrps/wave while keeping
+        // waves/CU above TARGET_MIN_WAVES_PER_CU for latency hiding.
+        constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;  // 128
+        constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;    // 2
+        constexpr int NUM_CUS = 60;  // MI50
+
         const int grid_n = (N + TN - 1) / TN;
+        const int k_groups = K / 4;
 
         int kb;
         if (K > 8192) {
-            kb = max(4, min(32, K / 512));          // FFN Down (K=18944): KB=32
-        } else if (grid_n >= 64) {
-            // Many N-tiles (e.g., FFN Gate/Up grid_n=148): cap KB for efficiency.
-            // K=3584 → 896 k-groups / 32 min = 28. Total blocks = 148*28 = 4144.
-            constexpr int MIN_KGROUPS_PER_BLOCK = 32;
-            const int k_groups = K / 4;
-            kb = max(2, k_groups / MIN_KGROUPS_PER_BLOCK);
+            // Large-K (FFN Down): inherently long inner loops, tune for occupancy
+            kb = max(4, min(32, K / 512));
         } else {
-            // Few N-tiles (e.g., Q/Wo grid_n=28): maximize parallelism via K-splitting.
-            // K=3584 → KB=56 → 28*56 = 1568 blocks → 26 waves/CU.
-            kb = max(2, min(64, (K + 63) / 64));
+            // All other shapes: target ≥64 k-groups per wave for efficiency,
+            // while keeping ≥10 waves/CU for memory latency hiding.
+            // Cap KB so inner loop never drops below 16 k-groups (proven floor
+            // from Q/Wo baseline — going shorter always hurts).
+            constexpr int TARGET_KGROUPS = 64;
+            constexpr int TARGET_MIN_WAVES_PER_CU = 10;
+            constexpr int MIN_KGROUPS_FLOOR = 16;
+            
+            // Start from ideal KB for target k-groups
+            int kb_for_kgroups = max(2, k_groups / TARGET_KGROUPS);
+            
+            // But ensure minimum occupancy
+            int min_blocks = TARGET_MIN_WAVES_PER_CU * NUM_CUS;
+            int kb_for_occupancy = max(2, (min_blocks + grid_n - 1) / grid_n);
+            
+            // Take the larger of the two constraints, but cap to preserve
+            // minimum inner loop length (protects small-N shapes like K/V proj)
+            int kb_max = max(2, k_groups / MIN_KGROUPS_FLOOR);
+            kb = min(max(kb_for_kgroups, kb_for_occupancy), kb_max);
         }
 
         hipMemsetAsync(d_C_int32, 0, N * sizeof(int32_t), static_cast<hipStream_t>(stream));  // NOLINT(clang-diagnostic-unused-result)
+
         hipLaunchKernelGGL(
             HIP_KERNEL_NAME(gemv_int8_int8_grid_kpar_vnni_kernel_t<TN, CPT>),
             dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
