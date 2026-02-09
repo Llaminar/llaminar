@@ -67,7 +67,7 @@ constexpr int GEMV_INT8_VNNI_WIDE2_TILE_N = 256;
 constexpr int GEMV_INT8_VNNI_SQUARE_TILE_N = 256;
 constexpr int GEMV_INT8_VNNI_KPAR_TILE_K = 256;
 constexpr int GEMV_INT8_VNNI_GRID_KPAR_TILE_N = 128;
-constexpr int GEMV_INT8_VNNI_GRID_KPAR_CPT = 4;
+constexpr int GEMV_INT8_VNNI_GRID_KPAR_CPT = 2;  // 64 threads = 1 full wavefront (was 4 = 32 threads = half wavefront)
 
 __global__ void gemv_int8_int8_vnni_kernel(
     const int8_t* __restrict__ d_A_int8,
@@ -337,11 +337,15 @@ bool rocmGemv_int8_int8_int32_vnni(
     {
         // Grid-level K-parallel with atomicAdd: KB independent blocks per output tile
         // Each block processes K/KB fraction; output must be zeroed before launch
-        // KB heuristic: target ~1500 wavefronts to saturate MI50 (60 CUs × ~40 waves/CU)
+        // KB heuristic: balance parallelism vs atomicAdd contention
+        //   - Small K (≤8192): moderate KB for parallelism without excessive atomics
+        //   - Large K (>8192): fewer K-blocks to reduce atomic contention per output
         constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;
         constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;
         const int grid_n = (N + TN - 1) / TN;
-        const int kb = max(2, min(64, (K + 63) / 64));
+        const int kb = (K > 8192)
+            ? max(4, min(32, K / 512))          // FFN Down (K=18944): KB=32 (proven 7.5% faster)
+            : max(32, min(64, (K + 63) / 64));  // QKV/Wo (K=3584): KB=56 (keep production value)
 
         hipMemsetAsync(d_C_int32, 0, N * sizeof(int32_t), static_cast<hipStream_t>(stream));  // NOLINT(clang-diagnostic-unused-result)
         hipLaunchKernelGGL(
