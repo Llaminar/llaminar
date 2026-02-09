@@ -13,6 +13,7 @@
  */
 
 #include "NvidiaDeviceContext.h"
+#include "CUDAGraphCapture.h"
 #include "../../utils/Logger.h"
 #include <cuda.h> // For cuDevicePrimaryCtxRetain, cuCtxSetCurrent
 #include <sstream>
@@ -323,10 +324,15 @@ namespace llaminar2
             cublas_handle_ = nullptr;
         }
 
-        // Destroy default stream
+        // Destroy default stream (ignore cudaErrorCudartUnloading during shutdown)
         if (default_stream_ != nullptr)
         {
-            CUDA_CHECK_VOID(cudaStreamDestroy(default_stream_));
+            cudaError_t err = cudaStreamDestroy(default_stream_);
+            if (err != cudaSuccess && err != cudaErrorCudartUnloading)
+            {
+                LOG_ERROR("[NvidiaDeviceContext] cudaStreamDestroy(default_stream_) failed: "
+                          << cudaGetErrorString(err));
+            }
             default_stream_ = nullptr;
         }
 
@@ -384,6 +390,10 @@ namespace llaminar2
 
     void *NvidiaDeviceContext::createStream()
     {
+        // Create a NON-BLOCKING stream. This is required for stream capture (GPU graphs)
+        // because CUTLASS/cuBLAS may internally dispatch to the legacy default stream.
+        // A blocking stream would create illegal cross-stream dependencies during capture
+        // (the blocking stream implicitly syncs with stream 0, violating capture mode).
         cudaStream_t stream;
         cudaError_t err = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
         if (err != cudaSuccess)
@@ -523,6 +533,68 @@ namespace llaminar2
             LOG_ERROR("[NvidiaDeviceContext] cudaDeviceSynchronize failed: " 
                       << cudaGetErrorString(err));
         } });
+    }
+
+    void NvidiaDeviceContext::synchronizeStream(void *stream)
+    {
+        // Synchronize a specific stream. nullptr = legacy default stream (stream 0).
+        // This is ~10× cheaper than cudaDeviceSynchronize() since it only waits
+        // for one stream's work, not all streams on the device.
+        cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : cudaStream_t(0);
+        cudaError_t err = cudaStreamSynchronize(cuda_stream);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaStreamSynchronize failed: "
+                      << cudaGetErrorString(err));
+        }
+    }
+
+    void NvidiaDeviceContext::insertStreamDependency(void *dependent_stream, void *dependency_stream)
+    {
+        // GPU-side inter-stream synchronization via events.
+        // Records an event on dependency_stream, makes dependent_stream wait for it.
+        // Unlike synchronizeStream(), this does NOT block the CPU.
+        //
+        // nullptr maps to legacy stream 0 (NOT default_stream_) because manual stages
+        // in segmented graph capture dispatch kernels to the actual legacy default stream.
+        cudaStream_t dep_stream = dependent_stream ? static_cast<cudaStream_t>(dependent_stream) : cudaStream_t(0);
+        cudaStream_t src_stream = dependency_stream ? static_cast<cudaStream_t>(dependency_stream) : cudaStream_t(0);
+
+        // Use lightweight event without timing to minimize overhead
+        cudaEvent_t event;
+        cudaError_t err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaEventCreate failed in insertStreamDependency: "
+                      << cudaGetErrorString(err));
+            return;
+        }
+
+        err = cudaEventRecord(event, src_stream);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaEventRecord failed: " << cudaGetErrorString(err));
+            cudaEventDestroy(event);
+            return;
+        }
+
+        err = cudaStreamWaitEvent(dep_stream, event, 0);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaStreamWaitEvent failed: " << cudaGetErrorString(err));
+        }
+
+        cudaEventDestroy(event);
+    }
+
+    std::unique_ptr<IGPUGraphCapture> NvidiaDeviceContext::createGraphCapture()
+    {
+        return std::make_unique<CUDAGraphCapture>(static_cast<cudaStream_t>(defaultStream()));
+    }
+
+    std::unique_ptr<IGPUGraphCapture> NvidiaDeviceContext::createGraphCapture(void *stream)
+    {
+        return std::make_unique<CUDAGraphCapture>(static_cast<cudaStream_t>(stream));
     }
 
 } // namespace llaminar2

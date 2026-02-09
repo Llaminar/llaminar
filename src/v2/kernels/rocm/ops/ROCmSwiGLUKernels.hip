@@ -15,6 +15,8 @@
 #include <cstdint>
 #include <cstdio>
 
+#include "../../../backends/rocm/HipDeviceGuard.h"
+
 namespace
 {
 
@@ -140,9 +142,10 @@ extern "C"
         const float *up,
         float *output,
         int size,
-        int device_idx)
+        int device_idx,
+        void *stream)
     {
-        hipSetDevice(device_idx);
+        llaminar2::HipDeviceGuard::setDevice(device_idx);
 
         int threads_per_block = 256;
         int num_blocks = (size + threads_per_block - 1) / threads_per_block;
@@ -150,7 +153,7 @@ extern "C"
         // Clear any stale error from previous operations
         (void)hipGetLastError();
 
-        hipLaunchKernelGGL(rocm_swiglu_fp32_kernel, dim3(num_blocks), dim3(threads_per_block), 0, 0,
+        hipLaunchKernelGGL(rocm_swiglu_fp32_kernel, dim3(num_blocks), dim3(threads_per_block), 0, static_cast<hipStream_t>(stream),
                            gate, up, output, size);
 
         hipError_t err = hipGetLastError();
@@ -167,9 +170,10 @@ extern "C"
         const uint16_t *up,
         uint16_t *output,
         int size,
-        int device_idx)
+        int device_idx,
+        void *stream)
     {
-        hipSetDevice(device_idx);
+        llaminar2::HipDeviceGuard::setDevice(device_idx);
 
         int threads_per_block = 256;
         int num_blocks = (size + threads_per_block - 1) / threads_per_block;
@@ -177,7 +181,7 @@ extern "C"
         // Clear any stale error from previous operations
         (void)hipGetLastError();
 
-        hipLaunchKernelGGL(rocm_swiglu_bf16_kernel, dim3(num_blocks), dim3(threads_per_block), 0, 0,
+        hipLaunchKernelGGL(rocm_swiglu_bf16_kernel, dim3(num_blocks), dim3(threads_per_block), 0, static_cast<hipStream_t>(stream),
                            gate, up, output, size);
 
         hipError_t err = hipGetLastError();
@@ -194,9 +198,10 @@ extern "C"
         const uint16_t *up,
         uint16_t *output,
         int size,
-        int device_idx)
+        int device_idx,
+        void *stream)
     {
-        hipSetDevice(device_idx);
+        llaminar2::HipDeviceGuard::setDevice(device_idx);
 
         int threads_per_block = 256;
         int num_blocks = (size + threads_per_block - 1) / threads_per_block;
@@ -204,7 +209,7 @@ extern "C"
         // Clear any stale error from previous operations
         (void)hipGetLastError();
 
-        hipLaunchKernelGGL(rocm_swiglu_fp16_kernel, dim3(num_blocks), dim3(threads_per_block), 0, 0,
+        hipLaunchKernelGGL(rocm_swiglu_fp16_kernel, dim3(num_blocks), dim3(threads_per_block), 0, static_cast<hipStream_t>(stream),
                            gate, up, output, size);
 
         hipError_t err = hipGetLastError();

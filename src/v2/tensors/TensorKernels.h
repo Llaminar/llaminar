@@ -309,6 +309,19 @@ namespace llaminar2
          * @return true if kernel can execute on this device
          */
         virtual bool supports_device(int device_idx) const = 0;
+
+        /**
+         * @brief Set the GPU stream for kernel dispatch (GPU graph capture support)
+         *
+         * When non-null, GPU kernels dispatch work on this stream instead of the
+         * default stream. This is required for GPU graph capture — all kernels must
+         * dispatch to the capture stream for nodes to be recorded in the graph.
+         *
+         * CPU kernels ignore this (default no-op).
+         *
+         * @param stream Opaque stream pointer (hipStream_t or cudaStream_t cast to void*)
+         */
+        virtual void setGPUStream(void *stream) { (void)stream; }
     };
 
     /**

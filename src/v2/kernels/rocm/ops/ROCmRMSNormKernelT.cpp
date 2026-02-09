@@ -7,22 +7,22 @@
 
 #include "ROCmRMSNormKernelT.h"
 #include "utils/Logger.h"
-#include "utils/KernelProfiler.h"
+#include "utils/ROCmKernelProfiler.h"
 #include <cstdint>
 #include <hip/hip_runtime.h>
 
 // Extern "C" declarations for HIP kernels
 extern "C" bool hipOps_rmsnorm_fp32(
     const float *input, const float *gamma, float *output,
-    int rows, int cols, float epsilon, int device_idx);
+    int rows, int cols, float epsilon, int device_idx, void *stream);
 
 extern "C" bool hipOps_rmsnorm_bf16(
     const uint16_t *input, const float *gamma, uint16_t *output,
-    int rows, int cols, float epsilon, int device_idx);
+    int rows, int cols, float epsilon, int device_idx, void *stream);
 
 extern "C" bool hipOps_rmsnorm_fp16(
     const uint16_t *input, const float *gamma, uint16_t *output,
-    int rows, int cols, float epsilon, int device_idx);
+    int rows, int cols, float epsilon, int device_idx, void *stream);
 
 namespace llaminar2
 {
@@ -62,7 +62,7 @@ namespace llaminar2
             float epsilon,
             int device_idx)
         {
-            return hipOps_rmsnorm_fp32(d_input, d_gamma, d_output, rows, cols, epsilon, device_idx);
+            return hipOps_rmsnorm_fp32(d_input, d_gamma, d_output, rows, cols, epsilon, device_idx, gpu_stream_);
         }
 
         bool ROCmRMSNormKernelT<ActivationPrecision::FP32>::apply_tensor(
@@ -74,7 +74,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx,
             int device_idx)
         {
-            KERNEL_PROFILE_SCOPE(KernelType::RMS_NORM);
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RMS_NORM, static_cast<hipStream_t>(gpu_stream_));
             (void)mpi_ctx;
             if (!input || !weight || !output)
             {
@@ -104,7 +104,7 @@ namespace llaminar2
             const float *d_weight_ptr = static_cast<const float *>(weight_fp32->gpu_data_ptr());
             float *d_output_ptr = static_cast<float *>(output_fp32->gpu_data_ptr());
 
-            bool ok = hipOps_rmsnorm_fp32(d_input_ptr, d_weight_ptr, d_output_ptr, rows, cols, epsilon, device_idx);
+            bool ok = hipOps_rmsnorm_fp32(d_input_ptr, d_weight_ptr, d_output_ptr, rows, cols, epsilon, device_idx, gpu_stream_);
             // No sync needed - coherence system handles sync when data is read
             return ok;
         }
@@ -154,7 +154,7 @@ namespace llaminar2
             float epsilon,
             int device_idx)
         {
-            return hipOps_rmsnorm_bf16(d_input, d_gamma, d_output, rows, cols, epsilon, device_idx);
+            return hipOps_rmsnorm_bf16(d_input, d_gamma, d_output, rows, cols, epsilon, device_idx, gpu_stream_);
         }
 
         bool ROCmRMSNormKernelT<ActivationPrecision::BF16>::apply_tensor(
@@ -166,7 +166,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx,
             int device_idx)
         {
-            KERNEL_PROFILE_SCOPE(KernelType::RMS_NORM);
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RMS_NORM, static_cast<hipStream_t>(gpu_stream_));
             (void)mpi_ctx;
             if (!input || !weight || !output)
             {
@@ -195,7 +195,7 @@ namespace llaminar2
             const float *d_weight_ptr = static_cast<const float *>(weight_fp32->gpu_data_ptr());
             uint16_t *d_output_ptr = static_cast<uint16_t *>(output_bf16->gpu_data_ptr());
 
-            bool ok = hipOps_rmsnorm_bf16(d_input_ptr, d_weight_ptr, d_output_ptr, rows, cols, epsilon, device_idx);
+            bool ok = hipOps_rmsnorm_bf16(d_input_ptr, d_weight_ptr, d_output_ptr, rows, cols, epsilon, device_idx, gpu_stream_);
             // No sync needed - coherence system handles sync when data is read
             return ok;
         }
@@ -245,7 +245,7 @@ namespace llaminar2
             float epsilon,
             int device_idx)
         {
-            return hipOps_rmsnorm_fp16(d_input, d_gamma, d_output, rows, cols, epsilon, device_idx);
+            return hipOps_rmsnorm_fp16(d_input, d_gamma, d_output, rows, cols, epsilon, device_idx, gpu_stream_);
         }
 
         bool ROCmRMSNormKernelT<ActivationPrecision::FP16>::apply_tensor(
@@ -257,7 +257,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx,
             int device_idx)
         {
-            KERNEL_PROFILE_SCOPE(KernelType::RMS_NORM);
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RMS_NORM, static_cast<hipStream_t>(gpu_stream_));
             (void)mpi_ctx;
             if (!input || !weight || !output)
             {
@@ -286,7 +286,7 @@ namespace llaminar2
             const float *d_weight_ptr = static_cast<const float *>(weight_fp32->gpu_data_ptr());
             uint16_t *d_output_ptr = static_cast<uint16_t *>(output_fp16->gpu_data_ptr());
 
-            bool ok = hipOps_rmsnorm_fp16(d_input_ptr, d_weight_ptr, d_output_ptr, rows, cols, epsilon, device_idx);
+            bool ok = hipOps_rmsnorm_fp16(d_input_ptr, d_weight_ptr, d_output_ptr, rows, cols, epsilon, device_idx, gpu_stream_);
             // No sync needed - coherence system handles sync when data is read
             return ok;
         }

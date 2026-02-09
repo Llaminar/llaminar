@@ -58,13 +58,15 @@ namespace llaminar2
         void setDeviceContext(IWorkerGPUContext* ctx) { device_ctx_ = ctx; }
         IWorkerGPUContext* deviceContext() const { return device_ctx_; }
         bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-        void* getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+        void* getStream() const { return gpu_stream_ ? gpu_stream_ : (device_ctx_ ? device_ctx_->defaultStream() : nullptr); }
 
         // ITensorKernel interface
         bool supports_device(int device_idx) const override
         {
             return device_idx >= 0; // ROCm supports any valid device index
         }
+
+        void setGPUStream(void *stream) override { gpu_stream_ = stream; }
 
         // ITensorEmbedding interface - FP32 output
         bool apply(
@@ -180,6 +182,7 @@ namespace llaminar2
     private:
         int device_idx_;
         IWorkerGPUContext* device_ctx_ = nullptr;
+        void *gpu_stream_ = nullptr;
 
         // IWorkspaceConsumer state
         DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned)

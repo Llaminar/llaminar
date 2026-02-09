@@ -256,6 +256,7 @@ if(HAVE_CUDA)
         backends/cuda/NvidiaDeviceContext.cu
         backends/cuda/NvidiaContextFactory.cu
         backends/cuda/CUDAWorkerImpl.cu
+        backends/cuda/CUDAGraphCapture.cu
         backends/CUDAEnumeration.cu
         collective/backends/NCCLBackendCUDA.cu
         collective/backends/HostBackendCUDA.cu
@@ -515,6 +516,8 @@ if(HAVE_ROCM)
         backends/rocm/AMDDeviceContext.cpp
         backends/rocm/AMDContextFactory.cpp
         backends/rocm/ROCmWorkerImpl.cpp
+        backends/rocm/HipDeviceGuard.cpp
+        backends/rocm/HIPGraphCapture.cpp
         backends/ROCmEnumeration.cpp
         collective/backends/HostBackendROCm.cpp              # HIP-specific host memory registration
         collective/backends/RCCLBackend.cpp                  # RCCL backend (MUST be here, not in llaminar2_core)

@@ -245,3 +245,26 @@ namespace llaminar2
     };
 
 } // namespace llaminar2
+
+// =============================================================================
+// Explicit factory registration functions
+// =============================================================================
+// These are defined in AMDContextFactory.cpp / NvidiaContextFactory.cu and
+// provide an explicit registration path when the static initializer in those
+// TUs is stripped by the linker (common with static libraries when no symbols
+// from the TU are referenced). Calling these functions also forces the linker
+// to include the respective object files, ensuring the static initializers run.
+
+#ifdef HAVE_ROCM
+namespace llaminar2
+{
+    void ensureAMDFactoryRegistered();
+}
+#endif
+
+#ifdef HAVE_CUDA
+namespace llaminar2
+{
+    void ensureNvidiaFactoryRegistered();
+}
+#endif

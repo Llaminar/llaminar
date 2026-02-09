@@ -7,9 +7,12 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include <memory>
 
 namespace llaminar2
 {
+    // Forward declaration
+    class ITensorResidualAdd;
 
     /**
      * @brief Residual addition stage: output = input + residual
@@ -52,6 +55,7 @@ namespace llaminar2
 
     private:
         Params params_;
+        mutable std::unique_ptr<llaminar2::ITensorResidualAdd> cached_kernel_;
 
         // Type-specific implementations
         bool executeFP32(IDeviceContext *ctx, size_t num_elements);

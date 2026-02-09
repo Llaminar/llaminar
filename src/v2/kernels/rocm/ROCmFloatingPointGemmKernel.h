@@ -179,6 +179,8 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override;
 
+            void setGPUStream(void *stream) override;
+
             // =========================================================================
             // IKernelSnapshotCapable interface
             // =========================================================================
@@ -205,6 +207,9 @@ namespace llaminar2
             // hipBLAS kernel - shared across all ROCm GEMM kernels on same device
             // Owned by DeviceKernelCache, not this kernel instance
             HipBLASGemmKernel *hipblas_kernel_ = nullptr;
+
+            // GPU stream for profiling (set via setGPUStream)
+            void *gpu_stream_ = nullptr;
         };
 
     } // namespace rocm

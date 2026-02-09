@@ -20,6 +20,7 @@
 #include "../../../collective/ILocalPPContext.h" // createLocalPPContext(), HierarchicalPPConfig
 #include "../../../collective/PPStage.h"         // PPStage variant type
 #include "../../../backends/p2p/DirectP2P.h"     // DirectP2PEngine for BAR-backed allocation
+#include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/MPIContext.h"
@@ -608,7 +609,84 @@ namespace llaminar2
                 return false;
             }
 
-            bool success = executor_.execute(*forward_cache_.graph, ctx);
+            bool success;
+            if (debugEnv().execution.fast_decode &&
+                !debugEnv().execution.executor_profiling &&
+                !executor_.config().snapshot_callback)
+            {
+                // GPU graph capture/replay path: eliminates per-kernel launch overhead
+                // Uses segmented capture to exclude attention/KV-cache stages whose
+                // kernel dimensions change each decode step (kv_len grows).
+                if (debugEnv().execution.gpu_graphs &&
+                    ctx->isGPU() &&
+                    forward_cache_.segment_cache.consecutive_failures < GraphExecutor::GraphSegmentCache::kMaxFailures)
+                {
+                    // Lazily initialize GPU stream and context on first use
+                    if (!forward_cache_.gpu_stream)
+                    {
+                        // Ensure backend factories are registered
+                        DeviceId dev_id = ctx->deviceId();
+#ifdef HAVE_ROCM
+                        if (dev_id.is_rocm())
+                            ensureAMDFactoryRegistered();
+#endif
+#ifdef HAVE_CUDA
+                        if (dev_id.is_cuda())
+                            ensureNvidiaFactoryRegistered();
+#endif
+
+                        auto &pool = GPUDeviceContextPool::instance();
+                        IWorkerGPUContext *gpu_ctx = nullptr;
+                        if (dev_id.is_rocm())
+                        {
+                            gpu_ctx = &pool.getAMDContext(dev_id.rocm_ordinal());
+                        }
+                        else if (dev_id.is_cuda())
+                        {
+                            gpu_ctx = &pool.getNvidiaContext(dev_id.cuda_ordinal());
+                        }
+                        if (gpu_ctx)
+                        {
+                            forward_cache_.gpu_stream = gpu_ctx->defaultStream();
+                            forward_cache_.gpu_ctx = gpu_ctx;
+                        }
+                    }
+
+                    if (forward_cache_.gpu_stream && forward_cache_.gpu_ctx)
+                    {
+                        success = executor_.executeWithSegmentedGraphCapture(
+                            *forward_cache_.graph, ctx,
+                            forward_cache_.segment_cache,
+                            forward_cache_.gpu_stream,
+                            forward_cache_.gpu_ctx);
+
+                        if (!success)
+                        {
+                            LOG_WARN("[DeviceGraphOrchestrator] Segmented graph failed, falling back to fast decode");
+                            forward_cache_.graph->reset();
+                            success = executor_.executeFastDecode(
+                                *forward_cache_.graph, ctx,
+                                &forward_cache_.collective_nodes);
+                        }
+                    }
+                    else
+                    {
+                        success = executor_.executeFastDecode(
+                            *forward_cache_.graph, ctx,
+                            &forward_cache_.collective_nodes);
+                    }
+                }
+                else
+                {
+                    success = executor_.executeFastDecode(
+                        *forward_cache_.graph, ctx,
+                        &forward_cache_.collective_nodes);
+                }
+            }
+            else
+            {
+                success = executor_.execute(*forward_cache_.graph, ctx);
+            }
 
             // Sync the stream at the forward pass boundary so logits are
             // immediately available to the caller without per-access event waits.
@@ -798,6 +876,25 @@ namespace llaminar2
         {
             forward_cache_.graph = std::make_unique<ComputeGraph>(std::move(graph));
             forward_cache_.output = output;
+            // Pre-compute collective node set for fast decode intercept
+            forward_cache_.collective_nodes.clear();
+            if (executor_.collectiveContext())
+            {
+                for (const auto &n : forward_cache_.graph->getExecutionOrder())
+                {
+                    auto *nd = forward_cache_.graph->getNode(n);
+                    if (nd && nd->stage)
+                    {
+                        auto t = nd->stage->type();
+                        if (t == ComputeStageType::ALLREDUCE ||
+                            t == ComputeStageType::ALLGATHER)
+                        {
+                            forward_cache_.collective_nodes.insert(n);
+                        }
+                    }
+                }
+            }
+
             forward_cache_.valid = true;
             LOG_INFO("[DeviceGraphOrchestrator] Cached forward graph for decode mode ("
                      << forward_cache_.graph->size() << " stages)");

@@ -5,10 +5,11 @@
 
 #include "ROCmEmbeddingKernelT.h"
 #include "utils/Logger.h"
-#include "utils/KernelProfiler.h"
+#include "utils/ROCmKernelProfiler.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../common/EmbedQ8Repack.h"
+#include "../../../backends/rocm/HipDeviceGuard.h"
 
 #include <hip/hip_runtime.h>
 
@@ -72,14 +73,14 @@ namespace llaminar2
         (void)mpi_ctx;
         int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-        hipError_t set_err = hipSetDevice(dev);
+        hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(dev));
         if (set_err != hipSuccess)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] Failed to set device " << dev << ": " << hipGetErrorString(set_err));
             return false;
         }
 
-        hipError_t err = hipOps_embedding_fp32(embed_data, token_ids, output, num_tokens, d_model, nullptr);
+        hipError_t err = hipOps_embedding_fp32(embed_data, token_ids, output, num_tokens, d_model, static_cast<hipStream_t>(getStream()));
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] FP32 kernel failed: " << hipGetErrorString(err));
@@ -101,14 +102,14 @@ namespace llaminar2
         (void)mpi_ctx;
         int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-        hipError_t set_err = hipSetDevice(dev);
+        hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(dev));
         if (set_err != hipSuccess)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] Failed to set device " << dev << ": " << hipGetErrorString(set_err));
             return false;
         }
 
-        hipError_t err = hipOps_embedding_bf16(embed_data, token_ids, output, num_tokens, d_model, nullptr);
+        hipError_t err = hipOps_embedding_bf16(embed_data, token_ids, output, num_tokens, d_model, static_cast<hipStream_t>(getStream()));
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] BF16 kernel failed: " << hipGetErrorString(err));
@@ -130,14 +131,14 @@ namespace llaminar2
         (void)mpi_ctx;
         int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-        hipError_t set_err = hipSetDevice(dev);
+        hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(dev));
         if (set_err != hipSuccess)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] Failed to set device " << dev << ": " << hipGetErrorString(set_err));
             return false;
         }
 
-        hipError_t err = hipOps_embedding_fp16(embed_data, token_ids, output, num_tokens, d_model, nullptr);
+        hipError_t err = hipOps_embedding_fp16(embed_data, token_ids, output, num_tokens, d_model, static_cast<hipStream_t>(getStream()));
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] FP16 kernel failed: " << hipGetErrorString(err));
@@ -159,7 +160,7 @@ namespace llaminar2
         (void)mpi_ctx;
         int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-        hipError_t set_err = hipSetDevice(dev);
+        hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(dev));
         if (set_err != hipSuccess)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] Failed to set device " << dev << ": " << hipGetErrorString(set_err));
@@ -172,7 +173,7 @@ namespace llaminar2
             return false;
         }
 
-        hipError_t err = hipOps_embedding_q8_1(embed_data, token_ids, output, num_tokens, d_model, nullptr);
+        hipError_t err = hipOps_embedding_q8_1(embed_data, token_ids, output, num_tokens, d_model, static_cast<hipStream_t>(getStream()));
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] Q8_1 kernel failed: " << hipGetErrorString(err));
@@ -191,7 +192,7 @@ namespace llaminar2
         const MPIContext *mpi_ctx,
         int device_idx)
     {
-        KERNEL_PROFILE_SCOPE(KernelType::EMBEDDING);
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::EMBEDDING_LOOKUP, static_cast<hipStream_t>(getStream()));
         (void)mpi_ctx;
 
         if (!embed_table || !output)
@@ -216,7 +217,7 @@ namespace llaminar2
 
         // Set target ROCm device
         int dev = (device_idx >= 0) ? device_idx : device_idx_;
-        hipError_t set_err = hipSetDevice(dev);
+        hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(dev));
         if (set_err != hipSuccess)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] Failed to set device " << dev << ": " << hipGetErrorString(set_err));
@@ -240,7 +241,12 @@ namespace llaminar2
         }
 
         size_t token_bytes = static_cast<size_t>(num_tokens) * sizeof(int);
-        hipError_t err = hipMemcpy(d_token_ids, token_ids, token_bytes, hipMemcpyHostToDevice);
+        // Use async copy on the device stream so this operation is compatible
+        // with HIP/CUDA stream capture (GPU graph recording). Synchronous
+        // hipMemcpy uses the legacy stream which would create a dependency on
+        // a capturing stream, causing capture to fail.
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        hipError_t err = hipMemcpyAsync(d_token_ids, token_ids, token_bytes, hipMemcpyHostToDevice, stream);
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] Failed to copy token_ids to GPU: " << hipGetErrorString(err));
@@ -268,7 +274,7 @@ namespace llaminar2
             float *d_embed = const_cast<float *>(static_cast<const float *>(embed_fp32->gpu_data_ptr()));
             LOG_DEBUG("[ROCmEmbeddingKernelT] FP32 fast path: d_embed=" << static_cast<void *>(d_embed)
                                                                         << " num_tokens=" << num_tokens << " d_model=" << d_model);
-            err = hipOps_embedding_fp32(d_embed, d_token_ids, d_output, num_tokens, d_model, nullptr);
+            err = hipOps_embedding_fp32(d_embed, d_token_ids, d_output, num_tokens, d_model, stream);
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmEmbeddingKernelT] FP32 kernel failed: " << hipGetErrorString(err));
@@ -294,6 +300,9 @@ namespace llaminar2
             {
                 auto repacked = repackEmbeddingToQ8(embed_table, d_model);
 
+                // Use sync copy for the large one-time embedding upload.
+                // This only happens on the first forward pass, not during
+                // cached decode, so it won't conflict with graph capture.
                 err = hipMemcpy(d_embed_q8, repacked.data.data(), repacked.byte_size,
                                 hipMemcpyHostToDevice);
                 if (err != hipSuccess)
@@ -314,7 +323,7 @@ namespace llaminar2
             size_t blocks_per_row = (static_cast<size_t>(d_model) + 31) / 32;
             err = hipOps_embedding_q8(d_embed_q8, d_token_ids, d_output,
                                       num_tokens, d_model,
-                                      static_cast<int>(blocks_per_row), nullptr);
+                                      static_cast<int>(blocks_per_row), stream);
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmEmbeddingKernelT] EmbedQ8 kernel failed: " << hipGetErrorString(err));

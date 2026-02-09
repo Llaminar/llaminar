@@ -1,5 +1,6 @@
 #pragma once
 
+#include "IGPUGraphCapture.h"
 #include <functional>
 #include <future>
 #include <memory>
@@ -270,6 +271,60 @@ namespace llaminar2
          * @thread_safety Thread-safe, can be called from any thread
          */
         virtual void synchronize() = 0;
+
+        /**
+         * @brief Synchronize a specific stream (CPU blocks until stream completes)
+         * @param stream Stream handle to synchronize. nullptr = legacy default stream (stream 0).
+         * @thread_safety Thread-safe, can be called from any thread
+         *
+         * @note This is significantly cheaper than synchronize() (device-wide sync)
+         *       because it only waits for work on one stream, not all streams.
+         *       Especially important for segmented graph capture where alternating
+         *       between graph launches (capture_stream) and manual stages (stream 0)
+         *       requires ~50 sync points per decode token.
+         */
+        virtual void synchronizeStream(void *stream) = 0;
+
+        /**
+         * @brief Insert a GPU-side dependency between two streams (non-blocking from CPU)
+         * @param dependent_stream Stream that should wait (nullptr = legacy stream 0)
+         * @param dependency_stream Stream to wait for (nullptr = legacy stream 0)
+         *
+         * Makes dependent_stream wait until all prior work on dependency_stream
+         * completes, using an internal event. This is a GPU-side wait — the CPU
+         * is NOT blocked. This is much cheaper than synchronizeStream() because
+         * it avoids CPU stalls entirely.
+         *
+         * Used by segmented graph capture to order graph launches (on capture_stream)
+         * with manual stage dispatches (on legacy stream 0) without CPU overhead.
+         *
+         * @note The event is managed internally; callers don't need to create/destroy events.
+         */
+        virtual void insertStreamDependency(void *dependent_stream, void *dependency_stream) = 0;
+
+        // =========================================================================
+        // GPU Graph Capture (worker-thread-only)
+        // =========================================================================
+
+        /**
+         * @brief Create a GPU graph capture object for this device's default stream
+         * @return Unique pointer to a backend-specific graph capture implementation
+         * @thread_safety Must be called from worker thread (within submitted work)
+         *
+         * @note The returned object captures from this context's default stream.
+         *       The graph capture object must not outlive this context.
+         */
+        virtual std::unique_ptr<IGPUGraphCapture> createGraphCapture() = 0;
+
+        /**
+         * @brief Create a GPU graph capture object using a specific stream
+         * @param stream Opaque GPU stream pointer (hipStream_t or cudaStream_t cast to void*)
+         * @return Unique pointer to a backend-specific graph capture implementation
+         *
+         * This overload is used for segmented graph capture, where the capture stream
+         * is created locally rather than using the device context's default stream.
+         */
+        virtual std::unique_ptr<IGPUGraphCapture> createGraphCapture(void *stream) = 0;
 
     protected:
         IWorkerGPUContext() = default;

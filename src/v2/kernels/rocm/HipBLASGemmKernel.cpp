@@ -23,6 +23,7 @@
 
 #include "HipBLASGemmKernel.h"
 #include "backends/IWorkerGPUContext.h"
+#include "../../backends/rocm/HipDeviceGuard.h"
 #include <stdexcept>
 #include <string>
 
@@ -95,7 +96,7 @@ namespace llaminar2
             }
 
             // Set device
-            hipError_t hip_err = hipSetDevice(device_id_.ordinal);
+            hipError_t hip_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_.ordinal));
             if (hip_err != hipSuccess)
             {
                 throw std::runtime_error(
@@ -277,7 +278,7 @@ namespace llaminar2
             }
 
             // Ensure we're on the correct device
-            hipError_t hip_err = hipSetDevice(device_id_.ordinal);
+            hipError_t hip_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_.ordinal));
             if (hip_err != hipSuccess)
             {
                 HIP_LOG_ERROR("[HipBLASGemmKernel::execute] Failed to set device: " << hipGetErrorString(hip_err));
@@ -357,7 +358,7 @@ namespace llaminar2
             }
 
             // Ensure we're on the correct device
-            hipError_t hip_err = hipSetDevice(device_id_.ordinal);
+            hipError_t hip_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_.ordinal));
             if (hip_err != hipSuccess)
             {
                 HIP_LOG_ERROR("[HipBLASGemmKernel::execute_with_bias] Failed to set device: " << hipGetErrorString(hip_err));
@@ -513,7 +514,7 @@ namespace llaminar2
             }
 
             // Ensure we're on the correct device
-            hipError_t hip_err = hipSetDevice(device_id_.ordinal);
+            hipError_t hip_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_.ordinal));
             if (hip_err != hipSuccess)
             {
                 HIP_LOG_ERROR("[HipBLASGemmKernel::execute_fp16] Failed to set device: " << hipGetErrorString(hip_err));
@@ -554,6 +555,15 @@ namespace llaminar2
             HipBLASGemmKernel::Precision precision)
         {
             return std::make_unique<HipBLASGemmKernel>(device_id, precision);
+        }
+
+        void HipBLASGemmKernel::setStream(void *stream)
+        {
+            if (handle_)
+            {
+                hipblasSetStream(static_cast<hipblasHandle_t>(handle_),
+                                 static_cast<hipStream_t>(stream));
+            }
         }
 
         void registerHipBLASGemmKernelFactory()
@@ -625,6 +635,8 @@ namespace llaminar2
         }
 
         void registerHipBLASGemmKernelFactory() {}
+
+        void HipBLASGemmKernel::setStream(void *) {}
 
 #endif // HAVE_ROCM
 

@@ -19,10 +19,16 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
+#ifdef HAVE_ROCM
+#include "../../../backends/rocm/HipDeviceGuard.h"
+#endif
+#include "../../../backends/IGPUGraphCapture.h"
+#include "../../../backends/IWorkerGPUContext.h"
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
 #include <iostream>
+#include "fort.hpp"
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -30,6 +36,64 @@
 
 namespace llaminar2
 {
+
+    // =========================================================================
+    // GraphSegmentCache — capture stream management
+    // =========================================================================
+
+    bool GraphExecutor::GraphSegmentCache::ensureCaptureStream(IWorkerGPUContext *ctx)
+    {
+        if (capture_stream)
+            return true;
+        if (!ctx)
+        {
+            LOG_ERROR("[GraphSegmentCache] No GPU context for stream creation");
+            return false;
+        }
+        capture_stream = ctx->createStream();
+        if (!capture_stream)
+        {
+            LOG_ERROR("[GraphSegmentCache] Failed to create capture stream");
+            return false;
+        }
+        gpu_ctx_ref = ctx;
+        LOG_DEBUG("[GraphSegmentCache] Created local capture stream");
+        return true;
+    }
+
+    void GraphExecutor::GraphSegmentCache::destroyCaptureStream()
+    {
+        if (!capture_stream)
+            return;
+        if (gpu_ctx_ref)
+            gpu_ctx_ref->destroyStream(capture_stream);
+        capture_stream = nullptr;
+        gpu_ctx_ref = nullptr;
+    }
+
+    bool GraphExecutor::GraphSegmentCache::ensureSyncEvent(IWorkerGPUContext *ctx)
+    {
+        if (sync_event)
+            return true;
+        if (!ctx)
+            return false;
+        sync_event = ctx->createEvent();
+        if (!sync_event)
+        {
+            LOG_ERROR("[GraphSegmentCache] Failed to create sync event");
+            return false;
+        }
+        return true;
+    }
+
+    void GraphExecutor::GraphSegmentCache::destroySyncEvent()
+    {
+        if (!sync_event)
+            return;
+        if (gpu_ctx_ref)
+            gpu_ctx_ref->destroyEvent(sync_event);
+        sync_event = nullptr;
+    }
 
     // =============================================================================
     // ExecutionMode Helpers
@@ -64,78 +128,104 @@ namespace llaminar2
         double stages_per_token = decode_tokens > 0 ? static_cast<double>(total_stages_executed) / decode_tokens : 0;
         double execute_per_token = decode_tokens > 0 ? total_execute_ms / decode_tokens : 0;
         double overhead_per_token = decode_tokens > 0 ? total_overhead / decode_tokens : 0;
+        (void)execute_per_token; // Used in efficiency section
 
-        std::cout << "\n";
-        std::cout << "╔══════════════════════════════════════════════════════════════════════════════╗\n";
-        std::cout << "║                    EXECUTOR OVERHEAD PROFILING SUMMARY                       ║\n";
-        std::cout << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
-
-        // Summary line
-        std::cout << "║ Total stages executed: " << std::setw(8) << total_stages_executed;
-        if (decode_tokens > 0)
+        // Helper to format a double with fixed precision
+        auto fmt = [](double val, int prec) -> std::string
         {
-            std::cout << "  (" << std::fixed << std::setprecision(1) << stages_per_token << " stages/token)";
-        }
-        std::cout << std::string(std::max(0, 31 - (decode_tokens > 0 ? 22 : 0)), ' ') << "║\n";
-
-        std::cout << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
-        std::cout << "║  CATEGORY                    │    TOTAL (ms)  │  PER-TOKEN (ms) │    %      ║\n";
-        std::cout << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
-
-        // Helper lambda for printing rows
-        auto printRow = [&](const char *name, double value_ms)
-        {
-            double per_token = decode_tokens > 0 ? value_ms / decode_tokens : 0;
-            double pct = total_all > 0 ? (value_ms / total_all) * 100.0 : 0;
-            std::cout << "║  " << std::left << std::setw(26) << name << " │ "
-                      << std::right << std::setw(13) << std::fixed << std::setprecision(2) << value_ms << " │ "
-                      << std::setw(15) << std::fixed << std::setprecision(3) << per_token << " │ "
-                      << std::setw(7) << std::fixed << std::setprecision(1) << pct << "%  ║\n";
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(prec) << val;
+            return oss.str();
         };
 
-        // Kernel execution time (the actual work)
-        printRow("Kernel Execution", total_execute_ms);
-
-        std::cout << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
-        std::cout << "║  COHERENCE OVERHEAD:                                                         ║\n";
-        printRow("  Input Coherence", overhead.input_cohere_ms);
-        printRow("  Weight Coherence", overhead.weight_cohere_ms);
-        printRow("  Output Allocation", overhead.output_alloc_ms);
-        printRow("  Mark Dirty (events)", overhead.mark_dirty_ms);
-
-        std::cout << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
-        std::cout << "║  FRAMEWORK OVERHEAD:                                                         ║\n";
-        printRow("  getDumpInfo() calls", overhead.get_dump_info_ms);
-        printRow("  extractBuffers() calls", overhead.extract_buffers_ms);
-        printRow("  Buffer Verification", overhead.verify_ms);
-        printRow("  Snapshot Callbacks", overhead.callback_ms);
-
-        std::cout << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
-        std::cout << "║  STAGE DUMP (if enabled):                                                    ║\n";
-        printRow("  Dump Inputs", overhead.dump_input_ms);
-        printRow("  Dump Outputs", overhead.dump_output_ms);
-
-        std::cout << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
-
-        // Totals
-        printRow("TOTAL OVERHEAD", total_overhead);
-        printRow("TOTAL (kernel + overhead)", total_all);
-
-        std::cout << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
-
-        // Efficiency metric
-        double efficiency = total_all > 0 ? (total_execute_ms / total_all) * 100.0 : 0;
-        std::cout << "║  Kernel Efficiency: " << std::fixed << std::setprecision(1) << efficiency << "%";
-        std::cout << "  (higher = less overhead)                            ║\n";
-
-        if (decode_tokens > 0)
+        // Helper to format percentage
+        auto pct = [&](double val) -> std::string
         {
-            std::cout << "║  Overhead per token: " << std::fixed << std::setprecision(3) << overhead_per_token << " ms";
-            std::cout << "                                             ║\n";
+            double p = total_all > 0 ? (val / total_all) * 100.0 : 0;
+            return fmt(p, 1) + "%";
+        };
+
+        // Helper to format per-token value
+        auto per_tok = [&](double val) -> std::string
+        {
+            if (decode_tokens == 0)
+                return "-";
+            return fmt(val / decode_tokens, 3);
+        };
+
+        // Build the table
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+
+        // Title row (spans all columns)
+        table << "EXECUTOR OVERHEAD PROFILING SUMMARY" << "" << "" << "" << fort::endr;
+        table[0][0].set_cell_span(4);
+        table[0][0].set_cell_text_align(fort::text_align::center);
+        table.row(0).set_cell_content_fg_color(fort::color::light_cyan);
+
+        // Summary info
+        {
+            std::ostringstream oss;
+            oss << "Total stages executed: " << total_stages_executed;
+            if (decode_tokens > 0)
+                oss << "  (" << fmt(stages_per_token, 1) << " stages/token)";
+            table << oss.str() << "" << "" << "" << fort::endr;
+            table[1][0].set_cell_span(4);
         }
 
-        std::cout << "╚══════════════════════════════════════════════════════════════════════════════╝\n";
-        std::cout << std::endl;
+        // Header row
+        table << fort::header << "CATEGORY" << "TOTAL (ms)" << "PER-TOKEN (ms)" << "%" << fort::endr;
+
+        // Column alignments
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        table.column(1).set_cell_text_align(fort::text_align::right);
+        table.column(2).set_cell_text_align(fort::text_align::right);
+        table.column(3).set_cell_text_align(fort::text_align::right);
+
+        // Kernel execution
+        table << "Kernel Execution" << fmt(total_execute_ms, 2) << per_tok(total_execute_ms) << pct(total_execute_ms) << fort::endr;
+
+        // Separator before coherence
+        table << fort::separator;
+        table << "COHERENCE OVERHEAD:" << "" << "" << "" << fort::endr;
+        table << "  Input Coherence" << fmt(overhead.input_cohere_ms, 2) << per_tok(overhead.input_cohere_ms) << pct(overhead.input_cohere_ms) << fort::endr;
+        table << "  Weight Coherence" << fmt(overhead.weight_cohere_ms, 2) << per_tok(overhead.weight_cohere_ms) << pct(overhead.weight_cohere_ms) << fort::endr;
+        table << "  Output Allocation" << fmt(overhead.output_alloc_ms, 2) << per_tok(overhead.output_alloc_ms) << pct(overhead.output_alloc_ms) << fort::endr;
+        table << "  Mark Dirty (events)" << fmt(overhead.mark_dirty_ms, 2) << per_tok(overhead.mark_dirty_ms) << pct(overhead.mark_dirty_ms) << fort::endr;
+
+        // Framework overhead
+        table << fort::separator;
+        table << "FRAMEWORK OVERHEAD:" << "" << "" << "" << fort::endr;
+        table << "  getDumpInfo() calls" << fmt(overhead.get_dump_info_ms, 2) << per_tok(overhead.get_dump_info_ms) << pct(overhead.get_dump_info_ms) << fort::endr;
+        table << "  extractBuffers() calls" << fmt(overhead.extract_buffers_ms, 2) << per_tok(overhead.extract_buffers_ms) << pct(overhead.extract_buffers_ms) << fort::endr;
+        table << "  Buffer Verification" << fmt(overhead.verify_ms, 2) << per_tok(overhead.verify_ms) << pct(overhead.verify_ms) << fort::endr;
+        table << "  Snapshot Callbacks" << fmt(overhead.callback_ms, 2) << per_tok(overhead.callback_ms) << pct(overhead.callback_ms) << fort::endr;
+
+        // Stage dump
+        table << fort::separator;
+        table << "STAGE DUMP (if enabled):" << "" << "" << "" << fort::endr;
+        table << "  Dump Inputs" << fmt(overhead.dump_input_ms, 2) << per_tok(overhead.dump_input_ms) << pct(overhead.dump_input_ms) << fort::endr;
+        table << "  Dump Outputs" << fmt(overhead.dump_output_ms, 2) << per_tok(overhead.dump_output_ms) << pct(overhead.dump_output_ms) << fort::endr;
+
+        // Totals
+        table << fort::separator;
+        table << "TOTAL OVERHEAD" << fmt(total_overhead, 2) << per_tok(total_overhead) << pct(total_overhead) << fort::endr;
+        table << "TOTAL (kernel + overhead)" << fmt(total_all, 2) << per_tok(total_all) << pct(total_all) << fort::endr;
+
+        // Efficiency row
+        table << fort::separator;
+        double efficiency = total_all > 0 ? (total_execute_ms / total_all) * 100.0 : 0;
+        {
+            std::ostringstream oss;
+            oss << "Kernel Efficiency: " << fmt(efficiency, 1) << "%  (higher = less overhead)";
+            if (decode_tokens > 0)
+                oss << "  |  Overhead per token: " << fmt(overhead_per_token, 3) << " ms";
+            table << oss.str() << "" << "" << "" << fort::endr;
+            table[table.row_count() - 1][0].set_cell_span(4);
+        }
+
+        std::cout << "\n"
+                  << table.to_string() << std::endl;
     }
 
     // =============================================================================
@@ -526,6 +616,763 @@ namespace llaminar2
         }
         stats_.total_flops += graph.totalEstimatedFlops();
 
+        return true;
+    }
+
+    bool GraphExecutor::executeFastDecode(ComputeGraph &graph, IDeviceContext *ctx,
+                                          const std::unordered_set<std::string> *collective_nodes)
+    {
+        // Set HIP device once for the entire decode pass — eliminates 339+ redundant hipSetDevice calls
+#ifdef HAVE_ROCM
+        if (ctx && ctx->deviceId().type == DeviceType::ROCm)
+        {
+            HipDeviceGuard::forceSetDevice(ctx->deviceId().toKernelDeviceIndex());
+        }
+#endif
+
+        auto order = graph.getExecutionOrder();
+
+        for (const auto &name : order)
+        {
+            auto *node = graph.getNode(name);
+
+            // Collective intercept for TP>1 (ALLREDUCE/ALLGATHER via RCCL/NCCL)
+            if (collective_ctx_ && collective_nodes && collective_nodes->count(name))
+            {
+                auto stage_type = node->stage->type();
+                if (stage_type == ComputeStageType::ALLREDUCE)
+                {
+                    if (!executeCollectiveAllreduce(*node, ctx))
+                    {
+                        LOG_ERROR("[GraphExecutor] Fast decode collective ALLREDUCE failed: " << name);
+                        return false;
+                    }
+                    graph.markCompleted(name);
+                    continue;
+                }
+                else if (stage_type == ComputeStageType::ALLGATHER)
+                {
+                    if (executeCollectiveStridedAllgather(*node, ctx))
+                    {
+                        graph.markCompleted(name);
+                        continue;
+                    }
+                    // Fall through to normal execution if strided path not available
+                }
+            }
+
+            // Direct execute — no coherence, no dumps, no profiling, no validation
+            if (!node->stage->execute(ctx))
+            {
+                LOG_ERROR("[GraphExecutor] Fast decode stage failed: " << name);
+                return false;
+            }
+
+            graph.markCompleted(name);
+        }
+
+        return true;
+    }
+
+    bool GraphExecutor::executeWithGraphCapture(ComputeGraph &graph, IDeviceContext *ctx,
+                                                IGPUGraphCapture *capture,
+                                                const std::unordered_set<std::string> *collective_nodes,
+                                                void *gpu_stream)
+    {
+        if (!capture)
+        {
+            LOG_WARN("[GraphExecutor] GPU graph capture is null, falling back to fast decode");
+            return executeFastDecode(graph, ctx, collective_nodes);
+        }
+
+        // TP>1 with collectives cannot be captured in a single-device graph
+        if (collective_nodes && !collective_nodes->empty())
+        {
+            LOG_DEBUG("[GraphExecutor] Collective nodes present, skipping graph capture for TP>1");
+            return executeFastDecode(graph, ctx, collective_nodes);
+        }
+
+        // Step 1: Begin capture
+        if (!capture->beginCapture())
+        {
+            LOG_WARN("[GraphExecutor] GPU graph beginCapture failed, falling back to fast decode");
+            return executeFastDecode(graph, ctx, collective_nodes);
+        }
+
+        // Step 2: Execute all stages into the captured stream
+        // Set HIP device once before the loop (same as executeFastDecode)
+#ifdef HAVE_ROCM
+        if (ctx && ctx->deviceId().type == DeviceType::ROCm)
+        {
+            HipDeviceGuard::forceSetDevice(ctx->deviceId().toKernelDeviceIndex());
+        }
+#endif
+
+        auto order = graph.getExecutionOrder();
+        bool exec_success = true;
+
+        // Set GPU stream on all stages so kernels dispatch to the capture stream
+        if (gpu_stream)
+        {
+            for (const auto &name : order)
+            {
+                auto *node = graph.getNode(name);
+                if (node && node->stage)
+                    node->stage->setGPUStream(gpu_stream);
+            }
+        }
+
+        for (const auto &name : order)
+        {
+            auto *node = graph.getNode(name);
+            if (!node->stage->execute(ctx))
+            {
+                LOG_ERROR("[GraphExecutor] Stage failed during graph capture: " << name);
+                exec_success = false;
+                break;
+            }
+            graph.markCompleted(name);
+        }
+
+        // Step 3: End capture
+        if (!exec_success || !capture->endCapture())
+        {
+            LOG_WARN("[GraphExecutor] GPU graph capture failed (exec_success=" << exec_success
+                                                                               << "), stream may be in bad state");
+            // If capture was started but execute failed, we still need to end capture
+            // to restore the stream to a usable state
+            if (exec_success)
+            {
+                // endCapture failed
+                capture->reset();
+            }
+            // Fall through — the stream should be usable again after endCapture
+            // The kernels were recorded during capture but NOT executed
+            return exec_success;
+        }
+
+        // If graph captured 0 nodes, all work was CPU-side (already executed
+        // during capture).  Skip instantiate/update/launch — there is nothing
+        // to replay.
+        if (capture->nodeCount() == 0)
+        {
+            LOG_WARN("[GraphExecutor] GPU graph captured 0 nodes — kernels NOT on capture stream! Skipping graph replay");
+            return true;
+        }
+
+        // Step 4: Instantiate or update + launch
+        LOG_WARN("[GraphExecutor] GPU graph captured " << capture->nodeCount()
+                                                       << " nodes, hasExecutable=" << capture->hasExecutable());
+        if (capture->hasExecutable())
+        {
+            // Try in-place update
+            GraphUpdateResult result = capture->tryUpdate();
+            LOG_WARN("[GraphExecutor] tryUpdate result=" << static_cast<int>(result));
+            if (result == GraphUpdateResult::Success)
+            {
+                // In-place update succeeded — launch the updated executable
+                if (!capture->launch())
+                {
+                    LOG_ERROR("[GraphExecutor] GPU graph launch failed after update");
+                    return false;
+                }
+                LOG_TRACE("[GraphExecutor] GPU graph updated and launched ("
+                          << capture->nodeCount() << " nodes)");
+                return true;
+            }
+            else if (result == GraphUpdateResult::NeedsReinstantiate)
+            {
+                // Topology changed — reinstantiate
+                LOG_WARN("[GraphExecutor] NeedsReinstantiate — calling instantiate()");
+                if (!capture->instantiate())
+                {
+                    LOG_WARN("[GraphExecutor] GPU graph reinstantiation failed");
+                    return false;
+                }
+            }
+            else
+            {
+                // Update failed
+                LOG_WARN("[GraphExecutor] GPU graph update failed (result="
+                         << static_cast<int>(result) << ")");
+                return false;
+            }
+        }
+        else
+        {
+            // First time — instantiate from captured graph
+            LOG_WARN("[GraphExecutor] First instantiation attempt (" << capture->nodeCount() << " nodes)");
+            if (!capture->instantiate())
+            {
+                LOG_WARN("[GraphExecutor] GPU graph instantiation failed");
+                return false;
+            }
+            LOG_WARN("[GraphExecutor] GPU graph instantiated with " << capture->nodeCount()
+                                                                    << " nodes (" << capture->backendName() << ")");
+        }
+
+        // Launch the (newly instantiated) executable
+        if (!capture->launch())
+        {
+            LOG_ERROR("[GraphExecutor] GPU graph launch failed");
+            return false;
+        }
+
+        return true;
+    }
+
+    bool GraphExecutor::executeWithSegmentedGraphCapture(ComputeGraph &graph, IDeviceContext *ctx,
+                                                         GraphSegmentCache &segment_cache,
+                                                         void *gpu_stream,
+                                                         IWorkerGPUContext *gpu_ctx)
+    {
+        if (!gpu_stream || !gpu_ctx)
+        {
+            LOG_WARN("[GraphExecutor] Segmented graph capture: missing stream or gpu_ctx, falling back");
+            return executeFastDecode(graph, ctx);
+        }
+
+        auto order = graph.getExecutionOrder();
+
+#ifdef HAVE_ROCM
+        if (ctx && ctx->deviceId().type == DeviceType::ROCm)
+        {
+            HipDeviceGuard::forceSetDevice(ctx->deviceId().toKernelDeviceIndex());
+        }
+#endif
+
+        // ===== Phase 1: Warmup (first call) — build segments, execute normally =====
+        // We do NOT capture on the first call. Some kernels lazily initialize workspace
+        // buffers (hipMalloc), which isn't compatible with stream capture.
+        // First call builds the segment list and runs via executeFastDecode.
+        if (!segment_cache.initialized)
+        {
+            segment_cache.segments.clear();
+
+            // Partition execution order into contiguous runs of capturable / non-capturable stages
+            bool current_capturable = false;
+            bool first = true;
+
+            for (const auto &name : order)
+            {
+                auto *node = graph.getNode(name);
+                if (!node || !node->stage)
+                    continue;
+
+                bool stage_capturable = node->stage->isGraphCapturable();
+
+                // Start a new segment if capturability changes or this is the first stage
+                if (first || stage_capturable != current_capturable)
+                {
+                    segment_cache.segments.emplace_back();
+                    segment_cache.segments.back().capturable = stage_capturable;
+                    current_capturable = stage_capturable;
+                    first = false;
+                }
+
+                segment_cache.segments.back().stage_names.push_back(name);
+            }
+
+            // Split oversized capturable segments if max_stages is set
+            const int max_stages = debugEnv().execution.gpu_graph_max_stages;
+            if (max_stages > 0)
+            {
+                std::vector<GraphSegment> split_segments;
+                for (auto &seg : segment_cache.segments)
+                {
+                    if (seg.capturable && static_cast<int>(seg.stage_names.size()) > max_stages)
+                    {
+                        // Split into chunks of max_stages
+                        for (size_t i = 0; i < seg.stage_names.size(); i += max_stages)
+                        {
+                            GraphSegment sub;
+                            sub.capturable = true;
+                            size_t end = std::min(i + max_stages, seg.stage_names.size());
+                            for (size_t j = i; j < end; j++)
+                                sub.stage_names.push_back(seg.stage_names[j]);
+                            split_segments.push_back(std::move(sub));
+                        }
+                    }
+                    else
+                    {
+                        split_segments.push_back(std::move(seg));
+                    }
+                }
+                segment_cache.segments = std::move(split_segments);
+            }
+
+            // Log segment layout
+            size_t capturable_segments = 0, manual_segments = 0;
+            size_t capturable_stages = 0, manual_stages = 0;
+            for (const auto &seg : segment_cache.segments)
+            {
+                if (seg.capturable)
+                {
+                    capturable_segments++;
+                    capturable_stages += seg.stage_names.size();
+                }
+                else
+                {
+                    manual_segments++;
+                    manual_stages += seg.stage_names.size();
+                }
+            }
+
+            LOG_INFO("[GraphExecutor] Segmented graph: " << capturable_segments << " capturable segments ("
+                                                         << capturable_stages << " stages) + " << manual_segments << " manual segments ("
+                                                         << manual_stages << " stages)");
+
+            // Warmup: execute all stages normally (no capture) to ensure
+            // lazy kernel initialization and workspace allocation complete.
+            segment_cache.initialized = true;
+            segment_cache.needs_capture = true;
+            return executeFastDecode(graph, ctx);
+        }
+
+        // ===== Phase 2: Capture (second call) — record capturable segments =====
+        if (segment_cache.needs_capture)
+        {
+            segment_cache.needs_capture = false;
+
+            // Create a local blocking stream for capture/replay.
+            // CRITICAL: We create this stream directly on the calling thread, NOT
+            // from the AMDDeviceContext worker thread. On ROCm (MI50/gfx906, ROCm 7.1),
+            // streams created on a different thread produce corrupted output when used
+            // for graph capture on the main thread. Creating the stream locally avoids
+            // this cross-thread issue.
+            if (!segment_cache.ensureCaptureStream(gpu_ctx))
+            {
+                LOG_WARN("[GraphExecutor] Failed to create capture stream, falling back");
+                return executeFastDecode(graph, ctx);
+            }
+            void *capture_stream = segment_cache.capture_stream;
+
+            for (auto &seg : segment_cache.segments)
+            {
+                if (seg.capturable)
+                {
+                    // Set the local capture stream on stages in this segment
+                    for (const auto &stage_name : seg.stage_names)
+                    {
+                        auto *node = graph.getNode(stage_name);
+                        if (node && node->stage)
+                            node->stage->setGPUStream(capture_stream);
+                    }
+
+                    // Create graph capture using our local stream via factory (avoids HIP/CUDA header collision)
+                    seg.capture = gpu_ctx->createGraphCapture(capture_stream);
+                    if (!seg.capture)
+                    {
+                        LOG_ERROR("[GraphExecutor] Failed to create graph capture for segment");
+                        segment_cache.reset();
+                        return executeFastDecode(graph, ctx);
+                    }
+
+                    // Begin capture
+                    if (!seg.capture->beginCapture())
+                    {
+                        LOG_ERROR("[GraphExecutor] beginCapture failed for segment");
+                        segment_cache.reset();
+                        return executeFastDecode(graph, ctx);
+                    }
+
+                    // Execute all stages in this segment into the capture stream
+                    bool exec_ok = true;
+                    for (const auto &stage_name : seg.stage_names)
+                    {
+                        auto *node = graph.getNode(stage_name);
+                        if (!node->stage->execute(ctx))
+                        {
+                            LOG_ERROR("[GraphExecutor] Stage failed during segmented capture: " << stage_name);
+                            exec_ok = false;
+                            break;
+                        }
+                        graph.markCompleted(stage_name);
+                    }
+
+                    // End capture
+                    if (!exec_ok || !seg.capture->endCapture())
+                    {
+                        LOG_ERROR("[GraphExecutor] Segmented capture failed");
+                        segment_cache.reset();
+                        return exec_ok;
+                    }
+
+                    // Instantiate and launch immediately so subsequent segments have valid data
+                    if (seg.capture->nodeCount() > 0)
+                    {
+                        if (!seg.capture->instantiate())
+                        {
+                            LOG_WARN("[GraphExecutor] Segment instantiation failed ("
+                                     << seg.capture->nodeCount() << " nodes)");
+                            segment_cache.reset();
+                            return false;
+                        }
+                        if (!seg.capture->launch())
+                        {
+                            LOG_ERROR("[GraphExecutor] Segment initial launch failed");
+                            segment_cache.reset();
+                            return false;
+                        }
+                        // Sync before moving to next segment
+                        gpu_ctx->synchronize();
+                        LOG_DEBUG("[GraphExecutor] Segment captured+launched: " << seg.capture->nodeCount()
+                                                                                << " nodes, " << seg.stage_names.size() << " stages");
+                    }
+                    else
+                    {
+                        LOG_DEBUG("[GraphExecutor] Segment captured 0 nodes (CPU-only), will execute manually");
+                        seg.capture.reset();
+                    }
+
+                    // Reset stages back to default stream for future manual fallbacks
+                    for (const auto &stage_name : seg.stage_names)
+                    {
+                        auto *node = graph.getNode(stage_name);
+                        if (node && node->stage)
+                            node->stage->setGPUStream(nullptr);
+                    }
+                }
+                else
+                {
+                    // Manual segment — execute stages on default stream (nullptr)
+                    gpu_ctx->synchronize(); // Sync prior graph segment
+
+                    for (const auto &stage_name : seg.stage_names)
+                    {
+                        auto *node = graph.getNode(stage_name);
+                        node->stage->setGPUStream(nullptr);
+                        if (!node->stage->execute(ctx))
+                        {
+                            LOG_ERROR("[GraphExecutor] Manual stage failed: " << stage_name);
+                            segment_cache.reset();
+                            return false;
+                        }
+                        graph.markCompleted(stage_name);
+                    }
+
+                    // Sync before next graph segment
+                    gpu_ctx->synchronize();
+                }
+            }
+
+            return true;
+        }
+
+        // ===== Phase 3: Replay — just launch() capturable segments directly =====
+        // SYNCHRONIZATION STRATEGY:
+        // Graph segments launch on capture_stream (non-blocking). Manual stages
+        // dispatch to the legacy default stream (stream 0). These are separate
+        // streams with no implicit ordering. We use per-stream synchronization
+        // at TYPE TRANSITIONS to ensure correct data dependencies:
+        //
+        //   [graph on capture_stream] → syncStream(capture_stream) → [manual on stream 0]
+        //   [manual on stream 0]      → syncStream(nullptr/stream0) → [graph on capture_stream]
+        //
+        // Per-stream sync (~5μs) is ~10× cheaper than device-wide sync (~50μs).
+        // We sync ONLY at transitions, not between consecutive same-type segments.
+        // Final device sync ensures all work completes before CPU reads.
+
+        void *capture_stream = segment_cache.capture_stream;
+        const auto &exec_cfg = debugEnv().execution;
+        const bool verify_mode = exec_cfg.gpu_graph_verify;
+        const bool recapture_mode = exec_cfg.gpu_graph_recapture;
+
+        int seg_idx = 0;
+        bool prev_was_graph = false;
+        for (auto &seg : segment_cache.segments)
+        {
+
+            if (seg.capturable && seg.capture && seg.capture->hasExecutable())
+            {
+                // Sync at manual→graph transition
+                if (!prev_was_graph)
+                    gpu_ctx->synchronizeStream(nullptr);
+
+                if (recapture_mode)
+                {
+                    // ===== Re-capture mode: capture fresh graph each iteration =====
+                    // This tests whether re-capturing fixes replay corruption.
+                    // Set stages to capture stream
+                    for (const auto &stage_name : seg.stage_names)
+                    {
+                        auto *node = graph.getNode(stage_name);
+                        if (node && node->stage)
+                            node->stage->setGPUStream(capture_stream);
+                    }
+
+                    // Re-capture
+                    if (!seg.capture->beginCapture())
+                    {
+                        LOG_ERROR("[GraphExecutor] Re-capture beginCapture failed, seg " << seg_idx);
+                        return false;
+                    }
+
+                    bool exec_ok = true;
+                    for (const auto &stage_name : seg.stage_names)
+                    {
+                        auto *node = graph.getNode(stage_name);
+                        if (!node->stage->execute(ctx))
+                        {
+                            exec_ok = false;
+                            break;
+                        }
+                    }
+
+                    if (!exec_ok || !seg.capture->endCapture())
+                    {
+                        LOG_ERROR("[GraphExecutor] Re-capture failed, seg " << seg_idx);
+                        return false;
+                    }
+
+                    // Try in-place update, else reinstantiate
+                    auto update_result = seg.capture->tryUpdate();
+                    if (update_result == GraphUpdateResult::NeedsReinstantiate)
+                    {
+                        if (!seg.capture->instantiate())
+                        {
+                            LOG_ERROR("[GraphExecutor] Re-capture reinstantiate failed");
+                            return false;
+                        }
+                    }
+                    else if (update_result == GraphUpdateResult::Failed)
+                    {
+                        if (!seg.capture->instantiate())
+                        {
+                            LOG_ERROR("[GraphExecutor] Re-capture instantiate failed");
+                            return false;
+                        }
+                    }
+
+                    // Launch the updated graph
+                    if (!seg.capture->launch())
+                    {
+                        LOG_ERROR("[GraphExecutor] Re-capture launch failed");
+                        return false;
+                    }
+
+                    gpu_ctx->synchronize();
+
+                    // Reset stages back to default stream
+                    for (const auto &stage_name : seg.stage_names)
+                    {
+                        auto *node = graph.getNode(stage_name);
+                        if (node && node->stage)
+                            node->stage->setGPUStream(nullptr);
+                    }
+
+                    for (const auto &stage_name : seg.stage_names)
+                        graph.markCompleted(stage_name);
+                }
+                else if (verify_mode)
+                {
+                    // ===== Verify mode: per-stage graph replay vs direct exec comparison =====
+                    // Step 1: Launch graph replay (executes ALL stages in segment)
+                    if (!seg.capture->launch())
+                    {
+                        LOG_ERROR("[GraphExecutor] Verify: graph launch failed, seg " << seg_idx);
+                        return false;
+                    }
+                    gpu_ctx->synchronize();
+
+                    // Step 2: Read output of EVERY stage after graph replay
+                    struct StageOutput
+                    {
+                        std::string name;
+                        float values[8] = {};
+                        size_t count = 0;
+                        bool has_gpu_ptr = false;
+                    };
+                    std::vector<StageOutput> graph_outputs(seg.stage_names.size());
+
+                    for (size_t s = 0; s < seg.stage_names.size(); s++)
+                    {
+                        auto *node = graph.getNode(seg.stage_names[s]);
+                        graph_outputs[s].name = seg.stage_names[s];
+                        if (node && node->stage)
+                        {
+                            const auto &dump_info = node->stage->getDumpInfo();
+                            if (!dump_info.outputs.empty())
+                            {
+                                const auto &out = dump_info.outputs[0];
+                                if (out.tensor)
+                                {
+                                    auto *base = dynamic_cast<TensorBase *>(out.tensor);
+                                    if (base)
+                                    {
+                                        const void *gpu_ptr = base->gpu_data_ptr();
+                                        if (gpu_ptr)
+                                        {
+                                            graph_outputs[s].count = std::min<size_t>(8, out.rows * out.cols);
+                                            graph_outputs[s].has_gpu_ptr = true;
+#ifdef HAVE_ROCM
+                                            hipMemcpy(graph_outputs[s].values, gpu_ptr,
+                                                      graph_outputs[s].count * sizeof(float),
+                                                      hipMemcpyDeviceToHost);
+#endif
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Step 3: Re-execute ALL stages directly (overwrites graph output)
+                    for (const auto &stage_name : seg.stage_names)
+                    {
+                        auto *node = graph.getNode(stage_name);
+                        node->stage->setGPUStream(nullptr);
+                        if (!node->stage->execute(ctx))
+                        {
+                            LOG_ERROR("[GraphExecutor] Verify: direct exec failed: " << stage_name);
+                            return false;
+                        }
+                    }
+                    gpu_ctx->synchronize();
+
+                    // Step 4: Read output of EVERY stage after direct execution
+                    std::vector<StageOutput> direct_outputs(seg.stage_names.size());
+                    for (size_t s = 0; s < seg.stage_names.size(); s++)
+                    {
+                        auto *node = graph.getNode(seg.stage_names[s]);
+                        direct_outputs[s].name = seg.stage_names[s];
+                        if (node && node->stage)
+                        {
+                            const auto &dump_info = node->stage->getDumpInfo();
+                            if (!dump_info.outputs.empty())
+                            {
+                                const auto &out = dump_info.outputs[0];
+                                if (out.tensor)
+                                {
+                                    auto *base = dynamic_cast<TensorBase *>(out.tensor);
+                                    if (base)
+                                    {
+                                        const void *gpu_ptr = base->gpu_data_ptr();
+                                        if (gpu_ptr)
+                                        {
+                                            direct_outputs[s].count = std::min<size_t>(8, out.rows * out.cols);
+                                            direct_outputs[s].has_gpu_ptr = true;
+#ifdef HAVE_ROCM
+                                            hipMemcpy(direct_outputs[s].values, gpu_ptr,
+                                                      direct_outputs[s].count * sizeof(float),
+                                                      hipMemcpyDeviceToHost);
+#endif
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Step 5: Per-stage comparison and logging
+                    FILE *f = fopen("/tmp/graph_phase3.log", "a");
+                    float seg_max_diff = 0;
+
+                    for (size_t s = 0; s < seg.stage_names.size(); s++)
+                    {
+                        if (!graph_outputs[s].has_gpu_ptr || !direct_outputs[s].has_gpu_ptr)
+                            continue;
+
+                        float max_diff = 0;
+                        size_t n = std::min(graph_outputs[s].count, direct_outputs[s].count);
+                        for (size_t i = 0; i < n; i++)
+                            max_diff = std::max(max_diff, std::abs(graph_outputs[s].values[i] - direct_outputs[s].values[i]));
+                        seg_max_diff = std::max(seg_max_diff, max_diff);
+
+                        char buf[1024];
+                        snprintf(buf, sizeof(buf),
+                                 "[STAGE_VERIFY] seg %d stage %zu/%zu (%s) max_diff=%.6e",
+                                 seg_idx, s, seg.stage_names.size(), seg.stage_names[s].c_str(), max_diff);
+
+                        if (f)
+                        {
+                            fprintf(f, "%s\n", buf);
+                            if (max_diff > 1e-6f)
+                            {
+                                fprintf(f, "  GRAPH : ");
+                                for (size_t i = 0; i < n; i++)
+                                    fprintf(f, "%.6f%s", graph_outputs[s].values[i], i < n - 1 ? ", " : "");
+                                fprintf(f, "\n  DIRECT: ");
+                                for (size_t i = 0; i < n; i++)
+                                    fprintf(f, "%.6f%s", direct_outputs[s].values[i], i < n - 1 ? ", " : "");
+                                fprintf(f, "\n");
+                            }
+                            fflush(f);
+                        }
+                    }
+
+                    // Summary line
+                    {
+                        char buf[512];
+                        snprintf(buf, sizeof(buf),
+                                 "[GRAPH_VERIFY] seg %d (%zu stages, %zu nodes, last=%s) seg_max_diff=%.6e",
+                                 seg_idx, seg.stage_names.size(), seg.capture->nodeCount(),
+                                 seg.stage_names.back().c_str(), seg_max_diff);
+                        if (f)
+                        {
+                            fprintf(f, "%s\n\n", buf);
+                            fflush(f);
+                        }
+                    }
+
+                    if (f)
+                        fclose(f);
+
+                    for (const auto &stage_name : seg.stage_names)
+                        graph.markCompleted(stage_name);
+                }
+                else
+                {
+                    // ===== Normal replay mode =====
+                    if (!seg.capture->launch())
+                    {
+                        LOG_ERROR("[GraphExecutor] Segment graph launch failed on replay");
+                        segment_cache.consecutive_failures++;
+                        if (segment_cache.consecutive_failures >= GraphSegmentCache::kMaxFailures)
+                        {
+                            LOG_WARN("[GraphExecutor] Too many segmented graph failures, disabling");
+                            segment_cache.reset();
+                        }
+                        graph.reset();
+                        return executeFastDecode(graph, ctx);
+                    }
+
+                    // Mark stages completed for graph bookkeeping
+                    for (const auto &stage_name : seg.stage_names)
+                        graph.markCompleted(stage_name);
+                }
+
+                prev_was_graph = true;
+            }
+            else
+            {
+                // Sync at graph→manual transition
+                if (prev_was_graph)
+                    gpu_ctx->synchronizeStream(capture_stream);
+
+                // Manual segment — execute stages on default stream (legacy stream 0)
+                for (const auto &stage_name : seg.stage_names)
+                {
+                    auto *node = graph.getNode(stage_name);
+                    node->stage->setGPUStream(nullptr);
+                    if (!node->stage->execute(ctx))
+                    {
+                        LOG_ERROR("[GraphExecutor] Manual stage failed on replay: " << stage_name);
+                        return false;
+                    }
+                    graph.markCompleted(stage_name);
+                }
+
+                prev_was_graph = false;
+            }
+
+            seg_idx++;
+        }
+
+        // Final device sync — ensures all GPU work has completed before CPU reads
+        gpu_ctx->synchronize();
+
+        segment_cache.consecutive_failures = 0;
         return true;
     }
 

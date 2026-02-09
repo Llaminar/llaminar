@@ -79,16 +79,22 @@ namespace llaminar2
                                                        << " device_id=" << params_.device_id.to_string());
             }
         }
-        auto kernel = llaminar::v2::kernels::KernelFactory::createRMSNorm(input_base, dev_type);
-        if (!kernel)
+        if (!cached_kernel_)
         {
-            LOG_ERROR("[RMSNormStage] Failed to create RMSNorm kernel for type "
-                      << input_base->dtype_name());
-            return false;
+            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createRMSNorm(input_base, dev_type);
+            if (!cached_kernel_)
+            {
+                LOG_ERROR("[RMSNormStage] Failed to create RMSNorm kernel for type "
+                          << input_base->dtype_name());
+                return false;
+            }
         }
 
+        // Thread GPU stream for graph capture
+        cached_kernel_->setGPUStream(gpuStream());
+
         // apply_tensor handles input != output cases internally
-        bool success = kernel->apply_tensor(
+        bool success = cached_kernel_->apply_tensor(
             input_base,
             gamma_base,
             output_base,

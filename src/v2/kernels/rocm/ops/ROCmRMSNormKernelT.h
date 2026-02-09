@@ -95,6 +95,9 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
+            // GPU stream for graph capture support
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
             // Typed API for direct device pointer access
             bool apply_typed(
                 const float *d_input,
@@ -108,6 +111,7 @@ namespace llaminar2
         private:
             int device_idx_ = 0;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
         };
 
         // ============================================================================
@@ -180,6 +184,9 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
+            // GPU stream for graph capture support
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
             // Typed API for direct device pointer access
             bool apply_typed(
                 const uint16_t *d_input,
@@ -193,6 +200,7 @@ namespace llaminar2
         private:
             int device_idx_ = 0;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
         };
 
         // ============================================================================
@@ -265,6 +273,9 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
+            // GPU stream for graph capture support
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
             // Typed API for direct device pointer access
             bool apply_typed(
                 const uint16_t *d_input,
@@ -278,6 +289,7 @@ namespace llaminar2
         private:
             int device_idx_ = 0;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
         };
 
     } // namespace rocm

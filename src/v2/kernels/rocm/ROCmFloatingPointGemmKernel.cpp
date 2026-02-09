@@ -23,6 +23,7 @@
 #include "tensors/Tensors.h"           // FP32Tensor, BF16Tensor, FP16Tensor
 #include "tensors/KernelSnapshotInfo.h"
 #include "utils/Logger.h"
+#include "utils/ROCmKernelProfiler.h"
 
 #include <stdexcept>
 
@@ -170,6 +171,7 @@ namespace llaminar2
             int /*device_idx*/,
             DeviceWorkspaceManager *workspace)
         {
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_ROCBLAS, static_cast<hipStream_t>(gpu_stream_));
             (void)workspace; // TODO: Use workspace for intermediate allocations
             if (!A || !C)
             {
@@ -197,7 +199,7 @@ namespace llaminar2
             // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr() (HIP pointer)
             const float *d_A = nullptr;
             float *d_C = nullptr;
-            
+
             if (A->isBARBacked() && A->rocm_data_ptr() != nullptr)
             {
                 d_A = static_cast<const float *>(A->rocm_data_ptr());
@@ -207,7 +209,7 @@ namespace llaminar2
             {
                 d_A = static_cast<const float *>(A->gpu_data_ptr());
             }
-            
+
             if (C->isBARBacked() && C->rocm_data_ptr() != nullptr)
             {
                 d_C = static_cast<float *>(C->rocm_data_ptr());
@@ -289,6 +291,7 @@ namespace llaminar2
             int /*device_idx*/,
             DeviceWorkspaceManager *workspace)
         {
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_ROCBLAS, static_cast<hipStream_t>(gpu_stream_));
             (void)workspace; // TODO: Use workspace for intermediate allocations
             if (!hipblas_kernel_)
             {
@@ -331,6 +334,15 @@ namespace llaminar2
 
             const auto &dev = dm.devices()[device_idx];
             return (dev.type == ComputeBackendType::GPU_ROCM && dev.device_id == rocm_device_id_);
+        }
+
+        void ROCmFloatingPointGemmKernel::setGPUStream(void *stream)
+        {
+            gpu_stream_ = stream;
+            if (hipblas_kernel_)
+            {
+                hipblas_kernel_->setStream(stream);
+            }
         }
 
         // =====================================================================

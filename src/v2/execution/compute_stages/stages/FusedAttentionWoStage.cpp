@@ -129,6 +129,7 @@ namespace llaminar2
                 LOG_ERROR("[FusedAttentionWoStage] Q16 kernel not initialized");
                 return false;
             }
+            q16_kernel_->setGPUStream(gpuStream());
 
             // Build params for Q16 kernel
             FusedAttentionWoParams q16_params;

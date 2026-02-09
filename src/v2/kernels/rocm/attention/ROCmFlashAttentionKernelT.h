@@ -134,6 +134,8 @@ namespace llaminar2
                 return device_idx >= 0; // GPU only
             }
 
+            void setGPUStream(void *stream) override { stream_ = stream; }
+
             /**
              * @brief Compute single-sequence attention
              *
@@ -320,6 +322,8 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
+            void setGPUStream(void *stream) override { stream_ = stream; }
+
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,
                 int seq_len, int n_heads, int n_kv_heads, int head_dim,
@@ -493,6 +497,8 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
+            void setGPUStream(void *stream) override { stream_ = stream; }
+
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,
                 int seq_len, int n_heads, int n_kv_heads, int head_dim,
@@ -624,6 +630,8 @@ namespace llaminar2
             ROCmFlashAttentionKernelT &operator=(ROCmFlashAttentionKernelT &&) noexcept;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
+
+            void setGPUStream(void *stream) override { stream_ = stream; }
 
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,

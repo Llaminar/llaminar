@@ -100,6 +100,7 @@ namespace llaminar2
                 LOG_ERROR("[FusedQKVGEMMStage] Failed to get fused QKV kernel");
                 return false;
             }
+            fused_kernel->setGPUStream(gpuStream());
 
             // Determine Q16 block size from K output tensor
             // LIMITATION: JIT kernel only properly supports block_size=64 or 32.
@@ -248,6 +249,7 @@ namespace llaminar2
                 LOG_ERROR("[FusedQKVGEMMStage] Failed to get fused QKV kernel for Q8_1 output");
                 return false;
             }
+            fused_kernel->setGPUStream(gpuStream());
 
             // Check if input is also Q8_1 - use Q8_1→Q8_1 path to avoid double quantization
             auto *input_q8_1 = dynamic_cast<const Q8_1Tensor *>(params_.input);
@@ -318,6 +320,9 @@ namespace llaminar2
         auto *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq_base, params_.device_id);
         auto *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk_base, params_.device_id);
         auto *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv_base, params_.device_id);
+        if (gemm_q) gemm_q->setGPUStream(gpuStream());
+        if (gemm_k) gemm_k->setGPUStream(gpuStream());
+        if (gemm_v) gemm_v->setGPUStream(gpuStream());
         const bool gpu_execution = (target_dev_type == DeviceType::CUDA || target_dev_type == DeviceType::ROCm);
         LOG_DEBUG("[FusedQKVGEMMStage] device_id=" << params_.device_id.to_string()
                                                    << " is_gpu=" << gpu_execution);

@@ -7,9 +7,12 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include <memory>
 
 namespace llaminar2
 {
+    // Forward declaration
+    class ITensorRMSNorm;
 
     /**
      * @brief RMS normalization stage
@@ -57,6 +60,7 @@ namespace llaminar2
 
     private:
         Params params_;
+        mutable std::unique_ptr<llaminar2::ITensorRMSNorm> cached_kernel_;
     };
 
 } // namespace llaminar2

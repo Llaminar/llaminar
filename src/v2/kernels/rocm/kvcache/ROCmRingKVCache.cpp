@@ -17,6 +17,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../tensors/GpuTensorView.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../../backends/rocm/HipDeviceGuard.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -136,7 +137,7 @@ namespace llaminar2
                   << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
                   << ", precision=" << static_cast<int>(Precision));
 
-        hipSetDevice(device_id_);
+        HipDeviceGuard::setDevice(device_id_);
 
         // Allocate entries
         entries_.resize(n_layers_);
@@ -189,7 +190,7 @@ namespace llaminar2
                   << ", device=" << device_id_
                   << ", precision=" << static_cast<int>(Precision));
 
-        hipSetDevice(device_id_);
+        HipDeviceGuard::setDevice(device_id_);
 
         // Allocate entries
         entries_.resize(n_layers_);
@@ -232,7 +233,7 @@ namespace llaminar2
                   << ", local_kv_dim=" << kv_dim_
                   << ", precision=" << static_cast<int>(Precision));
 
-        hipSetDevice(device_id_);
+        HipDeviceGuard::setDevice(device_id_);
 
         // Allocate entries
         entries_.resize(n_layers_);
@@ -288,7 +289,7 @@ namespace llaminar2
                   << ", device=" << device_id_
                   << ", precision=" << static_cast<int>(Precision));
 
-        hipSetDevice(device_id_);
+        HipDeviceGuard::setDevice(device_id_);
 
         // Allocate entries
         entries_.resize(n_layers_);
@@ -318,7 +319,7 @@ namespace llaminar2
     ROCmRingKVCache<Precision>::~ROCmRingKVCache()
     {
         // Check if HIP runtime is shutting down
-        hipError_t set_err = hipSetDevice(device_id_);
+        hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_));
         if (set_err == hipErrorDeinitialized || set_err == hipErrorNoDevice)
         {
             // Runtime is shutting down, skip cleanup

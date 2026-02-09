@@ -418,6 +418,8 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override;
 
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
             // =========================================================================
             // IKernelSnapshotCapable interface
             // =========================================================================
@@ -602,6 +604,9 @@ namespace llaminar2
             // Kernels do not own any work buffers; all buffers come from workspace
             DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned, REQUIRED)
 
+            // GPU stream for graph capture (nullptr = default stream)
+            void *gpu_stream_ = nullptr;
+
             // PIMPL for CK implementation (avoids CK headers in this header)
             struct Impl;
             std::unique_ptr<Impl> impl_;
@@ -666,7 +671,7 @@ extern "C"
         int32_t *d_C_int32,
         int M, int N, int K,
         int rocm_device_id,
-        float *kernel_time_ms);
+        float *kernel_time_ms, void *stream);
 
     /**
      * @brief Execute hipBLAS INT8 GEMM fallback

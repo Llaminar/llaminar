@@ -15,7 +15,7 @@
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
-#include "../../../utils/KernelProfiler.h"
+#include "../../../utils/ROCmKernelProfiler.h"
 #include <cstring>
 #include <stdexcept>
 
@@ -255,7 +255,6 @@ namespace llaminar2
             bool causal, int window_size, int position_offset,
             int device_idx)
         {
-            KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
             if (!Q || !K || !V || !output)
             {
@@ -318,14 +317,17 @@ namespace llaminar2
                 LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>] Using Flash Decoding: kv_len=" << kv_len
                                                                                             << " num_splits=" << num_splits);
 
-                result = hipFlashAttn_decode_fp32(
-                    Q, K, V, output,
-                    static_cast<float *>(partial_output_buf_),
-                    static_cast<float *>(partial_m_buf_),
-                    static_cast<float *>(partial_l_buf_),
-                    batch_size, kv_len,
-                    n_heads, n_kv_heads, head_dim,
-                    num_splits, stream_);
+                {
+                    ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::FLASH_ATTN_DECODE, static_cast<hipStream_t>(stream_));
+                    result = hipFlashAttn_decode_fp32(
+                        Q, K, V, output,
+                        static_cast<float *>(partial_output_buf_),
+                        static_cast<float *>(partial_m_buf_),
+                        static_cast<float *>(partial_l_buf_),
+                        batch_size, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        num_splits, stream_);
+                }
             }
             else
             {
@@ -333,12 +335,15 @@ namespace llaminar2
                 LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>] Using Flash Attention 2 (MI50): "
                           << "batch=" << batch_size << " seq_len=" << seq_len << " kv_len=" << kv_len);
 
-                result = hipFlashAttn_prefill_fa2(
-                    Q, K, V, output,
-                    batch_size, seq_len, kv_len,
-                    n_heads, n_kv_heads, head_dim,
-                    causal, window_size, position_offset,
-                    stream_);
+                {
+                    ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::FLASH_ATTN_PREFILL, static_cast<hipStream_t>(stream_));
+                    result = hipFlashAttn_prefill_fa2(
+                        Q, K, V, output,
+                        batch_size, seq_len, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        causal, window_size, position_offset,
+                        stream_);
+                }
             }
 
             if (result != 0)

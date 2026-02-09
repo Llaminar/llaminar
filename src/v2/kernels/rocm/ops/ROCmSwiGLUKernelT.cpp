@@ -15,7 +15,7 @@
 #include "ROCmSwiGLUKernelT.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../backends/DeviceId.h"
-#include "../../../utils/KernelProfiler.h"
+#include "../../../utils/ROCmKernelProfiler.h"
 
 #include <hip/hip_runtime.h>
 #include <cstdio>
@@ -29,13 +29,13 @@ extern "C"
     // SwiGLU
     bool hipOps_swiglu_fp32(
         const float *gate, const float *up, float *output,
-        int size, int device_idx);
+        int size, int device_idx, void *stream);
     bool hipOps_swiglu_bf16(
         const uint16_t *gate, const uint16_t *up, uint16_t *output,
-        int size, int device_idx);
+        int size, int device_idx, void *stream);
     bool hipOps_swiglu_fp16(
         const uint16_t *gate, const uint16_t *up, uint16_t *output,
-        int size, int device_idx);
+        int size, int device_idx, void *stream);
 }
 
 namespace llaminar2
@@ -69,7 +69,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx,
             int device_idx)
         {
-            KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::SWIGLU, static_cast<hipStream_t>(gpu_stream_));
             (void)add_residual;
             (void)mpi_ctx;
             if (!gate || !up || !output)
@@ -98,7 +98,7 @@ namespace llaminar2
 
             int size = rows * cols;
             // No sync needed - coherence system handles sync when data is read
-            return hipOps_swiglu_fp32(d_gate, d_up, d_output, size, dev);
+            return hipOps_swiglu_fp32(d_gate, d_up, d_output, size, dev, gpu_stream_);
         }
 
         bool ROCmSwiGLUKernelT<ActivationPrecision::FP32>::apply_typed(
@@ -110,7 +110,7 @@ namespace llaminar2
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             // No sync needed - coherence system handles sync when data is read
-            return hipOps_swiglu_fp32(gate, up, output, size, dev);
+            return hipOps_swiglu_fp32(gate, up, output, size, dev, gpu_stream_);
         }
 
         // =========================================================================
@@ -139,7 +139,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx,
             int device_idx)
         {
-            KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::SWIGLU, static_cast<hipStream_t>(gpu_stream_));
             (void)add_residual;
             (void)mpi_ctx;
             if (!gate || !up || !output)
@@ -166,7 +166,7 @@ namespace llaminar2
 
             int size = rows * cols;
             // No sync needed - coherence system handles sync when data is read
-            return hipOps_swiglu_bf16(d_gate, d_up, d_output, size, dev);
+            return hipOps_swiglu_bf16(d_gate, d_up, d_output, size, dev, gpu_stream_);
         }
 
         bool ROCmSwiGLUKernelT<ActivationPrecision::BF16>::apply_typed(
@@ -178,7 +178,7 @@ namespace llaminar2
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             // No sync needed - coherence system handles sync when data is read
-            return hipOps_swiglu_bf16(gate, up, output, size, dev);
+            return hipOps_swiglu_bf16(gate, up, output, size, dev, gpu_stream_);
         }
 
         // =========================================================================
@@ -207,7 +207,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx,
             int device_idx)
         {
-            KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::SWIGLU, static_cast<hipStream_t>(gpu_stream_));
             (void)add_residual;
             (void)mpi_ctx;
             if (!gate || !up || !output)
@@ -234,7 +234,7 @@ namespace llaminar2
 
             int size = rows * cols;
             // No sync needed - coherence system handles sync when data is read
-            return hipOps_swiglu_fp16(d_gate, d_up, d_output, size, dev);
+            return hipOps_swiglu_fp16(d_gate, d_up, d_output, size, dev, gpu_stream_);
         }
 
         bool ROCmSwiGLUKernelT<ActivationPrecision::FP16>::apply_typed(
@@ -246,7 +246,7 @@ namespace llaminar2
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             // No sync needed - coherence system handles sync when data is read
-            return hipOps_swiglu_fp16(gate, up, output, size, dev);
+            return hipOps_swiglu_fp16(gate, up, output, size, dev, gpu_stream_);
         }
 
     } // namespace rocm

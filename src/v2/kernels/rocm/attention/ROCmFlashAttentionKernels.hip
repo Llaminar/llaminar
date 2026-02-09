@@ -32,6 +32,8 @@
 #include <cfloat>
 #include <cstdio>
 
+#include "../../../backends/rocm/HipDeviceGuard.h"
+
 namespace
 {
     // =========================================================================
@@ -1030,7 +1032,7 @@ extern "C"
      */
     int hipFlashAttn_setDevice(int device_idx)
     {
-        return hipSetDevice(device_idx) == hipSuccess ? 0 : -1;
+        return llaminar2::HipDeviceGuard::setDevice(device_idx);
     }
 
     // hipFlashAttn_synchronize() removed - caller manages coherence via events

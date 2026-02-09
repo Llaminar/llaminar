@@ -10,6 +10,7 @@
 #include <hip/hip_fp16.h>
 #include <cstdint>
 #include <cstdio>
+#include "../../../backends/rocm/HipDeviceGuard.h"
 
 namespace {
 
@@ -118,16 +119,17 @@ bool rocmOps_residual_add_fp32(
     const float* residual,
     float* output,
     int size,
-    int device_idx)
+    int device_idx,
+    void* stream)
 {
-    hipSetDevice(device_idx);
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
 
     int threads_per_block = 256;
     int num_blocks = (size + threads_per_block - 1) / threads_per_block;
 
     hipLaunchKernelGGL(
         rocm_residual_add_fp32_kernel,
-        dim3(num_blocks), dim3(threads_per_block), 0, 0,
+        dim3(num_blocks), dim3(threads_per_block), 0, static_cast<hipStream_t>(stream),
         input, residual, output, size);
 
     (void)hipGetLastError();  // Clear stale errors
@@ -145,16 +147,17 @@ bool rocmOps_residual_add_bf16(
     const uint16_t* residual,
     uint16_t* output,
     int size,
-    int device_idx)
+    int device_idx,
+    void* stream)
 {
-    hipSetDevice(device_idx);
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
 
     int threads_per_block = 256;
     int num_blocks = (size + threads_per_block - 1) / threads_per_block;
 
     hipLaunchKernelGGL(
         rocm_residual_add_bf16_kernel,
-        dim3(num_blocks), dim3(threads_per_block), 0, 0,
+        dim3(num_blocks), dim3(threads_per_block), 0, static_cast<hipStream_t>(stream),
         input, residual, output, size);
 
     (void)hipGetLastError();  // Clear stale errors
@@ -172,9 +175,10 @@ bool rocmOps_residual_add_fp16(
     const uint16_t* residual,
     uint16_t* output,
     int size,
-    int device_idx)
+    int device_idx,
+    void* stream)
 {
-    hipSetDevice(device_idx);
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
 
     int threads_per_block = 256;
     int num_blocks = (size + threads_per_block - 1) / threads_per_block;

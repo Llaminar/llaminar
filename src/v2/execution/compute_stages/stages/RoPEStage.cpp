@@ -119,6 +119,9 @@ namespace llaminar2
 
         ITensorRoPE *kernel = cached_kernel_.get();
 
+        // Thread GPU stream for graph capture
+        kernel->setGPUStream(gpuStream());
+
         // Use provided position_ids if available (for batched execution with per-token positions)
         // Otherwise, pass nullptr to the kernel to enable zero-copy contiguous path.
         // The kernel computes positions on-the-fly on GPU: pos = pos_offset + seq_idx.

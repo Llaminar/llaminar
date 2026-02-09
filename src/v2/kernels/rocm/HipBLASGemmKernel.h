@@ -219,6 +219,12 @@ namespace llaminar2
              */
             bool ownsHandle() const { return owns_handle_; }
 
+            /**
+             * @brief Set the stream on the underlying hipBLAS handle
+             * @param stream HIP stream (cast to hipStream_t internally)
+             */
+            void setStream(void *stream);
+
         private:
             // hipblasHandle_t and hipblasLtHandle_t stored as void* to avoid including HIP headers.
             // This allows g++-compiled files to include this header without HIP namespace pollution.

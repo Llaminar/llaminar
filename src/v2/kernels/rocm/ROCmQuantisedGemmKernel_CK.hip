@@ -139,6 +139,8 @@
 #include <mutex>
 #include <memory>
 
+#include "../../backends/rocm/HipDeviceGuard.h"
+
 // ComposableKernel headers for INT8 GEMM
 
 namespace {
@@ -943,7 +945,7 @@ extern "C"
 
     bool rocmQuantGemm_setDevice(int rocm_device_id)
     {
-        hipError_t err = hipSetDevice(rocm_device_id);
+        hipError_t err = static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(rocm_device_id));
         if (err != hipSuccess)
         {
             fprintf(stderr, "[rocmQuantGemm_setDevice] Failed to set device %d: %s\n",
@@ -1153,7 +1155,7 @@ extern "C"
         const int8_t *d_weights_int8,
         int32_t *d_C_int32,
         int M, int N, int K,
-        int rocm_device_id)
+        int rocm_device_id, void* stream)
     {
         if (!rocmQuantGemm_setDevice(rocm_device_id))
             return false;
@@ -1201,7 +1203,7 @@ extern "C"
             }
 
             auto invoker = device_gemm.MakeInvoker();
-            invoker.Run(argument, StreamConfig{nullptr, false});
+            invoker.Run(argument, StreamConfig{static_cast<hipStream_t>(stream), false});
         }
         else if (M < 128)
         {
@@ -1222,7 +1224,7 @@ extern "C"
             }
 
             auto invoker = device_gemm.MakeInvoker();
-            invoker.Run(argument, StreamConfig{nullptr, false});
+            invoker.Run(argument, StreamConfig{static_cast<hipStream_t>(stream), false});
         }
         else if (M % 128 == 0)
         {
@@ -1243,7 +1245,7 @@ extern "C"
             }
 
             auto invoker = device_gemm.MakeInvoker();
-            invoker.Run(argument, StreamConfig{nullptr, false});
+            invoker.Run(argument, StreamConfig{static_cast<hipStream_t>(stream), false});
         }
         else
         {
@@ -1264,7 +1266,7 @@ extern "C"
             }
 
             auto invoker = device_gemm.MakeInvoker();
-            invoker.Run(argument, StreamConfig{nullptr, false});
+            invoker.Run(argument, StreamConfig{static_cast<hipStream_t>(stream), false});
         }
         
         // DEBUG: If timing enabled, sync and report actual GEMM execution time
@@ -1321,7 +1323,7 @@ extern "C"
         const float *d_scale_A,       // [M] per-row scales
         const float *d_scale_B,       // [N] per-column scales
         int M, int N, int K,
-        int rocm_device_id)
+        int rocm_device_id, void* stream)
     {
         if (M <= 0 || N <= 0 || K <= 0)
             return true;
@@ -1337,7 +1339,7 @@ extern "C"
         }
 
         // 2. Run CK INT8 GEMM: C_int32 = A_int8 × B_int8 (no scaling)
-        if (!rocmQuantGemm_executeNoScale(d_A_int8, d_B_int8, d_C_int32, M, N, K, rocm_device_id))
+        if (!rocmQuantGemm_executeNoScale(d_A_int8, d_B_int8, d_C_int32, M, N, K, rocm_device_id, stream))
         {
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel] CK NoScale GEMM failed\n");
             hipFree(d_C_int32);
@@ -1351,7 +1353,7 @@ extern "C"
 
         hipLaunchKernelGGL(
             applyScales_kernel,
-            dim3(grid_size), dim3(block_size), 0, 0,
+            dim3(grid_size), dim3(block_size), 0, static_cast<hipStream_t>(stream),
             d_C_int32, d_E_fp32, d_scale_A, d_scale_B, M, N);
 
         err = hipGetLastError();
@@ -1392,7 +1394,7 @@ extern "C"
         const float *d_scale_B,       // [N] per-column scales
         int32_t *d_C_int32,           // Pre-allocated [M × N] INT32 accumulator
         int M, int N, int K,
-        int rocm_device_id)
+        int rocm_device_id, void* stream)
     {
         auto t_total_start = std::chrono::high_resolution_clock::now();
         auto t_step_start = t_total_start;
@@ -1417,7 +1419,7 @@ extern "C"
         }
 
         // 1. Run CK INT8 GEMM: C_int32 = A_int8 × B_int8 (no scaling)
-        if (!rocmQuantGemm_executeNoScale(d_A_int8, d_B_int8, d_C_int32, M, N, K, rocm_device_id))
+        if (!rocmQuantGemm_executeNoScale(d_A_int8, d_B_int8, d_C_int32, M, N, K, rocm_device_id, stream))
         {
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_cached] CK NoScale GEMM failed\n");
             return false;
@@ -1431,7 +1433,7 @@ extern "C"
 
         hipLaunchKernelGGL(
             applyScales_kernel,
-            dim3(grid_size), dim3(block_size), 0, 0,
+            dim3(grid_size), dim3(block_size), 0, static_cast<hipStream_t>(stream),
             d_C_int32, d_E_fp32, d_scale_A, d_scale_B, M, N);
 
         (void)hipGetLastError();  // Clear stale errors
@@ -1489,7 +1491,7 @@ extern "C"
         int M,                        // Actual M (output rows needed)
         int padded_m,                 // Padded M for CK (>= CK_SMALL_MIN_M = 8)
         int N, int K,
-        int rocm_device_id)
+        int rocm_device_id, void* stream)
     {
         if (M <= 0 || N <= 0 || K <= 0)
             return true;
@@ -1589,7 +1591,7 @@ extern "C"
         }
 
         // 4. Run CK INT8 GEMM on padded dimensions: C_int32 = A_padded × B (no scaling)
-        if (!rocmQuantGemm_executeNoScale(d_A_padded, d_B_int8, d_C_int32, padded_m, N, K, rocm_device_id))
+        if (!rocmQuantGemm_executeNoScale(d_A_padded, d_B_int8, d_C_int32, padded_m, N, K, rocm_device_id, stream))
         {
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded] CK NoScale GEMM failed\n");
             hipFree(d_A_padded);
@@ -1605,7 +1607,7 @@ extern "C"
 
         hipLaunchKernelGGL(
             applyScales_kernel,
-            dim3(grid_size), dim3(block_size), 0, 0,
+            dim3(grid_size), dim3(block_size), 0, static_cast<hipStream_t>(stream),
             d_C_int32, d_E_padded, d_scale_A_padded, d_scale_B, padded_m, N);
 
         err = hipGetLastError();
@@ -1668,7 +1670,7 @@ extern "C"
         int M,                        // Actual M (output rows needed)
         int padded_m,                 // Padded M for CK (>= CK_SMALL_MIN_M = 8)
         int N, int K,
-        int rocm_device_id)
+        int rocm_device_id, void* stream)
     {
         auto t_total_start = std::chrono::high_resolution_clock::now();
         auto t_step_start = t_total_start;
@@ -1702,7 +1704,7 @@ extern "C"
         log_timing("param_validation");
 
         // 1. Zero-initialize the padded activation buffer (padding rows will be zeros)
-        err = hipMemsetAsync(d_A_padded, 0, static_cast<size_t>(padded_m) * K * sizeof(int8_t), nullptr);
+        err = hipMemsetAsync(d_A_padded, 0, static_cast<size_t>(padded_m) * K * sizeof(int8_t), static_cast<hipStream_t>(stream));
         if (err != hipSuccess)
         {
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] Failed to zero padded A: %s\n",
@@ -1713,7 +1715,7 @@ extern "C"
 
         // Copy actual activations into first M rows (async)
         err = hipMemcpyAsync(d_A_padded, d_A_int8, static_cast<size_t>(M) * K * sizeof(int8_t), 
-                             hipMemcpyDeviceToDevice, nullptr);
+                             hipMemcpyDeviceToDevice, static_cast<hipStream_t>(stream));
         if (err != hipSuccess)
         {
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] Failed to copy A to padded: %s\n",
@@ -1724,7 +1726,7 @@ extern "C"
 
         // 2. Copy actual scales and fill padding with 1.0 (neutral scale)
         err = hipMemcpyAsync(d_scale_A_padded, d_scale_A, static_cast<size_t>(M) * sizeof(float), 
-                             hipMemcpyDeviceToDevice, nullptr);
+                             hipMemcpyDeviceToDevice, static_cast<hipStream_t>(stream));
         if (err != hipSuccess)
         {
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] Failed to copy scales: %s\n",
@@ -1751,7 +1753,7 @@ extern "C"
             
             // Use async copy to avoid blocking - small buffer (<1KB for padded_m=128)
             err = hipMemcpyAsync(d_scale_A_padded + M, padding_scales.data(),
-                           padding_count * sizeof(float), hipMemcpyHostToDevice, nullptr);
+                           padding_count * sizeof(float), hipMemcpyHostToDevice, static_cast<hipStream_t>(stream));
             if (err != hipSuccess)
             {
                 fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] Failed to fill padding scales: %s\n",
@@ -1762,7 +1764,7 @@ extern "C"
         log_timing("fill_padding_scales");
 
         // 3. Run CK INT8 GEMM on padded dimensions: C_int32 = A_padded × B (no scaling)
-        if (!rocmQuantGemm_executeNoScale(d_A_padded, d_B_int8, d_C_int32, padded_m, N, K, rocm_device_id))
+        if (!rocmQuantGemm_executeNoScale(d_A_padded, d_B_int8, d_C_int32, padded_m, N, K, rocm_device_id, stream))
         {
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] CK NoScale GEMM failed\n");
             return false;
@@ -1776,7 +1778,7 @@ extern "C"
 
         hipLaunchKernelGGL(
             applyScales_kernel,
-            dim3(grid_size), dim3(block_size), 0, 0,
+            dim3(grid_size), dim3(block_size), 0, static_cast<hipStream_t>(stream),
             d_C_int32, d_E_padded, d_scale_A_padded, d_scale_B, padded_m, N);
 
         err = hipGetLastError();
@@ -1791,7 +1793,7 @@ extern "C"
         // 5. Extract first M rows of padded output to actual output (async)
         //    E_fp32[M × N] = E_padded[0:M, :]
         err = hipMemcpyAsync(d_E_fp32, d_E_padded, static_cast<size_t>(M) * N * sizeof(float), 
-                             hipMemcpyDeviceToDevice, nullptr);
+                             hipMemcpyDeviceToDevice, static_cast<hipStream_t>(stream));
         if (err != hipSuccess)
         {
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] Failed to extract output: %s\n",
@@ -1858,7 +1860,7 @@ extern "C"
         int8_t *d_A_int8,
         float *d_scales_A,
         int M, int K,
-        int rocm_device_id)
+        int rocm_device_id, void* stream)
     {
         if (!rocmQuantGemm_setDevice(rocm_device_id))
             return false;
@@ -1873,7 +1875,7 @@ extern "C"
 
         hipLaunchKernelGGL(
             quantizeActivationsQ8_kernel,
-            grid, block, 0, 0,
+            grid, block, 0, static_cast<hipStream_t>(stream),
             d_A_fp32, d_A_int8, d_scales_A, M, K);
 
         // Check for launch errors
@@ -1912,7 +1914,7 @@ extern "C"
         if (d_ptr)
         {
             // Set device before freeing - required by HIP/CUDA
-            hipError_t set_err = hipSetDevice(rocm_device_id);
+            hipError_t set_err = static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(rocm_device_id));
             if (set_err == hipErrorDeinitialized || set_err == hipErrorNoDevice)
             {
                 // HIP runtime is shutting down, skip cleanup
@@ -2026,7 +2028,7 @@ extern "C"
         int32_t *d_C_int32,           // Pre-allocated [M × N] INT32 accumulator
         int M, int N, int K,
         int rocm_device_id,
-        float *kernel_time_ms)        // OUTPUT: kernel execution time in ms
+        float *kernel_time_ms, void* stream)        // OUTPUT: kernel execution time in ms
     {
         if (M <= 0 || N <= 0 || K <= 0)
         {
@@ -2062,7 +2064,7 @@ extern "C"
         }
 
         // Record start event
-        err = hipEventRecord(start, 0);
+        err = hipEventRecord(start, static_cast<hipStream_t>(stream));
         if (err != hipSuccess)
         {
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_timed] Failed to record start event: %s\n",
@@ -2073,7 +2075,7 @@ extern "C"
         }
 
         // 1. Run CK INT8 GEMM: C_int32 = A_int8 × B_int8 (no scaling)
-        if (!rocmQuantGemm_executeNoScale(d_A_int8, d_B_int8, d_C_int32, M, N, K, rocm_device_id))
+        if (!rocmQuantGemm_executeNoScale(d_A_int8, d_B_int8, d_C_int32, M, N, K, rocm_device_id, stream))
         {
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_timed] CK NoScale GEMM failed\n");
             hipEventDestroy(start);
@@ -2088,7 +2090,7 @@ extern "C"
 
         hipLaunchKernelGGL(
             applyScales_kernel,
-            dim3(grid_size), dim3(block_size), 0, 0,
+            dim3(grid_size), dim3(block_size), 0, static_cast<hipStream_t>(stream),
             d_C_int32, d_E_fp32, d_scale_A, d_scale_B, M, N);
 
         err = hipGetLastError();
@@ -2102,7 +2104,7 @@ extern "C"
         }
 
         // Record stop event
-        err = hipEventRecord(stop, 0);
+        err = hipEventRecord(stop, static_cast<hipStream_t>(stream));
         if (err != hipSuccess)
         {
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_timed] Failed to record stop event: %s\n",
@@ -2165,7 +2167,7 @@ extern "C"
         float alpha, float beta,
         const float *d_C_existing,   // For beta != 0 (nullable)
         const float *d_bias,         // [N] optional bias (nullable)
-        int rocm_device_id)
+        int rocm_device_id, void* stream)
     {
         // Validate required pointers
         if (!d_C_int32 || !d_C_fp32 || !d_scales_A || !d_scales_B)
@@ -2186,7 +2188,7 @@ extern "C"
 
         hipLaunchKernelGGL(
             applyScaling_full_kernel,
-            grid, block, 0, 0,
+            grid, block, 0, static_cast<hipStream_t>(stream),
             d_C_int32, d_C_fp32, d_scales_A, d_scales_B,
             M, N, alpha, beta, d_C_existing, d_bias);
 
@@ -2225,7 +2227,7 @@ extern "C"
         float *d_output,       // [M × N] FP32 output (modified in-place)
         const float *d_bias,   // [N] bias vector
         int M, int N,
-        int rocm_device_id)
+        int rocm_device_id, void* stream)
     {
         if (!d_output || !d_bias)
         {
@@ -2243,7 +2245,7 @@ extern "C"
 
         hipLaunchKernelGGL(
             biasAdd_kernel,
-            dim3(grid_size), dim3(block_size), 0, 0,
+            dim3(grid_size), dim3(block_size), 0, static_cast<hipStream_t>(stream),
             d_output, d_bias, M, N);
 
         hipError_t err = hipGetLastError();

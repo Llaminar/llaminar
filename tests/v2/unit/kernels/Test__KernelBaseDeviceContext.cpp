@@ -16,6 +16,7 @@
 #include "kernels/cuda/CUDAKernelBase.h"
 #include "kernels/rocm/ROCmKernelBase.h"
 #include "backends/IWorkerGPUContext.h"
+#include "backends/IGPUGraphCapture.h"
 
 using namespace llaminar2;
 
@@ -74,6 +75,12 @@ public:
 
     // Synchronization
     void synchronize() override {}
+    void synchronizeStream(void * /*stream*/) override {}
+    void insertStreamDependency(void * /*dependent_stream*/, void * /*dependency_stream*/) override {}
+
+    // Graph Capture
+    std::unique_ptr<IGPUGraphCapture> createGraphCapture() override { return nullptr; }
+    std::unique_ptr<IGPUGraphCapture> createGraphCapture(void * /*stream*/) override { return nullptr; }
 
     // Test helpers - allow setting mock values
     void setMockStream(void *stream) { mock_stream_ = stream; }

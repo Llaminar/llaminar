@@ -31,6 +31,7 @@
 
 #include "../../../models/qwen/Qwen2Graph.h"
 #include "../../../backends/DeviceId.h"
+#include "../../../backends/IGPUGraphCapture.h"
 #include "IInferenceRunner.h"
 #include "../graph/GraphExecutor.h"
 #include "../graph/GraphBufferManager.h"
@@ -52,6 +53,7 @@
 #include <memory>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <map>
 #include <vector>
 #include <string>
@@ -1997,12 +1999,45 @@ namespace llaminar2
             std::vector<int> token_ids;    ///< Persistent decode token storage
             std::vector<int> position_ids; ///< Persistent decode position IDs
 
+            // Pre-computed collective stage names for fast decode intercept
+            std::unordered_set<std::string> collective_nodes;
+
+            /// GPU graph capture/replay for eliminating per-kernel launch overhead
+            std::unique_ptr<IGPUGraphCapture> gpu_graph;
+
+            /// Segmented GPU graph cache — excludes non-capturable stages (attention, KV cache)
+            /// and captures contiguous runs of capturable stages into separate graphs
+            GraphExecutor::GraphSegmentCache segment_cache;
+
+            /// GPU stream (from IWorkerGPUContext::defaultStream()) for kernel dispatch
+            /// Set when gpu_graph is created; used by stages to dispatch on correct stream
+            void *gpu_stream = nullptr;
+
+            /// GPU context for creating new graph captures (not owned)
+            IWorkerGPUContext *gpu_ctx = nullptr;
+
+            /// Number of consecutive graph update failures (fallback heuristic)
+            int gpu_graph_update_failures = 0;
+
+            /// Maximum consecutive update failures before disabling graph capture
+            static constexpr int kMaxGraphUpdateFailures = 4;
+
             void invalidate()
             {
+                if (gpu_graph)
+                {
+                    gpu_graph->reset();
+                    gpu_graph.reset();
+                }
+                segment_cache.reset();
+                gpu_stream = nullptr;
+                gpu_ctx = nullptr;
+                gpu_graph_update_failures = 0;
                 graph.reset();
                 valid = false;
                 token_ids.clear();
                 position_ids.clear();
+                collective_nodes.clear();
             }
         };
 

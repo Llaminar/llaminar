@@ -82,7 +82,7 @@
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/SlabGemmConfig.h"
 #include "utils/Logger.h"
-#include "utils/KernelProfiler.h"
+#include "utils/ROCmKernelProfiler.h"
 #include "utils/DebugEnv.h"
 
 #include <stdexcept>
@@ -132,7 +132,7 @@ namespace llaminar2
                 int8_t *d_A_int8,      // [M x K] output
                 float *d_scales_A,     // [M] output
                 int M, int K,
-                int rocm_device_id);
+                int rocm_device_id, void *stream);
 
             // Execute INT8 GEMM using CK with SEPARATE scaling (two-kernel approach)
             // This runs CK for INT8→INT32 GEMM, then a separate kernel for scaling.
@@ -143,7 +143,7 @@ namespace llaminar2
                 const float *d_scale_A, // [M] per-row activation scales
                 const float *d_scale_B, // [N] per-column weight scales
                 int M, int N, int K,
-                int rocm_device_id);
+                int rocm_device_id, void *stream);
 
             // Execute INT8 GEMM without scaling (INT8→INT32 only)
             // Used when you want to apply custom scaling/bias separately.
@@ -152,7 +152,7 @@ namespace llaminar2
                 const int8_t *d_B_int8, // [K x N] RowMajor weights
                 int32_t *d_C_int32,     // [M x N] RowMajor INT32 output
                 int M, int N, int K,
-                int rocm_device_id);
+                int rocm_device_id, void *stream);
 
             // Execute INT8 GEMM using CK two-kernel with PRE-ALLOCATED buffer (allocation-free)
             // This is the preferred variant for hot-path execution.
@@ -164,7 +164,7 @@ namespace llaminar2
                 const float *d_scale_B, // [N] per-column weight scales
                 int32_t *d_C_int32,     // [M x N] Pre-allocated INT32 accumulator
                 int M, int N, int K,
-                int rocm_device_id);
+                int rocm_device_id, void *stream);
 
             // Execute INT8 GEMM using CK two-kernel with M-PADDING for decode (M < 8)
             // Pads activations to padded_m, runs CK, extracts first M rows of output.
@@ -179,7 +179,7 @@ namespace llaminar2
                 int M,                  // Actual M (output rows needed)
                 int padded_m,           // Padded M for CK
                 int N, int K,
-                int rocm_device_id);
+                int rocm_device_id, void *stream);
 
             // Execute INT8 GEMM using CK two-kernel with M-PADDING and PRE-ALLOCATED buffers (allocation-free)
             // This is the preferred variant for hot-path decode execution.
@@ -196,7 +196,20 @@ namespace llaminar2
                 int M,                   // Actual M (output rows needed)
                 int padded_m,            // Padded M for CK
                 int N, int K,
-                int rocm_device_id);
+                int rocm_device_id, void *stream);
+
+            // Execute INT8 GEMM using CK two-kernel with HIP event timing (for benchmarking)
+            // Same as _cached but returns kernel time via kernel_time_ms parameter.
+            bool rocmQuantGemm_executeTwoKernel_timed(
+                const int8_t *d_A_int8, // [M × K] INT8 activations
+                const int8_t *d_B_int8, // [K × N] INT8 weights
+                float *d_E_fp32,        // [M × N] FP32 output
+                const float *d_scale_A, // [M] per-row scales
+                const float *d_scale_B, // [N] per-column scales
+                int32_t *d_C_int32,     // Pre-allocated [M × N] INT32 accumulator
+                int M, int N, int K,
+                int rocm_device_id,
+                float *kernel_time_ms, void *stream);
 
             // Allocate INT8 buffer
             bool rocmQuantGemm_allocInt8(int8_t **d_ptr, size_t count, int rocm_device_id);
@@ -227,14 +240,14 @@ namespace llaminar2
                 float alpha, float beta,
                 const float *d_C_existing, // For beta != 0 (nullable)
                 const float *d_bias,       // [N] optional bias (nullable)
-                int rocm_device_id);
+                int rocm_device_id, void *stream);
 
             // In-place bias addition: output[m,n] += bias[n]
             bool rocmQuantGemm_biasAdd(
                 float *d_output,     // [M × N] FP32 output (modified in-place)
                 const float *d_bias, // [N] bias vector
                 int M, int N,
-                int rocm_device_id);
+                int rocm_device_id, void *stream);
 
             // =========================================================================
             // GEMV kernel for decode (M=1) - bypasses CK INT8 GEMM entirely
@@ -247,7 +260,7 @@ namespace llaminar2
                 const int8_t *d_B_int8_vnni, // [K/4 × N × 4] VNNI-packed weights
                 int32_t *d_C_int32,          // [N] INT32 output vector
                 int N, int K,
-                int device_id);
+                int device_id, void *stream);
 
             // Repack VNNI [K/4][N][4] → row-major [N×K] into scratch buffer
             // Used for CK GEMM prefill and legacy fp16/fp32 GEMV modes.
@@ -256,7 +269,7 @@ namespace llaminar2
                 const int8_t *d_B_vnni, // [K/4][N][4] VNNI input
                 int8_t *d_B_rowmajor,   // [N×K] row-major output (scratch buffer)
                 int N, int K,
-                int device_id);
+                int device_id, void *stream);
         }
 
         // =====================================================================
@@ -643,7 +656,7 @@ namespace llaminar2
             int device_idx,
             DeviceWorkspaceManager *workspace)
         {
-            KERNEL_PROFILE_SCOPE(KernelType::GEMM_Q8);
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_CK, static_cast<hipStream_t>(gpu_stream_));
             (void)mpi_ctx;
             (void)device_idx;
             (void)transpose_B;
@@ -778,7 +791,7 @@ namespace llaminar2
 
                     validateWorkspace();
                     if (!rocmQuantGemm_quantizeActivations(
-                            d_input, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_))
+                            d_input, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Activation quantization failed");
                         return false;
@@ -786,7 +799,7 @@ namespace llaminar2
 
                     if (!rocmGemv_int8_int8_int32_vnni(
                             impl_->d_A_int8, d_weights_vnni, impl_->d_C_int32,
-                            n, k, rocm_device_id_))
+                            n, k, rocm_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV (VNNI) failed");
                         return false;
@@ -795,7 +808,7 @@ namespace llaminar2
                     const float *d_existing = (beta != 0.0f) ? d_output : nullptr;
                     if (!rocmQuantGemm_applyScaling(
                             impl_->d_C_int32, d_output, impl_->d_scales_A, d_scales_B,
-                            m, n, alpha, beta, d_existing, d_bias, rocm_device_id_))
+                            m, n, alpha, beta, d_existing, d_bias, rocm_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV scaling failed");
                         return false;
@@ -878,7 +891,7 @@ namespace llaminar2
                 phase_start = std::chrono::high_resolution_clock::now();
                 if (!rocmGemv_repackVNNI_to_rowmajor(
                         impl_->d_weights_int8_vnni, impl_->d_B_rowmajor_scratch,
-                        n, k, rocm_device_id_))
+                        n, k, rocm_device_id_, gpu_stream_))
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] VNNI→row-major repack failed");
                     return false;
@@ -944,7 +957,7 @@ namespace llaminar2
 
             // Quantize activations FP32 → INT8
             phase_start = std::chrono::high_resolution_clock::now();
-            if (!rocmQuantGemm_quantizeActivations(d_A_fp32_src, d_A_int8, d_scales_A, m, k, rocm_device_id_))
+            if (!rocmQuantGemm_quantizeActivations(d_A_fp32_src, d_A_int8, d_scales_A, m, k, rocm_device_id_, gpu_stream_))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to quantize activations");
                 return false;
@@ -1069,7 +1082,7 @@ namespace llaminar2
                     d_scales_A, d_scales_B,
                     impl_->d_CK_int32,
                     impl_->d_A_padded, impl_->d_scale_A_padded, impl_->d_E_padded,
-                    m, padded_m, n, k, rocm_device_id_);
+                    m, padded_m, n, k, rocm_device_id_, gpu_stream_);
                 auto gemm_end = std::chrono::high_resolution_clock::now();
                 double gemm_ms = std::chrono::duration<double, std::milli>(gemm_end - gemm_start).count();
                 LOG_TRACE("[ROCmGEMM::TIMING] executeTwoKernel_padded_cached M=" << m << " N=" << n << " K=" << k << " took " << gemm_ms << "ms");
@@ -1082,7 +1095,7 @@ namespace llaminar2
                     d_A_int8, d_weights_int8, d_C_fp32_dst,
                     d_scales_A, d_scales_B,
                     impl_->d_CK_int32,
-                    m, n, k, rocm_device_id_);
+                    m, n, k, rocm_device_id_, gpu_stream_);
                 auto gemm_end = std::chrono::high_resolution_clock::now();
                 double gemm_ms = std::chrono::duration<double, std::milli>(gemm_end - gemm_start).count();
                 LOG_TRACE("[ROCmGEMM::TIMING] executeTwoKernel_cached M=" << m << " N=" << n << " K=" << k << " took " << gemm_ms << "ms");
@@ -1165,7 +1178,7 @@ namespace llaminar2
             // Repack VNNI→row-major into scratch for CK GEMM
             if (!rocmGemv_repackVNNI_to_rowmajor(
                     impl_->d_weights_int8_vnni, impl_->d_B_rowmajor_scratch,
-                    n, k, rocm_device_id_))
+                    n, k, rocm_device_id_, gpu_stream_))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] VNNI→row-major repack failed");
                 return false;
@@ -1185,7 +1198,7 @@ namespace llaminar2
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Failed to copy A");
                 return false;
             }
-            if (!rocmQuantGemm_quantizeActivations(d_A_fp32, d_A_int8, d_scales_A, m, k, rocm_device_id_))
+            if (!rocmQuantGemm_quantizeActivations(d_A_fp32, d_A_int8, d_scales_A, m, k, rocm_device_id_, gpu_stream_))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Failed to quantize A");
                 return false;
@@ -1204,7 +1217,7 @@ namespace llaminar2
                     d_A_int8, d_weights_int8, d_C_fp32,
                     d_scales_A, d_scales_B,
                     impl_->d_CK_int32,
-                    m, padded_m, n, k, rocm_device_id_);
+                    m, padded_m, n, k, rocm_device_id_, gpu_stream_);
                 // Can't get accurate timing for padded path without modifying it
                 if (kernel_time_ms)
                     *kernel_time_ms = -1.0f; // Indicate timing not available
@@ -1217,7 +1230,7 @@ namespace llaminar2
                     d_scales_A, d_scales_B,
                     impl_->d_CK_int32,
                     m, n, k, rocm_device_id_,
-                    kernel_time_ms);
+                    kernel_time_ms, gpu_stream_);
             }
 
             if (!success)
@@ -1378,7 +1391,7 @@ namespace llaminar2
                     const_cast<float *>(d_input), // Source FP32 on device
                     impl_->d_A_int8,              // Destination INT8 on device
                     impl_->d_scales_A,            // Scales on device
-                    m, k, rocm_device_id_))
+                    m, k, rocm_device_id_, gpu_stream_))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Activation quantization failed");
                 return false;
@@ -1591,7 +1604,7 @@ namespace llaminar2
                     // INT8 VNNI GEMV: uses shared d_A_int8 from step 3
                     if (!rocmGemv_int8_int8_int32_vnni(
                             impl_->d_A_int8, d_vnni, rocm_kernel->impl_->d_CK_int32,
-                            n, k, rocm_device_id_))
+                            n, k, rocm_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] GEMV failed for projection " << i);
                         all_success = false;
@@ -1608,7 +1621,7 @@ namespace llaminar2
                             1.0f, 0.0f,
                             nullptr, // No existing C
                             d_bias,  // Fused bias (nullptr if no bias)
-                            rocm_device_id_))
+                            rocm_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] GEMV scaling failed for projection " << i);
                         all_success = false;
@@ -1630,7 +1643,7 @@ namespace llaminar2
 
                 if (d_vnni && d_scratch)
                 {
-                    if (!rocmGemv_repackVNNI_to_rowmajor(d_vnni, d_scratch, n, k, rocm_device_id_))
+                    if (!rocmGemv_repackVNNI_to_rowmajor(d_vnni, d_scratch, n, k, rocm_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " VNNI→row-major repack failed");
                         all_success = false;
@@ -1689,12 +1702,12 @@ namespace llaminar2
                             d_scales_B,
                             rocm_kernel->impl_->d_CK_int32,
                             impl_->d_A_padded, impl_->d_scale_A_padded, impl_->d_E_padded,
-                            m, padded_m, n, k, rocm_device_id_);
+                            m, padded_m, n, k, rocm_device_id_, gpu_stream_);
 
                         if (success)
                         {
                             // Apply bias using GPU kernel (fast path)
-                            success = rocmQuantGemm_biasAdd(d_output, d_bias, m, n, rocm_device_id_);
+                            success = rocmQuantGemm_biasAdd(d_output, d_bias, m, n, rocm_device_id_, gpu_stream_);
                             if (!success)
                             {
                                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Bias add failed for projection " << i);
@@ -1711,7 +1724,7 @@ namespace llaminar2
                             impl_->d_A_int8,
                             d_weights_int8,
                             rocm_kernel->impl_->d_CK_int32,
-                            m, n, k, rocm_device_id_);
+                            m, n, k, rocm_device_id_, gpu_stream_);
                         LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                                  << " AFTER executeNoScale success=" << success);
 
@@ -1729,7 +1742,7 @@ namespace llaminar2
                                 1.0f, 0.0f,
                                 nullptr, // No existing C
                                 d_bias,  // Add bias
-                                rocm_device_id_);
+                                rocm_device_id_, gpu_stream_);
                             LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                                      << " AFTER applyScaling success=" << success);
                         }
@@ -1747,7 +1760,7 @@ namespace llaminar2
                             impl_->d_scales_A,
                             d_scales_B,
                             rocm_kernel->impl_->d_CK_int32,
-                            m, padded_m, n, k, rocm_device_id_);
+                            m, padded_m, n, k, rocm_device_id_, gpu_stream_);
                     }
                     else
                     {
@@ -1758,7 +1771,7 @@ namespace llaminar2
                             impl_->d_scales_A,
                             d_scales_B,
                             rocm_kernel->impl_->d_CK_int32,
-                            m, n, k, rocm_device_id_);
+                            m, n, k, rocm_device_id_, gpu_stream_);
                     }
                 }
 
@@ -2208,7 +2221,7 @@ namespace llaminar2
 
                     validateWorkspace();
                     if (!rocmQuantGemm_quantizeActivations(
-                            d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_))
+                            d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] Activation quantization failed");
                         return false;
@@ -2216,7 +2229,7 @@ namespace llaminar2
 
                     if (!rocmGemv_int8_int8_int32_vnni(
                             impl_->d_A_int8, d_vnni, impl_->d_C_int32,
-                            n, k, rocm_device_id_))
+                            n, k, rocm_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 GEMV (VNNI) failed");
                         return false;
@@ -2225,7 +2238,7 @@ namespace llaminar2
                     const float *d_existing = (beta != 0.0f) ? d_C : nullptr;
                     return rocmQuantGemm_applyScaling(
                         impl_->d_C_int32, d_C, impl_->d_scales_A, d_s,
-                        m, n, alpha, beta, d_existing, nullptr, rocm_device_id_);
+                        m, n, alpha, beta, d_existing, nullptr, rocm_device_id_, gpu_stream_);
                 }
             }
 
@@ -2241,7 +2254,7 @@ namespace llaminar2
             }
             if (!rocmGemv_repackVNNI_to_rowmajor(
                     impl_->d_weights_int8_vnni, impl_->d_B_rowmajor_scratch,
-                    n, k, rocm_device_id_))
+                    n, k, rocm_device_id_, gpu_stream_))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] VNNI→row-major repack failed");
                 return false;
@@ -2249,7 +2262,7 @@ namespace llaminar2
 
             // Step 1: Quantize FP32 activations to INT8
             if (!rocmQuantGemm_quantizeActivations(
-                    d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_))
+                    d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel] Activation quantization failed");
                 return false;
@@ -2262,7 +2275,7 @@ namespace llaminar2
                     d_C, // Output FP32
                     impl_->d_scales_A, impl_->d_scales_B,
                     impl_->d_C_int32, // Pre-allocated INT32 accumulator
-                    m, n, k, rocm_device_id_))
+                    m, n, k, rocm_device_id_, gpu_stream_))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel] CK two-kernel GEMM failed");
                 return false;
@@ -2312,7 +2325,7 @@ namespace llaminar2
 
                     validateWorkspace();
                     if (!rocmQuantGemm_quantizeActivations(
-                            d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_))
+                            d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Activation quantization failed");
                         return false;
@@ -2320,7 +2333,7 @@ namespace llaminar2
 
                     if (!rocmGemv_int8_int8_int32_vnni(
                             impl_->d_A_int8, d_vnni, impl_->d_C_int32,
-                            n, k, rocm_device_id_))
+                            n, k, rocm_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 GEMV (VNNI) failed");
                         return false;
@@ -2329,7 +2342,7 @@ namespace llaminar2
                     const float *d_existing = (beta != 0.0f) ? d_C : nullptr;
                     return rocmQuantGemm_applyScaling(
                         impl_->d_C_int32, d_C, impl_->d_scales_A, d_s,
-                        m, n, alpha, beta, d_existing, d_bias, rocm_device_id_);
+                        m, n, alpha, beta, d_existing, d_bias, rocm_device_id_, gpu_stream_);
                 }
             }
 
@@ -2345,7 +2358,7 @@ namespace llaminar2
             }
             if (!rocmGemv_repackVNNI_to_rowmajor(
                     impl_->d_weights_int8_vnni, impl_->d_B_rowmajor_scratch,
-                    n, k, rocm_device_id_))
+                    n, k, rocm_device_id_, gpu_stream_))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] VNNI→row-major repack failed");
                 return false;
@@ -2353,7 +2366,7 @@ namespace llaminar2
 
             // Step 1: Quantize FP32 activations to INT8
             if (!rocmQuantGemm_quantizeActivations(
-                    d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_))
+                    d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel] Activation quantization failed");
                 return false;
@@ -2362,7 +2375,7 @@ namespace llaminar2
             // Step 2: Execute CK INT8 GEMM → INT32 (no scaling)
             if (!rocmQuantGemm_executeNoScale(
                     impl_->d_A_int8, impl_->d_B_rowmajor_scratch, impl_->d_C_int32,
-                    m, n, k, rocm_device_id_))
+                    m, n, k, rocm_device_id_, gpu_stream_))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel] CK NoScale GEMM failed");
                 return false;
@@ -2372,7 +2385,7 @@ namespace llaminar2
             const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
             if (!rocmQuantGemm_applyScaling(
                     impl_->d_C_int32, d_C, impl_->d_scales_A, impl_->d_scales_B,
-                    m, n, alpha, beta, d_C_existing, d_bias, rocm_device_id_))
+                    m, n, alpha, beta, d_C_existing, d_bias, rocm_device_id_, gpu_stream_))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel] Scaling with bias failed");
                 return false;

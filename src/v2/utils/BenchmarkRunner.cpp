@@ -311,6 +311,8 @@ namespace llaminar2
             }
 
             // Run prefill
+            CUDAKernelProfiler::setCurrentPhase(CUDAKernelProfiler::Phase::PREFILL);
+            ROCmKernelProfiler::setCurrentPhase(ROCmKernelProfiler::Phase::PREFILL);
             auto [prefill_success, prefill_time] = runPrefill(tokens);
             if (!prefill_success)
             {
@@ -325,6 +327,8 @@ namespace llaminar2
             // Run decode (if requested)
             if (n_decode > 0)
             {
+                CUDAKernelProfiler::setCurrentPhase(CUDAKernelProfiler::Phase::DECODE);
+                ROCmKernelProfiler::setCurrentPhase(ROCmKernelProfiler::Phase::DECODE);
                 int eos_token = tokenizer_->eos_token();
                 auto [decode_success, decode_time, tokens_generated, generated_text] =
                     runDecode(n_decode, eos_token);

@@ -72,6 +72,9 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
+            // GPU stream for graph capture support
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
             // ===== ITensorSwiGLU interface =====
             bool apply(
                 const float *gate, const float *up, float *output,
@@ -157,6 +160,7 @@ namespace llaminar2
         private:
             int device_idx_;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
         };
 
         // =========================================================================
@@ -280,6 +284,7 @@ namespace llaminar2
         private:
             int device_idx_;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
         };
 
         // =========================================================================
@@ -317,6 +322,9 @@ namespace llaminar2
             void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
+
+            // GPU stream for graph capture support
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
 
             // ===== ITensorSwiGLU interface =====
             bool apply(
@@ -403,6 +411,7 @@ namespace llaminar2
         private:
             int device_idx_;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
         };
 
     } // namespace rocm

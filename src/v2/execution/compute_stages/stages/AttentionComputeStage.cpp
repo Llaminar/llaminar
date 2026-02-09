@@ -137,6 +137,7 @@ namespace llaminar2
             LOG_ERROR("[AttentionComputeStage] Failed to get attention kernel");
             return false;
         }
+        kernel->setGPUStream(gpuStream());
 
         // Get device index using proper ordinal for GPU devices (0-based), not legacy index
         int device_idx = params_.device_id.toKernelDeviceIndex();

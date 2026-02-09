@@ -165,6 +165,7 @@ namespace llaminar2
             LOG_ERROR("[AttentionWithKVCacheStage::executePrefill] Failed to create attention kernel");
             return false;
         }
+        attention_kernel->setGPUStream(gpuStream());
 
         // Step 5: Allocate workspace for attention scores [n_heads, seq_len, kv_len]
         FP32Tensor scores_workspace({static_cast<size_t>(params_.n_heads * params_.seq_len * kv_len)});
@@ -282,6 +283,7 @@ namespace llaminar2
             LOG_ERROR("[AttentionWithKVCacheStage::executeDecode] Failed to create attention kernel");
             return false;
         }
+        attention_kernel->setGPUStream(gpuStream());
 
         // Step 5: Allocate workspace for attention scores [n_heads, q_seq_len, kv_len]
         // Use simple allocation - in production, use pre-allocated workspace
@@ -385,6 +387,7 @@ namespace llaminar2
             LOG_ERROR("[AttentionWithKVCacheStage::executeBatched] Failed to create attention kernel");
             return false;
         }
+        attention_kernel->setGPUStream(gpuStream());
 
         // Allocate workspace for attention scores
         // For batched: [batch_size * n_heads, seq_len, seq_len] but we compute per-batch

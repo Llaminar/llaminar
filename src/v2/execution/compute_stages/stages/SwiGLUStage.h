@@ -7,9 +7,12 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include <memory>
 
 namespace llaminar2
 {
+    // Forward declaration
+    class ITensorSwiGLU;
 
     /**
      * @brief SwiGLU activation stage
@@ -50,6 +53,7 @@ namespace llaminar2
 
     private:
         Params params_;
+        mutable std::unique_ptr<llaminar2::ITensorSwiGLU> cached_kernel_;
     };
 
 } // namespace llaminar2

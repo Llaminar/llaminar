@@ -184,17 +184,23 @@ namespace llaminar2
             }
         }
 
-        // Create kernel via KernelFactory with automatic device dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-        auto kernel = llaminar::v2::kernels::KernelFactory::createResidualAdd(input_base, dev_type);
-        if (!kernel)
+        // Create kernel via KernelFactory with automatic device dispatch (cached)
+        if (!cached_kernel_)
         {
-            LOG_ERROR("[ResidualAddStage::FP32] Failed to create ResidualAdd kernel");
-            return false;
+            auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createResidualAdd(input_base, dev_type);
+            if (!cached_kernel_)
+            {
+                LOG_ERROR("[ResidualAddStage::FP32] Failed to create ResidualAdd kernel");
+                return false;
+            }
         }
 
+        // Thread GPU stream for graph capture
+        cached_kernel_->setGPUStream(gpuStream());
+
         // Use apply_tensor() which handles GPU pointers correctly via active_data_ptr()
-        bool ok = kernel->apply_tensor(input_base, residual_base, output_base, n, params_.mpi_ctx,
+        bool ok = cached_kernel_->apply_tensor(input_base, residual_base, output_base, n, params_.mpi_ctx,
                                        params_.device_id.toKernelDeviceIndex());
 
         if (Logger::getInstance().shouldLog(LogLevel::TRACE))
@@ -229,16 +235,20 @@ namespace llaminar2
 
         LOG_DEBUG("[ResidualAddStage::BF16] Converting and adding " << n << " elements");
 
-        // Create kernel via KernelFactory with automatic device dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-        auto kernel = llaminar::v2::kernels::KernelFactory::createResidualAdd(input_base, dev_type);
-        if (!kernel)
+        // Create kernel via KernelFactory with automatic device dispatch (cached)
+        if (!cached_kernel_)
         {
-            LOG_ERROR("[ResidualAddStage::BF16] Failed to create ResidualAdd kernel");
-            return false;
+            auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createResidualAdd(input_base, dev_type);
+            if (!cached_kernel_)
+            {
+                LOG_ERROR("[ResidualAddStage::BF16] Failed to create ResidualAdd kernel");
+                return false;
+            }
         }
 
-        return kernel->apply_bf16(input, residual, output, n, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
+        cached_kernel_->setGPUStream(gpuStream());
+        return cached_kernel_->apply_bf16(input, residual, output, n, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
     }
 
     bool ResidualAddStage::executeFP16(IDeviceContext *ctx, size_t num_elements)
@@ -260,16 +270,20 @@ namespace llaminar2
 
         LOG_DEBUG("[ResidualAddStage::FP16] Converting and adding " << n << " elements");
 
-        // Create kernel via KernelFactory with automatic device dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-        auto kernel = llaminar::v2::kernels::KernelFactory::createResidualAdd(input_base, dev_type);
-        if (!kernel)
+        // Create kernel via KernelFactory with automatic device dispatch (cached)
+        if (!cached_kernel_)
         {
-            LOG_ERROR("[ResidualAddStage::FP16] Failed to create ResidualAdd kernel");
-            return false;
+            auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createResidualAdd(input_base, dev_type);
+            if (!cached_kernel_)
+            {
+                LOG_ERROR("[ResidualAddStage::FP16] Failed to create ResidualAdd kernel");
+                return false;
+            }
         }
 
-        return kernel->apply_fp16(input, residual, output, n, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
+        cached_kernel_->setGPUStream(gpuStream());
+        return cached_kernel_->apply_fp16(input, residual, output, n, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
     }
 
     bool ResidualAddStage::executeQ8_1(IDeviceContext *ctx, size_t num_elements)

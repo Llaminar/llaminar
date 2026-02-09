@@ -67,6 +67,7 @@ namespace llaminar2
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::COPY; }
+        bool isGraphCapturable() const override { return false; }
         bool supportsBackend(ComputeBackendType backend) const override { return true; }
         StageBufferRequirements getBufferRequirements() const override;
         std::vector<BufferDescriptor> getDeclaredOutputs() const override;

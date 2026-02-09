@@ -197,6 +197,24 @@ namespace llaminar2
         };
 
         /**
+         * @brief Inference phase for profiling separation
+         */
+        enum class Phase : int
+        {
+            COMBINED = 0,
+            PREFILL = 1,
+            DECODE = 2
+        };
+
+        /**
+         * @brief Set the current inference phase for this thread
+         */
+        static void setCurrentPhase(Phase phase)
+        {
+            current_phase() = phase;
+        }
+
+        /**
          * @brief Check if CUDA profiling is enabled
          */
         static bool isEnabled()
@@ -234,6 +252,13 @@ namespace llaminar2
             // Record to global stats
             inst.stats_[idx].add(elapsed_us);
 
+            // Record to phase-specific stats
+            Phase phase = current_phase();
+            if (phase == Phase::PREFILL)
+                inst.prefill_stats_[idx].add(elapsed_us);
+            else if (phase == Phase::DECODE)
+                inst.decode_stats_[idx].add(elapsed_us);
+
             // Record to per-device stats if device context is set
             int device = current_device_id();
             if (device >= 0)
@@ -254,6 +279,13 @@ namespace llaminar2
 
             // Record to global stats
             inst.stats_[idx].add(elapsed_us);
+
+            // Record to phase-specific stats
+            Phase phase = current_phase();
+            if (phase == Phase::PREFILL)
+                inst.prefill_stats_[idx].add(elapsed_us);
+            else if (phase == Phase::DECODE)
+                inst.decode_stats_[idx].add(elapsed_us);
 
             // Record to per-device stats
             if (device_id >= 0)
@@ -301,6 +333,10 @@ namespace llaminar2
             {
                 stats.reset();
             }
+            for (auto &stats : inst.prefill_stats_)
+                stats.reset();
+            for (auto &stats : inst.decode_stats_)
+                stats.reset();
             inst.device_stats_.clear();
         }
 
@@ -523,6 +559,61 @@ namespace llaminar2
             }
 
             oss << table.to_string();
+
+            // Phase breakdown (if phase data was collected)
+            bool has_prefill = false, has_decode = false;
+            for (size_t i = 0; i < static_cast<size_t>(CUDAKernelType::COUNT); ++i)
+            {
+                if (inst.prefill_stats_[i].call_count > 0)
+                    has_prefill = true;
+                if (inst.decode_stats_[i].call_count > 0)
+                    has_decode = true;
+            }
+
+            if (has_prefill || has_decode)
+            {
+                fort::utf8_table phase_table;
+                phase_table.set_border_style(FT_DOUBLE2_STYLE);
+
+                phase_table << fort::header << "Kernel Type" << "Prefill (ms)" << "Decode (ms)" << "Decode %" << fort::endr;
+                phase_table.column(0).set_cell_text_align(fort::text_align::left);
+                phase_table.column(1).set_cell_text_align(fort::text_align::right);
+                phase_table.column(2).set_cell_text_align(fort::text_align::right);
+                phase_table.column(3).set_cell_text_align(fort::text_align::right);
+
+                double decode_total_us = 0.0;
+                for (size_t idx : indices)
+                {
+                    const auto &pf = inst.prefill_stats_[idx];
+                    const auto &dc = inst.decode_stats_[idx];
+                    if (pf.call_count == 0 && dc.call_count == 0)
+                        continue;
+
+                    decode_total_us += dc.total_us;
+
+                    std::ostringstream pf_ss, dc_ss, pct_ss;
+                    pf_ss << std::fixed << std::setprecision(2) << (pf.total_us / 1000.0);
+                    dc_ss << std::fixed << std::setprecision(2) << (dc.total_us / 1000.0);
+                    double dc_pct = total_time_us > 0 ? (dc.total_us / total_time_us) * 100.0 : 0;
+                    pct_ss << static_cast<int>(dc_pct) << "%";
+
+                    phase_table << cudaKernelTypeName(static_cast<CUDAKernelType>(idx))
+                                << pf_ss.str() << dc_ss.str() << pct_ss.str() << fort::endr;
+                }
+
+                phase_table << fort::separator;
+                {
+                    double prefill_total_us = total_time_us - decode_total_us;
+                    std::ostringstream pf_ss, dc_ss;
+                    pf_ss << std::fixed << std::setprecision(2) << (prefill_total_us / 1000.0);
+                    dc_ss << std::fixed << std::setprecision(2) << (decode_total_us / 1000.0);
+                    phase_table << "PHASE TOTAL" << pf_ss.str() << dc_ss.str() << "" << fort::endr;
+                }
+
+                oss << "\nCUDA KERNEL PHASE BREAKDOWN (Prefill vs Decode):\n";
+                oss << phase_table.to_string();
+            }
+
             return oss.str();
         }
 
@@ -553,8 +644,16 @@ namespace llaminar2
             return device_id;
         }
 
+        static Phase &current_phase()
+        {
+            static thread_local Phase phase = Phase::COMBINED;
+            return phase;
+        }
+
         std::mutex mutex_;
         std::array<KernelStats, static_cast<size_t>(CUDAKernelType::COUNT)> stats_;
+        std::array<KernelStats, static_cast<size_t>(CUDAKernelType::COUNT)> prefill_stats_;
+        std::array<KernelStats, static_cast<size_t>(CUDAKernelType::COUNT)> decode_stats_;
         std::unordered_map<int, DeviceStats> device_stats_;
     };
 

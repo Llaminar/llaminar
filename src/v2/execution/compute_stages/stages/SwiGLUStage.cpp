@@ -63,18 +63,24 @@ namespace llaminar2
                                                     << " tensor_type=" << gate_base->dtype_name()
                                                     << " device_id=" << params_.device_id.to_string());
 
-        // Create kernel via KernelFactory with automatic type dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-        auto kernel = llaminar::v2::kernels::KernelFactory::createSwiGLU(gate_base, dev_type);
-        if (!kernel)
+        // Create kernel via KernelFactory with automatic type dispatch (cached)
+        if (!cached_kernel_)
         {
-            LOG_ERROR("[SwiGLUStage] Failed to create SwiGLU kernel for type "
-                      << gate_base->dtype_name());
-            return false;
+            auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createSwiGLU(gate_base, dev_type);
+            if (!cached_kernel_)
+            {
+                LOG_ERROR("[SwiGLUStage] Failed to create SwiGLU kernel for type "
+                          << gate_base->dtype_name());
+                return false;
+            }
         }
 
+        // Thread GPU stream for graph capture
+        cached_kernel_->setGPUStream(gpuStream());
+
         // Apply SwiGLU via kernel's apply_tensor method
-        return kernel->apply_tensor(
+        return cached_kernel_->apply_tensor(
             gate_base,
             up_base,
             output_base,

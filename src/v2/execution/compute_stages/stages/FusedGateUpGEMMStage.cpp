@@ -83,6 +83,7 @@ namespace llaminar2
             LOG_ERROR("[FusedGateUpGEMMStage] Failed to get fused Gate/Up kernel");
             return false;
         }
+        fused_kernel->setGPUStream(gpuStream());
 
         // Cast input/output tensors
         auto *input_base = requireTensorBase(params_.input, "input");

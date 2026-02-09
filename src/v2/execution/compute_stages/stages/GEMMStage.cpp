@@ -192,6 +192,9 @@ namespace llaminar2
             return false;
         }
 
+        // Thread GPU stream for graph capture
+        gemm->setGPUStream(gpuStream());
+
         LOG_DEBUG("[GEMMStage] Got kernel ptr=" << static_cast<const void *>(gemm)
                                                 << " for weight ITensor*=" << static_cast<const void *>(params_.B)
                                                 << " TensorBase*=" << static_cast<const void *>(B_base));

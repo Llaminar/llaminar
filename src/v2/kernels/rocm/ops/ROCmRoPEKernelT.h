@@ -92,6 +92,9 @@ namespace llaminar2
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
             void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
+            // ===== GPU Stream Support (Graph Capture) =====
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
             // ===== ITensorRoPE interface =====
@@ -223,6 +226,7 @@ namespace llaminar2
             int device_idx_;
             float rope_theta_;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
 
             // Workspace state
             DeviceWorkspaceManager *workspace_ = nullptr;
@@ -279,6 +283,8 @@ namespace llaminar2
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
             void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
+            // ===== GPU Stream Support (Graph Capture) =====
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
             // ===== ITensorRoPE interface =====
@@ -388,6 +394,7 @@ namespace llaminar2
             float rope_theta_;
             DeviceWorkspaceManager *workspace_ = nullptr;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
 
             // Workspace-based inverse frequency state (v3: tracked per instance)
             mutable bool inv_freq_initialized_ = false;
@@ -439,6 +446,8 @@ namespace llaminar2
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
             void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
+            // ===== GPU Stream Support (Graph Capture) =====
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
             // ===== ITensorRoPE interface =====
@@ -548,6 +557,7 @@ namespace llaminar2
             float rope_theta_;
             DeviceWorkspaceManager *workspace_ = nullptr;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
 
             // Workspace-based inverse frequency state (v3: tracked per instance)
             mutable bool inv_freq_initialized_ = false;

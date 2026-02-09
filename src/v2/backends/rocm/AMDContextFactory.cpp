@@ -7,6 +7,11 @@
  * GPUDeviceContextPool (which lives in llaminar2_core) to create
  * AMDDeviceContext instances without directly depending on HIP headers.
  *
+ * NOTE: The static initializer (AMDFactoryRegistrar) may be stripped by the
+ * linker when this TU is in a static library and no symbols are referenced.
+ * The public function ensureAMDFactoryRegistered() provides an explicit
+ * registration path that also forces the linker to include this TU.
+ *
  * @author David Sanftenberg
  * @date February 2026
  */
@@ -37,10 +42,40 @@ namespace llaminar2
         }
 
         /**
+         * @brief Perform the actual factory registration with the pool
+         *
+         * Shared logic used by both the static initializer and the explicit
+         * ensureAMDFactoryRegistered() function.
+         */
+        void doRegisterAMDFactory()
+        {
+            auto &pool = GPUDeviceContextPool::instance();
+            if (pool.hasAMDSupport())
+                return; // Already registered
+
+            auto devices = rocm_enumeration::enumerate_rocm_devices();
+            int device_count = static_cast<int>(devices.size());
+
+            if (device_count > 0)
+            {
+                pool.registerAMDFactory(createAMDContext, device_count);
+                LOG_INFO("[AMDContextFactory] Registered ROCm factory with "
+                         << device_count << " devices");
+            }
+            else
+            {
+                LOG_DEBUG("[AMDContextFactory] No ROCm devices found, factory not registered");
+            }
+        }
+
+        /**
          * @brief RAII helper for static initialization registration
          *
          * This struct's constructor runs during static initialization (before main)
          * to register the AMD factory with GPUDeviceContextPool.
+         *
+         * NOTE: This may not run if the linker strips this TU from the static
+         * library. Use ensureAMDFactoryRegistered() as an explicit fallback.
          */
         struct AMDFactoryRegistrar
         {
@@ -48,23 +83,7 @@ namespace llaminar2
             {
                 try
                 {
-                    // Get device count via enumeration
-                    auto devices = rocm_enumeration::enumerate_rocm_devices();
-                    int device_count = static_cast<int>(devices.size());
-
-                    if (device_count > 0)
-                    {
-                        // Register factory with device pool
-                        GPUDeviceContextPool::instance().registerAMDFactory(
-                            createAMDContext, device_count);
-
-                        LOG_DEBUG("[AMDContextFactory] Registered ROCm factory with "
-                                  << device_count << " devices");
-                    }
-                    else
-                    {
-                        LOG_DEBUG("[AMDContextFactory] No ROCm devices found, factory not registered");
-                    }
+                    doRegisterAMDFactory();
                 }
                 catch (const std::exception &e)
                 {
@@ -77,4 +96,21 @@ namespace llaminar2
         static AMDFactoryRegistrar amd_factory_registrar;
 
     } // anonymous namespace
+
+    // =========================================================================
+    // Explicit registration (called when static init is unreliable)
+    // =========================================================================
+
+    void ensureAMDFactoryRegistered()
+    {
+        try
+        {
+            doRegisterAMDFactory();
+        }
+        catch (const std::exception &e)
+        {
+            LOG_WARN("[AMDContextFactory] Explicit registration failed: " << e.what());
+        }
+    }
+
 } // namespace llaminar2

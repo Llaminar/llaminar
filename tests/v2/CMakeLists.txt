@@ -8676,4 +8676,70 @@ add_v2_test(V2_Unit_TreeToRunnerCompiler
 )
 
 message(STATUS "V2 Tests: Added TreeToRunnerCompiler unit tests")
+
+# Test: GPUGraphCapture - GPU graph capture/replay infrastructure
+# Tests IGPUGraphCapture interface, HIPGraphCapture, CUDAGraphCapture lifecycle
+add_executable(v2_test_gpu_graph_capture unit/backends/Test__GPUGraphCapture.cpp)
+if(UNIX AND NOT APPLE AND (HAVE_CUDA OR HAVE_ROCM))
+    set(_gpu_backends_whole_gc "")
+    if(HAVE_CUDA)
+        list(APPEND _gpu_backends_whole_gc -Wl,--whole-archive cuda_backend -Wl,--no-whole-archive)
+    endif()
+    if(HAVE_ROCM)
+        list(APPEND _gpu_backends_whole_gc -Wl,--whole-archive rocm_backend -Wl,--no-whole-archive)
+    endif()
+    target_link_libraries(v2_test_gpu_graph_capture PRIVATE
+        -Wl,--start-group
+        llaminar2_core
+        ${_gpu_backends_whole_gc}
+        -Wl,--end-group
+        GTest::gtest
+        GTest::gtest_main
+    )
+else()
+    target_link_libraries(v2_test_gpu_graph_capture PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+endif()
+add_v2_test(V2_Unit_GPUGraphCapture
+    COMMAND $<TARGET_FILE:v2_test_gpu_graph_capture>
+    LABELS "V2;Unit;Backends;GPUGraphCapture;CUDA;ROCm;GraphCapture"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added GPUGraphCapture unit tests")
+
+# Test: GPUGraphCaptureExecution - Integration test for GPU graph capture in GraphExecutor
+add_executable(v2_test_gpu_graph_capture_execution integration/execution/graph/Test__GPUGraphCaptureExecution.cpp)
+if(UNIX AND NOT APPLE AND (HAVE_CUDA OR HAVE_ROCM))
+    set(_gpu_backends_whole_gce "")
+    if(HAVE_CUDA)
+        list(APPEND _gpu_backends_whole_gce -Wl,--whole-archive cuda_backend -Wl,--no-whole-archive)
+    endif()
+    if(HAVE_ROCM)
+        list(APPEND _gpu_backends_whole_gce -Wl,--whole-archive rocm_backend -Wl,--no-whole-archive)
+    endif()
+    target_link_libraries(v2_test_gpu_graph_capture_execution PRIVATE
+        -Wl,--start-group
+        llaminar2_core
+        ${_gpu_backends_whole_gce}
+        -Wl,--end-group
+        GTest::gtest
+        GTest::gtest_main
+    )
+else()
+    target_link_libraries(v2_test_gpu_graph_capture_execution PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+endif()
+add_v2_test(V2_Integration_GPUGraphCaptureExecution
+    COMMAND $<TARGET_FILE:v2_test_gpu_graph_capture_execution>
+    LABELS "V2;Integration;Execution;GraphCapture;CUDA;ROCm"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added GPUGraphCaptureExecution integration tests")
+
 endif()

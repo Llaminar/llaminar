@@ -477,6 +477,19 @@ namespace llaminar2
         virtual bool requiresAllreduce() const { return false; }
 
         /**
+         * @brief Whether this stage can be captured inside a GPU graph
+         *
+         * Returns true by default. Override to return false for stages whose
+         * kernel launch parameters change between graph replays (e.g., attention
+         * and KV cache stages where kv_len grows each decode step). Non-capturable
+         * stages are executed manually between graph segments.
+         *
+         * @return true if this stage's kernel launches have stable grid dimensions
+         *         and parameters across decode steps
+         */
+        virtual bool isGraphCapturable() const { return true; }
+
+        /**
          * @brief Whether this stage allows all-zero output tensors
          *
          * By default, all-zero outputs are treated as bugs (likely uninitialized
@@ -526,6 +539,29 @@ namespace llaminar2
          * @return The device this stage executes on (CPU by default if not set)
          */
         DeviceId device() const { return device_id_; }
+
+        /**
+         * @brief Set GPU stream for kernel dispatch
+         *
+         * When GPU graph capture is active, the executor sets this to the
+         * capture stream so all GPU kernels submit work on the correct stream.
+         * The pointer is backend-agnostic: cast to hipStream_t (ROCm) or
+         * cudaStream_t (CUDA) as needed. nullptr means "use default/legacy
+         * stream" (backward compatible).
+         *
+         * @param stream Opaque GPU stream pointer (hipStream_t / cudaStream_t as void*)
+         */
+        void setGPUStream(void *stream) { gpu_stream_ = stream; }
+
+        /**
+         * @brief Get the GPU stream for kernel dispatch
+         *
+         * Returns the stream assigned by the executor, or nullptr if none was set.
+         * GPU kernel wrapper functions should pass this to their launch calls.
+         *
+         * @return Opaque GPU stream pointer (nullptr = use default stream)
+         */
+        void *gpuStream() const { return gpu_stream_; }
 
         /**
          * @brief Update dynamic parameters for graph reuse
@@ -655,7 +691,8 @@ namespace llaminar2
                                   const std::string &b_name, const ITensor *b) const;
 
     private:
-        DeviceId device_id_; ///< Authoritative device (set via constructor, no default)
+        DeviceId device_id_;         ///< Authoritative device (set via constructor, no default)
+        void *gpu_stream_ = nullptr; ///< GPU stream for kernel dispatch (nullptr = default stream)
 
         // Cached dump info (built once, reused for all subsequent calls)
         mutable StageDumpInfo cached_dump_info_;

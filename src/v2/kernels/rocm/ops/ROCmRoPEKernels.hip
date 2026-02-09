@@ -21,6 +21,8 @@
 #include <cmath>
 #include <vector>
 
+#include "../../../backends/rocm/HipDeviceGuard.h"
+
 namespace
 {
 
@@ -1020,10 +1022,11 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx, void* stream)
     {
-        hipSetDevice(device_idx);
+        llaminar2::HipDeviceGuard::setDevice(device_idx);
 
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
         const int half_dim = head_dim / 2;
         const int threads_per_block = min(256, half_dim);
         const size_t smem_size = 2 * half_dim * sizeof(float); // sin + cos tables
@@ -1033,7 +1036,7 @@ extern "C"
             // Fused Q+K kernel
             int total_blocks = seq_len * (n_heads + n_kv_heads);
             hipLaunchKernelGGL(rocm_rope_fp32_fused_qk_kernel, 
-                               dim3(total_blocks), dim3(threads_per_block), smem_size, 0,
+                               dim3(total_blocks), dim3(threads_per_block), smem_size, hip_stream,
                                Q, K, inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
         }
         else
@@ -1041,7 +1044,7 @@ extern "C"
             // Q only
             int num_blocks = seq_len * n_heads;
             hipLaunchKernelGGL(rocm_rope_fp32_kernel_v2, 
-                               dim3(num_blocks), dim3(threads_per_block), smem_size, 0,
+                               dim3(num_blocks), dim3(threads_per_block), smem_size, hip_stream,
                                Q, inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
 
@@ -1063,10 +1066,11 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx, void* stream)
     {
-        hipSetDevice(device_idx);
+        llaminar2::HipDeviceGuard::setDevice(device_idx);
 
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
         const int half_dim = head_dim / 2;
         const int threads_per_block = min(256, half_dim);
         const size_t smem_size = 2 * half_dim * sizeof(float);
@@ -1075,14 +1079,14 @@ extern "C"
         {
             int total_blocks = seq_len * (n_heads + n_kv_heads);
             hipLaunchKernelGGL(rocm_rope_bf16_fused_qk_kernel, 
-                               dim3(total_blocks), dim3(threads_per_block), smem_size, 0,
+                               dim3(total_blocks), dim3(threads_per_block), smem_size, hip_stream,
                                Q, K, inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
         }
         else
         {
             int num_blocks = seq_len * n_heads;
             hipLaunchKernelGGL(rocm_rope_bf16_kernel_v2, 
-                               dim3(num_blocks), dim3(threads_per_block), smem_size, 0,
+                               dim3(num_blocks), dim3(threads_per_block), smem_size, hip_stream,
                                Q, inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
 
@@ -1104,10 +1108,11 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx, void* stream)
     {
-        hipSetDevice(device_idx);
+        llaminar2::HipDeviceGuard::setDevice(device_idx);
 
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
         const int half_dim = head_dim / 2;
         const int threads_per_block = min(256, half_dim);
         const size_t smem_size = 2 * half_dim * sizeof(float);
@@ -1116,14 +1121,14 @@ extern "C"
         {
             int total_blocks = seq_len * (n_heads + n_kv_heads);
             hipLaunchKernelGGL(rocm_rope_fp16_fused_qk_kernel, 
-                               dim3(total_blocks), dim3(threads_per_block), smem_size, 0,
+                               dim3(total_blocks), dim3(threads_per_block), smem_size, hip_stream,
                                Q, K, inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
         }
         else
         {
             int num_blocks = seq_len * n_heads;
             hipLaunchKernelGGL(rocm_rope_fp16_kernel_v2, 
-                               dim3(num_blocks), dim3(threads_per_block), smem_size, 0,
+                               dim3(num_blocks), dim3(threads_per_block), smem_size, hip_stream,
                                Q, inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
 
@@ -1154,24 +1159,25 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx, void* stream)
     {
-        hipSetDevice(device_idx);
+        llaminar2::HipDeviceGuard::setDevice(device_idx);
 
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
         const int half_dim = head_dim / 2;
         const int threads_per_block = min(256, half_dim);
         const size_t smem_size = 2 * half_dim * sizeof(float);
 
         // Launch decode kernel for Q
         hipLaunchKernelGGL(rocm_rope_fp32_decode_kernel, 
-                           dim3(n_q_heads), dim3(threads_per_block), smem_size, 0,
+                           dim3(n_q_heads), dim3(threads_per_block), smem_size, hip_stream,
                            Q, inv_freq, pos, n_q_heads, head_dim);
 
         // Launch decode kernel for K if provided
         if (K != nullptr)
         {
             hipLaunchKernelGGL(rocm_rope_fp32_decode_kernel, 
-                               dim3(n_kv_heads), dim3(threads_per_block), smem_size, 0,
+                               dim3(n_kv_heads), dim3(threads_per_block), smem_size, hip_stream,
                                K, inv_freq, pos, n_kv_heads, head_dim);
         }
 
@@ -1192,22 +1198,23 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx, void* stream)
     {
-        hipSetDevice(device_idx);
+        llaminar2::HipDeviceGuard::setDevice(device_idx);
 
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
         const int half_dim = head_dim / 2;
         const int threads_per_block = min(256, half_dim);
         const size_t smem_size = 2 * half_dim * sizeof(float);
 
         hipLaunchKernelGGL(rocm_rope_bf16_decode_kernel, 
-                           dim3(n_q_heads), dim3(threads_per_block), smem_size, 0,
+                           dim3(n_q_heads), dim3(threads_per_block), smem_size, hip_stream,
                            Q, inv_freq, pos, n_q_heads, head_dim);
 
         if (K != nullptr)
         {
             hipLaunchKernelGGL(rocm_rope_bf16_decode_kernel, 
-                               dim3(n_kv_heads), dim3(threads_per_block), smem_size, 0,
+                               dim3(n_kv_heads), dim3(threads_per_block), smem_size, hip_stream,
                                K, inv_freq, pos, n_kv_heads, head_dim);
         }
 
@@ -1228,22 +1235,23 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx, void* stream)
     {
-        hipSetDevice(device_idx);
+        llaminar2::HipDeviceGuard::setDevice(device_idx);
 
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
         const int half_dim = head_dim / 2;
         const int threads_per_block = min(256, half_dim);
         const size_t smem_size = 2 * half_dim * sizeof(float);
 
         hipLaunchKernelGGL(rocm_rope_fp16_decode_kernel, 
-                           dim3(n_q_heads), dim3(threads_per_block), smem_size, 0,
+                           dim3(n_q_heads), dim3(threads_per_block), smem_size, hip_stream,
                            Q, inv_freq, pos, n_q_heads, head_dim);
 
         if (K != nullptr)
         {
             hipLaunchKernelGGL(rocm_rope_fp16_decode_kernel, 
-                               dim3(n_kv_heads), dim3(threads_per_block), smem_size, 0,
+                               dim3(n_kv_heads), dim3(threads_per_block), smem_size, hip_stream,
                                K, inv_freq, pos, n_kv_heads, head_dim);
         }
 
@@ -1275,10 +1283,11 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx, void* stream)
     {
-        hipSetDevice(device_idx);
+        llaminar2::HipDeviceGuard::setDevice(device_idx);
 
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
         const int half_dim = head_dim / 2;
         const int threads_per_block = min(256, half_dim);
         const size_t smem_size = 2 * half_dim * sizeof(float);
@@ -1287,14 +1296,14 @@ extern "C"
         {
             int total_blocks = seq_len * (n_q_heads + n_kv_heads);
             hipLaunchKernelGGL(rocm_rope_fp32_fused_qk_contiguous_kernel, 
-                               dim3(total_blocks), dim3(threads_per_block), smem_size, 0,
+                               dim3(total_blocks), dim3(threads_per_block), smem_size, hip_stream,
                                Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim);
         }
         else
         {
             int num_blocks = seq_len * n_q_heads;
             hipLaunchKernelGGL(rocm_rope_fp32_contiguous_kernel, 
-                               dim3(num_blocks), dim3(threads_per_block), smem_size, 0,
+                               dim3(num_blocks), dim3(threads_per_block), smem_size, hip_stream,
                                Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim);
         }
 
@@ -1316,10 +1325,11 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx, void* stream)
     {
-        hipSetDevice(device_idx);
+        llaminar2::HipDeviceGuard::setDevice(device_idx);
 
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
         const int half_dim = head_dim / 2;
         const int threads_per_block = min(256, half_dim);
         const size_t smem_size = 2 * half_dim * sizeof(float);
@@ -1328,14 +1338,14 @@ extern "C"
         {
             int total_blocks = seq_len * (n_q_heads + n_kv_heads);
             hipLaunchKernelGGL(rocm_rope_bf16_fused_qk_contiguous_kernel, 
-                               dim3(total_blocks), dim3(threads_per_block), smem_size, 0,
+                               dim3(total_blocks), dim3(threads_per_block), smem_size, hip_stream,
                                Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim);
         }
         else
         {
             int num_blocks = seq_len * n_q_heads;
             hipLaunchKernelGGL(rocm_rope_bf16_contiguous_kernel, 
-                               dim3(num_blocks), dim3(threads_per_block), smem_size, 0,
+                               dim3(num_blocks), dim3(threads_per_block), smem_size, hip_stream,
                                Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim);
         }
 
@@ -1357,10 +1367,11 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx, void* stream)
     {
-        hipSetDevice(device_idx);
+        llaminar2::HipDeviceGuard::setDevice(device_idx);
 
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
         const int half_dim = head_dim / 2;
         const int threads_per_block = min(256, half_dim);
         const size_t smem_size = 2 * half_dim * sizeof(float);
@@ -1369,14 +1380,14 @@ extern "C"
         {
             int total_blocks = seq_len * (n_q_heads + n_kv_heads);
             hipLaunchKernelGGL(rocm_rope_fp16_fused_qk_contiguous_kernel, 
-                               dim3(total_blocks), dim3(threads_per_block), smem_size, 0,
+                               dim3(total_blocks), dim3(threads_per_block), smem_size, hip_stream,
                                Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim);
         }
         else
         {
             int num_blocks = seq_len * n_q_heads;
             hipLaunchKernelGGL(rocm_rope_fp16_contiguous_kernel, 
-                               dim3(num_blocks), dim3(threads_per_block), smem_size, 0,
+                               dim3(num_blocks), dim3(threads_per_block), smem_size, hip_stream,
                                Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim);
         }
 
@@ -1433,7 +1444,7 @@ extern "C"
         float *d_inv_freq,
         int head_dim,
         float freq_base,
-        int device_idx)
+        int device_idx, void* stream)
     {
         if (!d_inv_freq)
             return false;
@@ -1441,15 +1452,16 @@ extern "C"
         const int half_dim = head_dim / 2;
         const float neg_log_base = -std::log(freq_base);
 
-        hipSetDevice(device_idx);
+        llaminar2::HipDeviceGuard::setDevice(device_idx);
 
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
         // Compute inv_freq directly on GPU — fully async, no pipeline drain.
         // The kernel runs on the same default stream as subsequent RoPE kernels,
         // so ordering is guaranteed without explicit synchronization.
         constexpr int kBlockSize = 64;
         int grid_size = (half_dim + kBlockSize - 1) / kBlockSize;
         hipLaunchKernelGGL(rope_populate_inv_freq_kernel,
-                           dim3(grid_size), dim3(kBlockSize), 0, 0,
+                           dim3(grid_size), dim3(kBlockSize), 0, hip_stream,
                            d_inv_freq, half_dim, neg_log_base, head_dim);
 
         hipError_t err = hipGetLastError();

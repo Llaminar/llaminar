@@ -147,6 +147,9 @@ namespace llaminar2
             return false;
         }
 
+        // Thread GPU stream for graph capture
+        kernel->setGPUStream(gpuStream());
+
         // Handle batched vs single sequence input
         if (params_.token_batches)
         {

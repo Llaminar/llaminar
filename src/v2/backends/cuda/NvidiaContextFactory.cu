@@ -7,6 +7,10 @@
  * GPUDeviceContextPool (which lives in llaminar2_core) to create
  * NvidiaDeviceContext instances without directly depending on CUDA headers.
  *
+ * NOTE: The static initializer works reliably here because nvcc device linking
+ * forces inclusion of all .cu object files. The public function
+ * ensureNvidiaFactoryRegistered() is provided for symmetry with the AMD path.
+ *
  * @author David Sanftenberg
  * @date February 2026
  */
@@ -37,6 +41,33 @@ namespace llaminar2
         }
 
         /**
+         * @brief Perform the actual factory registration with the pool
+         *
+         * Shared logic used by both the static initializer and the explicit
+         * ensureNvidiaFactoryRegistered() function.
+         */
+        void doRegisterNvidiaFactory()
+        {
+            auto &pool = GPUDeviceContextPool::instance();
+            if (pool.hasNvidiaSupport())
+                return; // Already registered
+
+            auto devices = cuda_enumeration::enumerate_cuda_devices();
+            int device_count = static_cast<int>(devices.size());
+
+            if (device_count > 0)
+            {
+                pool.registerNvidiaFactory(createNvidiaContext, device_count);
+                LOG_INFO("[NvidiaContextFactory] Registered CUDA factory with "
+                         << device_count << " devices");
+            }
+            else
+            {
+                LOG_DEBUG("[NvidiaContextFactory] No CUDA devices found, factory not registered");
+            }
+        }
+
+        /**
          * @brief RAII helper for static initialization registration
          *
          * This struct's constructor runs during static initialization (before main)
@@ -48,23 +79,7 @@ namespace llaminar2
             {
                 try
                 {
-                    // Get device count via enumeration
-                    auto devices = cuda_enumeration::enumerate_cuda_devices();
-                    int device_count = static_cast<int>(devices.size());
-
-                    if (device_count > 0)
-                    {
-                        // Register factory with device pool
-                        GPUDeviceContextPool::instance().registerNvidiaFactory(
-                            createNvidiaContext, device_count);
-
-                        LOG_DEBUG("[NvidiaContextFactory] Registered CUDA factory with "
-                                  << device_count << " devices");
-                    }
-                    else
-                    {
-                        LOG_DEBUG("[NvidiaContextFactory] No CUDA devices found, factory not registered");
-                    }
+                    doRegisterNvidiaFactory();
                 }
                 catch (const std::exception &e)
                 {
@@ -77,4 +92,21 @@ namespace llaminar2
         static NvidiaFactoryRegistrar nvidia_factory_registrar;
 
     } // anonymous namespace
+
+    // =========================================================================
+    // Explicit registration (called when static init is unreliable)
+    // =========================================================================
+
+    void ensureNvidiaFactoryRegistered()
+    {
+        try
+        {
+            doRegisterNvidiaFactory();
+        }
+        catch (const std::exception &e)
+        {
+            LOG_WARN("[NvidiaContextFactory] Explicit registration failed: " << e.what());
+        }
+    }
+
 } // namespace llaminar2

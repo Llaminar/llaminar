@@ -13,6 +13,7 @@
 #include <hip/hip_fp16.h>
 #include <cstdint>
 #include <cstdio>
+#include "../../../backends/rocm/HipDeviceGuard.h"
 
 // BF16 type support
 #if defined(__HIP_PLATFORM_AMD__)
@@ -226,7 +227,8 @@ extern "C" bool hipOps_rmsnorm_fp32(
     int rows,
     int cols,
     float epsilon,
-    int device_idx)
+    int device_idx,
+    void* stream)
 {
     if (!input || !gamma || !output || rows <= 0 || cols <= 0)
     {
@@ -234,12 +236,14 @@ extern "C" bool hipOps_rmsnorm_fp32(
         return false;
     }
 
-    hipError_t err = hipSetDevice(device_idx);
+    hipError_t err = static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(device_idx));
     if (err != hipSuccess)
     {
         fprintf(stderr, "hipOps_rmsnorm_fp32: hipSetDevice failed: %s\n", hipGetErrorString(err));
         return false;
     }
+
+    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
 
     // Launch configuration: one block per row
     constexpr int threads_per_block = 256;
@@ -250,7 +254,7 @@ extern "C" bool hipOps_rmsnorm_fp32(
     // Clear any stale error from previous operations (e.g., heterogeneous backend tests)
     (void)hipGetLastError();
 
-    rocm_rmsnorm_fp32_kernel<<<grid, block, shared_mem_size>>>(
+    rocm_rmsnorm_fp32_kernel<<<grid, block, shared_mem_size, hip_stream>>>(
         input, gamma, output, cols, epsilon);
 
     err = hipGetLastError();
@@ -271,7 +275,8 @@ extern "C" bool hipOps_rmsnorm_bf16(
     int rows,
     int cols,
     float epsilon,
-    int device_idx)
+    int device_idx,
+    void* stream)
 {
     if (!input || !gamma || !output || rows <= 0 || cols <= 0)
     {
@@ -279,12 +284,14 @@ extern "C" bool hipOps_rmsnorm_bf16(
         return false;
     }
 
-    hipError_t err = hipSetDevice(device_idx);
+    hipError_t err = static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(device_idx));
     if (err != hipSuccess)
     {
         fprintf(stderr, "hipOps_rmsnorm_bf16: hipSetDevice failed: %s\n", hipGetErrorString(err));
         return false;
     }
+
+    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
 
     constexpr int threads_per_block = 256;
     dim3 grid(rows);
@@ -294,7 +301,7 @@ extern "C" bool hipOps_rmsnorm_bf16(
     // Clear any stale error from previous operations
     (void)hipGetLastError();
 
-    rocm_rmsnorm_bf16_kernel<<<grid, block, shared_mem_size>>>(
+    rocm_rmsnorm_bf16_kernel<<<grid, block, shared_mem_size, hip_stream>>>(
         input, gamma, output, cols, epsilon);
 
     err = hipGetLastError();
@@ -315,7 +322,8 @@ extern "C" bool hipOps_rmsnorm_fp16(
     int rows,
     int cols,
     float epsilon,
-    int device_idx)
+    int device_idx,
+    void* stream)
 {
     if (!input || !gamma || !output || rows <= 0 || cols <= 0)
     {
@@ -323,12 +331,14 @@ extern "C" bool hipOps_rmsnorm_fp16(
         return false;
     }
 
-    hipError_t err = hipSetDevice(device_idx);
+    hipError_t err = static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(device_idx));
     if (err != hipSuccess)
     {
         fprintf(stderr, "hipOps_rmsnorm_fp16: hipSetDevice failed: %s\n", hipGetErrorString(err));
         return false;
     }
+
+    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
 
     constexpr int threads_per_block = 256;
     dim3 grid(rows);
@@ -338,7 +348,7 @@ extern "C" bool hipOps_rmsnorm_fp16(
     // Clear any stale error from previous operations
     (void)hipGetLastError();
 
-    rocm_rmsnorm_fp16_kernel<<<grid, block, shared_mem_size>>>(
+    rocm_rmsnorm_fp16_kernel<<<grid, block, shared_mem_size, hip_stream>>>(
         input, gamma, output, cols, epsilon);
 
     err = hipGetLastError();

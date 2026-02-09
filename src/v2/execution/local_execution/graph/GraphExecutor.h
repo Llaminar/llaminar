@@ -36,6 +36,8 @@
 #include "../../../backends/DeviceId.h"
 #include "../../../utils/DebugEnv.h" // For LLAMINAR_ASSERTIONS_ACTIVE
 #include "../../../interfaces/ICollectiveContext.h"
+#include "../../../backends/IGPUGraphCapture.h"
+#include "../../../backends/IWorkerGPUContext.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -364,6 +366,185 @@ namespace llaminar2
          * @return true on success
          */
         bool executeWithBufferManagement(ComputeGraph &graph, IDeviceContext *ctx);
+
+        /**
+         * @brief Execute a cached decode graph with minimal overhead
+         *
+         * Stripped-down execution path for cached decode graphs where:
+         * - All tensors are already on the target GPU device
+         * - Output GPU buffers are already allocated
+         * - No stage dumping, validation, or profiling is needed
+         * - Stage objects are reused (not rebuilt)
+         *
+         * Skips: getDumpInfo, extractBuffers, cohereInputs/Outputs,
+         *        shouldDump, printStageOutputs, profiling, assertions
+         *
+         * The collective_nodes set enables O(1) lookup for TP stages instead
+         * of calling stage->type() (virtual dispatch) on every node.
+         *
+         * @param graph The cached compute graph (stages already configured)
+         * @param ctx Device context for execution
+         * @param collective_nodes Pre-computed set of node names that are collective stages (optional, for TP>1)
+         * @return true on success
+         */
+        bool executeFastDecode(ComputeGraph &graph, IDeviceContext *ctx,
+                               const std::unordered_set<std::string> *collective_nodes = nullptr);
+
+        /**
+         * @brief Execute a cached decode graph with GPU graph capture/replay
+         *
+         * On first call: captures all kernel launches into a GPU graph, instantiates
+         * and launches it. On subsequent calls: re-captures, updates the executable
+         * in-place (hipGraphExecUpdate/cudaGraphExecUpdate), and launches.
+         *
+         * Falls back to executeFastDecode() if:
+         * - Graph capture/instantiation fails
+         * - Update fails more than max_failures times consecutively
+         * - Collective nodes are present (TP>1 with cross-device communication)
+         *
+         * @param graph The cached compute graph
+         * @param ctx Device context for execution
+         * @param capture GPU graph capture object (created once, reused across calls)
+         * @param collective_nodes Pre-computed collective node names (for TP>1)
+         * @param gpu_stream Opaque GPU stream pointer to assign to stages for dispatch
+         * @return true on success
+         */
+        bool executeWithGraphCapture(ComputeGraph &graph, IDeviceContext *ctx,
+                                     IGPUGraphCapture *capture,
+                                     const std::unordered_set<std::string> *collective_nodes = nullptr,
+                                     void *gpu_stream = nullptr);
+
+        // =========================================================================
+        // Segmented GPU Graph Capture/Replay
+        // =========================================================================
+
+        /**
+         * @brief A segment of the execution graph — either graph-capturable or manual
+         *
+         * The execution order is partitioned into contiguous segments based on
+         * isGraphCapturable(). Capturable segments get their own GPU graph;
+         * non-capturable segments (attention, KV cache) are executed manually
+         * between graph launches.
+         */
+        struct GraphSegment
+        {
+            std::vector<std::string> stage_names;      ///< Ordered stage names in this segment
+            bool capturable = true;                    ///< Whether this segment can be graph-captured
+            std::unique_ptr<IGPUGraphCapture> capture; ///< GPU graph (only for capturable segments)
+        };
+
+        /**
+         * @brief Persistent cache of graph segments for segmented capture/replay
+         *
+         * Built once on the first decode step, reused across subsequent steps.
+         * Capturable segments are replayed via GPU graph launch; non-capturable
+         * segments are executed manually each step.
+         */
+        struct GraphSegmentCache
+        {
+            std::vector<GraphSegment> segments;       ///< Ordered segments
+            bool initialized = false;                 ///< Whether segments have been built
+            bool needs_capture = false;               ///< True after warmup, before capture
+            int consecutive_failures = 0;             ///< Segment-level failure counter
+            void *capture_stream = nullptr;           ///< Locally-created blocking stream for capture/replay
+            void *sync_event = nullptr;               ///< Cached event for GPU-side inter-stream sync
+            IWorkerGPUContext *gpu_ctx_ref = nullptr; ///< GPU context for stream lifecycle (not owned)
+            static constexpr int kMaxFailures = 4;    ///< Disable after N failures
+
+            GraphSegmentCache() = default;
+            ~GraphSegmentCache()
+            {
+                destroySyncEvent();
+                destroyCaptureStream();
+            }
+
+            // Move-only (non-copyable due to stream/event ownership)
+            GraphSegmentCache(GraphSegmentCache &&other) noexcept
+                : segments(std::move(other.segments)),
+                  initialized(other.initialized),
+                  needs_capture(other.needs_capture),
+                  consecutive_failures(other.consecutive_failures),
+                  capture_stream(other.capture_stream),
+                  sync_event(other.sync_event),
+                  gpu_ctx_ref(other.gpu_ctx_ref)
+            {
+                other.capture_stream = nullptr;
+                other.sync_event = nullptr;
+                other.gpu_ctx_ref = nullptr;
+            }
+            GraphSegmentCache &operator=(GraphSegmentCache &&other) noexcept
+            {
+                if (this != &other)
+                {
+                    destroySyncEvent();
+                    destroyCaptureStream();
+                    segments = std::move(other.segments);
+                    initialized = other.initialized;
+                    needs_capture = other.needs_capture;
+                    consecutive_failures = other.consecutive_failures;
+                    capture_stream = other.capture_stream;
+                    sync_event = other.sync_event;
+                    gpu_ctx_ref = other.gpu_ctx_ref;
+                    other.capture_stream = nullptr;
+                    other.sync_event = nullptr;
+                    other.gpu_ctx_ref = nullptr;
+                }
+                return *this;
+            }
+            GraphSegmentCache(const GraphSegmentCache &) = delete;
+            GraphSegmentCache &operator=(const GraphSegmentCache &) = delete;
+
+            void reset()
+            {
+                segments.clear();
+                initialized = false;
+                needs_capture = false;
+                consecutive_failures = 0;
+                destroySyncEvent();
+                destroyCaptureStream();
+            }
+
+            /// Create a local blocking stream for graph capture via the GPU context.
+            /// @param ctx GPU context that creates the stream (stored for cleanup)
+            bool ensureCaptureStream(IWorkerGPUContext *ctx);
+
+            /// Destroy the capture stream if it exists
+            void destroyCaptureStream();
+
+            /// Create or get the cached sync event for inter-stream dependencies
+            bool ensureSyncEvent(IWorkerGPUContext *ctx);
+
+            /// Destroy the cached sync event if it exists
+            void destroySyncEvent();
+        };
+
+        /**
+         * @brief Execute with segmented GPU graph capture/replay
+         *
+         * Partitions the execution order into segments based on stage
+         * isGraphCapturable(). Capturable segments (GEMMs, norms, SwiGLU, etc.)
+         * are captured into separate GPU graphs and replayed. Non-capturable
+         * segments (attention, KV cache append) are executed manually between
+         * graph launches.
+         *
+         * For a 28-layer Qwen2.5 model this produces ~57 graph segments + 56
+         * manual segments per decode step, with each hipGraphLaunch costing
+         * ~5-10μs (total ~300-600μs host overhead vs ~43ms without graphs).
+         *
+         * On first call: builds segment list, captures all capturable segments.
+         * On subsequent calls: replays captured graphs, re-executes manual stages.
+         *
+         * @param graph The cached compute graph
+         * @param ctx Device context for execution
+         * @param segment_cache Persistent segment cache (built once, reused)
+         * @param gpu_stream Opaque GPU stream pointer for kernel dispatch
+         * @param gpu_ctx GPU context for creating new graph captures
+         * @return true on success
+         */
+        bool executeWithSegmentedGraphCapture(ComputeGraph &graph, IDeviceContext *ctx,
+                                              GraphSegmentCache &segment_cache,
+                                              void *gpu_stream,
+                                              IWorkerGPUContext *gpu_ctx);
 
     private:
         GraphExecutorConfig config_;

@@ -13,6 +13,7 @@
  */
 
 #include "AMDDeviceContext.h"
+#include "HIPGraphCapture.h"
 #include "../../utils/Logger.h"
 #include <sstream>
 #include <stdexcept>
@@ -222,8 +223,14 @@ namespace llaminar2
         // Step 1: Set HIP device
         HIP_CHECK(hipSetDevice(device_ordinal_));
 
-        // Step 2: Create default stream (non-blocking for better concurrency)
-        HIP_CHECK(hipStreamCreateWithFlags(&default_stream_, hipStreamNonBlocking));
+        // Step 2: Create default stream.
+        // IMPORTANT: Use hipStreamDefault (blocking) instead of hipStreamNonBlocking.
+        // Non-blocking streams do NOT synchronize with the legacy default stream (stream 0/nullptr).
+        // Some ROCm kernels (hipBLAS, CK) may internally dispatch work to stream 0,
+        // causing data races when the main compute stream is non-blocking.
+        // A blocking stream maintains implicit synchronization with stream 0,
+        // preventing these races while still allowing graph capture.
+        HIP_CHECK(hipStreamCreateWithFlags(&default_stream_, hipStreamDefault));
 
         // Step 3: Create hipBLAS handle
         hipblasStatus_t hipblas_status = hipblasCreate(&hipblas_handle_);
@@ -345,6 +352,9 @@ namespace llaminar2
     void *AMDDeviceContext::createStream()
     {
         hipStream_t stream;
+        // Use non-blocking stream for graph capture compatibility.
+        // HIP graph replay requires non-blocking streams to avoid implicit
+        // serialization with the null stream that can cause incorrect results.
         hipError_t err = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
         if (err != hipSuccess)
         {
@@ -483,6 +493,61 @@ namespace llaminar2
             LOG_ERROR("[AMDDeviceContext] hipDeviceSynchronize failed: " 
                       << hipGetErrorString(err));
         } });
+    }
+
+    void AMDDeviceContext::synchronizeStream(void *stream)
+    {
+        hipStream_t hip_stream = stream ? static_cast<hipStream_t>(stream) : hipStream_t(0);
+        hipError_t err = hipStreamSynchronize(hip_stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext] hipStreamSynchronize failed: "
+                      << hipGetErrorString(err));
+        }
+    }
+
+    void AMDDeviceContext::insertStreamDependency(void *dependent_stream, void *dependency_stream)
+    {
+        // GPU-side inter-stream synchronization via events.
+        // Records an event on dependency_stream, makes dependent_stream wait for it.
+        // Unlike synchronizeStream(), this does NOT block the CPU.
+        hipStream_t dep_stream = dependent_stream ? static_cast<hipStream_t>(dependent_stream) : hipStream_t(0);
+        hipStream_t src_stream = dependency_stream ? static_cast<hipStream_t>(dependency_stream) : hipStream_t(0);
+
+        hipEvent_t event;
+        hipError_t err = hipEventCreateWithFlags(&event, hipEventDisableTiming);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext] hipEventCreate failed in insertStreamDependency: "
+                      << hipGetErrorString(err));
+            return;
+        }
+
+        err = hipEventRecord(event, src_stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext] hipEventRecord failed: " << hipGetErrorString(err));
+            hipEventDestroy(event);
+            return;
+        }
+
+        err = hipStreamWaitEvent(dep_stream, event, 0);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext] hipStreamWaitEvent failed: " << hipGetErrorString(err));
+        }
+
+        hipEventDestroy(event);
+    }
+
+    std::unique_ptr<IGPUGraphCapture> AMDDeviceContext::createGraphCapture()
+    {
+        return std::make_unique<HIPGraphCapture>(static_cast<hipStream_t>(defaultStream()));
+    }
+
+    std::unique_ptr<IGPUGraphCapture> AMDDeviceContext::createGraphCapture(void *stream)
+    {
+        return std::make_unique<HIPGraphCapture>(static_cast<hipStream_t>(stream));
     }
 
 } // namespace llaminar2

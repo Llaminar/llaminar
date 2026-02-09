@@ -12,16 +12,16 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
-#include "../../../utils/KernelProfiler.h"
+#include "../../../utils/ROCmKernelProfiler.h"
 #include <cstdint>
 #include <stdexcept>
 
 // Forward declarations for HIP kernels (implemented in ROCmResidualAddKernels.hip)
 extern "C"
 {
-    bool rocmOps_residual_add_fp32(const float *input, const float *residual, float *output, int size, int device_idx);
-    bool rocmOps_residual_add_bf16(const uint16_t *input, const uint16_t *residual, uint16_t *output, int size, int device_idx);
-    bool rocmOps_residual_add_fp16(const uint16_t *input, const uint16_t *residual, uint16_t *output, int size, int device_idx);
+    bool rocmOps_residual_add_fp32(const float *input, const float *residual, float *output, int size, int device_idx, void *stream);
+    bool rocmOps_residual_add_bf16(const uint16_t *input, const uint16_t *residual, uint16_t *output, int size, int device_idx, void *stream);
+    bool rocmOps_residual_add_fp16(const uint16_t *input, const uint16_t *residual, uint16_t *output, int size, int device_idx, void *stream);
 }
 
 namespace llaminar2
@@ -80,17 +80,20 @@ namespace llaminar2
                 return device_idx >= 0; // Supports any ROCm GPU device
             }
 
+            // GPU stream for graph capture support
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
             bool apply(
                 const float *input, const float *residual, float *output,
                 size_t num_elements,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override
             {
-                KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
+                ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RESIDUAL_ADD, static_cast<hipStream_t>(gpu_stream_));
                 (void)mpi_ctx;
                 int dev = (device_idx >= 0) ? device_idx : device_idx_;
                 LOG_DEBUG("[ROCmResidualAddKernelT::FP32] Executing on device " << dev);
-                return rocmOps_residual_add_fp32(input, residual, output, static_cast<int>(num_elements), dev);
+                return rocmOps_residual_add_fp32(input, residual, output, static_cast<int>(num_elements), dev, gpu_stream_);
             }
 
             bool apply_tensor(
@@ -120,6 +123,7 @@ namespace llaminar2
         private:
             int device_idx_;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
         };
 
         // ============================================================================
@@ -180,11 +184,11 @@ namespace llaminar2
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override
             {
-                KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
+                ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RESIDUAL_ADD, static_cast<hipStream_t>(gpu_stream_));
                 (void)mpi_ctx;
                 int dev = (device_idx >= 0) ? device_idx : device_idx_;
                 LOG_DEBUG("[ROCmResidualAddKernelT::BF16] Executing on device " << dev);
-                return rocmOps_residual_add_bf16(input, residual, output, static_cast<int>(num_elements), dev);
+                return rocmOps_residual_add_bf16(input, residual, output, static_cast<int>(num_elements), dev, gpu_stream_);
             }
 
             bool apply_tensor(
@@ -213,6 +217,7 @@ namespace llaminar2
         private:
             int device_idx_;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
         };
 
         // ============================================================================
@@ -252,6 +257,9 @@ namespace llaminar2
                 return device_idx >= 0;
             }
 
+            // GPU stream for graph capture support
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
             bool apply(
                 const float *input, const float *residual, float *output,
                 size_t num_elements,
@@ -273,11 +281,11 @@ namespace llaminar2
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override
             {
-                KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
+                ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RESIDUAL_ADD, static_cast<hipStream_t>(gpu_stream_));
                 (void)mpi_ctx;
                 int dev = (device_idx >= 0) ? device_idx : device_idx_;
                 LOG_DEBUG("[ROCmResidualAddKernelT::FP16] Executing on device " << dev);
-                return rocmOps_residual_add_fp16(input, residual, output, static_cast<int>(num_elements), dev);
+                return rocmOps_residual_add_fp16(input, residual, output, static_cast<int>(num_elements), dev, gpu_stream_);
             }
 
             bool apply_tensor(
@@ -306,6 +314,7 @@ namespace llaminar2
         private:
             int device_idx_;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
         };
 
     } // namespace rocm

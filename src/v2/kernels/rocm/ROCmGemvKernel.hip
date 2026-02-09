@@ -44,6 +44,8 @@
 #include <cstdio>
 #include <cmath>
 
+#include "../../backends/rocm/HipDeviceGuard.h"
+
 // ============================================================================
 // Kernel: gemv_int8_fp32
 //
@@ -357,9 +359,9 @@ bool rocmGemv_int8_int8_int32_vnni(
     const int8_t* d_B_int8_vnni,
     int32_t* d_C_int32,
     int N, int K,
-    int device_id)
+    int device_id, void* stream)
 {
-    hipSetDevice(device_id);
+    llaminar2::HipDeviceGuard::setDevice(device_id);
 
     if ((K % 4) != 0)
     {
@@ -383,7 +385,7 @@ bool rocmGemv_int8_int8_int32_vnni(
         dim3 block(GEMV_INT8_VNNI_WIDE2_TILE_N / 2, 1, 1);
         hipLaunchKernelGGL(
             gemv_int8_int8_wide2_vnni_kernel,
-            dim3(grid_n), block, 0, 0,
+            dim3(grid_n), block, 0, static_cast<hipStream_t>(stream),
             d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
     }
     else if (use_wide_vec4 && (N >= GEMV_INT8_VNNI_WIDE_TILE_N))
@@ -392,7 +394,7 @@ bool rocmGemv_int8_int8_int32_vnni(
         dim3 block(GEMV_INT8_VNNI_WIDE_TILE_N / 4, 1, 1);
         hipLaunchKernelGGL(
             gemv_int8_int8_wide_vec4_vnni_kernel,
-            dim3(grid_n), block, 0, 0,
+            dim3(grid_n), block, 0, static_cast<hipStream_t>(stream),
             d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
     }
     else if (use_grid_kpar)
@@ -405,10 +407,10 @@ bool rocmGemv_int8_int8_int32_vnni(
         const int grid_n = (N + TN - 1) / TN;
         const int kb = max(2, min(64, (K + 63) / 64));
 
-        hipMemsetAsync(d_C_int32, 0, N * sizeof(int32_t), 0);
+        hipMemsetAsync(d_C_int32, 0, N * sizeof(int32_t), static_cast<hipStream_t>(stream));
         hipLaunchKernelGGL(
             HIP_KERNEL_NAME(gemv_int8_int8_grid_kpar_vnni_kernel_t<TN, CPT>),
-            dim3(grid_n, kb), dim3(TN / CPT), 0, 0,
+            dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
             d_A_int8, d_B_int8_vnni, d_C_int32, N, K, kb);
     }
     else if (use_square)
@@ -417,7 +419,7 @@ bool rocmGemv_int8_int8_int32_vnni(
         dim3 block(GEMV_INT8_VNNI_SQUARE_TILE_N, 1, 1);
         hipLaunchKernelGGL(
             gemv_int8_int8_square_vnni_kernel,
-            dim3(grid_n), block, 0, 0,
+            dim3(grid_n), block, 0, static_cast<hipStream_t>(stream),
             d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
     }
     else
@@ -425,7 +427,7 @@ bool rocmGemv_int8_int8_int32_vnni(
         const int grid_n = (N + GEMV_TILE_N - 1) / GEMV_TILE_N;
         hipLaunchKernelGGL(
             gemv_int8_int8_vnni_kernel,
-            dim3(grid_n), dim3(GEMV_TILE_N), 0, 0,
+            dim3(grid_n), dim3(GEMV_TILE_N), 0, static_cast<hipStream_t>(stream),
             d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
     }
 
@@ -492,7 +494,7 @@ bool rocmGemv_repackVNNI_to_rowmajor(
     const int8_t* d_B_vnni,
     int8_t* d_B_rowmajor,
     int N, int K,
-    int device_id)
+    int device_id, void* stream)
 {
     if ((K % 4) != 0)
     {
@@ -500,7 +502,7 @@ bool rocmGemv_repackVNNI_to_rowmajor(
         return false;
     }
 
-    hipSetDevice(device_id);
+    llaminar2::HipDeviceGuard::setDevice(device_id);
 
     const int k_groups = K / 4;
     const int total = N * k_groups;
@@ -509,7 +511,7 @@ bool rocmGemv_repackVNNI_to_rowmajor(
 
     hipLaunchKernelGGL(
         repack_vnni_to_rowmajor_kernel,
-        dim3(grid), dim3(BLOCK), 0, 0,
+        dim3(grid), dim3(BLOCK), 0, static_cast<hipStream_t>(stream),
         d_B_vnni, d_B_rowmajor, N, K);
 
     hipError_t err = hipGetLastError();

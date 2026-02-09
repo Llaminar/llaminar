@@ -66,6 +66,7 @@ namespace llaminar2
             LOG_ERROR("[LMHeadStage] Failed to get/create LM head GEMM kernel");
             return false;
         }
+        lm_gemm->setGPUStream(gpuStream());
 
         // LM head: logits = hidden @ lm_head^T + bias
         // hidden: [seq_len, d_model], lm_head: [vocab_size, d_model]

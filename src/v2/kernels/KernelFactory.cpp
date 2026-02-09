@@ -3624,6 +3624,17 @@ namespace llaminar
                 {
                 }
 
+                // Propagate GPU stream to internal GEMM kernels so they
+                // launch on the correct stream during graph capture/replay.
+                void setGPUStream(void *stream) override
+                {
+                    llaminar2::ITensorFusedGateUpGemm::setGPUStream(stream);
+                    if (gemm_gate_)
+                        gemm_gate_->setGPUStream(stream);
+                    if (gemm_up_)
+                        gemm_up_->setGPUStream(stream);
+                }
+
                 bool execute(
                     const llaminar2::TensorBase *input,
                     llaminar2::TensorBase *output_gate,
