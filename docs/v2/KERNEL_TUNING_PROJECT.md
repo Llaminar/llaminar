@@ -77,6 +77,7 @@
 - [x] **Fused FP32×INT8 GEMV** — ATTEMPTED & REVERTED: 9.8% regression due to gfx906 float atomicAdd CAS loop + no v_dot4 in FP32 path
 - [x] **v_dot4_i32_i8 intrinsic** — 303 → 286 µs/call avg (-5.6%), decode 30.31 → 32.10 tok/s (+5.9%)
 - [x] **GEMV tile/occupancy tuning** — CPT=4→2 (full wavefront), KB formula tuned per shape; +0.4% decode (32.30→32.43 tok/s)
+- [x] **Kill wide2_gemv + adaptive KB** — Route FFN Gate/Up through grid_kpar (was 17% peak BW, now 48-63%); adaptive KB for large-N vs small-N shapes; **+74.8% decode (32.43→56.69 tok/s)**
 - [ ] **Multi-projection GEMV** — batch Q+K+V in one kernel launch to reduce launch overhead
 - [ ] **GEMM prefill repack overhead** — VNNI→row-major repack runs PER CK GEMM call (~65-200µs each)
 - [x] **Assembly sweep (rsqrtf, rintf)** — RMS Norm rsqrtf + Quantize rintf, +0.6% decode (32.10→32.30 tok/s)
@@ -134,6 +135,59 @@ Ratio: 1.74× matches average ~1.7 sub-projections per fused call (QKV=3, GateUp
 ---
 
 ## Tuning Log
+
+### Entry 10: Kill wide2_gemv + Adaptive KB — GEMV Dispatch Overhaul (2026-02-10)
+
+**Target**: `wide2_gemv` kernel dispatch in `ROCmGemvKernel.hip` — FFN Gate/Up projections (2 of 7 per decode layer)
+
+**Problem**: Profiling with rocprof/rocprofv3 (see Appendix A) revealed `wide2_gemv` was catastrophically underperforming at **17% of peak HBM bandwidth** (176 GB/s vs 1024 GB/s theoretical). For FFN Gate/Up (N=18944, K=3584):
+- `wide2` created only `ceil(18944/256) = 74 blocks` with 128 threads = **148 waves for 60 CUs**
+- Each thread processed the entire K dimension (896 k-groups) without K-splitting
+- No K-parallel decomposition → insufficient wavefronts to hide HBM2 latency
+- Meanwhile, `grid_kpar` on FFN Down (same N×K product, transposed) achieved **63% peak BW**
+
+**Root Cause**: The dispatch condition `use_wide = (N >= 3*K)` steered all "wide" shapes away from `grid_kpar`. This was designed to avoid atomicAdd overhead, but atomicAdd is cheap (L2-cached for output arrays <8MB) while having too few wavefronts is fatal for bandwidth-bound GEMV.
+
+**Changes**:
+
+1. **Dispatch overhaul**: Eliminated `use_wide`/`use_wide2` — all shapes with N%4==0 now route through `grid_kpar`:
+   ```
+   Before: wide → wide2 (N<8K) or wide_vec4 (N≥8K)
+           non-wide → grid_kpar
+   After:  N≥8K → wide_vec4 (LM Head, already 67% peak)
+           N%4==0 → grid_kpar (everything else, K-splitting)
+           fallback → square → basic
+   ```
+
+2. **grid_kpar kernel optimizations**:
+   - Vectorized `int2` B-loads for CPT=2: load two adjacent VNNI columns in one 8-byte memory transaction
+   - Partial loop unrolling (`#pragma unroll 4`) for better memory-level parallelism
+   - Precomputed B row pointer to reduce address arithmetic
+
+3. **Adaptive KB heuristic** (three-tier):
+   - K > 8192: `KB = max(4, min(32, K/512))` — FFN Down path, unchanged
+   - K ≤ 8192, grid_n ≥ 64: `KB = k_groups/32` — cap KB for efficiency (28 for K=3584). Many N-tiles provide occupancy; fewer K-splits reduce atomicAdd contention.
+   - K ≤ 8192, grid_n < 64: `KB = min(64, (K+63)/64)` — maximize K-splits for occupancy (56 for K=3584 Q/Wo). Few N-tiles need aggressive K-splitting.
+
+**Kernel timing results** (rocprofv3, Qwen 7B shapes, warm):
+
+| Shape | Before | After | Speedup |
+|---|---|---|---|
+| FFN Gate (18944×3584) | 387 us (wide2) | **121 us** (grid_kpar KB=28) | **3.2×** |
+| FFN Up (18944×3584) | 385 us (wide2) | **123 us** (grid_kpar KB=28) | **3.1×** |
+| Q/Wo proj (3584×3584) | 24 us (grid_kpar KB=56) | **24 us** (grid_kpar KB=56) | unchanged |
+| FFN Down (3584×18944) | 105 us (grid_kpar KB=32) | **105 us** (grid_kpar KB=32) | unchanged |
+| LM Head (152064×3584) | 797 us (wide_vec4) | **800 us** (wide_vec4) | unchanged |
+
+**End-to-end results**:
+
+| Metric | Baseline (Entry 9) | This Entry | Change |
+|---|---|---|---|
+| **Decode** | 32.43 tok/s | **56.69 tok/s** | **+74.8%** |
+| **Prefill** | - | 173.0 tok/s | (not compared) |
+| **Correctness** | ✓ | ✓ | All 16 shapes pass (0.5B + 7B), cosine sim ≥ 0.99999 |
+
+**Why massive end-to-end impact**: FFN Gate and FFN Up are the two largest GEMV calls per layer (N=18944 > all other projections). With 28 layers in Qwen 7B, the per-layer savings of ~528 us × 28 layers = **14.8 ms/token**, cutting decode time from ~30.8 ms to ~18.3 ms per token.
 
 ### Entry 9: GEMV Tile/Occupancy Tuning — CPT + KB Optimization (2026-02-10)
 
@@ -422,3 +476,129 @@ acc = __builtin_amdgcn_sdot4(a_packed, b_packed, acc, false);
 - Established baseline profiling with phase-separated GPU event timing
 - Fixed ROCm kernel profiling (was using CPU chrono instead of HIP events)
 - Added prefill/decode phase breakdown to profiling output
+
+---
+
+## Appendix A: ROCm GEMV Kernel Profiling
+
+### Test Binary & Filters
+
+```bash
+# Test binary (Release build)
+build_v2_release/tests/v2/v2_perf_rocm_gemv_kernel
+
+# Available test filters
+--gtest_filter=ROCmGemvPerfTest.Correctness_Qwen05B   # 0.5B shapes (N≤4864)
+--gtest_filter=ROCmGemvPerfTest.Correctness_Qwen7B    # 7B shapes (N≤152064)
+--gtest_filter=ROCmGemvPerfTest.Benchmark_Qwen7B_DecodeLayer  # Timed benchmark
+```
+
+### rocprofv3 Kernel Trace (timing + grid/register info)
+
+```bash
+# Kernel trace — writes SQLite DB to <hostname>/<pid>_results.db
+rocprofv3 --kernel-trace -- ./build_v2_release/tests/v2/v2_perf_rocm_gemv_kernel \
+  --gtest_filter=ROCmGemvPerfTest.Correctness_Qwen7B
+
+# Query results (python3):
+python3 -c "
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+cur = db.cursor()
+tables = [t[0] for t in cur.execute(\"SELECT name FROM sqlite_master WHERE type='table'\").fetchall()]
+kd = [t for t in tables if 'kernel_dispatch' in t][0]
+ks = [t for t in tables if 'kernel_symbol' in t][0]
+rows = cur.execute(f'''
+    SELECT ks.kernel_name, (kd.end-kd.start)/1000.0 as dur_us,
+           kd.workgroup_size_x, kd.grid_size_x, kd.grid_size_y,
+           ks.sgpr_count, ks.arch_vgpr_count
+    FROM {kd} kd JOIN {ks} ks ON kd.kernel_id = ks.id ORDER BY kd.start
+''').fetchall()
+for r in rows:
+    print(f'{r[1]:8.1f}us  grid={r[3]}x{r[4]}  block={r[2]}  SGPR={r[5]}  VGPR={r[6]}  {r[0][:60]}')
+" <hostname>/<pid>_results.db
+```
+
+### rocprof v1 PMC Counter Collection
+
+rocprofv3 PMC collection hangs on gfx906; use rocprof v1 (`/opt/rocm/bin/rocprof`).
+gfx906 has limited single-pass counter capacity — collect in separate passes.
+
+```bash
+# Pass 1: Instruction mix (SQ counters)
+cat > /tmp/rocprof_p1.txt << 'EOF'
+pmc: SQ_WAVES SQ_INSTS_VALU SQ_INSTS_VMEM_RD SQ_INSTS_VMEM_WR SQ_INSTS_LDS
+EOF
+/opt/rocm/bin/rocprof --timestamp on -i /tmp/rocprof_p1.txt -o /tmp/results_p1.csv \
+  ./build_v2_release/tests/v2/v2_perf_rocm_gemv_kernel \
+  --gtest_filter=ROCmGemvPerfTest.Correctness_Qwen7B
+
+# Pass 2: L2 cache hit/miss
+cat > /tmp/rocprof_p2.txt << 'EOF'
+pmc: TCC_HIT_sum TCC_MISS_sum
+EOF
+/opt/rocm/bin/rocprof --timestamp on -i /tmp/rocprof_p2.txt -o /tmp/results_p2.csv \
+  ./build_v2_release/tests/v2/v2_perf_rocm_gemv_kernel \
+  --gtest_filter=ROCmGemvPerfTest.Correctness_Qwen7B
+
+# Pass 3: SALU/SMEM/FLAT instruction counts
+cat > /tmp/rocprof_p3.txt << 'EOF'
+pmc: SQ_INSTS_SALU SQ_INSTS_SMEM SQ_INSTS_FLAT
+EOF
+/opt/rocm/bin/rocprof --timestamp on -i /tmp/rocprof_p3.txt -o /tmp/results_p3.csv \
+  ./build_v2_release/tests/v2/v2_perf_rocm_gemv_kernel \
+  --gtest_filter=ROCmGemvPerfTest.Correctness_Qwen7B
+```
+
+**Counters NOT supported on gfx906**: `SQ_WAIT_ANY`, `SQ_WAIT_INST_LDS`, `TCP_TOTAL_CACHE_ACCESSES_sum`.
+**Derived metrics** (`FETCH_SIZE`, `WRITE_SIZE`) exceed HW limits — use `TCC_HIT_sum`/`TCC_MISS_sum` instead.
+
+### Analysis Script
+
+```bash
+python3 << 'PYEOF'
+import csv
+
+def load_csv(path):
+    with open(path) as f:
+        return list(csv.DictReader(f))
+
+def safe_int(v): return int(float(v))
+
+p1 = load_csv("/tmp/results_p1.csv")
+p2 = load_csv("/tmp/results_p2.csv")
+
+for i, r in enumerate(p1):
+    name = r['KernelName'].strip('"').replace('.kd','').split('(')[0]
+    if 'copyBuffer' in name or 'fillBuffer' in name: continue
+    dur_us = (int(r['EndNs']) - int(r['BeginNs'])) / 1000.0
+    waves = safe_int(r['SQ_WAVES'])
+    valu = safe_int(r['SQ_INSTS_VALU'])
+    vmem_rd = safe_int(r['SQ_INSTS_VMEM_RD'])
+    tcc_hit = safe_int(p2[i]['TCC_HIT_sum']) if i < len(p2) else 0
+    tcc_miss = safe_int(p2[i]['TCC_MISS_sum']) if i < len(p2) else 0
+    l2_total = tcc_hit + tcc_miss
+    l2_pct = 100.0 * tcc_hit / l2_total if l2_total else 0
+    miss_bytes = tcc_miss * 64  # 64B cache line on gfx906
+    bw_gbps = miss_bytes / (dur_us * 1e-6) / 1e9 if dur_us > 0 else 0
+    print(f"{dur_us:8.1f}us  waves={waves:5}  VALU/w={valu/waves if waves else 0:6.0f}"
+          f"  VMEM_R/w={vmem_rd/waves if waves else 0:5.0f}  L2Hit={l2_pct:5.1f}%"
+          f"  HBM_BW={bw_gbps:6.0f} GB/s  {name[:50]}")
+PYEOF
+```
+
+### Profiling Results (2026-02-09, Qwen 7B shapes)
+
+| Kernel | Shape (NxK) | Duration | Waves | L2 Hit% | HBM BW (GB/s) | % Peak (1024) |
+|--------|-------------|----------|-------|---------|----------------|---------------|
+| `grid_kpar_gemv` | Q/Wo proj (3584×3584) | 26 us | 1568 | 11% | **488** | 48% |
+| `grid_kpar_gemv` | K/V proj (512×3584) | 12 us | 224 | 12% | 148 | 15% |
+| `grid_kpar_gemv` | FFN Down (3584×18944) | 105 us | 896 | 1.7% | **649** | 63% |
+| `wide2_gemv` | FFN Gate/Up (18944×3584) | 385 us | 148 | 0.3% | **176** | **17%** |
+| `wide_vec4_gemv` | LM Head (152064×3584) | 797 us | 594 | 0.4% | **686** | 67% |
+
+**Key findings**:
+- `wide2_gemv` (FFN Gate/Up) is severely underperforming at 17% of peak BW — biggest optimization target
+- All GEMV kernels use 0 LDS and only 12-20 VGPRs — occupancy is NOT register-limited
+- L2 hit rates are very low (<12%), confirming pure HBM streaming workload
+- Register usage: grid_kpar=12 VGPR, wide2=12 VGPR, wide_vec4=20 VGPR (out of 256)
