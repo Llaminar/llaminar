@@ -1,8 +1,9 @@
 # Kernel Tuning & Optimisation Project
 
 **Started**: 2026-02-09  
-**Model**: Qwen2.5-7B-Instruct IQ4_NL (28 layers, 3584 hidden dim, 28 heads)  
+**Models**: Qwen2.5-7B-Instruct IQ4_NL / Q8_0 (28 layers, 3584 hidden dim, 28 heads)  
 **Benchmark**: 596 prefill tokens + 128 decode tokens, 3 iterations averaged after warmup  
+**Hardware**: AMD Instinct MI60 (gfx906, 32 GB HBM2, 60 CUs, 914 GB/s measured peak) / NVIDIA RTX 3090 (SM 8.6, 24 GB)  
 
 ---
 
@@ -73,12 +74,14 @@
 - [x] **exp2f hardware intrinsic** — 57.6 → 56.2 µs/call (2.4% kernel improvement, negligible end-to-end)
 - [x] **GQA-aware blocks** — ATTEMPTED & REVERTED: 5.1× regression due to CU starvation (32 vs 224 blocks on 60 CUs)
 
-### Phase 2: ROCm GEMM Decode (IN PROGRESS — 89% of decode time)
+### Phase 2: ROCm GEMM Decode (IN PROGRESS — 79% of decode time)
 - [x] **Fused FP32×INT8 GEMV** — ATTEMPTED & REVERTED: 9.8% regression due to gfx906 float atomicAdd CAS loop + no v_dot4 in FP32 path
 - [x] **v_dot4_i32_i8 intrinsic** — 303 → 286 µs/call avg (-5.6%), decode 30.31 → 32.10 tok/s (+5.9%)
 - [x] **GEMV tile/occupancy tuning** — CPT=4→2 (full wavefront), KB formula tuned per shape; +0.4% decode (32.30→32.43 tok/s)
 - [x] **Kill wide2_gemv + adaptive KB** — Route FFN Gate/Up through grid_kpar (was 17% peak BW, now 48-63%); adaptive KB for large-N vs small-N shapes; **+74.8% decode (32.43→56.69 tok/s)**
+- [x] **Production profiling baseline** — Measured actual MI60 HBM BW (914 GB/s vs 1024 theoretical); production GEMV efficiency 35-88% of actual peak; quantize+scale overhead = 25% of GEMM pipeline
 - [ ] **Multi-projection GEMV** — batch Q+K+V in one kernel launch to reduce launch overhead
+- [ ] **Quantize/Scale fusion** — eliminate separate quantize + scale kernels (25% of GEMM pipeline overhead)
 - [ ] **GEMM prefill repack overhead** — VNNI→row-major repack runs PER CK GEMM call (~65-200µs each)
 - [x] **Assembly sweep (rsqrtf, rintf)** — RMS Norm rsqrtf + Quantize rintf, +0.6% decode (32.10→32.30 tok/s)
 - [ ] Ops kernels (RoPE, SwiGLU) — low priority, <2% of time
@@ -135,6 +138,85 @@ Ratio: 1.74× matches average ~1.7 sub-projections per fused call (QKV=3, GateUp
 ---
 
 ## Tuning Log
+
+### Entry 11: Production Profiling Baseline — Measured MI60 HBM Bandwidth & GEMV Efficiency (2026-02-10)
+
+**Target**: Establish accurate production performance baseline with measured (not theoretical) peak bandwidth
+
+**Problem**: Previous profiling used isolated kernel benchmarks and 1024 GB/s theoretical peak for %Peak calculations. This creates two accuracy issues:
+1. Isolated kernel tests don't reflect production call patterns (cache state, kernel launch ordering, concurrent operations)
+2. Theoretical peak overestimates achievable bandwidth, making efficiency numbers look artificially low
+
+**Model**: Qwen2.5-7B-Instruct Q8_0 (same architecture as IQ4_NL; GEMV is equally bandwidth-bound for both quants at M=1)
+
+**Approach**:
+1. Custom HIP microbenchmark measuring actual achievable HBM bandwidth at GEMV-relevant buffer sizes
+2. `rocprofv3 --kernel-trace` on the production `llaminar2` binary doing real 10-token decode inference
+3. Per-shape bandwidth utilization computed against measured actual peak
+
+**MI60 Measured HBM Bandwidth** (not theoretical 1024 GB/s):
+
+| Test Pattern | 12 MB | 64 MB | 256 MB | 1 GB |
+|---|---|---|---|---|
+| Stream READ (float4) | 671 | 866 | 806 | 740 |
+| GEMV-pattern READ (int2) | 795 | **914** | 853 | 806 |
+| Stream WRITE (float4) | 615 | 674 | 666 | 618 |
+| hipMemcpy D2D | 391 | 418 | 382 | 373 |
+
+**Actual achievable peak: ~914 GB/s** at GEMV-relevant sizes (64 MB, int2 read pattern). This is 89% of the 1024 GB/s theoretical spec. The int2 pattern matches our GEMV inner loop which loads `int2` (8 bytes = 8 INT8 weights) per thread per iteration.
+
+**Production Decode GEMV Breakdown** (rocprofv3 kernel trace, 10 decode tokens):
+
+| Projection | Calls/layer | Avg (µs) | Weight (MB) | BW (GB/s) | %Peak (914) |
+|---|---|---|---|---|---|
+| **FFN Gate/Up** (18944×3584) | 2 | 105.1 | 64.8 | 646 | **71%** |
+| **FFN Down** (3584×18944) | 1 | 94.0 | 64.8 | 722 | **79%** |
+| **Q/Wo proj** (3584×3584) | 2 | 20.4 | 12.2 | 629 | **69%** |
+| **LM Head** (152064×3584) | 1/28 | 680.4 | 519.8 | 801 | **88%** |
+| **K/V proj** (512×3584) | 2 | 5.7 | 1.8 | 321 | **35%** |
+
+**GEMM Pipeline Per-Token Budget** (decode):
+
+| Component | Time (µs) | % of pipeline |
+|---|---|---|
+| GEMV kernels | 10,664 | 75% |
+| Quantize Q8 | 2,350 | 16% |
+| Scale output | 1,280 | 9% |
+| **Pipeline total** | **14,291** | = 70 tok/s at 100% efficiency |
+
+**Production Decode Kernel Summary** (all kernels, LLAMINAR_PROFILING=1):
+
+| Kernel | Decode (ms) | Decode % | Avg (µs) |
+|---|---|---|---|
+| GEMM_CK | 5,300 | 79% | 174.2 |
+| FLASH_ATTN_DECODE | 597 | 9% | 55.5 |
+| RMS_NORM | 412 | 6% | 19.2 |
+| RESIDUAL_ADD | 161 | 2% | 7.8 |
+| ROPE | 124 | 2% | 11.9 |
+| SWIGLU | 87 | 1% | 9.5 |
+
+**End-to-end results** (unprofiled):
+
+| Metric | ROCm MI60 (Q8_0) | ROCm MI60 (IQ4_NL, Entry 10) | CUDA RTX 3090 (Q8_0) |
+|---|---|---|---|
+| **Decode** | **56.36 tok/s** | 56.69 tok/s | 29.28 tok/s |
+| **Prefill** | 173.0 tok/s | 173.0 tok/s | 1,535 tok/s |
+
+**Key findings**:
+1. **LM Head is most efficient** at 88% of actual peak — near ceiling, not worth optimizing
+2. **FFN Gate/Up at 71%** and **Q/Wo at 69%** have ~20-30% headroom vs actual peak
+3. **K/V at 35%** is poor but tiny (3.2 ms total) — not worth optimizing
+4. **Quantize + Scale overhead is 25%** of the GEMM pipeline — significant non-GEMV target
+5. **Theoretical ceiling at 100% BW efficiency: ~70 tok/s** (vs current 56 tok/s = 80% of ceiling)
+6. Profiling overhead is significant on ROCm: 38.2 tok/s profiled vs 56.4 tok/s raw (32% overhead from hipDeviceSynchronize per kernel timing)
+7. Q8_0 decodes at same speed as IQ4_NL — both are equally bandwidth-bound at M=1
+
+**Next optimization targets** (by expected impact):
+1. **Fuse quantize+GEMV+scale** — eliminate 25% pipeline overhead (14,291 → ~10,664 µs/tok = 94 tok/s ceiling)
+2. **FFN Gate/Up BW improvement** — 71% → 85% peak would save ~2.7 ms/tok
+3. **Q/Wo BW improvement** — 69% → 85% peak would save ~0.9 ms/tok
+
+---
 
 ### Entry 10: Kill wide2_gemv + Adaptive KB — GEMV Dispatch Overhaul (2026-02-10)
 
@@ -587,18 +669,31 @@ for i, r in enumerate(p1):
 PYEOF
 ```
 
-### Profiling Results (2026-02-09, Qwen 7B shapes)
+### Profiling Results (2026-02-09, Qwen 7B shapes, BEFORE Entry 10 GEMV overhaul)
 
-| Kernel | Shape (NxK) | Duration | Waves | L2 Hit% | HBM BW (GB/s) | % Peak (1024) |
-|--------|-------------|----------|-------|---------|----------------|---------------|
-| `grid_kpar_gemv` | Q/Wo proj (3584×3584) | 26 us | 1568 | 11% | **488** | 48% |
-| `grid_kpar_gemv` | K/V proj (512×3584) | 12 us | 224 | 12% | 148 | 15% |
-| `grid_kpar_gemv` | FFN Down (3584×18944) | 105 us | 896 | 1.7% | **649** | 63% |
-| `wide2_gemv` | FFN Gate/Up (18944×3584) | 385 us | 148 | 0.3% | **176** | **17%** |
-| `wide_vec4_gemv` | LM Head (152064×3584) | 797 us | 594 | 0.4% | **686** | 67% |
+**Note**: % Peak below uses 1024 GB/s theoretical. See Entry 11 for measured actual peak (914 GB/s).
+
+| Kernel | Shape (NxK) | Duration | Waves | L2 Hit% | HBM BW (GB/s) | % Peak (1024) | % Actual (914) |
+|--------|-------------|----------|-------|---------|----------------|---------------|----------------|
+| `grid_kpar_gemv` | Q/Wo proj (3584×3584) | 26 us | 1568 | 11% | **488** | 48% | 53% |
+| `grid_kpar_gemv` | K/V proj (512×3584) | 12 us | 224 | 12% | 148 | 15% | 16% |
+| `grid_kpar_gemv` | FFN Down (3584×18944) | 105 us | 896 | 1.7% | **649** | 63% | 71% |
+| `wide2_gemv` | FFN Gate/Up (18944×3584) | 385 us | 148 | 0.3% | **176** | **17%** | **19%** |
+| `wide_vec4_gemv` | LM Head (152064×3584) | 797 us | 594 | 0.4% | **686** | 67% | 75% |
+
+### Profiling Results (2026-02-10, Qwen 7B shapes, AFTER Entry 10, production binary)
+
+| Kernel | Shape (NxK) | Duration | BW (GB/s) | % Actual Peak (914) |
+|--------|-------------|----------|-----------|---------------------|
+| `grid_kpar_gemv` | FFN Gate/Up (18944×3584) | 105 us | 646 | **71%** |
+| `grid_kpar_gemv` | FFN Down (3584×18944) | 94 us | 722 | **79%** |
+| `grid_kpar_gemv` | Q/Wo proj (3584×3584) | 20 us | 629 | **69%** |
+| `wide_vec4_gemv` | LM Head (152064×3584) | 680 us | 801 | **88%** |
+| `grid_kpar_gemv` | K/V proj (512×3584) | 5.7 us | 321 | **35%** |
 
 **Key findings**:
-- `wide2_gemv` (FFN Gate/Up) is severely underperforming at 17% of peak BW — biggest optimization target
+- `wide2_gemv` eliminated (Entry 10) — FFN Gate/Up now routes through `grid_kpar` at 71% actual peak (was 19%)
 - All GEMV kernels use 0 LDS and only 12-20 VGPRs — occupancy is NOT register-limited
 - L2 hit rates are very low (<12%), confirming pure HBM streaming workload
-- Register usage: grid_kpar=12 VGPR, wide2=12 VGPR, wide_vec4=20 VGPR (out of 256)
+- Register usage: grid_kpar=12 VGPR, wide_vec4=20 VGPR (out of 256)
+- MI60 achieves ~89% of theoretical HBM bandwidth (914 / 1024 GB/s) — use 914 GB/s for %Peak calculations
