@@ -12,6 +12,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
+#include <cstring>
 
 namespace llaminar2
 {
@@ -127,7 +128,27 @@ namespace llaminar2
         // The kernel computes positions on-the-fly on GPU: pos = pos_offset + seq_idx.
         // This avoids a synchronous hipMemcpy that forces a full GPU pipeline drain.
         const int *position_ids_ptr = params_.position_ids;
-        // NOTE: When position_ids_ptr is nullptr, the kernel MUST use pos_offset
+        if (gpuStream() != nullptr)
+        {
+            // Graph-capture path: ensure a stable position_ids pointer so the
+            // kernel can copy to device and avoid scalar pos_offset args.
+            if (seq_len > 0)
+            {
+                position_ids_cache_.resize(static_cast<size_t>(seq_len));
+                if (position_ids_ptr)
+                {
+                    std::memcpy(position_ids_cache_.data(), position_ids_ptr,
+                                static_cast<size_t>(seq_len) * sizeof(int));
+                }
+                else
+                {
+                    for (int i = 0; i < seq_len; ++i)
+                        position_ids_cache_[static_cast<size_t>(i)] = params_.pos_offset + i;
+                }
+                position_ids_ptr = position_ids_cache_.data();
+            }
+        }
+        // NOTE: When position_ids_ptr is nullptr, the kernel uses pos_offset
         // to compute contiguous positions. Do NOT generate a host array here.
 
         const int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;

@@ -26,6 +26,8 @@
 #include <cfloat>
 #include <cstdio>
 
+#include "../../attention/AttentionDeviceParams.h"
+
 // WMMA namespace for Tensor Core operations
 using namespace nvcuda;
 
@@ -272,9 +274,23 @@ namespace
         bool causal,
         int window_size,
         int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
+        const float *__restrict__ mask,
         int tile_q,
         int tile_kv)
     {
+        int kv_stride = kv_len;
+        int kv_len_runtime = kv_len;
+        int position_offset_runtime = position_offset;
+        int mask_stride = kv_len;
+
+        if (device_params)
+        {
+            kv_len_runtime = device_params->kv_len;
+            position_offset_runtime = device_params->position_offset;
+            mask_stride = device_params->mask_stride;
+        }
+
         // Block/thread indexing
         const int batch_idx = blockIdx.z;
         const int head_idx = blockIdx.x;
@@ -342,8 +358,8 @@ namespace
 
         // Pointers for this batch/head
         const float *Q_batch = Q + batch_idx * seq_len * n_heads * head_dim;
-        const float *K_batch = K + batch_idx * kv_len * n_kv_heads * head_dim;
-        const float *V_batch = V + batch_idx * kv_len * n_kv_heads * head_dim;
+        const float *K_batch = K + batch_idx * kv_stride * n_kv_heads * head_dim;
+        const float *V_batch = V + batch_idx * kv_stride * n_kv_heads * head_dim;
 
         // ALL warps: Load Q tile (done once)
         for (int i = threadIdx.x; i < q_tile_rows * head_dim; i += blockDim.x)
@@ -355,7 +371,7 @@ namespace
             Q_tile_fp16[local_row * smem_stride + d] = __float2half(val);
         }
 
-        const int num_kv_tiles = (kv_len + tile_kv - 1) / tile_kv;
+        const int num_kv_tiles = (kv_len_runtime + tile_kv - 1) / tile_kv;
 
         // =====================================================================
         // Pipeline prologue: Start loading first tile(s) asynchronously
@@ -363,7 +379,7 @@ namespace
         if (is_producer)
         {
             const int kv_start_0 = 0;
-            const int kv_end_0 = min(tile_kv, kv_len);
+            const int kv_end_0 = min(tile_kv, kv_len_runtime);
             const int actual_len_0 = kv_end_0 - kv_start_0;
 
             half *K_dst_0 = get_K_tile(0);
@@ -401,7 +417,7 @@ namespace
             const int next_stage = (kv_tile_iter + 1) % FA2_NUM_STAGES;
 
             const int kv_start = kv_tile_iter * tile_kv;
-            const int kv_end_tile = min(kv_start + tile_kv, kv_len);
+            const int kv_end_tile = min(kv_start + tile_kv, kv_len_runtime);
             const int actual_tile_kv_len = kv_end_tile - kv_start;
 
             // Early exit for causal
@@ -420,7 +436,7 @@ namespace
             if (is_producer && kv_tile_iter + 1 < num_kv_tiles)
             {
                 const int next_kv_start = (kv_tile_iter + 1) * tile_kv;
-                const int next_kv_end = min(next_kv_start + tile_kv, kv_len);
+                const int next_kv_end = min(next_kv_start + tile_kv, kv_len_runtime);
                 const int next_actual_len = next_kv_end - next_kv_start;
 
                 half *K_dst = get_K_tile(next_stage);
@@ -492,13 +508,26 @@ namespace
                     const int kv_pos = kv_start + j;
                     bool masked = false;
 
-                    if (causal && kv_pos > my_consumer_q_row + position_offset)
+                    if (causal && kv_pos > my_consumer_q_row + position_offset_runtime)
                         masked = true;
                     if (window_size > 0)
                     {
-                        int q_pos = my_consumer_q_row + position_offset;
+                        int q_pos = my_consumer_q_row + position_offset_runtime;
                         if (kv_pos < q_pos - window_size || kv_pos > q_pos + window_size)
                             masked = true;
+                    }
+
+                    if (mask)
+                    {
+                        float mask_val = mask[(batch_idx * seq_len + my_consumer_q_row) * mask_stride + kv_pos];
+                        if (mask_val <= -1.0e20f)
+                        {
+                            masked = true;
+                        }
+                        else
+                        {
+                            my_scores[j] += mask_val;
+                        }
                     }
 
                     if (masked)
@@ -565,10 +594,14 @@ namespace
     // Explicit template instantiations for supported configurations
     template __global__ void flash_attention_2_pipelined_kernel<6>(
         const float *, const float *, const float *, float *,
-        int, int, int, int, int, int, float, bool, int, int, int, int);
+        int, int, int, int, int, int, float, bool, int, int,
+        const llaminar2::attention::AttentionDeviceParams *, const float *,
+        int, int);
     template __global__ void flash_attention_2_pipelined_kernel<4>(
         const float *, const float *, const float *, float *,
-        int, int, int, int, int, int, float, bool, int, int, int, int);
+        int, int, int, int, int, int, float, bool, int, int,
+        const llaminar2::attention::AttentionDeviceParams *, const float *,
+        int, int);
 
     // =========================================================================
     // Flash Decoding - Split-K Kernel (FP32)
@@ -628,21 +661,29 @@ namespace
         int n_kv_heads,
         int head_dim,
         int num_splits,
-        float softmax_scale)
+        float softmax_scale,
+        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params)
     {
+        int kv_stride = kv_len;
+        int kv_len_runtime = kv_len;
+        if (device_params)
+        {
+            kv_len_runtime = device_params->kv_len;
+        }
+
         const int head_idx = blockIdx.x;
         const int split_idx = blockIdx.y;
         const int batch_idx = blockIdx.z;
 
         const int kv_head_idx = (n_heads == n_kv_heads) ? head_idx : (head_idx / (n_heads / n_kv_heads));
 
-        const int split_size = (kv_len + num_splits - 1) / num_splits;
+        const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
         const int kv_start = split_idx * split_size;
-        const int kv_end = min(kv_start + split_size, kv_len);
+        const int kv_end = min(kv_start + split_size, kv_len_runtime);
 
         const int partial_idx = (batch_idx * n_heads + head_idx) * num_splits + split_idx;
 
-        if (kv_start >= kv_len)
+        if (kv_start >= kv_len_runtime)
         {
             if (threadIdx.x == 0)
             {
@@ -674,8 +715,8 @@ namespace
         float m_local = -FLT_MAX;
         float l_local = 0.0f;
 
-        const float *K_batch = K_cache + batch_idx * kv_len * n_kv_heads * head_dim;
-        const float *V_batch = V_cache + batch_idx * kv_len * n_kv_heads * head_dim;
+        const float *K_batch = K_cache + batch_idx * kv_stride * n_kv_heads * head_dim;
+        const float *V_batch = V_cache + batch_idx * kv_stride * n_kv_heads * head_dim;
 
         for (int kv_pos = kv_start + tid; kv_pos < kv_end; kv_pos += num_threads)
         {
@@ -849,6 +890,8 @@ extern "C"
         int batch_size, int seq_len, int kv_len,
         int n_heads, int n_kv_heads, int head_dim,
         bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
         void *stream)
     {
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -905,6 +948,7 @@ extern "C"
                 batch_size, seq_len, kv_len,
                 n_heads, n_kv_heads, head_dim,
                 softmax_scale, causal, window_size, position_offset,
+                device_params, mask,
                 cfg.tile_q, cfg.tile_kv);
         }
         else
@@ -919,6 +963,7 @@ extern "C"
                 batch_size, seq_len, kv_len,
                 n_heads, n_kv_heads, head_dim,
                 softmax_scale, causal, window_size, position_offset,
+                device_params, mask,
                 cfg.tile_q, cfg.tile_kv);
         }
 
@@ -949,6 +994,7 @@ extern "C"
         int batch_size, int kv_len,
         int n_heads, int n_kv_heads, int head_dim,
         int num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
         void *stream)
     {
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -966,7 +1012,7 @@ extern "C"
                 Q, K_cache, V_cache,
                 O_partial, m_partial, l_partial,
                 kv_len, n_heads, n_kv_heads, head_dim,
-                num_splits, softmax_scale);
+                num_splits, softmax_scale, device_params);
         }
 
         // Phase 2: Reduce partials to final output

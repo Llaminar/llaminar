@@ -67,6 +67,10 @@ namespace llaminar2
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::COPY; }
+        // KV cache append cannot be graph-captured because the write position
+        // (head) changes every decode step — capturing would freeze the position.
+        // Instead, the GraphExecutor runs this as a manual segment on the same
+        // capture_stream, avoiding cross-stream sync overhead.
         bool isGraphCapturable() const override { return false; }
         bool supportsBackend(ComputeBackendType backend) const override { return true; }
         StageBufferRequirements getBufferRequirements() const override;

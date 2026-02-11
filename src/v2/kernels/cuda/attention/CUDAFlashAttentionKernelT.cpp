@@ -14,6 +14,7 @@
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/CUDAKernelProfiler.h"
+#include "../../attention/AttentionDeviceParams.h"
 #include <cstring>
 #include <stdexcept>
 
@@ -27,6 +28,8 @@ extern "C"
         int batch_size, int seq_len, int kv_len,
         int n_heads, int n_kv_heads, int head_dim,
         bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
         void *stream);
 
     // Flash Decoding for single-token decode with split-K parallelism
@@ -36,6 +39,7 @@ extern "C"
         int batch_size, int kv_len,
         int n_heads, int n_kv_heads, int head_dim,
         int num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
         void *stream);
 
     int cudaFlashAttn_allocWorkspace(
@@ -92,7 +96,7 @@ namespace llaminar2
             stream_ = ctx->defaultStream();
 
             LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Created for device " << device_idx_
-                                                                               << " using device context");
+                                                                              << " using device context");
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::~CUDAFlashAttentionKernelT()
@@ -206,15 +210,20 @@ namespace llaminar2
             (void)workspace_scores;
             (void)workspace_buffer;
             (void)workspace_context;
-            (void)workspace_mask;
             (void)use_bf16;
             (void)mpi_ctx;
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
+
+            const float *mask_ptr = nullptr;
+            if (workspace_mask)
+            {
+                mask_ptr = static_cast<const float *>(workspace_mask->gpu_data_ptr());
+            }
             return apply_typed(Q, K, V, output,
                                1, seq_len, seq_len, // batch=1, kv_len=seq_len
                                n_heads, n_kv_heads, head_dim,
-                               causal, window_size, 0, dev);
+                               causal, window_size, 0, dev, nullptr, mask_ptr);
         }
 
         bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::compute_batch(
@@ -232,15 +241,19 @@ namespace llaminar2
             (void)workspace_scores;
             (void)workspace_buffer;
             (void)workspace_context;
-            (void)workspace_mask;
             (void)use_bf16;
             (void)mpi_ctx;
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            const float *mask_ptr = nullptr;
+            if (workspace_mask)
+            {
+                mask_ptr = static_cast<const float *>(workspace_mask->gpu_data_ptr());
+            }
             return apply_typed(Q, K, V, output,
                                batch_size, seq_len, seq_len,
                                n_heads, n_kv_heads, head_dim,
-                               causal, window_size, 0, dev);
+                               causal, window_size, 0, dev, nullptr, mask_ptr);
         }
 
         bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::compute_decode(
@@ -251,7 +264,7 @@ namespace llaminar2
             return apply_typed(Q, K, V, output,
                                1, seq_len, kv_len,
                                n_heads, n_kv_heads, head_dim,
-                               causal, -1, position_offset, device_idx_);
+                               causal, -1, position_offset, device_idx_, nullptr, nullptr);
         }
 
         bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::apply_typed(
@@ -259,7 +272,9 @@ namespace llaminar2
             int batch_size, int seq_len, int kv_len,
             int n_heads, int n_kv_heads, int head_dim,
             bool causal, int window_size, int position_offset,
-            int device_idx)
+            int device_idx,
+            const attention::AttentionDeviceParams *device_params,
+            const float *mask)
         {
             if (!Q || !K || !V || !output)
             {
@@ -324,7 +339,7 @@ namespace llaminar2
                         static_cast<float *>(partial_l_buf_),
                         batch_size, kv_len,
                         n_heads, n_kv_heads, head_dim,
-                        num_splits, stream_);
+                        num_splits, device_params, stream_);
                 }
             }
             else
@@ -341,6 +356,7 @@ namespace llaminar2
                         batch_size, seq_len, kv_len,
                         n_heads, n_kv_heads, head_dim,
                         causal, window_size, position_offset,
+                        device_params, mask,
                         stream_);
                 }
             }
@@ -379,7 +395,6 @@ namespace llaminar2
             int local_n_kv_heads)
         {
             (void)workspace_scores;
-            (void)workspace_mask;
             (void)mpi_ctx;
             (void)head_start;
             (void)local_n_heads;
@@ -412,6 +427,14 @@ namespace llaminar2
                 return false;
             }
 
+            // NOTE: device_params intentionally nullptr — see ROCmFlashAttentionKernelT.cpp
+            // comment about why stream_ != nullptr is not a valid proxy for graph capture.
+            const float *mask_ptr = nullptr;
+            if (workspace_mask)
+            {
+                mask_ptr = static_cast<const float *>(workspace_mask->gpu_data_ptr());
+            }
+
             LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] batch=" << batch_size
                                                                                  << " seq_len=" << seq_len << " kv_len=" << kv_len
                                                                                  << " n_heads=" << n_heads << " n_kv_heads=" << n_kv_heads
@@ -426,7 +449,8 @@ namespace llaminar2
                 return apply_typed(Q_ptr, K_ptr, V_ptr, output_ptr,
                                    batch_size, seq_len, kv_len,
                                    n_heads, n_kv_heads, head_dim,
-                                   causal, window_size, 0, dev);
+                                   causal, window_size, 0, dev,
+                                   nullptr, mask_ptr);
             }
             else
             {
@@ -434,7 +458,8 @@ namespace llaminar2
                 return apply_typed(Q_ptr, K_ptr, V_ptr, output_ptr,
                                    batch_size, seq_len, seq_len,
                                    n_heads, n_kv_heads, head_dim,
-                                   causal, window_size, 0, dev);
+                                   causal, window_size, 0, dev,
+                                   nullptr, mask_ptr);
             }
         }
 
@@ -466,6 +491,10 @@ namespace llaminar2
             reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_OUTPUT, partial_output_bytes, 256, true});
             reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_M, partial_m_bytes, 256, true});
             reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_L, partial_l_bytes, 256, true});
+            reqs.buffers.push_back({AttentionWorkspaceBuffers::DEVICE_PARAMS,
+                                    sizeof(attention::AttentionDeviceParams),
+                                    256,
+                                    true});
 
             LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>::getWorkspaceRequirements] "
                       << "batch=" << batch_size << " n_heads=" << n_heads << " head_dim=" << head_dim
@@ -536,7 +565,7 @@ namespace llaminar2
             stream_ = ctx->defaultStream();
 
             LOG_DEBUG("[CUDAFlashAttentionKernelT<FP16>] Created for device " << device_idx_
-                                                                               << " using device context");
+                                                                              << " using device context");
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::~CUDAFlashAttentionKernelT()
@@ -665,8 +694,12 @@ namespace llaminar2
             int batch_size, int seq_len, int kv_len,
             int n_heads, int n_kv_heads, int head_dim,
             bool causal, int window_size, int position_offset,
-            int device_idx)
+            int device_idx,
+            const attention::AttentionDeviceParams *device_params,
+            const float *mask)
         {
+            (void)device_params;
+            (void)mask;
             // TODO: Native FP16 path
             (void)Q;
             (void)K;
@@ -787,7 +820,7 @@ namespace llaminar2
             stream_ = ctx->defaultStream();
 
             LOG_DEBUG("[CUDAFlashAttentionKernelT<BF16>] Created for device " << device_idx_
-                                                                               << " using device context");
+                                                                              << " using device context");
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::~CUDAFlashAttentionKernelT()
@@ -914,9 +947,13 @@ namespace llaminar2
             int batch_size, int seq_len, int kv_len,
             int n_heads, int n_kv_heads, int head_dim,
             bool causal, int window_size, int position_offset,
-            int device_idx)
+            int device_idx,
+            const attention::AttentionDeviceParams *device_params,
+            const float *mask)
         {
             // TODO: Native BF16 path
+            (void)device_params;
+            (void)mask;
             (void)Q;
             (void)K;
             (void)V;

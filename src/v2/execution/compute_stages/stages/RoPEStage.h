@@ -92,6 +92,9 @@ namespace llaminar2
         // HybridQ16 RoPE outputs HEAD_MAJOR layout, but snapshot comparison expects SEQ_MAJOR
         mutable std::vector<float> q_transposed_cache_;
         mutable std::vector<float> k_transposed_cache_;
+
+        // Stable host-side position_ids for graph capture (copied to device each step).
+        mutable std::vector<int> position_ids_cache_;
     };
 
 } // namespace llaminar2

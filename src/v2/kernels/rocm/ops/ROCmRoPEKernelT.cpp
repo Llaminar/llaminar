@@ -475,8 +475,11 @@ namespace llaminar2
                 inv_freq_theta_ = rope_theta;
             }
 
+            const bool force_device_positions = (gpu_stream_ != nullptr && position_ids != nullptr);
+
             // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
-            if (seq_len == 1)
+            // unless graph capture is active (force device position_ids for stable args).
+            if (seq_len == 1 && !force_device_positions)
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 return hipOps_rope_fp32_decode(d_Q, d_K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
@@ -485,7 +488,7 @@ namespace llaminar2
             // CONTIGUOUS DETECTION: Check if positions are sequential (pos_offset, pos_offset+1, ...)
             // If so, use the zero-copy contiguous kernel which computes positions on-the-fly on GPU.
             {
-                bool is_contiguous = (position_ids == nullptr);
+                bool is_contiguous = (position_ids == nullptr) && !force_device_positions;
                 if (!is_contiguous && position_ids)
                 {
                     is_contiguous = true;
@@ -742,7 +745,9 @@ namespace llaminar2
             }
 
             // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
-            if (seq_len == 1)
+            const bool force_device_positions = (gpu_stream_ != nullptr && position_ids != nullptr);
+
+            if (seq_len == 1 && !force_device_positions)
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 return hipOps_rope_bf16_decode(d_Q, d_K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
@@ -750,7 +755,7 @@ namespace llaminar2
 
             // CONTIGUOUS DETECTION: Avoid synchronous hipMemcpy pipeline drain
             {
-                bool is_contiguous = (position_ids == nullptr);
+                bool is_contiguous = (position_ids == nullptr) && !force_device_positions;
                 if (!is_contiguous && position_ids)
                 {
                     is_contiguous = true;
@@ -1004,7 +1009,9 @@ namespace llaminar2
             }
 
             // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
-            if (seq_len == 1)
+            const bool force_device_positions = (gpu_stream_ != nullptr && position_ids != nullptr);
+
+            if (seq_len == 1 && !force_device_positions)
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 return hipOps_rope_fp16_decode(d_Q, d_K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
@@ -1012,7 +1019,7 @@ namespace llaminar2
 
             // CONTIGUOUS DETECTION: Avoid synchronous hipMemcpy pipeline drain
             {
-                bool is_contiguous = (position_ids == nullptr);
+                bool is_contiguous = (position_ids == nullptr) && !force_device_positions;
                 if (!is_contiguous && position_ids)
                 {
                     is_contiguous = true;

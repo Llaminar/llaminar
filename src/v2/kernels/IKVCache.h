@@ -206,6 +206,31 @@ namespace llaminar2
             return append(layer, 0, K, V, num_tokens);
         }
 
+        /**
+         * @brief Stream-aware append for GPU graph capture compatibility
+         *
+         * GPU KV cache implementations override this to dispatch the append
+         * kernel on the specified stream instead of the default stream (0).
+         * This is critical for GPU graph capture where all operations must
+         * execute on the same stream.
+         *
+         * CPU caches ignore the stream and forward to the regular append.
+         *
+         * @param layer Layer index
+         * @param seq_idx Sequence index
+         * @param K Key tensor to append
+         * @param V Value tensor to append
+         * @param num_tokens Number of tokens to append
+         * @param gpu_stream Opaque GPU stream pointer (hipStream_t or cudaStream_t)
+         * @return true on success
+         */
+        virtual bool appendWithStream(int layer, int seq_idx, const ITensor *K, const ITensor *V,
+                                      int num_tokens, void *gpu_stream)
+        {
+            (void)gpu_stream;
+            return append(layer, seq_idx, K, V, num_tokens);
+        }
+
         // =================================================================
         // Clear Operations
         // =================================================================

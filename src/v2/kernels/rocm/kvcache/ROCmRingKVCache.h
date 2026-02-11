@@ -148,8 +148,12 @@ namespace llaminar2
                     const ITensor *K, const ITensor *V,
                     int num_tokens) override;
 
+        bool appendWithStream(int layer, int seq_idx, const ITensor *K, const ITensor *V,
+                              int num_tokens, void *gpu_stream) override;
+
         // Bring in convenience overloads from IKVCache
         using IKVCache::append;
+        using IKVCache::appendWithStream;
         using IKVCache::clear_sequence;
         using IKVCache::get_kv;
 

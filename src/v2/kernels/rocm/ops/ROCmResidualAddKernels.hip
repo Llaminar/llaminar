@@ -185,7 +185,7 @@ bool rocmOps_residual_add_fp16(
 
     hipLaunchKernelGGL(
         rocm_residual_add_fp16_kernel,
-        dim3(num_blocks), dim3(threads_per_block), 0, 0,
+        dim3(num_blocks), dim3(threads_per_block), 0, static_cast<hipStream_t>(stream),
         input, residual, output, size);
 
     (void)hipGetLastError();  // Clear stale errors

@@ -28,6 +28,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <cstdint>
+#include "../../attention/AttentionDeviceParams.h"
 #include <cmath>
 #include <cfloat>
 #include <cstdio>
@@ -276,9 +277,23 @@ namespace
         bool causal,
         int window_size,
         int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
+        const float *__restrict__ mask,
         int tile_q,
         int tile_kv)
     {
+        int kv_stride = kv_len;
+        int kv_len_runtime = kv_len;
+        int position_offset_runtime = position_offset;
+        int mask_stride = kv_len;
+
+        if (device_params)
+        {
+            kv_len_runtime = device_params->kv_len;
+            position_offset_runtime = device_params->position_offset;
+            mask_stride = device_params->mask_stride;
+        }
+
         // Block/thread indexing
         const int batch_idx = blockIdx.z;
         const int head_idx = blockIdx.x;
@@ -346,8 +361,8 @@ namespace
 
         // Batch/head pointers
         const float *Q_batch = Q + batch_idx * seq_len * n_heads * head_dim;
-        const float *K_batch = K + batch_idx * kv_len * n_kv_heads * head_dim;
-        const float *V_batch = V + batch_idx * kv_len * n_kv_heads * head_dim;
+        const float *K_batch = K + batch_idx * kv_stride * n_kv_heads * head_dim;
+        const float *V_batch = V + batch_idx * kv_stride * n_kv_heads * head_dim;
 
         // =====================================================================
         // Load Q tile into LDS (done once per block)
@@ -362,14 +377,14 @@ namespace
         }
         __syncthreads();
 
-        const int num_kv_tiles = (kv_len + tile_kv - 1) / tile_kv;
+        const int num_kv_tiles = (kv_len_runtime + tile_kv - 1) / tile_kv;
 
         // =====================================================================
         // Prologue: Load first KV tile
         // =====================================================================
         {
             const int kv_start = 0;
-            const int kv_end = min(tile_kv, kv_len);
+            const int kv_end = min(tile_kv, kv_len_runtime);
             const int actual_len = kv_end - kv_start;
 
             __half *K_dst = get_K_tile(0);
@@ -399,11 +414,11 @@ namespace
             const int next_stage = (kv_tile_iter + 1) % FA2_NUM_STAGES;
 
             const int kv_start = kv_tile_iter * tile_kv;
-            const int kv_end = min(kv_start + tile_kv, kv_len);
+            const int kv_end = min(kv_start + tile_kv, kv_len_runtime);
             const int actual_kv_len = kv_end - kv_start;
 
             // Early exit for causal (all positions masked)
-            if (causal && kv_start > (q_block_start + tile_q - 1) + position_offset)
+            if (causal && kv_start > (q_block_start + tile_q - 1) + position_offset_runtime)
             {
                 continue;
             }
@@ -417,7 +432,7 @@ namespace
             if (kv_tile_iter + 1 < num_kv_tiles)
             {
                 const int next_kv_start = (kv_tile_iter + 1) * tile_kv;
-                const int next_kv_end = min(next_kv_start + tile_kv, kv_len);
+                const int next_kv_end = min(next_kv_start + tile_kv, kv_len_runtime);
                 const int next_len = next_kv_end - next_kv_start;
 
                 __half *K_next = get_K_tile(next_stage);
@@ -501,15 +516,28 @@ namespace
                     bool masked = false;
 
                     // Causal masking
-                    if (causal && kv_pos > global_q_row + position_offset)
+                    if (causal && kv_pos > global_q_row + position_offset_runtime)
                         masked = true;
 
                     // Sliding window
                     if (window_size > 0)
                     {
-                        int q_pos = global_q_row + position_offset;
+                        int q_pos = global_q_row + position_offset_runtime;
                         if (kv_pos < q_pos - window_size || kv_pos > q_pos + window_size)
                             masked = true;
+                    }
+
+                    if (mask)
+                    {
+                        float mask_val = mask[(batch_idx * seq_len + global_q_row) * mask_stride + kv_pos];
+                        if (mask_val <= -1.0e20f)
+                        {
+                            masked = true;
+                        }
+                        else
+                        {
+                            my_scores[j] += mask_val;
+                        }
                     }
 
                     if (masked)
@@ -637,8 +665,16 @@ namespace
         int n_kv_heads,
         int head_dim,
         int num_splits,
-        float softmax_scale)
+        float softmax_scale,
+        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params)
     {
+        int kv_len_runtime = kv_len;
+        int kv_batch_stride = kv_len;
+        if (device_params)
+        {
+            kv_len_runtime = device_params->kv_len;
+        }
+
         const int head_idx = blockIdx.x;
         const int split_idx = blockIdx.y;
         const int batch_idx = blockIdx.z;
@@ -647,9 +683,9 @@ namespace
         const int kv_head_idx = head_idx / gqa_ratio;
 
         // Split range
-        const int split_size = (kv_len + num_splits - 1) / num_splits;
+        const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
         const int kv_start = split_idx * split_size;
-        const int kv_end = min(kv_start + split_size, kv_len);
+        const int kv_end = min(kv_start + split_size, kv_len_runtime);
 
         const int partial_idx = (batch_idx * n_heads + head_idx) * num_splits + split_idx;
 
@@ -660,7 +696,7 @@ namespace
         const int num_wavefronts = num_threads / WAVEFRONT_SIZE;
 
         // Handle empty splits
-        if (kv_start >= kv_len)
+        if (kv_start >= kv_len_runtime)
         {
             if (tid == 0)
             {
@@ -698,8 +734,8 @@ namespace
         float m_local = -FLT_MAX;
         float l_local = 0.0f;
 
-        const float *K_batch = K_cache + batch_idx * kv_len * n_kv_heads * head_dim;
-        const float *V_batch = V_cache + batch_idx * kv_len * n_kv_heads * head_dim;
+        const float *K_batch = K_cache + batch_idx * kv_batch_stride * n_kv_heads * head_dim;
+        const float *V_batch = V_cache + batch_idx * kv_batch_stride * n_kv_heads * head_dim;
 
         const int kv_head_offset = kv_head_idx * head_dim;
         const int kv_stride = n_kv_heads * head_dim;
@@ -903,6 +939,8 @@ extern "C"
         int batch_size, int seq_len, int kv_len,
         int n_heads, int n_kv_heads, int head_dim,
         bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
         void *stream)
     {
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
@@ -974,6 +1012,7 @@ extern "C"
             batch_size, seq_len, kv_len,
             n_heads, n_kv_heads, head_dim,
             softmax_scale, causal, window_size, position_offset,
+            device_params, mask,
             tile_q, tile_kv);
 
         (void)hipGetLastError();  // Clear stale errors
@@ -998,6 +1037,7 @@ extern "C"
         int batch_size, int kv_len,
         int n_heads, int n_kv_heads, int head_dim,
         int num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
         void *stream)
     {
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
@@ -1021,7 +1061,7 @@ extern "C"
             Q, K_cache, V_cache,
             O_partial, m_partial, l_partial,
             kv_len, n_heads, n_kv_heads, head_dim,
-            num_splits, softmax_scale);
+            num_splits, softmax_scale, device_params);
 
         // Reduction kernel
         dim3 grid_reduce(n_heads, batch_size);

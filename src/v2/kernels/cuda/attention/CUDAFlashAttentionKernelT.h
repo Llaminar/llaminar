@@ -20,6 +20,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/MPIContext.h"
+#include "../../attention/AttentionDeviceParams.h"
 
 namespace llaminar2
 {
@@ -45,6 +46,8 @@ namespace llaminar2
             constexpr const char *PARTIAL_M = "attn_partial_m";
             /// Logsumexp per split [batch × n_heads × num_splits] FP32
             constexpr const char *PARTIAL_L = "attn_partial_l";
+            /// Device-resident dynamic params (kv_len, position_offset, mask_stride)
+            constexpr const char *DEVICE_PARAMS = "attn_device_params";
         }
         // Forward declaration of precision element type mapping
         namespace detail
@@ -211,7 +214,9 @@ namespace llaminar2
                 int batch_size, int seq_len, int kv_len,
                 int n_heads, int n_kv_heads, int head_dim,
                 bool causal, int window_size, int position_offset,
-                int device_idx);
+                int device_idx,
+                const attention::AttentionDeviceParams *device_params = nullptr,
+                const float *mask = nullptr);
 
         private:
             int device_idx_;
@@ -266,6 +271,8 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
+            void setGPUStream(void *stream) override { stream_ = stream; }
+
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,
                 int seq_len, int n_heads, int n_kv_heads, int head_dim,
@@ -303,7 +310,9 @@ namespace llaminar2
                 int batch_size, int seq_len, int kv_len,
                 int n_heads, int n_kv_heads, int head_dim,
                 bool causal, int window_size, int position_offset,
-                int device_idx);
+                int device_idx,
+                const attention::AttentionDeviceParams *device_params = nullptr,
+                const float *mask = nullptr);
 
             /**
              * @brief Tensor-based attention dispatch
@@ -481,7 +490,9 @@ namespace llaminar2
                 int batch_size, int seq_len, int kv_len,
                 int n_heads, int n_kv_heads, int head_dim,
                 bool causal, int window_size, int position_offset,
-                int device_idx);
+                int device_idx,
+                const attention::AttentionDeviceParams *device_params = nullptr,
+                const float *mask = nullptr);
 
             /**
              * @brief Tensor-based attention dispatch for FP16
@@ -612,7 +623,9 @@ namespace llaminar2
                 int batch_size, int seq_len, int kv_len,
                 int n_heads, int n_kv_heads, int head_dim,
                 bool causal, int window_size, int position_offset,
-                int device_idx);
+                int device_idx,
+                const attention::AttentionDeviceParams *device_params = nullptr,
+                const float *mask = nullptr);
 
             /**
              * @brief Tensor-based attention dispatch for BF16

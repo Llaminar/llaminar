@@ -16,6 +16,7 @@
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/ROCmKernelProfiler.h"
+#include "../../attention/AttentionDeviceParams.h"
 #include <cstring>
 #include <stdexcept>
 
@@ -28,6 +29,8 @@ extern "C"
         int batch_size, int seq_len, int kv_len,
         int n_heads, int n_kv_heads, int head_dim,
         bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
         void *stream);
 
     // Flash Decoding for single-token decode with split-K parallelism
@@ -37,6 +40,7 @@ extern "C"
         int batch_size, int kv_len,
         int n_heads, int n_kv_heads, int head_dim,
         int num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
         void *stream);
 
     int hipFlashAttn_allocWorkspace(
@@ -199,15 +203,20 @@ namespace llaminar2
             (void)workspace_scores;
             (void)workspace_buffer;
             (void)workspace_context;
-            (void)workspace_mask;
             (void)use_bf16;
             (void)mpi_ctx;
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
+
+            const float *mask_ptr = nullptr;
+            if (workspace_mask)
+            {
+                mask_ptr = static_cast<const float *>(workspace_mask->gpu_data_ptr());
+            }
             return apply_typed(Q, K, V, output,
                                1, seq_len, seq_len, // batch=1, kv_len=seq_len
                                n_heads, n_kv_heads, head_dim,
-                               causal, window_size, 0, dev);
+                               causal, window_size, 0, dev, nullptr, nullptr);
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::compute_batch(
@@ -225,15 +234,19 @@ namespace llaminar2
             (void)workspace_scores;
             (void)workspace_buffer;
             (void)workspace_context;
-            (void)workspace_mask;
             (void)use_bf16;
             (void)mpi_ctx;
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            const float *mask_ptr = nullptr;
+            if (workspace_mask)
+            {
+                mask_ptr = static_cast<const float *>(workspace_mask->gpu_data_ptr());
+            }
             return apply_typed(Q, K, V, output,
                                batch_size, seq_len, seq_len,
                                n_heads, n_kv_heads, head_dim,
-                               causal, window_size, 0, dev);
+                               causal, window_size, 0, dev, nullptr, mask_ptr);
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::compute_decode(
@@ -245,7 +258,7 @@ namespace llaminar2
             return apply_typed(Q, K, V, output,
                                1, seq_len, kv_len,
                                n_heads, n_kv_heads, head_dim,
-                               causal, -1, position_offset, dev);
+                               causal, -1, position_offset, dev, nullptr, nullptr);
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::apply_typed(
@@ -253,7 +266,9 @@ namespace llaminar2
             int batch_size, int seq_len, int kv_len,
             int n_heads, int n_kv_heads, int head_dim,
             bool causal, int window_size, int position_offset,
-            int device_idx)
+            int device_idx,
+            const attention::AttentionDeviceParams *device_params,
+            const float *mask)
         {
 
             if (!Q || !K || !V || !output)
@@ -326,7 +341,7 @@ namespace llaminar2
                         static_cast<float *>(partial_l_buf_),
                         batch_size, kv_len,
                         n_heads, n_kv_heads, head_dim,
-                        num_splits, stream_);
+                        num_splits, device_params, stream_);
                 }
             }
             else
@@ -342,6 +357,7 @@ namespace llaminar2
                         batch_size, seq_len, kv_len,
                         n_heads, n_kv_heads, head_dim,
                         causal, window_size, position_offset,
+                        device_params, mask,
                         stream_);
                 }
             }
@@ -378,7 +394,6 @@ namespace llaminar2
             int local_n_kv_heads)
         {
             (void)workspace_scores;
-            (void)workspace_mask;
             (void)mpi_ctx;
             (void)head_start;
             (void)local_n_heads;
@@ -421,26 +436,24 @@ namespace llaminar2
                                                                                  << " head_dim=" << head_dim << " causal=" << causal
                                                                                  << " device_idx=" << dev);
 
-            // Determine if this is decode (seq_len=1) or prefill
-            if (seq_len == 1 && kv_len > 1)
+            // NOTE: device_params is intentionally nullptr. The device_params
+            // mechanism was designed for future graph-capture replay where kernel
+            // args are baked in and kv_len must be read from GPU memory. Currently
+            // no code uploads AttentionDeviceParams to the workspace buffer, so
+            // reading it would give stale/garbage kv_len. Function arguments are
+            // authoritative for non-captured stages.
+            const float *mask_ptr = nullptr;
+            if (workspace_mask)
             {
-                return compute_decode(Q_ptr, K_ptr, V_ptr, O_ptr,
-                                      seq_len, kv_len, n_heads, n_kv_heads, head_dim,
-                                      causal, 0, dev);
+                mask_ptr = static_cast<const float *>(workspace_mask->gpu_data_ptr());
             }
-            else
-            {
-                return apply_typed(Q_ptr, K_ptr, V_ptr, O_ptr,
-                                   batch_size, seq_len, kv_len,
-                                   n_heads, n_kv_heads, head_dim,
-                                   causal, window_size, 0, dev);
-            }
+
+            return apply_typed(Q_ptr, K_ptr, V_ptr, O_ptr,
+                               batch_size, seq_len, kv_len,
+                               n_heads, n_kv_heads, head_dim,
+                               causal, window_size, 0, dev,
+                               nullptr, mask_ptr);
         }
-
-        // =====================================================================
-        // FP32 IWorkspaceConsumer Interface Implementation
-        // =====================================================================
-
         WorkspaceRequirements ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::getWorkspaceRequirements(
             int m, int n, int k) const
         {
@@ -465,6 +478,10 @@ namespace llaminar2
             reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_OUTPUT, partial_output_bytes, 256, true});
             reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_M, partial_m_bytes, 256, true});
             reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_L, partial_l_bytes, 256, true});
+            reqs.buffers.push_back({AttentionWorkspaceBuffers::DEVICE_PARAMS,
+                                    sizeof(attention::AttentionDeviceParams),
+                                    256,
+                                    true});
 
             LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>::getWorkspaceRequirements] "
                       << "batch=" << batch_size << " n_heads=" << n_heads << " head_dim=" << head_dim
@@ -644,11 +661,16 @@ namespace llaminar2
             (void)workspace_scores;
             (void)workspace_buffer;
             (void)workspace_context;
-            (void)workspace_mask;
             (void)use_bf16;
             (void)mpi_ctx;
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
+
+            const float *mask_ptr = nullptr;
+            if (workspace_mask)
+            {
+                mask_ptr = static_cast<const float *>(workspace_mask->gpu_data_ptr());
+            }
 
             // Fall back to FP32 kernel
             return hipFlashAttn_prefill_fa2(
@@ -656,6 +678,7 @@ namespace llaminar2
                        1, seq_len, seq_len,
                        n_heads, n_kv_heads, head_dim,
                        causal, window_size, 0,
+                       nullptr, mask_ptr,
                        stream_) == 0;
         }
 
@@ -674,16 +697,22 @@ namespace llaminar2
             (void)workspace_scores;
             (void)workspace_buffer;
             (void)workspace_context;
-            (void)workspace_mask;
             (void)use_bf16;
             (void)mpi_ctx;
-            (void)device_idx;
+
+            int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            const float *mask_ptr = nullptr;
+            if (workspace_mask)
+            {
+                mask_ptr = static_cast<const float *>(workspace_mask->gpu_data_ptr());
+            }
 
             return hipFlashAttn_prefill_fa2(
                        Q, K, V, output,
                        batch_size, seq_len, seq_len,
                        n_heads, n_kv_heads, head_dim,
                        causal, window_size, 0,
+                       nullptr, mask_ptr,
                        stream_) == 0;
         }
 
@@ -719,15 +748,19 @@ namespace llaminar2
                        static_cast<float *>(partial_l_buf_),
                        1, kv_len,
                        n_heads, n_kv_heads, head_dim,
-                       num_splits, stream_) == 0;
+                       num_splits, nullptr, stream_) == 0;
         }
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::apply_typed(
             const uint16_t *Q, const uint16_t *K, const uint16_t *V, uint16_t *output,
             int batch_size, int seq_len, int kv_len,
             int n_heads, int n_kv_heads, int head_dim,
             bool causal, int window_size, int position_offset,
-            int device_idx)
+            int device_idx,
+            const attention::AttentionDeviceParams *device_params,
+            const float *mask)
         {
+            (void)device_params;
+            (void)mask;
             // TODO: Implement native FP16 kernel
             // For now, this would require conversion - not implemented
             LOG_ERROR("[ROCmFlashAttentionKernelT<FP16>::apply_typed] Native FP16 not implemented");
@@ -985,15 +1018,21 @@ namespace llaminar2
             (void)workspace_scores;
             (void)workspace_buffer;
             (void)workspace_context;
-            (void)workspace_mask;
             (void)use_bf16;
             (void)mpi_ctx;
+
+            const float *mask_ptr = nullptr;
+            if (workspace_mask)
+            {
+                mask_ptr = static_cast<const float *>(workspace_mask->gpu_data_ptr());
+            }
 
             return hipFlashAttn_prefill_fa2(
                        Q, K, V, output,
                        1, seq_len, seq_len,
                        n_heads, n_kv_heads, head_dim,
                        causal, window_size, 0,
+                       nullptr, mask_ptr,
                        stream_) == 0;
         }
 
@@ -1012,16 +1051,22 @@ namespace llaminar2
             (void)workspace_scores;
             (void)workspace_buffer;
             (void)workspace_context;
-            (void)workspace_mask;
             (void)use_bf16;
             (void)mpi_ctx;
-            (void)device_idx;
+
+            int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            const float *mask_ptr = nullptr;
+            if (workspace_mask)
+            {
+                mask_ptr = static_cast<const float *>(workspace_mask->gpu_data_ptr());
+            }
 
             return hipFlashAttn_prefill_fa2(
                        Q, K, V, output,
                        batch_size, seq_len, seq_len,
                        n_heads, n_kv_heads, head_dim,
                        causal, window_size, 0,
+                       nullptr, mask_ptr,
                        stream_) == 0;
         }
 
@@ -1057,7 +1102,7 @@ namespace llaminar2
                        static_cast<float *>(partial_l_buf_),
                        1, kv_len,
                        n_heads, n_kv_heads, head_dim,
-                       num_splits, stream_) == 0;
+                       num_splits, nullptr, stream_) == 0;
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::apply_typed(
@@ -1065,9 +1110,13 @@ namespace llaminar2
             int batch_size, int seq_len, int kv_len,
             int n_heads, int n_kv_heads, int head_dim,
             bool causal, int window_size, int position_offset,
-            int device_idx)
+            int device_idx,
+            const attention::AttentionDeviceParams *device_params,
+            const float *mask)
         {
             LOG_ERROR("[ROCmFlashAttentionKernelT<BF16>::apply_typed] Native BF16 not supported on MI50");
+            (void)device_params;
+            (void)mask;
             (void)Q;
             (void)K;
             (void)V;

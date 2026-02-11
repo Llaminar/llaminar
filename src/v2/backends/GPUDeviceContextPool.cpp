@@ -207,13 +207,6 @@ namespace llaminar2
         size_t nvidia_count = nvidia_contexts_.size();
         size_t amd_count = amd_contexts_.size();
 
-        if (nvidia_count > 0 || amd_count > 0)
-        {
-            LOG_DEBUG("[GPUDeviceContextPool] Shutting down: "
-                      << nvidia_count << " NVIDIA contexts, "
-                      << amd_count << " AMD contexts");
-        }
-
         // Clear all contexts (destructors handle cleanup)
         nvidia_contexts_.clear();
         amd_contexts_.clear();

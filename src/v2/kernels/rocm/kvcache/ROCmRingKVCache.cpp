@@ -119,6 +119,29 @@ namespace llaminar2
         return append(layer, seq_idx, d_k, d_v, num_tokens, 0);
     }
 
+    bool IROCmRingKVCache::appendWithStream(int layer, int seq_idx,
+                                            const ITensor *K, const ITensor *V,
+                                            int num_tokens, void *gpu_stream)
+    {
+        if (!K || !V)
+        {
+            LOG_DEBUG("[IROCmRingKVCache::appendWithStream] Null K or V tensor");
+            return false;
+        }
+
+        const void *d_k = K->gpu_data_ptr();
+        const void *d_v = V->gpu_data_ptr();
+
+        if (!d_k || !d_v)
+        {
+            LOG_ERROR("[IROCmRingKVCache::appendWithStream] K or V tensor lacks GPU data.");
+            return false;
+        }
+
+        return append(layer, seq_idx, d_k, d_v, num_tokens,
+                      static_cast<hipStream_t>(gpu_stream));
+    }
+
     // =========================================================================
     // ROCmRingKVCache Implementation
     // =========================================================================

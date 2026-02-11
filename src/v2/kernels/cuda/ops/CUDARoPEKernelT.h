@@ -103,6 +103,9 @@ namespace llaminar2
             bool hasWorkspace() const override { return workspace_ != nullptr; }
             DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
 
+            // ===== GPU Stream Support (Graph Capture) =====
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
             // ===== ITensorRoPE interface =====
             bool apply(
                 float *data, float *output,
@@ -268,6 +271,7 @@ namespace llaminar2
             float rope_theta_;
             DeviceWorkspaceManager *workspace_;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
 
             // Inverse frequency cache state (for workspace-based allocation)
             mutable bool inv_freq_initialized_;
@@ -316,6 +320,9 @@ namespace llaminar2
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
             void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+
+            // ===== GPU Stream Support (Graph Capture) =====
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
@@ -518,6 +525,7 @@ namespace llaminar2
             float rope_theta_;
             DeviceWorkspaceManager *workspace_;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
 
             // Inverse frequency cache state (for workspace-based allocation)
             mutable bool inv_freq_initialized_;
@@ -566,6 +574,9 @@ namespace llaminar2
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
             void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+
+            // ===== GPU Stream Support (Graph Capture) =====
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
@@ -768,6 +779,7 @@ namespace llaminar2
             float rope_theta_;
             DeviceWorkspaceManager *workspace_;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
 
             // Inverse frequency cache state (for workspace-based allocation)
             mutable bool inv_freq_initialized_;

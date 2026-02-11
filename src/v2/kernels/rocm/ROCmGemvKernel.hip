@@ -242,7 +242,11 @@ __global__ void gemv_int8_int8_grid_kpar_vnni_kernel_t(
     const int k_block = blockIdx.y;
 
     // Each block processes its K-segment: [k_start, k_end)
-    const int k_per = (K + kblocks - 1) / kblocks;
+    // CRITICAL: k_per must be a multiple of 4 to ensure k_start aligns with
+    // VNNI 4-byte groups. If k_start is not a multiple of 4, kg_offset would
+    // misalign with the weight K-groups, producing garbage output.
+    const int k_per_raw = (K + kblocks - 1) / kblocks;
+    const int k_per = ((k_per_raw + 3) / 4) * 4;  // Round up to multiple of 4
     const int k_start = k_block * k_per;
     const int k_end = min(k_start + k_per, K);
 
@@ -299,6 +303,190 @@ __global__ void gemv_int8_int8_grid_kpar_vnni_kernel_t(
             atomicAdd(&d_C_int32[n_base + c], acc[c]);
         }
     }
+}
+
+
+// ============================================================================
+// Fused FP32→INT8 GEMV kernel: Quantize + GEMV + Scale in one launch
+//
+// Eliminates the 3-kernel pipeline (quantize → GEMV → scale) by:
+//   1. Loading FP32 activations to shared memory per K-block
+//   2. Computing block-local absmax for INT8 quantization
+//   3. Quantizing in-register and using v_dot4_i32_i8 for the dot product
+//   4. Converting INT32 accumulator to FP32 with (block_scale * scale_B[n])
+//   5. atomicAdd FP32 partial results across K-blocks
+//   6. Optional fused bias addition
+//
+// Memory traffic: Same weight reads as INT8 GEMV, but no separate
+// activation INT8 buffer, no INT32 output buffer, no scale_A buffer.
+// Activations (14KB for K=3584) stay in L2 after first projection.
+//
+// Grid: dim3(grid_n, KB), Block: dim3(TILE_N/CPT)
+// Same grid structure as grid_kpar, but FP32 in → FP32 out.
+// ============================================================================
+template <int TILE_N, int CPT>
+__global__ void gemv_fused_fp32_int8_vnni_kernel_t(
+    const float* __restrict__ d_A_fp32,          // [K] FP32 activations
+    const int8_t* __restrict__ d_B_int8_vnni,    // [K/4][N][4] VNNI weights
+    float* __restrict__ d_C_fp32,                // [N] FP32 output (zeroed before launch)
+    const float* __restrict__ d_scales_B,        // [N] per-column weight scales
+    const float* __restrict__ d_bias,            // [N] optional bias (nullable)
+    int N, int K, int kblocks)
+{
+    constexpr int THREADS = TILE_N / CPT;  // 64 threads = 1 wavefront
+    // Process K in chunks of QUANT_TILE_K elements at a time for quantization.
+    // Each chunk: load FP32 → find absmax → quantize → dot product.
+    // 256 elements = 1KB FP32 in shared memory, fits easily.
+    constexpr int QUANT_TILE_K = 256;
+
+    const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+    const bool active = (n_base < N);
+    const int k_block = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    // Each block processes its K-segment: [k_start, k_end)
+    // Round k_per UP to a multiple of 4 so every k_start aligns with
+    // VNNI K-groups (4 consecutive K values packed together).
+    // Without this, k_start for intermediate blocks can land mid-group,
+    // causing activation/weight misalignment in sdot4.
+    const int k_per_raw = (K + kblocks - 1) / kblocks;
+    const int k_per = ((k_per_raw + 3) / 4) * 4;
+    const int k_start = k_block * k_per;
+    const int k_end = min(k_start + k_per, K);
+
+    // After rounding k_per up, the last block(s) may have k_start >= K.
+    // Those blocks have nothing to do — skip entirely.
+    if (k_start >= K) return;
+
+    // Shared memory: FP32 activations tile + reduction scratch
+    __shared__ float s_A_fp32[QUANT_TILE_K];
+    __shared__ float s_absmax;        // Block-wide absmax for this tile
+    __shared__ int8_t s_A_int8[QUANT_TILE_K]; // Quantized activations
+
+    // FP32 accumulators for partial results (will be atomicAdd'd)
+    float f_acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) f_acc[c] = 0.0f;
+
+    // Process K-segment in QUANT_TILE_K-sized chunks
+    for (int k_tile_start = k_start; k_tile_start < k_end; k_tile_start += QUANT_TILE_K)
+    {
+        const int tile_end = min(k_tile_start + QUANT_TILE_K, k_end);
+        const int tile_len = tile_end - k_tile_start;
+        const int tile_kgroups = tile_len / 4;
+
+        // --- Phase 1: Cooperative load of FP32 activations to shared memory ---
+        for (int i = tid; i < tile_len; i += THREADS)
+        {
+            s_A_fp32[i] = d_A_fp32[k_tile_start + i];
+        }
+        __syncthreads();
+
+        // --- Phase 2: Find absmax via parallel reduction ---
+        // Each thread finds local max over its portion
+        float local_max = 0.0f;
+        for (int i = tid; i < tile_len; i += THREADS)
+        {
+            float v = s_A_fp32[i];
+            float a = (v >= 0.0f) ? v : -v;
+            local_max = (a > local_max) ? a : local_max;
+        }
+
+        // Warp reduction (wavefront = 64 threads on gfx906)
+        #pragma unroll
+        for (int offset = 32; offset > 0; offset >>= 1)
+        {
+            float other = __shfl_down(local_max, offset);
+            local_max = (other > local_max) ? other : local_max;
+        }
+
+        // Thread 0 writes the block absmax
+        if (tid == 0)
+        {
+            s_absmax = local_max;
+        }
+        __syncthreads();
+
+        const float absmax = s_absmax;
+        const float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
+        const float inv_scale = (absmax > 0.0f) ? (127.0f / absmax) : 0.0f;
+
+        // --- Phase 3: Cooperative quantize FP32 → INT8 in shared memory ---
+        for (int i = tid; i < tile_len; i += THREADS)
+        {
+            float val = s_A_fp32[i] * inv_scale;
+            int q = static_cast<int>(rintf(val));
+            q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+            s_A_int8[i] = static_cast<int8_t>(q);
+        }
+        __syncthreads();
+
+        // --- Phase 4: INT8 dot product using v_dot4_i32_i8 ---
+        if (active)
+        {
+            int32_t tile_acc[CPT];
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c) tile_acc[c] = 0;
+
+            const int32_t* __restrict__ b_row =
+                reinterpret_cast<const int32_t*>(d_B_int8_vnni) + n_base;
+            const size_t b_stride = static_cast<size_t>(N);
+            const int kg_offset = k_tile_start / 4;
+
+            #pragma unroll 4
+            for (int tkg = 0; tkg < tile_kgroups; ++tkg)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(
+                    s_A_int8 + tkg * 4);
+
+                if constexpr (CPT == 2)
+                {
+                    const int2 b_pair = *reinterpret_cast<const int2*>(
+                        b_row + (kg_offset + tkg) * b_stride);
+                    tile_acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, tile_acc[0], false);
+                    tile_acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, tile_acc[1], false);
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int c = 0; c < CPT; ++c)
+                    {
+                        const int32_t b_packed = *(b_row + (kg_offset + tkg) * b_stride + c);
+                        tile_acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, tile_acc[c], false);
+                    }
+                }
+            }
+
+            // Convert tile INT32 → FP32 with tile-local scale
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+            {
+                f_acc[c] += static_cast<float>(tile_acc[c]) * scale;
+            }
+        }
+
+        __syncthreads();  // Ensure shared memory is safe for next tile
+    }
+
+    // --- Phase 5: Apply weight scales, write to output ---
+    if (active)
+    {
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            float result = f_acc[c] * d_scales_B[n_base + c];
+            if (kblocks == 1)
+                d_C_fp32[n_base + c] = result;      // Plain store — no contention
+            else
+                atomicAdd(&d_C_fp32[n_base + c], result);
+        }
+    }
+
+    // Bias: only apply once across all K-blocks (last block does it)
+    // We use k_block == kblocks - 1 as the "last" block.
+    // Note: this has a data race if atomicAdds from other blocks haven't
+    // completed yet. Instead, bias is applied as a separate follow-up.
+    // See dispatch function for bias handling.
 }
 
 
@@ -424,6 +612,97 @@ bool rocmGemv_int8_int8_int32_vnni(
         fprintf(stderr, "[rocmGemv_int8_int8_int32_vnni] Kernel launch failed: %s (N=%d K=%d)\n",
                 hipGetErrorString(err), N, K);
         return false;
+    }
+
+    return true;
+}
+
+// =============================================================================
+// Fused FP32→FP32 GEMV: Quantize + GEMV + Scale in one kernel
+// =============================================================================
+//
+// Replaces the 3-kernel decode pipeline:
+//   OLD: quantizeActivations → rocmGemv_int8_int8_int32_vnni → applyScaling
+//   NEW: rocmGemv_fused_fp32_int8_vnni (single launch, directly FP32→FP32)
+//
+// Eliminates:
+//   - d_A_int8 buffer (activation quantization done in shared memory)
+//   - d_scales_A buffer (scale folded into per-tile FP32 conversion)
+//   - d_CK_int32 buffer (output is FP32 directly)
+//   - 2 kernel launches per projection (quantize + scale)
+//
+bool rocmGemv_fused_fp32_int8_vnni(
+    const float* d_A_fp32,           // [K] FP32 activations
+    const int8_t* d_B_int8_vnni,     // [K/4 × N × 4] VNNI-packed weights
+    float* d_C_fp32,                 // [N] FP32 output (will be zeroed)
+    const float* d_scales_B,         // [N] per-column weight scales
+    const float* d_bias,             // [N] optional bias (nullable)
+    int N, int K,
+    int device_id, void* stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    if ((K % 4) != 0)
+    {
+        fprintf(stderr, "[rocmGemv_fused_fp32_int8_vnni] K must be multiple of 4 (N=%d K=%d)\n", N, K);
+        return false;
+    }
+
+    if ((N % 4) != 0)
+    {
+        fprintf(stderr, "[rocmGemv_fused_fp32_int8_vnni] N must be multiple of 4 (N=%d K=%d)\n", N, K);
+        return false;
+    }
+
+    constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;  // 128
+    constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;    // 2
+    constexpr int NUM_CUS = 60;  // MI50/MI60
+
+    const int grid_n = (N + TN - 1) / TN;
+    const int k_groups = K / 4;
+
+    // KB heuristic for FUSED kernel: very different from INT8 grid_kpar!
+    //
+    // The fused kernel uses FP32 atomicAdd for cross-block K-accumulation.
+    // On gfx906, FP32 atomicAdd is emulated via CAS loop (not hardware native),
+    // so ANY K-splitting causes massive contention overhead.
+    //
+    // Force kb=1: each block processes the entire K dimension sequentially
+    // via QUANT_TILE_K=256 tiles in a loop, then does a single plain store.
+    // No atomicAdd, no hipMemsetAsync needed.
+    const int kb = 1;
+
+    // Zero output only if using atomicAdd accumulation across K-blocks
+    if (kb > 1)
+        hipMemsetAsync(d_C_fp32, 0, N * sizeof(float), static_cast<hipStream_t>(stream));
+
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(gemv_fused_fp32_int8_vnni_kernel_t<TN, CPT>),
+        dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+        d_A_fp32, d_B_int8_vnni, d_C_fp32, d_scales_B, d_bias, N, K, kb);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemv_fused_fp32_int8_vnni] Kernel launch failed: %s (N=%d K=%d kb=%d)\n",
+                hipGetErrorString(err), N, K, kb);
+        return false;
+    }
+
+    // Apply bias separately if provided and using K-splitting.
+    // With kb==1, bias could be fused but we keep the separate path for simplicity.
+    if (d_bias)
+    {
+        // Reuse existing biasAdd from ROCmQuantisedGemmKernel_CK.hip
+        extern bool rocmQuantGemm_biasAdd(
+            float *d_output, const float *d_bias,
+            int M, int N, int rocm_device_id, void *stream);
+
+        if (!rocmQuantGemm_biasAdd(d_C_fp32, d_bias, 1, N, device_id, stream))
+        {
+            fprintf(stderr, "[rocmGemv_fused_fp32_int8_vnni] biasAdd failed (N=%d)\n", N);
+            return false;
+        }
     }
 
     return true;

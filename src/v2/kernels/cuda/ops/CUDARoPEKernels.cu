@@ -1010,7 +1010,8 @@ extern "C"
         float *d_inv_freq,
         int head_dim,
         float freq_base,
-        int device_idx)
+        int device_idx,
+        cudaStream_t stream)
     {
         if (!d_inv_freq)
             return false;
@@ -1028,8 +1029,8 @@ extern "C"
 
         // Copy to device
         cudaSetDevice(device_idx);
-        cudaError_t err = cudaMemcpy(d_inv_freq, h_inv_freq.data(),
-                                     half_dim * sizeof(float), cudaMemcpyHostToDevice);
+        cudaError_t err = cudaMemcpyAsync(d_inv_freq, h_inv_freq.data(),
+                                          half_dim * sizeof(float), cudaMemcpyHostToDevice, stream);
         return err == cudaSuccess;
     }
 
@@ -1045,7 +1046,8 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx,
+        cudaStream_t stream)
     {
         if (!d_inv_freq)
             return false;
@@ -1059,17 +1061,16 @@ extern "C"
         if (K != nullptr)
         {
             int total_blocks = seq_len * (n_heads + n_kv_heads);
-            rope_fp32_fused_qk_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+            rope_fp32_fused_qk_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
                 Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
         }
         else
         {
             int num_blocks_q = seq_len * n_heads;
-            rope_fp32_kernel_v3<<<num_blocks_q, threads_per_block, smem_size>>>(
+            rope_fp32_kernel_v3<<<num_blocks_q, threads_per_block, smem_size, stream>>>(
                 Q, d_inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
 
-        cudaDeviceSynchronize();
         (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
@@ -1086,7 +1087,8 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx,
+        cudaStream_t stream)
     {
         if (!d_inv_freq)
             return false;
@@ -1099,7 +1101,7 @@ extern "C"
 
         // The decode kernel handles both Q and K in one launch
         int total_blocks = n_heads + (K ? n_kv_heads : 0);
-        rope_fp32_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+        rope_fp32_decode_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
         (void)cudaGetLastError();  // Clear stale errors
@@ -1119,7 +1121,8 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx,
+        cudaStream_t stream)
     {
         if (!d_inv_freq)
             return false;
@@ -1132,7 +1135,7 @@ extern "C"
 
         int total_blocks = seq_len * (n_heads + (K ? n_kv_heads : 0));
 
-        rope_fp32_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+        rope_fp32_contiguous_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
             Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
 
         (void)cudaGetLastError();  // Clear stale errors
@@ -1152,7 +1155,8 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx,
+        cudaStream_t stream)
     {
         if (!d_inv_freq)
             return false;
@@ -1166,17 +1170,15 @@ extern "C"
         if (K != nullptr)
         {
             int total_blocks = seq_len * (n_heads + n_kv_heads);
-            rope_bf16_fused_qk_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+            rope_bf16_fused_qk_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
                 Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
         }
         else
         {
             int num_blocks = seq_len * n_heads;
-            rope_bf16_kernel_v3<<<num_blocks, threads_per_block, smem_size>>>(
+            rope_bf16_kernel_v3<<<num_blocks, threads_per_block, smem_size, stream>>>(
                 Q, d_inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
-
-        cudaDeviceSynchronize();
         (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
@@ -1193,7 +1195,8 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx,
+        cudaStream_t stream)
     {
         if (!d_inv_freq)
             return false;
@@ -1206,7 +1209,7 @@ extern "C"
 
         // The decode kernel handles both Q and K in one launch
         int total_blocks = n_heads + (K ? n_kv_heads : 0);
-        rope_bf16_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+        rope_bf16_decode_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
         (void)cudaGetLastError();  // Clear stale errors
@@ -1226,7 +1229,8 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx,
+        cudaStream_t stream)
     {
         if (!d_inv_freq)
             return false;
@@ -1239,7 +1243,7 @@ extern "C"
 
         int total_blocks = seq_len * (n_heads + (K ? n_kv_heads : 0));
 
-        rope_bf16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+        rope_bf16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
             Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
 
         (void)cudaGetLastError();  // Clear stale errors
@@ -1259,7 +1263,8 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx,
+        cudaStream_t stream)
     {
         if (!d_inv_freq)
             return false;
@@ -1273,17 +1278,15 @@ extern "C"
         if (K != nullptr)
         {
             int total_blocks = seq_len * (n_heads + n_kv_heads);
-            rope_fp16_fused_qk_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+            rope_fp16_fused_qk_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
                 Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
         }
         else
         {
             int num_blocks = seq_len * n_heads;
-            rope_fp16_kernel_v3<<<num_blocks, threads_per_block, smem_size>>>(
+            rope_fp16_kernel_v3<<<num_blocks, threads_per_block, smem_size, stream>>>(
                 Q, d_inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
-
-        cudaDeviceSynchronize();
         (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
@@ -1300,7 +1303,8 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx,
+        cudaStream_t stream)
     {
         if (!d_inv_freq)
             return false;
@@ -1313,7 +1317,7 @@ extern "C"
 
         // The decode kernel handles both Q and K in one launch
         int total_blocks = n_heads + (K ? n_kv_heads : 0);
-        rope_fp16_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+        rope_fp16_decode_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
         (void)cudaGetLastError();  // Clear stale errors
@@ -1333,7 +1337,8 @@ extern "C"
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx)
+        int device_idx,
+        cudaStream_t stream)
     {
         if (!d_inv_freq)
             return false;
@@ -1346,7 +1351,7 @@ extern "C"
 
         int total_blocks = seq_len * (n_heads + (K ? n_kv_heads : 0));
 
-        rope_fp16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+        rope_fp16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
             Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
 
         (void)cudaGetLastError();  // Clear stale errors

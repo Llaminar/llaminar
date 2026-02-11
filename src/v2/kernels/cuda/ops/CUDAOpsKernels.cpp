@@ -97,34 +97,34 @@ extern "C"
 
     // RoPE WORKSPACE-AWARE (v3 - external inv_freq buffer)
     bool cudaOps_rope_populate_inv_freq(
-        float *d_inv_freq, int head_dim, float freq_base, int device_idx);
+        float *d_inv_freq, int head_dim, float freq_base, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_fp32_v3(
         float *Q, float *K, const float *d_inv_freq, const int *position_ids,
-        int seq_len, int n_heads, int n_kv_heads, int head_dim, int device_idx);
+        int seq_len, int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_fp32_decode_v3(
         float *Q, float *K, const float *d_inv_freq, int pos,
-        int n_heads, int n_kv_heads, int head_dim, int device_idx);
+        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_fp32_contiguous_v3(
         float *Q, float *K, const float *d_inv_freq, int pos_offset, int seq_len,
-        int n_heads, int n_kv_heads, int head_dim, int device_idx);
+        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_bf16_v3(
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, const int *position_ids,
-        int seq_len, int n_heads, int n_kv_heads, int head_dim, int device_idx);
+        int seq_len, int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_bf16_decode_v3(
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, int pos,
-        int n_heads, int n_kv_heads, int head_dim, int device_idx);
+        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_bf16_contiguous_v3(
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, int pos_offset, int seq_len,
-        int n_heads, int n_kv_heads, int head_dim, int device_idx);
+        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_fp16_v3(
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, const int *position_ids,
-        int seq_len, int n_heads, int n_kv_heads, int head_dim, int device_idx);
+        int seq_len, int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_fp16_decode_v3(
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, int pos,
-        int n_heads, int n_kv_heads, int head_dim, int device_idx);
+        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_fp16_contiguous_v3(
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, int pos_offset, int seq_len,
-        int n_heads, int n_kv_heads, int head_dim, int device_idx);
+        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
 
     // Embedding lookup - FP32
     cudaError_t launch_embedding_lookup(
@@ -594,6 +594,8 @@ namespace llaminar2
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::ROPE);
+            cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream_);
+            const bool sync_after = (stream == nullptr);
 
             // Require workspace to be bound
             if (!workspace_)
@@ -612,7 +614,7 @@ namespace llaminar2
             // Initialize inv_freq if needed (lazy initialization)
             if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
             {
-                if (!cudaOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev))
+                if (!cudaOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev, stream))
                 {
                     LOG_ERROR("[CUDARoPEKernelT<FP32>] Failed to populate inv_freq");
                     return false;
@@ -622,23 +624,65 @@ namespace llaminar2
                 inv_freq_theta_ = rope_theta;
             }
 
+            const bool force_device_positions = (gpu_stream_ != nullptr && position_ids != nullptr);
+
             // ZERO-COPY PATH: If position_ids is nullptr, use contiguous kernel
-            if (position_ids == nullptr)
+            if (seq_len == 1 && !force_device_positions)
             {
-                return cudaOps_rope_fp32_contiguous_v3(Q, K, d_inv_freq, pos_offset, seq_len,
-                                                       n_heads, n_kv_heads, head_dim, dev);
+                int pos = position_ids ? position_ids[0] : pos_offset;
+                bool ok = cudaOps_rope_fp32_decode_v3(Q, K, d_inv_freq, pos,
+                                                     n_heads, n_kv_heads, head_dim, dev, stream);
+                if (ok && sync_after)
+                    cudaDeviceSynchronize();
+                return ok;
             }
 
-            // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
-            if (seq_len == 1)
             {
-                return cudaOps_rope_fp32_decode_v3(Q, K, d_inv_freq, position_ids[0],
-                                                   n_heads, n_kv_heads, head_dim, dev);
+                bool is_contiguous = (position_ids == nullptr) && !force_device_positions;
+                if (!is_contiguous && position_ids)
+                {
+                    is_contiguous = true;
+                    for (int i = 0; i < seq_len; ++i)
+                    {
+                        if (position_ids[i] != pos_offset + i)
+                        {
+                            is_contiguous = false;
+                            break;
+                        }
+                    }
+                }
+                if (is_contiguous)
+                {
+                    bool ok = cudaOps_rope_fp32_contiguous_v3(Q, K, d_inv_freq, pos_offset, seq_len,
+                                                             n_heads, n_kv_heads, head_dim, dev, stream);
+                    if (ok && sync_after)
+                        cudaDeviceSynchronize();
+                    return ok;
+                }
             }
 
-            // NON-CONTIGUOUS PATH: Copy position_ids to device
-            return cudaOps_rope_fp32_v3(Q, K, d_inv_freq, position_ids, seq_len,
-                                        n_heads, n_kv_heads, head_dim, dev);
+            int *d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
+            if (!d_position_ids)
+            {
+                LOG_ERROR("[CUDARoPEKernelT<FP32>] POSITION_IDS buffer not allocated in workspace");
+                return false;
+            }
+
+            size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
+            cudaError_t copy_err = cudaMemcpyAsync(d_position_ids, position_ids, pos_bytes,
+                                                   cudaMemcpyHostToDevice, stream);
+            if (copy_err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDARoPEKernelT<FP32>] Failed to copy position_ids to GPU: "
+                          << cudaGetErrorString(copy_err));
+                return false;
+            }
+
+            bool ok = cudaOps_rope_fp32_v3(Q, K, d_inv_freq, d_position_ids, seq_len,
+                                           n_heads, n_kv_heads, head_dim, dev, stream);
+            if (ok && sync_after)
+                cudaDeviceSynchronize();
+            return ok;
         }
 
         // =========================================================================
@@ -670,6 +714,8 @@ namespace llaminar2
             int pos_offset)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream_);
+            const bool sync_after = (stream == nullptr);
 
             // Require workspace to be bound
             if (!workspace_)
@@ -688,7 +734,7 @@ namespace llaminar2
             // Initialize inv_freq if needed (lazy initialization)
             if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
             {
-                if (!cudaOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev))
+                if (!cudaOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev, stream))
                 {
                     LOG_ERROR("[CUDARoPEKernelT<BF16>] Failed to populate inv_freq");
                     return false;
@@ -698,23 +744,64 @@ namespace llaminar2
                 inv_freq_theta_ = rope_theta;
             }
 
-            // ZERO-COPY PATH: If position_ids is nullptr, use contiguous kernel
-            if (position_ids == nullptr)
+            const bool force_device_positions = (gpu_stream_ != nullptr && position_ids != nullptr);
+
+            if (seq_len == 1 && !force_device_positions)
             {
-                return cudaOps_rope_bf16_contiguous_v3(Q, K, d_inv_freq, pos_offset, seq_len,
-                                                       n_heads, n_kv_heads, head_dim, dev);
+                int pos = position_ids ? position_ids[0] : pos_offset;
+                bool ok = cudaOps_rope_bf16_decode_v3(Q, K, d_inv_freq, pos,
+                                                     n_heads, n_kv_heads, head_dim, dev, stream);
+                if (ok && sync_after)
+                    cudaDeviceSynchronize();
+                return ok;
             }
 
-            // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
-            if (seq_len == 1)
             {
-                return cudaOps_rope_bf16_decode_v3(Q, K, d_inv_freq, position_ids[0],
-                                                   n_heads, n_kv_heads, head_dim, dev);
+                bool is_contiguous = (position_ids == nullptr) && !force_device_positions;
+                if (!is_contiguous && position_ids)
+                {
+                    is_contiguous = true;
+                    for (int i = 0; i < seq_len; ++i)
+                    {
+                        if (position_ids[i] != pos_offset + i)
+                        {
+                            is_contiguous = false;
+                            break;
+                        }
+                    }
+                }
+                if (is_contiguous)
+                {
+                    bool ok = cudaOps_rope_bf16_contiguous_v3(Q, K, d_inv_freq, pos_offset, seq_len,
+                                                             n_heads, n_kv_heads, head_dim, dev, stream);
+                    if (ok && sync_after)
+                        cudaDeviceSynchronize();
+                    return ok;
+                }
             }
 
-            // NON-CONTIGUOUS PATH: Copy position_ids to device
-            return cudaOps_rope_bf16_v3(Q, K, d_inv_freq, position_ids, seq_len,
-                                        n_heads, n_kv_heads, head_dim, dev);
+            int *d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
+            if (!d_position_ids)
+            {
+                LOG_ERROR("[CUDARoPEKernelT<BF16>] POSITION_IDS buffer not allocated in workspace");
+                return false;
+            }
+
+            size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
+            cudaError_t copy_err = cudaMemcpyAsync(d_position_ids, position_ids, pos_bytes,
+                                                   cudaMemcpyHostToDevice, stream);
+            if (copy_err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDARoPEKernelT<BF16>] Failed to copy position_ids to GPU: "
+                          << cudaGetErrorString(copy_err));
+                return false;
+            }
+
+            bool ok = cudaOps_rope_bf16_v3(Q, K, d_inv_freq, d_position_ids, seq_len,
+                                           n_heads, n_kv_heads, head_dim, dev, stream);
+            if (ok && sync_after)
+                cudaDeviceSynchronize();
+            return ok;
         }
 
         // =========================================================================
@@ -746,6 +833,8 @@ namespace llaminar2
             int pos_offset)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream_);
+            const bool sync_after = (stream == nullptr);
 
             // Require workspace to be bound
             if (!workspace_)
@@ -764,7 +853,7 @@ namespace llaminar2
             // Initialize inv_freq if needed (lazy initialization)
             if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
             {
-                if (!cudaOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev))
+                if (!cudaOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev, stream))
                 {
                     LOG_ERROR("[CUDARoPEKernelT<FP16>] Failed to populate inv_freq");
                     return false;
@@ -774,23 +863,64 @@ namespace llaminar2
                 inv_freq_theta_ = rope_theta;
             }
 
-            // ZERO-COPY PATH: If position_ids is nullptr, use contiguous kernel
-            if (position_ids == nullptr)
+            const bool force_device_positions = (gpu_stream_ != nullptr && position_ids != nullptr);
+
+            if (seq_len == 1 && !force_device_positions)
             {
-                return cudaOps_rope_fp16_contiguous_v3(Q, K, d_inv_freq, pos_offset, seq_len,
-                                                       n_heads, n_kv_heads, head_dim, dev);
+                int pos = position_ids ? position_ids[0] : pos_offset;
+                bool ok = cudaOps_rope_fp16_decode_v3(Q, K, d_inv_freq, pos,
+                                                     n_heads, n_kv_heads, head_dim, dev, stream);
+                if (ok && sync_after)
+                    cudaDeviceSynchronize();
+                return ok;
             }
 
-            // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
-            if (seq_len == 1)
             {
-                return cudaOps_rope_fp16_decode_v3(Q, K, d_inv_freq, position_ids[0],
-                                                   n_heads, n_kv_heads, head_dim, dev);
+                bool is_contiguous = (position_ids == nullptr) && !force_device_positions;
+                if (!is_contiguous && position_ids)
+                {
+                    is_contiguous = true;
+                    for (int i = 0; i < seq_len; ++i)
+                    {
+                        if (position_ids[i] != pos_offset + i)
+                        {
+                            is_contiguous = false;
+                            break;
+                        }
+                    }
+                }
+                if (is_contiguous)
+                {
+                    bool ok = cudaOps_rope_fp16_contiguous_v3(Q, K, d_inv_freq, pos_offset, seq_len,
+                                                             n_heads, n_kv_heads, head_dim, dev, stream);
+                    if (ok && sync_after)
+                        cudaDeviceSynchronize();
+                    return ok;
+                }
             }
 
-            // NON-CONTIGUOUS PATH: Copy position_ids to device
-            return cudaOps_rope_fp16_v3(Q, K, d_inv_freq, position_ids, seq_len,
-                                        n_heads, n_kv_heads, head_dim, dev);
+            int *d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
+            if (!d_position_ids)
+            {
+                LOG_ERROR("[CUDARoPEKernelT<FP16>] POSITION_IDS buffer not allocated in workspace");
+                return false;
+            }
+
+            size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
+            cudaError_t copy_err = cudaMemcpyAsync(d_position_ids, position_ids, pos_bytes,
+                                                   cudaMemcpyHostToDevice, stream);
+            if (copy_err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDARoPEKernelT<FP16>] Failed to copy position_ids to GPU: "
+                          << cudaGetErrorString(copy_err));
+                return false;
+            }
+
+            bool ok = cudaOps_rope_fp16_v3(Q, K, d_inv_freq, d_position_ids, seq_len,
+                                           n_heads, n_kv_heads, head_dim, dev, stream);
+            if (ok && sync_after)
+                cudaDeviceSynchronize();
+            return ok;
         }
 
     } // namespace cuda

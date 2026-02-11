@@ -499,13 +499,25 @@ namespace llaminar2
         auto *V_base = dynamic_cast<const TensorBase *>(params_.V);
         if (!K_base || !V_base)
         {
-            LOG_ERROR("[KVCacheAppendStage] K/V tensors must be CPU TensorBase (GPU not yet supported)");
+            LOG_ERROR("[KVCacheAppendStage] K/V tensors must be TensorBase");
             return false;
         }
 
-        bool success = params_.kv_cache->append(
-            params_.layer_idx, params_.seq_idx,
-            K_base, V_base, total_tokens);
+        // Use stream-aware append when a GPU stream is set (for graph capture compatibility)
+        bool success;
+        void *stream = gpuStream();
+        if (stream || params_.device_id.is_gpu())
+        {
+            success = params_.kv_cache->appendWithStream(
+                params_.layer_idx, params_.seq_idx,
+                K_base, V_base, total_tokens, stream);
+        }
+        else
+        {
+            success = params_.kv_cache->append(
+                params_.layer_idx, params_.seq_idx,
+                K_base, V_base, total_tokens);
+        }
 
         if (!success)
         {

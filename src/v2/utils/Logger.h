@@ -37,8 +37,8 @@ namespace llaminar2
     public:
         static Logger &getInstance()
         {
-            static Logger instance;
-            return instance;
+            static Logger *instance = new Logger();
+            return *instance;
         }
 
         void setLogLevel(LogLevel level)
@@ -237,8 +237,8 @@ namespace llaminar2
          */
         static std::string &thread_device_prefix()
         {
-            thread_local std::string prefix;
-            return prefix;
+            static thread_local std::string *prefix = new std::string();
+            return *prefix;
         }
 
         LogLevel current_level_;

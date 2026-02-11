@@ -1060,18 +1060,17 @@ namespace llaminar2
         }
 
         // ===== Phase 3: Replay — just launch() capturable segments directly =====
-        // SYNCHRONIZATION STRATEGY:
-        // Graph segments launch on capture_stream (non-blocking). Manual stages
-        // dispatch to the legacy default stream (stream 0). These are separate
-        // streams with no implicit ordering. We use per-stream synchronization
-        // at TYPE TRANSITIONS to ensure correct data dependencies:
+        // SYNCHRONIZATION STRATEGY (Unified-Stream):
+        // ALL work — both graph launches and manual stages — runs on capture_stream.
+        // Since all GPU operations are on the SAME stream, the GPU guarantees
+        // in-order execution. NO intermediate CPU-side synchronization is needed.
         //
-        //   [graph on capture_stream] → syncStream(capture_stream) → [manual on stream 0]
-        //   [manual on stream 0]      → syncStream(nullptr/stream0) → [graph on capture_stream]
+        // Manual stages' CPU code (metadata reads, mask creation) doesn't depend
+        // on GPU results being visible — it only reads CPU-side state that was
+        // updated during previous execute() calls (e.g., KV cache entry.count).
         //
-        // Per-stream sync (~5μs) is ~10× cheaper than device-wide sync (~50μs).
-        // We sync ONLY at transitions, not between consecutive same-type segments.
-        // Final device sync ensures all work completes before CPU reads.
+        // The ONLY sync point is the final device sync after all segments,
+        // ensuring GPU work completes before the caller reads output tensors.
 
         void *capture_stream = segment_cache.capture_stream;
         const auto &exec_cfg = debugEnv().execution;
@@ -1079,15 +1078,11 @@ namespace llaminar2
         const bool recapture_mode = exec_cfg.gpu_graph_recapture;
 
         int seg_idx = 0;
-        bool prev_was_graph = false;
         for (auto &seg : segment_cache.segments)
         {
 
             if (seg.capturable && seg.capture && seg.capture->hasExecutable())
             {
-                // Sync at manual→graph transition
-                if (!prev_was_graph)
-                    gpu_ctx->synchronizeStream(nullptr);
 
                 if (recapture_mode)
                 {
@@ -1341,20 +1336,14 @@ namespace llaminar2
                     for (const auto &stage_name : seg.stage_names)
                         graph.markCompleted(stage_name);
                 }
-
-                prev_was_graph = true;
             }
             else
             {
-                // Sync at graph→manual transition
-                if (prev_was_graph)
-                    gpu_ctx->synchronizeStream(capture_stream);
-
-                // Manual segment — execute stages on default stream (legacy stream 0)
+                // Manual segment — execute on capture_stream (unified with graph segments)
                 for (const auto &stage_name : seg.stage_names)
                 {
                     auto *node = graph.getNode(stage_name);
-                    node->stage->setGPUStream(nullptr);
+                    node->stage->setGPUStream(capture_stream);
                     if (!node->stage->execute(ctx))
                     {
                         LOG_ERROR("[GraphExecutor] Manual stage failed on replay: " << stage_name);
@@ -1362,8 +1351,7 @@ namespace llaminar2
                     }
                     graph.markCompleted(stage_name);
                 }
-
-                prev_was_graph = false;
+                // No end-of-segment sync — manual→graph transition sync handles it
             }
 
             seg_idx++;
