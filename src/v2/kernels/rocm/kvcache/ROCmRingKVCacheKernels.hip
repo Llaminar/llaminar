@@ -71,6 +71,41 @@ namespace llaminar2
     }
 
     /**
+     * @brief Append tokens to ring buffer (graph-capturable variant)
+     *
+     * Reads head position from a device pointer instead of a scalar argument.
+     * This allows the kernel to be captured in a HIP graph while the head
+     * position is updated between graph replays via H2D memcpy.
+     *
+     * @tparam T Data type (float, _Float16, hip_bfloat16)
+     */
+    template <typename T>
+    __global__ void ring_append_kernel_dynamic(
+        T *__restrict__ d_K_cache,     // [max_seq_len, kv_dim]
+        T *__restrict__ d_V_cache,     // [max_seq_len, kv_dim]
+        const T *__restrict__ d_K_new, // [num_tokens, kv_dim]
+        const T *__restrict__ d_V_new, // [num_tokens, kv_dim]
+        const int *__restrict__ d_head, // Head position (read from device memory)
+        int max_seq_len,               // Ring buffer capacity
+        int kv_dim,                    // n_kv_heads * head_dim
+        int num_tokens)                // Tokens to append
+    {
+        const int token_idx = blockIdx.x;
+        const int elem_idx = blockIdx.y * blockDim.x + threadIdx.x;
+
+        if (token_idx >= num_tokens || elem_idx >= kv_dim)
+            return;
+
+        const int head = *d_head; // Read from device memory
+        const int dst_pos = (head + token_idx) % max_seq_len;
+        const int dst_offset = dst_pos * kv_dim + elem_idx;
+        const int src_offset = token_idx * kv_dim + elem_idx;
+
+        d_K_cache[dst_offset] = d_K_new[src_offset];
+        d_V_cache[dst_offset] = d_V_new[src_offset];
+    }
+
+    /**
      * @brief Linearize wrapped ring buffer to contiguous output
      *
      * Copies data from ring buffer [tail..end, 0..head) to linear [0..count)
@@ -338,6 +373,67 @@ namespace llaminar2
                            d_K_caches, d_V_caches,
                            tails, counts,
                            num_seqs, max_kv_len, max_seq_len, kv_dim);
+    }
+
+    // =========================================================================
+    // Dynamic Head Append Wrappers (graph-capturable)
+    // =========================================================================
+
+    extern "C" void hip_ring_append_dynamic_fp32(
+        float *d_K_cache, float *d_V_cache,
+        const float *d_K_new, const float *d_V_new,
+        const int *d_head, int max_seq_len, int kv_dim, int num_tokens,
+        hipStream_t stream)
+    {
+        if (num_tokens <= 0 || kv_dim <= 0)
+            return;
+
+        dim3 grid(num_tokens, (kv_dim + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        dim3 block(BLOCK_SIZE);
+
+        hipLaunchKernelGGL(ring_append_kernel_dynamic<float>,
+                           grid, block, 0, stream,
+                           d_K_cache, d_V_cache,
+                           d_K_new, d_V_new,
+                           d_head, max_seq_len, kv_dim, num_tokens);
+    }
+
+    extern "C" void hip_ring_append_dynamic_fp16(
+        _Float16 *d_K_cache, _Float16 *d_V_cache,
+        const _Float16 *d_K_new, const _Float16 *d_V_new,
+        const int *d_head, int max_seq_len, int kv_dim, int num_tokens,
+        hipStream_t stream)
+    {
+        if (num_tokens <= 0 || kv_dim <= 0)
+            return;
+
+        dim3 grid(num_tokens, (kv_dim + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        dim3 block(BLOCK_SIZE);
+
+        hipLaunchKernelGGL(ring_append_kernel_dynamic<_Float16>,
+                           grid, block, 0, stream,
+                           d_K_cache, d_V_cache,
+                           d_K_new, d_V_new,
+                           d_head, max_seq_len, kv_dim, num_tokens);
+    }
+
+    extern "C" void hip_ring_append_dynamic_bf16(
+        hip_bfloat16 *d_K_cache, hip_bfloat16 *d_V_cache,
+        const hip_bfloat16 *d_K_new, const hip_bfloat16 *d_V_new,
+        const int *d_head, int max_seq_len, int kv_dim, int num_tokens,
+        hipStream_t stream)
+    {
+        if (num_tokens <= 0 || kv_dim <= 0)
+            return;
+
+        dim3 grid(num_tokens, (kv_dim + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        dim3 block(BLOCK_SIZE);
+
+        hipLaunchKernelGGL(ring_append_kernel_dynamic<hip_bfloat16>,
+                           grid, block, 0, stream,
+                           d_K_cache, d_V_cache,
+                           d_K_new, d_V_new,
+                           d_head, max_seq_len, kv_dim, num_tokens);
     }
 
 } // namespace llaminar2

@@ -250,6 +250,7 @@ namespace llaminar2
         auto node = std::make_unique<ComputeNode>(name, std::move(stage), device);
         node_index_[name] = nodes_.size();
         nodes_.push_back(std::move(node));
+        order_dirty_ = true;
         return *this;
     }
 
@@ -270,11 +271,15 @@ namespace llaminar2
         }
 
         nodes_[it->second]->dependencies.push_back(depends_on);
+        order_dirty_ = true;
         return *this;
     }
 
-    std::vector<std::string> ComputeGraph::getExecutionOrder() const
+    const std::vector<std::string> &ComputeGraph::getExecutionOrder() const
     {
+        if (!order_dirty_)
+            return cached_order_;
+
         // Kahn's algorithm for topological sort
         std::unordered_map<std::string, int> in_degree;
         std::unordered_map<std::string, std::vector<std::string>> adjacency;
@@ -331,7 +336,9 @@ namespace llaminar2
             LOG_ERROR("[ComputeGraph] Cycle detected in graph!");
         }
 
-        return order;
+        cached_order_ = std::move(order);
+        order_dirty_ = false;
+        return cached_order_;
     }
 
     std::vector<std::string> ComputeGraph::getReadyNodes() const
@@ -423,6 +430,7 @@ namespace llaminar2
     {
         nodes_.clear();
         node_index_.clear();
+        order_dirty_ = true;
     }
 
     ComputeGraph &ComputeGraph::merge(ComputeGraph &&other, const std::string &connect_from)
@@ -474,6 +482,7 @@ namespace llaminar2
         other.nodes_.clear();
         other.node_index_.clear();
 
+        order_dirty_ = true;
         return *this;
     }
 
@@ -559,7 +568,7 @@ namespace llaminar2
 
     bool GraphExecutor::executeSequential(ComputeGraph &graph, IDeviceContext *ctx)
     {
-        auto order = graph.getExecutionOrder();
+        const auto &order = graph.getExecutionOrder();
 
         auto total_start = std::chrono::high_resolution_clock::now();
 
@@ -631,7 +640,7 @@ namespace llaminar2
         }
 #endif
 
-        auto order = graph.getExecutionOrder();
+        const auto &order = graph.getExecutionOrder();
 
         for (const auto &name : order)
         {
@@ -709,7 +718,7 @@ namespace llaminar2
         }
 #endif
 
-        auto order = graph.getExecutionOrder();
+        const auto &order = graph.getExecutionOrder();
         bool exec_success = true;
 
         // Set GPU stream on all stages so kernels dispatch to the capture stream
@@ -833,7 +842,7 @@ namespace llaminar2
             return executeFastDecode(graph, ctx);
         }
 
-        auto order = graph.getExecutionOrder();
+        const auto &order = graph.getExecutionOrder();
 
 #ifdef HAVE_ROCM
         if (ctx && ctx->deviceId().type == DeviceType::ROCm)
@@ -1054,6 +1063,21 @@ namespace llaminar2
 
                     // Sync before next graph segment
                     gpu_ctx->synchronize();
+                }
+            }
+
+            // Precompute replay_callbacks: cache pointers to stages that override
+            // onGraphReplayed(), avoiding per-step hash map lookups in Phase 3.
+            for (auto &seg : segment_cache.segments)
+            {
+                if (!seg.capturable)
+                    continue;
+                seg.replay_callbacks.clear();
+                for (const auto &stage_name : seg.stage_names)
+                {
+                    auto *node = graph.getNode(stage_name);
+                    if (node && node->stage && node->stage->needsOnGraphReplayed())
+                        seg.replay_callbacks.push_back(node->stage.get());
                 }
             }
 
@@ -1357,9 +1381,13 @@ namespace llaminar2
                         return executeFastDecode(graph, ctx);
                     }
 
-                    // Mark stages completed for graph bookkeeping
-                    for (const auto &stage_name : seg.stage_names)
-                        graph.markCompleted(stage_name);
+                    // Run post-replay hooks via precomputed list (no hash lookups)
+                    for (auto *stage : seg.replay_callbacks)
+                        stage->onGraphReplayed();
+
+                    // NOTE: markCompleted is intentionally skipped for capturable
+                    // segments — graph.reset() clears all flags at the start of
+                    // the next step, so marking is unnecessary overhead.
 
                     // CUDA workaround: Unlike ROCm/HIP graphs which properly
                     // order graph launches w.r.t. subsequent kernel launches on the
@@ -1387,7 +1415,7 @@ namespace llaminar2
                         LOG_ERROR("[GraphExecutor] Manual stage failed on replay: " << stage_name);
                         return false;
                     }
-                    graph.markCompleted(stage_name);
+                    // markCompleted skipped — graph.reset() clears at next step
                 }
                 // CUDA workaround: sync stream after manual segment before next graph
                 if (needs_segment_sync)
@@ -1399,8 +1427,9 @@ namespace llaminar2
             seg_idx++;
         }
 
-        // Final device sync — ensures all GPU work has completed before CPU reads
-        gpu_ctx->synchronize();
+        // NOTE: No device sync here — the caller (DeviceGraphOrchestrator::syncLogitsAtBoundary)
+        // performs the final synchronize. Removing the redundant sync eliminates the
+        // overhead of submitting through the worker thread GPU context.
 
         segment_cache.consecutive_failures = 0;
         return true;
@@ -1468,7 +1497,7 @@ namespace llaminar2
         }
 
         graph.reset();
-        auto order = graph.getExecutionOrder();
+        const auto &order = graph.getExecutionOrder();
 
         for (const auto &name : order)
         {

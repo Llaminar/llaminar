@@ -7,6 +7,7 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "kernels/IKVCache.h"
 
 namespace llaminar2
 {
@@ -67,11 +68,39 @@ namespace llaminar2
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::COPY; }
-        // KV cache append cannot be graph-captured because the write position
-        // (head) changes every decode step — capturing would freeze the position.
-        // Instead, the GraphExecutor runs this as a manual segment on the same
-        // capture_stream, avoiding cross-stream sync overhead.
-        bool isGraphCapturable() const override { return false; }
+        // KV cache append is graph-capturable when the KV cache supports
+        // device-side head parameters. The H2D memcpy + dynamic kernel are
+        // captured once; on replay, updateDynamicParams() writes the new head
+        // to the same pinned host buffer, which the captured H2D re-reads.
+        bool isGraphCapturable() const override
+        {
+            return params_.kv_cache && params_.kv_cache->isGraphCaptureReady();
+        }
+        void updateDynamicParams(int pos_offset, int seq_len) override
+        {
+            params_.seq_len = seq_len;
+            if (params_.kv_cache)
+            {
+                // Write current head position to the pinned host buffer and issue
+                // H2D async copy. The captured graph's H2D will re-read this value.
+                // NOTE: Do NOT advanceHead here — that happens in onGraphReplayed()
+                // after the graph launches. This preserves the invariant that
+                // get_cached_tokens() returns the previous step's count when
+                // AttentionComputeStage::updateDynamicParams() reads it.
+                void *stream = gpuStream();
+                params_.kv_cache->setDynamicHead(params_.layer_idx, params_.seq_idx, stream);
+            }
+        }
+        void onGraphReplayed() override
+        {
+            // Advance the ring buffer head and count on the host side.
+            // Called by GraphExecutor AFTER the captured graph segment replays.
+            if (params_.kv_cache)
+            {
+                params_.kv_cache->advanceHead(params_.layer_idx, params_.seq_idx, params_.num_tokens);
+            }
+        }
+        bool needsOnGraphReplayed() const override { return true; }
         bool supportsBackend(ComputeBackendType backend) const override { return true; }
         StageBufferRequirements getBufferRequirements() const override;
         std::vector<BufferDescriptor> getDeclaredOutputs() const override;

@@ -16,6 +16,7 @@
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
+#include "../../kvcache/KVCacheDeviceParams.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -56,6 +57,42 @@ namespace llaminar2
             return;
 
         // Calculate destination position with wrap-around
+        int dst_pos = (head + token_idx) % max_seq_len;
+        int dst_offset = dst_pos * kv_dim + elem_idx;
+        int src_offset = token_idx * kv_dim + elem_idx;
+
+        d_K_cache[dst_offset] = d_K_new[src_offset];
+        d_V_cache[dst_offset] = d_V_new[src_offset];
+    }
+
+    /**
+     * @brief Append tokens to ring buffer (graph-capturable variant)
+     *
+     * Reads head position from a device pointer instead of a scalar argument.
+     * This allows the kernel to be captured in a GPU graph while the head
+     * position is updated between graph replays via H2D memcpy to the
+     * device params buffer.
+     *
+     * @tparam T Data type (float, __half, __nv_bfloat16)
+     */
+    template <typename T>
+    __global__ void ring_append_kernel_dynamic(
+        T *__restrict__ d_K_cache,      // [max_seq_len, kv_dim]
+        T *__restrict__ d_V_cache,      // [max_seq_len, kv_dim]
+        const T *__restrict__ d_K_new,  // [num_tokens, kv_dim]
+        const T *__restrict__ d_V_new,  // [num_tokens, kv_dim]
+        const int *__restrict__ d_head, // Head position (read from device memory)
+        int max_seq_len,                // Ring buffer capacity
+        int kv_dim,                     // n_kv_heads * head_dim
+        int num_tokens)                 // Tokens to append
+    {
+        int token_idx = blockIdx.x;
+        int elem_idx = blockIdx.y * blockDim.x + threadIdx.x;
+
+        if (token_idx >= num_tokens || elem_idx >= kv_dim)
+            return;
+
+        int head = *d_head; // Read from device memory
         int dst_pos = (head + token_idx) % max_seq_len;
         int dst_offset = dst_pos * kv_dim + elem_idx;
         int src_offset = token_idx * kv_dim + elem_idx;
@@ -254,6 +291,58 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // Dynamic Head Append Wrappers (graph-capturable)
+    // =========================================================================
+
+    extern "C" void cuda_ring_append_dynamic_fp32(
+        float *d_K_cache, float *d_V_cache,
+        const float *d_K_new, const float *d_V_new,
+        const int *d_head, int max_seq_len, int kv_dim, int num_tokens,
+        cudaStream_t stream)
+    {
+        if (num_tokens == 0)
+            return;
+
+        dim3 block(256);
+        dim3 grid(num_tokens, (kv_dim + 255) / 256);
+        ring_append_kernel_dynamic<float><<<grid, block, 0, stream>>>(
+            d_K_cache, d_V_cache, d_K_new, d_V_new,
+            d_head, max_seq_len, kv_dim, num_tokens);
+    }
+
+    extern "C" void cuda_ring_append_dynamic_fp16(
+        __half *d_K_cache, __half *d_V_cache,
+        const __half *d_K_new, const __half *d_V_new,
+        const int *d_head, int max_seq_len, int kv_dim, int num_tokens,
+        cudaStream_t stream)
+    {
+        if (num_tokens == 0)
+            return;
+
+        dim3 block(256);
+        dim3 grid(num_tokens, (kv_dim + 255) / 256);
+        ring_append_kernel_dynamic<__half><<<grid, block, 0, stream>>>(
+            d_K_cache, d_V_cache, d_K_new, d_V_new,
+            d_head, max_seq_len, kv_dim, num_tokens);
+    }
+
+    extern "C" void cuda_ring_append_dynamic_bf16(
+        __nv_bfloat16 *d_K_cache, __nv_bfloat16 *d_V_cache,
+        const __nv_bfloat16 *d_K_new, const __nv_bfloat16 *d_V_new,
+        const int *d_head, int max_seq_len, int kv_dim, int num_tokens,
+        cudaStream_t stream)
+    {
+        if (num_tokens == 0)
+            return;
+
+        dim3 block(256);
+        dim3 grid(num_tokens, (kv_dim + 255) / 256);
+        ring_append_kernel_dynamic<__nv_bfloat16><<<grid, block, 0, stream>>>(
+            d_K_cache, d_V_cache, d_K_new, d_V_new,
+            d_head, max_seq_len, kv_dim, num_tokens);
+    }
+
+    // =========================================================================
     // CUDARingKVCache Implementation
     // =========================================================================
 
@@ -295,6 +384,8 @@ namespace llaminar2
         LOG_INFO("[CUDARingKVCache] Allocated "
                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
                  << " MB total (including scratch)");
+
+        allocate_device_params();
     }
 
     template <ActivationPrecision Precision>
@@ -348,6 +439,8 @@ namespace llaminar2
         LOG_INFO("[CUDARingKVCache] Allocated "
                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
                  << " MB total (including scratch)");
+
+        allocate_device_params();
     }
 
     template <ActivationPrecision Precision>
@@ -391,6 +484,8 @@ namespace llaminar2
         LOG_INFO("[CUDARingKVCache] Allocated "
                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
                  << " MB total (including scratch)");
+
+        allocate_device_params();
     }
 
     template <ActivationPrecision Precision>
@@ -447,6 +542,8 @@ namespace llaminar2
         LOG_INFO("[CUDARingKVCache] Allocated "
                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
                  << " MB total (including scratch)");
+
+        allocate_device_params();
     }
 
     template <ActivationPrecision Precision>
@@ -459,6 +556,8 @@ namespace llaminar2
             // Runtime is shutting down, skip cleanup
             return;
         }
+
+        free_device_params();
 
         for (auto &layer_entries : entries_)
         {
@@ -530,6 +629,144 @@ namespace llaminar2
         entry.d_V_scratch = nullptr;
     }
 
+    // =========================================================================
+    // Graph Capture Device Params Management
+    // =========================================================================
+
+    template <ActivationPrecision Precision>
+    void CUDARingKVCache<Precision>::allocate_device_params()
+    {
+        int num_entries = n_layers_ * batch_size_;
+        cudaError_t err;
+
+        err = cudaMalloc(&d_head_params_, num_entries * sizeof(int));
+        if (err != cudaSuccess)
+        {
+            LOG_WARN("[CUDARingKVCache] Failed to allocate device head params: "
+                     << cudaGetErrorString(err) << " - graph capture for KV append disabled");
+            d_head_params_ = nullptr;
+            h_head_params_ = nullptr;
+            return;
+        }
+
+        err = cudaMallocHost(&h_head_params_, num_entries * sizeof(int));
+        if (err != cudaSuccess)
+        {
+            LOG_WARN("[CUDARingKVCache] Failed to allocate pinned head params: "
+                     << cudaGetErrorString(err) << " - graph capture for KV append disabled");
+            cudaFree(d_head_params_);
+            d_head_params_ = nullptr;
+            h_head_params_ = nullptr;
+            return;
+        }
+
+        // Initialize to zeros
+        cudaMemset(d_head_params_, 0, num_entries * sizeof(int));
+        std::memset(h_head_params_, 0, num_entries * sizeof(int));
+
+        LOG_DEBUG("[CUDARingKVCache] Allocated device params for graph capture: "
+                  << num_entries << " entries (" << num_entries * sizeof(int) << " bytes)");
+    }
+
+    template <ActivationPrecision Precision>
+    void CUDARingKVCache<Precision>::free_device_params()
+    {
+        if (d_head_params_)
+        {
+            cudaError_t err = cudaFree(d_head_params_);
+            if (err != cudaSuccess && err != cudaErrorCudartUnloading && err != cudaErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: cudaFree(d_head_params_) failed: %s\n", cudaGetErrorString(err));
+            }
+            d_head_params_ = nullptr;
+        }
+        if (h_head_params_)
+        {
+            cudaError_t err = cudaFreeHost(h_head_params_);
+            if (err != cudaSuccess && err != cudaErrorCudartUnloading && err != cudaErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: cudaFreeHost(h_head_params_) failed: %s\n", cudaGetErrorString(err));
+            }
+            h_head_params_ = nullptr;
+        }
+    }
+
+    template <ActivationPrecision Precision>
+    void CUDARingKVCache<Precision>::setDynamicHead(int layer, int seq_idx, void * /*gpu_stream*/)
+    {
+        if (!d_head_params_ || !h_head_params_)
+            return;
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+            return;
+
+        int idx = layer * batch_size_ + seq_idx;
+        h_head_params_[idx] = entries_[layer][seq_idx].head;
+        // No explicit H2D needed — the graph's captured cudaMemcpyAsync reads
+        // from this same pinned host buffer on replay. For stream-only/non-graph
+        // mode, append_typed() issues its own H2D during execute().
+    }
+
+    template <ActivationPrecision Precision>
+    void CUDARingKVCache<Precision>::advanceHead(int layer, int seq_idx, int num_tokens)
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+            return;
+
+        EntryT &entry = entries_[layer][seq_idx];
+
+        // Handle auto-eviction (same logic as append_typed)
+        if (entry.count + num_tokens > max_seq_len_)
+        {
+            int to_evict = entry.count + num_tokens - max_seq_len_;
+            entry.count -= to_evict;
+            total_evicted_ += to_evict;
+        }
+
+        entry.head = (entry.head + num_tokens) % max_seq_len_;
+        entry.count += num_tokens;
+        entry.scratch_valid = false;
+    }
+
+    // =========================================================================
+    // Dynamic Head Kernel Launcher (graph-capturable)
+    // =========================================================================
+
+    // Forward declarations for dynamic wrappers
+    extern "C" void cuda_ring_append_dynamic_fp32(
+        float *, float *, const float *, const float *,
+        const int *, int, int, int, cudaStream_t);
+    extern "C" void cuda_ring_append_dynamic_fp16(
+        __half *, __half *, const __half *, const __half *,
+        const int *, int, int, int, cudaStream_t);
+    extern "C" void cuda_ring_append_dynamic_bf16(
+        __nv_bfloat16 *, __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *,
+        const int *, int, int, int, cudaStream_t);
+
+    template <ActivationPrecision Precision>
+    void CUDARingKVCache<Precision>::launch_append_kernel_dynamic(
+        EntryT &entry, const DataT *d_k, const DataT *d_v,
+        const int *d_head, int num_tokens, cudaStream_t stream)
+    {
+        if constexpr (Precision == ActivationPrecision::FP32)
+        {
+            cuda_ring_append_dynamic_fp32(
+                entry.d_K, entry.d_V, d_k, d_v,
+                d_head, max_seq_len_, kv_dim_, num_tokens, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::FP16)
+        {
+            cuda_ring_append_dynamic_fp16(
+                entry.d_K, entry.d_V, d_k, d_v,
+                d_head, max_seq_len_, kv_dim_, num_tokens, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::BF16)
+        {
+            cuda_ring_append_dynamic_bf16(
+                entry.d_K, entry.d_V, d_k, d_v,
+                d_head, max_seq_len_, kv_dim_, num_tokens, stream);
+        }
+    }
+
     template <ActivationPrecision Precision>
     int CUDARingKVCache<Precision>::get_cached_tokens(int layer, int seq_idx) const
     {
@@ -596,8 +833,23 @@ namespace llaminar2
             LOG_DEBUG("[CUDARingKVCache::append] Auto-evicted " << to_evict << " tokens");
         }
 
-        // Launch append kernel
-        launch_append_kernel(entry, d_k, d_v, num_tokens, stream);
+        // Use dynamic head params when available and stream is provided.
+        // This path is graph-capturable: the H2D copy and kernel launch are
+        // recorded in the graph, and on replay setDynamicHead() updates the
+        // pinned host buffer before the captured H2D re-reads it.
+        if (d_head_params_ && h_head_params_ && stream)
+        {
+            int idx = layer * batch_size_ + seq_idx;
+            h_head_params_[idx] = entry.head;
+            cudaMemcpyAsync(&d_head_params_[idx], &h_head_params_[idx],
+                            sizeof(int), cudaMemcpyHostToDevice, stream);
+            launch_append_kernel_dynamic(entry, d_k, d_v, &d_head_params_[idx], num_tokens, stream);
+        }
+        else
+        {
+            // Fallback: scalar head argument (non-graph path)
+            launch_append_kernel(entry, d_k, d_v, num_tokens, stream);
+        }
 
         // Update ring buffer state
         entry.head = (entry.head + num_tokens) % max_seq_len_;

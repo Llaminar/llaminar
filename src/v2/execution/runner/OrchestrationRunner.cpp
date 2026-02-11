@@ -223,13 +223,12 @@ namespace llaminar2
             return result;
         }
 
-        // Tail stage: sample token
+        // Tail stage: sample token — zero-copy via raw pointer
         int vocab = vocabSize();
-        std::vector<float> logits_vec(logits, logits + vocab);
 
         SamplingParams params;
         params.temperature = 0.0f; // Greedy by default
-        int token = sampler_.sample(logits_vec, params);
+        int token = sampler_.sample(logits, static_cast<size_t>(vocab), params);
 
         result.tokens.push_back(token);
         last_token_ = token; // Store for next decode step

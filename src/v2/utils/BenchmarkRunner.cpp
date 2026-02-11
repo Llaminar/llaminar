@@ -7,6 +7,7 @@
 
 #include "BenchmarkRunner.h"
 #include "Logger.h"
+#include "DebugEnv.h"
 #include "KernelProfiler.h"
 #include "CUDAKernelProfiler.h"
 #include "ROCmKernelProfiler.h"
@@ -114,6 +115,10 @@ namespace llaminar2
         std::string generated_text;
         int tokens_generated = 0;
 
+        // Sampler profiling (enabled when LLAMINAR_PROFILING=1)
+        const bool profile_sampler = debugEnv().profile.enabled;
+        double sampler_total_us = 0.0;
+
         // Synchronize before timing decode phase
         MPI_Barrier(MPI_COMM_WORLD);
 
@@ -128,10 +133,15 @@ namespace llaminar2
             {
                 const float *logits = runner_->logits();
                 size_t vocab_size = tokenizer_->vocab_size();
-                std::vector<float> logits_vec(logits, logits + vocab_size);
 
-                // Greedy sampling (argmax) for deterministic benchmark
-                next_token = sampler.sample_greedy(logits_vec);
+                // Greedy sampling (argmax) directly on raw pointer — zero-copy
+                auto t0 = profile_sampler ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
+                next_token = sampler.sample_greedy(logits, vocab_size);
+                if (profile_sampler)
+                {
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    sampler_total_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                }
 
                 // Collect generated text for verification (but don't print during benchmark)
                 if (!tokenizer_->is_stop_token(next_token))
@@ -167,6 +177,17 @@ namespace llaminar2
 
         auto end = std::chrono::high_resolution_clock::now();
         double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+        // Report sampler overhead
+        if (profile_sampler && mpi_ctx_->rank() == 0 && tokens_generated > 0)
+        {
+            double avg_us = sampler_total_us / tokens_generated;
+            double pct = (sampler_total_us / 1000.0) / time_ms * 100.0;
+            LOG_INFO("Sampler profiling: " << std::fixed << std::setprecision(1)
+                                           << avg_us << " µs/token avg, "
+                                           << sampler_total_us / 1000.0 << " ms total ("
+                                           << pct << "% of decode time)");
+        }
 
         return {true, time_ms, tokens_generated, generated_text};
     }

@@ -34,6 +34,7 @@
 
 // Minimal includes - avoid MPI headers for hipcc compatibility
 #include "../../IKVCache.h"                          // Unified KVCache interface (src/v2/kernels/IKVCache.h)
+#include "../../kvcache/KVCacheDeviceParams.h"       // Device-side params for graph capture
 #include "../../../execution/config/RuntimeConfig.h" // For ActivationPrecision
 #include "../../../interfaces/IWorkspaceConsumer.h"  // Workspace management
 #include "../../../backends/IWorkerGPUContext.h"     // Device context support
@@ -241,6 +242,12 @@ namespace llaminar2
         virtual void reset_eviction_counter() = 0;
         virtual int get_linearization_count() const = 0;
         virtual void reset_linearization_counter() = 0;
+
+        // =====================================================================
+        // Graph Capture Support (IKVCache interface)
+        // =====================================================================
+
+        // Overrides are provided by the concrete ROCmRingKVCache<P> class
     };
 
     // =========================================================================
@@ -569,6 +576,16 @@ namespace llaminar2
          */
         IWorkerGPUContext *deviceContext() const { return device_ctx_; }
 
+        // =====================================================================
+        // Graph Capture Support (IKVCache overrides)
+        // =====================================================================
+
+        bool isGraphCaptureReady() const override { return d_head_params_ != nullptr; }
+
+        void setDynamicHead(int layer, int seq_idx, void *gpu_stream) override;
+
+        void advanceHead(int layer, int seq_idx, int num_tokens) override;
+
     private:
         int n_layers_;
         int batch_size_;
@@ -601,9 +618,22 @@ namespace llaminar2
         mutable int total_evicted_ = 0;
         mutable int linearization_count_ = 0;
 
+        // =====================================================================
+        // Graph Capture Device Params
+        // =====================================================================
+
+        // Device-side head position buffer for graph-capturable append.
+        // Layout: [n_layers_ * batch_size_] ints on device memory.
+        int *d_head_params_ = nullptr;
+
+        // Pinned host-side head position buffer (for H2D copy).
+        int *h_head_params_ = nullptr;
+
         // Helper methods
         void allocate_entry(EntryT &entry);
         void free_entry(EntryT &entry);
+        void allocate_device_params();
+        void free_device_params();
         void linearize_entry(EntryT &entry, hipStream_t stream);
 
         /**
@@ -624,6 +654,8 @@ namespace llaminar2
         // Kernel launchers
         void launch_append_kernel(EntryT &entry, const DataT *d_k, const DataT *d_v,
                                   int num_tokens, hipStream_t stream);
+        void launch_append_kernel_dynamic(EntryT &entry, const DataT *d_k, const DataT *d_v,
+                                          const int *d_head, int num_tokens, hipStream_t stream);
         void launch_linearize_kernel(const EntryT &entry, DataT *d_k_out, DataT *d_v_out,
                                      hipStream_t stream);
         void launch_gather_kernel(const std::vector<EntryT *> &entries,

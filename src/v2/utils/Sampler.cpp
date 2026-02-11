@@ -32,37 +32,45 @@ namespace llaminar2
 
     int Sampler::sample(const std::vector<float> &logits, const SamplingParams &params)
     {
-        if (logits.empty())
+        return sample(logits.data(), logits.size(), params);
+    }
+
+    int Sampler::sample(const float *logits, size_t vocab_size, const SamplingParams &params)
+    {
+        if (!logits || vocab_size == 0)
         {
             throw std::invalid_argument("Cannot sample from empty logits");
         }
 
-        // Greedy sampling (deterministic)
+        // Greedy sampling (deterministic) - zero-copy path
         if (params.is_greedy())
         {
-            return sample_greedy(logits);
+            return sample_greedy(logits, vocab_size);
         }
 
+        // Non-greedy paths need a vector (only allocate when truly needed)
+        std::vector<float> logits_vec(logits, logits + vocab_size);
+
         // Apply top-k if specified
-        if (params.top_k > 0 && params.top_k < static_cast<int>(logits.size()))
+        if (params.top_k > 0 && params.top_k < static_cast<int>(vocab_size))
         {
-            return sample_top_k(logits, params.top_k, params.temperature);
+            return sample_top_k(logits_vec, params.top_k, params.temperature);
         }
 
         // Apply top-p if specified
         if (params.top_p < 1.0f)
         {
-            return sample_top_p(logits, params.top_p, params.temperature);
+            return sample_top_p(logits_vec, params.top_p, params.temperature);
         }
 
         // Temperature sampling only
         if (params.temperature != 1.0f)
         {
-            return sample_temperature(logits, params.temperature);
+            return sample_temperature(logits_vec, params.temperature);
         }
 
         // Standard sampling (temperature = 1.0, no filtering)
-        auto probs = softmax(logits);
+        auto probs = softmax(logits_vec);
         return sample_from_probs(probs);
     }
 
@@ -74,6 +82,16 @@ namespace llaminar2
         }
 
         return std::max_element(logits.begin(), logits.end()) - logits.begin();
+    }
+
+    int Sampler::sample_greedy(const float *logits, size_t vocab_size)
+    {
+        if (!logits || vocab_size == 0)
+        {
+            throw std::invalid_argument("Cannot sample from empty logits");
+        }
+
+        return std::max_element(logits, logits + vocab_size) - logits;
     }
 
     int Sampler::sample_temperature(const std::vector<float> &logits, float temperature)

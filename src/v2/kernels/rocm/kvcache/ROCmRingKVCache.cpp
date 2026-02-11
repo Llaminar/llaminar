@@ -20,6 +20,7 @@
 #include "../../../backends/rocm/HipDeviceGuard.h"
 
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 
 namespace llaminar2
@@ -88,6 +89,17 @@ namespace llaminar2
         const int *tails, const int *counts,
         int num_seqs, int max_kv_len, int max_seq_len, int kv_dim,
         hipStream_t stream);
+
+    // Dynamic head append wrappers (graph-capturable)
+    extern "C" void hip_ring_append_dynamic_fp32(
+        float *, float *, const float *, const float *,
+        const int *, int, int, int, hipStream_t);
+    extern "C" void hip_ring_append_dynamic_fp16(
+        _Float16 *, _Float16 *, const _Float16 *, const _Float16 *,
+        const int *, int, int, int, hipStream_t);
+    extern "C" void hip_ring_append_dynamic_bf16(
+        hip_bfloat16 *, hip_bfloat16 *, const hip_bfloat16 *, const hip_bfloat16 *,
+        const int *, int, int, int, hipStream_t);
 
     // =========================================================================
     // IROCmRingKVCache::append(ITensor*) implementation
@@ -184,6 +196,8 @@ namespace llaminar2
         LOG_DEBUG("[ROCmRingKVCache] Allocated "
                   << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
                   << " MB total (including scratch)");
+
+        allocate_device_params();
     }
 
     template <ActivationPrecision Precision>
@@ -237,6 +251,8 @@ namespace llaminar2
         LOG_DEBUG("[ROCmRingKVCache] Allocated "
                   << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
                   << " MB total (including scratch)");
+
+        allocate_device_params();
     }
 
     template <ActivationPrecision Precision>
@@ -280,6 +296,8 @@ namespace llaminar2
         LOG_DEBUG("[ROCmRingKVCache] Allocated "
                   << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
                   << " MB total (including scratch)");
+
+        allocate_device_params();
     }
 
     template <ActivationPrecision Precision>
@@ -336,6 +354,8 @@ namespace llaminar2
         LOG_DEBUG("[ROCmRingKVCache] Allocated "
                   << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
                   << " MB total (including scratch)");
+
+        allocate_device_params();
     }
 
     template <ActivationPrecision Precision>
@@ -348,6 +368,8 @@ namespace llaminar2
             // Runtime is shutting down, skip cleanup
             return;
         }
+
+        free_device_params();
 
         for (auto &layer_entries : entries_)
         {
@@ -510,7 +532,25 @@ namespace llaminar2
         {
             const DataT *d_k_adjusted = d_k + tokens_to_skip * kv_dim_;
             const DataT *d_v_adjusted = d_v + tokens_to_skip * kv_dim_;
-            launch_append_kernel(entry, d_k_adjusted, d_v_adjusted, tokens_to_write, stream);
+
+            // Use dynamic head params when available and stream is provided.
+            // This path is graph-capturable: the H2D copy and kernel launch are
+            // recorded in the graph, and on replay setDynamicHead() updates the
+            // pinned host buffer before the captured H2D re-reads it.
+            if (d_head_params_ && h_head_params_ && stream)
+            {
+                int idx = layer * batch_size_ + seq_idx;
+                h_head_params_[idx] = entry.head;
+                hipMemcpyAsync(&d_head_params_[idx], &h_head_params_[idx],
+                               sizeof(int), hipMemcpyHostToDevice, stream);
+                launch_append_kernel_dynamic(entry, d_k_adjusted, d_v_adjusted,
+                                             &d_head_params_[idx], tokens_to_write, stream);
+            }
+            else
+            {
+                // Fallback: scalar head argument (non-graph path)
+                launch_append_kernel(entry, d_k_adjusted, d_v_adjusted, tokens_to_write, stream);
+            }
         }
 
         // Update ring buffer state based on actual tokens written
@@ -543,6 +583,129 @@ namespace llaminar2
             hip_ring_append_bf16(
                 entry.d_K, entry.d_V, d_k, d_v,
                 entry.head, max_seq_len_, kv_dim_, num_tokens, stream);
+        }
+    }
+
+    // =========================================================================
+    // Graph Capture Support: Device-side head parameters
+    // =========================================================================
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::allocate_device_params()
+    {
+        int num_entries = n_layers_ * batch_size_;
+        hipError_t err;
+
+        err = hipMalloc(&d_head_params_, num_entries * sizeof(int));
+        if (err != hipSuccess)
+        {
+            LOG_WARN("[ROCmRingKVCache] Failed to allocate device head params: "
+                     << hipGetErrorString(err) << " - graph capture for KV append disabled");
+            d_head_params_ = nullptr;
+            h_head_params_ = nullptr;
+            return;
+        }
+
+        err = hipHostMalloc(&h_head_params_, num_entries * sizeof(int));
+        if (err != hipSuccess)
+        {
+            LOG_WARN("[ROCmRingKVCache] Failed to allocate pinned head params: "
+                     << hipGetErrorString(err) << " - graph capture for KV append disabled");
+            hipFree(d_head_params_);
+            d_head_params_ = nullptr;
+            h_head_params_ = nullptr;
+            return;
+        }
+
+        // Initialize to zeros
+        hipMemset(d_head_params_, 0, num_entries * sizeof(int));
+        std::memset(h_head_params_, 0, num_entries * sizeof(int));
+
+        LOG_DEBUG("[ROCmRingKVCache] Allocated device params for graph capture: "
+                  << num_entries << " entries (" << num_entries * sizeof(int) << " bytes)");
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::free_device_params()
+    {
+        if (d_head_params_)
+        {
+            hipError_t err = hipFree(d_head_params_);
+            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: hipFree(d_head_params_) failed: %s\n", hipGetErrorString(err));
+            }
+            d_head_params_ = nullptr;
+        }
+        if (h_head_params_)
+        {
+            hipError_t err = hipHostFree(h_head_params_);
+            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: hipHostFree(h_head_params_) failed: %s\n", hipGetErrorString(err));
+            }
+            h_head_params_ = nullptr;
+        }
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::setDynamicHead(int layer, int seq_idx, void * /*gpu_stream*/)
+    {
+        if (!d_head_params_ || !h_head_params_)
+            return;
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+            return;
+
+        int idx = layer * batch_size_ + seq_idx;
+        h_head_params_[idx] = entries_[layer][seq_idx].head;
+        // No explicit H2D needed — the graph's captured hipMemcpyAsync reads
+        // from this same pinned host buffer on replay. For stream-only/non-graph
+        // mode, append_typed() issues its own H2D during execute().
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::advanceHead(int layer, int seq_idx, int num_tokens)
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+            return;
+
+        EntryT &entry = entries_[layer][seq_idx];
+
+        // Handle auto-eviction (same logic as append_typed)
+        if (entry.count + num_tokens > max_seq_len_)
+        {
+            int to_evict = entry.count + num_tokens - max_seq_len_;
+            entry.count -= to_evict;
+            total_evicted_ += to_evict;
+        }
+
+        entry.head = (entry.head + num_tokens) % max_seq_len_;
+        entry.count += num_tokens;
+        entry.scratch_valid = false;
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::launch_append_kernel_dynamic(
+        EntryT &entry, const DataT *d_k, const DataT *d_v,
+        const int *d_head, int num_tokens, hipStream_t stream)
+    {
+        if constexpr (Precision == ActivationPrecision::FP32)
+        {
+            hip_ring_append_dynamic_fp32(
+                entry.d_K, entry.d_V, d_k, d_v,
+                d_head, max_seq_len_, kv_dim_, num_tokens, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::FP16)
+        {
+            hip_ring_append_dynamic_fp16(
+                entry.d_K, entry.d_V, d_k, d_v,
+                d_head, max_seq_len_, kv_dim_, num_tokens, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::BF16)
+        {
+            hip_ring_append_dynamic_bf16(
+                entry.d_K, entry.d_V, d_k, d_v,
+                d_head, max_seq_len_, kv_dim_, num_tokens, stream);
         }
     }
 

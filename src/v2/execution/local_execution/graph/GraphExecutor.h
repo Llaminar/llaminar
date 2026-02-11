@@ -109,9 +109,12 @@ namespace llaminar2
 
         /**
          * @brief Get execution order respecting dependencies
-         * @return Vector of node names in valid execution order
+         * @return Reference to cached vector of node names in valid execution order
+         *
+         * The execution order is computed via topological sort on the first call
+         * and cached until the graph is modified (addNode, addDependency, merge, clear).
          */
-        std::vector<std::string> getExecutionOrder() const;
+        const std::vector<std::string> &getExecutionOrder() const;
 
         /**
          * @brief Get nodes that can execute in parallel (no unmet dependencies)
@@ -186,6 +189,8 @@ namespace llaminar2
     private:
         std::vector<std::unique_ptr<ComputeNode>> nodes_;
         std::unordered_map<std::string, size_t> node_index_;
+        mutable std::vector<std::string> cached_order_; ///< Cached topological order
+        mutable bool order_dirty_ = true;               ///< Invalidated on graph mutation
     };
 
     /**
@@ -428,9 +433,10 @@ namespace llaminar2
          */
         struct GraphSegment
         {
-            std::vector<std::string> stage_names;      ///< Ordered stage names in this segment
-            bool capturable = true;                    ///< Whether this segment can be graph-captured
-            std::unique_ptr<IGPUGraphCapture> capture; ///< GPU graph (only for capturable segments)
+            std::vector<std::string> stage_names;          ///< Ordered stage names in this segment
+            bool capturable = true;                        ///< Whether this segment can be graph-captured
+            std::unique_ptr<IGPUGraphCapture> capture;     ///< GPU graph (only for capturable segments)
+            std::vector<IComputeStage *> replay_callbacks; ///< Stages needing onGraphReplayed() (precomputed)
         };
 
         /**

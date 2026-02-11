@@ -85,6 +85,19 @@ namespace llaminar2
         int sample(const std::vector<float> &logits, const SamplingParams &params);
 
         /**
+         * @brief Sample next token from raw logits pointer (zero-copy)
+         *
+         * Avoids vector allocation for greedy path. For non-greedy sampling,
+         * constructs a vector internally only when needed.
+         *
+         * @param logits Raw logits pointer from model
+         * @param vocab_size Number of logit values
+         * @param params Sampling parameters
+         * @return Token ID (index into vocabulary)
+         */
+        int sample(const float *logits, size_t vocab_size, const SamplingParams &params);
+
+        /**
          * @brief Greedy sampling (always select argmax)
          *
          * Deterministic: Always returns token with highest logit value.
@@ -93,6 +106,18 @@ namespace llaminar2
          * @return Token ID with highest logit
          */
         int sample_greedy(const std::vector<float> &logits);
+
+        /**
+         * @brief Greedy sampling from raw pointer (zero-copy)
+         *
+         * Deterministic argmax directly on raw logits pointer.
+         * Avoids the ~600KB heap allocation per token for typical LLM vocab sizes.
+         *
+         * @param logits Raw logits pointer
+         * @param vocab_size Number of logit values
+         * @return Token ID with highest logit
+         */
+        int sample_greedy(const float *logits, size_t vocab_size);
 
         /**
          * @brief Sample with temperature scaling

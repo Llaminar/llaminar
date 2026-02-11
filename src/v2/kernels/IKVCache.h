@@ -232,6 +232,66 @@ namespace llaminar2
         }
 
         // =================================================================
+        // Graph Capture Support
+        // =================================================================
+
+        /**
+         * @brief Check if this cache supports GPU graph capture for append
+         *
+         * GPU caches that allocate device-side head parameter buffers return true.
+         * When true, the KVCacheAppendStage can mark itself as graph-capturable.
+         *
+         * @return true if setDynamicHead() and advanceHead() are implemented
+         */
+        virtual bool isGraphCaptureReady() const { return false; }
+
+        /**
+         * @brief Copy current head position to device buffer for graph replay
+         *
+         * Updates the pinned host buffer with the current ring buffer head
+         * position and issues an H2D copy on the given stream. This ensures
+         * the device buffer has the correct value before the graph replays
+         * the captured ring_append_kernel.
+         *
+         * For graph mode: the captured H2D in the graph also re-reads from
+         * the pinned host buffer, making the explicit copy here a no-op
+         * (but it's needed for stream-only mode without graph capture).
+         *
+         * @param layer Layer index
+         * @param seq_idx Sequence index
+         * @param gpu_stream GPU stream for the H2D copy
+         */
+        virtual void setDynamicHead(int layer, int seq_idx, void *gpu_stream)
+        {
+            (void)layer;
+            (void)seq_idx;
+            (void)gpu_stream;
+        }
+
+        /**
+         * @brief Advance ring buffer head position (host-side bookkeeping)
+         *
+         * During graph replay, execute() is not called on the KVCacheAppendStage.
+         * This method performs the host-side state updates that append() would
+         * normally do: advancing the head position, updating the token count,
+         * and handling auto-eviction when the ring buffer is full.
+         *
+         * Must be called AFTER setDynamicHead() to maintain correct ordering:
+         * setDynamicHead copies the CURRENT head to device, then advanceHead
+         * moves the head forward for the NEXT iteration.
+         *
+         * @param layer Layer index
+         * @param seq_idx Sequence index
+         * @param num_tokens Number of tokens appended (typically 1 during decode)
+         */
+        virtual void advanceHead(int layer, int seq_idx, int num_tokens)
+        {
+            (void)layer;
+            (void)seq_idx;
+            (void)num_tokens;
+        }
+
+        // =================================================================
         // Clear Operations
         // =================================================================
 

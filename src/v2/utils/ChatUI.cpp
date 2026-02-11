@@ -442,19 +442,17 @@ namespace llaminar2
                     break;
                 }
 
-                // Convert to vector for sampling
+                // Sample next token — zero-copy via raw pointer
                 size_t vocab_size = tokenizer_->vocab_size();
-                std::vector<float> logits_vec(logits_ptr, logits_ptr + vocab_size);
 
-                // Sample next token
                 int next_token;
                 if (config_.temperature < 0.01f)
                 {
-                    next_token = sampler.sample_greedy(logits_vec);
+                    next_token = sampler.sample_greedy(logits_ptr, vocab_size);
                 }
                 else
                 {
-                    next_token = sampler.sample(logits_vec, sampling_params);
+                    next_token = sampler.sample(logits_ptr, vocab_size, sampling_params);
                 }
                 token_count++;
 

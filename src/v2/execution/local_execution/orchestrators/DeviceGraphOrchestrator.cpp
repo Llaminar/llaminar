@@ -597,7 +597,7 @@ namespace llaminar2
             void *replay_stream = forward_cache_.segment_cache.capture_stream;
             if (replay_stream)
             {
-                auto order = forward_cache_.graph->getExecutionOrder();
+                const auto &order = forward_cache_.graph->getExecutionOrder();
                 for (const auto &node_name : order)
                 {
                     ComputeNode *node = forward_cache_.graph->getNode(node_name);
@@ -2476,7 +2476,7 @@ namespace llaminar2
     void DeviceGraphOrchestrator::updateCachedGraphParams(ComputeGraph &graph, int pos_offset, int seq_len)
     {
         // Update all stages in the graph that have dynamic parameters
-        auto order = graph.getExecutionOrder();
+        const auto &order = graph.getExecutionOrder();
 
         for (const auto &node_name : order)
         {

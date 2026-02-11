@@ -579,6 +579,29 @@ namespace llaminar2
             (void)seq_len;
         }
 
+        /**
+         * @brief Called after a captured GPU graph segment is replayed.
+         *
+         * This method is invoked by GraphExecutor after launching a graph segment
+         * containing this stage (Phase 3 replay). It allows stages to perform
+         * host-side bookkeeping that would normally happen inside execute().
+         *
+         * Primary use case: KVCacheAppendStage advances the ring buffer head
+         * position and count after the replayed graph performs the actual GPU append.
+         * This MUST happen AFTER the graph replay (not before in updateDynamicParams)
+         * to preserve the invariant that get_cached_tokens() returns the PREVIOUS
+         * step's count during updateDynamicParams.
+         */
+        virtual void onGraphReplayed() {}
+
+        /**
+         * @brief Returns true if this stage overrides onGraphReplayed().
+         *
+         * Used by GraphExecutor to precompute a list of stages needing
+         * post-replay callbacks, avoiding per-step hash map lookups.
+         */
+        virtual bool needsOnGraphReplayed() const { return false; }
+
     protected:
         /**
          * @brief Build dump info (implemented by derived classes)
