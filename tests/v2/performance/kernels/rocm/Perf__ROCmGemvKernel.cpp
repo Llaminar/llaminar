@@ -82,6 +82,11 @@ extern "C"
         int kb);
 
     void rocmGemv_int8_vnni_reset_tuning_overrides();
+    void rocmGemv_int8_vnni_set_wide_tuning_overrides(
+        int wide_tn,
+        int wide_cpt,
+        int wide_vec_load);
+    void rocmGemv_int8_vnni_reset_wide_tuning_overrides();
 
     bool rocmQuantGemm_executeTwoKernel_cached(
         const int8_t *d_A_int8,
@@ -1206,6 +1211,91 @@ namespace
         fprintf(stderr, "\nINT8 Q/Wo baseline GEMV min: %.6f ms\n", baseline.gemv_min_ms);
         fprintf(stderr, "INT8 Q/Wo best config: TN=%d KB=%d GEMV min=%.6f ms speedup=%.4fx\n", best_tn, best_kb, best_gemv_min, best_speedup);
         fprintf(stderr, "\nINT8 Q/Wo autosweep (N=%d, K=%d)\n%s\n", N, K, table.to_string().c_str());
+#endif
+    }
+    TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_LMHead_AutoSweep)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_INT8_LMHEAD_AUTOSWEEP");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_INT8_LMHEAD_AUTOSWEEP=1 to run INT8 LM Head autosweep";
+        }
+
+        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
+
+        const int N = kQwen7B.vocab;
+        const int K = kQwen7B.hidden;
+        const std::vector<int> tn_candidates = {128, 256, 512};
+        const std::vector<int> cpt_candidates = {2, 4};
+        const std::vector<int> vec_load_candidates = {1, 0};
+
+        rocmGemv_int8_vnni_reset_tuning_overrides();
+        rocmGemv_int8_vnni_reset_wide_tuning_overrides();
+        const auto baseline = benchmarkGemvSplit(N, K, 5, 20);
+        ASSERT_TRUE(baseline.success);
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "TN" << "CPT" << "VecLoad" << "Quant min(ms)" << "GEMV min(ms)" << "Scale min(ms)" << "Total min(ms)" << "GEMV speedup"
+              << fort::endr;
+
+        table.column(0).set_cell_text_align(fort::text_align::right);
+        table.column(1).set_cell_text_align(fort::text_align::right);
+        table.column(2).set_cell_text_align(fort::text_align::center);
+        for (int i = 3; i <= 7; ++i)
+            table.column(i).set_cell_text_align(fort::text_align::right);
+
+        double best_gemv_min = std::numeric_limits<double>::max();
+        int best_tn = -1;
+        int best_cpt = -1;
+        int best_vec_load = -1;
+
+        for (const int tn : tn_candidates)
+        {
+            for (const int cpt : cpt_candidates)
+            {
+                for (const int vec_load : vec_load_candidates)
+                {
+                    rocmGemv_int8_vnni_set_wide_tuning_overrides(tn, cpt, vec_load);
+                    const auto r = benchmarkGemvSplit(N, K, 3, 15);
+                    ASSERT_TRUE(r.success);
+
+                    const double speedup = baseline.gemv_min_ms / std::max(1e-9, r.gemv_min_ms);
+                    table << tn
+                          << cpt
+                          << (vec_load ? "on" : "off")
+                          << formatMs(r.quant_min_ms)
+                          << formatMs(r.gemv_min_ms)
+                          << formatMs(r.scale_min_ms)
+                          << formatMs(r.total.min_ms)
+                          << formatMs(speedup)
+                          << fort::endr;
+
+                    if (r.gemv_min_ms < best_gemv_min)
+                    {
+                        best_gemv_min = r.gemv_min_ms;
+                        best_tn = tn;
+                        best_cpt = cpt;
+                        best_vec_load = vec_load;
+                    }
+                }
+            }
+        }
+
+        rocmGemv_int8_vnni_reset_wide_tuning_overrides();
+
+        const double best_speedup = baseline.gemv_min_ms / std::max(1e-9, best_gemv_min);
+        fprintf(stderr, "\nINT8 LM Head baseline GEMV min: %.6f ms\n", baseline.gemv_min_ms);
+        fprintf(stderr, "INT8 LM Head best config: TN=%d CPT=%d VecLoad=%s GEMV min=%.6f ms speedup=%.4fx\n",
+                best_tn, best_cpt, best_vec_load ? "on" : "off", best_gemv_min, best_speedup);
+        fprintf(stderr, "\nINT8 LM Head autosweep (N=%d, K=%d)\n%s\n", N, K, table.to_string().c_str());
 #endif
     }
 

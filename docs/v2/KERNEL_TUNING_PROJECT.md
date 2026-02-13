@@ -453,6 +453,65 @@ Ratio: 1.74× matches average ~1.7 sub-projections per fused call (QKV=3, GateUp
 
 **Decision**: Keep default thresholds (`64 / 8 / 0.125`) — higher extreme-wide cutoffs regressed end-to-end decode timing on gfx906.
 
+### Entry 17: LM Head Wide-Kernel Autosweep + Default Lock-in (2026-02-13)
+
+**Target**: wide INT8 VNNI LM Head path in `ROCmGemvKernel.hip` (extreme-wide decode shape).
+
+**What changed**:
+
+- Added explicit wide-kernel tuning controls:
+   - `TN` (tile width): `{128, 256, 512}`
+   - `CPT` (columns per thread): `{2, 4}`
+   - `VecLoad` (packed-weight vectorized load): `{on, off}`
+- Added env-gated autosweep benchmark:
+   - `ROCmGemvPerfTest.Benchmark_INT8VNNI_LMHead_AutoSweep`
+   - gate: `LLAMINAR_RUN_INT8_LMHEAD_AUTOSWEEP=1`
+- Implemented vectorized packed-weight load modes in wide kernels (`int2` for `CPT=2`, `int4` for `CPT=4`) with scalar fallback for tails.
+
+**Autosweep result** (Qwen2.5-7B LM Head, release):
+
+- Baseline GEMV min: **0.647519 ms**
+- Best config: **TN=128, CPT=2, VecLoad=on**
+- Best GEMV min: **0.642720 ms** (**1.0075x** vs baseline)
+
+**Default lock-in (release)**:
+
+- Set wide-path defaults to:
+   - `GEMV_INT8_VNNI_WIDE_TILE_N=128`
+   - `GEMV_INT8_VNNI_WIDE_DEFAULT_CPT=2`
+   - `VecLoad=on` (default wide path behavior)
+
+**Validation**:
+
+- `V2_Perf_ROCmGemvKernel` full release suite passed after lock-in.
+
+### Entry 16: Quant No-Tail + LDS Row-Staging Dispatch (rule-based, decode-safe) (2026-02-13)
+
+**Target**: `quantizeActivationsQ8_kernel_t` dispatch in `ROCmQuantisedGemmKernel_CK.hip`.
+
+**What changed**:
+
+- Added templated quant paths:
+   - `NoTail=true` when `K % 4 == 0`
+   - `UseLdsRowStaging=true` when policy enables it
+- Initial LDS policy (`K <= 4096` unconditionally) regressed decode due to overhead on `M=1` rows.
+- Final rule-based policy kept generic and extensible:
+   - `UseLdsRowStaging = (K <= LLAMINAR_Q8_LDS_MAX_K) && (M >= LLAMINAR_Q8_LDS_MIN_M)`
+   - Defaults: `LLAMINAR_Q8_LDS_MAX_K=4096`, `LLAMINAR_Q8_LDS_MIN_M=4`
+
+**Release perf validation** (`V2_Perf_ROCmGemvKernel`, Qwen2.5-7B decode):
+
+- With unconditional LDS (`K<=4096`): **20.572 ms** (`All 28 layers + LM`)
+- With `M`-gated LDS policy (final): **20.150 ms**, then **19.986 ms** on rerun
+- Split timing after final policy shows lower quant overhead on decode shapes:
+   - `Q/Wo/K/V` quant min: **0.010 ms**
+   - `FFN Gate/Up` quant min: **0.009 ms**
+   - `LM Head` quant min: **0.009 ms**
+
+**Decision**: Keep the no-tail path and keep LDS staging enabled only via the `M`/`K` policy gate. This preserves the generic dispatch framework and avoids decode regressions from staging single-row workloads.
+
+**Default lock-in (release)**: Set `LLAMINAR_Q8_LDS_MIN_M` default to `4` in code. Full release perf suite (`V2_Perf_ROCmGemvKernel`) passed, with Qwen2.5-7B decode at **20.168 ms** (`All 28 layers + LM`) and `Per-layer GEMV total` **0.696 ms** in the validation run.
+
 ### Entry 9: GEMV Tile/Occupancy Tuning — CPT + KB Optimization (2026-02-10)
 
 **Target**: `grid_kpar_t<TN,CPT>` kernel in `ROCmGemvKernel.hip` — handles QKV, Wo, FFN Down projections (84 of 113 GEMV calls per decode token)

@@ -710,6 +710,12 @@ struct QuantAspectThresholds
     double balanced_min;
 };
 
+struct QuantLdsPolicy
+{
+    int max_k;
+    int min_m;
+};
+
 static QuantAspectThresholds getQuantAspectThresholds()
 {
     static const QuantAspectThresholds thresholds = []() {
@@ -753,6 +759,34 @@ static QuantAspectThresholds getQuantAspectThresholds()
     }();
 
     return thresholds;
+}
+
+static QuantLdsPolicy getQuantLdsPolicy()
+{
+    static const QuantLdsPolicy policy = []() {
+        QuantLdsPolicy p{4096, 4};
+
+        if (const char* env_max_k = std::getenv("LLAMINAR_Q8_LDS_MAX_K"))
+        {
+            const int v = std::atoi(env_max_k);
+            if (v > 0)
+            {
+                p.max_k = v;
+            }
+        }
+        if (const char* env_min_m = std::getenv("LLAMINAR_Q8_LDS_MIN_M"))
+        {
+            const int v = std::atoi(env_min_m);
+            if (v > 0)
+            {
+                p.min_m = v;
+            }
+        }
+
+        return p;
+    }();
+
+    return policy;
 }
 
 static QuantShapeClass classifyQuantShape(int M, int K)
@@ -816,7 +850,8 @@ static int chooseQuantThreadsFromShape(int M, int K)
  * @param M Number of rows
  * @param K Number of columns per row
  */
-__global__ void quantizeActivationsQ8_kernel(
+template <bool UseLdsRowStaging, bool NoTail>
+__global__ void quantizeActivationsQ8_kernel_t(
     const float *__restrict__ d_A_fp32,
     int8_t *__restrict__ d_A_int8,
     float *__restrict__ d_scales,
@@ -834,32 +869,49 @@ __global__ void quantizeActivationsQ8_kernel(
     __shared__ float s_wave_max[8];
     __shared__ float s_absmax;
 
+    extern __shared__ float s_row[];
+
     // Step 1: Find max absolute value in this row (parallel reduction)
     float local_max = 0.0f;
     const float *row_ptr = d_A_fp32 + static_cast<size_t>(row) * K;
-    const int vec_len = (K / 4) * 4;
     const bool fp32_aligned16 = ((reinterpret_cast<uintptr_t>(row_ptr) & 0x0F) == 0);
 
-    if (fp32_aligned16)
+    if constexpr (UseLdsRowStaging)
+    {
+        for (int k = tid; k < K; k += block_size)
+        {
+            s_row[k] = row_ptr[k];
+        }
+        __syncthreads();
+    }
+
+    const float* src_ptr = UseLdsRowStaging ? s_row : row_ptr;
+    const int vec_len = NoTail ? K : ((K / 4) * 4);
+    const bool src_aligned16 = ((reinterpret_cast<uintptr_t>(src_ptr) & 0x0F) == 0);
+
+    if (src_aligned16)
     {
         for (int k4 = tid * 4; k4 < vec_len; k4 += block_size * 4)
         {
-            const float4 v = *reinterpret_cast<const float4 *>(row_ptr + k4);
+            const float4 v = *reinterpret_cast<const float4 *>(src_ptr + k4);
             local_max = fmaxf(local_max, fabsf(v.x));
             local_max = fmaxf(local_max, fabsf(v.y));
             local_max = fmaxf(local_max, fabsf(v.z));
             local_max = fmaxf(local_max, fabsf(v.w));
         }
-        for (int k = vec_len + tid; k < K; k += block_size)
+        if constexpr (!NoTail)
         {
-            local_max = fmaxf(local_max, fabsf(row_ptr[k]));
+            for (int k = vec_len + tid; k < K; k += block_size)
+            {
+                local_max = fmaxf(local_max, fabsf(src_ptr[k]));
+            }
         }
     }
     else
     {
         for (int k = tid; k < K; k += block_size)
         {
-            float val = row_ptr[k];
+            float val = src_ptr[k];
             float abs_val = fabsf(val);
             local_max = fmaxf(local_max, abs_val);
         }
@@ -911,11 +963,11 @@ __global__ void quantizeActivationsQ8_kernel(
     int8_t *out_row = d_A_int8 + static_cast<size_t>(row) * K;
     const bool int8_aligned4 = ((reinterpret_cast<uintptr_t>(out_row) & 0x03) == 0);
 
-    if (fp32_aligned16 && int8_aligned4)
+    if (src_aligned16 && int8_aligned4)
     {
         for (int k4 = tid * 4; k4 < vec_len; k4 += block_size * 4)
         {
-            const float4 v = *reinterpret_cast<const float4 *>(row_ptr + k4);
+            const float4 v = *reinterpret_cast<const float4 *>(src_ptr + k4);
 
             int q0 = static_cast<int>(rintf(v.x * inv_scale));
             int q1 = static_cast<int>(rintf(v.y * inv_scale));
@@ -936,18 +988,21 @@ __global__ void quantizeActivationsQ8_kernel(
             *reinterpret_cast<uint32_t *>(out_row + k4) = packed;
         }
 
-        for (int k = vec_len + tid; k < K; k += block_size)
+        if constexpr (!NoTail)
         {
-            int q = static_cast<int>(rintf(row_ptr[k] * inv_scale));
-            q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
-            out_row[k] = static_cast<int8_t>(q);
+            for (int k = vec_len + tid; k < K; k += block_size)
+            {
+                int q = static_cast<int>(rintf(src_ptr[k] * inv_scale));
+                q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+                out_row[k] = static_cast<int8_t>(q);
+            }
         }
     }
     else
     {
         for (int k = tid; k < K; k += block_size)
         {
-            float val = row_ptr[k];
+            float val = src_ptr[k];
             float scaled = val * inv_scale;
 
             // rintf() maps to v_rndne_f32 (1 instruction) instead of
@@ -2067,6 +2122,10 @@ extern "C"
     // EXECUTION:
     //   - Grid: (M, 1, 1) - one block per row
     //   - Block: shape-driven (128/256/512) from aspect ratio K/M
+    //   - Fast-path dispatch:
+    //       * NoTail when K % 4 == 0 (elides scalar tail loops)
+    //       * LDS row staging when shape policy says rows are reusable
+    //         (K <= LLAMINAR_Q8_LDS_MAX_K and M >= LLAMINAR_Q8_LDS_MIN_M)
     //   - Parallel reduction for max_abs finding
     //
     // =========================================================================
@@ -2087,13 +2146,48 @@ extern "C"
         // Launch kernel: one block per row, thread count selected by shape class.
         // Policy is based on aspect ratio K/M (row width vs row count), not fixed dimensions.
         const int block_size = chooseQuantThreadsFromShape(M, K);
+        const bool no_tail = ((K & 0x3) == 0);
+        const QuantLdsPolicy lds_policy = getQuantLdsPolicy();
+        const bool use_lds_row_staging = (K <= lds_policy.max_k) && (M >= lds_policy.min_m);
         dim3 grid(M, 1, 1);
         dim3 block(block_size, 1, 1);
 
-        hipLaunchKernelGGL(
-            quantizeActivationsQ8_kernel,
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_A_fp32, d_A_int8, d_scales_A, M, K);
+        size_t shared_mem_bytes = use_lds_row_staging ? static_cast<size_t>(K) * sizeof(float) : 0;
+
+        if (use_lds_row_staging)
+        {
+            if (no_tail)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(quantizeActivationsQ8_kernel_t<true, true>),
+                    grid, block, shared_mem_bytes, static_cast<hipStream_t>(stream),
+                    d_A_fp32, d_A_int8, d_scales_A, M, K);
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(quantizeActivationsQ8_kernel_t<true, false>),
+                    grid, block, shared_mem_bytes, static_cast<hipStream_t>(stream),
+                    d_A_fp32, d_A_int8, d_scales_A, M, K);
+            }
+        }
+        else
+        {
+            if (no_tail)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(quantizeActivationsQ8_kernel_t<false, true>),
+                    grid, block, 0, static_cast<hipStream_t>(stream),
+                    d_A_fp32, d_A_int8, d_scales_A, M, K);
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(quantizeActivationsQ8_kernel_t<false, false>),
+                    grid, block, 0, static_cast<hipStream_t>(stream),
+                    d_A_fp32, d_A_int8, d_scales_A, M, K);
+            }
+        }
 
         // Check for launch errors
         (void)hipGetLastError();  // Clear stale errors

@@ -66,7 +66,8 @@
 constexpr int GEMV_TILE_N = 256;
 
 // VNNI kernel tile parameters
-constexpr int GEMV_INT8_VNNI_WIDE_TILE_N = 256;
+constexpr int GEMV_INT8_VNNI_WIDE_TILE_N = 128;
+constexpr int GEMV_INT8_VNNI_WIDE_DEFAULT_CPT = 2;
 constexpr int GEMV_INT8_VNNI_WIDE2_TILE_N = 256;
 constexpr int GEMV_INT8_VNNI_SQUARE_TILE_N = 256;
 constexpr int GEMV_INT8_VNNI_KPAR_TILE_K = 256;
@@ -82,6 +83,9 @@ static std::atomic<int> g_ratio_iq4_tn_override{-1};
 static std::atomic<int> g_ratio_iq4_kb_override{-1};
 static std::atomic<int> g_int8_vnni_tn_override{-1};
 static std::atomic<int> g_int8_vnni_kb_override{-1};
+static std::atomic<int> g_int8_vnni_wide_tn_override{-1};
+static std::atomic<int> g_int8_vnni_wide_cpt_override{-1};
+static std::atomic<int> g_int8_vnni_wide_vec_load_override{-1};
 
 __device__ __constant__ int8_t k_ratio_vnni_iq4_lut_i8[16] = {
     -127, -104, -83, -65,
@@ -449,46 +453,97 @@ __global__ void gemv_int8_int8_vnni_kernel(
     d_C_int32[n] = acc;
 }
 
-// Vectorized variant: each thread handles 4 columns (N must be divisible by 4)
-__global__ void gemv_int8_int8_wide_vec4_vnni_kernel(
+template <int TILE_N, int CPT, bool VEC_PACKED_LOAD>
+__global__ void gemv_int8_int8_wide_vnni_kernel_t(
     const int8_t* __restrict__ d_A_int8,
     const int8_t* __restrict__ d_B_int8_vnni,
     int32_t* __restrict__ d_C_int32,
     int N,
     int K)
 {
-    const int lane_n = threadIdx.x;
-    const int n4 = blockIdx.x * GEMV_INT8_VNNI_WIDE_TILE_N + lane_n * 4;
-    if (n4 >= N) return;
+    const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+    if (n_base >= N) return;
 
-    int4 acc = {0, 0, 0, 0};
+    int32_t acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) acc[c] = 0;
+
+    const bool full_cols = (n_base + (CPT - 1) < N);
     const int k_groups = K / 4;
     for (int kg = 0; kg < k_groups; ++kg)
     {
         // Load 4 INT8 activations as packed int32 for v_dot4_i32_i8
         const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
 
-        // Load 4 INT8 weights for each of 4 columns (VNNI = already packed)
-        const int32_t p0 = *reinterpret_cast<const int32_t*>(
-            d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n4 + 0)) * 4);
-        const int32_t p1 = *reinterpret_cast<const int32_t*>(
-            d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n4 + 1)) * 4);
-        const int32_t p2 = *reinterpret_cast<const int32_t*>(
-            d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n4 + 2)) * 4);
-        const int32_t p3 = *reinterpret_cast<const int32_t*>(
-            d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n4 + 3)) * 4);
+        const int32_t* __restrict__ b_row = reinterpret_cast<const int32_t*>(
+            d_B_int8_vnni + (static_cast<size_t>(kg) * N + n_base) * 4);
 
-        // Hardware INT8 dot product: 4 multiply-adds in 1 cycle (v_dot4_i32_i8)
-        acc.x = __builtin_amdgcn_sdot4(a_packed, p0, acc.x, false);
-        acc.y = __builtin_amdgcn_sdot4(a_packed, p1, acc.y, false);
-        acc.z = __builtin_amdgcn_sdot4(a_packed, p2, acc.z, false);
-        acc.w = __builtin_amdgcn_sdot4(a_packed, p3, acc.w, false);
+        if constexpr (VEC_PACKED_LOAD && CPT == 4)
+        {
+            if (full_cols)
+            {
+                const int4 b = *reinterpret_cast<const int4*>(b_row);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, acc[1], false);
+                acc[2] = __builtin_amdgcn_sdot4(a_packed, b.z, acc[2], false);
+                acc[3] = __builtin_amdgcn_sdot4(a_packed, b.w, acc[3], false);
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    if (n_base + c < N)
+                    {
+                        const int32_t b = *(b_row + c);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                    }
+                }
+            }
+        }
+        else if constexpr (VEC_PACKED_LOAD && CPT == 2)
+        {
+            if (full_cols)
+            {
+                const int2 b = *reinterpret_cast<const int2*>(b_row);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, acc[1], false);
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    if (n_base + c < N)
+                    {
+                        const int32_t b = *(b_row + c);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                    }
+                }
+            }
+        }
+        else
+        {
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+            {
+                if (n_base + c < N)
+                {
+                    const int32_t b = *(b_row + c);
+                    acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                }
+            }
+        }
     }
 
-    d_C_int32[n4 + 0] = acc.x;
-    d_C_int32[n4 + 1] = acc.y;
-    d_C_int32[n4 + 2] = acc.z;
-    d_C_int32[n4 + 3] = acc.w;
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        if (n_base + c < N)
+        {
+            d_C_int32[n_base + c] = acc[c];
+        }
+    }
 }
 
 // Wide-N kernel: 2 columns per thread
@@ -607,7 +662,8 @@ __global__ void gemv_int8_int8_vnni_scaled_kernel(
     d_C_fp32[n] = result;
 }
 
-__global__ void gemv_int8_int8_wide_vec4_vnni_scaled_kernel(
+template <int TILE_N, int CPT, bool VEC_PACKED_LOAD>
+__global__ void gemv_int8_int8_wide_vnni_scaled_kernel_t(
     const int8_t* __restrict__ d_A_int8,
     const int8_t* __restrict__ d_B_int8_vnni,
     float* __restrict__ d_C_fp32,
@@ -620,62 +676,100 @@ __global__ void gemv_int8_int8_wide_vec4_vnni_scaled_kernel(
     const float* __restrict__ d_C_existing,
     const float* __restrict__ d_bias)
 {
-    const int lane_n = threadIdx.x;
-    const int n4 = blockIdx.x * GEMV_INT8_VNNI_WIDE_TILE_N + lane_n * 4;
-    if (n4 >= N) return;
+    const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+    if (n_base >= N) return;
 
-    int4 acc = {0, 0, 0, 0};
+    int32_t acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) acc[c] = 0;
+
+    const bool full_cols = (n_base + (CPT - 1) < N);
     const int k_groups = K / 4;
     for (int kg = 0; kg < k_groups; ++kg)
     {
         const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
 
-        const int32_t p0 = *reinterpret_cast<const int32_t*>(
-            d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n4 + 0)) * 4);
-        const int32_t p1 = *reinterpret_cast<const int32_t*>(
-            d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n4 + 1)) * 4);
-        const int32_t p2 = *reinterpret_cast<const int32_t*>(
-            d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n4 + 2)) * 4);
-        const int32_t p3 = *reinterpret_cast<const int32_t*>(
-            d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n4 + 3)) * 4);
+        const int32_t* __restrict__ b_row = reinterpret_cast<const int32_t*>(
+            d_B_int8_vnni + (static_cast<size_t>(kg) * N + n_base) * 4);
 
-        acc.x = __builtin_amdgcn_sdot4(a_packed, p0, acc.x, false);
-        acc.y = __builtin_amdgcn_sdot4(a_packed, p1, acc.y, false);
-        acc.z = __builtin_amdgcn_sdot4(a_packed, p2, acc.z, false);
-        acc.w = __builtin_amdgcn_sdot4(a_packed, p3, acc.w, false);
+        if constexpr (VEC_PACKED_LOAD && CPT == 4)
+        {
+            if (full_cols)
+            {
+                const int4 b = *reinterpret_cast<const int4*>(b_row);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, acc[1], false);
+                acc[2] = __builtin_amdgcn_sdot4(a_packed, b.z, acc[2], false);
+                acc[3] = __builtin_amdgcn_sdot4(a_packed, b.w, acc[3], false);
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    if (n_base + c < N)
+                    {
+                        const int32_t b = *(b_row + c);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                    }
+                }
+            }
+        }
+        else if constexpr (VEC_PACKED_LOAD && CPT == 2)
+        {
+            if (full_cols)
+            {
+                const int2 b = *reinterpret_cast<const int2*>(b_row);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, acc[1], false);
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    if (n_base + c < N)
+                    {
+                        const int32_t b = *(b_row + c);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                    }
+                }
+            }
+        }
+        else
+        {
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+            {
+                if (n_base + c < N)
+                {
+                    const int32_t b = *(b_row + c);
+                    acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                }
+            }
+        }
     }
 
     const float scale_a = d_scale_A[0];
-    float4 out;
-    out.x = static_cast<float>(acc.x) * scale_a * d_scale_B[n4 + 0];
-    out.y = static_cast<float>(acc.y) * scale_a * d_scale_B[n4 + 1];
-    out.z = static_cast<float>(acc.z) * scale_a * d_scale_B[n4 + 2];
-    out.w = static_cast<float>(acc.w) * scale_a * d_scale_B[n4 + 3];
-
-    out.x *= alpha;
-    out.y *= alpha;
-    out.z *= alpha;
-    out.w *= alpha;
-
-    if (beta != 0.0f)
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
     {
-        out.x += beta * d_C_existing[n4 + 0];
-        out.y += beta * d_C_existing[n4 + 1];
-        out.z += beta * d_C_existing[n4 + 2];
-        out.w += beta * d_C_existing[n4 + 3];
+        const int n = n_base + c;
+        if (n < N)
+        {
+            float out = static_cast<float>(acc[c]) * scale_a * d_scale_B[n];
+            out *= alpha;
+            if (beta != 0.0f)
+            {
+                out += beta * d_C_existing[n];
+            }
+            if (d_bias)
+            {
+                out += d_bias[n];
+            }
+            d_C_fp32[n] = out;
+        }
     }
-    if (d_bias)
-    {
-        out.x += d_bias[n4 + 0];
-        out.y += d_bias[n4 + 1];
-        out.z += d_bias[n4 + 2];
-        out.w += d_bias[n4 + 3];
-    }
-
-    d_C_fp32[n4 + 0] = out.x;
-    d_C_fp32[n4 + 1] = out.y;
-    d_C_fp32[n4 + 2] = out.z;
-    d_C_fp32[n4 + 3] = out.w;
 }
 
 __global__ void gemv_int8_int8_square_vnni_scaled_kernel(
@@ -1209,6 +1303,21 @@ void rocmGemv_int8_vnni_reset_tuning_overrides()
     rocmGemv_int8_vnni_set_tuning_overrides(-1, -1);
 }
 
+void rocmGemv_int8_vnni_set_wide_tuning_overrides(
+    int wide_tn,
+    int wide_cpt,
+    int wide_vec_load)
+{
+    g_int8_vnni_wide_tn_override.store(wide_tn, std::memory_order_relaxed);
+    g_int8_vnni_wide_cpt_override.store(wide_cpt, std::memory_order_relaxed);
+    g_int8_vnni_wide_vec_load_override.store(wide_vec_load, std::memory_order_relaxed);
+}
+
+void rocmGemv_int8_vnni_reset_wide_tuning_overrides()
+{
+    rocmGemv_int8_vnni_set_wide_tuning_overrides(-1, -1, -1);
+}
+
 bool rocmGemv_int8_int8_int32_vnni(
     const int8_t* d_A_int8,
     const int8_t* d_B_int8_vnni,
@@ -1225,7 +1334,33 @@ bool rocmGemv_int8_int8_int32_vnni(
     }
 
     const bool use_vec4 = ((N % 4) == 0);
-    const bool use_wide_vec4 = (N >= 8 * K) && use_vec4 && (N >= GEMV_INT8_VNNI_WIDE_TILE_N);
+    const int wide_tn_override = g_int8_vnni_wide_tn_override.load(std::memory_order_relaxed);
+    const int wide_cpt_override = g_int8_vnni_wide_cpt_override.load(std::memory_order_relaxed);
+    const int wide_vec_load_override = g_int8_vnni_wide_vec_load_override.load(std::memory_order_relaxed);
+
+    int wide_tn = GEMV_INT8_VNNI_WIDE_TILE_N;
+    if (wide_tn_override == 128 || wide_tn_override == 256 || wide_tn_override == 512)
+    {
+        wide_tn = wide_tn_override;
+    }
+
+    int wide_cpt = GEMV_INT8_VNNI_WIDE_DEFAULT_CPT;
+    if (wide_cpt_override == 2 || wide_cpt_override == 4)
+    {
+        wide_cpt = wide_cpt_override;
+    }
+
+    bool wide_vec_load = true;
+    if (wide_vec_load_override == 0)
+    {
+        wide_vec_load = false;
+    }
+    else if (wide_vec_load_override == 1)
+    {
+        wide_vec_load = true;
+    }
+
+    const bool use_wide_vec4 = (N >= 8 * K) && (N >= wide_tn);
     // Grid-level K-parallel: handles ALL non-wide_vec4 shapes with N%4==0.
     // Previous wide2 path (N>=3K, N<8K) only generated N/256 blocks → 148 waves
     // for FFN Gate/Up, achieving just 17% peak BW. Grid_kpar K-splits via
@@ -1241,12 +1376,84 @@ bool rocmGemv_int8_int8_int32_vnni(
 
     if (use_wide_vec4)
     {
-        const int grid_n = (N + GEMV_INT8_VNNI_WIDE_TILE_N - 1) / GEMV_INT8_VNNI_WIDE_TILE_N;
-        dim3 block(GEMV_INT8_VNNI_WIDE_TILE_N / 4, 1, 1);
-        hipLaunchKernelGGL(
-            gemv_int8_int8_wide_vec4_vnni_kernel,
-            dim3(grid_n), block, 0, static_cast<hipStream_t>(stream),
-            d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
+        const int grid_n = (N + wide_tn - 1) / wide_tn;
+        dim3 block(wide_tn / wide_cpt, 1, 1);
+
+        if (wide_tn == 128)
+        {
+            if (wide_cpt == 2)
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_kernel_t<128, 2, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_kernel_t<128, 2, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
+                }
+            }
+            else
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_kernel_t<128, 4, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_kernel_t<128, 4, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
+                }
+            }
+        }
+        else if (wide_tn == 512)
+        {
+            if (wide_cpt == 2)
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_kernel_t<512, 2, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_kernel_t<512, 2, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
+                }
+            }
+            else
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_kernel_t<512, 4, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_kernel_t<512, 4, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
+                }
+            }
+        }
+        else
+        {
+            if (wide_cpt == 2)
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_kernel_t<256, 2, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_kernel_t<256, 2, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
+                }
+            }
+            else
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_kernel_t<256, 4, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_kernel_t<256, 4, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, N, K);
+                }
+            }
+        }
     }
     else if (use_grid_kpar)
     {
@@ -1392,7 +1599,33 @@ bool rocmGemv_int8_int8_fp32_vnni_scaled(
     }
 
     const bool use_vec4 = ((N % 4) == 0);
-    const bool use_wide_vec4 = (N >= 8 * K) && use_vec4 && (N >= GEMV_INT8_VNNI_WIDE_TILE_N);
+    const int wide_tn_override = g_int8_vnni_wide_tn_override.load(std::memory_order_relaxed);
+    const int wide_cpt_override = g_int8_vnni_wide_cpt_override.load(std::memory_order_relaxed);
+    const int wide_vec_load_override = g_int8_vnni_wide_vec_load_override.load(std::memory_order_relaxed);
+
+    int wide_tn = GEMV_INT8_VNNI_WIDE_TILE_N;
+    if (wide_tn_override == 128 || wide_tn_override == 256 || wide_tn_override == 512)
+    {
+        wide_tn = wide_tn_override;
+    }
+
+    int wide_cpt = GEMV_INT8_VNNI_WIDE_DEFAULT_CPT;
+    if (wide_cpt_override == 2 || wide_cpt_override == 4)
+    {
+        wide_cpt = wide_cpt_override;
+    }
+
+    bool wide_vec_load = true;
+    if (wide_vec_load_override == 0)
+    {
+        wide_vec_load = false;
+    }
+    else if (wide_vec_load_override == 1)
+    {
+        wide_vec_load = true;
+    }
+
+    const bool use_wide_vec4 = (N >= 8 * K) && (N >= wide_tn);
     const bool use_grid_kpar = !use_wide_vec4 && use_vec4 && (N >= GEMV_INT8_VNNI_GRID_KPAR_TILE_N);
     const bool use_square = !use_wide_vec4 && !use_grid_kpar && (N >= GEMV_INT8_VNNI_SQUARE_TILE_N);
 
@@ -1409,13 +1642,84 @@ bool rocmGemv_int8_int8_fp32_vnni_scaled(
 
     if (use_wide_vec4)
     {
-        const int grid_n = (N + GEMV_INT8_VNNI_WIDE_TILE_N - 1) / GEMV_INT8_VNNI_WIDE_TILE_N;
-        dim3 block(GEMV_INT8_VNNI_WIDE_TILE_N / 4, 1, 1);
-        hipLaunchKernelGGL(
-            gemv_int8_int8_wide_vec4_vnni_scaled_kernel,
-            dim3(grid_n), block, 0, static_cast<hipStream_t>(stream),
-            d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A, d_scale_B,
-            N, K, alpha, beta, d_C_existing, d_bias);
+        const int grid_n = (N + wide_tn - 1) / wide_tn;
+        dim3 block(wide_tn / wide_cpt, 1, 1);
+
+        if (wide_tn == 128)
+        {
+            if (wide_cpt == 2)
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_scaled_kernel_t<128, 2, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_scaled_kernel_t<128, 2, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+            }
+            else
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_scaled_kernel_t<128, 4, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_scaled_kernel_t<128, 4, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+            }
+        }
+        else if (wide_tn == 512)
+        {
+            if (wide_cpt == 2)
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_scaled_kernel_t<512, 2, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_scaled_kernel_t<512, 2, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+            }
+            else
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_scaled_kernel_t<512, 4, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_scaled_kernel_t<512, 4, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+            }
+        }
+        else
+        {
+            if (wide_cpt == 2)
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_scaled_kernel_t<256, 2, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_scaled_kernel_t<256, 2, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+            }
+            else
+            {
+                if (wide_vec_load)
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_scaled_kernel_t<256, 4, true>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+                else
+                {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_int8_int8_wide_vnni_scaled_kernel_t<256, 4, false>), dim3(grid_n), block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A, d_scale_B, N, K, alpha, beta, d_C_existing, d_bias);
+                }
+            }
+        }
     }
     else if (use_square)
     {
