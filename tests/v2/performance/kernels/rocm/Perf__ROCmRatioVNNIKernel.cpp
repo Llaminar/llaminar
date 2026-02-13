@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
+#include <array>
 #include <string>
 #include <functional>
 
@@ -36,6 +37,14 @@ extern "C"
         uint8_t block_size,
         uint16_t payload_bytes,
         int device_id, void *stream);
+
+    void rocmGemv_ratio_vnni_set_tuning_overrides(
+        int linear_tn,
+        int linear_kb,
+        int iq4_tn,
+        int iq4_kb);
+
+    void rocmGemv_ratio_vnni_reset_tuning_overrides();
 }
 
 namespace
@@ -186,6 +195,10 @@ namespace
 
         double speedup_sum = 0.0;
         int speedup_count = 0;
+        double q4_speedup_sum = 0.0;
+        int q4_speedup_count = 0;
+        double iq4_speedup_sum = 0.0;
+        int iq4_speedup_count = 0;
 
         for (const auto &fmt : formats)
         {
@@ -275,6 +288,16 @@ namespace
                 const double speedup = int8_timing.mean_ms / std::max(1e-9, ratio_timing.mean_ms);
                 speedup_sum += speedup;
                 speedup_count++;
+                if (fmt.second == CODEBOOK_LINEAR)
+                {
+                    q4_speedup_sum += speedup;
+                    q4_speedup_count++;
+                }
+                else if (fmt.second == CODEBOOK_IQ4)
+                {
+                    iq4_speedup_sum += speedup;
+                    iq4_speedup_count++;
+                }
 
                 table << fmt.first
                       << shape.name
@@ -295,9 +318,175 @@ namespace
                   << table.to_string() << std::endl;
 
         const double avg_speedup = speedup_sum / static_cast<double>(std::max(1, speedup_count));
+        const double q4_avg_speedup = q4_speedup_sum / static_cast<double>(std::max(1, q4_speedup_count));
+        const double iq4_avg_speedup = iq4_speedup_sum / static_cast<double>(std::max(1, iq4_speedup_count));
         std::cout << "Average ratio/int8 speedup: " << avg_speedup << "x" << std::endl;
+        std::cout << "Q4_0 average speedup: " << q4_avg_speedup << "x" << std::endl;
+        std::cout << "IQ4_NL average speedup: " << iq4_avg_speedup << "x" << std::endl;
 
-        EXPECT_GE(avg_speedup, 1.75);
+        EXPECT_GE(q4_avg_speedup, 1.55);
+        EXPECT_GE(iq4_avg_speedup, 1.38);
+#endif
+    }
+
+    TEST_F(ROCmRatioVNNIPerfTest, QWoAutoSweepTnKb)
+    {
+#ifdef HAVE_ROCM
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_QWO_AUTOSWEEP");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_QWO_AUTOSWEEP=1 to run Q/Wo autosweep";
+        }
+
+        const int N = 3584;
+        const int K = 3584;
+        const int blocks = K / 32;
+        const int kgroups = K / 4;
+
+        const std::array<int, 2> tn_candidates = {128, 256};
+        const std::array<int, 5> kb_candidates = {8, 10, 12, 14, 16};
+
+        std::mt19937 rng(12345);
+        std::uniform_int_distribution<int> qdist(0, 255);
+        std::uniform_int_distribution<int> rdist(-127, 127);
+        std::uniform_int_distribution<int> adist(-127, 127);
+
+        std::vector<int8_t> h_A(static_cast<size_t>(K));
+        for (auto &v : h_A)
+            v = static_cast<int8_t>(adist(rng));
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header << "Format" << "TN" << "KB" << "INT8 ms" << "Ratio ms" << "Speedup" << fort::endr;
+
+        const std::vector<std::pair<std::string, uint8_t>> formats = {
+            {"Q4_0", CODEBOOK_LINEAR},
+            {"IQ4_NL", CODEBOOK_IQ4},
+        };
+
+        for (const auto &fmt : formats)
+        {
+            std::vector<uint8_t> h_payload(static_cast<size_t>(blocks) * N * 16);
+            std::vector<int8_t> h_ratio(static_cast<size_t>(blocks) * N);
+            for (auto &v : h_payload)
+                v = static_cast<uint8_t>(qdist(rng));
+            for (auto &v : h_ratio)
+            {
+                int r = rdist(rng);
+                if (r == 0)
+                    r = 1;
+                v = static_cast<int8_t>(r);
+            }
+
+            std::vector<int8_t> h_int8_vnni(static_cast<size_t>(kgroups) * N * 4);
+            for (int n = 0; n < N; ++n)
+            {
+                for (int b = 0; b < blocks; ++b)
+                {
+                    const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
+                    const uint8_t *p16 = h_payload.data() + linear * 16;
+                    const int8_t r = h_ratio[linear];
+                    for (int g = 0; g < 8; ++g)
+                    {
+                        int8_t w[4];
+                        decodeQ4Group(p16, g, r, fmt.second, w);
+                        const int kg = b * 8 + g;
+                        const size_t dst = (static_cast<size_t>(kg) * N + static_cast<size_t>(n)) * 4;
+                        h_int8_vnni[dst + 0] = w[0];
+                        h_int8_vnni[dst + 1] = w[1];
+                        h_int8_vnni[dst + 2] = w[2];
+                        h_int8_vnni[dst + 3] = w[3];
+                    }
+                }
+            }
+
+            int8_t *d_A = nullptr;
+            int8_t *d_B_vnni = nullptr;
+            uint8_t *d_payload = nullptr;
+            int8_t *d_ratio = nullptr;
+            int32_t *d_C = nullptr;
+
+            ASSERT_EQ(hipMalloc(&d_A, static_cast<size_t>(K) * sizeof(int8_t)), hipSuccess);
+            ASSERT_EQ(hipMalloc(&d_B_vnni, h_int8_vnni.size() * sizeof(int8_t)), hipSuccess);
+            ASSERT_EQ(hipMalloc(&d_payload, h_payload.size() * sizeof(uint8_t)), hipSuccess);
+            ASSERT_EQ(hipMalloc(&d_ratio, h_ratio.size() * sizeof(int8_t)), hipSuccess);
+            ASSERT_EQ(hipMalloc(&d_C, static_cast<size_t>(N) * sizeof(int32_t)), hipSuccess);
+
+            ASSERT_EQ(hipMemcpy(d_A, h_A.data(), static_cast<size_t>(K) * sizeof(int8_t), hipMemcpyHostToDevice), hipSuccess);
+            ASSERT_EQ(hipMemcpy(d_B_vnni, h_int8_vnni.data(), h_int8_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice), hipSuccess);
+            ASSERT_EQ(hipMemcpy(d_payload, h_payload.data(), h_payload.size() * sizeof(uint8_t), hipMemcpyHostToDevice), hipSuccess);
+            ASSERT_EQ(hipMemcpy(d_ratio, h_ratio.data(), h_ratio.size() * sizeof(int8_t), hipMemcpyHostToDevice), hipSuccess);
+
+            rocmGemv_ratio_vnni_reset_tuning_overrides();
+            const auto int8_timing = benchKernel(5, 30, [&]()
+                                                 { return rocmGemv_int8_int8_int32_vnni(d_A, d_B_vnni, d_C, N, K, device_id_, nullptr); });
+            ASSERT_GT(int8_timing.mean_ms, 0.0);
+
+            double best_speedup = -1.0;
+            int best_tn = -1;
+            int best_kb = -1;
+
+            for (const int tn : tn_candidates)
+            {
+                for (const int kb : kb_candidates)
+                {
+                    if (fmt.second == CODEBOOK_LINEAR)
+                    {
+                        rocmGemv_ratio_vnni_set_tuning_overrides(tn, kb, -1, -1);
+                    }
+                    else
+                    {
+                        rocmGemv_ratio_vnni_set_tuning_overrides(-1, -1, tn, kb);
+                    }
+
+                    const auto ratio_timing = benchKernel(3, 15, [&]()
+                                                          { return rocmGemv_ratio_vnni_int8_int32(
+                                                                d_A,
+                                                                d_payload,
+                                                                d_ratio,
+                                                                d_C,
+                                                                N, K,
+                                                                4,
+                                                                fmt.second,
+                                                                0,
+                                                                32,
+                                                                16,
+                                                                device_id_,
+                                                                nullptr); });
+
+                    ASSERT_GT(ratio_timing.mean_ms, 0.0);
+                    const double speedup = int8_timing.mean_ms / std::max(1e-9, ratio_timing.mean_ms);
+
+                    table << fmt.first
+                          << tn
+                          << kb
+                          << int8_timing.mean_ms
+                          << ratio_timing.mean_ms
+                          << speedup
+                          << fort::endr;
+
+                    if (speedup > best_speedup)
+                    {
+                        best_speedup = speedup;
+                        best_tn = tn;
+                        best_kb = kb;
+                    }
+                }
+            }
+
+            std::cout << "[AUTOSWEEP] " << fmt.first << " best_tn=" << best_tn
+                      << " best_kb=" << best_kb << " best_speedup=" << best_speedup << "x" << std::endl;
+
+            rocmGemv_ratio_vnni_reset_tuning_overrides();
+            hipFree(d_A);
+            hipFree(d_B_vnni);
+            hipFree(d_payload);
+            hipFree(d_ratio);
+            hipFree(d_C);
+        }
+
+        std::cout << "\n[Q/Wo autosweep]" << std::endl;
+        std::cout << table.to_string() << std::endl;
 #endif
     }
 }

@@ -46,6 +46,7 @@
 #include <cstdlib>
 #include <array>
 #include <mutex>
+#include <atomic>
 
 #include "../../backends/rocm/HipDeviceGuard.h"
 
@@ -74,6 +75,11 @@ constexpr int GEMV_INT8_VNNI_GRID_KPAR_CPT = 2;  // 64 threads = 1 full wavefron
 
 constexpr uint8_t RATIO_VNNI_CODEBOOK_LINEAR = 0;
 constexpr uint8_t RATIO_VNNI_CODEBOOK_IQ4 = 4;
+
+static std::atomic<int> g_ratio_linear_tn_override{-1};
+static std::atomic<int> g_ratio_linear_kb_override{-1};
+static std::atomic<int> g_ratio_iq4_tn_override{-1};
+static std::atomic<int> g_ratio_iq4_kb_override{-1};
 
 __device__ __constant__ int8_t k_ratio_vnni_iq4_lut_i8[16] = {
     -127, -104, -83, -65,
@@ -1007,6 +1013,23 @@ __global__ void gemv_fused_fp32_int8_vnni_kernel_t(
 
 extern "C" {
 
+void rocmGemv_ratio_vnni_set_tuning_overrides(
+    int linear_tn,
+    int linear_kb,
+    int iq4_tn,
+    int iq4_kb)
+{
+    g_ratio_linear_tn_override.store(linear_tn, std::memory_order_relaxed);
+    g_ratio_linear_kb_override.store(linear_kb, std::memory_order_relaxed);
+    g_ratio_iq4_tn_override.store(iq4_tn, std::memory_order_relaxed);
+    g_ratio_iq4_kb_override.store(iq4_kb, std::memory_order_relaxed);
+}
+
+void rocmGemv_ratio_vnni_reset_tuning_overrides()
+{
+    rocmGemv_ratio_vnni_set_tuning_overrides(-1, -1, -1, -1);
+}
+
 bool rocmGemv_int8_int8_int32_vnni(
     const int8_t* d_A_int8,
     const int8_t* d_B_int8_vnni,
@@ -1163,8 +1186,15 @@ bool rocmGemv_ratio_vnni_int8_int32(
 
     constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;  // 128
     constexpr int TN_IQ4_WIDE = 256;
+    const int linear_tn_override = g_ratio_linear_tn_override.load(std::memory_order_relaxed);
+    const int linear_kb_override = g_ratio_linear_kb_override.load(std::memory_order_relaxed);
+    const int iq4_tn_override = g_ratio_iq4_tn_override.load(std::memory_order_relaxed);
+    const int iq4_kb_override = g_ratio_iq4_kb_override.load(std::memory_order_relaxed);
 
     const int blocks_per_row = K / 32;
+    const int min_dim = min(N, K);
+    const int max_dim = max(N, K);
+    const bool is_squareish_shape = (min_dim >= 2048) && (max_dim * 100 <= min_dim * 140);
 
     int kb;
     if (codebook_id == RATIO_VNNI_CODEBOOK_IQ4)
@@ -1174,9 +1204,31 @@ bool rocmGemv_ratio_vnni_int8_int32(
         else
             kb = min(12, max(2, blocks_per_row / 8));
 
+        if (is_squareish_shape)
+        {
+            kb = 16;
+        }
+
+        if (iq4_kb_override > 0)
+        {
+            kb = iq4_kb_override;
+        }
+
         hipMemsetAsync(d_C_int32, 0, N * sizeof(int32_t), static_cast<hipStream_t>(stream));
 
-        const bool iq4_use_wide_tile = (blocks_per_row > 256);
+        bool iq4_use_wide_tile = (blocks_per_row > 256);
+        if (is_squareish_shape)
+        {
+            iq4_use_wide_tile = false;
+        }
+        if (iq4_tn_override == TN)
+        {
+            iq4_use_wide_tile = false;
+        }
+        else if (iq4_tn_override == TN_IQ4_WIDE)
+        {
+            iq4_use_wide_tile = true;
+        }
         const int tn_iq4 = iq4_use_wide_tile ? TN_IQ4_WIDE : TN;
         const int grid_n_iq4 = (N + tn_iq4 - 1) / tn_iq4;
 
@@ -1209,9 +1261,31 @@ bool rocmGemv_ratio_vnni_int8_int32(
         else
             kb = min(12, max(2, blocks_per_row / 8));
 
+        if (is_squareish_shape)
+        {
+            kb = 16;
+        }
+
+        if (linear_kb_override > 0)
+        {
+            kb = linear_kb_override;
+        }
+
         hipMemsetAsync(d_C_int32, 0, N * sizeof(int32_t), static_cast<hipStream_t>(stream));
 
-        const bool linear_use_wide_tile = (blocks_per_row > 256);
+        bool linear_use_wide_tile = (blocks_per_row > 256);
+        if (is_squareish_shape)
+        {
+            linear_use_wide_tile = false;
+        }
+        if (linear_tn_override == TN)
+        {
+            linear_use_wide_tile = false;
+        }
+        else if (linear_tn_override == TN_IQ4_WIDE)
+        {
+            linear_use_wide_tile = true;
+        }
         const int tn_linear = linear_use_wide_tile ? TN_IQ4_WIDE : TN;
         const int grid_n_linear = (N + tn_linear - 1) / tn_linear;
 

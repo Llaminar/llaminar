@@ -1346,3 +1346,66 @@ if qavg_vals:
   print(f'q4_avg_mean={sum(qavg_vals)/len(qavg_vals):.6f} q4_avg_median={statistics.median(qavg_vals):.6f}')
 PY
 ```
+
+### B.12 Addendum: Q/Wo autosweep defaults (`2026-02-13`)
+
+To stabilize Q/Wo performance, we added a local autosweep harness for square-ish
+shapes and promoted the winning tuning into dispatch defaults.
+
+#### What changed
+
+- Added runtime tuning override hooks for ratio-VNNI dispatch:
+  - `rocmGemv_ratio_vnni_set_tuning_overrides(linear_tn, linear_kb, iq4_tn, iq4_kb)`
+  - `rocmGemv_ratio_vnni_reset_tuning_overrides()`
+- Added env-gated autosweep test (`QWoAutoSweepTnKb`) over:
+  - `TN ∈ {128, 256}`
+  - `KB ∈ {8, 10, 12, 14, 16}`
+- Promoted square-ish defaults in production dispatch for both codebooks:
+  - `TN = 128`
+  - `KB = 16`
+
+#### Autosweep winners (Q/Wo 3584x3584)
+
+- `Q4_0`: `TN=128`, `KB=16`, speedup `1.42474x`
+- `IQ4_NL`: `TN=128`, `KB=16`, speedup `1.42478x`
+
+#### Full perf table after promoting defaults
+
+Measured from `V2_Perf_ROCmRatioVNNIKernel` (release build, full table run):
+
+| Format | Shape | INT8 ms | Ratio ms | Speedup |
+|---|---|---:|---:|---:|
+| Q4_0 | Q/Wo 3584x3584 | 0.0305759 | 0.0237546 | 1.28716x |
+| Q4_0 | FFN Down 3584x18944 | 0.101738 | 0.0570932 | 1.78197x |
+| Q4_0 | FFN Gate 18944x3584 | 0.101706 | 0.0573652 | 1.77296x |
+| IQ4_NL | Q/Wo 3584x3584 | 0.0305813 | 0.0232159 | 1.31725x |
+| IQ4_NL | FFN Down 3584x18944 | 0.103424 | 0.0578558 | 1.78761x |
+| IQ4_NL | FFN Gate 18944x3584 | 0.104213 | 0.0568799 | 1.83216x |
+
+Summary metrics from the same run:
+
+- Global average speedup: `1.62985x`
+- Q4_0 average speedup: `1.61403x`
+- IQ4_NL average speedup: `1.64568x`
+
+Interpretation:
+
+- The autosweep winner improved Q/Wo versus the prior square-ish default path,
+  while preserving strong FFN performance and healthy overall averages.
+
+#### Repro commands
+
+Autosweep run:
+
+```bash
+LLAMINAR_RUN_QWO_AUTOSWEEP=1 \
+ctest --test-dir /workspaces/llaminar/build_v2_release \
+  -R '^V2_Perf_ROCmRatioVNNIKernel$' --output-on-failure -V
+```
+
+Full table run (defaults only):
+
+```bash
+ctest --test-dir /workspaces/llaminar/build_v2_release \
+  -R '^V2_Perf_ROCmRatioVNNIKernel$' --output-on-failure -V
+```
