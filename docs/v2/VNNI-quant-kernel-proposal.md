@@ -1005,3 +1005,37 @@ For each pass directory, keep:
 - `test_stdout.log` (benchmark context)
 
 This is sufficient to reproduce and compare future tuning iterations.
+
+
+## C. 2026-02-13 Mode3 const-LUT 10-run A/B (Release)
+
+### C.1 Setup
+
+- Binary: `build_v2_release/tests/v2/v2_perf_rocm_ratio_vnni_kernel`
+- Test filter: `ROCmRatioVNNIPerfTest.Phase1Q4AndIQ4SpeedupVsInt8VNNI`
+- Fixed env:
+  - `LLAMINAR_RATIO_IQ4_DECODE_MODE=3`
+  - `LLAMINAR_RATIO_IQ4_CPT=1`
+  - `LLAMINAR_RATIO_IQ4_PREFETCH_NEXT=1`
+- A/B variable:
+  - A: `LLAMINAR_RATIO_IQ4_MODE3_CONST_LUT=0`
+  - B: `LLAMINAR_RATIO_IQ4_MODE3_CONST_LUT=1`
+- Logs: `/tmp/iq4_mode3_constlut_ab_10run_20260213_150931`
+
+
+### C.2 Results (Global ratio/int8 speedup)
+
+- A (`MODE3_CONST_LUT=0`):
+  - mean `1.37030x`, median `1.37360x`, min/max `1.32466x / 1.46412x`, std `0.03723`
+  - pass count: `10/10`
+- B (`MODE3_CONST_LUT=1`):
+  - mean `1.41430x`, median `1.41512x`, min/max `1.38818x / 1.44810x`, std `0.01468`
+  - pass count: `10/10`
+
+- Median uplift (B vs A): **`+3.02%`**
+
+
+### C.3 Takeaway
+
+- The const-LUT mode3 path improves release median throughput and reduces run-to-run variance in this 10-run sample.
+- Keeping mode3 const-LUT enabled by default is supported by this A/B evidence.

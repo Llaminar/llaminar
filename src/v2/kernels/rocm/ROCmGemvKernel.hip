@@ -44,6 +44,8 @@
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
+#include <array>
+#include <mutex>
 
 #include "../../backends/rocm/HipDeviceGuard.h"
 
@@ -78,6 +80,71 @@ __device__ __constant__ int8_t k_ratio_vnni_iq4_lut_i8[16] = {
     -49, -35, -22, -10,
     1, 13, 25, 38,
     53, 69, 89, 113};
+
+__device__ __constant__ uint32_t k_ratio_iq4_perm_lut_words[1024];
+
+static std::array<uint32_t, 1024> build_ratio_iq4_perm_lut_table_host()
+{
+    std::array<uint32_t, 1024> table{};
+    for (int rb = 0; rb < 256; ++rb)
+    {
+        const int8_t ratio = static_cast<int8_t>(rb);
+        const int base = rb * 4;
+
+        uint32_t lut0 = 0;
+        uint32_t lut1 = 0;
+        uint32_t lut2 = 0;
+        uint32_t lut3 = 0;
+
+        for (int i = 0; i < 4; ++i)
+        {
+            const int8_t wi_lo_0 = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i]) + 64) >> 7);
+            const int8_t wi_lo_1 = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i + 4]) + 64) >> 7);
+            const int8_t wi_hi_0 = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i + 8]) + 64) >> 7);
+            const int8_t wi_hi_1 = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i + 12]) + 64) >> 7);
+
+            lut0 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_lo_0)) << (i * 8));
+            lut1 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_lo_1)) << (i * 8));
+            lut2 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_hi_0)) << (i * 8));
+            lut3 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_hi_1)) << (i * 8));
+        }
+
+        table[base + 0] = lut0;
+        table[base + 1] = lut1;
+        table[base + 2] = lut2;
+        table[base + 3] = lut3;
+    }
+    return table;
+}
+
+static bool ensure_ratio_iq4_perm_lut_table_on_device(int device_id)
+{
+    static std::mutex init_mutex;
+    static bool initialized[16] = {false};
+    static const std::array<uint32_t, 1024> host_table = build_ratio_iq4_perm_lut_table_host();
+
+    const int did = (device_id >= 0 && device_id < 16) ? device_id : 0;
+    std::lock_guard<std::mutex> lock(init_mutex);
+    if (initialized[did])
+    {
+        return true;
+    }
+
+    hipError_t err = hipMemcpyToSymbol(HIP_SYMBOL(k_ratio_iq4_perm_lut_words),
+                                       host_table.data(),
+                                       host_table.size() * sizeof(uint32_t),
+                                       0,
+                                       hipMemcpyHostToDevice);
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemv_ratio_vnni_int8_int32] Failed to init mode3 LUT table on device %d: %s\n",
+                did, hipGetErrorString(err));
+        return false;
+    }
+
+    initialized[did] = true;
+    return true;
+}
 
 template <bool IQ4>
 __device__ __forceinline__ int32_t decode_q4_pack4_low(
@@ -466,6 +533,20 @@ __device__ __forceinline__ void build_iq4_perm_lut_words_from_ratio(
     }
 }
 
+__device__ __forceinline__ void fetch_iq4_perm_lut_words_from_ratio_table(
+    int8_t ratio,
+    uint32_t& lut0,
+    uint32_t& lut1,
+    uint32_t& lut2,
+    uint32_t& lut3)
+{
+    const uint32_t idx = static_cast<uint32_t>(static_cast<uint8_t>(ratio)) * 4u;
+    lut0 = k_ratio_iq4_perm_lut_words[idx + 0];
+    lut1 = k_ratio_iq4_perm_lut_words[idx + 1];
+    lut2 = k_ratio_iq4_perm_lut_words[idx + 2];
+    lut3 = k_ratio_iq4_perm_lut_words[idx + 3];
+}
+
 __global__ void gemv_int8_int8_vnni_kernel(
     const int8_t* __restrict__ d_A_int8,
     const int8_t* __restrict__ d_B_int8_vnni,
@@ -751,7 +832,8 @@ __global__ void gemv_ratio_vnni_grid_kpar_kernel_t(
                 {
                     uint64_t lut_lo = 0;
                     uint64_t lut_hi = 0;
-                    if constexpr (IQ4_DECODE_MODE != 4)
+                    constexpr bool MODE3_CONST_LUT = IQ4 && (IQ4_DECODE_MODE == 3) && IQ4_CPT2_LUT64;
+                    if constexpr (IQ4_DECODE_MODE != 4 && !MODE3_CONST_LUT)
                     {
                         #pragma unroll
                         for (int i = 0; i < 8; ++i)
@@ -804,10 +886,21 @@ __global__ void gemv_ratio_vnni_grid_kpar_kernel_t(
                     else if constexpr (IQ4_DECODE_MODE == 3)
                     {
                         const uint4 packed = *reinterpret_cast<const uint4*>(payload16);
-                        const uint32_t lut0 = static_cast<uint32_t>(lut_lo & 0xFFFFFFFFu);
-                        const uint32_t lut1 = static_cast<uint32_t>((lut_lo >> 32) & 0xFFFFFFFFu);
-                        const uint32_t lut2 = static_cast<uint32_t>(lut_hi & 0xFFFFFFFFu);
-                        const uint32_t lut3 = static_cast<uint32_t>((lut_hi >> 32) & 0xFFFFFFFFu);
+                        uint32_t lut0 = 0;
+                        uint32_t lut1 = 0;
+                        uint32_t lut2 = 0;
+                        uint32_t lut3 = 0;
+                        if constexpr (MODE3_CONST_LUT)
+                        {
+                            fetch_iq4_perm_lut_words_from_ratio_table(ratio, lut0, lut1, lut2, lut3);
+                        }
+                        else
+                        {
+                            lut0 = static_cast<uint32_t>(lut_lo & 0xFFFFFFFFu);
+                            lut1 = static_cast<uint32_t>((lut_lo >> 32) & 0xFFFFFFFFu);
+                            lut2 = static_cast<uint32_t>(lut_hi & 0xFFFFFFFFu);
+                            lut3 = static_cast<uint32_t>((lut_hi >> 32) & 0xFFFFFFFFu);
+                        }
 
                         const int32_t a0 = a4[0];
                         const int32_t a1 = a4[1];
@@ -1423,6 +1516,7 @@ bool rocmGemv_ratio_vnni_int8_int32(
         int iq4_decode_mode = 0;  // 0=baseline block8 LUT64, 1=fused-pair LUT64, 2=fused-group LUT64, 3=perm-based pair LUT16, 4=wave-pair bpermute + perm LUT16
         bool iq4_prefetch_next = false;
         bool iq4_cpt2_lut64 = false;
+        bool iq4_mode3_const_lut = true;  // default on for mode3; env can override
         int iq4_kb_mode = 0;      // 0=default, 1=min-atomic, 2=high-occupancy
         if (const char* fp_env = std::getenv("LLAMINAR_RATIO_IQ4_FUSED_PAIR"))
         {
@@ -1448,6 +1542,10 @@ bool rocmGemv_ratio_vnni_int8_int32(
         if (const char* cpt2_lut64_env = std::getenv("LLAMINAR_RATIO_IQ4_CPT2_LUT64"))
         {
             iq4_cpt2_lut64 = (std::atoi(cpt2_lut64_env) != 0);
+        }
+        if (const char* mode3_table_env = std::getenv("LLAMINAR_RATIO_IQ4_MODE3_CONST_LUT"))
+        {
+            iq4_mode3_const_lut = (std::atoi(mode3_table_env) != 0);
         }
         if (const char* kb_mode_env = std::getenv("LLAMINAR_RATIO_IQ4_KB_MODE"))
         {
@@ -1576,6 +1674,13 @@ bool rocmGemv_ratio_vnni_int8_int32(
         else
         {
             const int iq4_mode = iq4_decode_mode;
+            if (iq4_mode == 3 && iq4_mode3_const_lut)
+            {
+                if (!ensure_ratio_iq4_perm_lut_table_on_device(device_id))
+                {
+                    return false;
+                }
+            }
             if (iq4_prefetch_next)
             {
                 if (iq4_use_wide_tile)
@@ -1598,11 +1703,22 @@ bool rocmGemv_ratio_vnni_int8_int32(
                             }
                             else if (iq4_mode == 3)
                             {
-                            hipLaunchKernelGGL(
-                                HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 3, true, false>),
-                                dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
-                                d_A_int8, d_payload, d_ratio, d_C_int32,
-                                N, K, kb, codebook_id);
+                                if (iq4_mode3_const_lut)
+                                {
+                                    hipLaunchKernelGGL(
+                                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 3, true, true>),
+                                        dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
+                                        d_A_int8, d_payload, d_ratio, d_C_int32,
+                                        N, K, kb, codebook_id);
+                                }
+                                else
+                                {
+                                    hipLaunchKernelGGL(
+                                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 3, true, false>),
+                                        dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
+                                        d_A_int8, d_payload, d_ratio, d_C_int32,
+                                        N, K, kb, codebook_id);
+                                }
                             }
                     else if (iq4_mode == 1)
                     {
@@ -1641,11 +1757,22 @@ bool rocmGemv_ratio_vnni_int8_int32(
                             }
                             else if (iq4_mode == 3)
                             {
-                            hipLaunchKernelGGL(
-                                HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 3, true, false>),
-                                dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
-                                d_A_int8, d_payload, d_ratio, d_C_int32,
-                                N, K, kb, codebook_id);
+                                if (iq4_mode3_const_lut)
+                                {
+                                    hipLaunchKernelGGL(
+                                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 3, true, true>),
+                                        dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
+                                        d_A_int8, d_payload, d_ratio, d_C_int32,
+                                        N, K, kb, codebook_id);
+                                }
+                                else
+                                {
+                                    hipLaunchKernelGGL(
+                                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 3, true, false>),
+                                        dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
+                                        d_A_int8, d_payload, d_ratio, d_C_int32,
+                                        N, K, kb, codebook_id);
+                                }
                             }
                     else if (iq4_mode == 1)
                     {
@@ -1687,11 +1814,22 @@ bool rocmGemv_ratio_vnni_int8_int32(
                             }
                             else if (iq4_mode == 3)
                             {
-                            hipLaunchKernelGGL(
-                                HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 3, false, false>),
-                                dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
-                                d_A_int8, d_payload, d_ratio, d_C_int32,
-                                N, K, kb, codebook_id);
+                                if (iq4_mode3_const_lut)
+                                {
+                                    hipLaunchKernelGGL(
+                                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 3, false, true>),
+                                        dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
+                                        d_A_int8, d_payload, d_ratio, d_C_int32,
+                                        N, K, kb, codebook_id);
+                                }
+                                else
+                                {
+                                    hipLaunchKernelGGL(
+                                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 3, false, false>),
+                                        dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
+                                        d_A_int8, d_payload, d_ratio, d_C_int32,
+                                        N, K, kb, codebook_id);
+                                }
                             }
                     else if (iq4_mode == 1)
                     {
@@ -1730,11 +1868,22 @@ bool rocmGemv_ratio_vnni_int8_int32(
                             }
                             else if (iq4_mode == 3)
                             {
-                            hipLaunchKernelGGL(
-                                HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 3, false, false>),
-                                dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
-                                d_A_int8, d_payload, d_ratio, d_C_int32,
-                                N, K, kb, codebook_id);
+                                if (iq4_mode3_const_lut)
+                                {
+                                    hipLaunchKernelGGL(
+                                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 3, false, true>),
+                                        dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
+                                        d_A_int8, d_payload, d_ratio, d_C_int32,
+                                        N, K, kb, codebook_id);
+                                }
+                                else
+                                {
+                                    hipLaunchKernelGGL(
+                                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 3, false, false>),
+                                        dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
+                                        d_A_int8, d_payload, d_ratio, d_C_int32,
+                                        N, K, kb, codebook_id);
+                                }
                             }
                     else if (iq4_mode == 1)
                     {
