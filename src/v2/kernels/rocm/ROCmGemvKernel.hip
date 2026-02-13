@@ -911,18 +911,23 @@ __global__ void gemv_ratio_vnni_grid_kpar_kernel_t(
                         const int32_t a6 = a4[6];
                         const int32_t a7 = a4[7];
 
+                        int32_t acc0 = acc[0];
+                        int32_t acc1 = 0;
+
                         int32_t w0_low, w0_high, w1_low, w1_high;
                         decode_q4_two_pairs_to_packed_i8_with_perm_lut16(packed.x, packed.y, lut0, lut1, lut2, lut3, w0_low, w0_high, w1_low, w1_high);
-                        acc[0] = __builtin_amdgcn_sdot4(a0, w0_low, acc[0], false);
-                        acc[0] = __builtin_amdgcn_sdot4(a4v, w0_high, acc[0], false);
-                        acc[0] = __builtin_amdgcn_sdot4(a1, w1_low, acc[0], false);
-                        acc[0] = __builtin_amdgcn_sdot4(a5, w1_high, acc[0], false);
+                        acc0 = __builtin_amdgcn_sdot4(a0, w0_low, acc0, false);
+                        acc1 = __builtin_amdgcn_sdot4(a4v, w0_high, acc1, false);
+                        acc0 = __builtin_amdgcn_sdot4(a1, w1_low, acc0, false);
+                        acc1 = __builtin_amdgcn_sdot4(a5, w1_high, acc1, false);
 
                         decode_q4_two_pairs_to_packed_i8_with_perm_lut16(packed.z, packed.w, lut0, lut1, lut2, lut3, w0_low, w0_high, w1_low, w1_high);
-                        acc[0] = __builtin_amdgcn_sdot4(a2, w0_low, acc[0], false);
-                        acc[0] = __builtin_amdgcn_sdot4(a6, w0_high, acc[0], false);
-                        acc[0] = __builtin_amdgcn_sdot4(a3, w1_low, acc[0], false);
-                        acc[0] = __builtin_amdgcn_sdot4(a7, w1_high, acc[0], false);
+                        acc0 = __builtin_amdgcn_sdot4(a2, w0_low, acc0, false);
+                        acc1 = __builtin_amdgcn_sdot4(a6, w0_high, acc1, false);
+                        acc0 = __builtin_amdgcn_sdot4(a3, w1_low, acc0, false);
+                        acc1 = __builtin_amdgcn_sdot4(a7, w1_high, acc1, false);
+
+                        acc[0] = acc0 + acc1;
                     }
                     else if constexpr (IQ4_DECODE_MODE == 4)
                     {
