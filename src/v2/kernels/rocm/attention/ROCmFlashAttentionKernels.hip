@@ -962,45 +962,65 @@ extern "C"
 
         float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
-        // Adaptively select tile sizes based on LDS constraints
-        // Start with default 64x64, fall back to smaller tiles if needed
+        // Adaptively select tile sizes based on LDS constraints.
+        // Prefer larger tile area, then larger tile_q (better Q reuse / fewer blocks).
         int tile_q = FA2_TILE_Q;
         int tile_kv = FA2_TILE_KV;
-
-        // Check if default tiles fit in LDS
         FA2LDSLayout lds_layout;
-        lds_layout.compute(head_dim, tile_q, tile_kv);
 
-        if (lds_layout.total_size > LDS_SIZE_BYTES)
+        struct TileCandidate
         {
-            // Try 32x64 tiles
-            tile_q = 32;
-            tile_kv = 64;
-            lds_layout.compute(head_dim, tile_q, tile_kv);
+            int q;
+            int kv;
+        };
 
-            if (lds_layout.total_size > LDS_SIZE_BYTES)
+        // Keep candidates conservative and power-of-two for predictable behavior.
+        // NOTE: 64x32 is intentionally included; for head_dim=128 it often fits
+        // where 64x64 does not, and is usually better than dropping to 32x32.
+        constexpr TileCandidate candidates[] = {
+            {64, 64},
+            {64, 32},
+            {32, 64},
+            {32, 32},
+            {16, 32},
+        };
+
+        int best_q = -1;
+        int best_kv = -1;
+        int best_area = -1;
+        FA2LDSLayout best_layout{};
+
+        for (const auto &c : candidates)
+        {
+            FA2LDSLayout cand_layout;
+            cand_layout.compute(head_dim, c.q, c.kv);
+            if (cand_layout.total_size > LDS_SIZE_BYTES)
+                continue;
+
+            const int area = c.q * c.kv;
+            const bool better =
+                (area > best_area) ||
+                (area == best_area && c.q > best_q);
+
+            if (better)
             {
-                // Try 32x32 tiles
-                tile_q = 32;
-                tile_kv = 32;
-                lds_layout.compute(head_dim, tile_q, tile_kv);
-
-                if (lds_layout.total_size > LDS_SIZE_BYTES)
-                {
-                    // Last resort: 16x32 tiles
-                    tile_q = 16;
-                    tile_kv = 32;
-                    lds_layout.compute(head_dim, tile_q, tile_kv);
-
-                    if (lds_layout.total_size > LDS_SIZE_BYTES)
-                    {
-                        printf("[hipFlashAttn_prefill_fa2] Error: Cannot fit head_dim=%d in LDS even with smallest tiles\n",
-                               head_dim);
-                        return -1;
-                    }
-                }
+                best_q = c.q;
+                best_kv = c.kv;
+                best_area = area;
+                best_layout = cand_layout;
             }
         }
+
+        if (best_area < 0)
+        {
+            printf("[hipFlashAttn_prefill_fa2] Error: Cannot fit head_dim=%d in LDS with supported tiles\n",
+                   head_dim);
+            return -1;
+        }
+
+        tile_q = best_q;
+        tile_kv = best_kv;
+        lds_layout = best_layout;
 
         // Grid configuration
         const int num_q_tiles = (seq_len + tile_q - 1) / tile_q;
