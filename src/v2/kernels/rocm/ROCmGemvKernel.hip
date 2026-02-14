@@ -2074,13 +2074,9 @@ bool rocmGemv_fused_fp32_int8_vnni(
 //
 // Mapping:  rowmajor[n*K + kg*4 + i] = vnni[(kg*N + n)*4 + i]
 //
-// Each thread handles one (n, kg) pair = 4 elements, packed as int32_t.
-// Grid: ceil(N * K/4 / blockDim.x) blocks, blockDim.x = 256 threads.
-//
-// Access pattern:
-//   - VNNI reads:  consecutive tids (consecutive n) → stride 4 → coalesced
-//   - Row-major writes: consecutive tids (consecutive n) → stride K → scattered
-//     but each write is a 4-byte int32_t, so individual writes are efficient.
+// Treat each 4-byte pack as one int32 element in matrix A[kg, n] and transpose
+// to B[n, kg] using a tiled shared-memory transpose to keep both reads and
+// writes coalesced.
 //
 // Cost: ~65-200μs for 18944×3584 (Gate/Up shape). Amortized over prefill.
 //
@@ -2090,23 +2086,45 @@ repack_vnni_to_rowmajor_kernel(
     int8_t* __restrict__ d_B_rowmajor,       // [N×K] output
     int N, int K)
 {
-    const int k_groups = K / 4;
-    const int total = N * k_groups;
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    constexpr int TILE_DIM = 32;
+    constexpr int BLOCK_ROWS = 8;
 
-    if (tid >= total)
-        return;
+    const int k_groups = K / 4; // number of int32 packs per output row
 
-    const int n  = tid % N;
-    const int kg = tid / N;
+    const int x_in = blockIdx.x * TILE_DIM + threadIdx.x; // n index in source A[kg, n]
+    const int y_in = blockIdx.y * TILE_DIM + threadIdx.y; // kg index in source A[kg, n]
 
-    // Read 4 bytes from VNNI as a single int32_t (coalesced for consecutive n)
-    const int32_t packed = *reinterpret_cast<const int32_t*>(
-        &d_B_vnni[(static_cast<int64_t>(kg) * N + n) * 4]);
+    const int32_t* __restrict__ src32 = reinterpret_cast<const int32_t*>(d_B_vnni);
+    int32_t* __restrict__ dst32 = reinterpret_cast<int32_t*>(d_B_rowmajor);
 
-    // Write 4 bytes to row-major (scattered for consecutive n, but 4B atomic)
-    *reinterpret_cast<int32_t*>(
-        &d_B_rowmajor[static_cast<int64_t>(n) * K + kg * 4]) = packed;
+    __shared__ int32_t tile[TILE_DIM][TILE_DIM + 1];
+
+    // Load tile from source (A = [k_groups, N], row-major in n)
+    #pragma unroll
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
+    {
+        const int y = y_in + j;
+        if (x_in < N && y < k_groups)
+        {
+            tile[threadIdx.y + j][threadIdx.x] = src32[static_cast<int64_t>(y) * N + x_in];
+        }
+    }
+
+    __syncthreads();
+
+    // Store transposed tile to destination (B = [N, k_groups], row-major in kg)
+    const int x_out = blockIdx.y * TILE_DIM + threadIdx.x; // kg
+    const int y_out = blockIdx.x * TILE_DIM + threadIdx.y; // n
+
+    #pragma unroll
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
+    {
+        const int y = y_out + j;
+        if (x_out < k_groups && y < N)
+        {
+            dst32[static_cast<int64_t>(y) * k_groups + x_out] = tile[threadIdx.x][threadIdx.y + j];
+        }
+    }
 }
 
 
@@ -2125,13 +2143,15 @@ bool rocmGemv_repackVNNI_to_rowmajor(
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
     const int k_groups = K / 4;
-    const int total = N * k_groups;
-    constexpr int BLOCK = 256;
-    const int grid = (total + BLOCK - 1) / BLOCK;
+    constexpr int TILE_DIM = 32;
+    constexpr int BLOCK_ROWS = 8;
+
+    const int grid_x = (N + TILE_DIM - 1) / TILE_DIM;
+    const int grid_y = (k_groups + TILE_DIM - 1) / TILE_DIM;
 
     hipLaunchKernelGGL(
         repack_vnni_to_rowmajor_kernel,
-        dim3(grid), dim3(BLOCK), 0, static_cast<hipStream_t>(stream),
+        dim3(grid_x, grid_y), dim3(TILE_DIM, BLOCK_ROWS), 0, static_cast<hipStream_t>(stream),
         d_B_vnni, d_B_rowmajor, N, K);
 
     hipError_t err = hipGetLastError();
