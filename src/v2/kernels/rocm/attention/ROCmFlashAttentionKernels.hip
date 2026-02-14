@@ -783,7 +783,11 @@ namespace
                 l_partial[partial_idx] = 0.0f;
             }
             float *O_out = O_partial + partial_idx * head_dim;
-            for (int d = tid; d < head_dim; d += num_threads)
+            for (int d = tid * 2; d + 1 < head_dim; d += num_threads * 2)
+            {
+                reinterpret_cast<float2 *>(O_out + d)[0] = make_float2(0.0f, 0.0f);
+            }
+            for (int d = (head_dim & ~1) + tid; d < head_dim; d += num_threads)
             {
                 O_out[d] = 0.0f;
             }
@@ -839,9 +843,24 @@ namespace
             // Lane i loads Q[i], Q[i+64], ... and K[i], K[i+64], ...
             // This is fully coalesced — adjacent lanes access adjacent floats
             float partial_dot = 0.0f;
-            for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE)
+            if ((head_dim & 1) == 0)
             {
-                partial_dot += Q_shared[d] * K_ptr[d];
+                const int head_dim_vec2 = head_dim / 2;
+                const float2 *Q_ptr2 = reinterpret_cast<const float2 *>(Q_shared);
+                const float2 *K_ptr2 = reinterpret_cast<const float2 *>(K_ptr);
+                for (int d2 = lane_id; d2 < head_dim_vec2; d2 += WAVEFRONT_SIZE)
+                {
+                    const float2 qv = Q_ptr2[d2];
+                    const float2 kv = K_ptr2[d2];
+                    partial_dot += qv.x * kv.x + qv.y * kv.y;
+                }
+            }
+            else
+            {
+                for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE)
+                {
+                    partial_dot += Q_shared[d] * K_ptr[d];
+                }
             }
 
             // Reduce across wavefront → full dot product (6 shuffles)
