@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cfloat>
 #include <cstdio>
+#include <cstdlib>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 
@@ -94,6 +95,128 @@ namespace
 
     // Threads per block for decode kernel
     constexpr int FD_THREADS_PER_BLOCK = 256;
+
+    // Max splits supported by reduction kernel shared-memory staging
+    constexpr int FD_MAX_SPLITS_SUPPORTED = 32;
+
+    inline int getEnvIntOrDefault(const char* name, int default_value)
+    {
+        const char* v = std::getenv(name);
+        return v ? std::atoi(v) : default_value;
+    }
+
+    inline int clampInt(int v, int lo, int hi)
+    {
+        return (v < lo) ? lo : ((v > hi) ? hi : v);
+    }
+
+    inline int roundUpPow2Clamped(int value, int max_allowed)
+    {
+        int p = 1;
+        while (p < value && p < max_allowed)
+        {
+            p <<= 1;
+        }
+        return clampInt(p, 1, max_allowed);
+    }
+
+    inline int chooseDecodeThreadsPerBlock(int head_dim, int kv_len, int effective_num_splits)
+    {
+        const int env_tpb = getEnvIntOrDefault("LLAMINAR_FLASH_DECODE_TPB", 0);
+        if (env_tpb == 128 || env_tpb == 256)
+        {
+            return env_tpb;
+        }
+
+        const bool auto_enabled = (getEnvIntOrDefault("LLAMINAR_FLASH_DECODE_AUTO", 1) != 0);
+        if (!auto_enabled)
+        {
+            return FD_THREADS_PER_BLOCK;
+        }
+
+        // Generic heuristic using work-per-split and split aspect.
+        const int safe_head_dim = std::max(head_dim, 1);
+        const int safe_splits = std::max(effective_num_splits, 1);
+        const int rows_per_split = std::max(1, kv_len / safe_splits);
+        const int64_t elems_per_split =
+            (static_cast<int64_t>(kv_len) * safe_head_dim) / safe_splits;
+
+        // Small per-split work or very short split rows favor lower TPB.
+        if ((rows_per_split <= 64 && elems_per_split <= 16384) ||
+            (rows_per_split <= 48 && elems_per_split <= 32768))
+        {
+            return 128;
+        }
+
+        return 256;
+    }
+
+    inline int chooseDecodeSplitsAuto(int kv_len, int head_dim, int max_allowed)
+    {
+        const int safe_head_dim = std::max(head_dim, 1);
+        const int64_t total_elements = static_cast<int64_t>(kv_len) * safe_head_dim;
+
+        // Target work-per-split (elements), configurable and architecture-agnostic.
+        const int target_default = 16384;
+        const int target_elements_per_split = clampInt(
+            getEnvIntOrDefault("LLAMINAR_FLASH_DECODE_TARGET_ELEMS_PER_SPLIT", target_default),
+            1024,
+            1 << 20);
+
+        int base_splits = static_cast<int>((total_elements + target_elements_per_split - 1) /
+                                           target_elements_per_split);
+        base_splits = std::max(base_splits, 1);
+
+        // Aspect-ratio adjustment: deeper KV relative to head_dim benefits from more splits.
+        // Uses ratio kv_len/head_dim (not hard-coded model dimensions).
+        if (kv_len >= safe_head_dim * 8)
+        {
+            base_splits = (base_splits * 3 + 1) / 2; // ~1.5x
+        }
+        else if (kv_len <= safe_head_dim * 2)
+        {
+            base_splits = std::max(1, (base_splits + 1) / 2);
+        }
+
+        // Don't over-split beyond useful row granularity.
+        base_splits = std::min(base_splits, std::max(kv_len, 1));
+
+        // Prefer power-of-two split counts for predictable reduction behavior.
+        int auto_splits = roundUpPow2Clamped(base_splits, max_allowed);
+
+        const int min_splits = clampInt(
+            getEnvIntOrDefault("LLAMINAR_FLASH_DECODE_MIN_SPLITS", 1),
+            1,
+            max_allowed);
+        auto_splits = clampInt(auto_splits, min_splits, max_allowed);
+        return auto_splits;
+    }
+
+    inline int chooseEffectiveDecodeSplits(int kv_len, int head_dim, int requested_num_splits)
+    {
+        const int forced = getEnvIntOrDefault("LLAMINAR_FLASH_DECODE_SPLITS", 0);
+        const bool auto_enabled = (getEnvIntOrDefault("LLAMINAR_FLASH_DECODE_AUTO", 1) != 0);
+        const int workspace_limit = (requested_num_splits > 0)
+            ? requested_num_splits
+            : FD_MAX_SPLITS_SUPPORTED;
+        const int max_allowed = std::max(1, std::min(FD_MAX_SPLITS_SUPPORTED, workspace_limit));
+
+        if (forced > 0)
+        {
+            return std::max(1, std::min(forced, max_allowed));
+        }
+
+        if (!auto_enabled)
+        {
+            const int requested = (requested_num_splits > 0)
+                ? requested_num_splits
+                : FD_DEFAULT_NUM_SPLITS;
+            return std::max(1, std::min(requested, max_allowed));
+        }
+
+        const int auto_splits = chooseDecodeSplitsAuto(kv_len, head_dim, max_allowed);
+        return std::max(1, std::min(auto_splits, max_allowed));
+    }
 
     // =========================================================================
     // Device Property Caching
@@ -1195,10 +1318,13 @@ extern "C"
 
         float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
+        const int effective_num_splits = chooseEffectiveDecodeSplits(kv_len, head_dim, num_splits);
+        const int decode_threads_per_block = chooseDecodeThreadsPerBlock(head_dim, kv_len, effective_num_splits);
+
         // Split-K kernel
         size_t smem_size = head_dim * sizeof(float); // Q in shared memory
-        dim3 grid_split(n_heads, num_splits, batch_size);
-        dim3 block_split(FD_THREADS_PER_BLOCK);
+        dim3 grid_split(n_heads, effective_num_splits, batch_size);
+        dim3 block_split(decode_threads_per_block);
 
         hipLaunchKernelGGL(
             flash_decoding_mi50_kernel,
@@ -1206,7 +1332,7 @@ extern "C"
             Q, K_cache, V_cache,
             O_partial, m_partial, l_partial,
             kv_len, n_heads, n_kv_heads, head_dim,
-            num_splits, softmax_scale, device_params);
+            effective_num_splits, softmax_scale, device_params);
 
         // Reduction kernel
         dim3 grid_reduce(n_heads, batch_size);
@@ -1216,7 +1342,7 @@ extern "C"
             flash_decoding_reduce_mi50_kernel,
             grid_reduce, block_reduce, 0, hip_stream,
             O_partial, m_partial, l_partial, O,
-            n_heads, head_dim, num_splits);
+            n_heads, head_dim, effective_num_splits);
 
         (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
