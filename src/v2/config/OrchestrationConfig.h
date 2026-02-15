@@ -291,7 +291,7 @@ namespace llaminar2
         // Recursive Topology Tree (Global PP Phase 8)
         // =========================================================================
 
-        /// Inline topology specification (--topology "PP(...)") 
+        /// Inline topology specification (--topology "PP(...)")
         std::string topology_string;
 
         /// Path to topology YAML file (--topology-file)
@@ -304,37 +304,37 @@ namespace llaminar2
         // Model Configuration
         // =========================================================================
 
-        std::string model_path;    ///< Path to GGUF model file
-        int max_seq_len = 2048;    ///< Maximum sequence length
-        bool use_mmap = true;      ///< Use memory-mapped file loading
+        std::string model_path; ///< Path to GGUF model file
+        int max_seq_len = 2048; ///< Maximum sequence length
+        bool use_mmap = true;   ///< Use memory-mapped file loading
 
         // =========================================================================
         // Inference Configuration
         // =========================================================================
 
-        std::string prompt;        ///< Input prompt
-        int n_predict = -1;        ///< Tokens to generate (-1 = until EOS)
-        int batch_size = 1;        ///< Batch size
-        int n_threads = -1;        ///< Thread count (-1 = auto)
-        int seed = -1;             ///< RNG seed (-1 = random)
+        std::string prompt; ///< Input prompt
+        int n_predict = -1; ///< Tokens to generate (-1 = until EOS)
+        int batch_size = 1; ///< Batch size
+        int n_threads = -1; ///< Thread count (-1 = auto)
+        int seed = -1;      ///< RNG seed (-1 = random)
 
         // =========================================================================
         // Sampling Configuration
         // =========================================================================
 
-        float temperature = 0.8f;  ///< Sampling temperature
-        int top_k = 40;            ///< Top-K sampling
-        float top_p = 0.9f;        ///< Top-P (nucleus) sampling
+        float temperature = 0.8f;   ///< Sampling temperature
+        int top_k = 40;             ///< Top-K sampling
+        float top_p = 0.9f;         ///< Top-P (nucleus) sampling
         bool deterministic = false; ///< Force deterministic mode
 
         // =========================================================================
         // Chat Configuration
         // =========================================================================
 
-        bool chat_mode = false;              ///< Interactive chat mode
-        bool single_shot_chat = false;       ///< Single prompt with chat template
-        std::string system_prompt;           ///< System message
-        std::string chat_template_override;  ///< Template override
+        bool chat_mode = false;             ///< Interactive chat mode
+        bool single_shot_chat = false;      ///< Single prompt with chat template
+        std::string system_prompt;          ///< System message
+        std::string chat_template_override; ///< Template override
 
         // =========================================================================
         // Benchmark Configuration
@@ -353,18 +353,18 @@ namespace llaminar2
         // MPI Bootstrap Configuration
         // =========================================================================
 
-        int mpi_procs = 0;             ///< MPI process count (0 = auto)
-        std::string hostfile;          ///< MPI hostfile path
-        bool mpi_dry_run = false;      ///< Print MPI config and exit
-        bool mpi_verbose = false;      ///< Verbose MPI output
-        bool mpi_no_bootstrap = false; ///< Disable auto-bootstrap
+        int mpi_procs = 0;              ///< MPI process count (0 = auto)
+        std::string hostfile;           ///< MPI hostfile path
+        bool mpi_dry_run = false;       ///< Print MPI config and exit
+        bool mpi_verbose = false;       ///< Verbose MPI output
+        bool mpi_no_bootstrap = false;  ///< Disable auto-bootstrap
         bool mpi_oversubscribe = false; ///< Allow oversubscription
 
         // =========================================================================
         // Verbosity and Debug
         // =========================================================================
 
-        int verbose_level = 0;   ///< 0=INFO, 1=DEBUG, 2=TRACE
+        int verbose_level = 0;     ///< 0=INFO, 1=DEBUG, 2=TRACE
         bool list_devices = false; ///< List devices and exit
         bool show_help = false;    ///< Show help and exit
 
@@ -372,21 +372,22 @@ namespace llaminar2
         // Memory Constraints
         // =========================================================================
 
-        std::optional<size_t> max_gpu_memory_mb;  ///< Maximum GPU memory in MB
-        std::optional<size_t> max_cpu_memory_mb;  ///< Maximum CPU memory in MB
+        std::optional<size_t> max_gpu_memory_mb; ///< Maximum GPU memory in MB
+        std::optional<size_t> max_cpu_memory_mb; ///< Maximum CPU memory in MB
 
         // =========================================================================
         // MoE Configuration
         // =========================================================================
 
-        bool moe_shared_experts_gpu = true;   ///< Place shared experts on GPU
-        bool moe_sparse_experts_cpu = true;   ///< Place sparse experts on CPU
+        bool moe_shared_experts_gpu = true; ///< Place shared experts on GPU
+        bool moe_sparse_experts_cpu = true; ///< Place sparse experts on CPU
 
         // =========================================================================
         // Precision
         // =========================================================================
 
-        std::string activation_precision = "fp32";  ///< "fp32", "bf16", "fp16", "q8_1"
+        std::string activation_precision = "fp32"; ///< "fp32", "bf16", "fp16", "q8_1"
+        std::string kv_cache_precision = "auto";   ///< "auto", "fp16", "q8_1"
 
         // =========================================================================
         // Weight Sharding
@@ -399,11 +400,11 @@ namespace llaminar2
         // Heterogeneous Mode
         // =========================================================================
 
-        bool heterogeneous_mode = false;      ///< Enable heterogeneous mode
-        float cpu_compute_fraction = 0.2f;    ///< CPU compute fraction (0.0 to 1.0)
-        bool disable_gpu_tp = false;          ///< Disable GPU tensor parallelism
-        bool disable_cpu_tp = false;          ///< Disable CPU tensor parallelism
-        int min_layers_per_domain = 2;        ///< Minimum layers per domain
+        bool heterogeneous_mode = false;   ///< Enable heterogeneous mode
+        float cpu_compute_fraction = 0.2f; ///< CPU compute fraction (0.0 to 1.0)
+        bool disable_gpu_tp = false;       ///< Disable GPU tensor parallelism
+        bool disable_cpu_tp = false;       ///< Disable CPU tensor parallelism
+        int min_layers_per_domain = 2;     ///< Minimum layers per domain
 
         // =========================================================================
         // Methods

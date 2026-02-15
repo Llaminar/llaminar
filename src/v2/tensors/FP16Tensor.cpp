@@ -90,8 +90,11 @@ namespace llaminar2
     const float *FP16Tensor::data() const
     {
         assertValid("FP16Tensor::data");
-        // Lazy dequantization to FP32 cache
-        if (dequant_cache_.empty())
+        // For views, always refresh dequantized cache because parent storage may
+        // be mutated between calls (e.g., KV cache append updates underlying rows).
+        // For owning tensors, retain lazy one-time dequantization semantics.
+        const bool need_refresh = is_view_ || dequant_cache_.empty();
+        if (need_refresh)
         {
             // Get the actual data pointer (owned or borrowed)
             const uint16_t *fp16_ptr = is_view_
@@ -244,34 +247,8 @@ namespace llaminar2
             throw std::invalid_argument("FP16Tensor::from_fp32: size mismatch");
         }
 
-        // Convert FP32 → FP16
-        // TODO: Add SIMD/hardware acceleration
-        for (size_t i = 0; i < count; ++i)
-        {
-            // Round to nearest even for FP32 → FP16
-            uint32_t bits;
-            std::memcpy(&bits, &fp32_data[i], sizeof(float));
-
-            uint32_t sign = (bits >> 16) & 0x8000;
-            int32_t exponent = static_cast<int32_t>((bits >> 23) & 0xFF) - 112; // Signed!
-            uint32_t mantissa = (bits >> 13) & 0x3FF;
-
-            if (exponent <= 0)
-            {
-                // Subnormal or zero
-                fp16_ptr[i] = static_cast<uint16_t>(sign);
-            }
-            else if (exponent >= 0x1F)
-            {
-                // Overflow → infinity
-                fp16_ptr[i] = static_cast<uint16_t>(sign | 0x7C00);
-            }
-            else
-            {
-                // Normal value
-                fp16_ptr[i] = static_cast<uint16_t>(sign | (exponent << 10) | mantissa);
-            }
-        }
+        // Convert FP32 → FP16 with proper rounding/handling
+        simd::convert_fp32_to_fp16(fp32_data, fp16_ptr, count);
 
         // Invalidate FP32 cache
         dequant_cache_.clear();

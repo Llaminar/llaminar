@@ -128,6 +128,9 @@ namespace llaminar2
         /// for typical Qwen2 models. See VNNISafetyConstants.h for VNNI overflow limits.
         float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must cover Q projection max (~130)
 
+        /// Explicit KV cache precision mode (AUTO preserves legacy behavior).
+        KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
+
         // Execution settings
         DeviceId default_device = DeviceId::cpu(); ///< Default device for execution
         bool enable_profiling = false;

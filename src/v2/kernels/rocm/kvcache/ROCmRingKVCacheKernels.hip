@@ -19,6 +19,8 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
+#include "../../../tensors/BlockStructures.h"
+#include "../../../tensors/TensorType.h"
 
 namespace llaminar2
 {
@@ -177,8 +179,8 @@ namespace llaminar2
         if (token_idx >= seq_count)
         {
             // Padding: zero-fill beyond sequence length
-            d_K_out[out_offset] = T(0);
-            d_V_out[out_offset] = T(0);
+            d_K_out[out_offset] = T{};
+            d_V_out[out_offset] = T{};
             return;
         }
 
@@ -189,6 +191,188 @@ namespace llaminar2
 
         d_K_out[out_offset] = d_K_caches[seq_idx][src_offset];
         d_V_out[out_offset] = d_V_caches[seq_idx][src_offset];
+    }
+
+    template <typename T>
+    __device__ inline float to_float_device(T v)
+    {
+        return static_cast<float>(v);
+    }
+
+    template <>
+    __device__ inline float to_float_device<half>(half v)
+    {
+        return __half2float(v);
+    }
+
+    template <>
+    __device__ inline float to_float_device<hip_bfloat16>(hip_bfloat16 v)
+    {
+        return static_cast<float>(v);
+    }
+
+    template <typename SrcT>
+    __global__ void convert_to_fp16_kernel(
+        const SrcT *__restrict__ src,
+        half *__restrict__ dst,
+        int count)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= count)
+            return;
+        dst[idx] = __float2half(to_float_device(src[idx]));
+    }
+
+    template <typename SrcT>
+    __global__ void convert_to_q8_1_kernel(
+        const SrcT *__restrict__ src,
+        Q8_1Block *__restrict__ dst,
+        int rows,
+        int cols,
+        int blocks_per_row)
+    {
+        const int row = blockIdx.y;
+        const int block_col = blockIdx.x;
+        const int lane = threadIdx.x;
+
+        if (row >= rows || block_col >= blocks_per_row || lane >= Q8_1Block::BLOCK_SIZE)
+            return;
+
+        const int col = block_col * Q8_1Block::BLOCK_SIZE + lane;
+        const bool in_bounds = (col < cols);
+        const float x = in_bounds ? to_float_device(src[row * cols + col]) : 0.0f;
+
+        __shared__ float s_absmax[Q8_1Block::BLOCK_SIZE];
+        __shared__ int s_q[Q8_1Block::BLOCK_SIZE];
+        __shared__ int s_sum[Q8_1Block::BLOCK_SIZE];
+
+        s_absmax[lane] = fabsf(x);
+        __syncthreads();
+
+        for (int stride = Q8_1Block::BLOCK_SIZE / 2; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+            {
+                s_absmax[lane] = fmaxf(s_absmax[lane], s_absmax[lane + stride]);
+            }
+            __syncthreads();
+        }
+
+        const float absmax = s_absmax[0];
+        const float d = (absmax > 0.0f) ? (absmax / 127.0f) : 0.0f;
+        int q = 0;
+        if (d > 0.0f)
+        {
+            q = __float2int_rn(x / d);
+            q = max(-127, min(127, q));
+        }
+
+        s_q[lane] = q;
+        s_sum[lane] = q;
+        __syncthreads();
+
+        for (int stride = Q8_1Block::BLOCK_SIZE / 2; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+            {
+                s_sum[lane] += s_sum[lane + stride];
+            }
+            __syncthreads();
+        }
+
+        if (lane == 0)
+        {
+            Q8_1Block &out = dst[row * blocks_per_row + block_col];
+            out.d = __half_as_ushort(__float2half(d));
+            out.sum_qs = static_cast<int16_t>(s_sum[0]);
+        }
+
+        dst[row * blocks_per_row + block_col].qs[lane] = static_cast<int8_t>(s_q[lane]);
+    }
+
+    extern "C" bool hip_convert_tensor_to_fp16(
+        const void *d_src,
+        TensorType src_type,
+        uint16_t *d_dst,
+        int count,
+        hipStream_t stream)
+    {
+        if (!d_src || !d_dst || count <= 0)
+        {
+            return false;
+        }
+
+        dim3 block(256);
+        dim3 grid((count + block.x - 1) / block.x);
+
+        switch (src_type)
+        {
+        case TensorType::FP32:
+            hipLaunchKernelGGL(convert_to_fp16_kernel<float>, grid, block, 0, stream,
+                               static_cast<const float *>(d_src),
+                               reinterpret_cast<half *>(d_dst),
+                               count);
+            break;
+        case TensorType::FP16:
+            hipMemcpyAsync(d_dst, d_src, static_cast<size_t>(count) * sizeof(uint16_t),
+                           hipMemcpyDeviceToDevice, stream);
+            break;
+        case TensorType::BF16:
+            hipLaunchKernelGGL(convert_to_fp16_kernel<hip_bfloat16>, grid, block, 0, stream,
+                               static_cast<const hip_bfloat16 *>(d_src),
+                               reinterpret_cast<half *>(d_dst),
+                               count);
+            break;
+        case TensorType::Q8_1:
+            return false;
+        default:
+            return false;
+        }
+
+        return hipGetLastError() == hipSuccess;
+    }
+
+    extern "C" bool hip_convert_tensor_to_q8_1(
+        const void *d_src,
+        TensorType src_type,
+        Q8_1Block *d_dst,
+        int rows,
+        int cols,
+        hipStream_t stream)
+    {
+        if (!d_src || !d_dst || rows <= 0 || cols <= 0)
+        {
+            return false;
+        }
+
+        const int blocks_per_row = (cols + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+        dim3 block(Q8_1Block::BLOCK_SIZE);
+        dim3 grid(blocks_per_row, rows);
+
+        switch (src_type)
+        {
+        case TensorType::FP32:
+            hipLaunchKernelGGL(convert_to_q8_1_kernel<float>, grid, block, 0, stream,
+                               static_cast<const float *>(d_src), d_dst, rows, cols, blocks_per_row);
+            break;
+        case TensorType::FP16:
+            hipLaunchKernelGGL(convert_to_q8_1_kernel<half>, grid, block, 0, stream,
+                               static_cast<const half *>(d_src), d_dst, rows, cols, blocks_per_row);
+            break;
+        case TensorType::BF16:
+            hipLaunchKernelGGL(convert_to_q8_1_kernel<hip_bfloat16>, grid, block, 0, stream,
+                               static_cast<const hip_bfloat16 *>(d_src), d_dst, rows, cols, blocks_per_row);
+            break;
+        case TensorType::Q8_1:
+            hipMemcpyAsync(d_dst, d_src,
+                           static_cast<size_t>(rows) * static_cast<size_t>(blocks_per_row) * sizeof(Q8_1Block),
+                           hipMemcpyDeviceToDevice, stream);
+            break;
+        default:
+            return false;
+        }
+
+        return hipGetLastError() == hipSuccess;
     }
 
     // =========================================================================
@@ -375,6 +559,66 @@ namespace llaminar2
                            num_seqs, max_kv_len, max_seq_len, kv_dim);
     }
 
+    // ------ Q8_1 Variants (block-based) ------
+
+    extern "C" void hip_ring_append_q8_1(
+        Q8_1Block *d_K_cache, Q8_1Block *d_V_cache,
+        const Q8_1Block *d_K_new, const Q8_1Block *d_V_new,
+        int head, int max_seq_len, int kv_blocks, int num_tokens,
+        hipStream_t stream)
+    {
+        if (num_tokens <= 0 || kv_blocks <= 0)
+            return;
+
+        dim3 grid(num_tokens, (kv_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        dim3 block(BLOCK_SIZE);
+
+        hipLaunchKernelGGL(ring_append_kernel<Q8_1Block>,
+                           grid, block, 0, stream,
+                           d_K_cache, d_V_cache,
+                           d_K_new, d_V_new,
+                           head, max_seq_len, kv_blocks, num_tokens);
+    }
+
+    extern "C" void hip_ring_linearize_q8_1(
+        Q8_1Block *d_out,
+        const Q8_1Block *d_cache,
+        int tail, int count, int max_seq_len, int kv_blocks,
+        hipStream_t stream)
+    {
+        if (count <= 0 || kv_blocks <= 0)
+            return;
+
+        dim3 grid(count, (kv_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        dim3 block(BLOCK_SIZE);
+
+        hipLaunchKernelGGL(ring_linearize_kernel<Q8_1Block>,
+                           grid, block, 0, stream,
+                           d_out, d_cache,
+                           tail, count, max_seq_len, kv_blocks);
+    }
+
+    extern "C" void hip_ring_gather_batched_q8_1(
+        Q8_1Block *d_K_out, Q8_1Block *d_V_out,
+        const Q8_1Block *const *d_K_caches, const Q8_1Block *const *d_V_caches,
+        const int *tails, const int *counts,
+        int num_seqs, int max_kv_len, int max_seq_len, int kv_blocks,
+        hipStream_t stream)
+    {
+        if (num_seqs <= 0 || max_kv_len <= 0 || kv_blocks <= 0)
+            return;
+
+        dim3 grid(max_kv_len, (kv_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE, num_seqs);
+        dim3 block(BLOCK_SIZE);
+
+        hipLaunchKernelGGL(ring_gather_batched_kernel<Q8_1Block>,
+                           grid, block, 0, stream,
+                           d_K_out, d_V_out,
+                           d_K_caches, d_V_caches,
+                           tails, counts,
+                           num_seqs, max_kv_len, max_seq_len, kv_blocks);
+    }
+
     // =========================================================================
     // Dynamic Head Append Wrappers (graph-capturable)
     // =========================================================================
@@ -434,6 +678,25 @@ namespace llaminar2
                            d_K_cache, d_V_cache,
                            d_K_new, d_V_new,
                            d_head, max_seq_len, kv_dim, num_tokens);
+    }
+
+    extern "C" void hip_ring_append_dynamic_q8_1(
+        Q8_1Block *d_K_cache, Q8_1Block *d_V_cache,
+        const Q8_1Block *d_K_new, const Q8_1Block *d_V_new,
+        const int *d_head, int max_seq_len, int kv_blocks, int num_tokens,
+        hipStream_t stream)
+    {
+        if (num_tokens <= 0 || kv_blocks <= 0)
+            return;
+
+        dim3 grid(num_tokens, (kv_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        dim3 block(BLOCK_SIZE);
+
+        hipLaunchKernelGGL(ring_append_kernel_dynamic<Q8_1Block>,
+                           grid, block, 0, stream,
+                           d_K_cache, d_V_cache,
+                           d_K_new, d_V_new,
+                           d_head, max_seq_len, kv_blocks, num_tokens);
     }
 
 } // namespace llaminar2

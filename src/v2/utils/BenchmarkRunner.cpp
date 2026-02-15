@@ -9,6 +9,7 @@
 #include "Logger.h"
 #include "DebugEnv.h"
 #include "KernelProfiler.h"
+#include "KVCacheProfiler.h"
 #include "CUDAKernelProfiler.h"
 #include "ROCmKernelProfiler.h"
 #include "../execution/local_execution/graph/IGraphExecutor.h"
@@ -310,6 +311,7 @@ namespace llaminar2
         if (KernelProfiler::isEnabled())
         {
             KernelProfiler::reset();
+            KVCacheProfiler::reset();
             CUDAKernelProfiler::reset();
             ROCmKernelProfiler::reset();
         }
@@ -335,6 +337,7 @@ namespace llaminar2
             // Run prefill
             CUDAKernelProfiler::setCurrentPhase(CUDAKernelProfiler::Phase::PREFILL);
             ROCmKernelProfiler::setCurrentPhase(ROCmKernelProfiler::Phase::PREFILL);
+            KVCacheProfiler::setCurrentPhase(KVCacheProfiler::Phase::PREFILL);
             auto [prefill_success, prefill_time] = runPrefill(tokens);
             if (!prefill_success)
             {
@@ -351,6 +354,7 @@ namespace llaminar2
             {
                 CUDAKernelProfiler::setCurrentPhase(CUDAKernelProfiler::Phase::DECODE);
                 ROCmKernelProfiler::setCurrentPhase(ROCmKernelProfiler::Phase::DECODE);
+                KVCacheProfiler::setCurrentPhase(KVCacheProfiler::Phase::DECODE);
                 int eos_token = tokenizer_->eos_token();
                 auto [decode_success, decode_time, tokens_generated, generated_text] =
                     runDecode(n_decode, eos_token);
@@ -508,6 +512,7 @@ namespace llaminar2
         {
             uint64_t total_tokens = result.prefill_tokens + result.decode_tokens;
             KernelProfiler::printSummary(total_tokens);
+            KVCacheProfiler::printSummary();
             CUDAKernelProfiler::printSummary(total_tokens);
             ROCmKernelProfiler::printSummary(total_tokens);
         }

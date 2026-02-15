@@ -7134,6 +7134,19 @@ add_v2_test(V2_Integration_FusedAttentionWo_Batch
     MPI_PROCS 1
 )
 
+# Test: CPUFlashAttentionKernel mixed-precision tensor path (FP32 Q, Q8_1 K/V)
+add_executable(v2_integration_cpu_flash_attention_kernel integration/kernels/cpu/attention/Test__CPUFlashAttentionKernel.cpp)
+target_link_libraries(v2_integration_cpu_flash_attention_kernel
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_CPUFlashAttentionKernel
+    COMMAND $<TARGET_FILE:v2_integration_cpu_flash_attention_kernel>
+    LABELS "V2;Integration;CPU;FlashAttention;Q8_1;Decode;Prefill"
+    MPI_PROCS 1
+)
+
 # Test: FusedAttentionWoTiled - Cache-blocked tiled implementation (Phase 3)
 # Tests for: tile size computation, tiled vs reference parity, various configs
 add_executable(v2_test_fused_attention_wo_tiled unit/kernels/cpu/attention/q8_1/Test__FusedAttentionWoTiled.cpp)

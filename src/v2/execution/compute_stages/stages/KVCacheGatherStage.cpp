@@ -8,7 +8,36 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/KVCacheProfiler.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
+
+#include <chrono>
+
+namespace
+{
+    static size_t estimateGatheredBytes(const llaminar2::TensorBase *tensor, int rows)
+    {
+        if (!tensor || rows <= 0)
+        {
+            return 0;
+        }
+
+        const auto &shape = tensor->shape();
+        if (shape.empty())
+        {
+            return 0;
+        }
+
+        const size_t total_rows = shape[0];
+        if (total_rows == 0)
+        {
+            return 0;
+        }
+
+        const size_t bytes_per_row = tensor->size_bytes() / total_rows;
+        return static_cast<size_t>(rows) * bytes_per_row;
+    }
+}
 
 namespace llaminar2
 {
@@ -18,8 +47,7 @@ namespace llaminar2
     // =============================================================================
 
     KVCacheGatherStage::KVCacheGatherStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
     }
 
@@ -56,18 +84,39 @@ namespace llaminar2
         }
 
         // Call the unified gather method
+        const auto start = std::chrono::high_resolution_clock::now();
         int max_kv_len = params_.kv_cache->gather_kv_batched(
             params_.layer_idx,
             params_.batch_size,
             out_K_base,
             out_V_base,
             last_per_seq_kv_lens_);
+        const auto end = std::chrono::high_resolution_clock::now();
 
         if (max_kv_len < 0)
         {
             LOG_ERROR("[KVCacheGatherStage] gather_kv_batched failed for layer " << params_.layer_idx);
             return false;
         }
+
+        const uint64_t duration_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+
+        uint64_t gathered_tokens = 0;
+        for (int kv_len : last_per_seq_kv_lens_)
+        {
+            if (kv_len > 0)
+            {
+                gathered_tokens += static_cast<uint64_t>(kv_len);
+            }
+        }
+
+        const int gathered_rows = params_.batch_size * max_kv_len;
+        const uint64_t gathered_bytes = static_cast<uint64_t>(
+            estimateGatheredBytes(out_K_base, gathered_rows) +
+            estimateGatheredBytes(out_V_base, gathered_rows));
+
+        KVCacheProfiler::record(KVCacheOpType::GATHER, duration_ns, gathered_tokens, gathered_bytes);
 
         last_max_kv_len_ = max_kv_len;
 

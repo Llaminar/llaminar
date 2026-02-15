@@ -20,6 +20,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include "../../../tensors/BlockStructures.h"
 #include <cstring>
 #include <stdexcept>
 
@@ -167,8 +168,8 @@ namespace llaminar2
         if (token_idx >= seq_count)
         {
             // Padding: zero-fill beyond sequence length
-            d_K_out[out_offset] = T(0);
-            d_V_out[out_offset] = T(0);
+            d_K_out[out_offset] = T{};
+            d_V_out[out_offset] = T{};
             return;
         }
 
@@ -179,6 +180,203 @@ namespace llaminar2
 
         d_K_out[out_offset] = d_K_caches[seq_idx][src_offset];
         d_V_out[out_offset] = d_V_caches[seq_idx][src_offset];
+    }
+
+    template <typename T>
+    __device__ inline float to_float_device(T v)
+    {
+        return static_cast<float>(v);
+    }
+
+    template <>
+    __device__ inline float to_float_device<__half>(__half v)
+    {
+        return __half2float(v);
+    }
+
+    template <>
+    __device__ inline float to_float_device<__nv_bfloat16>(__nv_bfloat16 v)
+    {
+        return __bfloat162float(v);
+    }
+
+    template <typename SrcT>
+    __global__ void convert_to_fp16_kernel(
+        const SrcT *__restrict__ src,
+        __half *__restrict__ dst,
+        int count)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= count)
+            return;
+        dst[idx] = __float2half_rn(to_float_device(src[idx]));
+    }
+
+    template <typename SrcT>
+    __global__ void convert_to_q8_1_kernel(
+        const SrcT *__restrict__ src,
+        Q8_1Block *__restrict__ dst,
+        int rows,
+        int cols,
+        int blocks_per_row)
+    {
+        const int row = blockIdx.y;
+        const int block_col = blockIdx.x;
+        const int lane = threadIdx.x;
+
+        if (row >= rows || block_col >= blocks_per_row || lane >= Q8_1Block::BLOCK_SIZE)
+            return;
+
+        const int col = block_col * Q8_1Block::BLOCK_SIZE + lane;
+        const bool in_bounds = (col < cols);
+        const float x = in_bounds ? to_float_device(src[row * cols + col]) : 0.0f;
+
+        __shared__ float s_absmax[Q8_1Block::BLOCK_SIZE];
+        __shared__ int s_q[Q8_1Block::BLOCK_SIZE];
+        __shared__ int s_sum[Q8_1Block::BLOCK_SIZE];
+
+        s_absmax[lane] = fabsf(x);
+        __syncthreads();
+
+        for (int stride = Q8_1Block::BLOCK_SIZE / 2; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+            {
+                s_absmax[lane] = fmaxf(s_absmax[lane], s_absmax[lane + stride]);
+            }
+            __syncthreads();
+        }
+
+        const float absmax = s_absmax[0];
+        const float d = (absmax > 0.0f) ? (absmax / 127.0f) : 0.0f;
+        int q = 0;
+        if (d > 0.0f)
+        {
+            q = __float2int_rn(x / d);
+            q = max(-127, min(127, q));
+        }
+
+        s_q[lane] = q;
+        s_sum[lane] = q;
+        __syncthreads();
+
+        for (int stride = Q8_1Block::BLOCK_SIZE / 2; stride > 0; stride >>= 1)
+        {
+            if (lane < stride)
+            {
+                s_sum[lane] += s_sum[lane + stride];
+            }
+            __syncthreads();
+        }
+
+        if (lane == 0)
+        {
+            Q8_1Block &out = dst[row * blocks_per_row + block_col];
+            out.d = __half_as_ushort(__float2half_rn(d));
+            out.sum_qs = static_cast<int16_t>(s_sum[0]);
+        }
+
+        if (lane < Q8_1Block::BLOCK_SIZE)
+        {
+            dst[row * blocks_per_row + block_col].qs[lane] = static_cast<int8_t>(s_q[lane]);
+        }
+    }
+
+    extern "C" bool cuda_convert_tensor_to_fp16(
+        const void *d_src,
+        TensorType src_type,
+        uint16_t *d_dst,
+        int count,
+        cudaStream_t stream)
+    {
+        if (!d_src || !d_dst || count <= 0)
+        {
+            return false;
+        }
+
+        const dim3 block(256);
+        const dim3 grid((count + block.x - 1) / block.x);
+
+        switch (src_type)
+        {
+        case TensorType::FP32:
+            convert_to_fp16_kernel<float><<<grid, block, 0, stream>>>(
+                static_cast<const float *>(d_src),
+                reinterpret_cast<__half *>(d_dst),
+                count);
+            break;
+        case TensorType::FP16:
+            cudaMemcpyAsync(d_dst, d_src, static_cast<size_t>(count) * sizeof(uint16_t),
+                            cudaMemcpyDeviceToDevice, stream);
+            break;
+        case TensorType::BF16:
+            convert_to_fp16_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
+                static_cast<const __nv_bfloat16 *>(d_src),
+                reinterpret_cast<__half *>(d_dst),
+                count);
+            break;
+        case TensorType::Q8_1:
+            return false;
+        default:
+            return false;
+        }
+
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    extern "C" bool cuda_convert_tensor_to_q8_1(
+        const void *d_src,
+        TensorType src_type,
+        Q8_1Block *d_dst,
+        int rows,
+        int cols,
+        cudaStream_t stream)
+    {
+        if (!d_src || !d_dst || rows <= 0 || cols <= 0)
+        {
+            return false;
+        }
+
+        const int blocks_per_row = (cols + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+        const dim3 block(Q8_1Block::BLOCK_SIZE);
+        const dim3 grid(blocks_per_row, rows);
+
+        switch (src_type)
+        {
+        case TensorType::FP32:
+            convert_to_q8_1_kernel<float><<<grid, block, 0, stream>>>(
+                static_cast<const float *>(d_src),
+                d_dst,
+                rows,
+                cols,
+                blocks_per_row);
+            break;
+        case TensorType::FP16:
+            convert_to_q8_1_kernel<__half><<<grid, block, 0, stream>>>(
+                static_cast<const __half *>(d_src),
+                d_dst,
+                rows,
+                cols,
+                blocks_per_row);
+            break;
+        case TensorType::BF16:
+            convert_to_q8_1_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
+                static_cast<const __nv_bfloat16 *>(d_src),
+                d_dst,
+                rows,
+                cols,
+                blocks_per_row);
+            break;
+        case TensorType::Q8_1:
+            cudaMemcpyAsync(d_dst, d_src,
+                            static_cast<size_t>(rows) * static_cast<size_t>(blocks_per_row) * sizeof(Q8_1Block),
+                            cudaMemcpyDeviceToDevice, stream);
+            break;
+        default:
+            return false;
+        }
+
+        return cudaGetLastError() == cudaSuccess;
     }
 
     // =========================================================================
@@ -290,6 +488,41 @@ namespace llaminar2
             d_V_out, d_V_cache, tail, count, max_seq_len, kv_dim);
     }
 
+    // Q8_1 variants (block-based)
+    extern "C" void cuda_ring_append_q8_1(
+        Q8_1Block *d_K_cache, Q8_1Block *d_V_cache,
+        const Q8_1Block *d_K_new, const Q8_1Block *d_V_new,
+        int head, int max_seq_len, int kv_blocks, int num_tokens,
+        cudaStream_t stream)
+    {
+        if (num_tokens == 0)
+            return;
+
+        dim3 block(256);
+        dim3 grid(num_tokens, (kv_blocks + 255) / 256);
+        ring_append_kernel<Q8_1Block><<<grid, block, 0, stream>>>(
+            d_K_cache, d_V_cache, d_K_new, d_V_new,
+            head, max_seq_len, kv_blocks, num_tokens);
+    }
+
+    extern "C" void cuda_ring_linearize_q8_1(
+        Q8_1Block *d_K_out, Q8_1Block *d_V_out,
+        const Q8_1Block *d_K_cache, const Q8_1Block *d_V_cache,
+        int tail, int count, int max_seq_len, int kv_blocks,
+        cudaStream_t stream)
+    {
+        if (count == 0)
+            return;
+
+        dim3 block(256);
+        dim3 grid(count, (kv_blocks + 255) / 256);
+
+        ring_linearize_kernel<Q8_1Block><<<grid, block, 0, stream>>>(
+            d_K_out, d_K_cache, tail, count, max_seq_len, kv_blocks);
+        ring_linearize_kernel<Q8_1Block><<<grid, block, 0, stream>>>(
+            d_V_out, d_V_cache, tail, count, max_seq_len, kv_blocks);
+    }
+
     // =========================================================================
     // Dynamic Head Append Wrappers (graph-capturable)
     // =========================================================================
@@ -342,6 +575,22 @@ namespace llaminar2
             d_head, max_seq_len, kv_dim, num_tokens);
     }
 
+    extern "C" void cuda_ring_append_dynamic_q8_1(
+        Q8_1Block *d_K_cache, Q8_1Block *d_V_cache,
+        const Q8_1Block *d_K_new, const Q8_1Block *d_V_new,
+        const int *d_head, int max_seq_len, int kv_blocks, int num_tokens,
+        cudaStream_t stream)
+    {
+        if (num_tokens == 0)
+            return;
+
+        dim3 block(256);
+        dim3 grid(num_tokens, (kv_blocks + 255) / 256);
+        ring_append_kernel_dynamic<Q8_1Block><<<grid, block, 0, stream>>>(
+            d_K_cache, d_V_cache, d_K_new, d_V_new,
+            d_head, max_seq_len, kv_blocks, num_tokens);
+    }
+
     // =========================================================================
     // CUDARingKVCache Implementation
     // =========================================================================
@@ -352,7 +601,11 @@ namespace llaminar2
         int n_kv_heads, int head_dim, int device_id)
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), local_n_kv_heads_(n_kv_heads), kv_head_start_(0),
-          head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim), device_id_(device_id),
+          head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim),
+          kv_storage_dim_((Precision == ActivationPrecision::Q8_1)
+                              ? ((n_kv_heads * head_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE)
+                              : (n_kv_heads * head_dim)),
+          device_id_(device_id),
           is_sharded_(false), device_ctx_(nullptr)
     {
         LOG_INFO("[CUDARingKVCache] Creating cache: "
@@ -394,7 +647,11 @@ namespace llaminar2
         int n_kv_heads, int head_dim, IWorkerGPUContext *ctx)
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), local_n_kv_heads_(n_kv_heads), kv_head_start_(0),
-          head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim), device_id_(0),
+          head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim),
+          kv_storage_dim_((Precision == ActivationPrecision::Q8_1)
+                              ? ((n_kv_heads * head_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE)
+                              : (n_kv_heads * head_dim)),
+          device_id_(0),
           is_sharded_(false), device_ctx_(nullptr)
     {
         if (!ctx)
@@ -450,7 +707,11 @@ namespace llaminar2
         int head_dim, int device_id)
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads), kv_head_start_(kv_head_start),
-          head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim), device_id_(device_id),
+          head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim),
+          kv_storage_dim_((Precision == ActivationPrecision::Q8_1)
+                              ? ((local_n_kv_heads * head_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE)
+                              : (local_n_kv_heads * head_dim)),
+          device_id_(device_id),
           is_sharded_(local_n_kv_heads != n_kv_heads), device_ctx_(nullptr)
     {
         LOG_INFO("[CUDARingKVCache] Creating sharded cache: "
@@ -495,7 +756,11 @@ namespace llaminar2
         int head_dim, IWorkerGPUContext *ctx)
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads), kv_head_start_(kv_head_start),
-          head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim), device_id_(0),
+          head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim),
+          kv_storage_dim_((Precision == ActivationPrecision::Q8_1)
+                              ? ((local_n_kv_heads * head_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE)
+                              : (local_n_kv_heads * head_dim)),
+          device_id_(0),
           is_sharded_(local_n_kv_heads != n_kv_heads), device_ctx_(nullptr)
     {
         if (!ctx)
@@ -571,7 +836,7 @@ namespace llaminar2
     template <ActivationPrecision Precision>
     void CUDARingKVCache<Precision>::allocate_entry(EntryT &entry)
     {
-        size_t buffer_size = max_seq_len_ * kv_dim_ * sizeof(DataT);
+        size_t buffer_size = static_cast<size_t>(max_seq_len_) * static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
 
         // Main K/V buffers
         cudaMalloc(&entry.d_K, buffer_size);
@@ -741,6 +1006,9 @@ namespace llaminar2
     extern "C" void cuda_ring_append_dynamic_bf16(
         __nv_bfloat16 *, __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *,
         const int *, int, int, int, cudaStream_t);
+    extern "C" void cuda_ring_append_dynamic_q8_1(
+        Q8_1Block *, Q8_1Block *, const Q8_1Block *, const Q8_1Block *,
+        const int *, int, int, int, cudaStream_t);
 
     template <ActivationPrecision Precision>
     void CUDARingKVCache<Precision>::launch_append_kernel_dynamic(
@@ -763,7 +1031,13 @@ namespace llaminar2
         {
             cuda_ring_append_dynamic_bf16(
                 entry.d_K, entry.d_V, d_k, d_v,
-                d_head, max_seq_len_, kv_dim_, num_tokens, stream);
+                d_head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::Q8_1)
+        {
+            cuda_ring_append_dynamic_q8_1(
+                entry.d_K, entry.d_V, d_k, d_v,
+                d_head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
         }
     }
 
@@ -868,19 +1142,25 @@ namespace llaminar2
         {
             cuda_ring_append_fp32(
                 entry.d_K, entry.d_V, d_k, d_v,
-                entry.head, max_seq_len_, kv_dim_, num_tokens, stream);
+                entry.head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
         }
         else if constexpr (Precision == ActivationPrecision::FP16)
         {
             cuda_ring_append_fp16(
                 entry.d_K, entry.d_V, d_k, d_v,
-                entry.head, max_seq_len_, kv_dim_, num_tokens, stream);
+                entry.head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
         }
         else if constexpr (Precision == ActivationPrecision::BF16)
         {
             cuda_ring_append_bf16(
                 entry.d_K, entry.d_V, d_k, d_v,
-                entry.head, max_seq_len_, kv_dim_, num_tokens, stream);
+                entry.head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::Q8_1)
+        {
+            cuda_ring_append_q8_1(
+                entry.d_K, entry.d_V, d_k, d_v,
+                entry.head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
         }
     }
 
@@ -924,8 +1204,8 @@ namespace llaminar2
         if (!entry.is_wrapped(max_seq_len_))
         {
             int tail = entry.tail(max_seq_len_);
-            *d_k_out = entry.d_K + tail * kv_dim_;
-            *d_v_out = entry.d_V + tail * kv_dim_;
+            *d_k_out = entry.d_K + static_cast<size_t>(tail) * kv_storage_dim_;
+            *d_v_out = entry.d_V + static_cast<size_t>(tail) * kv_storage_dim_;
             return true;
         }
 
@@ -971,7 +1251,13 @@ namespace llaminar2
         {
             cuda_ring_linearize_bf16(
                 d_k_out, d_v_out, entry.d_K, entry.d_V,
-                tail, entry.count, max_seq_len_, kv_dim_, stream);
+                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::Q8_1)
+        {
+            cuda_ring_linearize_q8_1(
+                d_k_out, d_v_out, entry.d_K, entry.d_V,
+                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
         }
     }
 
@@ -1143,13 +1429,13 @@ namespace llaminar2
 
         // Launch kernel
         dim3 block(256);
-        dim3 grid(max_kv_len, (kv_dim_ + 255) / 256, num_seqs);
+        dim3 grid(max_kv_len, (kv_storage_dim_ + 255) / 256, num_seqs);
 
         ring_gather_batched_kernel<DataT><<<grid, block, 0, stream>>>(
             d_k_out, d_v_out,
             d_k_caches, d_v_caches,
             d_tails, d_counts,
-            num_seqs, max_kv_len, max_seq_len_, kv_dim_);
+            num_seqs, max_kv_len, max_seq_len_, kv_storage_dim_);
 
         // Free temporary device arrays only if we allocated them
         if (!using_workspace)
@@ -1278,6 +1564,7 @@ namespace llaminar2
     template class CUDARingKVCache<ActivationPrecision::FP32>;
     template class CUDARingKVCache<ActivationPrecision::FP16>;
     template class CUDARingKVCache<ActivationPrecision::BF16>;
+    template class CUDARingKVCache<ActivationPrecision::Q8_1>;
 
     // =========================================================================
     // Factory Function
@@ -1300,6 +1587,10 @@ namespace llaminar2
 
         case ActivationPrecision::BF16:
             return std::make_unique<CUDARingKVCacheBF16>(
+                n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_id);
+
+        case ActivationPrecision::Q8_1:
+            return std::make_unique<CUDARingKVCacheQ8_1>(
                 n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_id);
 
         default:
@@ -1335,6 +1626,12 @@ namespace llaminar2
 
         case ActivationPrecision::BF16:
             return std::make_unique<CUDARingKVCacheBF16>(
+                n_layers, batch_size, max_seq_len,
+                n_kv_heads, local_n_kv_heads, kv_head_start,
+                head_dim, device_id);
+
+        case ActivationPrecision::Q8_1:
+            return std::make_unique<CUDARingKVCacheQ8_1>(
                 n_layers, batch_size, max_seq_len,
                 n_kv_heads, local_n_kv_heads, kv_head_start,
                 head_dim, device_id);

@@ -427,6 +427,18 @@ namespace llaminar2
         // Requires JIT backend and Q8_1 quantization.
         bool fused_wo = true;
 
+        // CPU flash attention KV tile overrides (0 or negative = disabled)
+        int flash_kv_tile_decode = -1;  ///< Override decode kv tile (LLAMINAR_FLASH_ATTN_KV_TILE_DECODE)
+        int flash_kv_tile_prefill = -1; ///< Override prefill kv tile (LLAMINAR_FLASH_ATTN_KV_TILE_PREFILL)
+
+        // CPU flash attention prefill INT16 (12-bit effective) Q·K path
+        bool flash_prefill_i16_i12 = false;          ///< Enable prefill INT16(i12) Q·K path (LLAMINAR_FLASH_PREFILL_I16_I12)
+        int flash_prefill_i16_i12_min_seq = 128;     ///< Minimum seq_len for INT16(i12) path (LLAMINAR_FLASH_PREFILL_I16_I12_MIN_SEQ)
+        int flash_prefill_i16_i12_min_kv = 128;      ///< Minimum kv_len for INT16(i12) path (LLAMINAR_FLASH_PREFILL_I16_I12_MIN_KV)
+        int64_t flash_prefill_i16_i12_min_work = 0;  ///< Minimum seq_len*kv_len for INT16(i12) path (LLAMINAR_FLASH_PREFILL_I16_I12_MIN_WORK)
+        int flash_prefill_i16_i12_qmax = 2047;       ///< Effective quant range cap (LLAMINAR_FLASH_PREFILL_I16_I12_QMAX)
+        int flash_prefill_i16_i12_max_head_dim = 256; ///< Max head_dim for safe INT32 accumulation (LLAMINAR_FLASH_PREFILL_I16_I12_MAX_HEAD_DIM)
+
         AttentionConfig()
         {
             reload();
@@ -450,6 +462,57 @@ namespace llaminar2
             if (fused_wo_env)
             {
                 fused_wo = (std::atoi(fused_wo_env) != 0);
+            }
+
+            const char *flash_decode_tile_env = std::getenv("LLAMINAR_FLASH_ATTN_KV_TILE_DECODE");
+            if (flash_decode_tile_env)
+            {
+                const int parsed = std::atoi(flash_decode_tile_env);
+                flash_kv_tile_decode = parsed > 0 ? parsed : -1;
+            }
+
+            const char *flash_prefill_tile_env = std::getenv("LLAMINAR_FLASH_ATTN_KV_TILE_PREFILL");
+            if (flash_prefill_tile_env)
+            {
+                const int parsed = std::atoi(flash_prefill_tile_env);
+                flash_kv_tile_prefill = parsed > 0 ? parsed : -1;
+            }
+
+            const char *flash_i16_i12_env = std::getenv("LLAMINAR_FLASH_PREFILL_I16_I12");
+            if (flash_i16_i12_env)
+            {
+                flash_prefill_i16_i12 = (std::atoi(flash_i16_i12_env) != 0);
+            }
+
+            const char *flash_i16_min_seq_env = std::getenv("LLAMINAR_FLASH_PREFILL_I16_I12_MIN_SEQ");
+            if (flash_i16_min_seq_env)
+            {
+                flash_prefill_i16_i12_min_seq = std::max(1, std::atoi(flash_i16_min_seq_env));
+            }
+
+            const char *flash_i16_min_kv_env = std::getenv("LLAMINAR_FLASH_PREFILL_I16_I12_MIN_KV");
+            if (flash_i16_min_kv_env)
+            {
+                flash_prefill_i16_i12_min_kv = std::max(1, std::atoi(flash_i16_min_kv_env));
+            }
+
+            const char *flash_i16_min_work_env = std::getenv("LLAMINAR_FLASH_PREFILL_I16_I12_MIN_WORK");
+            if (flash_i16_min_work_env)
+            {
+                flash_prefill_i16_i12_min_work = std::max<int64_t>(0, std::atoll(flash_i16_min_work_env));
+            }
+
+            const char *flash_i16_qmax_env = std::getenv("LLAMINAR_FLASH_PREFILL_I16_I12_QMAX");
+            if (flash_i16_qmax_env)
+            {
+                const int parsed = std::atoi(flash_i16_qmax_env);
+                flash_prefill_i16_i12_qmax = std::max(1, std::min(parsed, 32767));
+            }
+
+            const char *flash_i16_max_hd_env = std::getenv("LLAMINAR_FLASH_PREFILL_I16_I12_MAX_HEAD_DIM");
+            if (flash_i16_max_hd_env)
+            {
+                flash_prefill_i16_i12_max_head_dim = std::max(1, std::atoi(flash_i16_max_hd_env));
             }
         }
     };
@@ -530,6 +593,8 @@ namespace llaminar2
      *   LLAMINAR_AUTO_WEIGHT_TRANSFER      - Auto-transfer weights to target device (default: 1)
      *   LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT - Use GraphBufferManager for buffers (default: 1 - ON)
      *   LLAMINAR_EXEC_FULL_FORWARD         - Use full forward graph execution (default: 1 - ON)
+    *   LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED - Allow segmented GPU-graph replay for decode graphs
+    *                                        containing collectives (default: 0 - OFF, experimental)
      *
      * Device Placement / Heterogeneous Execution:
      *   LLAMINAR_CPU_PREFILL_PARTICIPATE   - Enable CPU participation in PREFILL phase (default: 0 - OFF)
@@ -571,6 +636,7 @@ namespace llaminar2
         bool gpu_graph_verify = false;             ///< Verify graph replay vs direct execution (default: OFF, env: LLAMINAR_GPU_GRAPH_VERIFY)
         bool gpu_graph_recapture = false;          ///< Re-capture each decode step instead of replaying cached graph (default: OFF, env: LLAMINAR_GPU_GRAPH_RECAPTURE)
         int gpu_graph_max_stages = 0;              ///< Max stages per capturable segment (0=unlimited, env: LLAMINAR_GPU_GRAPH_MAX_STAGES)
+        bool gpu_graph_collective_segmented = false; ///< Enable segmented replay for collective decode graphs (default: OFF, env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED)
 
         // =================================================================
         // Device Placement / Heterogeneous Execution
@@ -729,6 +795,12 @@ namespace llaminar2
             if (gpu_graph_max_stages_env)
             {
                 gpu_graph_max_stages = std::atoi(gpu_graph_max_stages_env);
+            }
+
+            const char *gpu_graph_collective_segmented_env = std::getenv("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED");
+            if (gpu_graph_collective_segmented_env)
+            {
+                gpu_graph_collective_segmented = (std::atoi(gpu_graph_collective_segmented_env) != 0);
             }
 
             // Model-level operation flags (embedding, lm_head)

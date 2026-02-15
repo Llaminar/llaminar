@@ -741,24 +741,34 @@ namespace llaminar2
         }
 
         // Local TP devices
-        if (!config.tp_devices.empty())
+        // IMPORTANT: Do not implicitly enable LOCAL TP in pure GLOBAL mode.
+        // Mixed local/global TP should only happen when tp_scope=HYBRID or explicit local configuration.
+        const bool allows_local_tp =
+            config.tp_scope == TPScope::LOCAL ||
+            config.tp_scope == TPScope::HYBRID ||
+            config.tp_scope == TPScope::AUTO;
+
+        if (allows_local_tp)
         {
-            plan.local_tp_devices = config.tp_devices;
-            plan.local_tp_weights = config.tp_weights;
-        }
-        else if (config.tp_degree > 1)
-        {
-            // Use GPUs on this rank if available
-            if (rank < static_cast<int>(cluster_inventory.ranks.size()))
+            if (!config.tp_devices.empty())
             {
-                const auto &rank_inv = cluster_inventory.ranks[rank];
-                for (int i = 0; i < std::min(config.tp_degree, static_cast<int>(rank_inv.gpus.size())); ++i)
+                plan.local_tp_devices = config.tp_devices;
+                plan.local_tp_weights = config.tp_weights;
+            }
+            else if (config.tp_degree > 1)
+            {
+                // Use GPUs on this rank if available
+                if (rank < static_cast<int>(cluster_inventory.ranks.size()))
                 {
-                    const auto &gpu = rank_inv.gpus[i];
-                    plan.local_tp_devices.push_back(GlobalDeviceAddress::fromLocalDeviceId(
-                        DeviceId(gpu.type, gpu.local_device_id),
-                        rank_inv.hostname,
-                        gpu.numa_node >= 0 ? gpu.numa_node : 0));
+                    const auto &rank_inv = cluster_inventory.ranks[rank];
+                    for (int i = 0; i < std::min(config.tp_degree, static_cast<int>(rank_inv.gpus.size())); ++i)
+                    {
+                        const auto &gpu = rank_inv.gpus[i];
+                        plan.local_tp_devices.push_back(GlobalDeviceAddress::fromLocalDeviceId(
+                            DeviceId(gpu.type, gpu.local_device_id),
+                            rank_inv.hostname,
+                            gpu.numa_node >= 0 ? gpu.numa_node : 0));
+                    }
                 }
             }
         }
@@ -768,7 +778,7 @@ namespace llaminar2
         {
             plan.primary_device = plan.local_tp_devices[0];
         }
-        else if (config.device_for_this_rank.has_value())
+        else if (config.device_for_this_rank.has_value() && cluster_inventory.world_size == 1)
         {
             plan.primary_device = *config.device_for_this_rank;
         }

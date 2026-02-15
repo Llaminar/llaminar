@@ -2265,6 +2265,11 @@ namespace llaminar2
         }
         uint16_t *mutable_fp16_data()
         {
+            dequant_cache_.clear();
+            if (is_view_ && parent_)
+            {
+                parent_->dequant_cache_.clear();
+            }
             return is_view_ ? (parent_data_ptr_->data() + view_offset_) : host_fp16_data_.data();
         }
         void from_fp32(const float *fp32_data, size_t count);
@@ -3658,6 +3663,21 @@ namespace llaminar2
         static std::shared_ptr<Q8_1Tensor> quantize_from_fp32(
             const float *src,
             const std::vector<size_t> &shape);
+
+        /**
+         * @brief Quantize FP32 data into existing Q8_1 tensor storage
+         * @param src_data Source FP32 data with at least rows()*cols() values
+         * @return true on success
+         */
+        bool copyFrom_fp32(const float *src_data);
+
+        /**
+         * @brief Quantize first num_rows rows from FP32 into existing Q8_1 tensor storage
+         * @param src_data Source FP32 data with at least num_rows*cols() values
+         * @param num_rows Number of rows to quantize (must be <= rows())
+         * @return true on success
+         */
+        bool copyFrom_fp32_rows(const float *src_data, size_t num_rows);
 
     protected:
         // ===== Lazy Transfer Accessors (Phase 3) =====

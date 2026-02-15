@@ -12,10 +12,28 @@
 
 #include "CUDARingKVCache.h"
 #include "../../../tensors/GpuTensorView.h"
+#include "../../../backends/DeviceId.h"
 #include "../../../utils/Logger.h"
+
+#include <cuda_runtime.h>
 
 namespace llaminar2
 {
+
+    extern "C" bool cuda_convert_tensor_to_fp16(
+        const void *d_src,
+        TensorType src_type,
+        uint16_t *d_dst,
+        int count,
+        cudaStream_t stream);
+
+    extern "C" bool cuda_convert_tensor_to_q8_1(
+        const void *d_src,
+        TensorType src_type,
+        Q8_1Block *d_dst,
+        int rows,
+        int cols,
+        cudaStream_t stream);
 
     // =========================================================================
     // ICUDARingKVCache::append(ITensor*) implementation
@@ -34,15 +52,39 @@ namespace llaminar2
             return false;
         }
 
-        // Get GPU data pointers from tensors via ITensor interface
+        const auto target = DeviceId::cuda(device_id());
+
+        // Try existing GPU pointers first
         const void *d_k = K->gpu_data_ptr();
         const void *d_v = V->gpu_data_ptr();
 
+        // If missing, force residency on cache device
+        if (!d_k)
+        {
+            auto *k_mut = const_cast<ITensor *>(K);
+            if (!k_mut->ensureOnDevice(target))
+            {
+                LOG_ERROR("[ICUDARingKVCache::append(ITensor)] Failed to ensure K on "
+                          << target.toString());
+                return false;
+            }
+            d_k = K->gpu_data_ptr();
+        }
+        if (!d_v)
+        {
+            auto *v_mut = const_cast<ITensor *>(V);
+            if (!v_mut->ensureOnDevice(target))
+            {
+                LOG_ERROR("[ICUDARingKVCache::append(ITensor)] Failed to ensure V on "
+                          << target.toString());
+                return false;
+            }
+            d_v = V->gpu_data_ptr();
+        }
+
         if (!d_k || !d_v)
         {
-            // Tensors don't have GPU data - caller should have called ensureOnDevice()
-            LOG_ERROR("[ICUDARingKVCache::append(ITensor)] K or V tensor lacks GPU data. "
-                      << "Call ensureOnDevice() before append.");
+            LOG_ERROR("[ICUDARingKVCache::append(ITensor)] K or V tensor lacks GPU data after ensureOnDevice().");
             return false;
         }
 
@@ -60,17 +102,139 @@ namespace llaminar2
             return false;
         }
 
+        const auto target = DeviceId::cuda(device_id());
+
         const void *d_k = K->gpu_data_ptr();
         const void *d_v = V->gpu_data_ptr();
 
+        if (!d_k)
+        {
+            auto *k_mut = const_cast<ITensor *>(K);
+            if (!k_mut->ensureOnDevice(target))
+            {
+                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Failed to ensure K on "
+                          << target.toString());
+                return false;
+            }
+            d_k = K->gpu_data_ptr();
+        }
+        if (!d_v)
+        {
+            auto *v_mut = const_cast<ITensor *>(V);
+            if (!v_mut->ensureOnDevice(target))
+            {
+                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Failed to ensure V on "
+                          << target.toString());
+                return false;
+            }
+            d_v = V->gpu_data_ptr();
+        }
+
         if (!d_k || !d_v)
         {
-            LOG_ERROR("[ICUDARingKVCache::appendWithStream] K or V tensor lacks GPU data.");
+            LOG_ERROR("[ICUDARingKVCache::appendWithStream] K or V tensor lacks GPU data after ensureOnDevice().");
             return false;
         }
 
+        const auto stream = static_cast<cudaStream_t>(gpu_stream);
+
+        if (precision() == ActivationPrecision::FP16 &&
+            (K->native_type() != TensorType::FP16 || V->native_type() != TensorType::FP16))
+        {
+            const auto &k_shape = K->shape();
+            const auto &v_shape = V->shape();
+            if (k_shape.size() < 2 || v_shape.size() < 2)
+            {
+                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Invalid K/V shape for FP16 conversion");
+                return false;
+            }
+
+            const int kv_dim = static_cast<int>(k_shape[1]);
+            const int elements = num_tokens * kv_dim;
+            if (elements <= 0)
+            {
+                return append(layer, seq_idx, d_k, d_v, num_tokens, stream);
+            }
+
+            uint16_t *d_k_fp16 = nullptr;
+            uint16_t *d_v_fp16 = nullptr;
+            if (cudaMalloc(&d_k_fp16, static_cast<size_t>(elements) * sizeof(uint16_t)) != cudaSuccess ||
+                cudaMalloc(&d_v_fp16, static_cast<size_t>(elements) * sizeof(uint16_t)) != cudaSuccess)
+            {
+                if (d_k_fp16)
+                    cudaFree(d_k_fp16);
+                if (d_v_fp16)
+                    cudaFree(d_v_fp16);
+                LOG_ERROR("[ICUDARingKVCache::appendWithStream] cudaMalloc failed for FP16 conversion buffers");
+                return false;
+            }
+
+            const bool k_ok = cuda_convert_tensor_to_fp16(d_k, K->native_type(), d_k_fp16, elements, stream);
+            const bool v_ok = cuda_convert_tensor_to_fp16(d_v, V->native_type(), d_v_fp16, elements, stream);
+            if (!k_ok || !v_ok)
+            {
+                cudaFree(d_k_fp16);
+                cudaFree(d_v_fp16);
+                LOG_ERROR("[ICUDARingKVCache::appendWithStream] GPU FP16 conversion failed");
+                return false;
+            }
+
+            const bool ok = append(layer, seq_idx, d_k_fp16, d_v_fp16, num_tokens, stream);
+            cudaFree(d_k_fp16);
+            cudaFree(d_v_fp16);
+            return ok;
+        }
+
+        if (precision() == ActivationPrecision::Q8_1 &&
+            (K->native_type() != TensorType::Q8_1 || V->native_type() != TensorType::Q8_1))
+        {
+            const auto &k_shape = K->shape();
+            const auto &v_shape = V->shape();
+            if (k_shape.size() < 2 || v_shape.size() < 2)
+            {
+                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Invalid K/V shape for Q8_1 conversion");
+                return false;
+            }
+
+            const int kv_dim = static_cast<int>(k_shape[1]);
+            const int blocks_per_row = (kv_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+            const size_t block_count = static_cast<size_t>(num_tokens) * static_cast<size_t>(blocks_per_row);
+            if (block_count == 0)
+            {
+                return append(layer, seq_idx, d_k, d_v, num_tokens, stream);
+            }
+
+            Q8_1Block *d_k_q8 = nullptr;
+            Q8_1Block *d_v_q8 = nullptr;
+            if (cudaMalloc(&d_k_q8, block_count * sizeof(Q8_1Block)) != cudaSuccess ||
+                cudaMalloc(&d_v_q8, block_count * sizeof(Q8_1Block)) != cudaSuccess)
+            {
+                if (d_k_q8)
+                    cudaFree(d_k_q8);
+                if (d_v_q8)
+                    cudaFree(d_v_q8);
+                LOG_ERROR("[ICUDARingKVCache::appendWithStream] cudaMalloc failed for Q8_1 conversion buffers");
+                return false;
+            }
+
+            const bool k_ok = cuda_convert_tensor_to_q8_1(d_k, K->native_type(), d_k_q8, num_tokens, kv_dim, stream);
+            const bool v_ok = cuda_convert_tensor_to_q8_1(d_v, V->native_type(), d_v_q8, num_tokens, kv_dim, stream);
+            if (!k_ok || !v_ok)
+            {
+                cudaFree(d_k_q8);
+                cudaFree(d_v_q8);
+                LOG_ERROR("[ICUDARingKVCache::appendWithStream] GPU Q8_1 conversion failed");
+                return false;
+            }
+
+            const bool ok = append(layer, seq_idx, d_k_q8, d_v_q8, num_tokens, stream);
+            cudaFree(d_k_q8);
+            cudaFree(d_v_q8);
+            return ok;
+        }
+
         return append(layer, seq_idx, d_k, d_v, num_tokens,
-                      static_cast<cudaStream_t>(gpu_stream));
+                      stream);
     }
 
     // =========================================================================
@@ -114,9 +278,15 @@ namespace llaminar2
                 return TensorType::FP16;
             else if constexpr (Precision == ActivationPrecision::BF16)
                 return TensorType::BF16;
+            else if constexpr (Precision == ActivationPrecision::Q8_1)
+                return TensorType::Q8_1;
             else
                 return TensorType::FP32;
         }();
+
+        const size_t view_cols = (Precision == ActivationPrecision::Q8_1)
+                                     ? static_cast<size_t>(kv_storage_dim_)
+                                     : static_cast<size_t>(kv_dim_);
 
         // Create or update the view
         auto &view = tensor_views_[layer][seq_idx][0]; // Index 0 = K
@@ -130,7 +300,7 @@ namespace llaminar2
             view = std::make_unique<GpuTensorView>(
                 const_cast<void *>(d_k), // GpuTensorView needs non-const for interface
                 static_cast<size_t>(kv_len),
-                static_cast<size_t>(kv_dim_),
+                view_cols,
                 tensor_type,
                 device_id_);
 
@@ -183,9 +353,15 @@ namespace llaminar2
                 return TensorType::FP16;
             else if constexpr (Precision == ActivationPrecision::BF16)
                 return TensorType::BF16;
+            else if constexpr (Precision == ActivationPrecision::Q8_1)
+                return TensorType::Q8_1;
             else
                 return TensorType::FP32;
         }();
+
+        const size_t view_cols = (Precision == ActivationPrecision::Q8_1)
+                                     ? static_cast<size_t>(kv_storage_dim_)
+                                     : static_cast<size_t>(kv_dim_);
 
         // Create or update the view
         auto &view = tensor_views_[layer][seq_idx][1]; // Index 1 = V
@@ -199,7 +375,7 @@ namespace llaminar2
             view = std::make_unique<GpuTensorView>(
                 const_cast<void *>(d_v), // GpuTensorView needs non-const for interface
                 static_cast<size_t>(kv_len),
-                static_cast<size_t>(kv_dim_),
+                view_cols,
                 tensor_type,
                 device_id_);
 
@@ -232,5 +408,10 @@ namespace llaminar2
     template const ITensor *CUDARingKVCache<ActivationPrecision::BF16>::get_k(int, int) const;
     template ITensor *CUDARingKVCache<ActivationPrecision::BF16>::get_v(int, int);
     template const ITensor *CUDARingKVCache<ActivationPrecision::BF16>::get_v(int, int) const;
+
+    template ITensor *CUDARingKVCache<ActivationPrecision::Q8_1>::get_k(int, int);
+    template const ITensor *CUDARingKVCache<ActivationPrecision::Q8_1>::get_k(int, int) const;
+    template ITensor *CUDARingKVCache<ActivationPrecision::Q8_1>::get_v(int, int);
+    template const ITensor *CUDARingKVCache<ActivationPrecision::Q8_1>::get_v(int, int) const;
 
 } // namespace llaminar2

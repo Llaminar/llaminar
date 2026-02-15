@@ -31,6 +31,7 @@
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../utils/KernelProfiler.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
 #include "../CPUKernelBase.h"
@@ -88,6 +89,9 @@ namespace llaminar2
                                            float beta = 0.0f,
                                            const float *bias = nullptr)
         {
+            const KernelType profile_type = (M == 1) ? KernelType::GEMV_FP32 : KernelType::GEMM_FP32;
+            KERNEL_PROFILE_SCOPE(profile_type);
+
             using dt = dnnl::memory::data_type;
             using tag = dnnl::memory::format_tag;
 
@@ -186,6 +190,9 @@ namespace llaminar2
                                            float alpha = 1.0f,
                                            float beta = 0.0f)
         {
+            const KernelType profile_type = (M == 1) ? KernelType::GEMV_FP32 : KernelType::GEMM_FP32;
+            KERNEL_PROFILE_SCOPE(profile_type);
+
             using dt = dnnl::memory::data_type;
             using tag = dnnl::memory::format_tag;
 
@@ -260,6 +267,9 @@ namespace llaminar2
                                            float alpha = 1.0f,
                                            float beta = 0.0f)
         {
+            const KernelType profile_type = (M == 1) ? KernelType::GEMV_FP32 : KernelType::GEMM_FP32;
+            KERNEL_PROFILE_SCOPE(profile_type);
+
             using dt = dnnl::memory::data_type;
             using tag = dnnl::memory::format_tag;
 
@@ -346,6 +356,9 @@ namespace llaminar2
                                                    float alpha = 1.0f,
                                                    float beta = 0.0f)
         {
+            const KernelType profile_type = (M == 1) ? KernelType::GEMV_FP32 : KernelType::GEMM_FP32;
+            KERNEL_PROFILE_SCOPE(profile_type);
+
             using dt = dnnl::memory::data_type;
             using tag = dnnl::memory::format_tag;
 

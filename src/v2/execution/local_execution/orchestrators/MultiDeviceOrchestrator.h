@@ -199,6 +199,9 @@ namespace llaminar2
             /// KV cache scale factor
             float kv_cache_scale = 1.0f;
 
+            /// Explicit KV cache precision mode (AUTO preserves legacy behavior)
+            KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
+
             /// Use mapped memory for GPU tensors (zero-copy host access)
             /// Required for correct coherence with column-parallel LM head
             bool use_mapped_memory = false;

@@ -34,6 +34,7 @@
 #include <hip/hip_runtime.h>
 #include "kernels/rocm/attention/ROCmFlashAttentionKernelT.h"
 #include "kernels/cpu/attention/CPUAttentionKernelT.h"
+#include "kernels/cpu/CPUKVCache.h"
 #endif
 
 #include <vector>
@@ -175,6 +176,13 @@ protected:
 
     // Workspace manager for FlashDecode tests (owned by fixture)
     std::unique_ptr<DeviceWorkspaceManager> workspace_;
+
+    void SetUp() override
+    {
+#ifdef HAVE_ROCM
+        ASSERT_EQ(hipSetDevice(0), hipSuccess) << "Failed to set active ROCm device to 0";
+#endif
+    }
 
     std::vector<float> randomFP32(size_t count)
     {
@@ -807,6 +815,247 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_LargeKVLen_GQA)
     EXPECT_LE(l2_error, 0.05) << "L2 error too high";
 
     LOG_INFO("[FlashDecode_FP32_LargeKVLen_GQA] PASSED");
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_Parity)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    constexpr int kv_len = 128;
+    constexpr int n_heads = 14;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    constexpr int seq_len = 1;
+
+    const size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+    const size_t kv_size = static_cast<size_t>(kv_len) * n_kv_heads * head_dim;
+    const size_t out_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+
+    auto Q_data = randomFP32(q_size);
+    auto K_data_fp32 = randomFP32(kv_size);
+    auto V_data_fp32 = randomFP32(kv_size);
+
+    std::vector<float> cpu_baseline_output(out_size, 0.0f);
+    std::vector<float> cpu_q81_output(out_size, 0.0f);
+    std::vector<float> rocm_q81_output(out_size, 0.0f);
+
+    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+
+    // Baseline decode with original FP32 K/V
+    ASSERT_TRUE(cpu_kernel.compute_decode(
+        Q_data.data(), K_data_fp32.data(), V_data_fp32.data(), cpu_baseline_output.data(),
+        seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+        false));
+
+    // Build Q8_1 cache and gather consumed K/V through IKVCache path
+    MPIContext local_mpi_ctx(0, 1, MPI_COMM_WORLD);
+    auto kv_cache = std::make_unique<CPUKVCache<ActivationPrecision::Q8_1>>(
+        local_mpi_ctx,
+        1,      // layers
+        1,      // batch_size
+        kv_len, // max_seq_len
+        n_kv_heads,
+        head_dim,
+        DeviceId::cpu());
+
+    auto k_q81 = Q8_1Tensor::quantize_from_fp32(
+        K_data_fp32.data(), {static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    auto v_q81 = Q8_1Tensor::quantize_from_fp32(
+        V_data_fp32.data(), {static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    ASSERT_NE(k_q81, nullptr);
+    ASSERT_NE(v_q81, nullptr);
+    ASSERT_TRUE(kv_cache->append_kv(0, 0, k_q81.get(), v_q81.get(), kv_len));
+
+    auto gathered_K_q81 = std::make_unique<Q8_1Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    auto gathered_V_q81 = std::make_unique<Q8_1Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    std::vector<int> kv_lens;
+    int gathered_max = kv_cache->gather_kv_batched(0, 1, gathered_K_q81.get(), gathered_V_q81.get(), kv_lens);
+    ASSERT_EQ(gathered_max, kv_len);
+    ASSERT_EQ(kv_lens.size(), 1u);
+    ASSERT_EQ(kv_lens[0], kv_len);
+
+    const float *K_from_q81 = gathered_K_q81->fp32_data();
+    const float *V_from_q81 = gathered_V_q81->fp32_data();
+    ASSERT_NE(K_from_q81, nullptr);
+    ASSERT_NE(V_from_q81, nullptr);
+
+    // CPU decode consuming dequantized gathered K/V from Q8_1 cache
+    ASSERT_TRUE(cpu_kernel.compute_decode(
+        Q_data.data(), K_from_q81, V_from_q81, cpu_q81_output.data(),
+        seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+        false));
+
+    // ROCm decode consuming same dequantized gathered K/V
+    llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
+
+    float *d_Q = nullptr;
+    float *d_K = nullptr;
+    float *d_V = nullptr;
+    float *d_out = nullptr;
+    hipMalloc(&d_Q, q_size * sizeof(float));
+    hipMalloc(&d_K, kv_size * sizeof(float));
+    hipMalloc(&d_V, kv_size * sizeof(float));
+    hipMalloc(&d_out, out_size * sizeof(float));
+
+    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    hipMemcpy(d_K, K_from_q81, kv_size * sizeof(float), hipMemcpyHostToDevice);
+    hipMemcpy(d_V, V_from_q81, kv_size * sizeof(float), hipMemcpyHostToDevice);
+    hipMemset(d_out, 0, out_size * sizeof(float));
+
+    bool rocm_success = rocm_kernel.compute_decode(
+        d_Q, d_K, d_V, d_out,
+        seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+        false,
+        0);
+    hipDeviceSynchronize();
+    ASSERT_TRUE(rocm_success);
+
+    hipMemcpy(rocm_q81_output.data(), d_out, out_size * sizeof(float), hipMemcpyDeviceToHost);
+
+    cleanupWorkspace(rocm_kernel);
+    hipFree(d_Q);
+    hipFree(d_K);
+    hipFree(d_V);
+    hipFree(d_out);
+
+    ASSERT_FALSE(hasNaNOrInf(cpu_q81_output.data(), out_size));
+    ASSERT_FALSE(hasNaNOrInf(rocm_q81_output.data(), out_size));
+
+    const double q81_rocm_cpu_cos = cosineSimilarity(rocm_q81_output.data(), cpu_q81_output.data(), out_size);
+    const double q81_rocm_cpu_l2 = relativeL2Error(rocm_q81_output.data(), cpu_q81_output.data(), out_size);
+
+    const double q81_vs_fp32_cos = cosineSimilarity(cpu_q81_output.data(), cpu_baseline_output.data(), out_size);
+    const double q81_vs_fp32_l2 = relativeL2Error(cpu_q81_output.data(), cpu_baseline_output.data(), out_size);
+
+    printComparisonStats("FlashDecode Q8_1-consumed ROCm vs CPU", q81_rocm_cpu_cos, q81_rocm_cpu_l2,
+                         maxAbsError(rocm_q81_output.data(), cpu_q81_output.data(), out_size), out_size);
+    printComparisonStats("FlashDecode Q8_1-consumed CPU vs FP32 baseline", q81_vs_fp32_cos, q81_vs_fp32_l2,
+                         maxAbsError(cpu_q81_output.data(), cpu_baseline_output.data(), out_size), out_size);
+
+    EXPECT_GE(q81_rocm_cpu_cos, 0.99) << "ROCm vs CPU parity too low for Q8_1-consumed path";
+    EXPECT_LE(q81_rocm_cpu_l2, 0.05) << "ROCm vs CPU L2 too high for Q8_1-consumed path";
+
+    EXPECT_GE(q81_vs_fp32_cos, 0.95) << "Q8_1-consumed drift vs FP32 baseline too high";
+    EXPECT_LE(q81_vs_fp32_l2, 0.15) << "Q8_1-consumed L2 drift vs FP32 baseline too high";
+
+    LOG_INFO("[FlashDecode_Q81KVCacheConsumption_Parity] PASSED");
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_NonCausal_MHA)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    constexpr int kv_len = 96;
+    constexpr int n_heads = 8;
+    constexpr int n_kv_heads = 8; // MHA
+    constexpr int head_dim = 64;
+    constexpr int seq_len = 1;
+
+    const size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+    const size_t kv_size = static_cast<size_t>(kv_len) * n_kv_heads * head_dim;
+    const size_t out_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+
+    auto Q_data = randomFP32(q_size);
+    auto K_data_fp32 = randomFP32(kv_size);
+    auto V_data_fp32 = randomFP32(kv_size);
+
+    std::vector<float> cpu_baseline_output(out_size, 0.0f);
+    std::vector<float> cpu_q81_output(out_size, 0.0f);
+    std::vector<float> rocm_q81_output(out_size, 0.0f);
+
+    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+
+    ASSERT_TRUE(cpu_kernel.compute_decode(
+        Q_data.data(), K_data_fp32.data(), V_data_fp32.data(), cpu_baseline_output.data(),
+        seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+        false));
+
+    MPIContext local_mpi_ctx(0, 1, MPI_COMM_WORLD);
+    auto kv_cache = std::make_unique<CPUKVCache<ActivationPrecision::Q8_1>>(
+        local_mpi_ctx, 1, 1, kv_len, n_kv_heads, head_dim, DeviceId::cpu());
+
+    auto k_q81 = Q8_1Tensor::quantize_from_fp32(
+        K_data_fp32.data(), {static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    auto v_q81 = Q8_1Tensor::quantize_from_fp32(
+        V_data_fp32.data(), {static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    ASSERT_NE(k_q81, nullptr);
+    ASSERT_NE(v_q81, nullptr);
+    ASSERT_TRUE(kv_cache->append_kv(0, 0, k_q81.get(), v_q81.get(), kv_len));
+
+    auto gathered_K_q81 = std::make_unique<Q8_1Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    auto gathered_V_q81 = std::make_unique<Q8_1Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    std::vector<int> kv_lens;
+    int gathered_max = kv_cache->gather_kv_batched(0, 1, gathered_K_q81.get(), gathered_V_q81.get(), kv_lens);
+    ASSERT_EQ(gathered_max, kv_len);
+
+    const float *K_from_q81 = gathered_K_q81->fp32_data();
+    const float *V_from_q81 = gathered_V_q81->fp32_data();
+    ASSERT_NE(K_from_q81, nullptr);
+    ASSERT_NE(V_from_q81, nullptr);
+
+    ASSERT_TRUE(cpu_kernel.compute_decode(
+        Q_data.data(), K_from_q81, V_from_q81, cpu_q81_output.data(),
+        seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+        false));
+
+    llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
+
+    float *d_Q = nullptr;
+    float *d_K = nullptr;
+    float *d_V = nullptr;
+    float *d_out = nullptr;
+    hipMalloc(&d_Q, q_size * sizeof(float));
+    hipMalloc(&d_K, kv_size * sizeof(float));
+    hipMalloc(&d_V, kv_size * sizeof(float));
+    hipMalloc(&d_out, out_size * sizeof(float));
+
+    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    hipMemcpy(d_K, K_from_q81, kv_size * sizeof(float), hipMemcpyHostToDevice);
+    hipMemcpy(d_V, V_from_q81, kv_size * sizeof(float), hipMemcpyHostToDevice);
+    hipMemset(d_out, 0, out_size * sizeof(float));
+
+    bool rocm_success = rocm_kernel.compute_decode(
+        d_Q, d_K, d_V, d_out,
+        seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+        false,
+        0);
+    hipDeviceSynchronize();
+    ASSERT_TRUE(rocm_success);
+
+    hipMemcpy(rocm_q81_output.data(), d_out, out_size * sizeof(float), hipMemcpyDeviceToHost);
+
+    cleanupWorkspace(rocm_kernel);
+    hipFree(d_Q);
+    hipFree(d_K);
+    hipFree(d_V);
+    hipFree(d_out);
+
+    const double q81_rocm_cpu_cos = cosineSimilarity(rocm_q81_output.data(), cpu_q81_output.data(), out_size);
+    const double q81_rocm_cpu_l2 = relativeL2Error(rocm_q81_output.data(), cpu_q81_output.data(), out_size);
+    const double q81_vs_fp32_cos = cosineSimilarity(cpu_q81_output.data(), cpu_baseline_output.data(), out_size);
+    const double q81_vs_fp32_l2 = relativeL2Error(cpu_q81_output.data(), cpu_baseline_output.data(), out_size);
+
+    printComparisonStats("FlashDecode Q8_1-consumed ROCm vs CPU (non-causal MHA)", q81_rocm_cpu_cos, q81_rocm_cpu_l2,
+                         maxAbsError(rocm_q81_output.data(), cpu_q81_output.data(), out_size), out_size);
+
+    EXPECT_GE(q81_rocm_cpu_cos, 0.99);
+    EXPECT_LE(q81_rocm_cpu_l2, 0.05);
+    EXPECT_GE(q81_vs_fp32_cos, 0.95);
+    EXPECT_LE(q81_vs_fp32_l2, 0.15);
+
+    LOG_INFO("[FlashDecode_Q81KVCacheConsumption_NonCausal_MHA] PASSED");
 }
 
 // ============================================================================

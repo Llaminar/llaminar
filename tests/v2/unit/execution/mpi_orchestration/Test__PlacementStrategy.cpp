@@ -473,6 +473,42 @@ TEST_F(Test__GPUFirstPlacementStrategy, ComputeDistributesAcrossMultipleGPUs)
     EXPECT_EQ(gpu_layers + cpu_layers, 24);
 }
 
+TEST_F(Test__GPUFirstPlacementStrategy, KVCachePrecisionAffectsLayerFitEstimate)
+{
+    GPUFirstPlacementStrategy strategy;
+    // Memory-constrained setup where KV estimate should influence number of GPU layers.
+    auto input = createGPUInput(24, 2);
+
+    auto count_gpu_layers = [](const PlacementPlan &plan)
+    {
+        int count = 0;
+        for (const auto &layer : plan.layers)
+        {
+            if (layer.device.isGPU())
+            {
+                count++;
+            }
+        }
+        return count;
+    };
+
+    input.kv_cache_precision = "auto";
+    const PlacementPlan plan_auto = strategy.compute(input);
+
+    input.kv_cache_precision = "fp16";
+    const PlacementPlan plan_fp16 = strategy.compute(input);
+
+    input.kv_cache_precision = "q8_1";
+    const PlacementPlan plan_q81 = strategy.compute(input);
+
+    const int gpu_auto = count_gpu_layers(plan_auto);
+    const int gpu_fp16 = count_gpu_layers(plan_fp16);
+    const int gpu_q81 = count_gpu_layers(plan_q81);
+
+    EXPECT_GE(gpu_fp16, gpu_auto);
+    EXPECT_GE(gpu_q81, gpu_fp16);
+}
+
 // =============================================================================
 // HybridOptimalPlacementStrategy Tests
 // =============================================================================

@@ -500,7 +500,8 @@ namespace llaminar2
         // Parallelizing this cuts ~50% off the MDO init time for 2+ devices.
         // =====================================================================
 
-        struct RunnerResult {
+        struct RunnerResult
+        {
             std::unique_ptr<IInferenceRunner> runner;
             int device_idx;
             std::string error;
@@ -516,42 +517,48 @@ namespace llaminar2
             DeviceId device_id = device_addr.toLocalDeviceId();
 
             futures.push_back(std::async(std::launch::async,
-                [this, device_idx, device_id]() -> RunnerResult {
-                    RunnerResult result;
-                    result.device_idx = device_idx;
-                    try {
-                        LOG_DEBUG("MultiDeviceOrchestrator: Creating runner for device " << device_idx
-                                                                                         << " (" << device_id.toString() << ")");
+                                         [this, device_idx, device_id]() -> RunnerResult
+                                         {
+                                             RunnerResult result;
+                                             result.device_idx = device_idx;
+                                             try
+                                             {
+                                                 LOG_DEBUG("MultiDeviceOrchestrator: Creating runner for device " << device_idx
+                                                                                                                  << " (" << device_id.toString() << ")");
 
-                        // Build InferenceRunnerConfig for LOCAL TP
-                        InferenceRunnerConfig runner_config;
-                        runner_config.max_seq_len = static_cast<int>(config_.max_seq_len);
-                        runner_config.batch_size = config_.batch_size;
-                        runner_config.activation_precision = config_.activation_precision;
-                        runner_config.kv_cache_scale = config_.kv_cache_scale;
-                        runner_config.use_mapped_memory = config_.use_mapped_memory;
-                        runner_config.use_bar_backed_hidden = config_.use_bar_backed_hidden;
+                                                 // Build InferenceRunnerConfig for LOCAL TP
+                                                 InferenceRunnerConfig runner_config;
+                                                 runner_config.max_seq_len = static_cast<int>(config_.max_seq_len);
+                                                 runner_config.batch_size = config_.batch_size;
+                                                 runner_config.activation_precision = config_.activation_precision;
+                                                 runner_config.kv_cache_scale = config_.kv_cache_scale;
+                                                 runner_config.kv_cache_precision = config_.kv_cache_precision;
+                                                 runner_config.use_mapped_memory = config_.use_mapped_memory;
+                                                 runner_config.use_bar_backed_hidden = config_.use_bar_backed_hidden;
 
-                        // Set LOCAL TP parameters
-                        runner_config.local_tp_ctx = tp_ctx_.get();
-                        runner_config.local_tp_device_index = device_idx;
+                                                 // Set LOCAL TP parameters
+                                                 runner_config.local_tp_ctx = tp_ctx_.get();
+                                                 runner_config.local_tp_device_index = device_idx;
 
-                        // Create the inference runner
-                        result.runner = createTestableInferenceRunner(model_ctx_, device_id, runner_config);
-                        if (!result.runner) {
-                            result.error = "Failed to create inference runner for device " +
-                                           std::to_string(device_idx);
-                        }
-                    } catch (const std::exception& e) {
-                        result.error = std::string("Exception creating runner for device ") +
-                                       std::to_string(device_idx) + ": " + e.what();
-                    }
-                    return result;
-                }));
+                                                 // Create the inference runner
+                                                 result.runner = createTestableInferenceRunner(model_ctx_, device_id, runner_config);
+                                                 if (!result.runner)
+                                                 {
+                                                     result.error = "Failed to create inference runner for device " +
+                                                                    std::to_string(device_idx);
+                                                 }
+                                             }
+                                             catch (const std::exception &e)
+                                             {
+                                                 result.error = std::string("Exception creating runner for device ") +
+                                                                std::to_string(device_idx) + ": " + e.what();
+                                             }
+                                             return result;
+                                         }));
         }
 
         // Collect results in device order
-        for (auto& fut : futures)
+        for (auto &fut : futures)
         {
             auto result = fut.get();
             if (!result.error.empty())
@@ -752,6 +759,7 @@ namespace llaminar2
             runner_config.batch_size = config_.batch_size;
             runner_config.activation_precision = config_.activation_precision;
             runner_config.kv_cache_scale = config_.kv_cache_scale;
+            runner_config.kv_cache_precision = config_.kv_cache_precision;
             runner_config.use_mapped_memory = config_.use_mapped_memory;
 
             // =====================================================================
@@ -785,6 +793,7 @@ namespace llaminar2
                 nested_config.batch_size = config_.batch_size;
                 nested_config.activation_precision = config_.activation_precision;
                 nested_config.kv_cache_scale = config_.kv_cache_scale;
+                nested_config.kv_cache_precision = config_.kv_cache_precision;
                 nested_config.use_mapped_memory = config_.use_mapped_memory;
                 nested_config.use_bar_backed_hidden = needs_bar_backed[stage_idx] || stage_config.requires_bar_backed_hidden;
 

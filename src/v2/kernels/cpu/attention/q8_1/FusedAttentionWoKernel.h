@@ -425,6 +425,11 @@ namespace llaminar2
         {
             using namespace llaminar::v2::kernels::jit;
 
+            const auto projection_profile_type = (params.seq_len <= 1)
+                                                     ? KernelType::GEMV_Q8
+                                                     : KernelType::GEMM_Q8;
+            KERNEL_PROFILE_SCOPE(projection_profile_type);
+
             auto work_size_index = [](WorkSizeClass w) -> size_t
             {
                 switch (w)

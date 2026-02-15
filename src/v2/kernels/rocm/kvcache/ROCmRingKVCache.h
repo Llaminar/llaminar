@@ -38,6 +38,7 @@
 #include "../../../execution/config/RuntimeConfig.h" // For ActivationPrecision
 #include "../../../interfaces/IWorkspaceConsumer.h"  // Workspace management
 #include "../../../backends/IWorkerGPUContext.h"     // Device context support
+#include "../../../tensors/BlockStructures.h"        // Q8_1Block
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
@@ -168,6 +169,7 @@ namespace llaminar2
         virtual int n_kv_heads() const = 0;
         virtual int head_dim() const = 0;
         virtual int kv_dim() const = 0; ///< n_kv_heads * head_dim
+        virtual int device_id() const = 0;
 
         // Ring buffer state
         virtual int get_head_position(int layer, int seq_idx = 0) const = 0;
@@ -282,6 +284,13 @@ namespace llaminar2
             using Type = hip_bfloat16;
             static constexpr size_t element_size = sizeof(hip_bfloat16);
         };
+
+        template <>
+        struct ROCmKVCacheType<ActivationPrecision::Q8_1>
+        {
+            using Type = Q8_1Block;
+            static constexpr size_t element_size = sizeof(Q8_1Block);
+        };
     } // namespace detail
 
     // =========================================================================
@@ -340,6 +349,7 @@ namespace llaminar2
      * - FP32: 32-bit float
      * - FP16: 16-bit half precision
      * - BF16: 16-bit brain float
+     * - Q8_1: 8-bit block-quantized (Q8_1Block)
      *
      * Optimized for AMD MI50 (gfx906):
      * - Uses HIP memory APIs for device allocation
@@ -462,6 +472,7 @@ namespace llaminar2
         int n_kv_heads() const override { return n_kv_heads_; }
         int head_dim() const override { return head_dim_; }
         int kv_dim() const override { return kv_dim_; }
+        int device_id() const override { return device_id_; }
 
         // =====================================================================
         // Sharding (Tensor Parallelism) Accessors (IKVCache interface)
@@ -594,7 +605,8 @@ namespace llaminar2
         int local_n_kv_heads_; // Local KV heads (this rank), == n_kv_heads_ if not sharded
         int kv_head_start_;    // Starting KV head index (0 if not sharded)
         int head_dim_;
-        int kv_dim_; // local_n_kv_heads * head_dim (storage dimension)
+        int kv_dim_;         // local_n_kv_heads * head_dim (storage dimension)
+        int kv_storage_dim_; // per-token storage units (elements for fp/bf16, blocks for Q8_1)
         int device_id_;
         bool is_sharded_; // True if using local KV heads (TP enabled)
 
@@ -671,6 +683,7 @@ namespace llaminar2
     using ROCmRingKVCacheFP32 = ROCmRingKVCache<ActivationPrecision::FP32>;
     using ROCmRingKVCacheFP16 = ROCmRingKVCache<ActivationPrecision::FP16>;
     using ROCmRingKVCacheBF16 = ROCmRingKVCache<ActivationPrecision::BF16>;
+    using ROCmRingKVCacheQ8_1 = ROCmRingKVCache<ActivationPrecision::Q8_1>;
 
     // Note: Factory functions are declared in ROCmRingKVCacheFactory.h
     // to avoid HIP header pollution in non-HIP code.

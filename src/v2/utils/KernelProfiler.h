@@ -51,7 +51,9 @@ namespace llaminar2
     {
         // GEMM variants
         GEMM_FP32 = 0, ///< FP32 GEMM (OpenBLAS fallback)
+        GEMV_FP32,     ///< FP32 GEMV / M=1 matvec path
         GEMM_Q8,       ///< Q8_1 quantized GEMM (JIT microkernel)
+        GEMV_Q8,       ///< Q8_1 quantized GEMV / M=1 decode matvec path
         GEMM_IQ4,      ///< IQ4_NL quantized GEMM
 
         // Attention
@@ -93,8 +95,12 @@ namespace llaminar2
         {
         case KernelType::GEMM_FP32:
             return "GEMM_FP32";
+        case KernelType::GEMV_FP32:
+            return "GEMV_FP32";
         case KernelType::GEMM_Q8:
             return "GEMM_Q8";
+        case KernelType::GEMV_Q8:
+            return "GEMV_Q8";
         case KernelType::GEMM_IQ4:
             return "GEMM_IQ4";
         case KernelType::ATTENTION:

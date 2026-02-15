@@ -550,7 +550,8 @@ namespace llaminar2
         bool executeWithSegmentedGraphCapture(ComputeGraph &graph, IDeviceContext *ctx,
                                               GraphSegmentCache &segment_cache,
                                               void *gpu_stream,
-                                              IWorkerGPUContext *gpu_ctx);
+                                              IWorkerGPUContext *gpu_ctx,
+                                              const std::unordered_set<std::string> *collective_nodes = nullptr);
 
     private:
         GraphExecutorConfig config_;

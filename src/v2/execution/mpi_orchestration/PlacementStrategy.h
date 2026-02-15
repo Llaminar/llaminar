@@ -92,15 +92,16 @@ namespace llaminar2
         // =====================================================================
         // Model info
         // =====================================================================
-        std::string architecture;          ///< e.g., "qwen2", "llama"
-        int n_layers = 0;                  ///< Number of transformer layers
-        size_t d_model = 0;                ///< Hidden dimension
-        size_t d_ff = 0;                   ///< FFN intermediate dimension
-        size_t vocab_size = 0;             ///< Vocabulary size
-        size_t n_heads = 0;                ///< Attention heads
-        size_t n_kv_heads = 0;             ///< KV heads (for GQA)
-        std::string quant_type;            ///< Quantization type (e.g., "Q4_0", "Q8_0")
-        size_t estimated_memory_bytes = 0; ///< Estimated total model memory
+        std::string architecture;                ///< e.g., "qwen2", "llama"
+        int n_layers = 0;                        ///< Number of transformer layers
+        size_t d_model = 0;                      ///< Hidden dimension
+        size_t d_ff = 0;                         ///< FFN intermediate dimension
+        size_t vocab_size = 0;                   ///< Vocabulary size
+        size_t n_heads = 0;                      ///< Attention heads
+        size_t n_kv_heads = 0;                   ///< KV heads (for GQA)
+        std::string kv_cache_precision = "auto"; ///< KV cache precision for memory estimates: "auto", "fp16", "q8_1"
+        std::string quant_type;                  ///< Quantization type (e.g., "Q4_0", "Q8_0")
+        size_t estimated_memory_bytes = 0;       ///< Estimated total model memory
 
         // =====================================================================
         // Cluster topology (from ClusterInventory after capability exchange)

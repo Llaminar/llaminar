@@ -941,6 +941,9 @@ namespace llaminar2
                                 bool accumulate, float alpha, float beta, const MPIContext *ctx, int device_idx,
                                 const float *gate_input = nullptr, bool do_swiglu = false)
             {
+                const KernelType profile_type = (m == 1) ? KernelType::GEMV_Q8 : KernelType::GEMM_Q8;
+                KERNEL_PROFILE_SCOPE(profile_type);
+
                 // Get reference to packed weights (either external or owned)
                 const auto &pw = packed_weights();
 

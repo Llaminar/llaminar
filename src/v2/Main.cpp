@@ -31,6 +31,7 @@
 #include <string>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <sstream>
 
 using namespace llaminar2;
@@ -166,6 +167,14 @@ int main(int argc, char *argv[])
     // ========================================================================
     // MPI Runtime - We are running under mpirun
     // ========================================================================
+
+    // OpenMPI vader's default CMA single-copy path can emit noisy
+    // "Read -1, expected ..., errno = 1" warnings in containerized environments
+    // where process_vm_readv is restricted. Keep user override if explicitly set.
+    if (mpi_env.is_mpi_process && std::getenv("OMPI_MCA_btl_vader_single_copy_mechanism") == nullptr)
+    {
+        setenv("OMPI_MCA_btl_vader_single_copy_mechanism", "none", 0);
+    }
 
     // Initialize MPI
     int provided;
@@ -785,7 +794,18 @@ int main(int argc, char *argv[])
         LOG_DEBUG("Generation complete.");
     }
 
+    if (mpi_ctx->world_size() > 1)
+    {
+        mpi_ctx->barrier();
+    }
+
     runner->shutdown();
+
+    if (mpi_ctx->world_size() > 1)
+    {
+        mpi_ctx->barrier();
+    }
+
     MPI_Finalize();
     return 0;
 }

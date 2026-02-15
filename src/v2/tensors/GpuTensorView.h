@@ -14,6 +14,7 @@
 
 #include "ITensor.h"
 #include "TensorType.h"
+#include "BlockStructures.h"
 #include "../backends/DeviceId.h"
 #include <vector>
 #include <stdexcept>
@@ -118,6 +119,8 @@ namespace llaminar2
                 return 2;
             case TensorType::BF16:
                 return 2;
+            case TensorType::Q8_1:
+                return sizeof(Q8_1Block);
             default:
                 return 4; // Fallback
             }

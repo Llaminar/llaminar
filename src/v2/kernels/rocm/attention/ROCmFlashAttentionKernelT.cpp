@@ -14,12 +14,15 @@
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
+#include "../../../tensors/BlockStructures.h"
+#include "../../../tensors/FP16Utils.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/ROCmKernelProfiler.h"
 #include "../../attention/AttentionDeviceParams.h"
 #include <hip/hip_runtime.h>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
 // Extern "C" declarations for HIP kernel wrappers
 extern "C"
@@ -439,11 +442,10 @@ namespace llaminar2
                 return false;
             }
 
-            // Check if tensors have FP32 type
-            if (Q->native_type() != TensorType::FP32 || K->native_type() != TensorType::FP32 ||
-                V->native_type() != TensorType::FP32 || output->native_type() != TensorType::FP32)
+            // Q and output must be FP32 for this specialization
+            if (Q->native_type() != TensorType::FP32 || output->native_type() != TensorType::FP32)
             {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Expected FP32 tensors, got Q="
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Expected FP32 Q/output tensors, got Q="
                           << Q->dtype_name() << " K=" << K->dtype_name()
                           << " V=" << V->dtype_name() << " O=" << output->dtype_name());
                 return false;
@@ -454,6 +456,114 @@ namespace llaminar2
             const float *K_ptr = static_cast<const float *>(K->gpu_data_ptr());
             const float *V_ptr = static_cast<const float *>(V->gpu_data_ptr());
             float *O_ptr = static_cast<float *>(output->gpu_data_ptr());
+
+            thread_local std::vector<float> k_host_fp32;
+            thread_local std::vector<float> v_host_fp32;
+
+            if (K->native_type() != TensorType::FP32 || V->native_type() != TensorType::FP32)
+            {
+                if (K->native_type() != V->native_type())
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Mixed K/V types not supported: K="
+                              << K->dtype_name() << " V=" << V->dtype_name());
+                    return false;
+                }
+
+                if (!workspace_)
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Mixed-precision KV requires workspace-bound conversion buffers");
+                    return false;
+                }
+
+                const size_t rows = static_cast<size_t>(batch_size) * static_cast<size_t>(kv_len);
+                const size_t logical_cols = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
+                const size_t logical_elements = rows * logical_cols;
+                k_host_fp32.resize(logical_elements);
+                v_host_fp32.resize(logical_elements);
+
+                if (K->native_type() == TensorType::FP16)
+                {
+                    thread_local std::vector<uint16_t> k_half;
+                    thread_local std::vector<uint16_t> v_half;
+                    k_half.resize(logical_elements);
+                    v_half.resize(logical_elements);
+                    if (hipMemcpy(k_half.data(), K->gpu_data_ptr(), logical_elements * sizeof(uint16_t), hipMemcpyDeviceToHost) != hipSuccess ||
+                        hipMemcpy(v_half.data(), V->gpu_data_ptr(), logical_elements * sizeof(uint16_t), hipMemcpyDeviceToHost) != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Failed D2H copy for FP16 KV conversion");
+                        return false;
+                    }
+
+                    for (size_t i = 0; i < logical_elements; ++i)
+                    {
+                        k_host_fp32[i] = fp16_to_fp32(k_half[i]);
+                        v_host_fp32[i] = fp16_to_fp32(v_half[i]);
+                    }
+                }
+                else if (K->native_type() == TensorType::Q8_1)
+                {
+                    const size_t blocks_per_row = (logical_cols + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+                    const size_t block_count = rows * blocks_per_row;
+
+                    thread_local std::vector<Q8_1Block> k_blocks;
+                    thread_local std::vector<Q8_1Block> v_blocks;
+                    k_blocks.resize(block_count);
+                    v_blocks.resize(block_count);
+                    if (hipMemcpy(k_blocks.data(), K->gpu_data_ptr(), block_count * sizeof(Q8_1Block), hipMemcpyDeviceToHost) != hipSuccess ||
+                        hipMemcpy(v_blocks.data(), V->gpu_data_ptr(), block_count * sizeof(Q8_1Block), hipMemcpyDeviceToHost) != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Failed D2H copy for Q8_1 KV conversion");
+                        return false;
+                    }
+
+                    for (size_t r = 0; r < rows; ++r)
+                    {
+                        const size_t row_base = r * logical_cols;
+                        for (size_t b = 0; b < blocks_per_row; ++b)
+                        {
+                            const Q8_1Block &kb = k_blocks[r * blocks_per_row + b];
+                            const Q8_1Block &vb = v_blocks[r * blocks_per_row + b];
+                            const float k_scale = fp16_to_fp32(kb.d);
+                            const float v_scale = fp16_to_fp32(vb.d);
+                            const size_t col_base = b * Q8_1Block::BLOCK_SIZE;
+                            for (size_t i = 0; i < Q8_1Block::BLOCK_SIZE; ++i)
+                            {
+                                const size_t col = col_base + i;
+                                if (col >= logical_cols)
+                                    break;
+                                k_host_fp32[row_base + col] = k_scale * static_cast<float>(kb.qs[i]);
+                                v_host_fp32[row_base + col] = v_scale * static_cast<float>(vb.qs[i]);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Unsupported KV tensor type for FP32 attention: "
+                              << K->dtype_name());
+                    return false;
+                }
+
+                float *d_k_tmp = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::K_TMP_FP32));
+                float *d_v_tmp = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::V_TMP_FP32));
+                if (!d_k_tmp || !d_v_tmp)
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Missing workspace conversion buffers: "
+                              << AttentionWorkspaceBuffers::K_TMP_FP32 << " / "
+                              << AttentionWorkspaceBuffers::V_TMP_FP32);
+                    return false;
+                }
+
+                if (hipMemcpy(d_k_tmp, k_host_fp32.data(), logical_elements * sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
+                    hipMemcpy(d_v_tmp, v_host_fp32.data(), logical_elements * sizeof(float), hipMemcpyHostToDevice) != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Failed H2D copy for temporary FP32 KV buffers");
+                    return false;
+                }
+
+                K_ptr = d_k_tmp;
+                V_ptr = d_v_tmp;
+            }
 
             if (!Q_ptr || !K_ptr || !V_ptr || !O_ptr)
             {
@@ -530,6 +640,15 @@ namespace llaminar2
             const int n_heads = (n > 0) ? n : 128;     // Max expected heads
             const int head_dim = (k > 0) ? k : 128;    // Max expected head dim
             const int num_splits = DEFAULT_NUM_SPLITS; // 8 splits
+            const int max_kv_len = 4096;               // decode workspace bound
+
+            // Conservative conversion buffer sizing for mixed-precision KV
+            // Assume n_kv_heads <= n_heads and allocate with n_heads for safety.
+            size_t kv_convert_bytes = static_cast<size_t>(batch_size) *
+                                      static_cast<size_t>(max_kv_len) *
+                                      static_cast<size_t>(n_heads) *
+                                      static_cast<size_t>(head_dim) *
+                                      sizeof(float);
 
             // partial_output: [batch × n_heads × num_splits × head_dim] FP32
             size_t partial_output_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * head_dim * sizeof(float);
@@ -547,13 +666,17 @@ namespace llaminar2
                                     sizeof(attention::AttentionDeviceParams),
                                     256,
                                     true});
+            reqs.buffers.push_back({AttentionWorkspaceBuffers::K_TMP_FP32, kv_convert_bytes, 256, true});
+            reqs.buffers.push_back({AttentionWorkspaceBuffers::V_TMP_FP32, kv_convert_bytes, 256, true});
 
             LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>::getWorkspaceRequirements] "
                       << "batch=" << batch_size << " n_heads=" << n_heads << " head_dim=" << head_dim
                       << " num_splits=" << num_splits
+                      << " max_kv_len=" << max_kv_len
                       << " => partial_output=" << (partial_output_bytes / 1024) << "KB"
                       << ", partial_m=" << partial_m_bytes << "B"
-                      << ", partial_l=" << partial_l_bytes << "B");
+                      << ", partial_l=" << partial_l_bytes << "B"
+                      << ", kv_convert(each)=" << (kv_convert_bytes / (1024 * 1024)) << "MB");
 
             return reqs;
         }

@@ -19,10 +19,42 @@
 #include "../../loaders/ModelContextConfig.h"
 #include "../../loaders/ModelLoader.h"
 #include "../../backends/ComputeBackend.h"
+#include "../../tensors/TensorFactory.h"
 #include "../../utils/Logger.h"
+#include "../../utils/MPITopology.h"
+#include "../../utils/NUMATopology.h"
+
+#include <algorithm>
+#include <cctype>
+#include <map>
 
 namespace llaminar2
 {
+
+    namespace
+    {
+        ActivationPrecision parseActivationPrecisionString(const std::string &value)
+        {
+            std::string lower = value;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c)
+                           { return static_cast<char>(std::tolower(c)); });
+
+            if (lower == "bf16")
+                return ActivationPrecision::BF16;
+            if (lower == "fp16")
+                return ActivationPrecision::FP16;
+            if (lower == "q8_1")
+                return ActivationPrecision::Q8_1;
+            if (lower == "q16_1")
+                return ActivationPrecision::Q16_1;
+            if (lower == "hybrid")
+                return ActivationPrecision::Hybrid;
+            if (lower == "hybridq16")
+                return ActivationPrecision::HybridQ16;
+            return ActivationPrecision::FP32;
+        }
+    } // namespace
 
     // =========================================================================
     // Construction
@@ -62,6 +94,27 @@ namespace llaminar2
             return true;
         }
 
+        auto syncInitStep = [&](bool local_ok, const char *step_name) -> bool
+        {
+            if (!mpi_ctx_ || mpi_ctx_->world_size() <= 1)
+            {
+                return local_ok;
+            }
+
+            int ok = local_ok ? 1 : 0;
+            int global_ok = 0;
+            MPI_Allreduce(&ok, &global_ok, 1, MPI_INT, MPI_MIN, mpi_ctx_->comm());
+            if (global_ok == 0)
+            {
+                if (local_ok)
+                {
+                    setError(std::string("Initialization failed on another rank at step: ") + step_name);
+                }
+                return false;
+            }
+            return true;
+        };
+
         try
         {
             // Step 1: Initialize MPI if needed
@@ -69,9 +122,18 @@ namespace llaminar2
             {
                 return false;
             }
+            if (!syncInitStep(true, "initializeMPI"))
+            {
+                return false;
+            }
 
             // Step 2: Build execution plan (if not pre-built)
             if (!buildExecutionPlan())
+            {
+                syncInitStep(false, "buildExecutionPlan");
+                return false;
+            }
+            if (!syncInitStep(true, "buildExecutionPlan"))
             {
                 return false;
             }
@@ -79,11 +141,21 @@ namespace llaminar2
             // Step 3: Setup LOCAL TP context
             if (!setupLocalTPContext())
             {
+                syncInitStep(false, "setupLocalTPContext");
+                return false;
+            }
+            if (!syncInitStep(true, "setupLocalTPContext"))
+            {
                 return false;
             }
 
             // Step 3.5: Setup LOCAL PP context
             if (!setupLocalPPContext())
+            {
+                syncInitStep(false, "setupLocalPPContext");
+                return false;
+            }
+            if (!syncInitStep(true, "setupLocalPPContext"))
             {
                 return false;
             }
@@ -91,17 +163,32 @@ namespace llaminar2
             // Step 4: Load model weights
             if (!loadWeights())
             {
+                syncInitStep(false, "loadWeights");
+                return false;
+            }
+            if (!syncInitStep(true, "loadWeights"))
+            {
                 return false;
             }
 
             // Step 5: Validate TP/PP configuration against model architecture
             if (!validateTPPPConfiguration())
             {
+                syncInitStep(false, "validateTPPPConfiguration");
+                return false;
+            }
+            if (!syncInitStep(true, "validateTPPPConfiguration"))
+            {
                 return false;
             }
 
             // Step 6: Build compute graph
             if (!buildComputeGraph())
+            {
+                syncInitStep(false, "buildComputeGraph");
+                return false;
+            }
+            if (!syncInitStep(true, "buildComputeGraph"))
             {
                 return false;
             }
@@ -423,7 +510,13 @@ namespace llaminar2
         ModelConfig model_config;
         if (!config_.model_path.empty())
         {
-            ModelLoader metadata_loader;
+            std::shared_ptr<MPIContext> metadata_mpi_ctx = mpi_ctx_;
+            if (!metadata_mpi_ctx)
+            {
+                metadata_mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
+            }
+            TensorFactory metadata_factory(*metadata_mpi_ctx);
+            ModelLoader metadata_loader(&metadata_factory);
             if (metadata_loader.loadModel(config_.model_path))
             {
                 model_config.n_layers = static_cast<int>(metadata_loader.blockCount());
@@ -490,9 +583,20 @@ namespace llaminar2
     {
         ClusterInventory inventory;
 
-        // Initialize DeviceManager to enumerate all available devices
-        DeviceManager::instance().initialize(-1); // -1 = no NUMA filtering, see all devices
-        const auto &devices = DeviceManager::instance().devices();
+        // Ensure DeviceManager is initialized with NUMA-aware filtering by default.
+        // This avoids accidentally broadening visibility to cross-socket devices in local execution.
+        auto &dm = DeviceManager::instance();
+        if (dm.devices().empty())
+        {
+            auto numa_info = NUMATopology::detectLocalNUMANode();
+            int target_numa_node = 0;
+            if (numa_info.detection_succeeded && numa_info.local_numa_node >= 0)
+            {
+                target_numa_node = numa_info.local_numa_node;
+            }
+            dm.initialize(target_numa_node);
+        }
+        const auto &devices = dm.devices();
 
         // Helper to convert ComputeBackendType to DeviceType
         auto toDeviceType = [](ComputeBackendType backend) -> DeviceType
@@ -529,14 +633,13 @@ namespace llaminar2
             rank_inv.cpu_cores = 1;
 
             // Enumerate actual GPUs from DeviceManager
-            int gpu_idx = 0;
             for (const auto &dev : devices)
             {
                 if (dev.type != ComputeBackendType::CPU)
                 {
                     DeviceInfo gpu;
                     gpu.type = toDeviceType(dev.type);
-                    gpu.local_device_id = gpu_idx++;
+                    gpu.local_device_id = dev.device_id;
                     gpu.memory_bytes = dev.total_memory_bytes;
                     gpu.free_memory_bytes = dev.free_memory_bytes;
                     gpu.name = dev.name;
@@ -576,79 +679,147 @@ namespace llaminar2
             return inventory;
         }
 
-        // For multi-rank: would gather from all ranks via MPI_Allgather
-        // For now, assume homogeneous setup based on this rank's devices
-        int world_size = mpi_ctx_->world_size();
-        int gpus_per_rank = 0;
+        // Multi-rank execution: build local RankInventory and exchange via MPI_Allgatherv.
+        const int world_size = mpi_ctx_->world_size();
+        const int rank = mpi_ctx_->rank();
+        MPI_Comm comm = mpi_ctx_->comm();
 
-        // Count GPUs from DeviceManager
+        RankInventory local_rank_inv;
+        local_rank_inv.rank = rank;
+        local_rank_inv.node_id = -1;
+        local_rank_inv.local_rank = 0;
+        local_rank_inv.numa_nodes = 1;
+
+        // Hostname
+        char hostname_buf[MPI_MAX_PROCESSOR_NAME] = {0};
+        int hostname_len = 0;
+        if (MPI_Get_processor_name(hostname_buf, &hostname_len) == MPI_SUCCESS && hostname_len > 0)
+        {
+            local_rank_inv.hostname.assign(hostname_buf, static_cast<size_t>(hostname_len));
+        }
+        else
+        {
+            local_rank_inv.hostname = "unknown";
+        }
+
+        // Detect local rank within physical node (shared-memory communicator)
+        MPI_Comm local_comm = MPI_COMM_NULL;
+        if (MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &local_comm) == MPI_SUCCESS)
+        {
+            int local_rank = 0;
+            int local_world = 1;
+            MPI_Comm_rank(local_comm, &local_rank);
+            MPI_Comm_size(local_comm, &local_world);
+            local_rank_inv.local_rank = local_rank;
+            local_rank_inv.numa_nodes = local_world;
+            MPI_Comm_free(&local_comm);
+        }
+
+        // Populate CPU info
+        local_rank_inv.cpu.type = DeviceType::CPU;
+        local_rank_inv.cpu.local_device_id = 0;
+        local_rank_inv.cpu_cores = 1;
+
+        // Populate GPU info from DeviceManager
         for (const auto &dev : devices)
         {
-            if (dev.type != ComputeBackendType::CPU)
+            if (dev.type == ComputeBackendType::CPU)
             {
-                gpus_per_rank++;
+                continue;
+            }
+
+            DeviceInfo gpu;
+            gpu.type = toDeviceType(dev.type);
+            gpu.local_device_id = dev.device_id;
+            gpu.memory_bytes = dev.total_memory_bytes;
+            gpu.free_memory_bytes = dev.free_memory_bytes;
+            gpu.name = dev.name;
+            gpu.numa_node = dev.numa_node;
+            gpu.compute_capability_major = dev.compute_capability / 10;
+            gpu.compute_capability_minor = dev.compute_capability % 10;
+            local_rank_inv.gpus.push_back(gpu);
+        }
+
+        // Override with explicit tp_devices if configured
+        if (!config_.tp_devices.empty())
+        {
+            local_rank_inv.gpus.clear();
+            for (size_t i = 0; i < config_.tp_devices.size(); ++i)
+            {
+                const auto &addr = config_.tp_devices[i];
+                DeviceInfo gpu;
+                gpu.type = addr.device_type;
+                gpu.local_device_id = static_cast<int>(i);
+                gpu.memory_bytes = 0;
+                local_rank_inv.gpus.push_back(gpu);
             }
         }
 
+        // Serialize local inventory
+        std::vector<uint8_t> local_data = MPITopology::serializeRankInventory(local_rank_inv);
+        const int local_size = static_cast<int>(local_data.size());
+
+        // Gather serialized sizes from all ranks
+        std::vector<int> all_sizes(world_size, 0);
+        MPI_Allgather(
+            &local_size, 1, MPI_INT,
+            all_sizes.data(), 1, MPI_INT,
+            comm);
+
+        // Compute displacements for allgatherv
+        std::vector<int> displacements(world_size, 0);
+        int total_size = 0;
         for (int r = 0; r < world_size; ++r)
         {
-            RankInventory rank_inv;
-            rank_inv.rank = r;
-            rank_inv.hostname = "localhost"; // Would be gathered from each rank
-            rank_inv.numa_nodes = 2;         // Assume 2 NUMA nodes per machine
-            rank_inv.node_id = r / 2;        // Assume 2 ranks per node
-            rank_inv.local_rank = r % 2;
-
-            // Add CPU
-            rank_inv.cpu.type = DeviceType::CPU;
-            rank_inv.cpu.local_device_id = 0;
-            rank_inv.cpu_cores = 1;
-
-            // Add GPUs from DeviceManager enumeration
-            int gpu_idx = 0;
-            for (const auto &dev : devices)
-            {
-                if (dev.type != ComputeBackendType::CPU)
-                {
-                    DeviceInfo gpu;
-                    gpu.type = toDeviceType(dev.type);
-                    gpu.local_device_id = gpu_idx++;
-                    gpu.memory_bytes = dev.total_memory_bytes;
-                    gpu.free_memory_bytes = dev.free_memory_bytes;
-                    gpu.name = dev.name;
-                    gpu.numa_node = dev.numa_node;
-                    gpu.compute_capability_major = dev.compute_capability / 10;
-                    gpu.compute_capability_minor = dev.compute_capability % 10;
-                    rank_inv.gpus.push_back(gpu);
-                }
-            }
-
-            // Override with explicit tp_devices if configured
-            if (!config_.tp_devices.empty())
-            {
-                rank_inv.gpus.clear();
-                for (size_t i = 0; i < config_.tp_devices.size(); ++i)
-                {
-                    const auto &addr = config_.tp_devices[i];
-                    DeviceInfo gpu;
-                    gpu.type = addr.device_type;
-                    gpu.local_device_id = static_cast<int>(i);
-                    gpu.memory_bytes = 0;
-                    rank_inv.gpus.push_back(gpu);
-                }
-                gpus_per_rank = static_cast<int>(config_.tp_devices.size());
-            }
-
-            inventory.ranks.push_back(rank_inv);
+            displacements[r] = total_size;
+            total_size += all_sizes[r];
         }
 
-        // Set cluster-level fields
+        std::vector<uint8_t> all_data(static_cast<size_t>(total_size));
+        MPI_Allgatherv(
+            local_data.data(), local_size, MPI_BYTE,
+            all_data.data(), all_sizes.data(), displacements.data(), MPI_BYTE,
+            comm);
+
+        // Deserialize inventories from all ranks
         inventory.world_size = world_size;
-        inventory.node_count = (world_size + 1) / 2; // Assume 2 ranks per node
-        inventory.total_gpus = world_size * gpus_per_rank;
+        inventory.ranks.resize(world_size);
+        for (int r = 0; r < world_size; ++r)
+        {
+            const uint8_t *ptr = all_data.data() + displacements[r];
+            const size_t size = static_cast<size_t>(all_sizes[r]);
+            try
+            {
+                inventory.ranks[r] = MPITopology::deserializeRankInventory(ptr, size);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[gatherClusterInventory] Failed to deserialize rank " << r << ": " << e.what());
+                inventory.ranks[r].rank = r;
+                inventory.ranks[r].hostname = "error";
+                inventory.ranks[r].node_id = -1;
+            }
+        }
+
+        // Build deterministic node_id mapping from hostname.
+        std::map<std::string, int> host_to_node_id;
+        int next_node_id = 0;
+        for (auto &rank_inv : inventory.ranks)
+        {
+            auto it = host_to_node_id.find(rank_inv.hostname);
+            if (it == host_to_node_id.end())
+            {
+                it = host_to_node_id.emplace(rank_inv.hostname, next_node_id++).first;
+            }
+            rank_inv.node_id = it->second;
+        }
+
+        inventory.node_count = next_node_id;
+        inventory.buildNodeAggregations();
 
         LOG_INFO("[gatherClusterInventory] Discovered " << inventory.total_gpus
-                                                        << " GPU(s) across " << world_size << " ranks");
+                                                         << " GPU(s) across " << world_size
+                                                         << " ranks on " << inventory.node_count << " node(s)");
         return inventory;
     }
 
@@ -838,7 +1009,12 @@ namespace llaminar2
         // Copy runtime settings from orchestration config
         config.max_seq_len = config_.max_seq_len;
         config.batch_size = 1;
-        config.activation_precision = ActivationPrecision::FP32;
+        config.activation_precision = parseActivationPrecisionString(config_.activation_precision);
+        config.kv_cache_precision = parseKVCachePrecision(config_.kv_cache_precision);
+
+        LOG_INFO("[OrchestrationRunner] Multi-device precision config: activation="
+                 << activationPrecisionToString(config.activation_precision)
+                 << ", kv_cache=" << kvCachePrecisionToString(config.kv_cache_precision));
 
         return config;
     }
@@ -954,6 +1130,12 @@ namespace llaminar2
         InferenceRunnerConfig runner_config;
         runner_config.max_seq_len = config_.max_seq_len;
         runner_config.batch_size = 1;
+        runner_config.activation_precision = parseActivationPrecisionString(config_.activation_precision);
+        runner_config.kv_cache_precision = parseKVCachePrecision(config_.kv_cache_precision);
+
+        LOG_INFO("[OrchestrationRunner] Single-device precision config: activation="
+                 << activationPrecisionToString(runner_config.activation_precision)
+                 << ", kv_cache=" << kvCachePrecisionToString(runner_config.kv_cache_precision));
 
         // Create runner via factory (returns IInferenceRunner)
         if (model_ctx_)

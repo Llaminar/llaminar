@@ -90,6 +90,26 @@ namespace llaminar2
         int num_seqs, int max_kv_len, int max_seq_len, int kv_dim,
         hipStream_t stream);
 
+    // Q8_1 kernel wrappers (block-based)
+    extern "C" void hip_ring_append_q8_1(
+        Q8_1Block *d_K_cache, Q8_1Block *d_V_cache,
+        const Q8_1Block *d_K_new, const Q8_1Block *d_V_new,
+        int head, int max_seq_len, int kv_blocks, int num_tokens,
+        hipStream_t stream);
+
+    extern "C" void hip_ring_linearize_q8_1(
+        Q8_1Block *d_out,
+        const Q8_1Block *d_cache,
+        int tail, int count, int max_seq_len, int kv_blocks,
+        hipStream_t stream);
+
+    extern "C" void hip_ring_gather_batched_q8_1(
+        Q8_1Block *d_K_out, Q8_1Block *d_V_out,
+        const Q8_1Block *const *d_K_caches, const Q8_1Block *const *d_V_caches,
+        const int *tails, const int *counts,
+        int num_seqs, int max_kv_len, int max_seq_len, int kv_blocks,
+        hipStream_t stream);
+
     // Dynamic head append wrappers (graph-capturable)
     extern "C" void hip_ring_append_dynamic_fp32(
         float *, float *, const float *, const float *,
@@ -100,6 +120,24 @@ namespace llaminar2
     extern "C" void hip_ring_append_dynamic_bf16(
         hip_bfloat16 *, hip_bfloat16 *, const hip_bfloat16 *, const hip_bfloat16 *,
         const int *, int, int, int, hipStream_t);
+    extern "C" void hip_ring_append_dynamic_q8_1(
+        Q8_1Block *, Q8_1Block *, const Q8_1Block *, const Q8_1Block *,
+        const int *, int, int, int, hipStream_t);
+
+    extern "C" bool hip_convert_tensor_to_fp16(
+        const void *d_src,
+        TensorType src_type,
+        uint16_t *d_dst,
+        int count,
+        hipStream_t stream);
+
+    extern "C" bool hip_convert_tensor_to_q8_1(
+        const void *d_src,
+        TensorType src_type,
+        Q8_1Block *d_dst,
+        int rows,
+        int cols,
+        hipStream_t stream);
 
     // =========================================================================
     // IROCmRingKVCache::append(ITensor*) implementation
@@ -115,15 +153,38 @@ namespace llaminar2
             return false;
         }
 
+        const auto target = DeviceId::rocm(device_id());
+
         // Get GPU data pointers from tensors via ITensor interface
         const void *d_k = K->gpu_data_ptr();
         const void *d_v = V->gpu_data_ptr();
 
+        if (!d_k)
+        {
+            auto *k_mut = const_cast<ITensor *>(K);
+            if (!k_mut->ensureOnDevice(target))
+            {
+                LOG_ERROR("[IROCmRingKVCache::append(ITensor)] Failed to ensure K on "
+                          << target.toString());
+                return false;
+            }
+            d_k = K->gpu_data_ptr();
+        }
+        if (!d_v)
+        {
+            auto *v_mut = const_cast<ITensor *>(V);
+            if (!v_mut->ensureOnDevice(target))
+            {
+                LOG_ERROR("[IROCmRingKVCache::append(ITensor)] Failed to ensure V on "
+                          << target.toString());
+                return false;
+            }
+            d_v = V->gpu_data_ptr();
+        }
+
         if (!d_k || !d_v)
         {
-            // Tensors don't have GPU data - caller should have called ensureOnDevice()
-            LOG_ERROR("[IROCmRingKVCache::append(ITensor)] K or V tensor lacks GPU data. "
-                      << "Call ensureOnDevice() before append.");
+            LOG_ERROR("[IROCmRingKVCache::append(ITensor)] K or V tensor lacks GPU data after ensureOnDevice().");
             return false;
         }
 
@@ -141,17 +202,139 @@ namespace llaminar2
             return false;
         }
 
+        const auto target = DeviceId::rocm(device_id());
+
         const void *d_k = K->gpu_data_ptr();
         const void *d_v = V->gpu_data_ptr();
 
+        if (!d_k)
+        {
+            auto *k_mut = const_cast<ITensor *>(K);
+            if (!k_mut->ensureOnDevice(target))
+            {
+                LOG_ERROR("[IROCmRingKVCache::appendWithStream] Failed to ensure K on "
+                          << target.toString());
+                return false;
+            }
+            d_k = K->gpu_data_ptr();
+        }
+        if (!d_v)
+        {
+            auto *v_mut = const_cast<ITensor *>(V);
+            if (!v_mut->ensureOnDevice(target))
+            {
+                LOG_ERROR("[IROCmRingKVCache::appendWithStream] Failed to ensure V on "
+                          << target.toString());
+                return false;
+            }
+            d_v = V->gpu_data_ptr();
+        }
+
         if (!d_k || !d_v)
         {
-            LOG_ERROR("[IROCmRingKVCache::appendWithStream] K or V tensor lacks GPU data.");
+            LOG_ERROR("[IROCmRingKVCache::appendWithStream] K or V tensor lacks GPU data after ensureOnDevice().");
             return false;
         }
 
+        const auto stream = static_cast<hipStream_t>(gpu_stream);
+
+        if (precision() == ActivationPrecision::FP16 &&
+            (K->native_type() != TensorType::FP16 || V->native_type() != TensorType::FP16))
+        {
+            const auto &k_shape = K->shape();
+            const auto &v_shape = V->shape();
+            if (k_shape.size() < 2 || v_shape.size() < 2)
+            {
+                LOG_ERROR("[IROCmRingKVCache::appendWithStream] Invalid K/V shape for FP16 conversion");
+                return false;
+            }
+
+            const int kv_dim = static_cast<int>(k_shape[1]);
+            const int elements = num_tokens * kv_dim;
+            if (elements <= 0)
+            {
+                return append(layer, seq_idx, d_k, d_v, num_tokens, stream);
+            }
+
+            uint16_t *d_k_fp16 = nullptr;
+            uint16_t *d_v_fp16 = nullptr;
+            if (hipMalloc(&d_k_fp16, static_cast<size_t>(elements) * sizeof(uint16_t)) != hipSuccess ||
+                hipMalloc(&d_v_fp16, static_cast<size_t>(elements) * sizeof(uint16_t)) != hipSuccess)
+            {
+                if (d_k_fp16)
+                    hipFree(d_k_fp16);
+                if (d_v_fp16)
+                    hipFree(d_v_fp16);
+                LOG_ERROR("[IROCmRingKVCache::appendWithStream] hipMalloc failed for FP16 conversion buffers");
+                return false;
+            }
+
+            const bool k_ok = hip_convert_tensor_to_fp16(d_k, K->native_type(), d_k_fp16, elements, stream);
+            const bool v_ok = hip_convert_tensor_to_fp16(d_v, V->native_type(), d_v_fp16, elements, stream);
+            if (!k_ok || !v_ok)
+            {
+                hipFree(d_k_fp16);
+                hipFree(d_v_fp16);
+                LOG_ERROR("[IROCmRingKVCache::appendWithStream] GPU FP16 conversion failed");
+                return false;
+            }
+
+            const bool ok = append(layer, seq_idx, d_k_fp16, d_v_fp16, num_tokens, stream);
+            hipFree(d_k_fp16);
+            hipFree(d_v_fp16);
+            return ok;
+        }
+
+        if (precision() == ActivationPrecision::Q8_1 &&
+            (K->native_type() != TensorType::Q8_1 || V->native_type() != TensorType::Q8_1))
+        {
+            const auto &k_shape = K->shape();
+            const auto &v_shape = V->shape();
+            if (k_shape.size() < 2 || v_shape.size() < 2)
+            {
+                LOG_ERROR("[IROCmRingKVCache::appendWithStream] Invalid K/V shape for Q8_1 conversion");
+                return false;
+            }
+
+            const int kv_dim = static_cast<int>(k_shape[1]);
+            const int blocks_per_row = (kv_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+            const size_t block_count = static_cast<size_t>(num_tokens) * static_cast<size_t>(blocks_per_row);
+            if (block_count == 0)
+            {
+                return append(layer, seq_idx, d_k, d_v, num_tokens, stream);
+            }
+
+            Q8_1Block *d_k_q8 = nullptr;
+            Q8_1Block *d_v_q8 = nullptr;
+            if (hipMalloc(&d_k_q8, block_count * sizeof(Q8_1Block)) != hipSuccess ||
+                hipMalloc(&d_v_q8, block_count * sizeof(Q8_1Block)) != hipSuccess)
+            {
+                if (d_k_q8)
+                    hipFree(d_k_q8);
+                if (d_v_q8)
+                    hipFree(d_v_q8);
+                LOG_ERROR("[IROCmRingKVCache::appendWithStream] hipMalloc failed for Q8_1 conversion buffers");
+                return false;
+            }
+
+            const bool k_ok = hip_convert_tensor_to_q8_1(d_k, K->native_type(), d_k_q8, num_tokens, kv_dim, stream);
+            const bool v_ok = hip_convert_tensor_to_q8_1(d_v, V->native_type(), d_v_q8, num_tokens, kv_dim, stream);
+            if (!k_ok || !v_ok)
+            {
+                hipFree(d_k_q8);
+                hipFree(d_v_q8);
+                LOG_ERROR("[IROCmRingKVCache::appendWithStream] GPU Q8_1 conversion failed");
+                return false;
+            }
+
+            const bool ok = append(layer, seq_idx, d_k_q8, d_v_q8, num_tokens, stream);
+            hipFree(d_k_q8);
+            hipFree(d_v_q8);
+            return ok;
+        }
+
         return append(layer, seq_idx, d_k, d_v, num_tokens,
-                      static_cast<hipStream_t>(gpu_stream));
+                      stream);
     }
 
     // =========================================================================
@@ -164,7 +347,11 @@ namespace llaminar2
         int n_kv_heads, int head_dim, int device_id)
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), local_n_kv_heads_(n_kv_heads), kv_head_start_(0),
-          head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim), device_id_(device_id),
+          head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim),
+          kv_storage_dim_((Precision == ActivationPrecision::Q8_1)
+                              ? ((n_kv_heads * head_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE)
+                              : (n_kv_heads * head_dim)),
+          device_id_(device_id),
           is_sharded_(false), device_ctx_(nullptr)
     {
         LOG_DEBUG("[ROCmRingKVCache] Creating cache: "
@@ -206,7 +393,11 @@ namespace llaminar2
         int n_kv_heads, int head_dim, IWorkerGPUContext *ctx)
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), local_n_kv_heads_(n_kv_heads), kv_head_start_(0),
-          head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim), device_id_(0),
+          head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim),
+          kv_storage_dim_((Precision == ActivationPrecision::Q8_1)
+                              ? ((n_kv_heads * head_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE)
+                              : (n_kv_heads * head_dim)),
+          device_id_(0),
           is_sharded_(false), device_ctx_(nullptr)
     {
         if (!ctx)
@@ -262,7 +453,11 @@ namespace llaminar2
         int head_dim, int device_id)
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads), kv_head_start_(kv_head_start),
-          head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim), device_id_(device_id),
+          head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim),
+          kv_storage_dim_((Precision == ActivationPrecision::Q8_1)
+                              ? ((local_n_kv_heads * head_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE)
+                              : (local_n_kv_heads * head_dim)),
+          device_id_(device_id),
           is_sharded_(local_n_kv_heads != n_kv_heads), device_ctx_(nullptr)
     {
         LOG_DEBUG("[ROCmRingKVCache] Creating sharded cache: "
@@ -307,7 +502,11 @@ namespace llaminar2
         int head_dim, IWorkerGPUContext *ctx)
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads), kv_head_start_(kv_head_start),
-          head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim), device_id_(0),
+          head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim),
+          kv_storage_dim_((Precision == ActivationPrecision::Q8_1)
+                              ? ((local_n_kv_heads * head_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE)
+                              : (local_n_kv_heads * head_dim)),
+          device_id_(0),
           is_sharded_(local_n_kv_heads != n_kv_heads), device_ctx_(nullptr)
     {
         if (!ctx)
@@ -383,7 +582,7 @@ namespace llaminar2
     template <ActivationPrecision Precision>
     void ROCmRingKVCache<Precision>::allocate_entry(EntryT &entry)
     {
-        size_t buffer_size = max_seq_len_ * kv_dim_ * sizeof(DataT);
+        size_t buffer_size = static_cast<size_t>(max_seq_len_) * static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
 
         // Main K/V buffers
         hipMalloc(&entry.d_K, buffer_size);
@@ -530,8 +729,8 @@ namespace llaminar2
         // Launch append kernel with adjusted pointers (skip earliest tokens)
         if (tokens_to_write > 0)
         {
-            const DataT *d_k_adjusted = d_k + tokens_to_skip * kv_dim_;
-            const DataT *d_v_adjusted = d_v + tokens_to_skip * kv_dim_;
+            const DataT *d_k_adjusted = d_k + static_cast<size_t>(tokens_to_skip) * kv_storage_dim_;
+            const DataT *d_v_adjusted = d_v + static_cast<size_t>(tokens_to_skip) * kv_storage_dim_;
 
             // Use dynamic head params when available and stream is provided.
             // This path is graph-capturable: the H2D copy and kernel launch are
@@ -570,19 +769,25 @@ namespace llaminar2
         {
             hip_ring_append_fp32(
                 entry.d_K, entry.d_V, d_k, d_v,
-                entry.head, max_seq_len_, kv_dim_, num_tokens, stream);
+                entry.head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
         }
         else if constexpr (Precision == ActivationPrecision::FP16)
         {
             hip_ring_append_fp16(
                 entry.d_K, entry.d_V, d_k, d_v,
-                entry.head, max_seq_len_, kv_dim_, num_tokens, stream);
+                entry.head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
         }
         else if constexpr (Precision == ActivationPrecision::BF16)
         {
             hip_ring_append_bf16(
                 entry.d_K, entry.d_V, d_k, d_v,
-                entry.head, max_seq_len_, kv_dim_, num_tokens, stream);
+                entry.head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::Q8_1)
+        {
+            hip_ring_append_q8_1(
+                entry.d_K, entry.d_V, d_k, d_v,
+                entry.head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
         }
     }
 
@@ -693,19 +898,25 @@ namespace llaminar2
         {
             hip_ring_append_dynamic_fp32(
                 entry.d_K, entry.d_V, d_k, d_v,
-                d_head, max_seq_len_, kv_dim_, num_tokens, stream);
+                d_head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
         }
         else if constexpr (Precision == ActivationPrecision::FP16)
         {
             hip_ring_append_dynamic_fp16(
                 entry.d_K, entry.d_V, d_k, d_v,
-                d_head, max_seq_len_, kv_dim_, num_tokens, stream);
+                d_head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
         }
         else if constexpr (Precision == ActivationPrecision::BF16)
         {
             hip_ring_append_dynamic_bf16(
                 entry.d_K, entry.d_V, d_k, d_v,
-                d_head, max_seq_len_, kv_dim_, num_tokens, stream);
+                d_head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::Q8_1)
+        {
+            hip_ring_append_dynamic_q8_1(
+                entry.d_K, entry.d_V, d_k, d_v,
+                d_head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
         }
     }
 
@@ -749,8 +960,8 @@ namespace llaminar2
         if (!entry.is_wrapped(max_seq_len_))
         {
             int tail = entry.tail(max_seq_len_);
-            *d_k_out = entry.d_K + tail * kv_dim_;
-            *d_v_out = entry.d_V + tail * kv_dim_;
+            *d_k_out = entry.d_K + static_cast<size_t>(tail) * kv_storage_dim_;
+            *d_v_out = entry.d_V + static_cast<size_t>(tail) * kv_storage_dim_;
             return true;
         }
 
@@ -785,29 +996,38 @@ namespace llaminar2
             // Linearize K
             hip_ring_linearize_fp32(
                 d_k_out, entry.d_K,
-                tail, entry.count, max_seq_len_, kv_dim_, stream);
+                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
             // Linearize V
             hip_ring_linearize_fp32(
                 d_v_out, entry.d_V,
-                tail, entry.count, max_seq_len_, kv_dim_, stream);
+                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
         }
         else if constexpr (Precision == ActivationPrecision::FP16)
         {
             hip_ring_linearize_fp16(
                 d_k_out, entry.d_K,
-                tail, entry.count, max_seq_len_, kv_dim_, stream);
+                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
             hip_ring_linearize_fp16(
                 d_v_out, entry.d_V,
-                tail, entry.count, max_seq_len_, kv_dim_, stream);
+                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
         }
         else if constexpr (Precision == ActivationPrecision::BF16)
         {
             hip_ring_linearize_bf16(
                 d_k_out, entry.d_K,
-                tail, entry.count, max_seq_len_, kv_dim_, stream);
+                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
             hip_ring_linearize_bf16(
                 d_v_out, entry.d_V,
-                tail, entry.count, max_seq_len_, kv_dim_, stream);
+                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::Q8_1)
+        {
+            hip_ring_linearize_q8_1(
+                d_k_out, entry.d_K,
+                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
+            hip_ring_linearize_q8_1(
+                d_v_out, entry.d_V,
+                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
         }
     }
 
@@ -977,7 +1197,7 @@ namespace llaminar2
                 const_cast<const float *const *>(d_k_caches),
                 const_cast<const float *const *>(d_v_caches),
                 d_tails, d_counts,
-                num_seqs, max_kv_len, max_seq_len_, kv_dim_, stream);
+                num_seqs, max_kv_len, max_seq_len_, kv_storage_dim_, stream);
         }
         else if constexpr (Precision == ActivationPrecision::FP16)
         {
@@ -986,7 +1206,7 @@ namespace llaminar2
                 const_cast<const _Float16 *const *>(d_k_caches),
                 const_cast<const _Float16 *const *>(d_v_caches),
                 d_tails, d_counts,
-                num_seqs, max_kv_len, max_seq_len_, kv_dim_, stream);
+                num_seqs, max_kv_len, max_seq_len_, kv_storage_dim_, stream);
         }
         else if constexpr (Precision == ActivationPrecision::BF16)
         {
@@ -995,7 +1215,16 @@ namespace llaminar2
                 const_cast<const hip_bfloat16 *const *>(d_k_caches),
                 const_cast<const hip_bfloat16 *const *>(d_v_caches),
                 d_tails, d_counts,
-                num_seqs, max_kv_len, max_seq_len_, kv_dim_, stream);
+                num_seqs, max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::Q8_1)
+        {
+            hip_ring_gather_batched_q8_1(
+                d_k_out, d_v_out,
+                const_cast<const Q8_1Block *const *>(d_k_caches),
+                const_cast<const Q8_1Block *const *>(d_v_caches),
+                d_tails, d_counts,
+                num_seqs, max_kv_len, max_seq_len_, kv_storage_dim_, stream);
         }
 
         // Removed hipStreamSynchronize() - caller manages coherence via events
@@ -1078,6 +1307,8 @@ namespace llaminar2
                 return TensorType::FP16;
             else if constexpr (Precision == ActivationPrecision::BF16)
                 return TensorType::BF16;
+            else if constexpr (Precision == ActivationPrecision::Q8_1)
+                return TensorType::Q8_1;
             else
                 return TensorType::FP32;
         }();
@@ -1147,6 +1378,8 @@ namespace llaminar2
                 return TensorType::FP16;
             else if constexpr (Precision == ActivationPrecision::BF16)
                 return TensorType::BF16;
+            else if constexpr (Precision == ActivationPrecision::Q8_1)
+                return TensorType::Q8_1;
             else
                 return TensorType::FP32;
         }();
@@ -1256,6 +1489,7 @@ namespace llaminar2
     template class ROCmRingKVCache<ActivationPrecision::FP32>;
     template class ROCmRingKVCache<ActivationPrecision::FP16>;
     template class ROCmRingKVCache<ActivationPrecision::BF16>;
+    template class ROCmRingKVCache<ActivationPrecision::Q8_1>;
 
     // =========================================================================
     // Factory Function
@@ -1278,6 +1512,10 @@ namespace llaminar2
 
         case ActivationPrecision::BF16:
             return std::make_unique<ROCmRingKVCacheBF16>(
+                n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_id);
+
+        case ActivationPrecision::Q8_1:
+            return std::make_unique<ROCmRingKVCacheQ8_1>(
                 n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_id);
 
         default:
@@ -1313,6 +1551,12 @@ namespace llaminar2
 
         case ActivationPrecision::BF16:
             return std::make_unique<ROCmRingKVCacheBF16>(
+                n_layers, batch_size, max_seq_len,
+                n_kv_heads, local_n_kv_heads, kv_head_start,
+                head_dim, device_id);
+
+        case ActivationPrecision::Q8_1:
+            return std::make_unique<ROCmRingKVCacheQ8_1>(
                 n_layers, batch_size, max_seq_len,
                 n_kv_heads, local_n_kv_heads, kv_head_start,
                 head_dim, device_id);

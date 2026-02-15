@@ -56,6 +56,34 @@ namespace llaminar2::quantization
         const int k_blocks = (k + 31) / 32;
         Q8_1Block *all_blocks = reinterpret_cast<Q8_1Block *>(q8_1_buffer);
         const bool k_aligned = (k % 32 == 0);
+        const int total_blocks = m * k_blocks;
+
+        if (total_blocks < 128)
+        {
+            for (int i = 0; i < m; ++i)
+            {
+                const float *a_row = A + i * k;
+                Q8_1Block *row_blocks = all_blocks + i * k_blocks;
+
+                if (k_aligned)
+                {
+                    for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
+                    {
+                        simd::quantize_single_block(a_row + k_blk * 32, row_blocks[k_blk], 32);
+                    }
+                }
+                else
+                {
+                    for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
+                    {
+                        const int valid_elements = std::min(32, k - k_blk * 32);
+                        simd::quantize_single_block(a_row + k_blk * 32, row_blocks[k_blk], valid_elements);
+                    }
+                }
+            }
+
+            return true;
+        }
 
         // Use OMP_WORKSHARE_REGION for nested parallelism compatibility
         auto do_quantize = [&]()

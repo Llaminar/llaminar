@@ -12,8 +12,55 @@
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../kernels/cpu/attention/q16_1/VNNISafetyConstants.h"
+#include "../../../utils/KVCacheProfiler.h"
+#include "../../../tensors/GpuTensorView.h"
 
 #include <immintrin.h>
+#include <cstring>
+#include <chrono>
+
+namespace
+{
+    static size_t estimateTensorAppendBytes(const llaminar2::ITensor *tensor, int num_tokens)
+    {
+        if (!tensor || num_tokens <= 0)
+        {
+            return 0;
+        }
+
+        const auto &shape = tensor->shape();
+        if (shape.empty())
+        {
+            return 0;
+        }
+
+        const size_t rows = shape[0];
+        if (rows == 0)
+        {
+            return 0;
+        }
+
+        const size_t bytes_per_row = tensor->size_bytes() / rows;
+        return static_cast<size_t>(num_tokens) * bytes_per_row;
+    }
+
+    static size_t elementSizeForTensorType(llaminar2::TensorType t)
+    {
+        using llaminar2::TensorType;
+        switch (t)
+        {
+        case TensorType::FP32:
+            return sizeof(float);
+        case TensorType::FP16:
+        case TensorType::BF16:
+            return sizeof(uint16_t);
+        case TensorType::Q8_1:
+            return sizeof(llaminar2::Q8_1Block);
+        default:
+            return 0;
+        }
+    }
+}
 
 namespace llaminar2
 {
@@ -23,8 +70,7 @@ namespace llaminar2
     // =============================================================================
 
     KVCacheAppendStage::KVCacheAppendStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
     }
 
@@ -51,6 +97,50 @@ namespace llaminar2
             total_tokens = static_cast<int>(params_.K->shape()[0]);
         }
 
+        auto append_to_cache = [&](int seq_idx,
+                                   const ITensor *k_tensor,
+                                   const ITensor *v_tensor,
+                                   int num_tokens) -> bool
+        {
+            if (!k_tensor || !v_tensor)
+            {
+                LOG_ERROR("[KVCacheAppendStage] append_to_cache received null tensor");
+                return false;
+            }
+
+            const auto start = std::chrono::high_resolution_clock::now();
+
+            bool success = false;
+            void *stream = gpuStream();
+            if (stream || params_.device_id.is_gpu())
+            {
+                success = params_.kv_cache->appendWithStream(
+                    params_.layer_idx, seq_idx,
+                    k_tensor, v_tensor, num_tokens, stream);
+            }
+            else
+            {
+                success = params_.kv_cache->append(
+                    params_.layer_idx, seq_idx,
+                    k_tensor, v_tensor, num_tokens);
+            }
+
+            const auto end = std::chrono::high_resolution_clock::now();
+            const uint64_t duration_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+
+            if (success)
+            {
+                const uint64_t bytes = static_cast<uint64_t>(
+                    estimateTensorAppendBytes(k_tensor, num_tokens) +
+                    estimateTensorAppendBytes(v_tensor, num_tokens));
+                const uint64_t tokens = static_cast<uint64_t>(num_tokens);
+                KVCacheProfiler::record(KVCacheOpType::APPEND, duration_ns, tokens, bytes);
+            }
+
+            return success;
+        };
+
         // Determine batch handling mode
         const int batch_size = params_.batch_size;
         const int seq_len = params_.seq_len;
@@ -60,6 +150,72 @@ namespace llaminar2
         if (batch_size > 1 && seq_len > 0)
         {
             const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
+
+            if (params_.device_id.is_gpu())
+            {
+                const auto target = params_.device_id;
+                const auto k_type = params_.K->native_type();
+                const auto v_type = params_.V->native_type();
+
+                const size_t k_elem_bytes = elementSizeForTensorType(k_type);
+                const size_t v_elem_bytes = elementSizeForTensorType(v_type);
+                if (k_elem_bytes == 0 || v_elem_bytes == 0)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Unsupported tensor type for GPU batched append: K="
+                              << params_.K->dtype_name() << " V=" << params_.V->dtype_name());
+                    return false;
+                }
+
+                const size_t k_cols = (k_type == TensorType::Q8_1)
+                                          ? ((kv_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE)
+                                          : kv_dim;
+                const size_t v_cols = (v_type == TensorType::Q8_1)
+                                          ? ((kv_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE)
+                                          : kv_dim;
+
+                const size_t k_seq_bytes = static_cast<size_t>(seq_len) * k_cols * k_elem_bytes;
+                const size_t v_seq_bytes = static_cast<size_t>(seq_len) * v_cols * v_elem_bytes;
+
+                auto *k_mut = const_cast<ITensor *>(params_.K);
+                auto *v_mut = const_cast<ITensor *>(params_.V);
+                if (!params_.K->gpu_data_ptr() && !k_mut->ensureOnDevice(target))
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Failed to ensure K on GPU for batched append");
+                    return false;
+                }
+                if (!params_.V->gpu_data_ptr() && !v_mut->ensureOnDevice(target))
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Failed to ensure V on GPU for batched append");
+                    return false;
+                }
+
+                const auto *k_base_ptr = static_cast<const uint8_t *>(params_.K->gpu_data_ptr());
+                const auto *v_base_ptr = static_cast<const uint8_t *>(params_.V->gpu_data_ptr());
+                if (!k_base_ptr || !v_base_ptr)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Missing GPU pointers for batched append");
+                    return false;
+                }
+
+                const int gpu_ordinal = target.gpu_ordinal();
+                for (int b = 0; b < batch_size; ++b)
+                {
+                    const int seq_idx = params_.seq_idx + b;
+                    void *k_seq_ptr = const_cast<uint8_t *>(k_base_ptr + static_cast<size_t>(b) * k_seq_bytes);
+                    void *v_seq_ptr = const_cast<uint8_t *>(v_base_ptr + static_cast<size_t>(b) * v_seq_bytes);
+
+                    GpuTensorView k_view(k_seq_ptr, static_cast<size_t>(seq_len), k_cols, k_type, gpu_ordinal);
+                    GpuTensorView v_view(v_seq_ptr, static_cast<size_t>(seq_len), v_cols, v_type, gpu_ordinal);
+
+                    if (!append_to_cache(seq_idx, &k_view, &v_view, seq_len))
+                    {
+                        LOG_ERROR("[KVCacheAppendStage] append failed for GPU batch index " << b);
+                        return false;
+                    }
+                }
+
+                return true;
+            }
 
             LOG_DEBUG("[KVCacheAppendStage] Batched append: batch_size=" << batch_size
                                                                          << " seq_len=" << seq_len
@@ -95,9 +251,81 @@ namespace llaminar2
                 LOG_TRACE("[KVCacheAppendStage] Appending " << seq_len << " tokens to layer "
                                                             << params_.layer_idx << " seq_idx=" << seq_idx);
 
-                bool success = params_.kv_cache->append(
-                    params_.layer_idx, seq_idx,
-                    k_slice.get(), v_slice.get(), seq_len);
+                bool success = false;
+                const ActivationPrecision cache_precision = params_.kv_cache->precision();
+                if (cache_precision == ActivationPrecision::FP16)
+                {
+                    const auto conv_start = std::chrono::high_resolution_clock::now();
+
+                    auto k_fp16 = std::make_unique<FP16Tensor>(
+                        std::vector<size_t>{static_cast<size_t>(seq_len), kv_dim});
+                    auto v_fp16 = std::make_unique<FP16Tensor>(
+                        std::vector<size_t>{static_cast<size_t>(seq_len), kv_dim});
+
+                    k_fp16->from_fp32(k_slice->data(), static_cast<size_t>(seq_len) * kv_dim);
+                    v_fp16->from_fp32(v_slice->data(), static_cast<size_t>(seq_len) * kv_dim);
+
+                    if (params_.device_id.is_gpu())
+                    {
+                        if (!k_fp16->ensureOnDevice(params_.device_id) ||
+                            !v_fp16->ensureOnDevice(params_.device_id))
+                        {
+                            LOG_ERROR("[KVCacheAppendStage] Failed to upload FP16 converted K/V slices to GPU");
+                            return false;
+                        }
+                    }
+
+                    const auto conv_end = std::chrono::high_resolution_clock::now();
+                    const uint64_t conv_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
+                    const uint64_t conv_bytes = static_cast<uint64_t>(
+                        estimateTensorAppendBytes(k_fp16.get(), seq_len) +
+                        estimateTensorAppendBytes(v_fp16.get(), seq_len));
+                    KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_FP16, conv_ns, static_cast<uint64_t>(seq_len), conv_bytes);
+
+                    success = append_to_cache(seq_idx, k_fp16.get(), v_fp16.get(), seq_len);
+                }
+                else if (cache_precision == ActivationPrecision::Q8_1)
+                {
+                    const auto conv_start = std::chrono::high_resolution_clock::now();
+
+                    auto k_q8 = Q8_1Tensor::quantize_from_fp32(
+                        k_slice->data(),
+                        {static_cast<size_t>(seq_len), kv_dim});
+                    auto v_q8 = Q8_1Tensor::quantize_from_fp32(
+                        v_slice->data(),
+                        {static_cast<size_t>(seq_len), kv_dim});
+
+                    if (!k_q8 || !v_q8)
+                    {
+                        LOG_ERROR("[KVCacheAppendStage] Failed to quantize batched K/V slices to Q8_1");
+                        return false;
+                    }
+
+                    if (params_.device_id.is_gpu())
+                    {
+                        if (!k_q8->ensureOnDevice(params_.device_id) ||
+                            !v_q8->ensureOnDevice(params_.device_id))
+                        {
+                            LOG_ERROR("[KVCacheAppendStage] Failed to upload Q8_1 converted K/V slices to GPU");
+                            return false;
+                        }
+                    }
+
+                    const auto conv_end = std::chrono::high_resolution_clock::now();
+                    const uint64_t conv_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
+                    const uint64_t conv_bytes = static_cast<uint64_t>(
+                        estimateTensorAppendBytes(k_q8.get(), seq_len) +
+                        estimateTensorAppendBytes(v_q8.get(), seq_len));
+                    KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_Q8_1, conv_ns, static_cast<uint64_t>(seq_len), conv_bytes);
+
+                    success = append_to_cache(seq_idx, k_q8.get(), v_q8.get(), seq_len);
+                }
+                else
+                {
+                    success = append_to_cache(seq_idx, k_slice.get(), v_slice.get(), seq_len);
+                }
 
                 if (!success)
                 {
@@ -116,12 +344,17 @@ namespace llaminar2
         // Check if tensors match cache precision - if not, need to convert
         // This handles Hybrid mode where K_rope is FP32 and V is Q8_1 but cache is FP32
         bool cache_is_fp32 = (params_.kv_cache->precision() == ActivationPrecision::FP32);
+        bool cache_is_fp16 = (params_.kv_cache->precision() == ActivationPrecision::FP16);
+        bool cache_is_q8_1 = (params_.kv_cache->precision() == ActivationPrecision::Q8_1);
         bool k_is_fp32 = (params_.K->native_type() == TensorType::FP32);
         bool v_is_fp32 = (params_.V->native_type() == TensorType::FP32);
+        const bool has_gpu_inputs = (params_.K->gpu_data_ptr() != nullptr && params_.V->gpu_data_ptr() != nullptr);
 
         // If cache is FP32 but inputs are not, convert to FP32 for cache append
         if (cache_is_fp32 && (!k_is_fp32 || !v_is_fp32))
         {
+            const auto conv_start = std::chrono::high_resolution_clock::now();
+
             LOG_DEBUG("[KVCacheAppendStage] Converting K/V to FP32 for cache append"
                       << " (K=" << params_.K->dtype_name()
                       << ", V=" << params_.V->dtype_name()
@@ -239,13 +472,163 @@ namespace llaminar2
                 }
             }
 
-            bool success = params_.kv_cache->append(
-                params_.layer_idx, params_.seq_idx,
+            const auto conv_end = std::chrono::high_resolution_clock::now();
+            const uint64_t conv_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
+            const uint64_t conv_bytes = static_cast<uint64_t>(
+                estimateTensorAppendBytes(k_slice.get(), total_tokens) +
+                estimateTensorAppendBytes(v_slice.get(), total_tokens));
+            KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_FP32, conv_ns, static_cast<uint64_t>(total_tokens), conv_bytes);
+
+            bool success = append_to_cache(
+                params_.seq_idx,
                 k_slice.get(), v_slice.get(), total_tokens);
 
             if (!success)
             {
                 LOG_ERROR("[KVCacheAppendStage] append failed (after conversion)");
+                return false;
+            }
+
+            return true;
+        }
+
+        // If cache is FP16 but inputs are not, convert K/V to FP16 for cache append
+        if (!has_gpu_inputs && cache_is_fp16 && (params_.K->native_type() != TensorType::FP16 || params_.V->native_type() != TensorType::FP16))
+        {
+            const auto conv_start = std::chrono::high_resolution_clock::now();
+
+            const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
+
+            const std::vector<size_t> fp16_shape{static_cast<size_t>(total_tokens), kv_dim};
+            if (!fp16_k_scratch_ || fp16_k_scratch_->shape() != fp16_shape)
+            {
+                fp16_k_scratch_ = std::make_unique<FP16Tensor>(fp16_shape);
+            }
+            if (!fp16_v_scratch_ || fp16_v_scratch_->shape() != fp16_shape)
+            {
+                fp16_v_scratch_ = std::make_unique<FP16Tensor>(fp16_shape);
+            }
+
+            const float *k_fp32 = params_.K->fp32_data();
+            const float *v_fp32 = params_.V->fp32_data();
+            if (!k_fp32 || !v_fp32)
+            {
+                LOG_ERROR("[KVCacheAppendStage] Cannot get FP32 data for FP16 cache conversion");
+                return false;
+            }
+
+            fp16_k_scratch_->from_fp32(k_fp32, static_cast<size_t>(total_tokens) * kv_dim);
+            fp16_v_scratch_->from_fp32(v_fp32, static_cast<size_t>(total_tokens) * kv_dim);
+
+            if (params_.device_id.is_gpu())
+            {
+                if (!fp16_k_scratch_->ensureOnDevice(params_.device_id) ||
+                    !fp16_v_scratch_->ensureOnDevice(params_.device_id))
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Failed to upload FP16 converted K/V tensors to GPU");
+                    return false;
+                }
+            }
+
+            const auto conv_end = std::chrono::high_resolution_clock::now();
+            const uint64_t conv_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
+            const uint64_t conv_bytes = static_cast<uint64_t>(
+                estimateTensorAppendBytes(fp16_k_scratch_.get(), total_tokens) +
+                estimateTensorAppendBytes(fp16_v_scratch_.get(), total_tokens));
+            KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_FP16, conv_ns, static_cast<uint64_t>(total_tokens), conv_bytes);
+
+            bool success = append_to_cache(params_.seq_idx, fp16_k_scratch_.get(), fp16_v_scratch_.get(), total_tokens);
+            if (!success)
+            {
+                LOG_ERROR("[KVCacheAppendStage] append failed (FP16 cache conversion path)");
+                return false;
+            }
+
+            return true;
+        }
+
+        // If cache is Q8_1 but inputs are not, convert K/V to Q8_1 for cache append
+        if (!has_gpu_inputs && cache_is_q8_1 && (params_.K->native_type() != TensorType::Q8_1 || params_.V->native_type() != TensorType::Q8_1))
+        {
+            const auto conv_start = std::chrono::high_resolution_clock::now();
+
+            const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
+
+            const std::vector<size_t> q8_shape{static_cast<size_t>(total_tokens), kv_dim};
+            if (!q8_k_scratch_ || q8_k_scratch_->shape() != q8_shape)
+            {
+                q8_k_scratch_ = std::make_unique<Q8_1Tensor>(q8_shape);
+            }
+            if (!q8_v_scratch_ || q8_v_scratch_->shape() != q8_shape)
+            {
+                q8_v_scratch_ = std::make_unique<Q8_1Tensor>(q8_shape);
+            }
+
+            const float *k_fp32 = params_.K->fp32_data();
+            const float *v_fp32 = params_.V->fp32_data();
+            if (!k_fp32 || !v_fp32)
+            {
+                LOG_ERROR("[KVCacheAppendStage] Cannot get FP32 data for Q8_1 cache conversion");
+                return false;
+            }
+
+            const size_t total_elements = static_cast<size_t>(total_tokens) * kv_dim;
+            const size_t total_blocks = (total_elements + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+
+            // Decode path hot loop: tiny workloads benefit from direct quantization
+            // over both K and V in one loop to reduce helper/dispatch overhead.
+            if (total_blocks <= 32)
+            {
+                Q8_1Block *k_blocks = q8_k_scratch_->mutable_typed_data();
+                Q8_1Block *v_blocks = q8_v_scratch_->mutable_typed_data();
+                if (!k_blocks || !v_blocks)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Failed to access mutable Q8_1 scratch blocks");
+                    return false;
+                }
+
+                for (size_t block_idx = 0; block_idx < total_blocks; ++block_idx)
+                {
+                    const size_t offset = block_idx * Q8_1Block::BLOCK_SIZE;
+                    const int count = static_cast<int>(std::min<size_t>(Q8_1Block::BLOCK_SIZE, total_elements - offset));
+                    simd::quantize_single_block(k_fp32 + offset, k_blocks[block_idx], count);
+                    simd::quantize_single_block(v_fp32 + offset, v_blocks[block_idx], count);
+                }
+            }
+            else
+            {
+                if (!q8_k_scratch_->copyFrom_fp32_rows(k_fp32, static_cast<size_t>(total_tokens)) ||
+                    !q8_v_scratch_->copyFrom_fp32_rows(v_fp32, static_cast<size_t>(total_tokens)))
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Failed to quantize K/V for Q8_1 cache append (in-place)");
+                    return false;
+                }
+            }
+
+            if (params_.device_id.is_gpu())
+            {
+                if (!q8_k_scratch_->ensureOnDevice(params_.device_id) ||
+                    !q8_v_scratch_->ensureOnDevice(params_.device_id))
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Failed to upload Q8_1 converted K/V tensors to GPU");
+                    return false;
+                }
+            }
+
+            const auto conv_end = std::chrono::high_resolution_clock::now();
+            const uint64_t conv_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
+            const uint64_t conv_bytes = static_cast<uint64_t>(
+                estimateTensorAppendBytes(q8_k_scratch_.get(), total_tokens) +
+                estimateTensorAppendBytes(q8_v_scratch_.get(), total_tokens));
+            KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_Q8_1, conv_ns, static_cast<uint64_t>(total_tokens), conv_bytes);
+
+            bool success = append_to_cache(params_.seq_idx, q8_k_scratch_.get(), q8_v_scratch_.get(), total_tokens);
+            if (!success)
+            {
+                LOG_ERROR("[KVCacheAppendStage] append failed (Q8_1 cache conversion path)");
                 return false;
             }
 
@@ -266,6 +649,8 @@ namespace llaminar2
 
         if (cache_is_q16_1)
         {
+            const auto conv_start = std::chrono::high_resolution_clock::now();
+
             const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
             const float kv_cache_scale = params_.kv_cache_scale;
             const int head_dim = params_.head_dim;
@@ -480,8 +865,16 @@ namespace llaminar2
                 }
             }
 
-            bool success = params_.kv_cache->append(
-                params_.layer_idx, params_.seq_idx,
+            const auto conv_end = std::chrono::high_resolution_clock::now();
+            const uint64_t conv_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
+            const uint64_t conv_bytes = static_cast<uint64_t>(
+                estimateTensorAppendBytes(k_for_cache, total_tokens) +
+                estimateTensorAppendBytes(v_for_cache, total_tokens));
+            KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_Q16_1, conv_ns, static_cast<uint64_t>(total_tokens), conv_bytes);
+
+            bool success = append_to_cache(
+                params_.seq_idx,
                 k_for_cache, v_for_cache, total_tokens);
 
             if (!success)
@@ -495,29 +888,9 @@ namespace llaminar2
 
         // Direct append path - tensors already match cache precision
         // Cast ITensor* to TensorBase* for append_kv
-        auto *K_base = dynamic_cast<const TensorBase *>(params_.K);
-        auto *V_base = dynamic_cast<const TensorBase *>(params_.V);
-        if (!K_base || !V_base)
-        {
-            LOG_ERROR("[KVCacheAppendStage] K/V tensors must be TensorBase");
-            return false;
-        }
-
-        // Use stream-aware append when a GPU stream is set (for graph capture compatibility)
-        bool success;
-        void *stream = gpuStream();
-        if (stream || params_.device_id.is_gpu())
-        {
-            success = params_.kv_cache->appendWithStream(
-                params_.layer_idx, params_.seq_idx,
-                K_base, V_base, total_tokens, stream);
-        }
-        else
-        {
-            success = params_.kv_cache->append(
-                params_.layer_idx, params_.seq_idx,
-                K_base, V_base, total_tokens);
-        }
+        bool success = append_to_cache(
+            params_.seq_idx,
+            params_.K, params_.V, total_tokens);
 
         if (!success)
         {

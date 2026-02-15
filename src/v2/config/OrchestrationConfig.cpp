@@ -561,6 +561,29 @@ namespace llaminar2
             errors.push_back("CPU layers must be >= 0, got " + std::to_string(cpu_layers));
         }
 
+        // Validate precision strings
+        {
+            const std::string act = toLower(activation_precision);
+            static const std::unordered_set<std::string> valid_activation = {
+                "fp32", "bf16", "fp16", "q8_1", "q16_1", "hybrid", "hybridq16"};
+            if (!valid_activation.count(act))
+            {
+                errors.push_back("Invalid activation_precision: '" + activation_precision +
+                                 "' (valid: fp32, bf16, fp16, q8_1, q16_1, hybrid, hybridq16)");
+            }
+        }
+
+        {
+            const std::string kv = toLower(kv_cache_precision);
+            static const std::unordered_set<std::string> valid_kv = {
+                "auto", "fp16", "q8_1", "q8", "q81"};
+            if (!valid_kv.count(kv))
+            {
+                errors.push_back("Invalid kv_cache_precision: '" + kv_cache_precision +
+                                 "' (valid: auto, fp16, q8_1)");
+            }
+        }
+
         return errors;
     }
 

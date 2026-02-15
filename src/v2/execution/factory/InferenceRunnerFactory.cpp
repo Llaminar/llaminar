@@ -225,8 +225,11 @@ namespace llaminar2
         // Propagate kv_cache_scale for Q16_1 KV cache quantization
         // This fixed scale determines the FP32 range that maps to INT16 [-32767, +32767]
         graph_config.kv_cache_scale = config.kv_cache_scale;
+        graph_config.kv_cache_precision = config.kv_cache_precision;
         LOG_DEBUG("[InferenceRunner] KV cache scale: " << config.kv_cache_scale
                                                        << " (±" << config.kv_cache_scale << " FP32 range)");
+        LOG_DEBUG("[InferenceRunner] KV cache precision mode: "
+                  << kvCachePrecisionToString(config.kv_cache_precision));
 
         // Try to get d_ff from metadata (intermediate_size)
         if (model.hasMetadata("llama.feed_forward_length"))
@@ -569,7 +572,10 @@ namespace llaminar2
         // - RCCL for ROCm devices
         // - MPI fallback for CPU-only or heterogeneous setups
         // =====================================================================
-        if (mpi_ctx && mpi_ctx->world_size() > 1)
+        const bool local_tp_collectives_enabled =
+            (config.local_tp_ctx != nullptr && config.local_tp_ctx->degree() > 1);
+
+        if (local_tp_collectives_enabled)
         {
             // Build local cluster inventory (detects CUDA/ROCm GPUs)
             ClusterInventory cluster_inventory = buildLocalClusterInventory(mpi_ctx);
@@ -597,6 +603,12 @@ namespace llaminar2
             {
                 LOG_DEBUG("[InferenceRunner] No GPUs detected - using CPU MPI for collectives");
             }
+        }
+        else if (mpi_ctx && mpi_ctx->world_size() > 1)
+        {
+            // GLOBAL TP path: use MPI-based collectives from compute stages.
+            // Do not initialize LOCAL GPU-native collective context here.
+            LOG_DEBUG("[InferenceRunner] GLOBAL TP mode: GPU-native LOCAL collectives disabled");
         }
 
         LOG_DEBUG("[InferenceRunner] DeviceGraphOrchestrator created successfully");
@@ -1377,6 +1389,7 @@ namespace llaminar2
 
         // Propagate kv_cache_scale
         graph_config.kv_cache_scale = config.kv_cache_scale;
+        graph_config.kv_cache_precision = config.kv_cache_precision;
 
         // PP layer offset for KV cache indexing:
         // When building graphs for PP stage [first_layer, last_layer), this offset
@@ -1569,6 +1582,7 @@ namespace llaminar2
         graph_config.activation_precision = config.activation_precision;
         graph_config.fused_attention_backend = config.fused_attention_backend;
         graph_config.kv_cache_scale = config.kv_cache_scale;
+        graph_config.kv_cache_precision = config.kv_cache_precision;
 
         // Get d_ff from model context if available, otherwise estimate as ~4x d_model
         int d_ff = model_ctx->feedForwardLength();

@@ -877,6 +877,7 @@ namespace llaminar2
         size_t n_kv_heads,
         const std::string &quant_type,
         size_t estimated_memory,
+        const std::string &kv_cache_precision,
         const std::string &strategy_name) const
     {
         PlacementInput input;
@@ -888,6 +889,7 @@ namespace llaminar2
         input.n_heads = n_heads;
         input.n_kv_heads = n_kv_heads;
         input.quant_type = quant_type;
+        input.kv_cache_precision = kv_cache_precision;
         input.estimated_memory_bytes = estimated_memory;
         input.preferred_strategy = strategy_name;
 

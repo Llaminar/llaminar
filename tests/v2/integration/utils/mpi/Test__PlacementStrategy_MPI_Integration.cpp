@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 #include <mpi.h>
+#include <algorithm>
 #include <vector>
 #include <functional>
 
@@ -98,6 +99,16 @@ protected:
         }
 
         return hash;
+    }
+
+    static int countGPULayers(const PlacementPlan &plan)
+    {
+        return static_cast<int>(std::count_if(
+            plan.layers.begin(), plan.layers.end(),
+            [](const LayerPlacement &layer)
+            {
+                return layer.device.isGPU();
+            }));
     }
 };
 
@@ -418,6 +429,60 @@ TEST_F(Test__PlacementStrategy_MPI_Integration, DifferentQuantTypesProduceSamePl
             << "Layer " << i << " has different device for different quant types";
         EXPECT_EQ(plan_q4_0.layers[i].owner_rank, plan_q8_0.layers[i].owner_rank)
             << "Layer " << i << " has different owner_rank for different quant types";
+    }
+}
+
+TEST_F(Test__PlacementStrategy_MPI_Integration, KVPrecisionMonotonicLayerFitViaTopologyConvenience)
+{
+    if (!topology_->has_accelerator())
+    {
+        GTEST_SKIP() << "No accelerator detected; KV precision does not affect CPU-only placement.";
+    }
+
+    constexpr int n_layers = 4096;
+    constexpr size_t estimated_memory = 0;
+
+    PlacementPlan plan_auto = topology_->computePlacement(
+        "kv_precision_probe", n_layers, 1024, 4096, 32000, 16, 16, "Q4_0",
+        estimated_memory, "auto", "GPUFirst");
+
+    PlacementPlan plan_fp16 = topology_->computePlacement(
+        "kv_precision_probe", n_layers, 1024, 4096, 32000, 16, 16, "Q4_0",
+        estimated_memory, "fp16", "GPUFirst");
+
+    PlacementPlan plan_q8_1 = topology_->computePlacement(
+        "kv_precision_probe", n_layers, 1024, 4096, 32000, 16, 16, "Q4_0",
+        estimated_memory, "q8_1", "GPUFirst");
+
+    const int gpu_layers_auto = countGPULayers(plan_auto);
+    const int gpu_layers_fp16 = countGPULayers(plan_fp16);
+    const int gpu_layers_q8_1 = countGPULayers(plan_q8_1);
+
+    EXPECT_GE(gpu_layers_fp16, gpu_layers_auto)
+        << "FP16 KV cache should fit at least as many GPU layers as AUTO";
+    EXPECT_GE(gpu_layers_q8_1, gpu_layers_fp16)
+        << "Q8_1 KV cache should fit at least as many GPU layers as FP16";
+
+    struct LayerFitCounts
+    {
+        int auto_layers;
+        int fp16_layers;
+        int q8_1_layers;
+    };
+
+    LayerFitCounts my_counts{gpu_layers_auto, gpu_layers_fp16, gpu_layers_q8_1};
+    std::vector<LayerFitCounts> all_counts(world_size_);
+    MPI_Allgather(&my_counts, sizeof(LayerFitCounts), MPI_BYTE,
+                  all_counts.data(), sizeof(LayerFitCounts), MPI_BYTE, MPI_COMM_WORLD);
+
+    for (int r = 1; r < world_size_; ++r)
+    {
+        EXPECT_EQ(all_counts[r].auto_layers, all_counts[0].auto_layers)
+            << "Rank " << r << " has different AUTO layer-fit count";
+        EXPECT_EQ(all_counts[r].fp16_layers, all_counts[0].fp16_layers)
+            << "Rank " << r << " has different FP16 layer-fit count";
+        EXPECT_EQ(all_counts[r].q8_1_layers, all_counts[0].q8_1_layers)
+            << "Rank " << r << " has different Q8_1 layer-fit count";
     }
 }
 

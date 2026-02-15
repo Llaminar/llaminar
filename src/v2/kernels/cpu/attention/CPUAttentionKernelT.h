@@ -30,6 +30,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/OpenMPUtils.h"
+#include "../../../utils/KernelProfiler.h"
 #include <memory>
 #include <vector>
 #include <cstring>
@@ -196,20 +197,26 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
+            KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
+
             const ElementType *Q_typed = reinterpret_cast<const ElementType *>(Q);
             const ElementType *K_typed = reinterpret_cast<const ElementType *>(K);
             const ElementType *V_typed = reinterpret_cast<const ElementType *>(V);
 
             // Allocate workspaces if not provided
-            std::shared_ptr<TensorBase> scores_alloc;
             float *scores_ptr = nullptr;
             float *context_ptr = nullptr;
             const float *mask_ptr = nullptr;
 
             if (!workspace_scores)
             {
-                scores_alloc = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(n_heads * seq_len * kv_len)});
-                scores_ptr = scores_alloc->mutable_data();
+                thread_local std::vector<float> scores_scratch;
+                const size_t needed = static_cast<size_t>(n_heads) * static_cast<size_t>(seq_len) * static_cast<size_t>(kv_len);
+                if (scores_scratch.size() < needed)
+                {
+                    scores_scratch.resize(needed);
+                }
+                scores_ptr = scores_scratch.data();
             }
             else
             {
@@ -897,7 +904,7 @@ namespace llaminar2
                 }
 
                 // 2. Scores @ V -> Output (FP32)
-                std::memset(output, 0, seq_len * n_heads * head_dim * sizeof(float));
+                // No pre-zeroing needed: both the decode fast path and GEMM path write with beta=0.
 
                 // Capture variables for nested-safe parallel execution
                 auto typed_attention_work = [&]()
@@ -931,6 +938,7 @@ namespace llaminar2
                         {
                             if constexpr (std::is_same_v<TensorT, FP32Tensor>)
                             {
+                                KERNEL_PROFILE_SCOPE(KernelType::GEMV_FP32);
                                 // 1. Q @ K^T
                                 for (int t = 0; t < kv_len; ++t)
                                 {
@@ -1511,10 +1519,12 @@ namespace llaminar2
             }
             else
             {
-                // FP32/BF16/FP16 path: use data() pointers
-                Q_ptr = Q_base->data();
-                K_ptr = K_base->data();
-                V_ptr = V_base->data();
+                // FP32/BF16/FP16 path: use explicit FP32 views for inputs.
+                // This avoids accidental calls into deprecated quantized data() paths
+                // (e.g. Q8_1Tensor::data()) when mixed-precision tensors are routed here.
+                Q_ptr = Q_base->fp32_data();
+                K_ptr = K_base->fp32_data();
+                V_ptr = V_base->fp32_data();
                 output_ptr = output_base->mutable_data();
             }
 

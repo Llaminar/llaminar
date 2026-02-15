@@ -48,6 +48,10 @@ namespace llaminar2
             constexpr const char *PARTIAL_L = "attn_partial_l";
             /// Device-resident dynamic params (kv_len, position_offset, mask_stride)
             constexpr const char *DEVICE_PARAMS = "attn_device_params";
+            /// Temporary FP32 K buffer for mixed-precision KV conversion
+            constexpr const char *K_TMP_FP32 = "attn_k_tmp_fp32";
+            /// Temporary FP32 V buffer for mixed-precision KV conversion
+            constexpr const char *V_TMP_FP32 = "attn_v_tmp_fp32";
         }
         // Forward declaration of precision element type mapping
         namespace detail

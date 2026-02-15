@@ -304,6 +304,75 @@ namespace llaminar2
         }
 
         // =========================================================================
+        // Test: Q8_1 sharded append/retrieve works per-rank
+        // =========================================================================
+
+        TEST_F(Test__MPI_ShardedKVCache, Q81ShardedAppendAndRetrieve)
+        {
+            auto cache = createShardedCPUKVCache(
+                ActivationPrecision::Q8_1,
+                *mpi_ctx_,
+                kNumLayers, kBatchSize, kMaxSeqLen,
+                kNKVHeads, local_n_kv_heads_, kv_head_start_,
+                kHeadDim,
+                DeviceId::cpu());
+
+            ASSERT_NE(cache, nullptr);
+            ASSERT_EQ(cache->precision(), ActivationPrecision::Q8_1);
+
+            const int layer = 0;
+            const int num_tokens = 5;
+            const size_t total = static_cast<size_t>(num_tokens) * static_cast<size_t>(local_kv_dim_);
+
+            std::vector<float> k_fp32(total);
+            std::vector<float> v_fp32(total);
+            for (size_t i = 0; i < total; ++i)
+            {
+                // Keep values in a small, stable range for quantization checks
+                const float base = static_cast<float>((rank_ + 1) * 100) * 0.001f + static_cast<float>(i % 97) * 0.005f;
+                k_fp32[i] = base;
+                v_fp32[i] = -base;
+            }
+
+            auto k_q8 = Q8_1Tensor::quantize_from_fp32(
+                k_fp32.data(),
+                {static_cast<size_t>(num_tokens), static_cast<size_t>(local_kv_dim_)});
+            auto v_q8 = Q8_1Tensor::quantize_from_fp32(
+                v_fp32.data(),
+                {static_cast<size_t>(num_tokens), static_cast<size_t>(local_kv_dim_)});
+
+            ASSERT_NE(k_q8, nullptr);
+            ASSERT_NE(v_q8, nullptr);
+
+            ASSERT_TRUE(cache->append_kv(layer, 0, k_q8.get(), v_q8.get(), num_tokens));
+            EXPECT_EQ(cache->get_cached_tokens(layer, 0), num_tokens);
+
+            const ITensor *k_cached_it = cache->get_k(layer, 0);
+            const ITensor *v_cached_it = cache->get_v(layer, 0);
+            ASSERT_NE(k_cached_it, nullptr);
+            ASSERT_NE(v_cached_it, nullptr);
+            EXPECT_EQ(k_cached_it->native_type(), TensorType::Q8_1);
+            EXPECT_EQ(v_cached_it->native_type(), TensorType::Q8_1);
+
+            const float *k_cached = k_cached_it->fp32_data();
+            const float *v_cached = v_cached_it->fp32_data();
+            ASSERT_NE(k_cached, nullptr);
+            ASSERT_NE(v_cached, nullptr);
+
+            // Validate a representative subset with quantization tolerance
+            const size_t sample = std::min<size_t>(total, 128);
+            for (size_t i = 0; i < sample; ++i)
+            {
+                EXPECT_NEAR(k_cached[i], k_fp32[i], 0.08f)
+                    << "K mismatch at idx=" << i << " on rank " << rank_;
+                EXPECT_NEAR(v_cached[i], v_fp32[i], 0.08f)
+                    << "V mismatch at idx=" << i << " on rank " << rank_;
+            }
+
+            MPI_Barrier(MPI_COMM_WORLD);
+        }
+
+        // =========================================================================
         // Test: Sequential decode simulation (each rank handles its local heads)
         // =========================================================================
 

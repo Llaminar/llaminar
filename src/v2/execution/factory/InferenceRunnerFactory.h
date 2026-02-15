@@ -107,6 +107,10 @@ namespace llaminar2
         // Default 64.0f covers Q8_1 activation ranges (max ±35) with ~2× headroom.
         float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must cover Q projection max (~130 for Qwen2)
 
+        // Explicit KV cache precision control.
+        // AUTO preserves legacy behavior (derived from activation precision mode).
+        KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
+
         // Use mapped memory for GPU tensor allocation (zero-copy host access)
         // When true, FP32 activation buffers are allocated using cudaHostAllocMapped /
         // hipHostMallocMapped, enabling direct host access without memcpy.

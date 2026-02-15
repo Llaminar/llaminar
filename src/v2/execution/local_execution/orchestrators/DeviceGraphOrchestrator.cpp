@@ -645,7 +645,12 @@ namespace llaminar2
             }
 
             bool success;
-            if (debugEnv().execution.fast_decode &&
+            const bool has_collective_nodes = !forward_cache_.collective_nodes.empty();
+            const bool allow_fast_decode = debugEnv().execution.fast_decode;
+            const bool allow_collective_segmented = debugEnv().execution.gpu_graph_collective_segmented;
+            const bool can_use_segmented_graph =
+                !has_collective_nodes || allow_collective_segmented;
+            if (allow_fast_decode &&
                 !debugEnv().execution.executor_profiling &&
                 !executor_.config().snapshot_callback)
             {
@@ -654,8 +659,13 @@ namespace llaminar2
                 // kernel dimensions change each decode step (kv_len grows).
                 if (debugEnv().execution.gpu_graphs &&
                     ctx->isGPU() &&
+                    can_use_segmented_graph &&
                     forward_cache_.segment_cache.consecutive_failures < GraphExecutor::GraphSegmentCache::kMaxFailures)
                 {
+                    if (has_collective_nodes && allow_collective_segmented)
+                    {
+                        LOG_INFO("[DeviceGraphOrchestrator] Experimental collective segmented GPU-graph replay enabled");
+                    }
                     // Lazily initialize GPU stream and context on first use
                     if (!forward_cache_.gpu_stream)
                     {
@@ -693,7 +703,8 @@ namespace llaminar2
                             *forward_cache_.graph, ctx,
                             forward_cache_.segment_cache,
                             forward_cache_.gpu_stream,
-                            forward_cache_.gpu_ctx);
+                            forward_cache_.gpu_ctx,
+                            &forward_cache_.collective_nodes);
 
                         // Phase 3 replay doesn't call markCompleted(), so we can
                         // skip graph.reset() on subsequent steps.
@@ -729,6 +740,10 @@ namespace llaminar2
             }
             else
             {
+                if (debugEnv().execution.fast_decode && has_collective_nodes)
+                {
+                    LOG_DEBUG("[DeviceGraphOrchestrator] Falling back to full executor for collective graph replay");
+                }
                 success = executor_.execute(*forward_cache_.graph, ctx);
             }
 
@@ -922,19 +937,17 @@ namespace llaminar2
             forward_cache_.output = output;
             // Pre-compute collective node set for fast decode intercept
             forward_cache_.collective_nodes.clear();
-            if (executor_.collectiveContext())
+            for (const auto &n : forward_cache_.graph->getExecutionOrder())
             {
-                for (const auto &n : forward_cache_.graph->getExecutionOrder())
+                auto *nd = forward_cache_.graph->getNode(n);
+                if (nd && nd->stage)
                 {
-                    auto *nd = forward_cache_.graph->getNode(n);
-                    if (nd && nd->stage)
+                    auto t = nd->stage->type();
+                    if (t == ComputeStageType::ALLREDUCE ||
+                        t == ComputeStageType::ALLGATHER ||
+                        t == ComputeStageType::ALLGATHER_V)
                     {
-                        auto t = nd->stage->type();
-                        if (t == ComputeStageType::ALLREDUCE ||
-                            t == ComputeStageType::ALLGATHER)
-                        {
-                            forward_cache_.collective_nodes.insert(n);
-                        }
+                        forward_cache_.collective_nodes.insert(n);
                     }
                 }
             }
@@ -1903,6 +1916,7 @@ namespace llaminar2
             // V is Q8_1 from GEMM, needs to match KV cache precision (FP32 for Hybrid, Q16_1 for HybridQ16)
             ActivationPrecision kv_cache_prec = resolveBufferPrecision(
                 act_prec, HybridBufferType::KV_Cache, nullptr);
+            kv_cache_prec = resolveKVCacheStoragePrecision(config.kv_cache_precision, kv_cache_prec);
             state_.V_dequant = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
                 kv_cache_prec, head_dim, device);
@@ -2042,7 +2056,10 @@ namespace llaminar2
         // For Hybrid mode: KV cache uses BF16 (better than Q8_1, 2x compression)
         ActivationPrecision kv_cache_prec = resolveBufferPrecision(
             act_prec, HybridBufferType::KV_Cache, nullptr);
+        kv_cache_prec = resolveKVCacheStoragePrecision(config.kv_cache_precision, kv_cache_prec);
         LOG_DEBUG("[DeviceGraphOrchestrator] KV cache precision: " << activationPrecisionToString(kv_cache_prec));
+        LOG_DEBUG("[DeviceGraphOrchestrator] KV cache precision mode: "
+                  << kvCachePrecisionToString(config.kv_cache_precision));
 
         // Determine KV cache layout mode:
         // - Q16_1 precision requires HEAD_MAJOR layout for Q16IntegerAttention kernel

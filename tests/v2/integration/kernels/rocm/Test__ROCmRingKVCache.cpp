@@ -9,7 +9,7 @@
  * 2. Ring buffer wrap-around behavior
  * 3. O(1) eviction correctness
  * 4. Sliding window pattern
- * 5. Multi-precision (FP32, FP16, BF16)
+ * 5. Multi-precision (FP32, FP16, BF16, Q8_1)
  *
  * Target Hardware: AMD MI50 (gfx906 / Vega 20)
  */
@@ -18,6 +18,7 @@
 #include <vector>
 #include <random>
 #include <cmath>
+#include <cstring>
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -862,6 +863,107 @@ TEST(Test__ROCmRingKVCache, BatchedGather)
     LOG_INFO("[BatchedGather] PASSED");
 }
 
+TEST(Test__ROCmRingKVCache, BatchedGather_Q81)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    const int n_layers = 1;
+    const int batch_size = 3;
+    const int max_seq_len = 32;
+    const int n_kv_heads = 2;
+    const int head_dim = 32;
+    const int kv_dim = n_kv_heads * head_dim;
+    ASSERT_EQ(kv_dim % static_cast<int>(Q8_1Block::BLOCK_SIZE), 0);
+    const int kv_blocks = kv_dim / static_cast<int>(Q8_1Block::BLOCK_SIZE);
+
+    auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::Q8_1>>(
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
+    ASSERT_NE(cache, nullptr);
+
+    const int seq_lens[3] = {4, 7, 5};
+
+    std::vector<std::vector<Q8_1Block>> h_K(batch_size);
+    std::vector<std::vector<Q8_1Block>> h_V(batch_size);
+
+    Q8_1Block *d_K = nullptr;
+    Q8_1Block *d_V = nullptr;
+    hipMalloc(&d_K, static_cast<size_t>(max_seq_len) * kv_blocks * sizeof(Q8_1Block));
+    hipMalloc(&d_V, static_cast<size_t>(max_seq_len) * kv_blocks * sizeof(Q8_1Block));
+
+    for (int seq = 0; seq < batch_size; ++seq)
+    {
+        const size_t blocks = static_cast<size_t>(seq_lens[seq]) * kv_blocks;
+        h_K[seq].resize(blocks);
+        h_V[seq].resize(blocks);
+
+        for (size_t i = 0; i < blocks; ++i)
+        {
+            h_K[seq][i].d = static_cast<uint16_t>(0x3A00u + static_cast<uint16_t>(seq * 64 + i));
+            h_K[seq][i].sum_qs = static_cast<int16_t>((static_cast<int>(i) % 43) - 21);
+            h_V[seq][i].d = static_cast<uint16_t>(0x3C00u + static_cast<uint16_t>(seq * 64 + i));
+            h_V[seq][i].sum_qs = static_cast<int16_t>((static_cast<int>(i) % 39) - 19);
+            for (int q = 0; q < Q8_1Block::BLOCK_SIZE; ++q)
+            {
+                h_K[seq][i].qs[q] = static_cast<int8_t>(((seq * 11 + static_cast<int>(i) + q) % 255) - 127);
+                h_V[seq][i].qs[q] = static_cast<int8_t>(((seq * 17 + static_cast<int>(i) + q * 3) % 255) - 127);
+            }
+        }
+
+        hipMemcpy(d_K, h_K[seq].data(), blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
+        hipMemcpy(d_V, h_V[seq].data(), blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
+        ASSERT_TRUE(cache->append(0, seq, d_K, d_V, seq_lens[seq]));
+    }
+
+    auto reqs = cache->getWorkspaceRequirements(batch_size, 0, 0);
+    DeviceWorkspaceManager workspace(DeviceId::rocm(0), 1024 * 1024);
+    ASSERT_TRUE(workspace.allocate(reqs));
+    cache->bindWorkspace(&workspace);
+
+    const int max_kv_len = 8;
+    Q8_1Block *d_K_gathered = nullptr;
+    Q8_1Block *d_V_gathered = nullptr;
+    hipMalloc(&d_K_gathered, static_cast<size_t>(batch_size) * max_kv_len * kv_blocks * sizeof(Q8_1Block));
+    hipMalloc(&d_V_gathered, static_cast<size_t>(batch_size) * max_kv_len * kv_blocks * sizeof(Q8_1Block));
+
+    std::vector<int> kv_lens(batch_size);
+    int actual_max = cache->gather_kv_batched(0, batch_size,
+                                              d_K_gathered, d_V_gathered,
+                                              kv_lens.data(), max_kv_len);
+
+    EXPECT_EQ(actual_max, 7);
+    for (int seq = 0; seq < batch_size; ++seq)
+    {
+        EXPECT_EQ(kv_lens[seq], seq_lens[seq]);
+    }
+
+    std::vector<Q8_1Block> h_K_gathered(static_cast<size_t>(batch_size) * max_kv_len * kv_blocks);
+    std::vector<Q8_1Block> h_V_gathered(static_cast<size_t>(batch_size) * max_kv_len * kv_blocks);
+    hipMemcpy(h_K_gathered.data(), d_K_gathered, h_K_gathered.size() * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
+    hipMemcpy(h_V_gathered.data(), d_V_gathered, h_V_gathered.size() * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
+
+    for (int seq = 0; seq < batch_size; ++seq)
+    {
+        const size_t dst_base = static_cast<size_t>(seq) * max_kv_len * kv_blocks;
+        const size_t src_blocks = static_cast<size_t>(seq_lens[seq]) * kv_blocks;
+
+        EXPECT_EQ(std::memcmp(h_K_gathered.data() + dst_base, h_K[seq].data(), src_blocks * sizeof(Q8_1Block)), 0)
+            << "Q8_1 gathered K mismatch for seq " << seq;
+        EXPECT_EQ(std::memcmp(h_V_gathered.data() + dst_base, h_V[seq].data(), src_blocks * sizeof(Q8_1Block)), 0)
+            << "Q8_1 gathered V mismatch for seq " << seq;
+    }
+
+    cache->unbindWorkspace();
+    hipFree(d_K);
+    hipFree(d_V);
+    hipFree(d_K_gathered);
+    hipFree(d_V_gathered);
+
+    LOG_INFO("[BatchedGather_Q81] PASSED");
+}
+
 // =============================================================================
 // Test: Contiguous Optimization
 // =============================================================================
@@ -998,6 +1100,155 @@ TEST(Test__ROCmRingKVCache, MultiPrecision_BF16)
     hipFree(d_V);
 
     LOG_INFO("[MultiPrecision_BF16] PASSED");
+}
+
+// =============================================================================
+// Test: Multi-Precision (Q8_1)
+// =============================================================================
+
+TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_Q81)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    const int n_layers = 1;
+    const int batch_size = 1;
+    const int max_seq_len = 32;
+    const int n_kv_heads = 2;
+    const int head_dim = 32;
+    const int kv_dim = n_kv_heads * head_dim;
+    ASSERT_EQ(kv_dim % static_cast<int>(Q8_1Block::BLOCK_SIZE), 0);
+    const int kv_blocks = kv_dim / static_cast<int>(Q8_1Block::BLOCK_SIZE);
+
+    auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::Q8_1>>(
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
+    ASSERT_NE(cache, nullptr);
+    EXPECT_EQ(cache->precision(), ActivationPrecision::Q8_1);
+
+    const int num_tokens = 9;
+    const size_t block_count = static_cast<size_t>(num_tokens) * static_cast<size_t>(kv_blocks);
+
+    std::vector<Q8_1Block> h_K(block_count);
+    std::vector<Q8_1Block> h_V(block_count);
+    for (size_t i = 0; i < block_count; ++i)
+    {
+        h_K[i].d = static_cast<uint16_t>(0x3000u + static_cast<uint16_t>(i));
+        h_K[i].sum_qs = static_cast<int16_t>((static_cast<int>(i) % 41) - 20);
+        h_V[i].d = static_cast<uint16_t>(0x3400u + static_cast<uint16_t>(i));
+        h_V[i].sum_qs = static_cast<int16_t>((static_cast<int>(i) % 37) - 18);
+        for (int q = 0; q < Q8_1Block::BLOCK_SIZE; ++q)
+        {
+            h_K[i].qs[q] = static_cast<int8_t>(((static_cast<int>(i) + q * 3) % 255) - 127);
+            h_V[i].qs[q] = static_cast<int8_t>(((static_cast<int>(i) * 5 + q) % 255) - 127);
+        }
+    }
+
+    Q8_1Block *d_K = nullptr;
+    Q8_1Block *d_V = nullptr;
+    hipMalloc(&d_K, block_count * sizeof(Q8_1Block));
+    hipMalloc(&d_V, block_count * sizeof(Q8_1Block));
+    hipMemcpy(d_K, h_K.data(), block_count * sizeof(Q8_1Block), hipMemcpyHostToDevice);
+    hipMemcpy(d_V, h_V.data(), block_count * sizeof(Q8_1Block), hipMemcpyHostToDevice);
+
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens));
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
+
+    const void *d_K_out = nullptr;
+    const void *d_V_out = nullptr;
+    int kv_len = 0;
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    EXPECT_EQ(kv_len, num_tokens);
+
+    std::vector<Q8_1Block> h_K_out(block_count);
+    std::vector<Q8_1Block> h_V_out(block_count);
+    hipMemcpy(h_K_out.data(), d_K_out, block_count * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
+    hipMemcpy(h_V_out.data(), d_V_out, block_count * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
+
+    EXPECT_EQ(std::memcmp(h_K_out.data(), h_K.data(), block_count * sizeof(Q8_1Block)), 0)
+        << "Q8_1 K blocks mismatch";
+    EXPECT_EQ(std::memcmp(h_V_out.data(), h_V.data(), block_count * sizeof(Q8_1Block)), 0)
+        << "Q8_1 V blocks mismatch";
+
+    hipFree(d_K);
+    hipFree(d_V);
+
+    LOG_INFO("[BasicAppendRetrieve_Q81] PASSED");
+}
+
+TEST(Test__ROCmRingKVCache, WrapAround_Q81)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    const int n_layers = 1;
+    const int batch_size = 1;
+    const int max_seq_len = 8;
+    const int n_kv_heads = 2;
+    const int head_dim = 32;
+    const int kv_dim = n_kv_heads * head_dim;
+    ASSERT_EQ(kv_dim % static_cast<int>(Q8_1Block::BLOCK_SIZE), 0);
+    const int kv_blocks = kv_dim / static_cast<int>(Q8_1Block::BLOCK_SIZE);
+
+    auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::Q8_1>>(
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
+    ASSERT_NE(cache, nullptr);
+
+    const int total_tokens = 12;
+    const size_t total_blocks = static_cast<size_t>(total_tokens) * static_cast<size_t>(kv_blocks);
+
+    std::vector<Q8_1Block> h_K_all(total_blocks);
+    std::vector<Q8_1Block> h_V_all(total_blocks);
+    for (size_t i = 0; i < total_blocks; ++i)
+    {
+        h_K_all[i].d = static_cast<uint16_t>(0x3800u + static_cast<uint16_t>(i));
+        h_K_all[i].sum_qs = static_cast<int16_t>((static_cast<int>(i) % 29) - 14);
+        h_V_all[i].d = static_cast<uint16_t>(0x3A00u + static_cast<uint16_t>(i));
+        h_V_all[i].sum_qs = static_cast<int16_t>((static_cast<int>(i) % 31) - 15);
+        for (int q = 0; q < Q8_1Block::BLOCK_SIZE; ++q)
+        {
+            h_K_all[i].qs[q] = static_cast<int8_t>(((static_cast<int>(i) + q) % 255) - 127);
+            h_V_all[i].qs[q] = static_cast<int8_t>(((static_cast<int>(i) + q * 7) % 255) - 127);
+        }
+    }
+
+    Q8_1Block *d_K = nullptr;
+    Q8_1Block *d_V = nullptr;
+    hipMalloc(&d_K, total_blocks * sizeof(Q8_1Block));
+    hipMalloc(&d_V, total_blocks * sizeof(Q8_1Block));
+    hipMemcpy(d_K, h_K_all.data(), total_blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
+    hipMemcpy(d_V, h_V_all.data(), total_blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
+
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens));
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq_len);
+    EXPECT_TRUE(cache->is_wrapped(0, 0));
+    EXPECT_EQ(cache->get_total_evicted(), total_tokens - max_seq_len);
+
+    const void *d_K_out = nullptr;
+    const void *d_V_out = nullptr;
+    int kv_len = 0;
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    EXPECT_EQ(kv_len, max_seq_len);
+
+    const size_t kept_blocks = static_cast<size_t>(max_seq_len) * static_cast<size_t>(kv_blocks);
+    std::vector<Q8_1Block> h_K_out(kept_blocks);
+    std::vector<Q8_1Block> h_V_out(kept_blocks);
+    hipMemcpy(h_K_out.data(), d_K_out, kept_blocks * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
+    hipMemcpy(h_V_out.data(), d_V_out, kept_blocks * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
+
+    const size_t skipped_blocks = static_cast<size_t>(total_tokens - max_seq_len) * static_cast<size_t>(kv_blocks);
+    EXPECT_EQ(std::memcmp(h_K_out.data(), h_K_all.data() + skipped_blocks, kept_blocks * sizeof(Q8_1Block)), 0)
+        << "Q8_1 wrapped K blocks mismatch";
+    EXPECT_EQ(std::memcmp(h_V_out.data(), h_V_all.data() + skipped_blocks, kept_blocks * sizeof(Q8_1Block)), 0)
+        << "Q8_1 wrapped V blocks mismatch";
+
+    hipFree(d_K);
+    hipFree(d_V);
+
+    LOG_INFO("[WrapAround_Q81] PASSED");
 }
 
 #endif // HAVE_ROCM

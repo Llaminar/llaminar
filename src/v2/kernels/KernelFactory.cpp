@@ -16,6 +16,7 @@
 #include "cpu/ops/CPUResidualAddKernelT.h"
 #include "cpu/ops/CPUEmbeddingKernelT.h"
 #include "cpu/attention/CPUAttentionKernelT.h"
+#include "cpu/attention/CPUFlashAttentionKernelT.h"
 
 // KVCache includes
 #include "cpu/CPUKVCache.h"
@@ -2280,7 +2281,7 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    return std::make_unique<llaminar2::CPUFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
@@ -2304,7 +2305,7 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    return std::make_unique<llaminar2::CPUFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
@@ -2328,7 +2329,7 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    return std::make_unique<llaminar2::CPUFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
@@ -4031,21 +4032,21 @@ namespace llaminar
 #ifdef HAVE_CUDA
             std::unique_ptr<llaminar2::ICUDARingKVCache> KernelFactory::createCUDAKVCache(const KVCacheConfig &config)
             {
-                // Validate precision - CUDA ring cache only supports FP32/BF16/FP16
+                // Validate precision - CUDA ring cache supports FP32/BF16/FP16/Q8_1
                 switch (config.precision)
                 {
                 case llaminar2::ActivationPrecision::FP32:
                 case llaminar2::ActivationPrecision::BF16:
                 case llaminar2::ActivationPrecision::FP16:
+                case llaminar2::ActivationPrecision::Q8_1:
                     break; // Supported
 
-                case llaminar2::ActivationPrecision::Q8_1:
                 case llaminar2::ActivationPrecision::Q16_1:
                 case llaminar2::ActivationPrecision::Hybrid:
                 case llaminar2::ActivationPrecision::HybridQ16:
                     LOG_ERROR("[KernelFactory] CUDA KVCache does not support precision: "
                               << llaminar2::activationPrecisionToString(config.precision)
-                              << ". Use FP32, BF16, or FP16.");
+                              << ". Use FP32, BF16, FP16, or Q8_1.");
                     throw std::runtime_error("KernelFactory::createCUDAKVCache: Unsupported precision");
 
                 default:
@@ -4126,6 +4127,15 @@ namespace llaminar
                         config.head_dim,
                         cuda_device);
 
+                case llaminar2::ActivationPrecision::Q8_1:
+                    return std::make_unique<llaminar2::CUDARingKVCache<llaminar2::ActivationPrecision::Q8_1>>(
+                        config.num_layers,
+                        config.batch_size,
+                        config.max_seq_len,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        cuda_device);
+
                 default:
                     // Should not reach here due to earlier validation
                     throw std::runtime_error("KernelFactory::createCUDAKVCache: Unexpected precision");
@@ -4142,15 +4152,15 @@ namespace llaminar
                 case llaminar2::ActivationPrecision::FP32:
                 case llaminar2::ActivationPrecision::BF16:
                 case llaminar2::ActivationPrecision::FP16:
+                case llaminar2::ActivationPrecision::Q8_1:
                     break; // Supported
 
-                case llaminar2::ActivationPrecision::Q8_1:
                 case llaminar2::ActivationPrecision::Q16_1:
                 case llaminar2::ActivationPrecision::Hybrid:
                 case llaminar2::ActivationPrecision::HybridQ16:
                     LOG_ERROR("[KernelFactory] ROCm KVCache does not support precision: "
                               << llaminar2::activationPrecisionToString(config.precision)
-                              << ". Use FP32, BF16, or FP16.");
+                              << ". Use FP32, BF16, FP16, or Q8_1.");
                     throw std::runtime_error("KernelFactory::createROCmKVCache: Unsupported precision");
 
                 default:

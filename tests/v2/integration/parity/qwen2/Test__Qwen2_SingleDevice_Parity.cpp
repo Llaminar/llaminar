@@ -29,7 +29,7 @@ using namespace llaminar2::test::parity::qwen2;
 
 static const std::vector<TestConfig> kSingleDeviceConfigs = {
     {
-        .name = "CPU",
+        .name = "CPU_KV_FP16",
         .devices = {ParityDeviceType::CPU},
         .parallelism = Parallelism::None,
         .collective = Collective::None,
@@ -40,9 +40,26 @@ static const std::vector<TestConfig> kSingleDeviceConfigs = {
             .min_early_layers_passed = 3,
             .kl_threshold = 0.15f,
         },
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
     },
     {
-        .name = "CUDA",
+        .name = "CPU_KV_Q8_1",
+        .devices = {ParityDeviceType::CPU},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.999f,
+            .decode_cosine_threshold = 0.99f,
+            .early_layers_count = 4,
+            .min_early_layers_passed = 3,
+            .kl_threshold = 0.15f,
+        },
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::Q8_1,
+    },
+    {
+        .name = "CUDA_KV_FP16",
         .devices = {ParityDeviceType::CUDA},
         .parallelism = Parallelism::None,
         .collective = Collective::None,
@@ -53,9 +70,26 @@ static const std::vector<TestConfig> kSingleDeviceConfigs = {
             .min_early_layers_passed = 4,
             .kl_threshold = 0.10f,
         },
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
     },
     {
-        .name = "ROCm",
+        .name = "CUDA_KV_Q8_1",
+        .devices = {ParityDeviceType::CUDA},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.95f,
+            .decode_cosine_threshold = 0.90f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.10f,
+        },
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::Q8_1,
+    },
+    {
+        .name = "ROCm_KV_FP16",
         .devices = {ParityDeviceType::ROCm},
         .parallelism = Parallelism::None,
         .collective = Collective::None,
@@ -66,6 +100,23 @@ static const std::vector<TestConfig> kSingleDeviceConfigs = {
             .min_early_layers_passed = 4,
             .kl_threshold = 0.10f,
         },
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
+    },
+    {
+        .name = "ROCm_KV_Q8_1",
+        .devices = {ParityDeviceType::ROCm},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.95f,
+            .decode_cosine_threshold = 0.90f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.10f,
+        },
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::Q8_1,
     },
 };
 

@@ -13,6 +13,8 @@
 #include "../../backends/ComputeBackend.h"
 #include "../../utils/CPUFeatures.h"
 #include "../../utils/Logger.h"
+#include <algorithm>
+#include <cctype>
 #include <string>
 
 namespace llaminar2
@@ -176,6 +178,63 @@ namespace llaminar2
             return "HybridQ16";
         default:
             return "Unknown";
+        }
+    }
+
+    /**
+     * @brief Explicit KV cache storage precision mode
+     *
+     * AUTO preserves legacy behavior (derive KV cache precision from activation mode).
+     */
+    enum class KVCachePrecision
+    {
+        AUTO,
+        FP16,
+        Q8_1
+    };
+
+    inline const char *kvCachePrecisionToString(KVCachePrecision precision)
+    {
+        switch (precision)
+        {
+        case KVCachePrecision::AUTO:
+            return "AUTO";
+        case KVCachePrecision::FP16:
+            return "FP16";
+        case KVCachePrecision::Q8_1:
+            return "Q8_1";
+        default:
+            return "UNKNOWN";
+        }
+    }
+
+    inline KVCachePrecision parseKVCachePrecision(const std::string &value)
+    {
+        std::string lower = value;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
+
+        if (lower == "fp16")
+            return KVCachePrecision::FP16;
+        if (lower == "q8_1" || lower == "q8" || lower == "q81")
+            return KVCachePrecision::Q8_1;
+        return KVCachePrecision::AUTO;
+    }
+
+    inline ActivationPrecision resolveKVCacheStoragePrecision(
+        KVCachePrecision mode,
+        ActivationPrecision fallback_precision)
+    {
+        switch (mode)
+        {
+        case KVCachePrecision::FP16:
+            return ActivationPrecision::FP16;
+        case KVCachePrecision::Q8_1:
+            return ActivationPrecision::Q8_1;
+        case KVCachePrecision::AUTO:
+        default:
+            return fallback_precision;
         }
     }
 
@@ -399,6 +458,9 @@ namespace llaminar2
          * @see VNNISafetyConstants.h for VNNI overflow limits
          */
         float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must cover Q projection max (~130 for Qwen2)
+
+        /// Explicit KV cache storage precision mode (AUTO preserves existing behavior)
+        KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
 
         // ===== Multi-Device Executor Feature Flags (Incremental Rollout) =====
 

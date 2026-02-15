@@ -9,8 +9,21 @@
 #include "placement/HeterogeneousMultiDomainStrategy.h"
 #include "../../utils/Logger.h"
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <stdexcept>
+
+namespace
+{
+    static std::string toLowerCopy(const std::string &s)
+    {
+        std::string out = s;
+        std::transform(out.begin(), out.end(), out.begin(),
+                       [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
+        return out;
+    }
+}
 
 namespace llaminar2
 {
@@ -203,6 +216,30 @@ namespace llaminar2
     {
         // INT8 data + amortized scale overhead
         return 1.0f + 4.0f / static_cast<float>(K);
+    }
+
+    /**
+     * @brief Get KV cache bytes per element for placement memory estimation.
+     *
+     * Supported values (case-insensitive):
+     * - "fp16": 2.0 B/element
+     * - "q8_1": 36/32 = 1.125 B/element
+     * - "auto" (or unknown): preserve legacy FP32 estimate (4.0 B/element)
+     */
+    static float getKVCacheBytesPerElement(const std::string &kv_cache_precision)
+    {
+        const std::string kv = toLowerCopy(kv_cache_precision);
+        if (kv == "fp16")
+        {
+            return 2.0f;
+        }
+        if (kv == "q8_1")
+        {
+            return 36.0f / 32.0f; // Q8_1 block format
+        }
+
+        // AUTO (and unknown values): keep legacy behavior for conservative placement.
+        return 4.0f;
     }
 
     /**
@@ -400,8 +437,11 @@ namespace llaminar2
         size_t activation_memory = act_est.per_layer_bytes;
 
         // KV cache per layer (estimate for max_seq_len = 2048)
-        // K and V each: n_kv_heads × max_seq_len × head_dim × sizeof(float)
-        size_t kv_cache_per_layer = 2 * input.n_kv_heads * 2048 * head_dim * sizeof(float);
+        // K and V each: n_kv_heads × max_seq_len × head_dim × bytes_per_kv_element
+        const float kv_bytes_per_element = getKVCacheBytesPerElement(input.kv_cache_precision);
+        size_t kv_cache_per_layer = static_cast<size_t>(
+            2.0 * static_cast<double>(input.n_kv_heads) * 2048.0 * static_cast<double>(head_dim) *
+            static_cast<double>(kv_bytes_per_element));
 
         return weight_memory + norm_memory + activation_memory + kv_cache_per_layer;
     }
@@ -756,7 +796,10 @@ namespace llaminar2
         auto act_est = estimateActivationBuffers(1, 512, d_model, d_ff, input.n_heads, input.n_kv_heads);
 
         // KV cache per layer
-        size_t kv_cache = 2 * input.n_kv_heads * 2048 * head_dim * sizeof(float);
+        const float kv_bytes_per_element = getKVCacheBytesPerElement(input.kv_cache_precision);
+        size_t kv_cache = static_cast<size_t>(
+            2.0 * static_cast<double>(input.n_kv_heads) * 2048.0 * static_cast<double>(head_dim) *
+            static_cast<double>(kv_bytes_per_element));
 
         size_t bytes_per_layer_gpu = layer_weight_bytes + act_est.per_layer_bytes + kv_cache;
 
@@ -894,7 +937,10 @@ namespace llaminar2
                                  3 * d_ff * d_model;
         float bytes_per_weight = getCUDAPackedBytesPerWeight(d_model);
         auto act_est = estimateActivationBuffers(1, 512, d_model, d_ff, input.n_heads, input.n_kv_heads);
-        size_t kv_cache = 2 * input.n_kv_heads * 2048 * head_dim * sizeof(float);
+        const float kv_bytes_per_element = getKVCacheBytesPerElement(input.kv_cache_precision);
+        size_t kv_cache = static_cast<size_t>(
+            2.0 * static_cast<double>(input.n_kv_heads) * 2048.0 * static_cast<double>(head_dim) *
+            static_cast<double>(kv_bytes_per_element));
         size_t bytes_per_layer = static_cast<size_t>(weight_elements * bytes_per_weight) +
                                  act_est.per_layer_bytes + kv_cache;
 

@@ -680,6 +680,167 @@ TEST_F(GraphBatchedKVCacheTest, KVCacheAppendStage_IncrementalDecodeAppend)
     }
 }
 
+/**
+ * @test KVCacheAppendStage_FP16Cache_ConvertsFromFP32Input
+ * @brief Verify KVCacheAppendStage converts FP32 K/V inputs before appending into FP16 cache
+ */
+TEST_F(GraphBatchedKVCacheTest, KVCacheAppendStage_FP16Cache_ConvertsFromFP32Input)
+{
+    const int batch_size = 1;
+    const int seq_len = 3;
+    const int max_seq_len = 64;
+    const int test_layer = 0;
+
+    auto cache = std::make_unique<CPUKVCache<ActivationPrecision::FP16>>(
+        *mpi_ctx_,
+        n_layers_,
+        batch_size,
+        max_seq_len,
+        n_kv_heads_,
+        head_dim_,
+        DeviceId::cpu());
+
+    auto K = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim_)});
+    auto V = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim_)});
+
+    float *k_data = K->mutable_data();
+    float *v_data = V->mutable_data();
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int d = 0; d < kv_dim_; ++d)
+        {
+            const size_t idx = static_cast<size_t>(t) * kv_dim_ + d;
+            const float val = 0.01f * static_cast<float>(idx + 1);
+            k_data[idx] = val;
+            v_data[idx] = -val;
+        }
+    }
+
+    KVCacheAppendStage::Params params;
+    params.K = K.get();
+    params.V = V.get();
+    params.kv_cache = cache.get();
+    params.layer_idx = test_layer;
+    params.seq_idx = 0;
+    params.batch_size = batch_size;
+    params.seq_len = seq_len;
+
+    auto stage = std::make_unique<KVCacheAppendStage>(params);
+    ASSERT_TRUE(executeStage(stage.get())) << "KVCacheAppendStage failed for FP16 cache conversion";
+
+    ASSERT_EQ(cache->get_cached_tokens(test_layer, 0), seq_len);
+    EXPECT_EQ(cache->get_k(test_layer, 0)->native_type(), TensorType::FP16);
+    EXPECT_EQ(cache->get_v(test_layer, 0)->native_type(), TensorType::FP16);
+
+    const float *k_cached = cache->get_k(test_layer, 0)->fp32_data();
+    const float *v_cached = cache->get_v(test_layer, 0)->fp32_data();
+    ASSERT_NE(k_cached, nullptr);
+    ASSERT_NE(v_cached, nullptr);
+
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int d = 0; d < std::min(kv_dim_, 16); ++d)
+        {
+            const size_t idx = static_cast<size_t>(t) * kv_dim_ + d;
+            EXPECT_NEAR(k_cached[idx], k_data[idx], 2e-2f)
+                << "FP16 cache K mismatch at t=" << t << " d=" << d;
+            EXPECT_NEAR(v_cached[idx], v_data[idx], 2e-2f)
+                << "FP16 cache V mismatch at t=" << t << " d=" << d;
+        }
+    }
+}
+
+/**
+ * @test KVCacheAppendStage_Q81Cache_BatchedConvertsFromFP32Input
+ * @brief Verify batched KVCacheAppendStage converts FP32 K/V inputs before appending into Q8_1 cache
+ */
+TEST_F(GraphBatchedKVCacheTest, KVCacheAppendStage_Q81Cache_BatchedConvertsFromFP32Input)
+{
+    const int batch_size = 2;
+    const int seq_len = 2;
+    const int max_seq_len = 64;
+    const int test_layer = 0;
+
+    auto cache = std::make_unique<CPUKVCache<ActivationPrecision::Q8_1>>(
+        *mpi_ctx_,
+        n_layers_,
+        batch_size,
+        max_seq_len,
+        n_kv_heads_,
+        head_dim_,
+        DeviceId::cpu());
+
+    auto K = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(batch_size * seq_len), static_cast<size_t>(kv_dim_)});
+    auto V = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(batch_size * seq_len), static_cast<size_t>(kv_dim_)});
+
+    float *k_data = K->mutable_data();
+    float *v_data = V->mutable_data();
+    for (int b = 0; b < batch_size; ++b)
+    {
+        for (int t = 0; t < seq_len; ++t)
+        {
+            for (int d = 0; d < kv_dim_; ++d)
+            {
+                const size_t idx = (static_cast<size_t>(b) * seq_len + t) * kv_dim_ + d;
+                const float base = 0.02f * static_cast<float>(d + 1) + static_cast<float>(b) * 0.2f + static_cast<float>(t) * 0.05f;
+                k_data[idx] = base;
+                v_data[idx] = -base;
+            }
+        }
+    }
+
+    KVCacheAppendStage::Params params;
+    params.K = K.get();
+    params.V = V.get();
+    params.kv_cache = cache.get();
+    params.layer_idx = test_layer;
+    params.seq_idx = 0;
+    params.batch_size = batch_size;
+    params.seq_len = seq_len;
+
+    auto stage = std::make_unique<KVCacheAppendStage>(params);
+    ASSERT_TRUE(executeStage(stage.get())) << "KVCacheAppendStage failed for Q8_1 batched conversion";
+
+    ASSERT_EQ(cache->get_cached_tokens(test_layer, 0), seq_len);
+    ASSERT_EQ(cache->get_cached_tokens(test_layer, 1), seq_len);
+    EXPECT_EQ(cache->get_k(test_layer, 0)->native_type(), TensorType::Q8_1);
+    EXPECT_EQ(cache->get_v(test_layer, 0)->native_type(), TensorType::Q8_1);
+
+    const float *k_seq0 = cache->get_k(test_layer, 0)->fp32_data();
+    const float *v_seq0 = cache->get_v(test_layer, 0)->fp32_data();
+    const float *k_seq1 = cache->get_k(test_layer, 1)->fp32_data();
+    const float *v_seq1 = cache->get_v(test_layer, 1)->fp32_data();
+
+    ASSERT_NE(k_seq0, nullptr);
+    ASSERT_NE(v_seq0, nullptr);
+    ASSERT_NE(k_seq1, nullptr);
+    ASSERT_NE(v_seq1, nullptr);
+
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int d = 0; d < std::min(kv_dim_, 16); ++d)
+        {
+            const size_t local_idx = static_cast<size_t>(t) * kv_dim_ + d;
+            const size_t src0_idx = (0 * seq_len + t) * kv_dim_ + d;
+            const size_t src1_idx = (1 * seq_len + t) * kv_dim_ + d;
+
+            EXPECT_NEAR(k_seq0[local_idx], k_data[src0_idx], 6e-2f)
+                << "Q8_1 seq0 K mismatch at t=" << t << " d=" << d;
+            EXPECT_NEAR(v_seq0[local_idx], v_data[src0_idx], 6e-2f)
+                << "Q8_1 seq0 V mismatch at t=" << t << " d=" << d;
+
+            EXPECT_NEAR(k_seq1[local_idx], k_data[src1_idx], 6e-2f)
+                << "Q8_1 seq1 K mismatch at t=" << t << " d=" << d;
+            EXPECT_NEAR(v_seq1[local_idx], v_data[src1_idx], 6e-2f)
+                << "Q8_1 seq1 V mismatch at t=" << t << " d=" << d;
+        }
+    }
+}
+
 // =============================================================================
 // KVCacheGatherStage Tests
 // =============================================================================
@@ -998,6 +1159,115 @@ TEST_F(GraphBatchedKVCacheTest, KVCacheGatherStage_AfterBatchedAppend)
     if (rank_ == 0)
     {
         LOG_INFO("[KVCacheGather] ✓ Append + Gather workflow works correctly");
+    }
+}
+
+/**
+ * @test KVCacheGatherStage_Q81Cache_GathersQuantizedOutputs
+ * @brief Verify gather stage preserves Q8_1 storage and values across batched sequences
+ */
+TEST_F(GraphBatchedKVCacheTest, KVCacheGatherStage_Q81Cache_GathersQuantizedOutputs)
+{
+    const int batch_size = 2;
+    const int max_seq_len = 64;
+    const int test_layer = 0;
+    const int seq0_len = 3;
+    const int seq1_len = 5;
+
+    auto cache = std::make_unique<CPUKVCache<ActivationPrecision::Q8_1>>(
+        *mpi_ctx_,
+        n_layers_,
+        batch_size,
+        max_seq_len,
+        n_kv_heads_,
+        head_dim_,
+        DeviceId::cpu());
+
+    auto append_seq = [&](int seq_idx, int seq_len)
+    {
+        std::vector<float> k_fp32(static_cast<size_t>(seq_len) * kv_dim_);
+        std::vector<float> v_fp32(static_cast<size_t>(seq_len) * kv_dim_);
+
+        for (int t = 0; t < seq_len; ++t)
+        {
+            for (int d = 0; d < kv_dim_; ++d)
+            {
+                const size_t idx = static_cast<size_t>(t) * kv_dim_ + d;
+                const float value = static_cast<float>(seq_idx * 0.25f + t * 0.1f + d * 0.002f);
+                k_fp32[idx] = value;
+                v_fp32[idx] = -value;
+            }
+        }
+
+        auto k_q8 = Q8_1Tensor::quantize_from_fp32(
+            k_fp32.data(), {static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim_)});
+        auto v_q8 = Q8_1Tensor::quantize_from_fp32(
+            v_fp32.data(), {static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim_)});
+
+        ASSERT_NE(k_q8, nullptr);
+        ASSERT_NE(v_q8, nullptr);
+        ASSERT_TRUE(cache->append_kv(test_layer, seq_idx, k_q8.get(), v_q8.get(), seq_len));
+    };
+
+    append_seq(0, seq0_len);
+    append_seq(1, seq1_len);
+
+    EXPECT_EQ(cache->get_cached_tokens(test_layer, 0), seq0_len);
+    EXPECT_EQ(cache->get_cached_tokens(test_layer, 1), seq1_len);
+
+    const size_t gather_rows = batch_size * max_seq_len;
+    auto gathered_K = std::make_unique<Q8_1Tensor>(
+        std::vector<size_t>{gather_rows, static_cast<size_t>(kv_dim_)});
+    auto gathered_V = std::make_unique<Q8_1Tensor>(
+        std::vector<size_t>{gather_rows, static_cast<size_t>(kv_dim_)});
+
+    KVCacheGatherStage::Params gather_params;
+    gather_params.kv_cache = cache.get();
+    gather_params.layer_idx = test_layer;
+    gather_params.batch_size = batch_size;
+    gather_params.out_K = gathered_K.get();
+    gather_params.out_V = gathered_V.get();
+
+    auto gather_stage = std::make_unique<KVCacheGatherStage>(gather_params);
+    ASSERT_TRUE(executeStage(gather_stage.get())) << "Q8_1 gather failed";
+
+    const int max_kv_len = gather_stage->getMaxKVLen();
+    EXPECT_EQ(max_kv_len, seq1_len);
+    const auto &per_seq_lens = gather_stage->getPerSeqKVLens();
+    ASSERT_EQ(per_seq_lens.size(), static_cast<size_t>(batch_size));
+    EXPECT_EQ(per_seq_lens[0], seq0_len);
+    EXPECT_EQ(per_seq_lens[1], seq1_len);
+
+    EXPECT_EQ(gathered_K->native_type(), TensorType::Q8_1);
+    EXPECT_EQ(gathered_V->native_type(), TensorType::Q8_1);
+
+    const float *gk = gathered_K->fp32_data();
+    const float *gv = gathered_V->fp32_data();
+    ASSERT_NE(gk, nullptr);
+    ASSERT_NE(gv, nullptr);
+
+    for (int seq_idx = 0; seq_idx < batch_size; ++seq_idx)
+    {
+        const int valid_len = (seq_idx == 0) ? seq0_len : seq1_len;
+        const size_t seq_base = static_cast<size_t>(seq_idx) * static_cast<size_t>(max_kv_len) * static_cast<size_t>(kv_dim_);
+
+        for (int t = 0; t < valid_len; ++t)
+        {
+            for (int d = 0; d < std::min(kv_dim_, 16); ++d)
+            {
+                const size_t idx = seq_base + static_cast<size_t>(t) * static_cast<size_t>(kv_dim_) + d;
+                const float expected = static_cast<float>(seq_idx * 0.25f + t * 0.1f + d * 0.002f);
+                EXPECT_NEAR(gk[idx], expected, 0.08f)
+                    << "Q8_1 gathered K mismatch at seq=" << seq_idx << " t=" << t << " d=" << d;
+                EXPECT_NEAR(gv[idx], -expected, 0.08f)
+                    << "Q8_1 gathered V mismatch at seq=" << seq_idx << " t=" << t << " d=" << d;
+            }
+        }
+    }
+
+    if (rank_ == 0)
+    {
+        LOG_INFO("[KVCacheGather] ✓ Q8_1 gather preserves quantized consumption path");
     }
 }
 

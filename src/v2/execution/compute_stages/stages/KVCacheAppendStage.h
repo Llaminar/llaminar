@@ -8,9 +8,13 @@
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
 #include "kernels/IKVCache.h"
+#include <memory>
 
 namespace llaminar2
 {
+
+    class FP16Tensor;
+    class Q8_1Tensor;
 
     /**
      * @brief Explicit KV cache append stage
@@ -111,6 +115,10 @@ namespace llaminar2
 
     private:
         Params params_;
+        std::unique_ptr<FP16Tensor> fp16_k_scratch_;
+        std::unique_ptr<FP16Tensor> fp16_v_scratch_;
+        std::unique_ptr<Q8_1Tensor> q8_k_scratch_;
+        std::unique_ptr<Q8_1Tensor> q8_v_scratch_;
     };
 
 } // namespace llaminar2

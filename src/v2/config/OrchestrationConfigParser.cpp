@@ -7,7 +7,7 @@
  */
 
 #include "OrchestrationConfigParser.h"
-#include "ParallelismTreeParser.h" // For --topology parsing
+#include "ParallelismTreeParser.h"          // For --topology parsing
 #include "execution/config/RuntimeConfig.h" // For parseFusedAttentionBackend
 #include "utils/Logger.h"
 #include <fstream>
@@ -765,8 +765,6 @@ namespace llaminar2
                 // The factory will parse when n_layers is available from model
             }
 
-
-
             // ===== Memory Constraints =====
             else if (matchesFlag(arg, "", "--max-gpu-memory"))
             {
@@ -805,8 +803,6 @@ namespace llaminar2
                 config.moe_sparse_experts_cpu = true;
             }
 
-
-
             // ===== Activation Precision =====
             else if (arg == "--activation-precision" || arg == "--activation-prec" || arg == "--act-prec")
             {
@@ -821,6 +817,21 @@ namespace llaminar2
                     throw std::invalid_argument("Invalid activation precision: '" + value + "'. Valid: fp32, bf16, fp16, q8_1");
                 }
                 config.activation_precision = value;
+            }
+            else if (arg == "--kv-cache-precision" || arg == "--kv-prec")
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--kv-cache-precision requires a value");
+                }
+                value = toLower(value);
+                static const std::set<std::string> valid_precisions = {"auto", "fp16", "q8_1", "q8", "q81"};
+                if (valid_precisions.find(value) == valid_precisions.end())
+                {
+                    throw std::invalid_argument("Invalid KV cache precision: '" + value + "'. Valid: auto, fp16, q8_1");
+                }
+                config.kv_cache_precision = value;
             }
 
             // ===== Weight Sharding =====
@@ -1058,6 +1069,14 @@ namespace llaminar2
                 if (backend)
                     config.default_backend = *backend;
             }
+            else if (key == "activation_precision")
+            {
+                config.activation_precision = value;
+            }
+            else if (key == "kv_cache_precision")
+            {
+                config.kv_cache_precision = value;
+            }
         }
 
         return config;
@@ -1169,6 +1188,8 @@ MoE Configuration:
 Precision:
   --activation-precision <type>  Activation precision: fp32, bf16, fp16, q8_1
   --act-prec <type>      Alias for --activation-precision
+    --kv-cache-precision <type>  KV cache precision: auto, fp16, q8_1
+    --kv-prec <type>       Alias for --kv-cache-precision
 
 Weight Sharding:
   --shard-weights        Enable weight sharding

@@ -497,6 +497,7 @@ namespace llaminar2
          * @param n_heads Attention heads
          * @param n_kv_heads KV heads (for GQA)
          * @param quant_type Quantization type (e.g., "Q4_0")
+         * @param kv_cache_precision KV cache precision mode for placement memory model ("auto", "fp16", "q8_1")
          * @param estimated_memory Total model memory estimate
          * @param strategy_name Strategy to use (empty = auto-select)
          * @return Computed PlacementPlan
@@ -511,6 +512,7 @@ namespace llaminar2
             size_t n_kv_heads,
             const std::string &quant_type,
             size_t estimated_memory,
+            const std::string &kv_cache_precision = "auto",
             const std::string &strategy_name = "") const;
 
         /**

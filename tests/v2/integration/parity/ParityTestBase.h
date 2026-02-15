@@ -536,6 +536,10 @@ namespace llaminar2::test::parity
         /// TP backend for stages that are TP domains (only used when pp_stage_sizes has entries > 1)
         Collective tp_collective = Collective::None;
 
+        /// Runner precision controls (defaults preserve current parity behavior)
+        ActivationPrecision activation_precision = ActivationPrecision::FP32;
+        KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
+
         // Derived accessors
         size_t device_count() const { return devices.size(); }
         ParityDeviceType primary_device() const { return devices.empty() ? ParityDeviceType::CPU : devices[0]; }
@@ -1725,6 +1729,8 @@ namespace llaminar2::test::parity
             inf_config.max_seq_len = 4096;
             inf_config.batch_size = 1;
             inf_config.force_graph = true;
+            inf_config.activation_precision = cfg().activation_precision;
+            inf_config.kv_cache_precision = cfg().kv_cache_precision;
 
             // Enable mapped memory for GPU devices to avoid slow D2H syncs during snapshot capture
             // This works for both CUDA and ROCm - mapped memory enables zero-copy host access

@@ -35,8 +35,12 @@ namespace llaminar2
             return std::make_unique<ROCmRingKVCache<ActivationPrecision::FP16>>(
                 n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_id);
 
+        case ActivationPrecision::Q8_1:
+            return std::make_unique<ROCmRingKVCache<ActivationPrecision::Q8_1>>(
+                n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_id);
+
         default:
-            throw std::runtime_error("createROCmRingKVCache: Unsupported precision. Use FP32, FP16, or BF16.");
+            throw std::runtime_error("createROCmRingKVCache: Unsupported precision. Use FP32, FP16, BF16, or Q8_1.");
         }
     }
 
@@ -65,8 +69,12 @@ namespace llaminar2
             return std::make_unique<ROCmRingKVCache<ActivationPrecision::FP16>>(
                 n_layers, batch_size, max_seq_len, n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_id);
 
+        case ActivationPrecision::Q8_1:
+            return std::make_unique<ROCmRingKVCache<ActivationPrecision::Q8_1>>(
+                n_layers, batch_size, max_seq_len, n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_id);
+
         default:
-            throw std::runtime_error("createShardedROCmRingKVCache: Unsupported precision. Use FP32, FP16, or BF16.");
+            throw std::runtime_error("createShardedROCmRingKVCache: Unsupported precision. Use FP32, FP16, BF16, or Q8_1.");
         }
     }
 

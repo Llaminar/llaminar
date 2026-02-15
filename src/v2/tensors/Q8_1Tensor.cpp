@@ -885,7 +885,59 @@ namespace llaminar2
 
         // Return direct pointer - no copy needed!
         return &blocks[row_idx * blocks_per_row + k_block_offset];
-    } // ===== Static Quantization Method (Key Method!) =====
+    }
+
+    bool Q8_1Tensor::copyFrom_fp32(const float *src_data)
+    {
+        return copyFrom_fp32_rows(src_data, shape_[0]);
+    }
+
+    bool Q8_1Tensor::copyFrom_fp32_rows(const float *src_data, size_t num_rows)
+    {
+        if (!src_data)
+        {
+            LOG_ERROR("[Q8_1Tensor::copyFrom_fp32_rows] src_data is null");
+            return false;
+        }
+
+        if (shape_.size() < 2)
+        {
+            LOG_ERROR("[Q8_1Tensor::copyFrom_fp32_rows] Tensor must be at least 2D");
+            return false;
+        }
+
+        if (num_rows > shape_[0])
+        {
+            LOG_ERROR("[Q8_1Tensor::copyFrom_fp32_rows] num_rows (" << num_rows
+                                                                    << ") exceeds tensor rows (" << shape_[0] << ")");
+            return false;
+        }
+
+        const size_t cols = shape_[1];
+        const size_t total_elements = num_rows * cols;
+        const size_t n_blocks = (total_elements + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+
+        Q8_1Block *blocks = mutable_typed_data();
+        if (!blocks)
+        {
+            LOG_ERROR("[Q8_1Tensor::copyFrom_fp32_rows] Failed to get mutable block storage");
+            return false;
+        }
+
+#pragma omp parallel for schedule(static) if (n_blocks >= 128)
+        for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
+        {
+            const size_t offset = block_idx * Q8_1Block::BLOCK_SIZE;
+            const size_t count = std::min(Q8_1Block::BLOCK_SIZE, total_elements - offset);
+
+            Q8_1Block &block = blocks[block_idx];
+            simd::quantize_single_block(src_data + offset, block, static_cast<int>(count));
+        }
+
+        return true;
+    }
+
+    // ===== Static Quantization Method (Key Method!) =====
 
     std::shared_ptr<Q8_1Tensor> Q8_1Tensor::quantize_from_fp32(
         const float *src,
@@ -912,58 +964,14 @@ namespace llaminar2
         Q8_1Block *blocks = reinterpret_cast<Q8_1Block *>(raw_data.data());
 
         // Quantize each block
-#pragma omp parallel for
+#pragma omp parallel for if (n_blocks >= 128)
         for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
         {
             const size_t offset = block_idx * Q8_1Block::BLOCK_SIZE;
             const size_t count = std::min(Q8_1Block::BLOCK_SIZE, total_elements - offset);
 
             Q8_1Block &block = blocks[block_idx];
-
-            // Find max absolute value in block
-            float max_abs = 0.0f;
-            for (size_t i = 0; i < count; ++i)
-            {
-                max_abs = std::max(max_abs, std::abs(src[offset + i]));
-            }
-
-            // Compute scale factor (d = max_abs / 127)
-            const float d = (max_abs > 1e-10f) ? (max_abs / 127.0f) : 0.0f;
-            block.d = fp32_to_fp16(d);
-
-            // Quantize AND compute sum simultaneously (CUDA pattern!)
-            // CRITICAL (Nov 2024): Store RAW integer sum, not d × sum!
-            int32_t sum_i32 = 0;
-            if (d > 1e-10f)
-            {
-                const float inv_d = 1.0f / d;
-                for (size_t i = 0; i < count; ++i)
-                {
-                    const float val = src[offset + i];
-                    const float scaled = val * inv_d;
-                    const float clamped = std::max(-127.0f, std::min(127.0f, scaled));
-                    block.qs[i] = static_cast<int8_t>(std::round(clamped));
-                    sum_i32 += static_cast<int32_t>(block.qs[i]); // Sum QUANTIZED values (CRITICAL!)
-                }
-            }
-            else
-            {
-                // Zero block
-                for (size_t i = 0; i < count; ++i)
-                {
-                    block.qs[i] = 0;
-                }
-            }
-
-            // Zero-fill partial block tail (if any)
-            for (size_t i = count; i < Q8_1Block::BLOCK_SIZE; ++i)
-            {
-                block.qs[i] = 0;
-            }
-
-            // Store pre-computed integer sum directly (INT16)
-            // Range check: 32 int8 values sum to [-4064, 4064], safe for INT16 [-32768, 32767]
-            block.sum_qs = static_cast<int16_t>(sum_i32);
+            simd::quantize_single_block(src + offset, block, static_cast<int>(count));
         }
 
         // Create and return Q8_1Tensor
