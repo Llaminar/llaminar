@@ -216,7 +216,7 @@ namespace llaminar2
             return false;
         }
 
-        // Device coherence is now handled automatically by GraphExecutor at stage boundaries
+        // Device coherence is now handled automatically by DeviceGraphExecutor at stage boundaries
         // based on the stage's coherencePolicy() (FULL by default)
 
         LOG_DEBUG("[AttentionComputeStage] Executing kernel: Q_type=" << params_.Q->dtype_name()
@@ -238,7 +238,7 @@ namespace llaminar2
             params_.mpi_ctx,
             device_idx);
 
-        // Device coherence (mark_device_dirty) is now handled automatically by GraphExecutor
+        // Device coherence (mark_device_dirty) is now handled automatically by DeviceGraphExecutor
         // at stage boundaries based on the stage's coherencePolicy() (FULL by default)
 
         if (!success)

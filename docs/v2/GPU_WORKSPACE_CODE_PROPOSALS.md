@@ -936,9 +936,9 @@ IBackend* DeviceWorkspaceManager::getBackend()
 } // namespace llaminar2
 ```
 
-### 1.4 GraphBufferManager Extensions
+### 1.4 DeviceGraphBufferManager Extensions
 
-Add to `GraphBufferManager.h`:
+Add to `DeviceGraphBufferManager.h`:
 
 ```cpp
 // In private section:
@@ -1675,7 +1675,7 @@ gpu_workspace.reload();
 Phase 1 (Week 1)
 ├── WorkspaceDescriptor.h ─────┐
 ├── DeviceWorkspaceManager.h/cpp ────┼── Can be done in parallel
-└── GraphBufferManager extensions ┘
+└── DeviceGraphBufferManager extensions ┘
 
 Phase 2 (Week 2, depends on Phase 1)
 ├── IWorkspaceConsumer.h

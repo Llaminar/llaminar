@@ -433,7 +433,7 @@ namespace llaminar2
          * buffer allocation infrastructure.
          *
          * @param resolved Resolved buffer specifications
-         * @return StageBufferRequirements suitable for GraphBufferManager
+         * @return StageBufferRequirements suitable for DeviceGraphBufferManager
          */
         static StageBufferRequirements toBufferRequirements(
             const std::vector<ResolvedBufferSpec> &resolved);

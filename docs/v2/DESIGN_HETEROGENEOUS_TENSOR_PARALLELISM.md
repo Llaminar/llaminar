@@ -49,7 +49,7 @@ graph.addNode("wo_allreduce",
 // Runtime/orchestrator resolves HOW to execute it
 ```
 
-The `GraphExecutor` or a `CollectiveResolver` layer binds abstract collective stages to concrete backends at execution time, based on:
+The `DeviceGraphExecutor` or a `CollectiveResolver` layer binds abstract collective stages to concrete backends at execution time, based on:
 - Device topology discovered at startup
 - Runtime configuration (prefer NCCL? Force MPI?)
 - Tensor locations (which device is the buffer on?)
@@ -71,7 +71,7 @@ The `GraphExecutor` or a `CollectiveResolver` layer binds abstract collective st
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                         EXECUTION LAYER                                      │
 │  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │  GraphExecutor                                                           ││
+│  │  DeviceGraphExecutor                                                           ││
 │  │    │                                                                     ││
 │  │    └── CollectiveContext  ←─── Decides HOW to execute collectives      ││
 │  │          │                                                               ││
@@ -635,9 +635,9 @@ The `AllreduceStage::Params` does NOT contain:
 
 ### 4.2 Backend Resolution: Two Approaches
 
-#### Approach A: GraphExecutor Resolves at Execution Time (Recommended)
+#### Approach A: DeviceGraphExecutor Resolves at Execution Time (Recommended)
 
-The `GraphExecutor` holds a `CollectiveContext` that knows how to execute collectives:
+The `DeviceGraphExecutor` holds a `CollectiveContext` that knows how to execute collectives:
 
 ```cpp
 // src/v2/execution/CollectiveContext.h
@@ -645,7 +645,7 @@ The `GraphExecutor` holds a `CollectiveContext` that knows how to execute collec
 /**
  * @brief Runtime context for collective operations
  * 
- * Injected into GraphExecutor at construction time.
+ * Injected into DeviceGraphExecutor at construction time.
  * Encapsulates ALL collective backend knowledge.
  */
 class CollectiveContext {
@@ -683,11 +683,11 @@ private:
 };
 ```
 
-The `GraphExecutor` uses this context when executing collective stages:
+The `DeviceGraphExecutor` uses this context when executing collective stages:
 
 ```cpp
-// In GraphExecutor::executeStage()
-void GraphExecutor::executeStage(const ComputeNode& node) {
+// In DeviceGraphExecutor::executeStage()
+void DeviceGraphExecutor::executeStage(const ComputeNode& node) {
     if (node.stage->type() == ComputeStageType::ALLREDUCE) {
         // Cast to get params
         auto* allreduce = static_cast<AllreduceStage*>(node.stage.get());
@@ -727,7 +727,7 @@ The stages that model graphs create are intentionally simple:
  * @brief Abstract AllReduce stage - declares WHAT, not HOW
  * 
  * Model graphs create these to declare "I need an allreduce here".
- * The GraphExecutor/CollectiveContext decides how to execute it.
+ * The DeviceGraphExecutor/CollectiveContext decides how to execute it.
  */
 class AllreduceStage : public IComputeStage {
 public:
@@ -739,7 +739,7 @@ public:
     
     explicit AllreduceStage(Params params);
     
-    // Accessors for GraphExecutor to use
+    // Accessors for DeviceGraphExecutor to use
     ITensor* buffer() const { return params_.buffer; }
     size_t count() const { return params_.count; }
     

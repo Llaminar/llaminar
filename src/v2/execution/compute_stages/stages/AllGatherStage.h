@@ -67,7 +67,7 @@ namespace llaminar2
         /// Get the TPDomain this stage belongs to (nullptr = legacy mpi_ctx path)
         const TPDomain *getDomain() const { return params_.domain; }
 
-        /// Get the stage parameters (for GraphExecutor strided allgather path)
+        /// Get the stage parameters (for DeviceGraphExecutor strided allgather path)
         const Params &getParams() const { return params_; }
 
     private:

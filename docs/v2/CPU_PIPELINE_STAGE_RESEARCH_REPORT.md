@@ -208,8 +208,8 @@ class CPUTensorBase {
 The coherence protocol is **automatic at stage boundaries**:
 
 ```cpp
-// GraphExecutor handles coherence per stage's policy:
-bool GraphExecutor::executeNode(ComputeNode& node, IDeviceContext* ctx) {
+// DeviceGraphExecutor handles coherence per stage's policy:
+bool DeviceGraphExecutor::executeNode(ComputeNode& node, IDeviceContext* ctx) {
     DeviceId target_device = node.device;
     auto policy = node.stage->coherencePolicy();
     
@@ -349,12 +349,12 @@ For CPU-only layers, weights **never need to be uploaded to GPU**.
 
 ## 5. Execution Model
 
-### 5.1 Current GraphExecutor Behavior
+### 5.1 Current DeviceGraphExecutor Behavior
 
-From `src/v2/execution/GraphExecutor.cpp`:
+From `src/v2/execution/DeviceGraphExecutor.cpp`:
 
 ```cpp
-bool GraphExecutor::executeNode(ComputeNode& node, IDeviceContext* ctx) {
+bool DeviceGraphExecutor::executeNode(ComputeNode& node, IDeviceContext* ctx) {
     // 1. Determine target device from node or stage
     DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
     
@@ -401,7 +401,7 @@ executor.execute(graph, ctx);
 
 ### 5.3 Async Execution - Current Gaps
 
-**Current limitation**: GraphExecutor executes stages **sequentially**:
+**Current limitation**: DeviceGraphExecutor executes stages **sequentially**:
 
 ```cpp
 // Current: sequential execution
@@ -435,7 +435,7 @@ The architecture supports this (nodes have devices, dependencies are tracked), b
 
 **Recommendation**: 
 ```cpp
-// Add to GraphBufferManager or DeviceWorkspaceManager:
+// Add to DeviceGraphBufferManager or DeviceWorkspaceManager:
 class PinnedMemoryPool {
     void* allocatePinned(size_t bytes);  // From pre-pinned pool
     void deallocate(void* ptr);
@@ -524,7 +524,7 @@ To enable CPU as a pipeline stage with current architecture:
    graph.addNode("cpu_layer0_gemm", std::move(stage), DeviceId::cpu());
    ```
 
-3. **Coherence**: Automatic - `GraphExecutor` handles CPU↔GPU at boundaries
+3. **Coherence**: Automatic - `DeviceGraphExecutor` handles CPU↔GPU at boundaries
 
 4. **KV Cache**: Use `KernelFactory::createCPUKVCache()` for CPU layers
 

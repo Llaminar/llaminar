@@ -54,7 +54,7 @@ This eliminates context corruption by ensuring single-threaded ownership of all 
 | Component | Thread Used | What It Creates/Uses |
 |-----------|-------------|---------------------|
 | `NCCLBackend` (init) | Worker thread via `submitAndWait` | Streams, `ncclComm_t` |
-| `NCCLBackend` (collectives) | Caller thread (GraphExecutor) | Direct NCCL calls |
+| `NCCLBackend` (collectives) | Caller thread (DeviceGraphExecutor) | Direct NCCL calls |
 | `CUDABackend` (memory ops) | Caller thread | `cudaMemcpy`, allocate |
 | `CuBLASGemmKernel` | Caller thread | cuBLAS handles, kernel launches |
 | `FlashAttentionKernel` | Caller thread | CUDA kernels |

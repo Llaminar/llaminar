@@ -1,4 +1,4 @@
-# GraphExecutor Buffer Management Plan
+# DeviceGraphExecutor Buffer Management Plan
 
 **Author:** David Sanftenberg  
 **Date:** December 2025  
@@ -6,7 +6,7 @@
 
 ## Overview
 
-Transfer buffer management from `PipelineBase`/`Qwen2Pipeline` to the `GraphExecutor` framework with a standardized, type-safe system for buffer classification and zero hot-path allocations.
+Transfer buffer management from `PipelineBase`/`Qwen2Pipeline` to the `DeviceGraphExecutor` framework with a standardized, type-safe system for buffer classification and zero hot-path allocations.
 
 ## Goals
 
@@ -54,8 +54,8 @@ enum class BufferTensorType {
 ### Component Hierarchy
 
 ```
-GraphExecutor
-├── GraphBufferManager          [COMPLETE] Buffer allocation & lifetime
+DeviceGraphExecutor
+├── DeviceGraphBufferManager          [COMPLETE] Buffer allocation & lifetime
 │   ├── BufferDescriptor        [COMPLETE] Single buffer spec
 │   ├── StageBufferRequirements [COMPLETE] All buffers for a stage
 │   └── LivenessAnalyzer        [COMPLETE] SCRATCH reuse optimization
@@ -97,17 +97,17 @@ Every `IComputeStage` must:
 
 ---
 
-### Phase 2: GraphBufferManager Core ✅ COMPLETE
+### Phase 2: DeviceGraphBufferManager Core ✅ COMPLETE
 
 **Goal**: Implement buffer allocation without reuse optimization.
 
 **Files Created**:
-- `src/v2/execution/GraphBufferManager.h`
-- `src/v2/execution/GraphBufferManager.cpp`
-- `tests/v2/unit/Test__GraphBufferManager.cpp`
+- `src/v2/execution/DeviceGraphBufferManager.h`
+- `src/v2/execution/DeviceGraphBufferManager.cpp`
+- `tests/v2/unit/Test__DeviceGraphBufferManager.cpp`
 
 **Deliverables**:
-- [x] `GraphBufferManager` class
+- [x] `DeviceGraphBufferManager` class
 - [x] `registerBuffer()` - register named buffer requirements
 - [x] `allocateAll()` - allocate all registered buffers
 - [x] `getBuffer()` - retrieve named buffer as TensorBase*
@@ -115,7 +115,7 @@ Every `IComputeStage` must:
 - [x] `getTotalMemoryBytes()` - memory budget tracking
 - [x] `getBufferMemoryBytes()` - per-buffer memory query
 - [x] Device-aware allocation (device_idx parameter)
-- [x] Unit tests: 32 tests in Test__GraphBufferManager.cpp
+- [x] Unit tests: 32 tests in Test__DeviceGraphBufferManager.cpp
 
 **Breaking Changes**: None (new API alongside existing)
 
@@ -243,7 +243,7 @@ public:
 
 ### Phase 5: Qwen2Graph Integration ← NEXT
 
-**Goal**: Qwen2Graph uses GraphBufferManager instead of external buffers.
+**Goal**: Qwen2Graph uses DeviceGraphBufferManager instead of external buffers.
 
 **Files to Modify**:
 - `src/v2/pipelines/qwen/Qwen2Graph.h` - Add buffer spec
@@ -318,7 +318,7 @@ Non-overlapping lifetimes enable reuse:
 
 ### Unit Tests
 - `Test__BufferRole.cpp` - Enum and descriptor tests
-- `Test__GraphBufferManager.cpp` - Allocation, retrieval, release
+- `Test__DeviceGraphBufferManager.cpp` - Allocation, retrieval, release
 - `Test__LivenessAnalyzer.cpp` - Aliasing correctness
 
 ### Integration Tests
@@ -370,7 +370,7 @@ Non-overlapping lifetimes enable reuse:
 
 **Completed**: Phases 1-4 (~8-9 days, 103 unit tests total)
 - Phase 1: 8 tests (BufferRole, BufferDescriptor)
-- Phase 2: 32 tests (GraphBufferManager)
+- Phase 2: 32 tests (DeviceGraphBufferManager)
 - Phase 3: 35 tests (StageBufferRequirements)
 - Phase 4: 28 tests (LivenessAnalyzer)
 

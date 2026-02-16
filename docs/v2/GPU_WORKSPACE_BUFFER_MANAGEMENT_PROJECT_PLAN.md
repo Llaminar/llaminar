@@ -14,7 +14,7 @@ This project introduces centralized GPU workspace buffer management into Llamina
 - No support for streaming/chunked operations that trade throughput for memory
 - Hot-path allocations in performance-critical code paths (e.g., FP16 GEMM)
 
-The solution is to extend `GraphBufferManager` to handle GPU workspace buffers as a first-class concern, enabling memory-bounded inference and slab-based GPU operations.
+The solution is to extend `DeviceGraphBufferManager` to handle GPU workspace buffers as a first-class concern, enabling memory-bounded inference and slab-based GPU operations.
 
 ---
 
@@ -105,7 +105,7 @@ StageBufferRequirements GEMMStage::getBufferRequirements() const {
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                     GraphBufferManager (Extended)                        │
+│                     DeviceGraphBufferManager (Extended)                        │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  CPU Activation Buffers          │  GPU Workspace Buffers               │
 │  (existing LivenessAnalyzer)     │  (NEW: DeviceWorkspaceManager)          │
@@ -161,7 +161,7 @@ Llaminar has multiple distinct buffer categories:
 
 | Buffer Type | Memory Location | Allocation Timing | Lifetime | Current System |
 |-------------|-----------------|-------------------|----------|----------------|
-| **Activation Buffers** | CPU (host) | Graph construction | Graph lifetime | `GraphBufferManager` + `LivenessAnalyzer` |
+| **Activation Buffers** | CPU (host) | Graph construction | Graph lifetime | `DeviceGraphBufferManager` + `LivenessAnalyzer` |
 | **KV Cache** | CPU (host) | Model init | Session lifetime | `IKVCache` |
 | **Weights** | CPU + GPU | Model load | Model lifetime | `WeightManager` + `ensureOnDevice()` |
 | **CPU Scratch** | CPU (host) | Graph construction | Stage lifetime | `BufferRole::SCRATCH` + aliasing |
@@ -253,11 +253,11 @@ void GraphBuilder::build() {
 
 **Goal:** Create `CPUBackend` implementing `IBackend` to unify memory query and allocation across all device types.
 
-**Rationale:** Without `CPUBackend`, the `GraphBufferManager` would need device-type switches to query memory:
+**Rationale:** Without `CPUBackend`, the `DeviceGraphBufferManager` would need device-type switches to query memory:
 
 ```cpp
 // WITHOUT CPUBackend (asymmetric, error-prone)
-size_t GraphBufferManager::computeWorkspaceBudget(DeviceId device, float fraction) {
+size_t DeviceGraphBufferManager::computeWorkspaceBudget(DeviceId device, float fraction) {
     if (device.is_gpu()) {
         IBackend* backend = BackendManager::getBackendFor(device);
         return backend->deviceMemoryFree(device.index()) * fraction;
@@ -268,7 +268,7 @@ size_t GraphBufferManager::computeWorkspaceBudget(DeviceId device, float fractio
 }
 
 // WITH CPUBackend (symmetric, clean)
-size_t GraphBufferManager::computeWorkspaceBudget(DeviceId device, float fraction) {
+size_t DeviceGraphBufferManager::computeWorkspaceBudget(DeviceId device, float fraction) {
     IBackend* backend = BackendManager::getBackendFor(device);  // Works for ALL devices
     return backend->deviceMemoryFree(device.index()) * fraction;
 }
@@ -694,7 +694,7 @@ With the rank-local view, DeviceIds are simpler:
 │     CUDA:0    → First CUDA GPU visible    CUDABackend::deviceMemoryFree(0)  │
 │     ROCm:0    → First ROCm GPU visible    ROCmBackend::deviceMemoryFree(0)  │
 │                                                                              │
-│   GraphBufferManager (running on each rank):                                │
+│   DeviceGraphBufferManager (running on each rank):                                │
 │     for (DeviceId device : stage->getUsedDevices()) {                       │
 │         IBackend* backend = BackendManager::getBackendFor(device);          │
 │         size_t budget = backend->deviceMemoryFree(device.index()) * 0.5f;   │
@@ -785,7 +785,7 @@ GPU workspace management integrates at the **GRAPH LAYER**, not the ORCHESTRATIO
 │                          │                                                   │
 │                          ▼                                                   │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  GraphBufferManager (EXTENDED)                                        │   │
+│  │  DeviceGraphBufferManager (EXTENDED)                                        │   │
 │  │                                                                       │   │
 │  │    EXISTING:                          NEW (GPU Workspace):            │   │
 │  │    ├── allocateTensors()              ├── allocateDeviceWorkspace()      │   │
@@ -811,7 +811,7 @@ GPU workspace management integrates at the **GRAPH LAYER**, not the ORCHESTRATIO
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                            EXECUTION LAYER                                   │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  GraphExecutor                                                        │   │
+│  │  DeviceGraphExecutor                                                        │   │
 │  │    • Runs stages in topological order                                │   │
 │  │    • Stages already have workspace pointers via setGpuWorkspaceBuffers() │
 │  └──────────────────────────────────────────────────────────────────────┘   │
@@ -833,7 +833,7 @@ GPU workspace management integrates at the **GRAPH LAYER**, not the ORCHESTRATIO
 | Concern | When Decided | Who Decides | Data Source | What It's For |
 |---------|--------------|-------------|-------------|---------------|
 | **Weight Placement** | At startup | PlacementStrategy | `DeviceInventory.gpu_memory` (TOTAL) | "Which layers fit on which GPU?" |
-| **Workspace Budget** | After weights loaded | GraphBufferManager | `IBackend::deviceMemoryFree()` (FREE) | "How much scratch space for kernels?" |
+| **Workspace Budget** | After weights loaded | DeviceGraphBufferManager | `IBackend::deviceMemoryFree()` (FREE) | "How much scratch space for kernels?" |
 
 ### Timeline: Memory Decisions
 
@@ -850,11 +850,11 @@ GPU workspace management integrates at the **GRAPH LAYER**, not the ORCHESTRATIO
 │  4. IBackend::deviceMemoryFree()   →  Query ACTUAL free VRAM: ~10.5 GB     │
 │         ↓                               (After weights, driver overhead)     │
 │         ↓                                                                    │
-│  5. GraphBufferManager             →  Compute workspace budget              │
+│  5. DeviceGraphBufferManager             →  Compute workspace budget              │
 │     .allocateDeviceWorkspace()             "Budget = 10.5GB × 0.8 = 8.4GB"     │
 │         ↓                               (Leave headroom for KV cache growth) │
 │         ↓                                                                    │
-│  6. GraphExecutor.run()            →  Stages use pre-allocated workspace    │
+│  6. DeviceGraphExecutor.run()            →  Stages use pre-allocated workspace    │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -887,7 +887,7 @@ GPU workspace management integrates at the **GRAPH LAYER**, not the ORCHESTRATIO
 |--------------------|---------------|-------|
 | `IBackend` | `deviceMemoryFree()`, `allocate()`, `free()` | Already implemented for ROCm |
 | `DeviceId` | Identifies target device for workspace | Existing type |
-| `GraphBufferManager` | Extended with `allocateDeviceWorkspace()` | Existing class |
+| `DeviceGraphBufferManager` | Extended with `allocateDeviceWorkspace()` | Existing class |
 | `IComputeStage` | Extended with `getWorkspaceRequirements()` | Existing interface |
 | `BackendManager` | Gets `IBackend*` for device type | Existing singleton |
 
@@ -896,7 +896,7 @@ GPU workspace management integrates at the **GRAPH LAYER**, not the ORCHESTRATIO
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                                                                              │
-│   GraphBufferManager                                                        │
+│   DeviceGraphBufferManager                                                        │
 │          │                                                                   │
 │          │ 1. Enumerate devices from graph                                  │
 │          ▼                                                                   │
@@ -1075,12 +1075,12 @@ private:
 } // namespace llaminar2
 ```
 
-### 1.3 GraphBufferManager Extension
+### 1.3 DeviceGraphBufferManager Extension
 
 ```cpp
-// Additions to GraphBufferManager
+// Additions to DeviceGraphBufferManager
 
-class GraphBufferManager : public IGraphBufferManager {
+class DeviceGraphBufferManager : public IGraphBufferManager {
 public:
     // ... existing interface ...
     
@@ -1124,9 +1124,9 @@ private:
 The workspace budget is computed **after weights are loaded**, using actual free memory:
 
 ```cpp
-// New methods in GraphBufferManager
+// New methods in DeviceGraphBufferManager
 
-class GraphBufferManager {
+class DeviceGraphBufferManager {
 public:
     // =========================================================================
     // Memory Query (uses IBackend via BackendManager)
@@ -1165,7 +1165,7 @@ public:
         constexpr size_t HEADROOM_BYTES = 256 * 1024 * 1024;  // 256 MB
         
         if (available <= HEADROOM_BYTES) {
-            LOG_WARN("[GraphBufferManager] Very low GPU memory on " 
+            LOG_WARN("[DeviceGraphBufferManager] Very low GPU memory on " 
                      << device.toString() << ": " << available / (1024*1024) << " MB");
             return 0;
         }
@@ -1173,7 +1173,7 @@ public:
         size_t usable = available - HEADROOM_BYTES;
         size_t budget = static_cast<size_t>(usable * fraction);
         
-        LOG_INFO("[GraphBufferManager] Device " << device.toString() 
+        LOG_INFO("[DeviceGraphBufferManager] Device " << device.toString() 
                  << ": " << available / (1024*1024) << " MB free, "
                  << budget / (1024*1024) << " MB workspace budget");
         
@@ -1200,7 +1200,7 @@ public:
                 : computeWorkspaceBudget(device);
             
             if (budget == 0) {
-                LOG_WARN("[GraphBufferManager] Zero budget for " << device.toString());
+                LOG_WARN("[DeviceGraphBufferManager] Zero budget for " << device.toString());
                 continue;
             }
             
@@ -1218,7 +1218,7 @@ public:
             // 4. Create manager and allocate
             auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
             if (!manager->allocate(combined)) {
-                LOG_ERROR("[GraphBufferManager] Failed to allocate workspace on " 
+                LOG_ERROR("[DeviceGraphBufferManager] Failed to allocate workspace on " 
                           << device.toString());
                 return false;
             }
@@ -1247,13 +1247,13 @@ For CPU-side workspace budgets (host pinned buffers, weight streaming), use `CPU
 
 ```cpp
 // Query CPU memory via unified IBackend API (same as GPU!)
-size_t GraphBufferManager::queryAvailableCpuMemory() {
+size_t DeviceGraphBufferManager::queryAvailableCpuMemory() {
     IBackend* backend = BackendManager::getCPUBackend();
     // deviceMemoryFree(0) returns this rank's NUMA node available memory
     return backend->deviceMemoryFree(0);
 }
 
-size_t GraphBufferManager::computeCpuWorkspaceBudget(float fraction) {
+size_t DeviceGraphBufferManager::computeCpuWorkspaceBudget(float fraction) {
     size_t available = queryAvailableCpuMemory();
     // CPU memory is shared - use conservative fraction (0.3-0.5)
     return static_cast<size_t>(available * fraction);
@@ -1273,8 +1273,8 @@ size_t GraphBufferManager::computeCpuWorkspaceBudget(float fraction) {
 | `src/v2/execution/WorkspaceDescriptor.h` | CREATE | Workspace requirement types |
 | `src/v2/execution/DeviceWorkspaceManager.h` | CREATE | Per-device workspace manager |
 | `src/v2/execution/DeviceWorkspaceManager.cpp` | CREATE | Implementation |
-| `src/v2/execution/GraphBufferManager.h` | MODIFY | Add GPU workspace methods + budget queries |
-| `src/v2/execution/GraphBufferManager.cpp` | MODIFY | Add GPU workspace implementation |
+| `src/v2/execution/DeviceGraphBufferManager.h` | MODIFY | Add GPU workspace methods + budget queries |
+| `src/v2/execution/DeviceGraphBufferManager.cpp` | MODIFY | Add GPU workspace implementation |
 | `tests/v2/unit/Test__DeviceWorkspaceManager.cpp` | CREATE | Unit tests |
 
 ### 1.7 Acceptance Criteria
@@ -1282,7 +1282,7 @@ size_t GraphBufferManager::computeCpuWorkspaceBudget(float fraction) {
 **Prerequisites:** Phase 0.5 (CPUBackend) must be complete for unified `BackendManager::getBackendFor()` API.
 
 - [ ] `DeviceWorkspaceManager` can allocate/release buffers within budget
-- [ ] `GraphBufferManager::allocateDeviceWorkspace()` works for multi-device
+- [ ] `DeviceGraphBufferManager::allocateDeviceWorkspace()` works for multi-device
 - [ ] Memory budget is respected (allocation fails gracefully if exceeded)
 - [ ] `queryAvailableGpuMemory()` returns accurate free memory via `IBackend`
 - [ ] `queryAvailableCpuMemory()` returns accurate free memory via `CPUBackend`
@@ -1715,7 +1715,7 @@ class MyGpuKernel : public IWorkspaceConsumer {
 
 ```cpp
 // Setup workspace before graph execution
-GraphBufferManager manager(&factory, &mpi_ctx);
+DeviceGraphBufferManager manager(&factory, &mpi_ctx);
 
 // Set GPU memory budget (optional - auto-detected if not set)
 manager.setGpuWorkspaceBudget(DeviceId::cuda(0), 256 * 1024 * 1024);  // 256 MB

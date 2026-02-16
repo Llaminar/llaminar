@@ -260,6 +260,19 @@ function(add_v2_test TEST_NAME)
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../.."
     )
     
+    # =========================================================================
+    # PROCESSORS: Tell CTest how many CPU slots each test consumes.
+    #
+    # CTest uses PROCESSORS to cap concurrent tests so the total does not
+    # exceed the --parallel limit (defaults to nproc = 112 on 2×28c HT).
+    # Setting each test to 4 processors means at most ~28 tests run
+    # concurrently (112 / 4), which avoids MPI/OpenMP oversubscription
+    # while still allowing good parallelism across the test suite.
+    # =========================================================================
+    set_tests_properties(${TEST_NAME} PROPERTIES
+        PROCESSORS 4
+    )
+
     # Add RESOURCE_LOCK if specified (prevents parallel execution of tests needing same resource)
     # Also: integration tests that touch GPU hardware share a lock to prevent
     # GPU resource contention when running with `ctest --parallel`.
@@ -1066,7 +1079,7 @@ add_v2_test(V2_Unit_CollectiveContext
     MPI_PROCS 1
 )
 
-# Test: GraphExecutorCollective - CollectiveContext integration with GraphExecutor
+# Test: GraphExecutorCollective - CollectiveContext integration with DeviceGraphExecutor
 add_executable(v2_unit_graph_executor_collective unit/execution/local_execution/graph/Test__GraphExecutorCollective.cpp)
 target_include_directories(v2_unit_graph_executor_collective PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
@@ -1078,7 +1091,7 @@ target_link_libraries(v2_unit_graph_executor_collective
 )
 add_v2_test(V2_Unit_GraphExecutorCollective 
     COMMAND $<TARGET_FILE:v2_unit_graph_executor_collective>
-    LABELS "V2;Unit;Collective;GraphExecutor;Execution"
+    LABELS "V2;Unit;Collective;DeviceGraphExecutor;Execution"
     MPI_PROCS 1
 )
 
@@ -1206,7 +1219,7 @@ target_link_libraries(v2_unit_mock_graph_buffer_manager
 )
 add_v2_test(V2_Unit_MockGraphBufferManager 
     COMMAND $<TARGET_FILE:v2_unit_mock_graph_buffer_manager>
-    LABELS "V2;Unit;Mock;GraphBufferManager;Testing"
+    LABELS "V2;Unit;Mock;DeviceGraphBufferManager;Testing"
     MPI_PROCS 1
 )
 
@@ -4433,7 +4446,7 @@ add_v2_test(V2_Unit_LayerExecutor
 
 # Test: BufferRole (buffer role classification and descriptor types)
 # Tests BufferRole enum, BufferDescriptor, StageBufferRequirements, and real-world usage patterns
-# Part of Phase 1: GraphExecutor buffer management infrastructure
+# Part of Phase 1: DeviceGraphExecutor buffer management infrastructure
 add_executable(v2_test_buffer_role unit/execution/debug/Test__BufferRole.cpp)
 target_link_libraries(v2_test_buffer_role llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_BufferRole
@@ -4442,25 +4455,25 @@ add_v2_test(V2_Unit_BufferRole
     MPI_PROCS 1
 )
 
-# Test: GraphBufferManager (centralized buffer allocation and management)
+# Test: DeviceGraphBufferManager (centralized buffer allocation and management)
 # Tests buffer allocation, retrieval, statistics, graph allocation, and executor integration
-# Part of Phase 2: GraphExecutor buffer management infrastructure
+# Part of Phase 2: DeviceGraphExecutor buffer management infrastructure
 add_executable(v2_test_graph_buffer_manager unit/execution/local_execution/graph/Test__GraphBufferManager.cpp)
 target_link_libraries(v2_test_graph_buffer_manager llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_GraphBufferManager
     COMMAND $<TARGET_FILE:v2_test_graph_buffer_manager>
-    LABELS "V2;Unit;Execution;GraphBufferManager;BufferManagement;TensorAllocation"
+    LABELS "V2;Unit;Execution;DeviceGraphBufferManager;BufferManagement;TensorAllocation"
     MPI_PROCS 1
 )
 
-# Test: GraphBufferManager BAR Allocation (Phase 3: BAR-backed tensor support)
-# Tests integration between GraphBufferManager and TensorFactory for BAR-backed
+# Test: DeviceGraphBufferManager BAR Allocation (Phase 3: BAR-backed tensor support)
+# Tests integration between DeviceGraphBufferManager and TensorFactory for BAR-backed
 # tensor allocation when using PCIeBAR backend with heterogeneous CUDA/ROCm GPUs.
 add_executable(v2_test_graph_buffer_manager_bar_allocation unit/execution/local_execution/graph/Test__GraphBufferManager_BARAllocation.cpp)
 target_link_libraries(v2_test_graph_buffer_manager_bar_allocation llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_GraphBufferManager_BARAllocation
     COMMAND $<TARGET_FILE:v2_test_graph_buffer_manager_bar_allocation>
-    LABELS "V2;Unit;Execution;GraphBufferManager;BufferManagement;PCIeBAR;Heterogeneous;TensorParallelism"
+    LABELS "V2;Unit;Execution;DeviceGraphBufferManager;BufferManagement;PCIeBAR;Heterogeneous;TensorParallelism"
     MPI_PROCS 1
 )
 
@@ -4817,7 +4830,7 @@ add_v2_test(V2_Unit_HeterogeneousLayerExecutor
 
 # Test: StageBufferRequirements (IComputeStage::getBufferRequirements())
 # Tests buffer requirement declarations for all compute stages (SwiGLU, ResidualAdd,
-# RMSNorm, RoPE, GEMM, FusedQKVGEMM, FusedGateUpGEMM) for GraphBufferManager integration
+# RMSNorm, RoPE, GEMM, FusedQKVGEMM, FusedGateUpGEMM) for DeviceGraphBufferManager integration
 # Part of Phase 3: Stage Migration for buffer management infrastructure
 add_executable(v2_test_stage_buffer_requirements unit/execution/compute_stages/Test__StageBufferRequirements.cpp)
 target_link_libraries(v2_test_stage_buffer_requirements llaminar2_core GTest::gtest GTest::gtest_main)
@@ -4871,7 +4884,7 @@ add_v2_test(V2_Unit_InferenceMode
     MPI_PROCS 1
 )
 
-# Test: ValidationConfig (buffer validation environment variables and GraphExecutor integration)
+# Test: ValidationConfig (buffer validation environment variables and DeviceGraphExecutor integration)
 # Tests LLAMINAR_VALIDATE_BUFFERS, LLAMINAR_FAIL_ON_ZERO, LLAMINAR_FAIL_ON_NAN.
 # Part of Buffer Contract Validation System - Phase 5: Debug Validation Flag
 add_executable(v2_test_validation_config unit/execution/config/Test__ValidationConfig.cpp)
@@ -5019,7 +5032,7 @@ add_executable(v2_test_stage_coherence unit/execution/local_execution/coherence/
 target_link_libraries(v2_test_stage_coherence llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_StageCoherence
     COMMAND $<TARGET_FILE:v2_test_stage_coherence>
-    LABELS "V2;Unit;Coherence;GraphExecutor;DeviceAbstraction;Execution"
+    LABELS "V2;Unit;Coherence;DeviceGraphExecutor;DeviceAbstraction;Execution"
     MPI_PROCS 1
 )
 
@@ -5034,7 +5047,7 @@ add_v2_test(V2_Unit_LivenessAnalyzer
     MPI_PROCS 1
 )
 
-# Test: Qwen2GraphBufferManagement (GraphBufferManager integration with DeviceGraphOrchestrator)
+# Test: Qwen2GraphBufferManagement (DeviceGraphBufferManager integration with DeviceGraphOrchestrator)
 # Tests setTensorFactory/initializeBuffers workflow, buffer allocation/binding,
 # statistics tracking, and release cleanup.
 # Part of Phase 3: Buffer Management moved to DeviceGraphOrchestrator
@@ -5042,7 +5055,7 @@ add_executable(v2_test_device_graph_orchestrator_buffer_mgmt unit/execution/loca
 target_link_libraries(v2_test_device_graph_orchestrator_buffer_mgmt llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_DeviceGraphOrchestratorBufferManagement
     COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator_buffer_mgmt>
-    LABELS "V2;Unit;DeviceGraphOrchestrator;BufferManagement;GraphBufferManager"
+    LABELS "V2;Unit;DeviceGraphOrchestrator;BufferManagement;DeviceGraphBufferManager"
     MPI_PROCS 1
 )
 
@@ -8776,7 +8789,7 @@ add_v2_test(V2_Unit_GPUGraphCapture
 )
 message(STATUS "V2 Tests: Added GPUGraphCapture unit tests")
 
-# Test: GPUGraphCaptureExecution - Integration test for GPU graph capture in GraphExecutor
+# Test: GPUGraphCaptureExecution - Integration test for GPU graph capture in DeviceGraphExecutor
 add_executable(v2_test_gpu_graph_capture_execution integration/execution/graph/Test__GPUGraphCaptureExecution.cpp)
 if(UNIX AND NOT APPLE AND (HAVE_CUDA OR HAVE_ROCM))
     set(_gpu_backends_whole_gce "")
@@ -8807,5 +8820,40 @@ add_v2_test(V2_Integration_GPUGraphCaptureExecution
     MPI_PROCS 1
 )
 message(STATUS "V2 Tests: Added GPUGraphCaptureExecution integration tests")
+
+# Test: SegmentedGraphCaptureExecution - Integration test for segmented GPU graph capture/replay
+add_executable(v2_test_segmented_graph_capture_execution integration/execution/graph/Test__SegmentedGraphCaptureExecution.cpp)
+if(UNIX AND NOT APPLE AND (HAVE_CUDA OR HAVE_ROCM))
+    set(_gpu_backends_whole_sgce "")
+    if(HAVE_CUDA)
+        list(APPEND _gpu_backends_whole_sgce -Wl,--whole-archive cuda_backend -Wl,--no-whole-archive)
+    endif()
+    if(HAVE_ROCM)
+        list(APPEND _gpu_backends_whole_sgce -Wl,--whole-archive rocm_backend -Wl,--no-whole-archive)
+    endif()
+    target_link_libraries(v2_test_segmented_graph_capture_execution PRIVATE
+        -Wl,--start-group
+        llaminar2_core
+        ${_gpu_backends_whole_sgce}
+        -Wl,--end-group
+        GTest::gtest
+        GTest::gtest_main
+    )
+else()
+    target_link_libraries(v2_test_segmented_graph_capture_execution PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+endif()
+add_v2_test(V2_Integration_SegmentedGraphCaptureExecution
+    COMMAND $<TARGET_FILE:v2_test_segmented_graph_capture_execution>
+    LABELS "V2;Integration;Execution;GraphCapture;Segmented;CUDA;ROCm"
+    MPI_PROCS 1
+)
+set_tests_properties(V2_Integration_SegmentedGraphCaptureExecution PROPERTIES
+    ENVIRONMENT "LLAMINAR_VALIDATE_BUFFERS=0;LLAMINAR_VALIDATE_INPUTS=0;LLAMINAR_FAIL_ON_ZERO=0"
+)
+message(STATUS "V2 Tests: Added SegmentedGraphCaptureExecution integration tests")
 
 endif()

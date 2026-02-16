@@ -21,7 +21,7 @@
 #include "config/TPDomainConfig.h"
 #include "config/PPStageConfig.h"
 #include "execution/compute_stages/IComputeStage.h"
-#include "execution/local_execution/graph/GraphExecutor.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "tensors/TensorFactory.h"
 #include "backends/DeviceId.h"
 #include "../../../mocks/MockLocalPPContext.h"

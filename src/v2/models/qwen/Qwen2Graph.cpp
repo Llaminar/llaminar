@@ -1657,6 +1657,7 @@ namespace llaminar2
                 int total_tokens = batch_size * seq_len;
 
                 KVCacheAppendStage::Params kv_append_params;
+                kv_append_params.device_id = device;
 
                 // Hybrid/HybridQ16 mode: Use K_rope (post-RoPE) instead of K (pre-RoPE Q8_1)
                 // The KV cache stores post-RoPE values (FP32 for Hybrid, Q16_1 for HybridQ16)
@@ -2453,7 +2454,7 @@ namespace llaminar2
             // For PCIeBAR backend, row-parallel output tensors need to be
             // registered with LocalTPContext so executePCIeBarAllreduce()
             // can find them by stage name. The tensor was allocated as
-            // BAR-backed by GraphBufferManager if conditions were met.
+            // BAR-backed by DeviceGraphBufferManager if conditions were met.
             //
             // This registration is called for EACH device orchestrator,
             // so each device registers its own tensor for this stage.

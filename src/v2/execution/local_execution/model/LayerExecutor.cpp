@@ -1,16 +1,16 @@
 /**
  * @file LayerExecutor.cpp
- * @brief Backwards compatibility - includes GraphExecutor.cpp via header
+ * @brief Backwards compatibility - includes DeviceGraphExecutor.cpp via header
  * @author David Sanftenberg
  * @date December 2025
  *
  * @deprecated This file exists for backwards compatibility only.
- * The implementation is in GraphExecutor.cpp.
+ * The implementation is in DeviceGraphExecutor.cpp.
  * 
  * Note: This file is intentionally empty as all symbols are provided
- * by GraphExecutor.cpp. The LayerExecutor alias in GraphExecutor.h
+ * by DeviceGraphExecutor.cpp. The LayerExecutor alias in DeviceGraphExecutor.h
  * ensures backwards compatibility.
  */
 
-// Implementation is in GraphExecutor.cpp
-// LayerExecutor is aliased to GraphExecutor in GraphExecutor.h
+// Implementation is in DeviceGraphExecutor.cpp
+// LayerExecutor is aliased to DeviceGraphExecutor in DeviceGraphExecutor.h

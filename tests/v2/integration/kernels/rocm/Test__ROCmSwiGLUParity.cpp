@@ -591,7 +591,7 @@ TEST_F(Test__ROCmSwiGLUParity, SwiGLU_FP16_Large)
 // ============================================================================
 // SwiGLU Tensor Interface Test
 // Note: Tensor interface tests require proper GPU coherence setup which is
-// handled by GraphExecutor in the pipeline. The low-level apply_typed tests
+// handled by DeviceGraphExecutor in the pipeline. The low-level apply_typed tests
 // above verify kernel correctness. The tensor interface is tested implicitly
 // through full pipeline integration tests.
 // ============================================================================

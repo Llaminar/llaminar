@@ -1,6 +1,6 @@
 /**
  * @file Test__CollectiveBufferAllocation.cpp
- * @brief Unit tests for collective buffer allocation via GraphBufferManager
+ * @brief Unit tests for collective buffer allocation via DeviceGraphBufferManager
  *
  * Tests the Phase 3 Buffer Registration API integration where buffers
  * marked as participating in collective operations can be allocated
@@ -11,7 +11,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "v2/execution/local_execution/graph/GraphBufferManager.h"
+#include "v2/execution/local_execution/graph/DeviceGraphBufferManager.h"
 #include "v2/execution/local_execution/collective/CollectiveContext.h"
 #include "v2/collective/backends/PCIeBARBackend.h"
 #include "v2/collective/BackendRouter.h"
@@ -194,7 +194,7 @@ namespace llaminar2::test
         {
             mpi_ctx_ = std::make_unique<MPIContext>(0, 1, MPI_COMM_WORLD);
             factory_ = std::make_unique<TensorFactory>(*mpi_ctx_);
-            manager_ = std::make_unique<GraphBufferManager>(factory_.get(), mpi_ctx_.get());
+            manager_ = std::make_unique<DeviceGraphBufferManager>(factory_.get(), mpi_ctx_.get());
         }
 
         void TearDown() override
@@ -206,7 +206,7 @@ namespace llaminar2::test
 
         std::unique_ptr<MPIContext> mpi_ctx_;
         std::unique_ptr<TensorFactory> factory_;
-        std::unique_ptr<GraphBufferManager> manager_;
+        std::unique_ptr<DeviceGraphBufferManager> manager_;
     };
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -271,7 +271,7 @@ namespace llaminar2::test
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // GraphBufferManager Collective Integration Tests
+    // DeviceGraphBufferManager Collective Integration Tests
     // ═══════════════════════════════════════════════════════════════════════════
 
     TEST_F(CollectiveBufferAllocationTest, SetCollectiveContext_Works)

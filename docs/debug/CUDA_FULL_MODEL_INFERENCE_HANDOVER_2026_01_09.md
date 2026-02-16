@@ -109,7 +109,7 @@ void mark_device_dirty() {
 
 3. **Hardcoded CPU Devices** (Partially Fixed):
    - [BufferRole.h](../../src/v2/execution/BufferRole.h) lines 372-400: Static builders hardcode `DeviceId::cpu()`
-   - [GraphBufferManager.cpp](../../src/v2/execution/GraphBufferManager.cpp) line 289: `group_desc.device = DeviceId::cpu();`
+   - [DeviceGraphBufferManager.cpp](../../src/v2/execution/DeviceGraphBufferManager.cpp) line 289: `group_desc.device = DeviceId::cpu();`
    - Note: `GraphOrchestrator::initializeInferenceState()` does pass device correctly to TensorFactory
 
 4. **Multiple Tensor Instances**: Could there be separate tensor objects for the same logical buffer?
@@ -123,7 +123,7 @@ void mark_device_dirty() {
 | [CUDAOpsKernels.cpp](../../src/v2/kernels/cuda/ops/CUDAOpsKernels.cpp) | CUDA kernel implementations | Embedding line 909, RMSNorm line 152 |
 | [Qwen2Graph.cpp](../../src/v2/models/qwen/Qwen2Graph.cpp) | Buffer wiring | Lines 700-770: Stage buffer connections |
 | [GraphOrchestrator.cpp](../../src/v2/execution/GraphOrchestrator.cpp) | Buffer initialization | Lines 730-900: `initializeInferenceState()` |
-| [GraphBufferManager.cpp](../../src/v2/execution/GraphBufferManager.cpp) | Buffer allocation | Line 289: Hardcoded CPU device |
+| [DeviceGraphBufferManager.cpp](../../src/v2/execution/DeviceGraphBufferManager.cpp) | Buffer allocation | Line 289: Hardcoded CPU device |
 | [BufferRole.h](../../src/v2/execution/BufferRole.h) | Buffer descriptors | Lines 372-400: Static builders hardcode CPU |
 
 ## Test Commands
@@ -171,7 +171,7 @@ LOG_DEBUG("[ensureOnDevice] tensor=" << (void*)this
 ```
 
 ### Priority 3: Check Buffer Allocation Path
-Trace whether `GraphBufferManager::allocateAliasingGroups()` is creating buffers with wrong device affinity.
+Trace whether `DeviceGraphBufferManager::allocateAliasingGroups()` is creating buffers with wrong device affinity.
 
 ### Priority 4: Validate Debug Log Accuracy
 The debug output may be reading from host after device write. Verify by:

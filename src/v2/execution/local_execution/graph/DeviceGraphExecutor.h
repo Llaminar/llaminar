@@ -1,10 +1,10 @@
 /**
- * @file GraphExecutor.h
+ * @file DeviceGraphExecutor.h
  * @brief Compute graph execution engine
  * @author David Sanftenberg
  * @date December 2025
  *
- * GraphExecutor coordinates the execution of ComputeStages within a compute graph,
+ * DeviceGraphExecutor coordinates the execution of ComputeStages within a compute graph,
  * managing:
  * - Device-aware stage scheduling
  * - Asynchronous execution with dependency tracking
@@ -17,7 +17,7 @@
  *   Pipeline / ModelExecutor
  *      |
  *      v
- *   GraphExecutor  <-- This component
+ *   DeviceGraphExecutor  <-- This component
  *      |
  *      v
  *   ComputeStage[] (device-specific implementations)
@@ -32,7 +32,7 @@
 #include "../../compute_stages/ComputeStages.h"
 #include "../device/DeviceContext.h"
 #include "../../mpi_orchestration/WorkDistributor.h"
-#include "GraphBufferManager.h"
+#include "DeviceGraphBufferManager.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../utils/DebugEnv.h" // For LLAMINAR_ASSERTIONS_ACTIVE
 #include "../../../interfaces/ICollectiveContext.h"
@@ -196,12 +196,12 @@ namespace llaminar2
     /**
      * @brief Orchestrates execution of compute stages within a graph
      *
-     * GraphExecutor manages the execution of compute graphs by handling
+     * DeviceGraphExecutor manages the execution of compute graphs by handling
      * topological ordering, device contexts, and execution modes.
      *
      * Usage:
      * @code
-     * GraphExecutor executor(config);
+     * DeviceGraphExecutor executor(config);
      *
      * // Build a graph
      * ComputeGraph graph;
@@ -213,21 +213,21 @@ namespace llaminar2
      * executor.execute(graph, ctx);
      * @endcode
      */
-    class GraphExecutor : public IGraphExecutor
+    class DeviceGraphExecutor : public IGraphExecutor
     {
     public:
         /**
          * @brief Construct with configuration
          * @param config Executor configuration
          */
-        explicit GraphExecutor(const GraphExecutorConfig &config = GraphExecutorConfig());
-        ~GraphExecutor() override;
+        explicit DeviceGraphExecutor(const GraphExecutorConfig &config = GraphExecutorConfig());
+        ~DeviceGraphExecutor() override;
 
         // Non-copyable, movable
-        GraphExecutor(const GraphExecutor &) = delete;
-        GraphExecutor &operator=(const GraphExecutor &) = delete;
-        GraphExecutor(GraphExecutor &&) = default;
-        GraphExecutor &operator=(GraphExecutor &&) = default;
+        DeviceGraphExecutor(const DeviceGraphExecutor &) = delete;
+        DeviceGraphExecutor &operator=(const DeviceGraphExecutor &) = delete;
+        DeviceGraphExecutor(DeviceGraphExecutor &&) = default;
+        DeviceGraphExecutor &operator=(DeviceGraphExecutor &&) = default;
 
         // =========================================================================
         // Configuration (IGraphExecutor interface)
@@ -348,13 +348,13 @@ namespace llaminar2
          *
          * @param manager Buffer manager (not owned, must outlive executor)
          */
-        void setBufferManager(GraphBufferManager *manager) { buffer_manager_ = manager; }
+        void setBufferManager(DeviceGraphBufferManager *manager) { buffer_manager_ = manager; }
 
         /**
          * @brief Get the current buffer manager
          * @return Pointer to buffer manager (nullptr if not set)
          */
-        GraphBufferManager *bufferManager() const { return buffer_manager_; }
+        DeviceGraphBufferManager *bufferManager() const { return buffer_manager_; }
 
         /**
          * @brief Execute a graph with automatic buffer management
@@ -558,10 +558,38 @@ namespace llaminar2
                                               IWorkerGPUContext *gpu_ctx,
                                               const std::unordered_set<std::string> *collective_nodes = nullptr);
 
+        /**
+         * @brief Policy object for decode capture/replay execution mode selection
+         */
+        struct DecodeCapturePolicy
+        {
+            bool allow_fast_decode = true;
+            bool allow_segmented_capture = false;
+            bool collective_segmented_enabled = false;
+            int max_segment_failures = 4;
+        };
+
+        /**
+         * @brief Execute decode graph according to a single policy object
+         *
+         * Centralizes mode selection between segmented replay, fast decode, and
+         * full executor fallback. When segmented replay fails, this method falls
+         * back to fast decode automatically.
+         */
+        bool executeDecodeWithCapturePolicy(
+            ComputeGraph &graph,
+            IDeviceContext *ctx,
+            GraphSegmentCache *segment_cache,
+            void *gpu_stream,
+            IWorkerGPUContext *gpu_ctx,
+            const std::unordered_set<std::string> *collective_nodes,
+            const DecodeCapturePolicy &policy,
+            bool *used_segmented_capture = nullptr);
+
     private:
         GraphExecutorConfig config_;
         GraphExecutorStats stats_;
-        GraphBufferManager *buffer_manager_ = nullptr; ///< Optional buffer manager (not owned)
+        DeviceGraphBufferManager *buffer_manager_ = nullptr; ///< Optional buffer manager (not owned)
         ICollectiveContext *collective_ctx_ = nullptr; ///< Optional collective context (not owned)
 
         // Internal execution helpers
@@ -643,6 +671,6 @@ namespace llaminar2
     };
 
     // Backwards compatibility alias
-    using LayerExecutor = GraphExecutor;
+    using LayerExecutor = DeviceGraphExecutor;
 
 } // namespace llaminar2

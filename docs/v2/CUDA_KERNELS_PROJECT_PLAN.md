@@ -33,7 +33,7 @@ Stages must be updated to work with `ITensor*` directly (via polymorphism) rathe
 | `DeviceType` enum | ✅ Working | `src/v2/devices/DeviceContext.h` |
 | `IDeviceContext` interface | ✅ Working | `src/v2/devices/DeviceContext.h` |
 | `ComputeGraph` with `device_idx` | ✅ Working | `src/v2/execution/ComputeGraph.h` |
-| `GraphExecutor::executeMultiDevice()` | ✅ Working | `src/v2/execution/GraphExecutor.cpp` |
+| `DeviceGraphExecutor::executeMultiDevice()` | ✅ Working | `src/v2/execution/DeviceGraphExecutor.cpp` |
 | `KernelFactory` device routing | ✅ Working | `src/v2/kernels/KernelFactory.h` |
 | `LayerPlacement` per-layer devices | ✅ Exists | `src/v2/pipelines/qwen/PlacementPlan.h` |
 | `PlacementStrategy` interface | ✅ Exists | `src/v2/pipelines/qwen/PlacementStrategy.h` |
@@ -240,12 +240,12 @@ bool TensorBase::ensureOnDevice(int target_device) {
 
 ---
 
-### Hook 5: GraphExecutor Multi-Device Dispatch
+### Hook 5: DeviceGraphExecutor Multi-Device Dispatch
 
-**File**: `src/v2/execution/GraphExecutor.cpp`
+**File**: `src/v2/execution/DeviceGraphExecutor.cpp`
 
 ```cpp
-bool GraphExecutor::executeMultiDevice(
+bool DeviceGraphExecutor::executeMultiDevice(
     ComputeGraph& graph,
     const std::unordered_map<int, IDeviceContext*>& contexts) 
 {
@@ -605,7 +605,7 @@ GraphOrchestrator
     ├─> Qwen2Graph::build*Graph(placement_plan)
     │       └─> Creates stages with per-layer device_idx
     │
-    └─> GraphExecutor::executeMultiDevice(graph, {cpu_ctx, cuda_ctx})
+    └─> DeviceGraphExecutor::executeMultiDevice(graph, {cpu_ctx, cuda_ctx})
             │
             ├─> CPU nodes → CPUDeviceContext → CPU kernels
             └─> GPU nodes → CUDADeviceContext → CUDA kernels

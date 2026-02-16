@@ -8,7 +8,7 @@
 #include <gtest/gtest.h>
 #include "execution/local_execution/graph/GraphResolver.h"
 #include "execution/local_execution/graph/GraphSchema.h"
-#include "execution/local_execution/graph/GraphExecutor.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "models/qwen/Qwen2Schema.h"
 #include "tensors/Tensors.h"
 
@@ -396,6 +396,77 @@ TEST_F(Test__GraphResolver, Qwen2Schema_AttentionStages_HaveCorrectTPModes)
     }
 
     EXPECT_TRUE(found_qkv) << "qkv_proj stage not found in Qwen2 schema";
+}
+
+// ============================================================================
+// Regression Test: KVCacheAppend device propagation
+//
+// Locks in the fix for the bug where KVCacheAppend resolved stages didn't
+// propagate the target device to the stage params, causing
+// appendWithStream() to never be called for GPU KV caches.
+//
+// Bug: KVCacheAppendStage::Params.device_id defaulted to CPU regardless of
+//      the resolved stage's device. Raw FP32 bytes were written directly
+//      to FP16/Q8_1 ring buffers, corrupting KV cache data.
+// Fix: Added params.device_id = stage.device in GraphResolver::buildStage()
+// ============================================================================
+
+TEST_F(Test__GraphResolver, Qwen2Schema_KVCacheAppend_DeviceFromConfig)
+{
+    Qwen2SchemaFactory factory;
+    GraphSchema schema = factory.createSchema();
+
+    // Configure with a CUDA device and KV cache enabled
+    // (KVCacheAppend stage has requires_kv_cache=true in schema)
+    GraphResolverConfig config = default_config_;
+    config.n_layers = 1;
+    config.default_device = DeviceId::cuda(0);
+    config.has_kv_cache = true;
+
+    ResolvedGraphSpec resolved = resolver_.resolve(schema, config, empty_tensors_);
+
+    // Find the KVCacheAppend resolved stage
+    bool found_kv_append = false;
+    for (const auto &stage : resolved.stages)
+    {
+        if (stage.type == StageType::KVCacheAppend)
+        {
+            found_kv_append = true;
+            EXPECT_TRUE(stage.device.is_gpu())
+                << "REGRESSION: KVCacheAppend resolved stage has CPU device when "
+                   "config.default_device is CUDA. This will cause "
+                   "KVCacheAppendStage::Params.device_id to be CPU, preventing "
+                   "appendWithStream() from being called on GPU KV caches.";
+            EXPECT_EQ(stage.device.type, DeviceType::CUDA)
+                << "KVCacheAppend stage device should match config.default_device";
+        }
+    }
+    EXPECT_TRUE(found_kv_append)
+        << "Qwen2 schema should include a KVCacheAppend stage";
+}
+
+TEST_F(Test__GraphResolver, Qwen2Schema_KVCacheAppend_CPUDeviceForCPUConfig)
+{
+    Qwen2SchemaFactory factory;
+    GraphSchema schema = factory.createSchema();
+
+    // Configure with CPU device and KV cache enabled
+    GraphResolverConfig config = default_config_;
+    config.n_layers = 1;
+    config.default_device = DeviceId::cpu();
+    config.has_kv_cache = true;
+
+    ResolvedGraphSpec resolved = resolver_.resolve(schema, config, empty_tensors_);
+
+    for (const auto &stage : resolved.stages)
+    {
+        if (stage.type == StageType::KVCacheAppend)
+        {
+            EXPECT_TRUE(stage.device.is_cpu())
+                << "KVCacheAppend resolved stage should have CPU device "
+                   "when config.default_device is CPU";
+        }
+    }
 }
 
 // ============================================================================

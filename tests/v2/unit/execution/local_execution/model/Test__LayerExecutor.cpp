@@ -527,9 +527,9 @@ TEST_F(LayerExecutorTest, StatsReset)
 // =============================================================================
 // NOTE: Architecture-specific graph building tests (buildAttentionGraph,
 // buildFFNGraph, buildMoEGraph) were moved to Test__Qwen2Graph.cpp as part
-// of the LayerExecutor → GraphExecutor + Qwen2Graph refactoring.
+// of the LayerExecutor → DeviceGraphExecutor + Qwen2Graph refactoring.
 //
-// GraphExecutor is now a pure execution engine. Architecture-specific graph
+// DeviceGraphExecutor is now a pure execution engine. Architecture-specific graph
 // building logic lives in Qwen2Graph (or other architecture-specific classes).
 // =============================================================================
 
@@ -597,7 +597,7 @@ TEST_F(LayerExecutorTest, ExecuteMultiDeviceSingleContext)
 // =============================================================================
 
 // NOTE: Tests for buildAttentionGraph/buildFFNGraph/buildMoEGraph with null
-// params moved to Test__Qwen2Graph.cpp - GraphExecutor is pure execution engine
+// params moved to Test__Qwen2Graph.cpp - DeviceGraphExecutor is pure execution engine
 
 TEST_F(LayerExecutorTest, DuplicateNodeName)
 {

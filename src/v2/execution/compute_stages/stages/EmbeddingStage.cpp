@@ -213,7 +213,7 @@ namespace llaminar2
 
         // Mark output as device-dirty WITH EVENT immediately after GPU kernel launch.
         // This ensures any subsequent read (e.g., DEBUG logging below) will properly
-        // sync via event wait rather than reading stale data. The GraphExecutor's
+        // sync via event wait rather than reading stale data. The DeviceGraphExecutor's
         // markOutputsDirty() call is too late for reads inside execute().
         if (params_.device_id.type != DeviceType::CPU)
         {

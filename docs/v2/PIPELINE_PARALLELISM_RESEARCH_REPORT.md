@@ -65,7 +65,7 @@ for (int layer = 0; layer < config_.n_layers; ++layer)
 
 **Current Flow**:
 1. `executeForward()` builds full forward graph
-2. `GraphExecutor::execute()` runs stages in topological order
+2. `DeviceGraphExecutor::execute()` runs stages in topological order
 3. No inter-rank synchronization except `AllreduceStage` and `AllGatherStage` for tensor parallelism
 
 **Key Structures**:
@@ -255,23 +255,23 @@ public:
 };
 ```
 
-### 2.3 ComputeGraph/GraphExecutor Changes
+### 2.3 ComputeGraph/DeviceGraphExecutor Changes
 
-**Current Limitation**: `GraphExecutor::execute()` is synchronous—no support for interleaved execution with communication.
+**Current Limitation**: `DeviceGraphExecutor::execute()` is synchronous—no support for interleaved execution with communication.
 
 **Required Changes**:
 
 1. **Add `ExecutionMode::PIPELINED`** (already defined but not implemented):
 ```cpp
-// GraphExecutor.cpp line 365
+// DeviceGraphExecutor.cpp line 365
 case ExecutionMode::PIPELINED:
-    LOG_WARN("[GraphExecutor] Pipelined mode not yet implemented, using sequential");
+    LOG_WARN("[DeviceGraphExecutor] Pipelined mode not yet implemented, using sequential");
     return executeSequential(graph, ctx);
 ```
 
 2. **Implement `executePipelined()`**:
 ```cpp
-bool GraphExecutor::executePipelined(ComputeGraph& graph, IDeviceContext* ctx) {
+bool DeviceGraphExecutor::executePipelined(ComputeGraph& graph, IDeviceContext* ctx) {
     // For GPipe-style execution:
     // 1. Process micro-batches in order
     // 2. Overlap communication with computation where possible
@@ -778,7 +778,7 @@ Legend: F(mbX) = Forward pass for micro-batch X
 | `MPIContext` | `src/v2/utils/MPIContext.h` | Extend with P2P methods |
 | `Qwen2Graph::buildAttentionGraph/buildFFNGraph` | `src/v2/models/qwen/Qwen2Graph.cpp` | Already per-layer, reuse directly |
 | `LayerGraphCache` | `src/v2/execution/GraphOrchestrator.h` | Cache per-layer graphs per stage |
-| `ComputeGraph::merge()` | `src/v2/execution/GraphExecutor.cpp` | Compose stage subgraphs |
+| `ComputeGraph::merge()` | `src/v2/execution/DeviceGraphExecutor.cpp` | Compose stage subgraphs |
 | `WeightManager::getWeight()` | `src/v2/loaders/WeightManager.h` | Load by layer name |
 | `IKVCache` per-layer interface | `src/v2/kernels/IKVCache.h` | Allocate partial cache |
 | `AllreduceStage`, `AllGatherStage` | `src/v2/execution/compute_stages/` | Pattern for new P2P stages |
@@ -798,7 +798,7 @@ Legend: F(mbX) = Forward pass for micro-batch X
 | `Qwen2Graph::buildForwardGraph_PP` | PP-aware graph building | 3 days |
 | `GraphOrchestrator::forward_PP` | Micro-batch scheduling | 5 days |
 | `PipelineBuffers` | Multi-buffer management | 2 days |
-| `GraphExecutor::executePipelined` | Pipelined execution mode | 3 days |
+| `DeviceGraphExecutor::executePipelined` | Pipelined execution mode | 3 days |
 | Unit/integration tests | Test coverage | 3 days |
 
 **Total Estimate**: 3-4 weeks for basic PP, 6-8 weeks for production-ready

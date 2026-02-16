@@ -7,7 +7,7 @@
  * This is an internal interface used by CollectiveContext to execute
  * collective operations. Model graphs (like Qwen2Graph) do NOT interact
  * with this interface directly - they use abstract AllreduceStage/AllGatherStage
- * and the GraphExecutor handles backend selection via CollectiveContext.
+ * and the DeviceGraphExecutor handles backend selection via CollectiveContext.
  *
  * Provides a unified interface for collective operations (AllReduce, AllGather, etc.)
  * across different backends:

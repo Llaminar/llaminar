@@ -559,7 +559,7 @@ namespace llaminar2::verification
      * @param expect Model dimension expectations
      * @return LayoutValidationResult with pass/fail and diagnostics
      *
-     * @note This is called by GraphExecutor during automatic layout validation
+     * @note This is called by DeviceGraphExecutor during automatic layout validation
      */
     inline LayoutValidationResult validateBufferLayoutByShape(
         const std::vector<size_t> &shape,

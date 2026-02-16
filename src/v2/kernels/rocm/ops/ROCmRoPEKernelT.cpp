@@ -466,7 +466,7 @@ namespace llaminar2
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             HipDeviceGuard::setDevice(dev);
 
-            // Get GPU pointers - coherence is handled by GraphExecutor
+            // Get GPU pointers - coherence is handled by DeviceGraphExecutor
             float *d_Q = static_cast<float *>(q_fp32->gpu_data_ptr());
             float *d_K = k_fp32 ? static_cast<float *>(k_fp32->gpu_data_ptr()) : nullptr;
 

@@ -1,5 +1,5 @@
 /**
- * @file IGraphBufferManager.h
+ * @file IDeviceGraphBufferManager.h
  * @brief Interface for graph buffer management operations
  *
  * Abstracts buffer allocation and retrieval to enable:
@@ -39,7 +39,7 @@ namespace llaminar2
      * - Testing aliasing algorithms in isolation
      *
      * Implementations:
-     * - GraphBufferManager: Real buffer manager with tensor allocation
+     * - DeviceGraphBufferManager: Real buffer manager with tensor allocation
      * - MockGraphBufferManager: Test implementation with configurable behavior
      */
     class IGraphBufferManager
@@ -157,7 +157,7 @@ namespace llaminar2
         /**
          * @brief Bind a buffer to a stage's params
          *
-         * This is a hook for future integration where GraphExecutor
+         * This is a hook for future integration where DeviceGraphExecutor
          * automatically binds buffers to stage params before execution.
          *
          * @param node_name Node name

@@ -5,7 +5,7 @@
  * @date December 2025
  *
  * Tests that each stage correctly declares its buffer requirements,
- * enabling GraphBufferManager to allocate and manage buffers.
+ * enabling DeviceGraphBufferManager to allocate and manage buffers.
  */
 
 #include <gtest/gtest.h>

@@ -21,12 +21,12 @@ This document describes how to integrate CUDA Graphs with Llaminar's ComputeStag
 ┌─────────────────────────────────────────────────────────────────┐
 │                     ModelExecutor                                │
 │  - Manages prefill/decode phases                                │
-│  - Calls GraphExecutor.execute() per iteration                  │
+│  - Calls DeviceGraphExecutor.execute() per iteration                  │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                     GraphExecutor                                │
+│                     DeviceGraphExecutor                                │
 │  - Iterates over ComputeGraph nodes in topological order        │
 │  - Calls executeNode() for each stage                           │
 │  - Handles coherence (ensureOnDevice, markOutputsDirty)         │
@@ -54,7 +54,7 @@ This document describes how to integrate CUDA Graphs with Llaminar's ComputeStag
         │ Decode (batch=1)                      │ Prefill (batch=N)
         ▼                                       ▼
 ┌───────────────────────┐           ┌───────────────────────┐
-│  CUDAGraphExecutor    │           │  GraphExecutor        │
+│  CUDAGraphExecutor    │           │  DeviceGraphExecutor        │
 │  (new component)      │           │  (existing)           │
 └───────────┬───────────┘           └───────────────────────┘
             │
@@ -160,13 +160,13 @@ public:
 
 ```cpp
 /**
- * @file CUDAGraphExecutor.h
+ * @file CUDADeviceGraphExecutor.h
  * @brief CUDA Graph-based executor for decode phase
  */
 
 #pragma once
 
-#include "IGraphExecutor.h"
+#include "IDeviceGraphExecutor.h"
 #include <memory>
 
 namespace llaminar2 {
@@ -251,7 +251,7 @@ bool CUDAGraphExecutor::execute(ComputeGraph& graph, IDeviceContext* ctx) {
     if (state_ == GraphState::UNCAPTURED || needsRecapture(graph)) {
         if (!captureGraph(graph, ctx)) {
             LOG_WARN("[CUDAGraphExecutor] Capture failed, falling back to direct execution");
-            return GraphExecutor::executeSequential(graph, ctx);
+            return DeviceGraphExecutor::executeSequential(graph, ctx);
         }
     }
     
@@ -353,7 +353,7 @@ bool CUDAGraphExecutor::replayGraph(IDeviceContext* ctx) {
 
 ### Problem: Coherence Operations Are Host-Side
 
-Current coherence management in GraphExecutor:
+Current coherence management in DeviceGraphExecutor:
 ```cpp
 // This is HOST code - runs on CPU
 if (!cohereInputs(inputs, target_device)) { ... }  // Host decision
@@ -428,7 +428,7 @@ The KV cache grows by 1 position each decode step. This changes memory access pa
 // In ModelExecutor.cpp
 
 class ModelExecutor {
-    std::unique_ptr<GraphExecutor> standard_executor_;      // For prefill
+    std::unique_ptr<DeviceGraphExecutor> standard_executor_;      // For prefill
     std::unique_ptr<CUDAGraphExecutor> decode_executor_;    // For decode
     
 public:

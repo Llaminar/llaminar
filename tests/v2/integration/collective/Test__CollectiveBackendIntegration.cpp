@@ -4,7 +4,7 @@
  *
  * This test suite validates that collectives work correctly for all supported
  * backend configurations. Tests exercise the full path:
- *   GraphExecutor → CollectiveContext → BackendRouter → Backend
+ *   DeviceGraphExecutor → CollectiveContext → BackendRouter → Backend
  *
  * ## Test Scenarios
  *
@@ -29,7 +29,7 @@
 #include <numeric>
 
 #include "execution/local_execution/collective/CollectiveContext.h"
-#include "execution/local_execution/graph/GraphExecutor.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/compute_stages/stages/AllreduceStage.h"
@@ -395,7 +395,7 @@ TEST_F(Test__CollectiveCPU, AllReduceSumViaMPIBackend)
 }
 
 /**
- * @brief Test GraphExecutor's interception of AllreduceStage
+ * @brief Test DeviceGraphExecutor's interception of AllreduceStage
  */
 TEST_F(Test__CollectiveCPU, AllReduceWithGraphExecutorInterception)
 {
@@ -403,7 +403,7 @@ TEST_F(Test__CollectiveCPU, AllReduceWithGraphExecutorInterception)
     auto collective_ctx = CollectiveContextFactory::createIntraNode(inventory, mpi_ctx_);
 
     GraphExecutorConfig config;
-    auto executor = std::make_unique<GraphExecutor>(config);
+    auto executor = std::make_unique<DeviceGraphExecutor>(config);
     executor->setCollectiveContext(collective_ctx.get());
 
     auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{SMALL_SIZE});
@@ -445,9 +445,9 @@ TEST_F(Test__CollectiveCPU, AllReduceWithGraphExecutorInterception)
     CPUDeviceContext cpu_ctx(DeviceId::cpu());
 
     bool success = executor->execute(graph, &cpu_ctx);
-    ASSERT_TRUE(success) << "GraphExecutor::execute failed";
+    ASSERT_TRUE(success) << "DeviceGraphExecutor::execute failed";
 
-    verifyAllReduceResult(tensor->data(), expected.data(), SMALL_SIZE, "MPI (via GraphExecutor)");
+    verifyAllReduceResult(tensor->data(), expected.data(), SMALL_SIZE, "MPI (via DeviceGraphExecutor)");
     verifyRankParity(tensor->data(), SMALL_SIZE);
 }
 

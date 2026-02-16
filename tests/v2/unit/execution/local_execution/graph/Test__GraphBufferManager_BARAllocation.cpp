@@ -1,8 +1,8 @@
 /**
  * @file Test__GraphBufferManager_BARAllocation.cpp
- * @brief Unit tests for GraphBufferManager BAR-backed allocation
+ * @brief Unit tests for DeviceGraphBufferManager BAR-backed allocation
  *
- * Tests the integration between GraphBufferManager and TensorFactory for
+ * Tests the integration between DeviceGraphBufferManager and TensorFactory for
  * BAR-backed tensor allocation when using PCIeBAR backend with heterogeneous
  * CUDA/ROCm GPUs.
  *
@@ -15,7 +15,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/local_execution/graph/GraphBufferManager.h"
+#include "execution/local_execution/graph/DeviceGraphBufferManager.h"
 #include "tensors/TensorFactory.h"
 #include "models/qwen/Qwen2BufferSpec.h"
 #include "config/OrchestrationConfig.h"
@@ -142,14 +142,14 @@ namespace llaminar2
         }
 
         // =========================================================================
-        // Test: GraphBufferManager allocates standard tensors without BAR
+        // Test: DeviceGraphBufferManager allocates standard tensors without BAR
         // =========================================================================
 
         TEST_F(Test__GraphBufferManager_BARAllocation, AllocateStandardTensor_NoBAR)
         {
             // Create manager with default config (no BAR)
             GraphBufferManagerConfig config;
-            GraphBufferManager manager(factory_.get(), nullptr, config);
+            DeviceGraphBufferManager manager(factory_.get(), nullptr, config);
 
             // Allocate a buffer
             auto desc = createBufferDesc("residual");
@@ -168,7 +168,7 @@ namespace llaminar2
         }
 
         // =========================================================================
-        // Test: GraphBufferManager falls back gracefully when BAR unavailable
+        // Test: DeviceGraphBufferManager falls back gracefully when BAR unavailable
         // =========================================================================
 
         TEST_F(Test__GraphBufferManager_BARAllocation, FallbackWhenBARUnavailable)
@@ -176,7 +176,7 @@ namespace llaminar2
             // Create manager with PCIeBAR config but factory has no P2P set
             // This simulates the case where BAR is requested but not available
             auto config = createPCIeBarConfig();
-            GraphBufferManager manager(factory_.get(), nullptr, config);
+            DeviceGraphBufferManager manager(factory_.get(), nullptr, config);
 
             // Factory should NOT be able to create BAR-backed tensors without P2P
             EXPECT_FALSE(factory_->canCreateBARBacked());

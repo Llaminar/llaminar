@@ -98,7 +98,7 @@ namespace llaminar2
                 return false;
             }
 
-            // Coherence handled by GraphExecutor - tensors are already on GPU
+            // Coherence handled by DeviceGraphExecutor - tensors are already on GPU
             // Get device pointers
             const float *d_input_ptr = static_cast<const float *>(input_fp32->gpu_data_ptr());
             const float *d_weight_ptr = static_cast<const float *>(weight_fp32->gpu_data_ptr());

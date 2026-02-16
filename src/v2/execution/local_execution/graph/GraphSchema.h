@@ -185,8 +185,8 @@ namespace llaminar2
         /// Only used if is_optional = true
         std::string exec_policy_key;
 
-        /// Device override (CPU = use default)
-        DeviceId device = DeviceId::cpu();
+        /// Device override (invalid = use runtime default_device)
+        DeviceId device; // Default-constructed = invalid, inherits from runtime config
 
         // =================================================================
         // Stage-specific parameters (declarative, not pointers)
@@ -259,7 +259,7 @@ namespace llaminar2
      * @brief Alias group specification for memory optimization
      *
      * Defines a group of buffers that can share physical memory because
-     * their lifetimes don't overlap. GraphBufferManager uses this to
+     * their lifetimes don't overlap. DeviceGraphBufferManager uses this to
      * reduce activation memory footprint.
      *
      * Example: Q, K, V are consumed before gate, up are written,

@@ -4,7 +4,7 @@
  * @author David Sanftenberg
  * @date December 2025
  *
- * These tests ensure that when a snapshot callback is set on GraphExecutor,
+ * These tests ensure that when a snapshot callback is set on DeviceGraphExecutor,
  * it is invoked for EVERY stage after successful execution. This is critical
  * for E2E parity testing and debugging.
  *
@@ -24,7 +24,7 @@
 #include <algorithm>
 
 // Core execution components
-#include "execution/local_execution/graph/GraphExecutor.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/local_execution/graph/IGraphExecutor.h"
 #include "execution/local_execution/device/DeviceContext.h"
@@ -184,7 +184,7 @@ TEST_F(GraphSnapshotCallbackTest, RMSNormStage_CallbackInvoked)
     GraphExecutorConfig config;
     config.snapshot_callback = createTrackingCallback();
 
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     // Execute with graph
     ASSERT_TRUE(executor.execute(graph, ctx_.get()));
@@ -224,7 +224,7 @@ TEST_F(GraphSnapshotCallbackTest, SwiGLUStage_CallbackInvoked)
     GraphExecutorConfig config;
     config.snapshot_callback = createTrackingCallback();
 
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     ASSERT_TRUE(executor.execute(graph, ctx_.get()));
 
@@ -263,7 +263,7 @@ TEST_F(GraphSnapshotCallbackTest, ResidualAddStage_CallbackInvoked)
     GraphExecutorConfig config;
     config.snapshot_callback = createTrackingCallback();
 
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     ASSERT_TRUE(executor.execute(graph, ctx_.get()));
 
@@ -343,7 +343,7 @@ TEST_F(GraphSnapshotCallbackTest, FusedAttentionWoStage_CallbackInvoked)
     GraphExecutorConfig config;
     config.snapshot_callback = createTrackingCallback();
 
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     // Execute the graph
     bool success = executor.execute(graph, ctx_.get());
@@ -445,7 +445,7 @@ TEST_F(GraphSnapshotCallbackTest, DISABLED_FusedAttentionWoStage_Q16IntegerBacke
     GraphExecutorConfig config;
     config.snapshot_callback = createTrackingCallback();
 
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     // Execute the graph
     bool success = executor.execute(graph, ctx_.get());
@@ -550,7 +550,7 @@ TEST_F(GraphSnapshotCallbackTest, DISABLED_Q16IntegerBackend_SnapshotOutputsCorr
     GraphExecutorConfig config;
     config.snapshot_callback = createTrackingCallback();
 
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
     bool success = executor.execute(graph, ctx_.get());
     ASSERT_TRUE(success) << "Q16_INTEGER attention execution failed";
 
@@ -717,7 +717,7 @@ TEST_F(GraphSnapshotCallbackTest, DISABLED_Q16IntegerBackend_RejectsWrongTensorT
     graph.addNode("wrong_type_test", ComputeStageFactory::createFusedAttentionWo(params), DeviceId::cpu());
 
     GraphExecutorConfig config;
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     // Execution should fail due to wrong tensor types
     bool success = executor.execute(graph, ctx_.get());
@@ -799,7 +799,7 @@ TEST_F(GraphSnapshotCallbackTest, MultiStageGraph_AllCallbacksInvoked)
     GraphExecutorConfig config;
     config.snapshot_callback = createTrackingCallback();
 
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     ASSERT_TRUE(executor.execute(graph, ctx_.get()));
 
@@ -844,7 +844,7 @@ TEST_F(GraphSnapshotCallbackTest, NoCallback_NoFailure)
     GraphExecutorConfig config;
     // config.snapshot_callback is nullptr by default
 
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     // Should not crash even without callback
     EXPECT_TRUE(executor.execute(graph, ctx_.get()));
@@ -882,7 +882,7 @@ TEST_F(GraphSnapshotCallbackTest, CallbackCanBeChanged)
     GraphExecutorConfig config;
     config.snapshot_callback = createTrackingCallback();
 
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     // First execution
     ASSERT_TRUE(executor.execute(graph, ctx_.get()));
@@ -940,7 +940,7 @@ TEST_F(GraphSnapshotCallbackTest, CallbackReceivesValidDumpInfo)
         captured_info = info;
     };
 
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
     ASSERT_TRUE(executor.execute(graph, ctx_.get()));
 
     EXPECT_TRUE(callback_invoked);

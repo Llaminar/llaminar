@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "GraphExecutor.h"
+#include "DeviceGraphExecutor.h"
 #include "../../../backends/DeviceId.h"
 
 namespace llaminar2

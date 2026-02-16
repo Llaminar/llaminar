@@ -20,7 +20,7 @@
 #include <memory>
 
 #include "execution/local_execution/graph/IPipelineParallelGraphBuilder.h"
-#include "execution/local_execution/graph/GraphExecutor.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "execution/compute_stages/ComputeStageFactory.h"
 #include "tensors/Tensors.h"

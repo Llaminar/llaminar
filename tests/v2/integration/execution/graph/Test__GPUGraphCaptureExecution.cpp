@@ -1,6 +1,6 @@
 /**
  * @file Test__GPUGraphCaptureExecution.cpp
- * @brief Integration tests for GPU graph capture/replay via GraphExecutor::executeWithGraphCapture()
+ * @brief Integration tests for GPU graph capture/replay via DeviceGraphExecutor::executeWithGraphCapture()
  *
  * Tests the end-to-end flow:
  *   1. Build ComputeGraph with real stages (RMSNorm, ResidualAdd)
@@ -23,7 +23,7 @@
 #include <cmath>
 
 // Core execution
-#include "execution/local_execution/graph/GraphExecutor.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/local_execution/device/DeviceContext.h"
 
@@ -200,7 +200,7 @@ TEST_F(GPUGraphCaptureExecutionTest, FirstExecution_ProducesCorrectOutput)
     auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
 
     GraphExecutorConfig config;
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     // Execute via graph capture path
     bool success = executor.executeWithGraphCapture(graph, device_ctx_.get(), capture_.get());
@@ -253,7 +253,7 @@ TEST_F(GPUGraphCaptureExecutionTest, SecondExecution_UsesUpdatePath)
     auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
 
     GraphExecutorConfig config;
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     // First execution — instantiate path (or 0-node skip for CPU-only stages)
     ASSERT_TRUE(executor.executeWithGraphCapture(graph, device_ctx_.get(), capture_.get()));
@@ -310,7 +310,7 @@ TEST_F(GPUGraphCaptureExecutionTest, MultipleReExecutions_StableOutput)
     auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
 
     GraphExecutorConfig config;
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     // First execution
     ASSERT_TRUE(executor.executeWithGraphCapture(graph, device_ctx_.get(), capture_.get()));
@@ -351,7 +351,7 @@ TEST_F(GPUGraphCaptureExecutionTest, NullCapture_FallsBackToFastDecode)
     auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
 
     GraphExecutorConfig config;
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     // Pass nullptr for capture — should fall back to executeFastDecode
     bool success = executor.executeWithGraphCapture(graph, device_ctx_.get(), nullptr);
@@ -387,7 +387,7 @@ TEST_F(GPUGraphCaptureExecutionTest, CollectiveNodesPresent_FallsBackToFastDecod
     auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
 
     GraphExecutorConfig config;
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     // Provide a non-empty collective_nodes set — this forces the fallback path
     // even though none of the actual nodes in our graph are collective.
@@ -432,7 +432,7 @@ TEST_F(GPUGraphCaptureExecutionTest, EmptyCollectiveSet_DoesNotFallBack)
     auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
 
     GraphExecutorConfig config;
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     // Empty set — should NOT cause fallback
     std::unordered_set<std::string> empty_collectives;
@@ -476,7 +476,7 @@ TEST_F(GPUGraphCaptureExecutionTest, ResetAndRecapture_Works)
     auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
 
     GraphExecutorConfig config;
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     // First execution
     ASSERT_TRUE(executor.executeWithGraphCapture(graph, device_ctx_.get(), capture_.get()));
@@ -530,7 +530,7 @@ TEST_F(GPUGraphCaptureExecutionTest, SingleStageGraph_Works)
     graph.addNode("solo_rmsnorm", ComputeStageFactory::createRMSNorm(params), device_ctx_->deviceId());
 
     GraphExecutorConfig config;
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     ASSERT_TRUE(executor.executeWithGraphCapture(graph, device_ctx_.get(), capture_.get()));
     // With GPU stages, hasExecutable() is true.
@@ -565,7 +565,7 @@ TEST_F(GPUGraphCaptureExecutionTest, OutputMatchesFastDecode)
     auto graph1 = buildNormResidualGraph(seq_len, d_model, norm_input1, residual1, result1);
 
     GraphExecutorConfig config;
-    GraphExecutor executor(config);
+    DeviceGraphExecutor executor(config);
 
     ASSERT_TRUE(executor.executeWithGraphCapture(graph1, device_ctx_.get(), nullptr));
     std::vector<float> fast_decode_output(num_elements);

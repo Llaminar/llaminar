@@ -294,16 +294,16 @@ if (dm.has_gpu()) {
 
 ## 5. Graph Buffer Management System
 
-### GraphBufferManager
+### DeviceGraphBufferManager
 
-**File**: [src/v2/execution/GraphBufferManager.h](../../../src/v2/execution/GraphBufferManager.h)
+**File**: [src/v2/execution/DeviceGraphBufferManager.h](../../../src/v2/execution/DeviceGraphBufferManager.h)
 
-Centralized buffer management for GraphExecutor:
+Centralized buffer management for DeviceGraphExecutor:
 
 ```cpp
-class GraphBufferManager {
+class DeviceGraphBufferManager {
 public:
-    explicit GraphBufferManager(TensorFactory* factory, const MPIContext* mpi_ctx = nullptr);
+    explicit DeviceGraphBufferManager(TensorFactory* factory, const MPIContext* mpi_ctx = nullptr);
     
     // Allocation
     bool allocateForGraph(ComputeGraph& graph);
@@ -350,8 +350,8 @@ struct BufferDescriptor {
 ### Current Buffer Allocation Flow (CPU)
 
 ```cpp
-// GraphBufferManager::createTensorFromDescriptor() (current implementation)
-std::unique_ptr<TensorBase> GraphBufferManager::createTensorFromDescriptor(const BufferDescriptor& desc) {
+// DeviceGraphBufferManager::createTensorFromDescriptor() (current implementation)
+std::unique_ptr<TensorBase> DeviceGraphBufferManager::createTensorFromDescriptor(const BufferDescriptor& desc) {
     int device_idx = desc.device_idx;  // Currently always -1 (CPU)
     
     switch (desc.tensor_type) {
@@ -375,15 +375,15 @@ std::unique_ptr<TensorBase> GraphBufferManager::createTensorFromDescriptor(const
 ### Issue 1: Return Type Mismatch
 
 **Current State**:
-- `GraphBufferManager` stores `std::unique_ptr<TensorBase>` (alias for `CPUTensorBase`)
+- `DeviceGraphBufferManager` stores `std::unique_ptr<TensorBase>` (alias for `CPUTensorBase`)
 - `CUDATensorBase` does NOT inherit from `CPUTensorBase`
 - Both inherit from `ITensor` (common interface)
 
 **Solution**: Change buffer storage to `std::unique_ptr<ITensor>`:
 
 ```cpp
-// GraphBufferManager.h
-class GraphBufferManager {
+// DeviceGraphBufferManager.h
+class DeviceGraphBufferManager {
 private:
     // OLD:
     // std::unordered_map<BufferKey, std::unique_ptr<TensorBase>, BufferKeyHash> buffers_;
@@ -429,12 +429,12 @@ struct BufferDescriptor {
 };
 ```
 
-### Issue 3: GraphBufferManager::createTensorFromDescriptor
+### Issue 3: DeviceGraphBufferManager::createTensorFromDescriptor
 
 Needs to use `TensorFactory::create()` (which already supports CUDA) instead of type-specific methods:
 
 ```cpp
-std::unique_ptr<ITensor> GraphBufferManager::createTensorFromDescriptor(const BufferDescriptor& desc) {
+std::unique_ptr<ITensor> DeviceGraphBufferManager::createTensorFromDescriptor(const BufferDescriptor& desc) {
     DeviceId device = (desc.device_idx >= 0) 
         ? DeviceId::cuda(desc.device_idx) 
         : DeviceId::cpu();
@@ -487,10 +487,10 @@ struct ResolvedBufferSpec {
 
 ## 7. Concrete Implementation Plan
 
-### Phase 1: Update GraphBufferManager to Support ITensor
+### Phase 1: Update DeviceGraphBufferManager to Support ITensor
 
 ```cpp
-// GraphBufferManager.h changes:
+// DeviceGraphBufferManager.h changes:
 
 // 1. Change storage type
 std::unordered_map<BufferKey, std::unique_ptr<ITensor>, BufferKeyHash> buffers_;
@@ -506,9 +506,9 @@ std::unique_ptr<ITensor> createTensorFromDescriptor(const BufferDescriptor& desc
 ### Phase 2: Implement GPU Buffer Creation
 
 ```cpp
-// GraphBufferManager.cpp changes:
+// DeviceGraphBufferManager.cpp changes:
 
-std::unique_ptr<ITensor> GraphBufferManager::createTensorFromDescriptor(const BufferDescriptor& desc) {
+std::unique_ptr<ITensor> DeviceGraphBufferManager::createTensorFromDescriptor(const BufferDescriptor& desc) {
     DeviceId device = DeviceId::fromLegacyIndex(desc.device_idx);
     
     // Map BufferTensorType to TensorType
@@ -589,8 +589,8 @@ StageBufferRequirements CUDAAttentionStage::getBufferRequirements() const {
 
 | Component | Change Needed | Priority |
 |-----------|---------------|----------|
-| GraphBufferManager storage | `TensorBase` → `ITensor` | High |
-| GraphBufferManager::getBuffer | Return `ITensor*` | High |
+| DeviceGraphBufferManager storage | `TensorBase` → `ITensor` | High |
+| DeviceGraphBufferManager::getBuffer | Return `ITensor*` | High |
 | createTensorFromDescriptor | Use `factory_->create()` | High |
 | BufferSpec (schema) | Add `device` field | Medium |
 | Stage buffer requirements | Set `device_idx` for GPU | Medium |
@@ -603,7 +603,7 @@ StageBufferRequirements CUDAAttentionStage::getBufferRequirements() const {
 
 // 1. Create factory and manager
 TensorFactory factory(mpi_ctx);
-GraphBufferManager manager(&factory, &mpi_ctx);
+DeviceGraphBufferManager manager(&factory, &mpi_ctx);
 
 // 2. Allocate GPU buffer manually
 BufferDescriptor gpu_output;
@@ -632,7 +632,7 @@ float* d_ptr = cuda_tensor->typed_data();  // Device pointer
 - **TensorFactory**: [src/v2/tensors/TensorFactory.h](../../../src/v2/tensors/TensorFactory.h)
 - **CUDATensorBase**: [src/v2/tensors/cuda/CUDATensorBase.h](../../../src/v2/tensors/cuda/CUDATensorBase.h)
 - **CUDATypedTensor**: [src/v2/tensors/cuda/CUDATypedTensor.h](../../../src/v2/tensors/cuda/CUDATypedTensor.h)
-- **GraphBufferManager**: [src/v2/execution/GraphBufferManager.h](../../../src/v2/execution/GraphBufferManager.h)
+- **DeviceGraphBufferManager**: [src/v2/execution/DeviceGraphBufferManager.h](../../../src/v2/execution/DeviceGraphBufferManager.h)
 - **BufferRole/BufferDescriptor**: [src/v2/execution/BufferRole.h](../../../src/v2/execution/BufferRole.h)
 - **GraphSchema (BufferSpec)**: [src/v2/execution/GraphSchema.h](../../../src/v2/execution/GraphSchema.h)
 - **GraphResolver (ResolvedBufferSpec)**: [src/v2/execution/GraphResolver.h](../../../src/v2/execution/GraphResolver.h)

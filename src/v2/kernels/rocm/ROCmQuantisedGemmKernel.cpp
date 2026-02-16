@@ -603,7 +603,7 @@ namespace llaminar2
                 auto *accessor = dynamic_cast<const IQuantizedTileAccessor *>(tensor);
                 if (!accessor)
                 {
-                    LOG_WARN("[packRatioVNNIPhase1] Tensor does not implement IQuantizedTileAccessor");
+                    LOG_DEBUG("[packRatioVNNIPhase1] Tensor does not implement IQuantizedTileAccessor");
                     return false;
                 }
 
@@ -1703,7 +1703,7 @@ namespace llaminar2
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to cast input to FP32Tensor");
                     return false;
                 }
-                // Coherence handled automatically by GraphExecutor
+                // Coherence handled automatically by DeviceGraphExecutor
                 // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr() (HIP pointer)
                 if (fp32_input->isBARBacked() && fp32_input->rocm_data_ptr() != nullptr)
                 {
@@ -1807,7 +1807,7 @@ namespace llaminar2
                     break;
                 }
 
-                // Coherence handled automatically by GraphExecutor
+                // Coherence handled automatically by DeviceGraphExecutor
                 // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr() (HIP pointer)
                 float *d_output = nullptr;
                 if (fp32_output->isBARBacked() && fp32_output->rocm_data_ptr() != nullptr)

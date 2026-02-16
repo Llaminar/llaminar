@@ -22,7 +22,7 @@ V2 is a **kernel-centric, operator-free** architecture:
 6. **Centralized kernel dispatch** – `KernelFactory` provides unified kernel creation with caching
 7. **Automatic weight sharding** – Megatron-style tensor parallelism distributes weights across MPI ranks
 8. **Graph caching** – `LayerGraphCache` builds DAGs that are cached and reused during decode
-9. **Zero-allocation hot path** – all buffers pre-allocated via `GraphBufferManager` + `DeviceWorkspaceManager`
+9. **Zero-allocation hot path** – all buffers pre-allocated via `DeviceGraphBufferManager` + `DeviceWorkspaceManager`
 10. **Automatic coherence** – GPU↔CPU memory sync handled by `StageCoherence` at stage boundaries
 11. **Hybrid parallelism** – Three-level parallelism: cross-rank PP, intra-rank layer placement, heterogeneous GPU TP
 12. **Proportional work distribution** – Unequal work splits for mixed GPU vendors (e.g., NVIDIA 73%, AMD 27%)
@@ -92,14 +92,14 @@ V2 is a **kernel-centric, operator-free** architecture:
 │                             GRAPH LAYER                                      │
 │                                                                              │
 │   ┌───────────────────────┐        ┌────────────────────────────────────┐   │
-│   │  ComputeGraph (DAG)   │        │  GraphBufferManager                │   │
+│   │  ComputeGraph (DAG)   │        │  DeviceGraphBufferManager                │   │
 │   │    • ComputeNode      │        │    • LivenessAnalyzer (aliasing)   │   │
 │   │    • dependencies     │        │    • DeviceWorkspaceManager        │   │
 │   │    • getExecutionOrder│        │    • WorkspaceBudgetConfig         │   │
 │   └───────────────────────┘        └────────────────────────────────────┘   │
 │                                                                              │
 │   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  GraphExecutor (IGraphExecutor)                                     │   │
+│   │  DeviceGraphExecutor (IGraphExecutor)                                     │   │
 │   │    • execute(graph, ctx) → topological order                        │   │
 │   │    • StageCoherence (GPU↔CPU sync at boundaries)                   │   │
 │   │    • TensorVerification (debug builds: NaN/zero detection)         │   │
@@ -372,7 +372,7 @@ The **DeviceGraphOrchestrator** is the single-device graph-based execution syste
 │                        DeviceGraphOrchestrator                              │
 │                                                                              │
 │   ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────────────┐   │
-│   │  InferenceState │   │  GraphExecutor  │   │   LayerGraphCache       │   │
+│   │  InferenceState │   │  DeviceGraphExecutor  │   │   LayerGraphCache       │   │
 │   │  - hidden       │   │  - execute()    │   │   - attention_decode    │   │
 │   │  - logits       │   │  - topo sort    │   │   - ffn_decode          │   │
 │   │  - kv_cache     │   │  - coherence    │   │   - layer_prefetch_fn   │   │
@@ -440,7 +440,7 @@ struct InferenceState {
 
 ### 3.3 ComputeGraph and ComputeNode
 
-Location: `src/v2/execution/local_execution/graph/GraphExecutor.h`
+Location: `src/v2/execution/local_execution/graph/DeviceGraphExecutor.h`
 
 A **ComputeGraph** is a DAG of `ComputeNode` structures:
 
@@ -485,7 +485,7 @@ public:
     // Debugging/parity (REQUIRED for all stages)
     virtual StageDumpInfo getDumpInfo() const = 0;
     
-    // Buffer requirements for GraphBufferManager
+    // Buffer requirements for DeviceGraphBufferManager
     virtual StageBufferRequirements getBufferRequirements() const { return {}; }
     
     // Coherence policy for automatic GPU↔CPU sync
@@ -629,7 +629,7 @@ The DeviceGraphOrchestrator implements **Megatron-style tensor parallelism** whe
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           RANK 0                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  DeviceGraphOrchestrator (owns InferenceState, GraphExecutor)        │    │
+│  │  DeviceGraphOrchestrator (owns InferenceState, DeviceGraphExecutor)        │    │
 │  │  ┌──────────────────────────────────────────────────────────────┐   │    │
 │  │  │  ComputeGraph (FFN layer)                                     │   │    │
 │  │  │  ┌────────┐ ┌────────┐ ┌────────┐ ┌──────────────┐ ┌───────┐ │   │    │
@@ -791,14 +791,14 @@ enum class CollectiveBackendType {
 
 ## 5. Buffer Management
 
-### 5.1 GraphBufferManager
+### 5.1 DeviceGraphBufferManager
 
-Location: `src/v2/execution/local_execution/graph/GraphBufferManager.h`
+Location: `src/v2/execution/local_execution/graph/DeviceGraphBufferManager.h`
 
 Manages memory allocation with buffer aliasing for reduced footprint:
 
 ```cpp
-class GraphBufferManager : public IGraphBufferManager {
+class DeviceGraphBufferManager : public IGraphBufferManager {
 public:
     struct MemoryInfo {
         size_t total_bytes;
@@ -1013,11 +1013,11 @@ The verification system provides fail-fast validation at stage boundaries in Deb
 - **All-zero detection**: Warns on suspiciously empty tensors
 - **Layout validation**: Verifies shape matches expected layout
 
-**GraphExecutor Integration:**
+**DeviceGraphExecutor Integration:**
 
 ```cpp
 // Automatically called at stage boundaries
-void GraphExecutor::execute(ComputeGraph& graph, ExecutionContext& ctx) {
+void DeviceGraphExecutor::execute(ComputeGraph& graph, ExecutionContext& ctx) {
     for (auto& stage : topological_order) {
         // BEFORE stage execution
         verifyStageEntry(stage, layer_idx);
@@ -1260,15 +1260,15 @@ public:
 };
 ```
 
-#### Automatic Coherence via GraphExecutor
+#### Automatic Coherence via DeviceGraphExecutor
 
-Location: `src/v2/execution/local_execution/graph/GraphExecutor.cpp`, `src/v2/execution/local_execution/coherence/StageCoherence.h`
+Location: `src/v2/execution/local_execution/graph/DeviceGraphExecutor.cpp`, `src/v2/execution/local_execution/coherence/StageCoherence.h`
 
-The `GraphExecutor` handles coherence **automatically** at stage boundaries using the stage's `coherencePolicy()`:
+The `DeviceGraphExecutor` handles coherence **automatically** at stage boundaries using the stage's `coherencePolicy()`:
 
 ```cpp
-// GraphExecutor stage execution flow (simplified)
-bool GraphExecutor::executeStage(const ComputeNode& node) {
+// DeviceGraphExecutor stage execution flow (simplified)
+bool DeviceGraphExecutor::executeStage(const ComputeNode& node) {
     CoherencePolicy policy = node.stage->coherencePolicy();
     auto dump_info = node.stage->getDumpInfo();
     
@@ -1391,7 +1391,7 @@ bool initMappedMemory(size_t bytes, DeviceId target_device);
 
 Location: `src/v2/execution/local_execution/coherence/GpuCoherence.h`
 
-For tests and custom pipelines that bypass GraphExecutor, use RAII utilities:
+For tests and custom pipelines that bypass DeviceGraphExecutor, use RAII utilities:
 
 ```cpp
 #include "execution/local_execution/coherence/GpuCoherence.h"
@@ -1682,7 +1682,7 @@ The `StageDumper` provides comprehensive disk-based debugging of stage execution
 | `LLAMINAR_STAGE_DUMP_TYPES` | Comma-separated stage types to dump (e.g., `GEMM,ATTENTION`) |
 | `LLAMINAR_STAGE_DUMP_LAYERS` | Comma-separated layer indices to dump |
 
-**Usage (automatic via GraphExecutor):**
+**Usage (automatic via DeviceGraphExecutor):**
 ```bash
 LLAMINAR_STAGE_DUMP=1 LLAMINAR_STAGE_DUMP_LAYERS=0,1 ./build_v2/llaminar2 -m model.gguf -p "test"
 ```
@@ -1695,7 +1695,7 @@ The **snapshot system** uses `StageDumpInfo` outputs for parity testing. It capt
 
 **Architecture:**
 ```
-StageDumpInfo.outputs  ->  GraphExecutor.snapshot_callback_  ->  In-memory storage
+StageDumpInfo.outputs  ->  DeviceGraphExecutor.snapshot_callback_  ->  In-memory storage
                                      |
                           IInferenceRunner.getSnapshot()  ->  parity test comparison
 ```
@@ -1704,7 +1704,7 @@ StageDumpInfo.outputs  ->  GraphExecutor.snapshot_callback_  ->  In-memory stora
 - **In-memory storage** - `std::map<std::string, std::vector<float>>`
 - **Zero overhead in Release** - Compiles away to NOOPs
 
-**GraphExecutor Integration:**
+**DeviceGraphExecutor Integration:**
 ```cpp
 // After stage execution, if snapshot callback is configured
 if (success && config_.snapshot_callback) {
@@ -1742,7 +1742,7 @@ for (const auto& key : keys) {
 The TensorVerification system (Section 4.4) also uses `StageDumpInfo`:
 
 ```cpp
-void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
+void DeviceGraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
     auto dump_info = node.stage->getDumpInfo();  // Get all outputs
     
     for (const auto& output : dump_info.outputs) {
@@ -1787,9 +1787,9 @@ void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
 | InferenceRunnerFactory | `src/v2/execution/factory/InferenceRunnerFactory.h` |
 | Model context interface | `src/v2/interfaces/IModelContext.h` |
 | **Local Execution / Graph** | |
-| GraphExecutor | `src/v2/execution/local_execution/graph/GraphExecutor.h` |
+| DeviceGraphExecutor | `src/v2/execution/local_execution/graph/DeviceGraphExecutor.h` |
 | IGraphBuilder | `src/v2/execution/local_execution/graph/IGraphBuilder.h` |
-| GraphBufferManager | `src/v2/execution/local_execution/graph/GraphBufferManager.h` |
+| DeviceGraphBufferManager | `src/v2/execution/local_execution/graph/DeviceGraphBufferManager.h` |
 | LivenessAnalyzer | `src/v2/execution/local_execution/graph/LivenessAnalyzer.h` |
 | **Local Execution / Device** | |
 | DeviceContext | `src/v2/execution/local_execution/device/DeviceContext.h` |
@@ -1852,7 +1852,7 @@ void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
 4. **Use KernelFactory** – Prefer `getOrCreateGemm()` for cached kernel access
 5. **Declarative graphs** – Build computation as DAGs of `ComputeStage` nodes
 6. **Graph caching** – Reuse cached graphs in decode mode for performance
-7. **Use StageCoherence** – Let GraphExecutor handle GPU↔CPU sync automatically
+7. **Use StageCoherence** – Let DeviceGraphExecutor handle GPU↔CPU sync automatically
 8. **Implement getDumpInfo()** – All stages must support introspection
 9. **DeviceId not int** – Use typed `DeviceId` for device identification
 10. **Collective via BackendRouter** – Let the router select optimal MPI backend
@@ -1865,7 +1865,7 @@ void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
 |----------|--------|
 | `LLAMINAR_LOG_LEVEL=DEBUG` | Set logging verbosity |
 | `LLAMINAR_PROFILE_KERNELS=1` | Enable per-kernel timing in benchmark mode |
-| `LLAMINAR_EXECUTOR_PROFILING=1` | Enable per-stage profiling in GraphExecutor |
+| `LLAMINAR_EXECUTOR_PROFILING=1` | Enable per-stage profiling in DeviceGraphExecutor |
 | `LLAMINAR_VALIDATE_BUFFERS=1` | Enable buffer validation at stage boundaries |
 | `LLAMINAR_VALIDATE_INPUTS=1` | Enable input validation before stage execution |
 | `LLAMINAR_FAIL_ON_NAN=1` | Throw exception on NaN/Inf detection (default in Debug) |
@@ -2263,12 +2263,12 @@ public:
 };
 ```
 
-**GraphExecutor Integration:**
+**DeviceGraphExecutor Integration:**
 ```cpp
-// Inject CollectiveContext into GraphExecutor
+// Inject CollectiveContext into DeviceGraphExecutor
 executor.setCollectiveContext(collective_ctx);
 
-// GraphExecutor automatically intercepts ALLREDUCE/ALLGATHER stages
+// DeviceGraphExecutor automatically intercepts ALLREDUCE/ALLGATHER stages
 // and routes to CollectiveContext instead of stage's internal MPI
 ```
 

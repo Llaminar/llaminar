@@ -2,7 +2,7 @@
  * @file Test__UnifiedPP_Execution.cpp
  * @brief Integration tests for unified PP graph execution
  *
- * Tests the execution of unified PP graphs via GraphExecutor::executeMultiDevice()
+ * Tests the execution of unified PP graphs via DeviceGraphExecutor::executeMultiDevice()
  * with:
  * 1. Multiple device contexts (one per PP stage domain)
  * 2. LocalPPTransferStage nodes executing transfers between stages
@@ -23,7 +23,7 @@
 #include "config/PipelineConfig.h"
 #include "config/TPDomainConfig.h"
 #include "config/PPStageConfig.h"
-#include "execution/local_execution/graph/GraphExecutor.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/compute_stages/stages/LocalPPTransferStage.h"
 #include "loaders/ModelContext.h"
@@ -483,7 +483,7 @@ namespace
      * @test Execute 2-stage PP forward pass with mock transfers
      *
      * Verifies that a unified PP graph can be built and executed
-     * via GraphExecutor::executeMultiDevice().
+     * via DeviceGraphExecutor::executeMultiDevice().
      */
     TEST_F(Test__UnifiedPP_Execution, ExecuteTwoStagePPForward)
     {
@@ -527,7 +527,7 @@ namespace
         GraphExecutorConfig exec_config;
         exec_config.enable_validation = false;  // Disable validation for performance
         exec_config.enable_profiling = false;
-        GraphExecutor executor(exec_config);
+        DeviceGraphExecutor executor(exec_config);
 
         // Execute graph
         bool success = executor.executeMultiDevice(compute_graph, contexts);
@@ -571,7 +571,7 @@ namespace
         std::unordered_map<DeviceId, IDeviceContext *> contexts;
         contexts[cpu_device_] = cpu_context_.get();
 
-        GraphExecutor executor;
+        DeviceGraphExecutor executor;
         bool success = executor.executeMultiDevice(compute_graph, contexts);
         ASSERT_TRUE(success);
 
@@ -617,7 +617,7 @@ namespace
         std::unordered_map<DeviceId, IDeviceContext *> contexts;
         contexts[cpu_device_] = cpu_context_.get();
 
-        GraphExecutor executor;
+        DeviceGraphExecutor executor;
         bool success = executor.executeMultiDevice(compute_graph, contexts);
         ASSERT_TRUE(success);
 
@@ -672,7 +672,7 @@ namespace
         std::unordered_map<DeviceId, IDeviceContext *> contexts;
         contexts[cpu_device_] = cpu_context_.get();
 
-        GraphExecutor executor;
+        DeviceGraphExecutor executor;
         bool success = executor.executeMultiDevice(compute_graph, contexts);
         ASSERT_TRUE(success);
 
@@ -722,7 +722,7 @@ namespace
         std::unordered_map<DeviceId, IDeviceContext *> contexts;
         contexts[cpu_device_] = cpu_context_.get();
 
-        GraphExecutor executor;
+        DeviceGraphExecutor executor;
         bool success = executor.executeMultiDevice(compute_graph, contexts);
         ASSERT_TRUE(success);
 
@@ -773,7 +773,7 @@ namespace
         std::unordered_map<DeviceId, IDeviceContext *> contexts;
         contexts[cpu_device_] = cpu_context_.get();
 
-        GraphExecutor executor;
+        DeviceGraphExecutor executor;
         bool success = executor.executeMultiDevice(compute_graph, contexts);
         ASSERT_TRUE(success);
 
@@ -830,7 +830,7 @@ namespace
         std::unordered_map<DeviceId, IDeviceContext *> contexts;
         contexts[cpu_device_] = cpu_context_.get();
 
-        GraphExecutor executor;
+        DeviceGraphExecutor executor;
         bool success = executor.executeMultiDevice(compute_graph, contexts);
         ASSERT_TRUE(success);
 

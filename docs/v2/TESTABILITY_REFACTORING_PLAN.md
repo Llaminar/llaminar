@@ -34,7 +34,7 @@ This document outlines a phased approach to improve testability of Llaminar V2's
 | MEDIUM | `CollectiveContext` | `ICollectiveContext` | Blocks collective operation tests |
 | MEDIUM | `WeightPlacementMap` | `IWeightPlacementMap` | Blocks placement strategy tests |
 | MEDIUM | `WorkDistributor` | `IWorkDistributor` | Blocks work distribution tests |
-| MEDIUM | `GraphBufferManager` | `IGraphBufferManager` | Blocks buffer allocation tests |
+| MEDIUM | `DeviceGraphBufferManager` | `IGraphBufferManager` | Blocks buffer allocation tests |
 
 ---
 
@@ -809,7 +809,7 @@ public:
 
 ### 3.4 IGraphBufferManager Interface Design
 
-**Location:** `src/v2/interfaces/IGraphBufferManager.h`
+**Location:** `src/v2/interfaces/IDeviceGraphBufferManager.h`
 
 ```cpp
 #pragma once
@@ -867,15 +867,15 @@ public:
 | CREATE | `src/v2/interfaces/ICollectiveContext.h` | Interface definition |
 | CREATE | `src/v2/interfaces/IModelContext.h` | Interface definition |
 | CREATE | `src/v2/interfaces/IWorkDistributor.h` | Interface definition |
-| CREATE | `src/v2/interfaces/IGraphBufferManager.h` | Interface definition |
+| CREATE | `src/v2/interfaces/IDeviceGraphBufferManager.h` | Interface definition |
 | CREATE | `tests/v2/mocks/MockCollectiveContext.h` | Mock header |
 | CREATE | `tests/v2/mocks/MockCollectiveContext.cpp` | Mock implementation |
 | CREATE | `tests/v2/mocks/MockModelContext.h` | Mock header |
 | CREATE | `tests/v2/mocks/MockModelContext.cpp` | Mock implementation |
 | CREATE | `tests/v2/mocks/MockWorkDistributor.h` | Mock header |
 | CREATE | `tests/v2/mocks/MockWorkDistributor.cpp` | Mock implementation |
-| CREATE | `tests/v2/mocks/MockGraphBufferManager.h` | Mock header |
-| CREATE | `tests/v2/mocks/MockGraphBufferManager.cpp` | Mock implementation |
+| CREATE | `tests/v2/mocks/MockDeviceGraphBufferManager.h` | Mock header |
+| CREATE | `tests/v2/mocks/MockDeviceGraphBufferManager.cpp` | Mock implementation |
 
 ---
 
@@ -1147,7 +1147,7 @@ TEST(Test__PhaseAwareExecution, PrefillUsesGpuDecodeUsesCpu) {
     
     // Create graph with phase awareness
     auto graph = Qwen2Graph::build(*model_ctx);
-    auto executor = GraphExecutor::create(graph, *model_ctx);
+    auto executor = DeviceGraphExecutor::create(graph, *model_ctx);
     
     // Prefill with 100 tokens - should use GPU
     auto prefill_config = executor->get_device_config(ExecutionPhase::PREFILL, 100);
@@ -1203,7 +1203,7 @@ src/v2/
 │   ├── IModelContext.h
 │   ├── ICollectiveContext.h
 │   ├── IWorkDistributor.h
-│   ├── IGraphBufferManager.h
+│   ├── IDeviceGraphBufferManager.h
 │   └── IWeightPlacementMap.h
 ├── utils/
 │   ├── MPIContext.h               # MODIFY: Inherit from IMPIContext
@@ -1213,7 +1213,7 @@ src/v2/
 │   └── WeightManager.h            # MODIFY: Inherit from IWeightManager
 └── execution/
     ├── CollectiveContext.h        # MODIFY: Inherit from ICollectiveContext
-    └── GraphBufferManager.h       # MODIFY: Inherit from IGraphBufferManager
+    └── DeviceGraphBufferManager.h       # MODIFY: Inherit from IGraphBufferManager
 
 tests/v2/
 ├── mocks/                         # NEW: All mock implementations
@@ -1231,8 +1231,8 @@ tests/v2/
 │   ├── MockCollectiveContext.cpp
 │   ├── MockWorkDistributor.h
 │   ├── MockWorkDistributor.cpp
-│   ├── MockGraphBufferManager.h
-│   └── MockGraphBufferManager.cpp
+│   ├── MockDeviceGraphBufferManager.h
+│   └── MockDeviceGraphBufferManager.cpp
 ├── integration/
 │   ├── Test__HeterogeneousExecution.cpp
 │   ├── Test__WorkDistribution.cpp
@@ -1264,7 +1264,7 @@ set(INTERFACE_HEADERS
     interfaces/IModelContext.h
     interfaces/ICollectiveContext.h
     interfaces/IWorkDistributor.h
-    interfaces/IGraphBufferManager.h
+    interfaces/IDeviceGraphBufferManager.h
 )
 
 # Add to library target
@@ -1282,7 +1282,7 @@ set(MOCK_SOURCES
     mocks/MockModelContext.cpp
     mocks/MockCollectiveContext.cpp
     mocks/MockWorkDistributor.cpp
-    mocks/MockGraphBufferManager.cpp
+    mocks/MockDeviceGraphBufferManager.cpp
 )
 
 # Create mock library

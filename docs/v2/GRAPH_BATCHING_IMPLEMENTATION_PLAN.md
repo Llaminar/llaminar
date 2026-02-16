@@ -225,9 +225,9 @@ for (int seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
 
 **Goal:** Ensure all activation buffers are sized for batched execution.
 
-#### 4.1 GraphBufferManager Allocation
+#### 4.1 DeviceGraphBufferManager Allocation
 
-**File:** `src/v2/execution/GraphBufferManager.cpp`
+**File:** `src/v2/execution/DeviceGraphBufferManager.cpp`
 
 Current allocation pattern:
 ```cpp
@@ -484,7 +484,7 @@ positions[1] = 0;
 | `src/v2/pipelines/qwen/Qwen2Graph.cpp` | Pass batch_size to attention, fix position handling | P0 |
 | `src/v2/pipelines/qwen/Qwen2Graph.h` | Add batch_size to LayerContext | P0 |
 | `src/v2/execution/ComputeStage.cpp` | KVCacheAppendStage batch support | P1 |
-| `src/v2/execution/GraphBufferManager.cpp` | Batched buffer allocation | P1 |
+| `src/v2/execution/DeviceGraphBufferManager.cpp` | Batched buffer allocation | P1 |
 | `src/v2/pipelines/qwen/GraphOrchestrator.cpp` | Batch flow in executeForward | P1 |
 | `tests/v2/e2e/qwen2/Test__Qwen2MPIRankParity.cpp` | Remove force_pipeline | P2 |
 

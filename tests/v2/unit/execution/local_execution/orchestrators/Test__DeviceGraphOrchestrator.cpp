@@ -12,7 +12,7 @@
 #include "backends/DeviceId.h"
 #include "execution/local_execution/collective/CollectiveContext.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
-#include "execution/local_execution/graph/GraphExecutor.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/config/RuntimeConfig.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -283,12 +283,12 @@ TEST_F(Test__DeviceGraphOrchestrator, ExecutorAccess)
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Non-const access
-    GraphExecutor &exec = orchestrator->executor();
+    DeviceGraphExecutor &exec = orchestrator->executor();
     (void)exec; // Just verify we can access it
 
     // Const access
     const DeviceGraphOrchestrator *const_orch = orchestrator.get();
-    const GraphExecutor &const_exec = const_orch->executor();
+    const DeviceGraphExecutor &const_exec = const_orch->executor();
     (void)const_exec; // Just verify we can access it
 }
 

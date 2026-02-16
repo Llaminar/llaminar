@@ -22,6 +22,7 @@
 #include "tensors/TensorFactory.h"
 #include "execution/compute_stages/stages/AttentionComputeStage.h"
 #include "execution/compute_stages/stages/FusedAttentionWoStage.h"
+#include "execution/compute_stages/stages/KVCacheAppendStage.h"
 
 using namespace llaminar2;
 
@@ -586,6 +587,102 @@ namespace
         // Verify KV cache append stage exists
         EXPECT_TRUE(hasStageType(attn_graph, ComputeStageType::COPY))
             << "Expected KVCacheAppendStage (type=COPY) in graph with KV cache";
+    }
+
+    // ============================================================================
+    // REGRESSION TEST: KVCacheAppendStage device_id propagation
+    //
+    // Locks in the fix for the bug where KVCacheAppendStage::Params.device_id
+    // defaulted to DeviceId::cpu() even when building with a GPU device.
+    //
+    // Before fix: device_id = cpu() → appendWithStream never called → raw FP32
+    //             bytes written to FP16 ring buffer → complete data corruption
+    // After fix:  device_id = device → appendWithStream called → GPU FP16
+    //             conversion → correct data in ring buffer
+    // ============================================================================
+
+    TEST_F(Test__Qwen2Graph_KVCachePP, KVAppendStage_DeviceId_MatchesTargetDevice)
+    {
+        // Build graph targeting a GPU device (even though we can't execute on GPU
+        // in a unit test, we can verify the stage params are wired correctly)
+        auto graph_builder = createGraph(/*pp_layer_offset=*/0);
+
+        auto cache = std::make_unique<CPURingKVCache<ActivationPrecision::FP32>>(
+            *mpi_ctx_, /*n_layers=*/N_LAYERS, /*batch_size=*/1, MAX_SEQ_LEN,
+            N_KV_HEADS, HEAD_DIM);
+
+        std::vector<int> position_ids = {0, 1, 2, 3};
+        auto layer_weights = getLayerWeights(0);
+
+        // Build with a CUDA device target
+        DeviceId cuda_device = DeviceId::cuda(0);
+        ComputeGraph attn_graph = graph_builder->buildAttentionGraph(
+            layer_weights, buffers_,
+            /*layer_idx=*/0, /*seq_len=*/4, /*batch_size=*/1,
+            cache.get(), position_ids.data(),
+            cuda_device);
+
+        // Find KVCacheAppendStage and verify its device_id matches the target device
+        bool found_kv_append = false;
+        auto order = attn_graph.getExecutionOrder();
+        for (const auto &name : order)
+        {
+            const ComputeNode *node = attn_graph.getNode(name);
+            if (node && node->stage && node->stage->type() == ComputeStageType::COPY)
+            {
+                auto *kv_stage = dynamic_cast<KVCacheAppendStage *>(node->stage.get());
+                if (kv_stage)
+                {
+                    found_kv_append = true;
+                    const auto &params = kv_stage->getParams();
+                    EXPECT_TRUE(params.device_id.is_gpu())
+                        << "REGRESSION: KVCacheAppendStage.device_id is CPU when graph "
+                           "targets GPU. This causes appendWithStream() to never be "
+                           "called, resulting in raw FP32 bytes written to FP16/Q8_1 "
+                           "ring buffers (complete data corruption).";
+                    EXPECT_EQ(params.device_id.type, cuda_device.type)
+                        << "REGRESSION: KVCacheAppendStage.device_id type doesn't "
+                           "match target device type";
+                }
+            }
+        }
+        EXPECT_TRUE(found_kv_append)
+            << "Expected KVCacheAppendStage in graph with KV cache";
+    }
+
+    // Also verify CPU device builds correctly (baseline)
+    TEST_F(Test__Qwen2Graph_KVCachePP, KVAppendStage_DeviceId_CPUDevice)
+    {
+        auto graph_builder = createGraph(/*pp_layer_offset=*/0);
+
+        auto cache = std::make_unique<CPURingKVCache<ActivationPrecision::FP32>>(
+            *mpi_ctx_, /*n_layers=*/N_LAYERS, /*batch_size=*/1, MAX_SEQ_LEN,
+            N_KV_HEADS, HEAD_DIM);
+
+        std::vector<int> position_ids = {0, 1, 2, 3};
+        auto layer_weights = getLayerWeights(0);
+
+        ComputeGraph attn_graph = graph_builder->buildAttentionGraph(
+            layer_weights, buffers_,
+            /*layer_idx=*/0, /*seq_len=*/4, /*batch_size=*/1,
+            cache.get(), position_ids.data(),
+            DeviceId::cpu());
+
+        auto order = attn_graph.getExecutionOrder();
+        for (const auto &name : order)
+        {
+            const ComputeNode *node = attn_graph.getNode(name);
+            if (node && node->stage && node->stage->type() == ComputeStageType::COPY)
+            {
+                auto *kv_stage = dynamic_cast<KVCacheAppendStage *>(node->stage.get());
+                if (kv_stage)
+                {
+                    const auto &params = kv_stage->getParams();
+                    EXPECT_TRUE(params.device_id.is_cpu())
+                        << "CPU graph should have CPU device_id on KVCacheAppendStage";
+                }
+            }
+        }
     }
 
     // ============================================================================

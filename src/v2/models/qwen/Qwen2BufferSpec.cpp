@@ -24,14 +24,14 @@ namespace llaminar2
         // FFN down projection outputs
         "ffn_down_output",
         "ffn_down_allreduce",
-        "ffn_output", // GraphBufferManager may use this name
+        "ffn_output", // DeviceGraphBufferManager may use this name
 
         // Attention Wo projection outputs
         "attention_wo_output",
         "attn_wo_output",
         "attn_wo_allreduce",
         "wo_output",
-        "attn_proj" // GraphBufferManager may use this name
+        "attn_proj" // DeviceGraphBufferManager may use this name
     };
 
     // =========================================================================

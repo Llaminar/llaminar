@@ -141,7 +141,7 @@ namespace
      * @brief Regression test for the bug: device_idx = 0
      *
      * Bug scenario (before fix):
-     *   - GraphBufferManager uses device_idx=0 for first NUMA node
+     *   - DeviceGraphBufferManager uses device_idx=0 for first NUMA node
      *   - CPUAttentionKernelT rejected device_idx != -1
      *   - Attention compute failed with "device_idx must be -1"
      *

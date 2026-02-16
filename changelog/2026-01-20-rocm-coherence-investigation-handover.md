@@ -150,7 +150,7 @@ LLAMINAR_LOG_LEVEL=TRACE ./build_v2_release/llaminar2 \
 
 **Output format**:
 ```
-[TRACE] [GraphExecutor::PHASES] layer0_qkv_proj input_cohere=0.007ms weight_cohere=2.9ms output_alloc=0.15ms execute=13.5ms mark_dirty=0.1ms total=16.7ms
+[TRACE] [DeviceGraphExecutor::PHASES] layer0_qkv_proj input_cohere=0.007ms weight_cohere=2.9ms output_alloc=0.15ms execute=13.5ms mark_dirty=0.1ms total=16.7ms
 ```
 
 ### 2. Weight Coherence Across Iterations
@@ -252,7 +252,7 @@ More complex but allows overlapping computation with communication:
 | `src/v2/tensors/cpu/CPUTensors.h` | CPUTensorBase with coherence methods |
 | `src/v2/execution/compute_stages/stages/AllreduceStage.cpp` | MPI allreduce implementation |
 | `src/v2/loaders/WeightManager.cpp` | Weight sharding and TensorSlice creation |
-| `src/v2/execution/GraphExecutor.cpp` | Stage execution with timing |
+| `src/v2/execution/DeviceDeviceGraphExecutor.cpp` | Stage execution with timing |
 
 ## Environment Variables for Debugging
 

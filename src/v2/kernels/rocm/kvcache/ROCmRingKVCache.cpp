@@ -19,7 +19,10 @@
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
 
+#include "../../../utils/KVCacheProfiler.h"
+
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 
@@ -140,6 +143,67 @@ namespace llaminar2
         hipStream_t stream);
 
     // =========================================================================
+    // IROCmRingKVCache destructor + conversion scratch buffer management
+    // =========================================================================
+
+    IROCmRingKVCache::~IROCmRingKVCache()
+    {
+        freeConvScratch();
+    }
+
+    bool IROCmRingKVCache::ensureConvScratch(size_t bytes)
+    {
+        if (bytes <= conv_scratch_capacity_)
+            return true;
+
+        // Grow to requested size (round up to 4KB for alignment)
+        const size_t alloc_size = (bytes + 4095) & ~size_t(4095);
+
+        void *new_k = nullptr;
+        void *new_v = nullptr;
+        if (hipMalloc(&new_k, alloc_size) != hipSuccess ||
+            hipMalloc(&new_v, alloc_size) != hipSuccess)
+        {
+            if (new_k)
+                hipFree(new_k);
+            if (new_v)
+                hipFree(new_v);
+            LOG_ERROR("[IROCmRingKVCache] Failed to allocate conversion scratch buffers ("
+                      << alloc_size << " bytes each)");
+            return false;
+        }
+
+        // Free old buffers
+        if (conv_scratch_k_)
+            hipFree(conv_scratch_k_);
+        if (conv_scratch_v_)
+            hipFree(conv_scratch_v_);
+
+        conv_scratch_k_ = new_k;
+        conv_scratch_v_ = new_v;
+        conv_scratch_capacity_ = alloc_size;
+
+        LOG_DEBUG("[IROCmRingKVCache] Allocated conversion scratch: "
+                  << alloc_size << " bytes each (" << (alloc_size * 2 / 1024) << " KB total)");
+        return true;
+    }
+
+    void IROCmRingKVCache::freeConvScratch()
+    {
+        if (conv_scratch_k_)
+        {
+            hipFree(conv_scratch_k_);
+            conv_scratch_k_ = nullptr;
+        }
+        if (conv_scratch_v_)
+        {
+            hipFree(conv_scratch_v_);
+            conv_scratch_v_ = nullptr;
+        }
+        conv_scratch_capacity_ = 0;
+    }
+
+    // =========================================================================
     // IROCmRingKVCache::append(ITensor*) implementation
     // =========================================================================
 
@@ -256,32 +320,63 @@ namespace llaminar2
                 return append(layer, seq_idx, d_k, d_v, num_tokens, stream);
             }
 
-            uint16_t *d_k_fp16 = nullptr;
-            uint16_t *d_v_fp16 = nullptr;
-            if (hipMalloc(&d_k_fp16, static_cast<size_t>(elements) * sizeof(uint16_t)) != hipSuccess ||
-                hipMalloc(&d_v_fp16, static_cast<size_t>(elements) * sizeof(uint16_t)) != hipSuccess)
+            // --- Profiling: ensure scratch buffers ---
+            const auto alloc_start = std::chrono::high_resolution_clock::now();
+
+            const size_t buf_bytes = static_cast<size_t>(elements) * sizeof(uint16_t);
+            if (!ensureConvScratch(buf_bytes))
             {
-                if (d_k_fp16)
-                    hipFree(d_k_fp16);
-                if (d_v_fp16)
-                    hipFree(d_v_fp16);
-                LOG_ERROR("[IROCmRingKVCache::appendWithStream] hipMalloc failed for FP16 conversion buffers");
+                LOG_ERROR("[IROCmRingKVCache::appendWithStream] Failed to ensure FP16 conversion scratch");
                 return false;
             }
+            auto *d_k_fp16 = static_cast<uint16_t *>(conv_scratch_k_);
+            auto *d_v_fp16 = static_cast<uint16_t *>(conv_scratch_v_);
 
-            const bool k_ok = hip_convert_tensor_to_fp16(d_k, K->native_type(), d_k_fp16, elements, stream);
-            const bool v_ok = hip_convert_tensor_to_fp16(d_v, V->native_type(), d_v_fp16, elements, stream);
+            const auto alloc_end = std::chrono::high_resolution_clock::now();
+
+            // --- Profiling: FP16 conversion kernels ---
+            const auto conv_start = std::chrono::high_resolution_clock::now();
+
+            const bool k_ok = hip_convert_tensor_to_fp16(
+                d_k,
+                K->native_type(),
+                d_k_fp16,
+                elements,
+                stream);
+            const bool v_ok = hip_convert_tensor_to_fp16(
+                d_v,
+                V->native_type(),
+                d_v_fp16,
+                elements,
+                stream);
             if (!k_ok || !v_ok)
             {
-                hipFree(d_k_fp16);
-                hipFree(d_v_fp16);
                 LOG_ERROR("[IROCmRingKVCache::appendWithStream] GPU FP16 conversion failed");
                 return false;
             }
 
+            const auto conv_end = std::chrono::high_resolution_clock::now();
+
+            // --- Profiling: ring buffer append ---
+            const auto append_start = std::chrono::high_resolution_clock::now();
             const bool ok = append(layer, seq_idx, d_k_fp16, d_v_fp16, num_tokens, stream);
-            hipFree(d_k_fp16);
-            hipFree(d_v_fp16);
+            const auto append_end = std::chrono::high_resolution_clock::now();
+
+            // Record profiling breakdown
+            {
+                auto to_ns = [](auto d) -> uint64_t
+                {
+                    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
+                };
+                const uint64_t alloc_ns = to_ns(alloc_end - alloc_start);
+                const uint64_t conv_ns = to_ns(conv_end - conv_start);
+                const uint64_t append_ns = to_ns(append_end - append_start);
+                const uint64_t bytes = static_cast<uint64_t>(elements) * sizeof(uint16_t) * 2;
+                KVCacheProfiler::record(KVCacheOpType::GPU_ALLOC, alloc_ns);
+                KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_FP16, conv_ns, static_cast<uint64_t>(num_tokens), bytes);
+                KVCacheProfiler::record(KVCacheOpType::APPEND, append_ns, static_cast<uint64_t>(num_tokens), bytes);
+            }
+
             return ok;
         }
 
@@ -304,37 +399,78 @@ namespace llaminar2
                 return append(layer, seq_idx, d_k, d_v, num_tokens, stream);
             }
 
-            Q8_1Block *d_k_q8 = nullptr;
-            Q8_1Block *d_v_q8 = nullptr;
-            if (hipMalloc(&d_k_q8, block_count * sizeof(Q8_1Block)) != hipSuccess ||
-                hipMalloc(&d_v_q8, block_count * sizeof(Q8_1Block)) != hipSuccess)
+            // --- Profiling: ensure scratch buffers ---
+            const auto alloc_start = std::chrono::high_resolution_clock::now();
+
+            const size_t buf_bytes = block_count * sizeof(Q8_1Block);
+            if (!ensureConvScratch(buf_bytes))
             {
-                if (d_k_q8)
-                    hipFree(d_k_q8);
-                if (d_v_q8)
-                    hipFree(d_v_q8);
-                LOG_ERROR("[IROCmRingKVCache::appendWithStream] hipMalloc failed for Q8_1 conversion buffers");
+                LOG_ERROR("[IROCmRingKVCache::appendWithStream] Failed to ensure Q8_1 conversion scratch");
                 return false;
             }
+            auto *d_k_q8 = static_cast<Q8_1Block *>(conv_scratch_k_);
+            auto *d_v_q8 = static_cast<Q8_1Block *>(conv_scratch_v_);
 
-            const bool k_ok = hip_convert_tensor_to_q8_1(d_k, K->native_type(), d_k_q8, num_tokens, kv_dim, stream);
-            const bool v_ok = hip_convert_tensor_to_q8_1(d_v, V->native_type(), d_v_q8, num_tokens, kv_dim, stream);
+            const auto alloc_end = std::chrono::high_resolution_clock::now();
+
+            // --- Profiling: Q8_1 conversion kernels ---
+            const auto conv_start = std::chrono::high_resolution_clock::now();
+
+            const bool k_ok = hip_convert_tensor_to_q8_1(
+                d_k,
+                K->native_type(),
+                d_k_q8,
+                num_tokens,
+                kv_dim,
+                stream);
+            const bool v_ok = hip_convert_tensor_to_q8_1(
+                d_v,
+                V->native_type(),
+                d_v_q8,
+                num_tokens,
+                kv_dim,
+                stream);
             if (!k_ok || !v_ok)
             {
-                hipFree(d_k_q8);
-                hipFree(d_v_q8);
                 LOG_ERROR("[IROCmRingKVCache::appendWithStream] GPU Q8_1 conversion failed");
                 return false;
             }
 
+            const auto conv_end = std::chrono::high_resolution_clock::now();
+
+            // --- Profiling: ring buffer append ---
+            const auto append_start = std::chrono::high_resolution_clock::now();
             const bool ok = append(layer, seq_idx, d_k_q8, d_v_q8, num_tokens, stream);
-            hipFree(d_k_q8);
-            hipFree(d_v_q8);
+            const auto append_end = std::chrono::high_resolution_clock::now();
+
+            // Record profiling breakdown
+            {
+                auto to_ns = [](auto d) -> uint64_t
+                {
+                    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
+                };
+                const uint64_t alloc_ns = to_ns(alloc_end - alloc_start);
+                const uint64_t conv_ns = to_ns(conv_end - conv_start);
+                const uint64_t append_ns = to_ns(append_end - append_start);
+                const uint64_t bytes = block_count * sizeof(Q8_1Block) * 2;
+                KVCacheProfiler::record(KVCacheOpType::GPU_ALLOC, alloc_ns);
+                KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_Q8_1, conv_ns, static_cast<uint64_t>(num_tokens), bytes);
+                KVCacheProfiler::record(KVCacheOpType::APPEND, append_ns, static_cast<uint64_t>(num_tokens), bytes);
+            }
+
             return ok;
         }
 
-        return append(layer, seq_idx, d_k, d_v, num_tokens,
-                      stream);
+        // No conversion needed - profile just the append
+        {
+            const auto start = std::chrono::high_resolution_clock::now();
+            const bool ok = append(layer, seq_idx, d_k, d_v, num_tokens, stream);
+            const auto end = std::chrono::high_resolution_clock::now();
+            const uint64_t ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+            KVCacheProfiler::record(KVCacheOpType::APPEND, ns, static_cast<uint64_t>(num_tokens), 0);
+            return ok;
+        }
     }
 
     // =========================================================================
@@ -758,6 +894,23 @@ namespace llaminar2
         entry.scratch_valid = false; // Scratch is stale after append
 
         return true;
+    }
+
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::appendConvertedWithStream(
+        int layer, int seq_idx,
+        const void *d_k_src, const void *d_v_src,
+        TensorType src_type,
+        int num_tokens, hipStream_t stream)
+    {
+        (void)layer;
+        (void)seq_idx;
+        (void)d_k_src;
+        (void)d_v_src;
+        (void)src_type;
+        (void)num_tokens;
+        (void)stream;
+        return false;
     }
 
     template <ActivationPrecision Precision>

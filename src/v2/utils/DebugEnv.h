@@ -593,7 +593,7 @@ namespace llaminar2
      *   LLAMINAR_EXECUTOR_PROFILING        - Enable per-stage profiling in LayerExecutor (default: 0)
      *   LLAMINAR_EXECUTOR_VALIDATION       - Enable output validation after each stage (default: 0)
      *   LLAMINAR_AUTO_WEIGHT_TRANSFER      - Auto-transfer weights to target device (default: 1)
-     *   LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT - Use GraphBufferManager for buffers (default: 1 - ON)
+     *   LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT - Use DeviceGraphBufferManager for buffers (default: 1 - ON)
      *   LLAMINAR_EXEC_FULL_FORWARD         - Use full forward graph execution (default: 1 - ON)
      *   LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED - Allow segmented GPU-graph replay for decode graphs
      *                                        containing collectives (default: 0 - OFF, experimental)
@@ -631,7 +631,7 @@ namespace llaminar2
         bool executor_profiling = false;                                       ///< Enable stage profiling
         bool executor_validation = false;                                      ///< Validate outputs after each stage
         bool auto_weight_transfer = true;                                      ///< Auto-transfer weights to device
-        bool use_graph_buffer_management = true;                               ///< Use GraphBufferManager for buffer allocation (default: ON)
+        bool use_graph_buffer_management = true;                               ///< Use DeviceGraphBufferManager for buffer allocation (default: ON)
         bool exec_full_forward = true;                                         ///< Use orchestrator->executeForward() for complete inference (default: ON)
         bool fast_decode = true;                                               ///< Use fast decode path skipping coherence/debug overhead (default: ON, env: LLAMINAR_FAST_DECODE)
         bool gpu_graphs = false;                                               ///< Use GPU graph capture/replay for decode (default: OFF, env: LLAMINAR_GPU_GRAPHS)

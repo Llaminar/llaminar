@@ -113,7 +113,7 @@ case DeviceType::CUDA:
 
 **Solution Path**:
 1. Add `DataTransferStage` to compute graph for explicit cross-device copies
-2. Or: Automatic transfer detection in `GraphExecutor` when stage device differs from input device
+2. Or: Automatic transfer detection in `DeviceGraphExecutor` when stage device differs from input device
 
 #### Block 3: MPI + GPU Work Division
 
@@ -138,7 +138,7 @@ case DeviceType::CUDA:
 
 **Solution Path**:
 1. Add `DevicePreference` enum: `REQUIRE_GPU`, `PREFER_GPU`, `CPU_ONLY`, `ANY`
-2. `GraphExecutor` selects device based on preference + availability
+2. `DeviceGraphExecutor` selects device based on preference + availability
 3. Support device lists for data-parallel stages
 
 ### Device-Specific Weight Packing
@@ -285,7 +285,7 @@ INTER-NODE (MPI)                    INTRA-NODE (Device)
 - **MPI ranks** handle **inter-node** tensor parallelism (weight sharding, AllReduce)
 - **DeviceManager + WeightPlacementMap** handle **intra-node** heterogeneous execution
 - These are orthogonal: a rank can shard weights across nodes AND offload layers to GPU
-- Cross-device transfers (GPU↔CPU) use `DataTransferStage` or automatic transfers in `GraphExecutor`
+- Cross-device transfers (GPU↔CPU) use `DataTransferStage` or automatic transfers in `DeviceGraphExecutor`
 
 ### Work Distribution Decision Flow
 
@@ -1053,7 +1053,7 @@ case DeviceType::CUDA:
        Params: src_device, dst_device, tensor, async
    };
    ```
-2. Or: Automatic transfer detection in `GraphExecutor`:
+2. Or: Automatic transfer detection in `DeviceGraphExecutor`:
    - Track each tensor's current device
    - Insert implicit copies when stage device differs from input device
 3. Profile and optimize: Prefer keeping data on one device when possible

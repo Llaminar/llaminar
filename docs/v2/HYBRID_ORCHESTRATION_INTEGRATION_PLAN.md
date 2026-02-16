@@ -81,7 +81,7 @@ The codebase has a clear separation into three layers:
 │    • WeightManager - Load ONLY assigned layers/shards from GGUF                 │
 │    • GraphOrchestrator - Build compute graph for assigned layers                │
 │    • Qwen2Graph - Layer implementations, stage creation                         │
-│    • GraphExecutor - Execute stages, manage device memory                       │
+│    • DeviceGraphExecutor - Execute stages, manage device memory                       │
 │    • CollectiveContext - Execute collectives via BackendRouter                  │
 │    • KernelFactory - Create device-specific kernels                             │
 │                                                                                 │

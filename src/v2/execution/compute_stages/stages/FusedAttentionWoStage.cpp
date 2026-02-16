@@ -100,7 +100,7 @@ namespace llaminar2
         }
 
         // Note: Layout validation is now handled declaratively via getLayoutExpectation()
-        // and getBufferRequirements().withLayout() - GraphExecutor validates automatically
+        // and getBufferRequirements().withLayout() - DeviceGraphExecutor validates automatically
 
         // Compute position offset for decode mode
         int position_offset = params_.position_offset;
@@ -1002,7 +1002,7 @@ namespace llaminar2
     verification::LayoutExpectation FusedAttentionWoStage::getLayoutExpectation() const
     {
         // Provide model dimensions for automatic layout validation
-        // GraphExecutor uses this with getBufferRequirements().withLayout() declarations
+        // DeviceGraphExecutor uses this with getBufferRequirements().withLayout() declarations
         return verification::LayoutExpectation::forAttention(
             params_.head_dim,
             params_.n_heads,

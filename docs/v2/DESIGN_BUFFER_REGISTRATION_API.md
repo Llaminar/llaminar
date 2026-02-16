@@ -442,8 +442,8 @@ private:
 The GraphOrchestrator needs to allocate ROCm tensors that participate in collectives from the BAR region:
 
 ```cpp
-// GraphBufferManager.cpp - BAR-aware allocation
-std::unique_ptr<ITensor> GraphBufferManager::allocateBuffer(
+// DeviceGraphBufferManager.cpp - BAR-aware allocation
+std::unique_ptr<ITensor> DeviceGraphBufferManager::allocateBuffer(
     const BufferDescriptor& desc,
     DeviceId device)
 {
@@ -566,7 +566,7 @@ bool PCIeBARBackend::allreduceRegistered(
 
 1. Extend `AllreduceStage` to optionally carry a `collective_id`
 2. Add `registerCollectiveBuffers()` to `GraphOrchestrator`
-3. GraphExecutor calls registration before execution
+3. DeviceGraphExecutor calls registration before execution
 
 ### Phase 3: Update Tests
 

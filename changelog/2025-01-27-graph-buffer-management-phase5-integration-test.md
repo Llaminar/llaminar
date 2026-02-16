@@ -74,7 +74,7 @@ All 4 integration tests now pass with perfect cosine similarity (1.0) at every d
 
 ## Labels Applied
 ```cmake
-LABELS "V2;Integration;GraphBufferManager;BufferManagement;Parity;ExecutionFramework;Phase5"
+LABELS "V2;Integration;DeviceGraphBufferManager;BufferManagement;Parity;ExecutionFramework;Phase5"
 ```
 
 ## Phase 5 Status: COMPLETE ✅

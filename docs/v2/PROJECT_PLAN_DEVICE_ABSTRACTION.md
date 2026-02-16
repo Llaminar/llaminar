@@ -27,14 +27,14 @@ All five phases of this project plan have been successfully implemented:
 ### Modified Files
 - `src/v2/kernels/KernelFactory.h/cpp` - Added KVCache, FusedQKVGemm, FusedGateUpGemm factories
 - `src/v2/execution/GraphOrchestrator.cpp` - Uses KernelFactory for KVCache creation
-- `src/v2/execution/GraphExecutor.cpp` - Automatic coherence at stage boundaries
+- `src/v2/execution/DeviceGraphExecutor.cpp` - Automatic coherence at stage boundaries
 - `src/v2/execution/compute_stages/IComputeStage.h` - Added `coherencePolicy()`, `preferredDevice()`, tensor pointers
 - `src/v2/execution/compute_stages/stages/*Stage.cpp` - Tensor pointers and coherence policies
 - `src/v2/tensors/TensorKernels.h` - Added `ITensorFusedQKVGemm`, `ITensorFusedGateUpGemm`
 
 ### Usage
 
-Automatic stage coherence is always enabled. The GraphExecutor handles device coherence automatically at stage boundaries based on each stage's `coherencePolicy()`:
+Automatic stage coherence is always enabled. The DeviceGraphExecutor handles device coherence automatically at stage boundaries based on each stage's `coherencePolicy()`:
 ```bash
 # No environment variable needed - coherence is automatic
 ./build_v2_release/llaminar2 -m model.gguf -p "Hello"
@@ -231,12 +231,12 @@ std::unique_ptr<ICUDARingKVCache> KernelFactory::createCUDAKVCache(const KVCache
 | `src/v2/execution/StageCoherence.h` | ✅ Created | Coherence policy enum, helper declarations |
 | `src/v2/execution/StageCoherence.cpp` | ✅ Created | Implementation of coherence helpers |
 | `src/v2/execution/compute_stages/IComputeStage.h` | ✅ Modified | Added `coherencePolicy()`, `preferredDevice()`, tensor pointers in buffers |
-| `src/v2/execution/GraphExecutor.cpp` | ✅ Modified | Added automatic coherence at stage boundaries |
+| `src/v2/execution/DeviceGraphExecutor.cpp` | ✅ Modified | Added automatic coherence at stage boundaries |
 | `src/v2/CMakeLists.txt` | ✅ Modified | Added StageCoherence.cpp to build |
 
 ### How It Works
 
-Automatic coherence is always enabled. The GraphExecutor handles device coherence at stage boundaries based on each stage's `coherencePolicy()` (FULL by default):
+Automatic coherence is always enabled. The DeviceGraphExecutor handles device coherence at stage boundaries based on each stage's `coherencePolicy()` (FULL by default):
 
 ```bash
 # No configuration needed - coherence is automatic
@@ -250,7 +250,7 @@ Automatic coherence is always enabled. The GraphExecutor handles device coherenc
 
 ### Goal
 
-Eliminate manual `ensureOnDevice()`/`mark_device_dirty()` calls in stages by adding automatic coherence at stage boundaries in `GraphExecutor`.
+Eliminate manual `ensureOnDevice()`/`mark_device_dirty()` calls in stages by adding automatic coherence at stage boundaries in `DeviceGraphExecutor`.
 
 ### Current State
 
@@ -327,12 +327,12 @@ struct StageDumpInfo {
 };
 ```
 
-#### GraphExecutor Integration
+#### DeviceGraphExecutor Integration
 
 ```cpp
-// GraphExecutor.cpp
+// DeviceGraphExecutor.cpp
 
-bool GraphExecutor::executeNode(ComputeNode& node, IDeviceContext* ctx) {
+bool DeviceGraphExecutor::executeNode(ComputeNode& node, IDeviceContext* ctx) {
     if (!node.stage) return false;
     
     // Determine execution device
@@ -371,7 +371,7 @@ bool GraphExecutor::executeNode(ComputeNode& node, IDeviceContext* ctx) {
 | **New**: `src/v2/execution/StageCoherence.cpp` | Implementation |
 | `src/v2/execution/compute_stages/IComputeStage.h` | Add `coherencePolicy()`, `preferredDevice()` |
 | `src/v2/execution/compute_stages/StageDumpInfo.h` | Add `ITensor*` to buffers |
-| `src/v2/execution/GraphExecutor.cpp` | Add coherence calls |
+| `src/v2/execution/DeviceGraphExecutor.cpp` | Add coherence calls |
 | All GPU-capable stages | Remove manual coherence |
 
 ### Stages to Clean Up
@@ -398,7 +398,7 @@ bool GraphExecutor::executeNode(ComputeNode& node, IDeviceContext* ctx) {
 
 - **Infrastructure (StageCoherence.h/cpp)**: 3 hours
 - **StageDumpInfo extension**: 1 hour
-- **GraphExecutor integration**: 2 hours
+- **DeviceGraphExecutor integration**: 2 hours
 - **Stage cleanup**: 4 hours (20 stages × 12 min each)
 - **Testing**: 3 hours
 
@@ -531,7 +531,7 @@ return kernel->apply(token_ids, output_base, ...);
 | 2.1 Create StageCoherence.h/cpp | P0 | None | 2h |
 | 2.2 Extend StageDumpInfo with ITensor* | P1 | None | 1h |
 | 2.3 Add coherencePolicy() to IComputeStage | P1 | None | 0.5h |
-| 2.4 Integrate coherence in GraphExecutor | P0 | 2.1, 2.2, 2.3 | 2h |
+| 2.4 Integrate coherence in DeviceGraphExecutor | P0 | 2.1, 2.2, 2.3 | 2h |
 | 2.5 Write coherence unit tests | P0 | 2.4 | 2h |
 
 **Deliverable**: Automatic coherence working, can be enabled via env var.

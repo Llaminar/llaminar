@@ -7,8 +7,8 @@
  *
  * Architecture:
  * - Model graphs (Qwen2Graph) create abstract collective stages
- * - GraphExecutor holds a CollectiveContext
- * - When executing collective stages, GraphExecutor delegates to CollectiveContext
+ * - DeviceGraphExecutor holds a CollectiveContext
+ * - When executing collective stages, DeviceGraphExecutor delegates to CollectiveContext
  * - CollectiveContext selects and uses the appropriate backend
  *
  * This separation ensures:
@@ -62,13 +62,13 @@ namespace llaminar2
      * @brief Runtime context for collective operations
      *
      * Implements ICollectiveContext interface.
-     * Injected into GraphExecutor at construction time.
+     * Injected into DeviceGraphExecutor at construction time.
      * Encapsulates ALL collective backend knowledge - model graphs never see this.
      *
-     * Usage in GraphExecutor:
+     * Usage in DeviceGraphExecutor:
      *
      *   // At construction
-     *   GraphExecutor executor(graph, collective_ctx);
+     *   DeviceGraphExecutor executor(graph, collective_ctx);
      *
      *   // At execution
      *   if (stage->type() == ComputeStageType::ALLREDUCE) {
@@ -121,7 +121,7 @@ namespace llaminar2
 
         // =====================================================================
         // High-Level Collective Operations (ICollectiveContext)
-        // These are called by GraphExecutor when executing collective stages
+        // These are called by DeviceGraphExecutor when executing collective stages
         // =====================================================================
 
         /**
@@ -316,7 +316,7 @@ namespace llaminar2
          * @brief Get the PCIeBARBackend if available
          *
          * Returns the PCIeBARBackend from the router if one is registered
-         * and active. This is used by GraphBufferManager to allocate
+         * and active. This is used by DeviceGraphBufferManager to allocate
          * collective buffers from the BAR region.
          *
          * @return Pointer to PCIeBARBackend, or nullptr if not available

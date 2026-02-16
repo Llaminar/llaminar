@@ -88,7 +88,7 @@ namespace llaminar2
     class IROCmRingKVCache : public IKVCache
     {
     public:
-        virtual ~IROCmRingKVCache() = default;
+        virtual ~IROCmRingKVCache();
 
         // =====================================================================
         // IKVCache Interface (public API)
@@ -182,6 +182,29 @@ namespace llaminar2
                             const void *d_k, const void *d_v,
                             int num_tokens, hipStream_t stream = 0) = 0;
 
+        /**
+         * @brief Capture-safe fused convert+append path (optional override)
+         *
+         * Used by appendWithStream() for precision-mismatch paths to avoid
+         * intermediate scratch writes in graph-captured decode. Implementations
+         * may return false to indicate fallback to the standard convert+append
+         * sequence should be used.
+         */
+        virtual bool appendConvertedWithStream(int layer, int seq_idx,
+                                               const void *d_k_src, const void *d_v_src,
+                                               TensorType src_type,
+                                               int num_tokens, hipStream_t stream)
+        {
+            (void)layer;
+            (void)seq_idx;
+            (void)d_k_src;
+            (void)d_v_src;
+            (void)src_type;
+            (void)num_tokens;
+            (void)stream;
+            return false;
+        }
+
         // Convenience for single-sequence mode
         bool append(int layer, const void *d_k, const void *d_v,
                     int num_tokens, hipStream_t stream = 0)
@@ -250,6 +273,25 @@ namespace llaminar2
         // =====================================================================
 
         // Overrides are provided by the concrete ROCmRingKVCache<P> class
+
+    protected:
+        // =====================================================================
+        // Pre-allocated conversion scratch buffers
+        // =====================================================================
+        // Avoids hipMalloc/hipFree per appendWithStream call.
+        // Lazily allocated and grown as needed.
+
+        /// Ensure scratch buffers have at least `bytes` capacity each.
+        /// Returns true on success. Thread-safe via single-writer assumption
+        /// (one decode step at a time).
+        bool ensureConvScratch(size_t bytes);
+
+        /// Free scratch buffers (called from destructor)
+        void freeConvScratch();
+
+        void *conv_scratch_k_ = nullptr;   ///< Scratch buffer for K conversion
+        void *conv_scratch_v_ = nullptr;   ///< Scratch buffer for V conversion
+        size_t conv_scratch_capacity_ = 0; ///< Current capacity in bytes (per buffer)
     };
 
     // =========================================================================
@@ -522,6 +564,11 @@ namespace llaminar2
         bool append_typed(int layer, int seq_idx,
                           const DataT *d_k, const DataT *d_v,
                           int num_tokens, hipStream_t stream = 0);
+
+        bool appendConvertedWithStream(int layer, int seq_idx,
+                                       const void *d_k_src, const void *d_v_src,
+                                       TensorType src_type,
+                                       int num_tokens, hipStream_t stream) override;
 
         // =====================================================================
         // IWorkspaceConsumer Interface

@@ -6,7 +6,7 @@
  */
 
 #include "LivenessAnalyzer.h"
-#include "GraphExecutor.h"
+#include "DeviceGraphExecutor.h"
 #include "../../compute_stages/ComputeStages.h"
 #include "../../../utils/Logger.h"
 #include <algorithm>

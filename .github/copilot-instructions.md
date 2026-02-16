@@ -43,7 +43,7 @@ This document provides practical guidelines for working with the **Llaminar V2**
 - **Automatic Weight Sharding**: Megatron-style tensor parallelism across MPI ranks
 
 **Execution Flow**:
-> **GraphOrchestrator** → builds **ComputeGraph** → **GraphExecutor** runs **ComputeStages** → stages use **KernelFactory** to get kernels → kernels operate on local buffers. MPI synchronization via **AllreduceStage** / **AllGatherStage**.
+> **GraphOrchestrator** → builds **ComputeGraph** → **DeviceGraphExecutor** runs **ComputeStages** → stages use **KernelFactory** to get kernels → kernels operate on local buffers. MPI synchronization via **AllreduceStage** / **AllGatherStage**.
 
 See `.github/instructions/llaminar-architecture-v2.instructions.md` for a full-stack walkthrough.
 
@@ -997,11 +997,11 @@ If you attempt to borrow a register that's already borrowed, you get a detailed 
 Llaminar uses a **coherence protocol** to manage tensor data movement between host (CPU) and device (GPU) memory. This system:
 - Tracks whether tensor data is "dirty" on CPU or GPU
 - Automatically synchronizes data when needed
-- Provides both automatic (GraphExecutor) and manual (test/utility) patterns
+- Provides both automatic (DeviceGraphExecutor) and manual (test/utility) patterns
 
 **Key Files:**
 - `src/v2/tensors/TensorClasses.h` - `TensorBase` coherence methods (`ensureOnDevice()`, `mark_device_dirty()`, `ensureOnHost()`, `data()`)
-- `src/v2/execution/StageCoherence.h` - `StageCoherence` helper for GraphExecutor
+- `src/v2/execution/StageCoherence.h` - `StageCoherence` helper for DeviceGraphExecutor
 - `src/v2/execution/GpuCoherence.h` - RAII utilities for tests and direct kernel calls
 
 ### Coherence Protocol
@@ -1028,17 +1028,17 @@ const float* data();
 float* mutable_data();  // Also marks CPU as authoritative
 ```
 
-### Automatic Coherence (GraphExecutor)
+### Automatic Coherence (DeviceGraphExecutor)
 
-When using `GraphExecutor` (the standard inference path), **coherence is automatic**:
+When using `DeviceGraphExecutor` (the standard inference path), **coherence is automatic**:
 
 1. **Stage Entry**: `StageCoherence::ensureInputsOnDevice()` uploads all stage inputs
 2. **Stage Execution**: Kernel runs on GPU
 3. **Stage Exit**: `StageCoherence::markOutputsDirty()` marks outputs as device-authoritative
 
 ```cpp
-// GraphExecutor automatically handles this:
-void GraphExecutor::executeStage(const ComputeNode& node) {
+// DeviceGraphExecutor automatically handles this:
+void DeviceGraphExecutor::executeStage(const ComputeNode& node) {
     // 1. Auto-cohere inputs to GPU
     StageCoherence::ensureInputsOnDevice(node.stage, device_);
     
@@ -1061,7 +1061,7 @@ void GraphExecutor::executeStage(const ComputeNode& node) {
 
 ### Manual Coherence (Tests and Direct Kernel Calls)
 
-When calling kernels **directly** (bypassing GraphExecutor), you must handle coherence manually. Use the utilities in `execution/local_execution/coherence/GpuCoherence.h`:
+When calling kernels **directly** (bypassing DeviceGraphExecutor), you must handle coherence manually. Use the utilities in `execution/local_execution/coherence/GpuCoherence.h`:
 
 #### Preferred Pattern: `with_gpu_coherence()`
 
@@ -1133,10 +1133,10 @@ const float* result = output->data();  // Correctly syncs GPU→host
 
 | Context | Pattern |
 |---------|--------|
-| Pipeline stages (via GraphExecutor) | Automatic - do nothing special |
+| Pipeline stages (via DeviceGraphExecutor) | Automatic - do nothing special |
 | Integration tests calling kernels directly | `with_gpu_coherence()` lambda wrapper |
 | Simple single-output tests | `GpuOutput<T>` RAII wrapper |
-| Custom pipelines bypassing GraphExecutor | `GpuCoherenceScope` for fine-grained control |
+| Custom pipelines bypassing DeviceGraphExecutor | `GpuCoherenceScope` for fine-grained control |
 
 ---
 
@@ -1300,9 +1300,9 @@ Llaminar uses a systematic assertion framework that is **automatically enabled**
 | `LLAMINAR_UNREACHABLE(msg_stream)` | Unreachable code marker | **Always active** |
 | `LLAMINAR_SNAPSHOT_ASSERT*` | Snapshot-only assertions | No-op |
 
-**Automatic Buffer Validation** (GraphExecutor):
+**Automatic Buffer Validation** (DeviceGraphExecutor):
 
-When assertions are active, the GraphExecutor automatically validates stage outputs after each execution:
+When assertions are active, the DeviceGraphExecutor automatically validates stage outputs after each execution:
 
 - **NaN/Inf detection**: Fails by default (catches numerical bugs early)
 - **Zero-tensor detection**: Warns but doesn't fail (set `LLAMINAR_FAIL_ON_ZERO=1` for strict mode)
@@ -1391,7 +1391,7 @@ print(f'Min/Max: {data[~np.isnan(data)].min():.6f} / {data[~np.isnan(data)].max(
 
 **Key Files**:
 - `src/v2/tensors/TensorVerification.h` - Verification system implementation
-- `src/v2/execution/GraphExecutor.cpp` - Integration with `verifyStageEntry()`/`verifyStageExit()`
+- `src/v2/execution/DeviceGraphExecutor.cpp` - Integration with `verifyStageEntry()`/`verifyStageExit()`
 - `src/v2/utils/DebugEnv.h` - `ValidationConfig` struct with environment variable parsing
 
 ### Logging Standards
@@ -1499,7 +1499,7 @@ std::cout << "║" << std::setw(10) << "Name" << " ║"
 | `LLAMINAR_LOG_LEVEL` | Logging verbosity (ERROR/WARN/INFO/DEBUG/TRACE) | INFO |
 | `LLAMINAR_PROFILING` | Enable all profiling (kernel timing + executor overhead) | Disabled |
 | `LLAMINAR_PROFILE_KERNELS` | (Legacy) Enable per-kernel timing in benchmark mode | Disabled |
-| `LLAMINAR_EXECUTOR_PROFILING` | (Legacy) Enable per-stage profiling in GraphExecutor | Disabled |
+| `LLAMINAR_EXECUTOR_PROFILING` | (Legacy) Enable per-stage profiling in DeviceGraphExecutor | Disabled |
 | `LLAMINAR_VALIDATE_BUFFERS` | Enable buffer validation after stage execution | Auto-ON in Debug/Integration |
 | `LLAMINAR_VALIDATE_INPUTS` | Enable input validation before stage execution | Auto-ON in Debug/Integration |
 | `LLAMINAR_FAIL_ON_ZERO` | Fail on zero tensors during validation | Disabled |
@@ -1588,7 +1588,7 @@ LLAMINAR_TRACE_TRANSFERS_MIN_BYTES=1000000 \
 | Directory | Purpose |
 |-----------|---------|
 | `src/v2/inference/` | IInferenceRunner interface and factory |
-| `src/v2/execution/` | ComputeGraph, GraphExecutor, ComputeStages |
+| `src/v2/execution/` | ComputeGraph, DeviceGraphExecutor, ComputeStages |
 | `src/v2/pipelines/qwen/` | GraphOrchestrator, Qwen2Graph, buffer specs |
 | `src/v2/config/` | OrchestrationConfig, OrchestrationConfigParser (CLI/YAML parsing) |
 | `src/v2/kernels/cpu/` | CPU kernels (GEMM, attention, primitives) |

@@ -1,5 +1,5 @@
 /**
- * @file IGraphExecutor.h
+ * @file IDeviceGraphExecutor.h
  * @brief Interface for compute graph execution orchestration
  * @author David Sanftenberg
  * @date December 2025
@@ -33,7 +33,7 @@ namespace llaminar2
     struct StageDumpInfo;
 
     /**
-     * @brief Execution mode for GraphExecutor
+     * @brief Execution mode for DeviceGraphExecutor
      */
     enum class ExecutionMode
     {
@@ -57,7 +57,7 @@ namespace llaminar2
         const StageDumpInfo &dump_info)>;
 
     /**
-     * @brief Configuration for GraphExecutor
+     * @brief Configuration for DeviceGraphExecutor
      */
     struct GraphExecutorConfig
     {
@@ -180,7 +180,7 @@ namespace llaminar2
      * }
      *
      * // In production
-     * GraphExecutor executor(config);
+     * DeviceGraphExecutor executor(config);
      * processGraph(executor, graph, ctx);
      *
      * // In tests

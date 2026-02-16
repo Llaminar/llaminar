@@ -11,11 +11,11 @@
  * ## Design Pattern: Workspace Delegation
  *
  * The workspace system was designed for stages to be the workspace consumers
- * (GraphBufferManager binds workspace to stages). However, the actual memory
+ * (DeviceGraphBufferManager binds workspace to stages). However, the actual memory
  * is consumed by kernels inside stages. This mixin bridges the gap:
  *
  * @code
- * // GraphBufferManager binds to stage
+ * // DeviceGraphBufferManager binds to stage
  * for (auto* stage : stages) {
  *     auto* consumer = dynamic_cast<IWorkspaceConsumer*>(stage);
  *     consumer->bindWorkspace(workspace);  // Stage delegates to kernel
@@ -44,7 +44,7 @@
  * caches kernels by (tensor pointer, target device type).
  *
  * @see IWorkspaceConsumer for the base interface
- * @see GraphBufferManager::allocateDeviceWorkspace() for the binding logic
+ * @see DeviceGraphBufferManager::allocateDeviceWorkspace() for the binding logic
  */
 
 #pragma once

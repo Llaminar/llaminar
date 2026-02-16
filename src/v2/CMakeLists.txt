@@ -1151,8 +1151,9 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/FusedAttentionWoStage.cpp
     execution/compute_stages/stages/EmbeddingStage.cpp
     execution/compute_stages/stages/LMHeadStage.cpp
-    execution/local_execution/graph/GraphExecutor.cpp
-    execution/local_execution/graph/GraphBufferManager.cpp
+    execution/local_execution/graph/DeviceGraphCaptureController.cpp
+    execution/local_execution/graph/DeviceGraphExecutor.cpp
+    execution/local_execution/graph/DeviceGraphBufferManager.cpp
     execution/local_execution/device/DomainAwareBufferManager.cpp
     execution/local_execution/graph/GraphResolver.cpp
     execution/local_execution/graph/LivenessAnalyzer.cpp

@@ -13,7 +13,7 @@ This document outlines the plan to unify Pipeline Parallelism (PP) into the same
 
 ### Key Outcomes
 
-1. **Single execution model** - All parallelism (TP, PP, future MoE) uses `ComputeGraph` + `GraphExecutor`
+1. **Single execution model** - All parallelism (TP, PP, future MoE) uses `ComputeGraph` + `DeviceGraphExecutor`
 2. **Composable domains** - TP domains can be nested within PP stages
 3. **Explicit transfers** - `LocalPPTransferStage` is a first-class graph node
 4. **Sunset `LocalPPOrchestrator`** - Remove the separate orchestrator pattern
@@ -28,7 +28,7 @@ This document outlines the plan to unify Pipeline Parallelism (PP) into the same
 ┌─────────────────────────────────────────────────────────────────┐
 │ Tensor Parallelism (TP)                                         │
 │ ┌─────────────────────────────────────────────────────────────┐ │
-│ │ ComputeGraph → GraphExecutor                                │ │
+│ │ ComputeGraph → DeviceGraphExecutor                                │ │
 │ │   - Stages have device_id                                   │ │
 │ │   - LocalTPAllreduceStage at sync points                    │ │
 │ │   - Single graph for full model                             │ │
@@ -52,7 +52,7 @@ This document outlines the plan to unify Pipeline Parallelism (PP) into the same
 ┌─────────────────────────────────────────────────────────────────┐
 │ All Parallelism: Single ComputeGraph                            │
 │ ┌─────────────────────────────────────────────────────────────┐ │
-│ │ ComputeGraph → GraphExecutor::executeMultiDevice()          │ │
+│ │ ComputeGraph → DeviceGraphExecutor::executeMultiDevice()          │ │
 │ │                                                             │ │
 │ │   [PP Stage 0: TP Domain A (cuda:0, cuda:1)]                │ │
 │ │     ├── embedding (device: cuda:0)                          │ │
@@ -276,12 +276,12 @@ graph.addNode("pp_transfer_" + std::to_string(from_stage) + "_to_" + std::to_str
 
 ### Phase 3: Execution Integration (2-3 days)
 
-**Goal:** Execute unified PP graphs via `GraphExecutor::executeMultiDevice()`.
+**Goal:** Execute unified PP graphs via `DeviceGraphExecutor::executeMultiDevice()`.
 
 | Task | File | Description | Tests |
 |------|------|-------------|-------|
 | 3.1 | `DeviceGraphOrchestrator.cpp` | Build device contexts for all domains | Unit: `Test__DeviceGraphOrchestrator_PP.cpp` |
-| 3.2 | `GraphExecutor.cpp` | Verify `executeMultiDevice()` handles PP graphs | Integration |
+| 3.2 | `DeviceGraphExecutor.cpp` | Verify `executeMultiDevice()` handles PP graphs | Integration |
 | 3.3 | `Qwen2Pipeline.cpp` | Option to use unified PP path | Integration |
 | 3.4 | Context factories | Create `ILocalPPContext` per stage boundary | Unit |
 

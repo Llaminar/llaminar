@@ -1046,7 +1046,7 @@ namespace llaminar2
                       << cuda_tensor << "). "
                                         "PCIeBAR allreduce requires each device to have its own buffer: "
                                         "CUDA device needs a CUDA-memory tensor, ROCm device needs a BAR-backed tensor. "
-                                        "Fix: Ensure GraphBufferManager allocates per-device buffers for row-parallel "
+                                        "Fix: Ensure DeviceGraphBufferManager allocates per-device buffers for row-parallel "
                                         "outputs when using LOCAL TP with PCIeBAR backend.");
             return false;
         }

@@ -29,7 +29,7 @@ namespace llaminar2
     // Forward declarations
     class ComputeGraph;
     class ICollectiveContext;
-    class GraphBufferManager;
+    class DeviceGraphBufferManager;
     class IDeviceContext;
 
     /**
@@ -71,7 +71,7 @@ namespace llaminar2
             LayerPlacementConfig *placement_config = nullptr; ///< Layer-to-device mapping (required)
             MultiDomainTPConfig *tp_config = nullptr;         ///< Multi-domain TP config (optional)
             ICollectiveContext *collective_ctx = nullptr;     ///< Collective context for MPI ops (optional)
-            GraphBufferManager *buffer_manager = nullptr;     ///< Buffer manager for allocation (optional)
+            DeviceGraphBufferManager *buffer_manager = nullptr;     ///< Buffer manager for allocation (optional)
             IDeviceContext *cpu_context = nullptr;            ///< CPU device context (optional)
             IDeviceContext *gpu_context = nullptr;            ///< GPU device context (optional)
             bool enable_profiling = false;                    ///< Track per-layer timing

@@ -121,7 +121,7 @@
 > **Depends on**: G1
 
 - [ ] **G3.1** Add `DataTransferStage` for explicit GPU↔CPU copies
-- [ ] **G3.2** Automatic transfer detection in `GraphExecutor`
+- [ ] **G3.2** Automatic transfer detection in `DeviceGraphExecutor`
 - [ ] **G3.3** Async transfers with CUDA streams / HIP streams
 
 #### Phase G4: Heterogeneous Work Distribution

@@ -98,7 +98,7 @@ The coherence system tracks data validity across CPU and GPU:
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                    GraphExecutor::executeStage()                 │
+│                    DeviceGraphExecutor::executeStage()                 │
 ├──────────────────────────────────────────────────────────────────┤
 │  1. StageCoherence::ensureInputsOnDevice()                       │
 │     - For each input tensor:                                     │
@@ -208,7 +208,7 @@ bool ROCmBackend::deviceToHost(void* dst, const void* src, size_t bytes, int dev
 
 | File | Purpose |
 |------|---------|
-| `src/v2/execution/GraphExecutor.cpp` | Stage execution loop |
+| `src/v2/execution/DeviceGraphExecutor.cpp` | Stage execution loop |
 | `src/v2/execution/compute_stages/stages/FusedQKVGEMMStage.cpp` | QKV projection stage |
 | `src/v2/execution/compute_stages/stages/FusedGateUpGEMMStage.cpp` | FFN gate/up projection |
 

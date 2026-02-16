@@ -62,7 +62,7 @@ This document outlines a phased implementation plan for enabling heterogeneous m
 | **PCIeBAR Backend** | ✅ Validated | 25μs latency for 14KB (8× better than 200μs target) |
 | **Pipeline Parallelism** | ✅ Complete | MPI P2P + Send/Recv stages + PipelineParallelConfig (52 tests) |
 | **Heterogeneous TP** | ✅ Complete | TensorParallelConfig + WeightManager + AllGatherV (64 tests) |
-| **CollectiveContext Wiring** | ✅ Complete | Wired to GraphExecutor, BackendRouter operational |
+| **CollectiveContext Wiring** | ✅ Complete | Wired to DeviceGraphExecutor, BackendRouter operational |
 | **CPU Pipeline Stage** | ✅ Ready | LayerPlacementConfig complete (33 tests) |
 | **Cross-Socket CPU TP** | ✅ Complete | TPDomain + NodeTopology + UPIBackend + NUMAAllocator (144 tests) |
 
@@ -81,22 +81,22 @@ Wire the existing infrastructure and validate PCIeBAR latency before building on
 **Changes**:
 | File | Change |
 |------|--------|
-| `src/v2/execution/GraphExecutor.h` | Add `collective_ctx_` member and setter |
-| `src/v2/execution/GraphExecutor.cpp` | Add `executeCollectiveStage()` intercept for ALLREDUCE/ALLGATHER |
+| `src/v2/execution/DeviceGraphExecutor.h` | Add `collective_ctx_` member and setter |
+| `src/v2/execution/DeviceGraphExecutor.cpp` | Add `executeCollectiveStage()` intercept for ALLREDUCE/ALLGATHER |
 | `src/v2/pipelines/qwen/GraphOrchestrator.cpp` | Wire `injected_collective_ctx_` to executor |
 | `InferenceRunnerFactory.cpp` | Create CollectiveContext with ClusterInventory |
 
 **Implementation**:
 ```cpp
-// GraphExecutor.h
-class GraphExecutor : public IGraphExecutor {
+// DeviceGraphExecutor.h
+class DeviceGraphExecutor : public IGraphExecutor {
 public:
     void setCollectiveContext(ICollectiveContext* ctx) { collective_ctx_ = ctx; }
 private:
     ICollectiveContext* collective_ctx_ = nullptr;
 };
 
-// GraphExecutor.cpp - executeNode()
+// DeviceGraphExecutor.cpp - executeNode()
 if (collective_ctx_ && node.stage->type() == ComputeStageType::ALLREDUCE) {
     return executeCollectiveStage(node, ctx);  // Delegates to CollectiveContext
 }
@@ -567,7 +567,7 @@ class TransferActivationsStage : public ComputeStageBase {
 
 **Effort**: 1 week
 
-**Current Limitation**: GraphExecutor runs stages sequentially. CPU and GPU stages don't overlap.
+**Current Limitation**: DeviceGraphExecutor runs stages sequentially. CPU and GPU stages don't overlap.
 
 **Enhancement**:
 ```cpp
@@ -785,7 +785,7 @@ void MultiDomainOrchestrator::buildLayerGraph(int layer_idx, ComputeGraph& graph
 ### Completed Work Detail
 
 **Week 1-3 Accomplishments**:
-- ✅ Wired CollectiveContext to AllreduceStage via GraphExecutor
+- ✅ Wired CollectiveContext to AllreduceStage via DeviceGraphExecutor
 - ✅ Implemented BackendRouter for automatic NCCL/RCCL/PCIeBAR selection
 - ✅ TensorParallelConfig with DeviceShardingAssignment (proportional + equal split)
 - ✅ WeightManager proportional slicing based on TensorParallelConfig
@@ -809,8 +809,8 @@ void MultiDomainOrchestrator::buildLayerGraph(int layer_idx, ComputeGraph& graph
 ## Appendix A: File Change Summary
 
 ### Phase 0 Files
-- `src/v2/execution/GraphExecutor.h` - Add collective_ctx_
-- `src/v2/execution/GraphExecutor.cpp` - Add executeCollectiveStage()
+- `src/v2/execution/DeviceGraphExecutor.h` - Add collective_ctx_
+- `src/v2/execution/DeviceGraphExecutor.cpp` - Add executeCollectiveStage()
 - `src/v2/pipelines/qwen/GraphOrchestrator.cpp` - Wire collective_ctx
 - `tests/v2/integration/Test__PCIeBARLatencyBenchmark.cpp` - New
 
@@ -1017,7 +1017,7 @@ ICollectiveBackend* selectBackend(const CollectiveOp& op, const TPDomain* domain
 | `src/v2/collective/BackendRouter.h` | Add `selectBackend(const TPDomain*)` overload |
 | `src/v2/collective/BackendRouter.cpp` | Domain-aware backend selection logic |
 | `src/v2/collective/CollectiveContext.h` | Add domain tracking |
-| `src/v2/execution/GraphExecutor.cpp` | Pass domain to collective operations |
+| `src/v2/execution/DeviceGraphExecutor.cpp` | Pass domain to collective operations |
 | `src/v2/pipelines/qwen/GraphOrchestrator.cpp` | Use MultiDomainOrchestrator pattern |
 
 ### Test Files

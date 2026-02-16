@@ -1,21 +1,21 @@
 /**
  * @file Test__ValidationConfig.cpp
- * @brief Unit tests for ValidationConfig and buffer validation in GraphExecutor
+ * @brief Unit tests for ValidationConfig and buffer validation in DeviceGraphExecutor
  * @author GitHub Copilot
  * @date December 2025
  *
  * Tests the Buffer Contract Validation System - Phase 5:
  * - ValidationConfig environment variable parsing
- * - Buffer validation integration with GraphExecutor
+ * - Buffer validation integration with DeviceGraphExecutor
  *
  * @see DebugEnv.h for ValidationConfig struct
- * @see GraphExecutor.cpp for validateStageOutputs implementation
+ * @see DeviceGraphExecutor.cpp for validateStageOutputs implementation
  */
 
 #include <gtest/gtest.h>
 #include "utils/DebugEnv.h"
 #include "utils/Assertions.h" // For LLAMINAR_ASSERTIONS_ACTIVE
-#include "execution/local_execution/graph/GraphExecutor.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "tensors/Tensors.h"
@@ -220,7 +220,7 @@ namespace llaminar2::test
     };
 
     // =============================================================================
-    // GraphExecutor Validation Integration Tests
+    // DeviceGraphExecutor Validation Integration Tests
     // =============================================================================
 
 #ifndef NDEBUG
@@ -283,7 +283,7 @@ namespace llaminar2::test
 
         // Execute
         GraphExecutorConfig config;
-        GraphExecutor executor(config);
+        DeviceGraphExecutor executor(config);
         CPUDeviceContext ctx(DeviceId::cpu());
 
         bool success = executor.execute(graph, &ctx);
@@ -308,7 +308,7 @@ namespace llaminar2::test
 
         // Execute - should succeed (warning only)
         GraphExecutorConfig config;
-        GraphExecutor executor(config);
+        DeviceGraphExecutor executor(config);
         CPUDeviceContext ctx(DeviceId::cpu());
 
         bool success = executor.execute(graph, &ctx);
@@ -333,7 +333,7 @@ namespace llaminar2::test
 
         // Execute - should throw VerificationFailure exception (fail-fast behavior)
         GraphExecutorConfig config;
-        GraphExecutor executor(config);
+        DeviceGraphExecutor executor(config);
         CPUDeviceContext ctx(DeviceId::cpu());
 
         EXPECT_THROW({ executor.execute(graph, &ctx); }, verification::VerificationFailure);
@@ -360,7 +360,7 @@ namespace llaminar2::test
 
         // Execute - should succeed (warning only)
         GraphExecutorConfig config;
-        GraphExecutor executor(config);
+        DeviceGraphExecutor executor(config);
         CPUDeviceContext ctx(DeviceId::cpu());
 
         bool success = executor.execute(graph, &ctx);
@@ -389,7 +389,7 @@ namespace llaminar2::test
 
         // Execute - should throw VerificationFailure exception (fail-fast behavior)
         GraphExecutorConfig config;
-        GraphExecutor executor(config);
+        DeviceGraphExecutor executor(config);
         CPUDeviceContext ctx(DeviceId::cpu());
 
         EXPECT_THROW({ executor.execute(graph, &ctx); }, verification::VerificationFailure);
@@ -412,7 +412,7 @@ namespace llaminar2::test
 
         // Execute - should succeed because validation is disabled
         GraphExecutorConfig config;
-        GraphExecutor executor(config);
+        DeviceGraphExecutor executor(config);
         CPUDeviceContext ctx(DeviceId::cpu());
 
         bool success = executor.execute(graph, &ctx);

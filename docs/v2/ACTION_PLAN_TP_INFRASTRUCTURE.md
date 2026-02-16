@@ -408,7 +408,7 @@ Debug-mode validity tracking with assertions on access.
 ### Files to Modify
 - `src/v2/tensors/TensorBase.h`
 - `src/v2/tensors/TensorBase.cpp` (if exists)
-- `src/v2/execution/GraphBufferManager.h`
+- `src/v2/execution/DeviceGraphBufferManager.h`
 
 ### Code Sample
 
@@ -514,14 +514,14 @@ public:
 };
 ```
 
-**GraphBufferManager** - Invalidate on release:
+**DeviceGraphBufferManager** - Invalidate on release:
 ```cpp
-void GraphBufferManager::releaseBuffer(TensorBase* tensor) {
-    tensor->invalidate("Released back to buffer pool by GraphBufferManager");
+void DeviceGraphBufferManager::releaseBuffer(TensorBase* tensor) {
+    tensor->invalidate("Released back to buffer pool by DeviceGraphBufferManager");
     // ... return to pool ...
 }
 
-void GraphBufferManager::aliasBuffer(TensorBase* original, TensorBase* alias) {
+void DeviceGraphBufferManager::aliasBuffer(TensorBase* original, TensorBase* alias) {
     original->invalidate("Aliased to " + alias->debugName());
     // ... setup alias ...
 }

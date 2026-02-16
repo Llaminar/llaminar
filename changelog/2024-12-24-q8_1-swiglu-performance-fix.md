@@ -45,7 +45,7 @@ This ensures SwiGLU uses the explicit `seq_len` parameter when provided, falling
 
 ### 2. `src/v2/pipelines/qwen/GraphOrchestrator.cpp`
 
-Wired up `LLAMINAR_EXECUTOR_PROFILING` environment variable to GraphExecutor. Both constructors now include:
+Wired up `LLAMINAR_EXECUTOR_PROFILING` environment variable to DeviceGraphExecutor. Both constructors now include:
 
 ```cpp
 exec_config.enable_profiling = graph_builder_->config().enable_profiling 
@@ -72,7 +72,7 @@ Created integration test for Q8_1 prefill with tensor parallelism. Tests 5 seque
 | Variable | Purpose |
 |----------|---------|
 | `LLAMINAR_PROFILE_KERNELS=1` | Per-kernel timing breakdown (GEMM, ATTENTION, etc.) |
-| `LLAMINAR_EXECUTOR_PROFILING=1` | Per-stage timing in GraphExecutor (swiglu, rope, etc.) |
+| `LLAMINAR_EXECUTOR_PROFILING=1` | Per-stage timing in DeviceGraphExecutor (swiglu, rope, etc.) |
 | `LLAMINAR_LOG_LEVEL=DEBUG` | Detailed logging output |
 
 ### Example Profiling Commands

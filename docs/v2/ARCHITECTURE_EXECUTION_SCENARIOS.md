@@ -33,7 +33,7 @@ This document provides detailed diagrams showing how Llaminar constructs and exe
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
 │  │  GraphOrchestrator (implements IInferenceRunner)                      │   │
 │  │    ├── InferenceState (hidden, logits, kv_cache, positions)          │   │
-│  │    ├── GraphExecutor (DAG execution engine)                          │   │
+│  │    ├── DeviceGraphExecutor (DAG execution engine)                          │   │
 │  │    ├── LayerGraphCache (decode-mode graph caching)                   │   │
 │  │    ├── Qwen2Graph (IGraphBuilder - declarative graph construction)   │   │
 │  │    └── CollectiveContext (MPI backend routing)                       │   │
@@ -112,7 +112,7 @@ This document provides detailed diagrams showing how Llaminar constructs and exe
 │  └─────────────────────────────────────────────────────────────────────┘    │
 │                                      │                                       │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  GraphBufferManager (IGraphBufferManager)                            │    │
+│  │  DeviceGraphBufferManager (IGraphBufferManager)                            │    │
 │  │    ├── queryAvailableMemory(device) → total, free, usable          │    │
 │  │    ├── computeWorkspaceBudget(device, config) → budget bytes       │    │
 │  │    ├── allocateWithAliasing(graph) → LivenessAnalyzer optimization │    │
@@ -131,7 +131,7 @@ This document provides detailed diagrams showing how Llaminar constructs and exe
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                            EXECUTION LAYER                                   │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  GraphExecutor (IGraphExecutor)                                      │    │
+│  │  DeviceGraphExecutor (IGraphExecutor)                                      │    │
 │  │    ├── execute(graph, ctx) → topological order execution            │    │
 │  │    ├── executeMultiDevice(graph, contexts) → multi-GPU support      │    │
 │  │    ├── setSnapshotCallback() for debugging/parity tests            │    │
@@ -582,7 +582,7 @@ This section details the unified memory management system that enables efficient
 │          │                                                                   │
 │          ▼                                                                   │
 │   ┌──────────────────────────────────────────────────────────────────┐      │
-│   │                    GraphBufferManager                             │      │
+│   │                    DeviceGraphBufferManager                             │      │
 │   │  Central coordinator for buffer allocation and workspace budgets │      │
 │   │                                                                   │      │
 │   │  queryAvailableMemory(device):                                   │      │
@@ -649,7 +649,7 @@ This section details the unified memory management system that enables efficient
 │   1. BUDGET COMPUTATION (after model load)                                  │
 │   ─────────────────────────────────────────                                 │
 │                                                                              │
-│   GraphBufferManager::computeWorkspaceBudget(CUDA:0, config)                │
+│   DeviceGraphBufferManager::computeWorkspaceBudget(CUDA:0, config)                │
 │          │                                                                   │
 │          ▼                                                                   │
 │   ┌─────────────────────────────────────────────────────────┐               │
@@ -798,11 +798,11 @@ This section details the unified memory management system that enables efficient
 │   │                             │    │  Allocation overhead: 0ms   │       │
 │   └─────────────────────────────┘    └─────────────────────────────┘       │
 │                                                                              │
-│   Usage in GraphExecutor:                                                   │
+│   Usage in DeviceGraphExecutor:                                                   │
 │   ───────────────────────                                                   │
 │                                                                              │
 │   // At graph construction time (once)                                      │
-│   GraphBufferManager gbm;                                                   │
+│   DeviceGraphBufferManager gbm;                                                   │
 │   auto budget = gbm.computeWorkspaceBudget(CUDA:0, config);                 │
 │   auto reqs = kernel->getWorkspaceRequirements();                           │
 │   auto mgr = gbm.allocateDeviceWorkspace(CUDA:0, reqs);                        │
@@ -2073,10 +2073,10 @@ ComputeGraph Qwen2Graph::build(const Model& model, const GlobalTopology& topo) {
 
 ## Execution Flow
 
-### GraphExecutor Loop
+### DeviceGraphExecutor Loop
 
 ```cpp
-void GraphExecutor::execute(ComputeGraph& graph) {
+void DeviceGraphExecutor::execute(ComputeGraph& graph) {
     // Topological order ensures dependencies are satisfied
     for (ComputeNode* node : graph.topologicalOrder()) {
         

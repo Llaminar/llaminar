@@ -7,9 +7,9 @@
  */
 
 #include "HeterogeneousLayerExecutor.h"
-#include "../graph/GraphExecutor.h"
+#include "../graph/DeviceGraphExecutor.h"
 #include "../device/DeviceContext.h"
-#include "../graph/GraphBufferManager.h"
+#include "../graph/DeviceGraphBufferManager.h"
 #include "../../../interfaces/ICollectiveContext.h"
 #include "../../../utils/Logger.h"
 
@@ -230,7 +230,7 @@ namespace llaminar2
         //
         // For now, we mark success and track stats. The actual stage execution
         // is handled by the pipeline/DeviceGraphOrchestrator which already calls
-        // GraphExecutor with the appropriate context.
+        // DeviceGraphExecutor with the appropriate context.
 
         LOG_TRACE("executeLayerStages: layer " << layer_idx
                                                << " with " << (ctx ? "valid" : "null") << " context");
@@ -238,7 +238,7 @@ namespace llaminar2
         // If no context provided, the stages will use their default execution path
         // This is acceptable for Phase 5.1 where we're establishing the routing framework
 
-        // In Phase 5.3, this will integrate with GraphExecutor::executeMultiDevice()
+        // In Phase 5.3, this will integrate with DeviceGraphExecutor::executeMultiDevice()
         // to actually run the stages on the appropriate device
 
         return true; // Success - actual execution delegated to existing infrastructure

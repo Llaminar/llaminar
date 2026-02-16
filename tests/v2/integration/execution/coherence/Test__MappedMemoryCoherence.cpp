@@ -183,7 +183,7 @@ TEST_F(Test__MappedMemoryCoherence, MappedTensor_KernelWriteVisibleOnHost)
         gpu_ptr[i] = test_value + static_cast<float>(i);
     }
 
-    // Mark as device dirty (simulating what GraphExecutor does after kernel)
+    // Mark as device dirty (simulating what DeviceGraphExecutor does after kernel)
     tensor->mark_device_dirty();
 
     // Host should see the writes WITHOUT explicit memcpy

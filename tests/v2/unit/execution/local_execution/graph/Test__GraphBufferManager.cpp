@@ -1,6 +1,6 @@
 /**
- * @file Test__GraphBufferManager.cpp
- * @brief Unit tests for GraphBufferManager
+ * @file Test__DeviceGraphBufferManager.cpp
+ * @brief Unit tests for DeviceGraphBufferManager
  * @author David Sanftenberg
  * @date December 2025
  *
@@ -9,8 +9,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/local_execution/graph/GraphBufferManager.h"
-#include "execution/local_execution/graph/GraphExecutor.h"
+#include "execution/local_execution/graph/DeviceGraphBufferManager.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/collective/CollectiveContext.h"
 #include "backends/BackendManager.h"
 #include "execution/compute_stages/ComputeStages.h"
@@ -34,7 +34,7 @@ protected:
         // Create mock MPI context (single rank)
         mpi_ctx_ = std::make_unique<MPIContext>(0, 1, MPI_COMM_WORLD);
         factory_ = std::make_unique<TensorFactory>(*mpi_ctx_);
-        manager_ = std::make_unique<GraphBufferManager>(factory_.get(), mpi_ctx_.get());
+        manager_ = std::make_unique<DeviceGraphBufferManager>(factory_.get(), mpi_ctx_.get());
     }
 
     void TearDown() override
@@ -46,7 +46,7 @@ protected:
 
     std::unique_ptr<MPIContext> mpi_ctx_;
     std::unique_ptr<TensorFactory> factory_;
-    std::unique_ptr<GraphBufferManager> manager_;
+    std::unique_ptr<DeviceGraphBufferManager> manager_;
 };
 
 // =============================================================================
@@ -94,6 +94,59 @@ public:
     // Uses default getBufferRequirements() which returns empty
 };
 
+/**
+ * @brief Mock stage implementing IWorkspaceConsumer for workspace binding tests
+ */
+class MockWorkspaceConsumerStage : public IComputeStage, public IWorkspaceConsumer
+{
+public:
+    explicit MockWorkspaceConsumerStage(DeviceId device = DeviceId::cpu())
+        : IComputeStage(device) {}
+
+    bool execute(IDeviceContext *) override { return true; }
+    ComputeStageType type() const override { return ComputeStageType::COPY; }
+    bool supportsBackend(ComputeBackendType) const override { return true; }
+    size_t estimatedFlops() const override { return 0; }
+    StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+
+    WorkspaceRequirements getWorkspaceRequirements(int m = 0, int n = 0, int k = 0) const override
+    {
+        (void)n;
+        (void)k;
+        WorkspaceRequirements reqs;
+        const size_t bytes = (m > 0) ? static_cast<size_t>(m) * sizeof(float) : 4096;
+        reqs.buffers.push_back({"mock_workspace", bytes, 256, true});
+        return reqs;
+    }
+
+    void bindWorkspace(DeviceWorkspaceManager *workspace) override
+    {
+        bound_workspace_ = workspace;
+        bind_count_++;
+    }
+
+    void unbindWorkspace() override
+    {
+        bound_workspace_ = nullptr;
+    }
+
+    bool hasWorkspace() const override
+    {
+        return bound_workspace_ != nullptr;
+    }
+
+    DeviceWorkspaceManager *getWorkspace() const override
+    {
+        return bound_workspace_;
+    }
+
+    int bindCount() const { return bind_count_; }
+
+private:
+    DeviceWorkspaceManager *bound_workspace_ = nullptr;
+    int bind_count_ = 0;
+};
+
 // =============================================================================
 // Basic Construction Tests
 // =============================================================================
@@ -106,7 +159,7 @@ TEST_F(GraphBufferManagerTest, ConstructWithFactory)
 
 TEST_F(GraphBufferManagerTest, ConstructWithNullFactory)
 {
-    GraphBufferManager null_manager(nullptr);
+    DeviceGraphBufferManager null_manager(nullptr);
     EXPECT_EQ(null_manager.bufferCount(), 0u);
 }
 
@@ -430,7 +483,7 @@ TEST_F(GraphBufferManagerTest, AllocateEmptyShapeFails)
 
 TEST_F(GraphBufferManagerTest, NullFactoryAllocateFails)
 {
-    GraphBufferManager null_manager(nullptr);
+    DeviceGraphBufferManager null_manager(nullptr);
     BufferDescriptor desc = BufferDescriptor::output("out", {16}, BufferTensorType::FP32);
 
     EXPECT_FALSE(null_manager.allocateBuffer("node", desc));
@@ -438,7 +491,7 @@ TEST_F(GraphBufferManagerTest, NullFactoryAllocateFails)
 
 TEST_F(GraphBufferManagerTest, NullFactoryGraphAllocateFails)
 {
-    GraphBufferManager null_manager(nullptr);
+    DeviceGraphBufferManager null_manager(nullptr);
 
     StageBufferRequirements reqs;
     reqs.addOutput("out", {16}, BufferTensorType::FP32);
@@ -469,7 +522,7 @@ TEST_F(GraphBufferManagerTest, StatsTrackByRole)
 }
 
 // =============================================================================
-// Integration with GraphExecutor Tests
+// Integration with DeviceGraphExecutor Tests
 // =============================================================================
 
 class GraphExecutorBufferTest : public GraphBufferManagerTest
@@ -478,10 +531,10 @@ protected:
     void SetUp() override
     {
         GraphBufferManagerTest::SetUp();
-        executor_ = std::make_unique<GraphExecutor>();
+        executor_ = std::make_unique<DeviceGraphExecutor>();
     }
 
-    std::unique_ptr<GraphExecutor> executor_;
+    std::unique_ptr<DeviceGraphExecutor> executor_;
 };
 
 TEST_F(GraphExecutorBufferTest, SetAndGetBufferManager)
@@ -1052,6 +1105,55 @@ TEST_F(GraphBufferManagerTest, AllocateGpuWorkspaceWithNonConsumerStages)
     // Should succeed with no workspace consumers found
     EXPECT_TRUE(manager_->allocateDeviceWorkspace(stages));
     EXPECT_EQ(manager_->totalDeviceWorkspaceAllocated(), 0u);
+}
+
+TEST_F(GraphBufferManagerTest, AllocateGpuWorkspaceBindsAllConsumersSameDevice)
+{
+    initCPUBackend(0);
+
+    MockWorkspaceConsumerStage stage1(DeviceId::cpu());
+    MockWorkspaceConsumerStage stage2(DeviceId::cpu());
+    std::vector<IComputeStage *> stages = {&stage1, &stage2};
+
+    WorkspaceBudgetConfig config;
+    config.min_budget = 64 * 1024;
+    config.headroom = 0;
+
+    ASSERT_TRUE(manager_->allocateDeviceWorkspace(stages, config));
+
+    auto *workspace = manager_->getDeviceWorkspace(DeviceId::cpu());
+    ASSERT_NE(workspace, nullptr);
+    EXPECT_TRUE(stage1.hasWorkspace());
+    EXPECT_TRUE(stage2.hasWorkspace());
+    EXPECT_EQ(stage1.getWorkspace(), workspace);
+    EXPECT_EQ(stage2.getWorkspace(), workspace);
+    EXPECT_GE(stage1.bindCount(), 1);
+    EXPECT_GE(stage2.bindCount(), 1);
+    EXPECT_GT(manager_->deviceWorkspaceAllocated(DeviceId::cpu()), 0u);
+}
+
+TEST_F(GraphBufferManagerTest, AllocateGpuWorkspaceRebuildRebindsNewConsumers)
+{
+    initCPUBackend(0);
+
+    WorkspaceBudgetConfig config;
+    config.min_budget = 64 * 1024;
+    config.headroom = 0;
+
+    MockWorkspaceConsumerStage first_graph_stage(DeviceId::cpu());
+    std::vector<IComputeStage *> first_graph = {&first_graph_stage};
+    ASSERT_TRUE(manager_->allocateDeviceWorkspace(first_graph, config));
+    auto *first_workspace = manager_->getDeviceWorkspace(DeviceId::cpu());
+    ASSERT_NE(first_workspace, nullptr);
+    EXPECT_EQ(first_graph_stage.getWorkspace(), first_workspace);
+
+    MockWorkspaceConsumerStage rebuilt_graph_stage(DeviceId::cpu());
+    std::vector<IComputeStage *> rebuilt_graph = {&rebuilt_graph_stage};
+    ASSERT_TRUE(manager_->allocateDeviceWorkspace(rebuilt_graph, config));
+    auto *rebuilt_workspace = manager_->getDeviceWorkspace(DeviceId::cpu());
+    ASSERT_NE(rebuilt_workspace, nullptr);
+    EXPECT_EQ(rebuilt_graph_stage.getWorkspace(), rebuilt_workspace);
+    EXPECT_GE(rebuilt_graph_stage.bindCount(), 1);
 }
 
 TEST_F(GraphBufferManagerTest, WorkspaceBudgetConfigDefaults)

@@ -1,10 +1,10 @@
 /**
  * @file ILayerExecutor.h
- * @brief Backwards compatibility header - includes IGraphExecutor.h
+ * @brief Backwards compatibility header - includes IDeviceGraphExecutor.h
  * @author David Sanftenberg
  * @date December 2025
  *
- * @deprecated Use IGraphExecutor.h directly. This header exists for
+ * @deprecated Use IDeviceGraphExecutor.h directly. This header exists for
  * backwards compatibility and will be removed in a future version.
  *
  * ILayerExecutor has been renamed to IGraphExecutor to better reflect
@@ -15,7 +15,7 @@
 
 #include "../graph/IGraphExecutor.h"
 
-// All types are aliased in IGraphExecutor.h:
+// All types are aliased in IDeviceGraphExecutor.h:
 // - ILayerExecutor = IGraphExecutor
 // - LayerExecutorConfig = GraphExecutorConfig
 // - LayerExecutorStats = GraphExecutorStats

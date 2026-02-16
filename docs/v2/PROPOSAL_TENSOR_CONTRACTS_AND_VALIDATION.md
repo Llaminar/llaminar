@@ -21,7 +21,7 @@
 
 ### Phase 1 Deliverables
 - ✅ Created `src/v2/tensors/TensorVerification.h` with `VerificationResult`, `VerificationConfig`, `verifyRawBuffer()`, `dumpStageBuffers()`, `VerificationFailure` exception
-- ✅ Added `verifyStageEntry()` and `verifyStageExit()` to `GraphExecutor` with automatic entry/exit validation
+- ✅ Added `verifyStageEntry()` and `verifyStageExit()` to `DeviceGraphExecutor` with automatic entry/exit validation
 - ✅ Validation auto-enabled in Debug/Integration builds via `LLAMINAR_ASSERTIONS_ACTIVE`
 - ✅ Automatic buffer dumps to `/tmp/llaminar_verification_dump/` on verification failure
 - ✅ 26 unit tests in `tests/v2/unit/utils/Test__TensorVerification.cpp`
@@ -53,7 +53,7 @@
 - ✅ Added `validateBufferLayoutByShape()` function to infer layout from tensor dimensions
 - ✅ Extended `BufferDescriptor` with optional `TensorLayout expected_layout` field (default: `UNKNOWN`)
 - ✅ Extended fluent API: `addInput(name, shape, type, layout)`, `addOutput(name, shape, type, layout)`, `addInout(name, shape, type, layout)`, `addScratch(name, shape, type, layout)`, `addWeight(name, shape, type, layout)` - optional 4th layout parameter preserves fluent chaining
-- ✅ `GraphExecutor::verifyStageEntry()` automatically validates input layouts against `getBufferRequirements()` declarations
+- ✅ `DeviceGraphExecutor::verifyStageEntry()` automatically validates input layouts against `getBufferRequirements()` declarations
 - ✅ 3 new unit tests for layout parameter API in `Test__BufferRole.cpp`: `LayoutParameterAPI`, `LayoutDefaultsToUnknown`, `MixedLayoutDeclarations`
 - ✅ Updated `FusedAttentionWoStage` to use new layout declaration API
 - ✅ All 213 V2 unit tests pass
@@ -99,7 +99,7 @@ Five architectural gaps are causing debugging difficulty and silent failures in 
 
 ### Issue 1: Missing Systematic Buffer Validation
 
-**Current State**: `GraphExecutor` has post-stage validation via `getDumpInfo()`, but:
+**Current State**: `DeviceGraphExecutor` has post-stage validation via `getDumpInfo()`, but:
 - No **input validation** before stage execution
 - No enforcement of null/NaN/Inf/zero checks on stage entry
 - Validation happens only after stage completion (too late to catch input corruption)
@@ -298,14 +298,14 @@ private:
 } // namespace llaminar2::verification
 ```
 
-#### 1.2 Stage Boundary Verification in GraphExecutor
+#### 1.2 Stage Boundary Verification in DeviceGraphExecutor
 
 ```cpp
-// In GraphExecutor::executeNode()
+// In DeviceGraphExecutor::executeNode()
 
 #if LLAMINAR_ASSERTIONS_ACTIVE
 
-bool GraphExecutor::verifyStageEntry(const ComputeNode& node, int layer_idx) {
+bool DeviceGraphExecutor::verifyStageEntry(const ComputeNode& node, int layer_idx) {
     using namespace verification;
     
     const auto& config = debugEnv().validation;
@@ -338,7 +338,7 @@ bool GraphExecutor::verifyStageEntry(const ComputeNode& node, int layer_idx) {
     return true;
 }
 
-bool GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
+bool DeviceGraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
     using namespace verification;
     
     const auto& config = debugEnv().validation;
@@ -376,7 +376,7 @@ bool GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
 #### 1.3 Execution Flow with Verification
 
 ```cpp
-bool GraphExecutor::executeNode(ComputeNode& node, IDeviceContext* ctx) {
+bool DeviceGraphExecutor::executeNode(ComputeNode& node, IDeviceContext* ctx) {
     // Extract layer index from node name (e.g., "layer3_attention" -> 3)
     int layer_idx = extractLayerIndex(node.name);
     
@@ -390,7 +390,7 @@ bool GraphExecutor::executeNode(ComputeNode& node, IDeviceContext* ctx) {
     bool success = node.stage->execute(ctx);
     
     if (!success) {
-        LOG_ERROR("[GraphExecutor] Stage '" << node.name << "' returned false");
+        LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name << "' returned false");
         return false;
     }
 
@@ -767,11 +767,11 @@ Analysis of existing codebase reveals the following infrastructure to build upon
 
 | File | Component | Current Behavior | Issue |
 |------|-----------|-----------------|-------|
-| `GraphExecutor.cpp:567-655` | `validateStageOutputs()` | Only validates FP32 OUTPUTS | No input validation |
-| `GraphExecutor.cpp:492-560` | `executeNode()` | Calls validation after execute | No entry validation |
+| `DeviceGraphExecutor.cpp:567-655` | `validateStageOutputs()` | Only validates FP32 OUTPUTS | No input validation |
+| `DeviceGraphExecutor.cpp:492-560` | `executeNode()` | Calls validation after execute | No entry validation |
 | `TensorValidation.h` | `tensorAppearsZero()` | Checks sampled elements for zeros | Uses `#ifndef NDEBUG` not `LLAMINAR_ASSERTIONS_ACTIVE` |
 | `TensorValidation.h` | `tensorHasNaNOrInf()` | Checks sampled elements for NaN/Inf | Returns bool, doesn't throw |
-| `TensorValidation.h` | `assertTensorValid()` | Throws `std::runtime_error` | Not used in GraphExecutor, wrong exception type |
+| `TensorValidation.h` | `assertTensorValid()` | Throws `std::runtime_error` | Not used in DeviceGraphExecutor, wrong exception type |
 
 **Reusable Dump Infrastructure** (in `StageDumper.h`):
 
@@ -792,7 +792,7 @@ Analysis of existing codebase reveals the following infrastructure to build upon
 | `dump_on_failure` | N/A | **Add new field**, default `true` |
 | `sample_rows` | N/A | **Add new field**, default `8` |
 
-**Execution Context** (in `IGraphExecutor.h`):
+**Execution Context** (in `IDeviceGraphExecutor.h`):
 
 | Field | Location | Use |
 |-------|----------|-----|
@@ -824,8 +824,8 @@ Analysis of existing codebase reveals the following infrastructure to build upon
 
 | File | Changes |
 |------|---------|
-| `src/v2/execution/GraphExecutor.h` | Add `verifyStageEntry()`, `verifyStageExit()` methods (under `#if LLAMINAR_ASSERTIONS_ACTIVE`) |
-| `src/v2/execution/GraphExecutor.cpp` | Replace `validateStageOutputs()` with entry/exit verification calls in `executeNode()` |
+| `src/v2/execution/DeviceGraphExecutor.h` | Add `verifyStageEntry()`, `verifyStageExit()` methods (under `#if LLAMINAR_ASSERTIONS_ACTIVE`) |
+| `src/v2/execution/DeviceGraphExecutor.cpp` | Replace `validateStageOutputs()` with entry/exit verification calls in `executeNode()` |
 | `src/v2/utils/DebugEnv.h` | Extend `ValidationConfig` with `dump_on_failure`, `sample_rows` |
 | `src/v2/tensors/TensorValidation.h` | **DEPRECATED** - functionality moved to TensorVerification.h |
 | `src/v2/CMakeLists.txt` | Add TensorVerification.cpp to sources |
@@ -959,14 +959,14 @@ std::string dumpStageBuffers(
 } // namespace llaminar2::verification
 ```
 
-**2. Modified `executeNode()` in GraphExecutor.cpp:**
+**2. Modified `executeNode()` in DeviceGraphExecutor.cpp:**
 
 ```cpp
-bool GraphExecutor::executeNode(ComputeNode &node, IDeviceContext *ctx)
+bool DeviceGraphExecutor::executeNode(ComputeNode &node, IDeviceContext *ctx)
 {
     if (!node.stage)
     {
-        LOG_ERROR("[GraphExecutor] Node '" << node.name << "' has no stage");
+        LOG_ERROR("[DeviceGraphExecutor] Node '" << node.name << "' has no stage");
         return false;
     }
 
@@ -1008,7 +1008,7 @@ bool GraphExecutor::executeNode(ComputeNode &node, IDeviceContext *ctx)
 
 ```cpp
 #if LLAMINAR_ASSERTIONS_ACTIVE
-void GraphExecutor::verifyStageEntry(const ComputeNode& node, int layer_idx)
+void DeviceGraphExecutor::verifyStageEntry(const ComputeNode& node, int layer_idx)
 {
     using namespace verification;
     
@@ -1044,7 +1044,7 @@ void GraphExecutor::verifyStageEntry(const ComputeNode& node, int layer_idx)
     }
 }
 
-void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx)
+void DeviceGraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx)
 {
     using namespace verification;
     
@@ -1298,7 +1298,7 @@ std::string dumpStageBuffers(
 | `TensorValidation.h::tensorAppearsZero()` | Logic absorbed into `verifyRawBuffer()` |
 | `TensorValidation.h::tensorHasNaNOrInf()` | Logic absorbed into `verifyRawBuffer()` |
 | `TensorValidation.h::assertTensorValid()` | Replaced by `VerificationFailure` exception |
-| `GraphExecutor::validateStageOutputs()` | Replaced by `verifyStageEntry()` + `verifyStageExit()` |
+| `DeviceGraphExecutor::validateStageOutputs()` | Replaced by `verifyStageEntry()` + `verifyStageExit()` |
 
 #### Reusable Infrastructure
 
@@ -1483,7 +1483,7 @@ TEST_F(TensorVerificationTest, DumpManifestContainsCorrectMetadata)
 }
 
 // =============================================================================
-// 5. GraphExecutor Integration Tests (requires mock stage)
+// 5. DeviceGraphExecutor Integration Tests (requires mock stage)
 // =============================================================================
 
 // These should be in tests/v2/integration/Test__GraphExecutorVerification.cpp
@@ -1493,7 +1493,7 @@ TEST_F(GraphExecutorVerificationTest, ThrowsOnNaNInput)
     // Create a mock stage with NaN input
     auto stage = createMockStageWithNaNInput();
     
-    GraphExecutor executor;
+    DeviceGraphExecutor executor;
     executor.addNode("nan_stage", std::move(stage));
     
     // Should throw VerificationFailure at ENTRY
@@ -1508,7 +1508,7 @@ TEST_F(GraphExecutorVerificationTest, ThrowsOnNaNOutput)
     // Create a mock stage that produces NaN output
     auto stage = createMockStageProducingNaN();
     
-    GraphExecutor executor;
+    DeviceGraphExecutor executor;
     executor.addNode("bad_stage", std::move(stage));
     
     // Should throw VerificationFailure at EXIT
@@ -1525,7 +1525,7 @@ TEST_F(GraphExecutorVerificationTest, PassesValidStage)
 {
     auto stage = createValidMockStage();
     
-    GraphExecutor executor;
+    DeviceGraphExecutor executor;
     executor.addNode("valid_stage", std::move(stage));
     
     // Should not throw
@@ -2500,7 +2500,7 @@ StageBufferRequirements FusedAttentionWoStage::getBufferRequirements() const ove
 
 1. **Optional Layout Parameter**: All `addInput/addOutput/addInout/addScratch/addWeight` methods accept optional 4th parameter `TensorLayout layout = TensorLayout::UNKNOWN`
 2. **Fluent Chaining Preserved**: Returns `StageBufferRequirements&` for continued chaining
-3. **Automatic Validation**: `GraphExecutor::verifyStageEntry()` validates input layouts against declarations
+3. **Automatic Validation**: `DeviceGraphExecutor::verifyStageEntry()` validates input layouts against declarations
 4. **LayoutExpectation Struct**: Encodes expected layout from buffer requirements
 5. **LayoutValidationResult Struct**: Captures validation outcomes with detailed error messages
 6. **Shape-Based Inference**: `validateBufferLayoutByShape()` can infer layout from tensor dimensions
@@ -2508,7 +2508,7 @@ StageBufferRequirements FusedAttentionWoStage::getBufferRequirements() const ove
 **Files Modified:**
 - `src/v2/tensors/TensorLayout.h` - Added `LayoutExpectation`, `LayoutValidationResult`, validation functions
 - `src/v2/execution/compute_stages/BufferRole.h` - Extended fluent API with optional layout parameter
-- `src/v2/execution/GraphExecutor.cpp` - Layout validation in `verifyStageEntry()`
+- `src/v2/execution/DeviceGraphExecutor.cpp` - Layout validation in `verifyStageEntry()`
 - `tests/v2/unit/stages/Test__BufferRole.cpp` - 3 new tests for layout API
 
 ---
@@ -3155,7 +3155,7 @@ bool MyStage::execute() {
 
 **After** (automatic verification at stage boundaries):
 ```cpp
-// GraphExecutor automatically calls verification before/after execute()
+// DeviceGraphExecutor automatically calls verification before/after execute()
 // On failure:
 //   1. Logs: layer=5 stage=MyStage phase=EXIT tensor=output reason="156 NaN values"
 //   2. Dumps all buffers to /tmp/llaminar_verification_dump/...

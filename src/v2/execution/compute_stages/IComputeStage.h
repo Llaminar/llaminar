@@ -424,7 +424,7 @@ namespace llaminar2
         /**
          * @brief Get buffer requirements for this stage
          *
-         * Used by GraphBufferManager for intelligent buffer allocation and reuse.
+         * Used by DeviceGraphBufferManager for intelligent buffer allocation and reuse.
          * Stages should declare all buffers they read, write, or allocate.
          */
         virtual StageBufferRequirements getBufferRequirements() const
@@ -435,7 +435,7 @@ namespace llaminar2
         /**
          * @brief Get layout expectation for automatic validation
          *
-         * If a stage returns a non-empty LayoutExpectation, the GraphExecutor
+         * If a stage returns a non-empty LayoutExpectation, the DeviceGraphExecutor
          * will automatically validate all input/output tensors with declared
          * layouts (via getBufferRequirements().withLayout()) against this
          * expectation at stage entry and exit.
@@ -451,7 +451,7 @@ namespace llaminar2
          *        params_.head_dim, params_.n_heads, params_.n_kv_heads,
          *        local_heads, local_kv_heads);
          *    @endcode
-         * 3. GraphExecutor automatically validates on each execute()
+         * 3. DeviceGraphExecutor automatically validates on each execute()
          *
          * @return LayoutExpectation with model dimensions, or empty (is_set()==false)
          *         if no automatic validation is desired.
@@ -500,7 +500,7 @@ namespace llaminar2
          * - SwiGLU: Theoretically possible with extreme gate values (rare)
          *
          * Override this to return true if your stage has legitimate all-zero
-         * output scenarios. The GraphExecutor will skip zero-check validation
+         * output scenarios. The DeviceGraphExecutor will skip zero-check validation
          * for stages that return true.
          *
          * @return false by default (all-zero outputs are bugs)
@@ -567,7 +567,7 @@ namespace llaminar2
          * @brief Update dynamic parameters for graph reuse
          *
          * Allows updating position-dependent parameters (like RoPE position offset)
-         * without rebuilding the entire compute graph. Called by GraphExecutor
+         * without rebuilding the entire compute graph. Called by DeviceGraphExecutor
          * between decode steps.
          *
          * @param pos_offset Current position in sequence (for RoPE, causal mask)
@@ -591,7 +591,7 @@ namespace llaminar2
         /**
          * @brief Called after a captured GPU graph segment is replayed.
          *
-         * This method is invoked by GraphExecutor after launching a graph segment
+         * This method is invoked by DeviceGraphExecutor after launching a graph segment
          * containing this stage (Phase 3 replay). It allows stages to perform
          * host-side bookkeeping that would normally happen inside execute().
          *
@@ -606,7 +606,7 @@ namespace llaminar2
         /**
          * @brief Returns true if this stage overrides onGraphReplayed().
          *
-         * Used by GraphExecutor to precompute a list of stages needing
+         * Used by DeviceGraphExecutor to precompute a list of stages needing
          * post-replay callbacks, avoiding per-step hash map lookups.
          */
         virtual bool needsOnGraphReplayed() const { return false; }

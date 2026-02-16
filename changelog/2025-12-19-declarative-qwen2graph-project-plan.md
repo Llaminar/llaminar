@@ -40,7 +40,7 @@ This violates Single Responsibility Principle and makes the class harder to test
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          EXECUTION LAYER                                     │
 │  ┌─────────────────────┐   ┌─────────────────────┐   ┌──────────────────┐  │
-│  │   GraphExecutor     │   │  GraphCacheManager  │   │ DeviceContextMgr │  │
+│  │   DeviceGraphExecutor     │   │  GraphCacheManager  │   │ DeviceContextMgr │  │
 │  │   (executes DAGs)   │   │  (Phase 10 caching) │   │ (device contexts)│  │
 │  └─────────────────────┘   └─────────────────────┘   └──────────────────┘  │
 │                                                                             │
@@ -150,7 +150,7 @@ position_ids_buffer_ = buildPositionIds(input.seq_len, input.batch_size, input.p
 **Changes Made**:
 1. ✅ Created `GraphOrchestrator` that wraps:
    - `Qwen2Graph` (as `graph_builder_` via non-owning shared_ptr)
-   - `GraphExecutor` (references `graph_builder_->executor()`)
+   - `DeviceGraphExecutor` (references `graph_builder_->executor()`)
    - `IDeviceContext` cache (`device_contexts_`)
    - Graph cache (`layer_graph_cache_`)
 
@@ -239,7 +239,7 @@ position_ids_buffer_ = buildPositionIds(input.seq_len, input.batch_size, input.p
    class CompositeStage : public IComputeStage {
        ComputeGraph subgraph_;
        bool execute(IDeviceContext*) override {
-           return GraphExecutor::execute(subgraph_, ctx);
+           return DeviceGraphExecutor::execute(subgraph_, ctx);
        }
    };
    ```

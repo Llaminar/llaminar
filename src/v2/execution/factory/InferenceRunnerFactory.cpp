@@ -609,7 +609,7 @@ namespace llaminar2
         {
             // GLOBAL TP path: use MPI-based collectives from compute stages.
             // Optional experiment path: route collective stages through
-            // GraphExecutor intercept + MPI-backed CollectiveContext.
+            // DeviceGraphExecutor intercept + MPI-backed CollectiveContext.
             if (env.execution.force_mpi_collective_context)
             {
                 // Build CPU-only world inventory to force MPI backend selection

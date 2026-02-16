@@ -12,7 +12,7 @@
  */
 
 #include "IPipelineParallelGraphBuilder.h"
-#include "GraphExecutor.h" // For full ComputeGraph definition
+#include "DeviceGraphExecutor.h" // For full ComputeGraph definition
 #include "../../compute_stages/ComputeStageFactory.h"
 #include "../../compute_stages/stages/SendActivationsStage.h"
 #include "../../compute_stages/stages/ReceiveActivationsStage.h"

@@ -46,7 +46,7 @@ namespace llaminar2
 
         // =========================================================================
         // High-Level Collective Operations
-        // These are called by GraphExecutor when executing collective stages
+        // These are called by DeviceGraphExecutor when executing collective stages
         // =========================================================================
 
         /**

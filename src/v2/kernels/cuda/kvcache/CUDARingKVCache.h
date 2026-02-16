@@ -86,7 +86,7 @@ namespace llaminar2
     class ICUDARingKVCache : public IKVCache
     {
     public:
-        virtual ~ICUDARingKVCache() = default;
+        virtual ~ICUDARingKVCache();
 
         // =====================================================================
         // IKVCache Interface (public API)
@@ -248,6 +248,25 @@ namespace llaminar2
         // =====================================================================
 
         // Overrides are provided by the concrete CUDARingKVCache<P> class
+
+    protected:
+        // =====================================================================
+        // Pre-allocated conversion scratch buffers
+        // =====================================================================
+        // Avoids cudaMalloc/cudaFree per appendWithStream call.
+        // Lazily allocated and grown as needed.
+
+        /// Ensure scratch buffers have at least `bytes` capacity each.
+        /// Returns true on success. Thread-safe via single-writer assumption
+        /// (one decode step at a time).
+        bool ensureConvScratch(size_t bytes);
+
+        /// Free scratch buffers (called from destructor)
+        void freeConvScratch();
+
+        void *conv_scratch_k_ = nullptr;   ///< Scratch buffer for K conversion
+        void *conv_scratch_v_ = nullptr;   ///< Scratch buffer for V conversion
+        size_t conv_scratch_capacity_ = 0; ///< Current capacity in bytes (per buffer)
     };
 
     // =========================================================================

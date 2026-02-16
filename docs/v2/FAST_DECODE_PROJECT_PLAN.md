@@ -10,7 +10,7 @@
 
 ## Problem Statement
 
-During decode (seq_len=1), each forward pass processes 339 stages through `GraphExecutor::executeNode()`. Each call performs ~10 operations, most of which are **no-ops during cached decode**:
+During decode (seq_len=1), each forward pass processes 339 stages through `DeviceGraphExecutor::executeNode()`. Each call performs ~10 operations, most of which are **no-ops during cached decode**:
 
 | Per-Stage Operation | Time (µs) | Needed During Cached Decode? |
 |---|---|---|
@@ -101,11 +101,11 @@ DeviceGraphOrchestrator::forward()
 **Risk**: Low  
 **Expected improvement**: 21 → 125-143 tok/s
 
-### 1.1 — Add `executeFastDecode()` to GraphExecutor
+### 1.1 — Add `executeFastDecode()` to DeviceGraphExecutor
 
-**File**: `src/v2/execution/local_execution/graph/GraphExecutor.h`
+**File**: `src/v2/execution/local_execution/graph/DeviceGraphExecutor.h`
 
-Add a new method to the `GraphExecutor` class:
+Add a new method to the `DeviceGraphExecutor` class:
 
 ```cpp
 /**
@@ -127,12 +127,12 @@ Add a new method to the `GraphExecutor` class:
 bool executeFastDecode(ComputeGraph &graph, IDeviceContext *ctx);
 ```
 
-**File**: `src/v2/execution/local_execution/graph/GraphExecutor.cpp`
+**File**: `src/v2/execution/local_execution/graph/DeviceGraphExecutor.cpp`
 
 Implementation — a tight loop that only calls `execute()` and handles collective intercept:
 
 ```cpp
-bool GraphExecutor::executeFastDecode(ComputeGraph &graph, IDeviceContext *ctx)
+bool DeviceGraphExecutor::executeFastDecode(ComputeGraph &graph, IDeviceContext *ctx)
 {
     auto order = graph.getExecutionOrder();
 
@@ -164,7 +164,7 @@ bool GraphExecutor::executeFastDecode(ComputeGraph &graph, IDeviceContext *ctx)
         // Direct execute — no coherence, no dumps, no profiling
         if (!node->stage->execute(ctx))
         {
-            LOG_ERROR("[GraphExecutor] Fast decode stage failed: " << name);
+            LOG_ERROR("[DeviceGraphExecutor] Fast decode stage failed: " << name);
             return false;
         }
 
@@ -446,8 +446,8 @@ llama.cpp style: store mutable parameters (position_offset, KV write index) in G
 
 | File | Change |
 |---|---|
-| `src/v2/execution/local_execution/graph/GraphExecutor.h` | Add `executeFastDecode()` declaration |
-| `src/v2/execution/local_execution/graph/GraphExecutor.cpp` | Implement `executeFastDecode()` |
+| `src/v2/execution/local_execution/graph/DeviceGraphExecutor.h` | Add `executeFastDecode()` declaration |
+| `src/v2/execution/local_execution/graph/DeviceGraphExecutor.cpp` | Implement `executeFastDecode()` |
 | `src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h` | Add `collective_nodes` to `ForwardCache` |
 | `src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp` | Populate `collective_nodes` on cache build; call `executeFastDecode()` on cache hit |
 | `src/v2/utils/DebugEnv.h` | Add `fast_decode` to `ExecutionConfig` |

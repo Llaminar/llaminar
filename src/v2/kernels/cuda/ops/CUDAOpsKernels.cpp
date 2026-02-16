@@ -204,7 +204,7 @@ namespace llaminar2
             if (!input_fp32 || !weight_fp32 || !output_fp32)
                 return false;
 
-            // Coherence handled automatically by GraphExecutor
+            // Coherence handled automatically by DeviceGraphExecutor
 
             // Get device pointers
             const float *d_input = static_cast<const float *>(input_fp32->gpu_data_ptr());
@@ -270,14 +270,14 @@ namespace llaminar2
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Coherence handled automatically by GraphExecutor
+            // Coherence handled automatically by DeviceGraphExecutor
 
             // Get device pointers - use gpu_data_ptr() for proper GPU pointer handling
             const uint16_t *d_input = static_cast<const uint16_t *>(in_bf16->gpu_data_ptr());
             const float *d_weight = static_cast<const float *>(weight_fp32->gpu_data_ptr());
             uint16_t *d_output = static_cast<uint16_t *>(out_bf16->gpu_data_ptr());
 
-            // No sync needed - GraphExecutor handles async execution via stream ordering
+            // No sync needed - DeviceGraphExecutor handles async execution via stream ordering
             return cudaOps_rmsnorm_bf16(d_input, d_weight, d_output, rows, cols, epsilon, dev, gpu_stream_);
         }
 
@@ -334,14 +334,14 @@ namespace llaminar2
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Coherence handled automatically by GraphExecutor
+            // Coherence handled automatically by DeviceGraphExecutor
 
             // Get device pointers - use gpu_data_ptr() for proper GPU pointer handling
             const uint16_t *d_input = static_cast<const uint16_t *>(in_fp16->gpu_data_ptr());
             const float *d_weight = static_cast<const float *>(weight_fp32->gpu_data_ptr());
             uint16_t *d_output = static_cast<uint16_t *>(out_fp16->gpu_data_ptr());
 
-            // No sync needed - GraphExecutor handles async execution via stream ordering
+            // No sync needed - DeviceGraphExecutor handles async execution via stream ordering
             return cudaOps_rmsnorm_fp16(d_input, d_weight, d_output, rows, cols, epsilon, dev, gpu_stream_);
         }
 
@@ -405,7 +405,7 @@ namespace llaminar2
             if (!gate_fp32 || !up_fp32 || !output_fp32)
                 return false;
 
-            // Coherence handled automatically by GraphExecutor
+            // Coherence handled automatically by DeviceGraphExecutor
 
             // Get device pointers
             const float *d_gate = static_cast<const float *>(gate_fp32->gpu_data_ptr());
@@ -474,7 +474,7 @@ namespace llaminar2
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Coherence handled automatically by GraphExecutor
+            // Coherence handled automatically by DeviceGraphExecutor
 
             // Get device pointers
             const uint16_t *d_gate = static_cast<const uint16_t *>(gate_bf16->gpu_data_ptr());
@@ -482,7 +482,7 @@ namespace llaminar2
             uint16_t *d_output = static_cast<uint16_t *>(out_bf16->gpu_data_ptr());
 
             int size = rows * cols;
-            // No sync needed - GraphExecutor handles async execution via stream ordering
+            // No sync needed - DeviceGraphExecutor handles async execution via stream ordering
             return cudaOps_swiglu_bf16(d_gate, d_up, d_output, size, dev, gpu_stream_);
         }
 
@@ -544,7 +544,7 @@ namespace llaminar2
 
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Coherence handled automatically by GraphExecutor
+            // Coherence handled automatically by DeviceGraphExecutor
 
             // Get device pointers
             const uint16_t *d_gate = static_cast<const uint16_t *>(gate_fp16->gpu_data_ptr());
@@ -552,7 +552,7 @@ namespace llaminar2
             uint16_t *d_output = static_cast<uint16_t *>(out_fp16->gpu_data_ptr());
 
             int size = rows * cols;
-            // No sync needed - GraphExecutor handles async execution via stream ordering
+            // No sync needed - DeviceGraphExecutor handles async execution via stream ordering
             return cudaOps_swiglu_fp16(d_gate, d_up, d_output, size, dev, gpu_stream_);
         }
 
@@ -1271,7 +1271,7 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Step 2: Get GPU pointer for output (coherence handled by GraphExecutor)
+        // Step 2: Get GPU pointer for output (coherence handled by DeviceGraphExecutor)
         // =====================================================================
         float *d_output = static_cast<float *>(output_fp32->gpu_data_ptr());
         if (!d_output)

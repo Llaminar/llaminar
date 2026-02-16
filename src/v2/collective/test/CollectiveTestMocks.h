@@ -10,7 +10,7 @@
  * These mocks enable unit testing of:
  * - CollectiveContext
  * - BackendRouter
- * - GraphExecutor (collective execution path)
+ * - DeviceGraphExecutor (collective execution path)
  *
  * Without requiring:
  * - Real MPI environment

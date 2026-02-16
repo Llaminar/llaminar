@@ -12,7 +12,7 @@
  * - DeviceGraphOrchestrator: Imperative executor (manages state, caching, device contexts)
  *
  * The orchestrator owns:
- * - GraphExecutor (for DAG execution)
+ * - DeviceGraphExecutor (for DAG execution)
  * - Device context cache (lazy initialization)
  * - Graph cache (decode optimization)
  * - Execution state (position offset tracking)
@@ -33,8 +33,8 @@
 #include "../../../backends/DeviceId.h"
 #include "../../../backends/IGPUGraphCapture.h"
 #include "IInferenceRunner.h"
-#include "../graph/GraphExecutor.h"
-#include "../graph/GraphBufferManager.h"
+#include "../graph/DeviceGraphExecutor.h"
+#include "../graph/DeviceGraphBufferManager.h"
 #include "../device/DeviceContext.h"
 #include "../../mpi_orchestration/PlacementStrategy.h" // For InferencePhase
 #include "../../compute_stages/ComputeStages.h"        // For StageDumpInfo
@@ -67,7 +67,6 @@ namespace llaminar2
     class IKVCache;
     class WeightManager;
     class WeightPlacementMap;
-    class DeviceWorkspaceManager;
     class TensorParallelConfig;
 
     /**
@@ -267,7 +266,7 @@ namespace llaminar2
      * @brief Generic orchestrator for compute graph execution
      *
      * Separates execution concerns from graph definition, implementing:
-     * - Graph execution via GraphExecutor
+     * - Graph execution via DeviceGraphExecutor
      * - Device context management with lazy initialization
      * - Graph caching for decode mode
      * - Execution state tracking
@@ -592,7 +591,7 @@ namespace llaminar2
          * @brief Set collective context for GPU-native collective operations
          *
          * When set, AllreduceStage and AllGatherStage execution will be intercepted
-         * by GraphExecutor and routed through the BackendRouter for device-native
+         * by DeviceGraphExecutor and routed through the BackendRouter for device-native
          * collectives (NCCL for CUDA, RCCL for ROCm, PCIeBAR for P2P).
          *
          * This eliminates the need for GPU→CPU→GPU transfers during tensor-parallel
@@ -937,7 +936,7 @@ namespace llaminar2
         TensorFactory *tensorFactory() const { return tensor_factory_; }
 
         /**
-         * @brief Initialize activation buffers using GraphBufferManager
+         * @brief Initialize activation buffers using DeviceGraphBufferManager
          *
          * Allocates all activation buffers with automatic aliasing optimization
          * for SCRATCH buffers. This is an alternative to manual buffer allocation.
@@ -1325,8 +1324,8 @@ namespace llaminar2
         /**
          * @brief Get the underlying executor
          */
-        GraphExecutor &executor() { return executor_; }
-        const GraphExecutor &executor() const { return executor_; }
+        DeviceGraphExecutor &executor() { return executor_; }
+        const DeviceGraphExecutor &executor() const { return executor_; }
 
         /**
          * @brief Get device context for a device (creates if needed)
@@ -1935,6 +1934,18 @@ namespace llaminar2
         void syncLogitsAtBoundary(IDeviceContext *ctx);
 
         /**
+         * @brief Build decode-time capture policy from runtime and graph context
+         */
+        DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
+            bool has_collective_nodes,
+            IDeviceContext *ctx) const;
+
+        /**
+         * @brief Check whether collective segmented replay is backend-supported
+         */
+        bool collectivesSupportSegmentedReplay() const;
+
+        /**
          * @brief Check if we can use cached graph for current execution
          *
          * @param layer_idx Layer index
@@ -1951,7 +1962,7 @@ namespace llaminar2
         std::shared_ptr<Qwen2Graph> graph_builder_;
 
         /// Graph executor
-        GraphExecutor executor_;
+        DeviceGraphExecutor executor_;
 
         /// MPI context for distributed execution
         std::shared_ptr<MPIContext> mpi_ctx_;
@@ -2022,7 +2033,7 @@ namespace llaminar2
 
             /// Segmented GPU graph cache — excludes non-capturable stages (attention, KV cache)
             /// and captures contiguous runs of capturable stages into separate graphs
-            GraphExecutor::GraphSegmentCache segment_cache;
+            DeviceGraphExecutor::GraphSegmentCache segment_cache;
 
             /// GPU stream (from IWorkerGPUContext::defaultStream()) for kernel dispatch
             /// Set when gpu_graph is created; used by stages to dispatch on correct stream
@@ -2083,19 +2094,13 @@ namespace llaminar2
         TensorFactory *tensor_factory_ = nullptr;
 
         /// Buffer manager for graph-managed allocation (nullptr if using manual buffers)
-        std::unique_ptr<GraphBufferManager> buffer_manager_;
+        std::unique_ptr<DeviceGraphBufferManager> buffer_manager_;
 
         /// Owned tensors when using graph-managed allocation
         std::vector<std::unique_ptr<TensorBase>> owned_buffers_;
 
         /// Model-level buffers (when using graph-managed allocation)
         Qwen2ModelBuffers managed_buffers_;
-
-        /// Whether GPU workspace has been allocated for GEMM kernels
-        bool device_workspace_allocated_ = false;
-
-        /// Per-device workspace managers for GPU GEMM kernels
-        std::unordered_map<DeviceId, std::unique_ptr<DeviceWorkspaceManager>> device_workspaces_;
 
         /**
          * @brief Allocate GPU workspace for stages in a graph

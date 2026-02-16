@@ -4,7 +4,7 @@
  * @author David Sanftenberg
  * @date January 2025
  *
- * Tests the GraphBufferManager integration with DeviceGraphOrchestrator:
+ * Tests the DeviceGraphBufferManager integration with DeviceGraphOrchestrator:
  * - setTensorFactory() / initializeBuffers() workflow
  * - Buffer allocation and binding
  * - Statistics tracking

@@ -141,7 +141,7 @@ This document outlines the implementation plan for **Option A**: creating a new 
 │  │   - device_id = cuda:0                               │   │
 │  └──────────────────────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────────┐   │
-│  │ GraphExecutor → Qwen2Graph → ComputeStages           │   │
+│  │ DeviceGraphExecutor → Qwen2Graph → ComputeStages           │   │
 │  └──────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 ```

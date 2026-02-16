@@ -109,7 +109,7 @@ TEST_F(Test__GEMMStage, CastsToIWorkspaceConsumer)
     GEMMStage stage(params);
 
     // GEMMStage inherits from IWorkspaceConsumerStage which inherits from IWorkspaceConsumer
-    // This enables GraphExecutor to treat the stage as a workspace consumer
+    // This enables DeviceGraphExecutor to treat the stage as a workspace consumer
     IWorkspaceConsumer *consumer = dynamic_cast<IWorkspaceConsumer *>(&stage);
 
     EXPECT_NE(consumer, nullptr);

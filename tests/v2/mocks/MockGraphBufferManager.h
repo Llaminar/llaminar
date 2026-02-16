@@ -1,5 +1,5 @@
 /**
- * @file MockGraphBufferManager.h
+ * @file MockDeviceGraphBufferManager.h
  * @brief Mock graph buffer manager for unit testing without actual tensor allocation
  *
  * This mock enables:
@@ -17,7 +17,7 @@
 #include "execution/local_execution/graph/IGraphBufferManager.h"
 #include "execution/debug/BufferRole.h"
 #include "execution/local_execution/graph/LivenessAnalyzer.h"       // For AliasingGroup
-#include "execution/local_execution/graph/GraphExecutor.h"          // For ComputeGraph
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"          // For ComputeGraph
 #include "execution/local_execution/collective/CollectiveContext.h" // For CollectiveContext (Phase 3)
 #include "tensors/Tensors.h"
 #include <memory>

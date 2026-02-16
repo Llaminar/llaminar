@@ -1,10 +1,10 @@
 /**
- * @file GraphBufferManager.h
- * @brief Centralized buffer management for GraphExecutor
+ * @file DeviceGraphBufferManager.h
+ * @brief Centralized buffer management for DeviceGraphExecutor
  * @author David Sanftenberg
  * @date December 2025
  *
- * GraphBufferManager handles pre-allocation and lifecycle management of all
+ * DeviceGraphBufferManager handles pre-allocation and lifecycle management of all
  * buffers used by compute stages within a graph. This enables:
  * - Zero-allocation hot paths during inference
  * - Memory planning based on stage requirements
@@ -13,7 +13,7 @@
  * ## Design Philosophy
  *
  * Stages declare their buffer requirements via getBufferRequirements().
- * GraphBufferManager collects these requirements, allocates all buffers
+ * DeviceGraphBufferManager collects these requirements, allocates all buffers
  * upfront, then binds them to stages before execution.
  *
  * ## Buffer Aliasing (Phase 4+)
@@ -31,7 +31,7 @@
  *
  * @code
  * // Create manager with tensor factory
- * GraphBufferManager manager(&tensor_factory, &mpi_ctx);
+ * DeviceGraphBufferManager manager(&tensor_factory, &mpi_ctx);
  *
  * // Allocate all buffers for a graph (with aliasing optimization)
  * manager.allocateWithAliasing(graph);
@@ -83,7 +83,7 @@ namespace llaminar2
     // =========================================================================
 
     /**
-     * @brief Configuration for GraphBufferManager
+     * @brief Configuration for DeviceGraphBufferManager
      *
      * Controls buffer allocation behavior, including mapped memory support
      * for zero-copy GPU↔CPU access when snapshot/debugging mode is enabled.
@@ -173,11 +173,11 @@ namespace llaminar2
     /**
      * @brief Configuration for workspace memory budget calculation
      *
-     * Controls how GraphBufferManager computes workspace budgets for GPU and CPU
+     * Controls how DeviceGraphBufferManager computes workspace budgets for GPU and CPU
      * devices. The budget is calculated as:
      *   budget = min(max(available * fraction - headroom, min_budget), max_budget)
      *
-     * @see GraphBufferManager::computeWorkspaceBudget()
+     * @see DeviceGraphBufferManager::computeWorkspaceBudget()
      */
     struct WorkspaceBudgetConfig
     {
@@ -186,6 +186,34 @@ namespace llaminar2
         size_t min_budget = 64 * 1024 * 1024;          ///< Minimum budget (64MB)
         size_t max_budget = 4ULL * 1024 * 1024 * 1024; ///< Maximum budget (4GB)
         size_t headroom = 128 * 1024 * 1024;           ///< Reserved headroom (128MB)
+    };
+
+    /**
+     * @brief Model-aware sizing hints for workspace consumers
+     *
+     * Used to preserve orchestrator workspace sizing behavior when routing
+     * ownership through DeviceGraphBufferManager.
+     */
+    struct WorkspaceSizingHints
+    {
+        int max_seq_len = 4096;
+        int n_heads = 0;
+        int head_dim = 0;
+        int d_model = 0;
+        int batch_size = 1;
+        int vocab_size = 0;
+    };
+
+    /**
+     * @brief Explicit workspace request for non-graph consumers
+     */
+    struct WorkspaceConsumerRequest
+    {
+        IWorkspaceConsumer *consumer = nullptr;
+        DeviceId device;
+        int m = 4096;
+        int n = 0;
+        int k = 0;
     };
 
     // =========================================================================
@@ -284,7 +312,7 @@ namespace llaminar2
      * Multiple non-overlapping SCRATCH buffers can share the same
      * physical allocation to reduce memory usage.
      */
-    class GraphBufferManager : public IGraphBufferManager
+    class DeviceGraphBufferManager : public IGraphBufferManager
     {
     public:
         /**
@@ -293,18 +321,18 @@ namespace llaminar2
          * @param mpi_ctx MPI context for NUMA awareness (not owned)
          * @param config Configuration for buffer allocation behavior
          */
-        explicit GraphBufferManager(TensorFactory *factory, const MPIContext *mpi_ctx = nullptr,
+        explicit DeviceGraphBufferManager(TensorFactory *factory, const MPIContext *mpi_ctx = nullptr,
                                     const GraphBufferManagerConfig &config = GraphBufferManagerConfig{});
 
-        ~GraphBufferManager();
+        ~DeviceGraphBufferManager();
 
         // Non-copyable
-        GraphBufferManager(const GraphBufferManager &) = delete;
-        GraphBufferManager &operator=(const GraphBufferManager &) = delete;
+        DeviceGraphBufferManager(const DeviceGraphBufferManager &) = delete;
+        DeviceGraphBufferManager &operator=(const DeviceGraphBufferManager &) = delete;
 
         // Movable
-        GraphBufferManager(GraphBufferManager &&) = default;
-        GraphBufferManager &operator=(GraphBufferManager &&) = default;
+        DeviceGraphBufferManager(DeviceGraphBufferManager &&) = default;
+        DeviceGraphBufferManager &operator=(DeviceGraphBufferManager &&) = default;
 
         // =====================================================================
         // Collective Context (Phase 3: Buffer Registration API)
@@ -418,7 +446,7 @@ namespace llaminar2
         /**
          * @brief Bind a buffer to a stage's params
          *
-         * This is a hook for future integration where GraphExecutor
+         * This is a hook for future integration where DeviceGraphExecutor
          * automatically binds buffers to stage params before execution.
          *
          * Currently a no-op placeholder.
@@ -490,6 +518,20 @@ namespace llaminar2
          */
         bool allocateDeviceWorkspace(const std::vector<IComputeStage *> &stages,
                                      const WorkspaceBudgetConfig &config = WorkspaceBudgetConfig{});
+
+        /**
+         * @brief Allocate GPU workspace using graph-aware, model-aware sizing
+         *
+         * This is the preferred API for orchestrator integration. It scans graph
+         * stages for IWorkspaceConsumer implementations, derives per-stage dimension
+         * hints from stage identity, allocates per-device workspace, and binds all
+         * consumers. Optional extra consumers (e.g., KV cache) can be provided.
+         */
+        bool allocateDeviceWorkspaceForGraph(
+            const ComputeGraph &graph,
+            const WorkspaceSizingHints &hints,
+            const std::vector<WorkspaceConsumerRequest> &extra_consumers = {},
+            const WorkspaceBudgetConfig &config = WorkspaceBudgetConfig{});
 
         /**
          * @brief Release all GPU workspace
@@ -592,6 +634,8 @@ namespace llaminar2
 
         /// GPU workspace budgets per device (for metrics)
         std::unordered_map<DeviceId, size_t> device_workspace_budgets_;
+
+        size_t computeModelAwareBudgetFloor(const WorkspaceSizingHints &hints) const;
 
         // Internal helpers
         std::unique_ptr<TensorBase> createTensorFromDescriptor(const BufferDescriptor &desc);

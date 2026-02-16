@@ -114,6 +114,7 @@ namespace llaminar2
             void *stream = gpuStream();
             if (stream || params_.device_id.is_gpu())
             {
+                // GPU path: fine-grained profiling handled inside appendWithStream
                 success = params_.kv_cache->appendWithStream(
                     params_.layer_idx, seq_idx,
                     k_tensor, v_tensor, num_tokens, stream);
@@ -129,8 +130,9 @@ namespace llaminar2
             const uint64_t duration_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
 
-            if (success)
+            if (success && !(stream || params_.device_id.is_gpu()))
             {
+                // CPU path only: record APPEND here (GPU path records internally)
                 const uint64_t bytes = static_cast<uint64_t>(
                     estimateTensorAppendBytes(k_tensor, num_tokens) +
                     estimateTensorAppendBytes(v_tensor, num_tokens));

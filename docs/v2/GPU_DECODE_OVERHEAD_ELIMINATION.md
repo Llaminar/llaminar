@@ -266,7 +266,7 @@ Default OFF until validated. Can be promoted to default ON after parity tests pa
 |---|------|-------|--------|--------------|
 | 2.1 | Add `LLAMINAR_HIP_GRAPHS` to DebugEnv | `DebugEnv.h` | 15min | None |
 | 2.2 | Add `HIPGraphCache` struct | `DeviceGraphOrchestrator.h` | 30min | None |
-| 2.3 | Prototype: simple capture/replay in `executeFastDecode()` | `GraphExecutor.h/cpp` | 2hr | 2.1, 2.2 |
+| 2.3 | Prototype: simple capture/replay in `executeFastDecode()` | `DeviceGraphExecutor.h/cpp` | 2hr | 2.1, 2.2 |
 | 2.4 | Convert sync `hipMemcpy` in embedding to async | `ROCmEmbeddingKernelT.cpp` | 1hr | None |
 | 2.5 | Wire graph capture in DeviceGraphOrchestrator | `DeviceGraphOrchestrator.cpp` | 2hr | 2.3 |
 | 2.6 | Add graph update mechanism (Option A: re-capture + update) | `DeviceGraphOrchestrator.cpp` | 2hr | 2.5 |
@@ -303,7 +303,7 @@ Default OFF until validated. Can be promoted to default ON after parity tests pa
 
 | File | Purpose |
 |------|---------|
-| `execution/local_execution/graph/GraphExecutor.h/cpp` | `executeFastDecode()` — primary integration point |
+| `execution/local_execution/graph/DeviceGraphExecutor.h/cpp` | `executeFastDecode()` — primary integration point |
 | `execution/local_execution/orchestrators/DeviceGraphOrchestrator.h/cpp` | Forward graph cache, decode orchestration |
 | `execution/compute_stages/stages/RMSNormStage.h/cpp` | Uncached kernel creation (line 82) |
 | `execution/compute_stages/stages/SwiGLUStage.h/cpp` | Uncached kernel creation (line 68) |

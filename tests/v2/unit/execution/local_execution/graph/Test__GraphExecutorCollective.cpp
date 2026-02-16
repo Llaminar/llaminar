@@ -1,9 +1,9 @@
 /**
  * @file Test__GraphExecutorCollective.cpp
- * @brief Unit tests for GraphExecutor collective context integration
+ * @brief Unit tests for DeviceGraphExecutor collective context integration
  *
  * Tests that:
- * 1. GraphExecutor accepts a CollectiveContext via setter
+ * 1. DeviceGraphExecutor accepts a CollectiveContext via setter
  * 2. When collective_ctx is set, ALLREDUCE stages are intercepted
  * 3. When collective_ctx is set, ALLGATHER stages are intercepted
  * 4. When collective_ctx is nullptr, normal stage execution happens
@@ -13,7 +13,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/local_execution/graph/GraphExecutor.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/collective/CollectiveContext.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/compute_stages/stages/AllreduceStage.h"
@@ -47,7 +47,7 @@ protected:
         // Create executor
         GraphExecutorConfig config;
         config.enable_profiling = true;
-        executor_ = std::make_unique<GraphExecutor>(config);
+        executor_ = std::make_unique<DeviceGraphExecutor>(config);
 
         // Create device context (CPU context requires DeviceId)
         cpu_ctx_ = std::make_unique<CPUDeviceContext>(DeviceId::cpu());
@@ -76,7 +76,7 @@ protected:
     std::unique_ptr<MockCollectiveBackend> mock_backend_;
     MockCollectiveBackend *mock_backend_raw_ = nullptr;
     std::unique_ptr<MockBackendRouter> mock_router_;
-    std::unique_ptr<GraphExecutor> executor_;
+    std::unique_ptr<DeviceGraphExecutor> executor_;
     std::unique_ptr<CPUDeviceContext> cpu_ctx_;
 };
 
@@ -175,7 +175,7 @@ TEST_F(Test__GraphExecutorCollective, AllreduceStage_NotInterceptedWhenContextNu
 
 // =============================================================================
 // ALLGATHER Stage Tests
-// NOTE: GraphExecutor does NOT intercept ALLGATHER stages via CollectiveContext.
+// NOTE: DeviceGraphExecutor does NOT intercept ALLGATHER stages via CollectiveContext.
 // This is intentional because column-parallel operations (e.g., LM head) require
 // strided placement using MPI_Type_vector, which AllGatherStage::executeViaMPI()
 // handles correctly. The CollectiveContext path only supports simple contiguous
@@ -217,7 +217,7 @@ TEST_F(Test__GraphExecutorCollective, AllgatherStage_NotInterceptedEvenWithConte
     graph.addNode("allgather", std::move(stage), DeviceId::cpu());
 
     // Execute graph - should FAIL because:
-    // 1. GraphExecutor does NOT intercept ALLGATHER (by design)
+    // 1. DeviceGraphExecutor does NOT intercept ALLGATHER (by design)
     // 2. AllGatherStage::execute() falls back to MPI path
     // 3. MPI context is null, so executeViaMPI() returns false
     bool success = executor_->execute(graph, cpu_ctx_.get());
@@ -459,7 +459,7 @@ TEST_F(Test__GraphExecutorCollective, AllreduceWithNullDomainUsesLegacyMethod)
 
 TEST_F(Test__GraphExecutorCollective, AllgatherWithDomain_NotIntercepted_ExecutesViaMPI)
 {
-    // NOTE: GraphExecutor does NOT intercept ALLGATHER stages, even when they have
+    // NOTE: DeviceGraphExecutor does NOT intercept ALLGATHER stages, even when they have
     // a domain configured. This is because column-parallel operations require
     // strided output layout via MPI_Type_vector, which CollectiveContext doesn't
     // support. The AllGatherStage handles this internally via executeViaMPI().

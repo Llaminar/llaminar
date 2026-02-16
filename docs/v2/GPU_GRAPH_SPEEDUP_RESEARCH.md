@@ -120,10 +120,10 @@ Prefill `seq_len` varies, causing grid dimension changes. Graph capture for pref
 Phase 3 replay uses `gpu_ctx->synchronizeStream()` at type transitions:
 
 ```cpp
-// manual→graph transition (GraphExecutor.cpp:1063)
+// manual→graph transition (DeviceGraphExecutor.cpp:1063)
 gpu_ctx->synchronizeStream(nullptr);  // blocks CPU until stream 0 completes
 
-// graph→manual transition (GraphExecutor.cpp:1314)
+// graph→manual transition (DeviceGraphExecutor.cpp:1314)
 gpu_ctx->synchronizeStream(capture_stream);  // blocks CPU until capture stream completes
 ```
 
@@ -145,7 +145,7 @@ The codebase has a complete event-based inter-stream dependency API that was **b
 - ROCm: `AMDDeviceContext.cpp:509-540` — `hipEventCreateWithFlags(hipEventDisableTiming)` + `hipEventRecord` + `hipStreamWaitEvent`
 
 **Cached sync event exists**:
-- `GraphSegmentCache::sync_event` (`GraphExecutor.h:450`) with `ensureSyncEvent()`/`destroySyncEvent()` methods (`GraphExecutor.cpp:73-95`)
+- `GraphSegmentCache::sync_event` (`DeviceGraphExecutor.h:450`) with `ensureSyncEvent()`/`destroySyncEvent()` methods (`DeviceGraphExecutor.cpp:73-95`)
 - Created and destroyed but **never used for recording/waiting**
 
 ### Proposed Change
@@ -188,7 +188,7 @@ gpu_ctx->insertStreamDependency(nullptr, capture_stream);
 
 ### Implementation Complexity: VERY LOW
 
-- **~10 lines** changed in one file (`GraphExecutor.cpp`)
+- **~10 lines** changed in one file (`DeviceGraphExecutor.cpp`)
 - All API infrastructure already exists and is tested
 - Event reuse pattern (single cached event, alternating record/wait) is safe
 - Add env var `LLAMINAR_GPU_GRAPH_EVENT_SYNC` for A/B testing
@@ -209,7 +209,7 @@ gpu_ctx->insertStreamDependency(nullptr, capture_stream);
 
 ### Current Segmentation
 
-The segmentation algorithm (`GraphExecutor.cpp:822-848`) already performs cross-layer merging — consecutive capturable stages are grouped regardless of layer boundaries.
+The segmentation algorithm (`DeviceGraphExecutor.cpp:822-848`) already performs cross-layer merging — consecutive capturable stages are grouped regardless of layer boundaries.
 
 Per-layer pattern (GPU decomposed path):
 ```

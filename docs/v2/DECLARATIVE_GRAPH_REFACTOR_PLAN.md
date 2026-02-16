@@ -33,7 +33,7 @@ This refactoring separates concerns so that:
 
 | State | Purpose | Problem |
 |-------|---------|---------|
-| `executor_` | GraphExecutor instance | Execution, not building |
+| `executor_` | DeviceGraphExecutor instance | Execution, not building |
 | `device_contexts_` | IDeviceContext map | Execution infrastructure |
 | `layer_graph_cache_` | Cached ComputeGraphs | Runtime optimization |
 | `graph_caching_enabled_` | Cache flag | Runtime state |
@@ -47,7 +47,7 @@ This refactoring separates concerns so that:
 | `initializeBuffers()` | Allocate activation buffers | Memory lifecycle |
 | `releaseBuffers()` | Free buffers | Memory lifecycle |
 | `bindGraphManagedBuffers()` | Wire buffers to struct | Memory management |
-| `buffer_manager_` | GraphBufferManager instance | Memory infrastructure |
+| `buffer_manager_` | DeviceGraphBufferManager instance | Memory infrastructure |
 | `buffer_spec_builder_` | Qwen2BufferSpecBuilder | Could stay or move |
 
 ### 4. Helper Functions That Should Be Shared

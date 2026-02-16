@@ -8,7 +8,7 @@
  *
  * Key Design:
  * - This class BUILDS compute graphs (it's a graph builder, not executor)
- * - The actual execution is delegated to GraphExecutor
+ * - The actual execution is delegated to DeviceGraphExecutor
  * - Supports both model-level and layer-level graph construction
  *
  * Graph Building Methods:
@@ -23,8 +23,8 @@
 
 #pragma once
 
-#include "../../execution/local_execution/graph/GraphExecutor.h"
-#include "../../execution/local_execution/graph/GraphBufferManager.h"
+#include "../../execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "../../execution/local_execution/graph/DeviceGraphBufferManager.h"
 #include "../../execution/compute_stages/ComputeStages.h"
 #include "../../execution/local_execution/device/DeviceContext.h"
 #include "../../execution/config/ExecutionPolicy.h"
@@ -141,7 +141,7 @@ namespace llaminar2
         // removed as part of Phase 7 cleanup. See DISTRIBUTED_ARCHITECTURE_PROPOSAL.md.
 
         /// Use graph-managed buffer allocation with aliasing optimization.
-        /// When true, Qwen2Graph will use GraphBufferManager to allocate activation
+        /// When true, Qwen2Graph will use DeviceGraphBufferManager to allocate activation
         /// buffers with automatic aliasing of non-overlapping SCRATCH buffers.
         /// NOTE: As of December 2025, this defaults to true (Graph is primary path).
         bool use_graph_buffer_management = true;
@@ -152,7 +152,7 @@ namespace llaminar2
         /// Execution policy controlling which operations run
         ExecutionPolicy execution_policy = ExecutionPolicy::allEnabled();
 
-        /// Base GraphExecutor configuration
+        /// Base DeviceGraphExecutor configuration
         GraphExecutorConfig executor_config = GraphExecutorConfig{};
 
         /// Fused attention backend selection
@@ -462,7 +462,7 @@ namespace llaminar2
      * @brief Qwen2 compute graph builder
      *
      * Builds ComputeGraph instances for Qwen2 architecture,
-     * delegating execution to GraphExecutor.
+     * delegating execution to DeviceGraphExecutor.
      *
      * Implements IGraphBuilder interface for polymorphic graph building
      * and testability via MockGraphBuilder.

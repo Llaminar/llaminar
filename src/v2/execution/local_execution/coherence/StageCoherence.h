@@ -17,7 +17,7 @@
  * - OUTPUT: Only mark outputs dirty (assume inputs are ready)
  * - FULL: Both inputs and outputs (default for most stages)
  *
- * @note Automatic coherence is always enabled. The GraphExecutor handles
+ * @note Automatic coherence is always enabled. The DeviceGraphExecutor handles
  *       coherence automatically at stage boundaries based on each stage's
  *       coherencePolicy().
  */
@@ -39,7 +39,7 @@ namespace llaminar2
     /**
      * @brief Coherence policy for automatic stage boundary management
      *
-     * Controls how the GraphExecutor handles tensor coherence at stage entry/exit.
+     * Controls how the DeviceGraphExecutor handles tensor coherence at stage entry/exit.
      */
     enum class CoherencePolicy
     {

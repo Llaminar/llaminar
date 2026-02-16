@@ -1,16 +1,16 @@
 /**
  * @file BufferRole.h
- * @brief Buffer role classification and descriptor types for GraphExecutor
+ * @brief Buffer role classification and descriptor types for DeviceGraphExecutor
  * @author David Sanftenberg
  * @date December 2025
  *
- * This header defines the type system for buffer management in the GraphExecutor
+ * This header defines the type system for buffer management in the DeviceGraphExecutor
  * framework. Every buffer used by a ComputeStage has a formal role that determines:
  * - Read/write permissions
  * - Persistence after execution
  * - Eligibility for buffer reuse/aliasing
  *
- * @see GraphBufferManager for buffer allocation
+ * @see DeviceGraphBufferManager for buffer allocation
  * @see IComputeStage::getBufferRequirements() for stage integration
  */
 
@@ -51,7 +51,7 @@ namespace llaminar2
      * ## Buffer Aliasing
      *
      * Only SCRATCH buffers are eligible for aliasing (sharing physical memory).
-     * GraphBufferManager performs liveness analysis to identify non-overlapping
+     * DeviceGraphBufferManager performs liveness analysis to identify non-overlapping
      * SCRATCH buffers that can share the same allocation.
      *
      * ## Example Usage
@@ -113,7 +113,7 @@ namespace llaminar2
          * - ELIGIBLE for aliasing with non-overlapping SCRATCH buffers
          *
          * Use non-const `TensorBase*` in Params struct.
-         * GraphBufferManager may alias multiple SCRATCH buffers to save memory.
+         * DeviceGraphBufferManager may alias multiple SCRATCH buffers to save memory.
          */
         SCRATCH,
 
@@ -241,7 +241,7 @@ namespace llaminar2
      * @brief Describes a single buffer's requirements
      *
      * Used by stages to declare what buffers they need, and by
-     * GraphBufferManager to allocate and track buffers.
+     * DeviceGraphBufferManager to allocate and track buffers.
      *
      * ## Example
      *
@@ -296,7 +296,7 @@ namespace llaminar2
         // =====================================================================
 
         /// Expected TensorLayout for this buffer (UNKNOWN = no validation)
-        /// Used by GraphExecutor for automatic layout validation
+        /// Used by DeviceGraphExecutor for automatic layout validation
         TensorLayout expected_layout = TensorLayout::UNKNOWN;
 
         // =====================================================================
@@ -449,7 +449,7 @@ namespace llaminar2
         /**
          * @brief Declare expected tensor layout for this buffer
          *
-         * Used by GraphExecutor for automatic layout validation in debug builds.
+         * Used by DeviceGraphExecutor for automatic layout validation in debug builds.
          * When set, the executor verifies the tensor's declared layout matches
          * this expectation and that the tensor's shape is consistent with the
          * layout given the model's dimension parameters.
@@ -483,7 +483,7 @@ namespace llaminar2
         /**
          * @brief Mark this buffer as participating in a collective operation
          *
-         * When a buffer participates in a collective and the GraphBufferManager
+         * When a buffer participates in a collective and the DeviceGraphBufferManager
          * has a CollectiveContext with a backend requiring registration (e.g.,
          * PCIeBARBackend), the buffer will be allocated from the BAR region
          * for cross-vendor P2P transfers.

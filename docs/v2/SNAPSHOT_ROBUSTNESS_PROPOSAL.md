@@ -236,7 +236,7 @@ q16_fused_attention_wo_residual_reference(params);
 
 ### New Infrastructure
 - [ ] Add `SnapshotValidationConfig` to `DebugEnv`
-- [ ] Add validation logic to `GraphExecutor::executeNode()`
+- [ ] Add validation logic to `DeviceGraphExecutor::executeNode()`
 - [ ] Add `SnapshotKey` enum with layer-indexed helpers
 - [ ] Add tests for snapshot validation
 

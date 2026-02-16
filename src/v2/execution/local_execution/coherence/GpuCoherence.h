@@ -3,11 +3,11 @@
  * @brief RAII utilities for GPU tensor coherence management
  *
  * This header provides intuitive, self-documenting patterns for managing
- * GPU tensor coherence when calling kernels directly (outside GraphExecutor).
+ * GPU tensor coherence when calling kernels directly (outside DeviceGraphExecutor).
  *
  * ## Why This Exists
  *
- * When using GraphExecutor, coherence is handled automatically at stage boundaries.
+ * When using DeviceGraphExecutor, coherence is handled automatically at stage boundaries.
  * However, when calling kernels directly (in tests, utilities, or custom pipelines),
  * you must manually:
  * 1. Call `ensureOnDevice()` on inputs before the kernel runs

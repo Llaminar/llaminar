@@ -10,8 +10,6 @@
 
 #include "DeviceGraphOrchestrator.h"
 #include "../../config/HybridPrecisionConfig.h"
-#include "../device/DeviceWorkspaceManager.h"
-#include "../device/WorkspaceDescriptor.h"
 #include "../../../loaders/WeightManager.h"
 #include "../../../loaders/WeightPlacementMap.h"
 #include "../../../config/TensorParallelConfig.h"
@@ -84,7 +82,7 @@ namespace llaminar2
             exec_config.mode = ExecutionMode::SEQUENTIAL;
         }
 
-        executor_ = GraphExecutor(exec_config);
+        executor_ = DeviceGraphExecutor(exec_config);
 
         // Propagate MPI rank to executor for stage dumping (from injected topology)
         if (injected_topology_)
@@ -96,7 +94,7 @@ namespace llaminar2
         if (injected_collective_ctx_)
         {
             executor_.setCollectiveContext(injected_collective_ctx_.get());
-            LOG_INFO("[DeviceGraphOrchestrator] Wired CollectiveContext to GraphExecutor");
+            LOG_INFO("[DeviceGraphOrchestrator] Wired CollectiveContext to DeviceGraphExecutor");
         }
 
         LOG_INFO("[DeviceGraphOrchestrator] Initialized with injected dependencies, caching="
@@ -142,7 +140,7 @@ namespace llaminar2
             exec_config.mode = ExecutionMode::SEQUENTIAL;
         }
 
-        executor_ = GraphExecutor(exec_config);
+        executor_ = DeviceGraphExecutor(exec_config);
 
         // Propagate MPI rank to executor for stage dumping
         if (mpi_ctx_)
@@ -192,7 +190,7 @@ namespace llaminar2
             exec_config.mode = ExecutionMode::SEQUENTIAL;
         }
 
-        executor_ = GraphExecutor(exec_config);
+        executor_ = DeviceGraphExecutor(exec_config);
 
         // Propagate MPI rank to executor for stage dumping
         if (mpi_ctx_)
@@ -321,7 +319,7 @@ namespace llaminar2
         // - CUDA device: standard FP32 tensor
         // - ROCm device: BAR-backed FP32 tensor accessible by both devices
         //
-        // The GraphBufferManager checks Qwen2BufferSpec::requiresBARBacked() to
+        // The DeviceGraphBufferManager checks Qwen2BufferSpec::requiresBARBacked() to
         // identify which buffers need BAR allocation.
         // =====================================================================
         if (config.local_tp_ctx && config.local_tp_ctx->degree() > 1)
@@ -363,7 +361,7 @@ namespace llaminar2
         }
 
         // Create buffer manager with TensorFactory
-        buffer_manager_ = std::make_unique<GraphBufferManager>(
+        buffer_manager_ = std::make_unique<DeviceGraphBufferManager>(
             tensor_factory_, mpi_ctx_.get(), buffer_config);
 
         // Build layer buffer specifications using BufferAllocator
@@ -646,134 +644,64 @@ namespace llaminar2
 
             bool success;
             const bool has_collective_nodes = !forward_cache_.collective_nodes.empty();
-            const bool allow_fast_decode = debugEnv().execution.fast_decode;
-            const bool allow_collective_segmented = debugEnv().execution.gpu_graph_collective_segmented;
-            bool collective_segmented_backend_supported = true;
-            if (has_collective_nodes && allow_collective_segmented)
+            const auto capture_policy = buildDecodeCapturePolicy(has_collective_nodes, ctx);
+            if (capture_policy.collective_segmented_enabled)
             {
-                collective_segmented_backend_supported = false;
-
-                const auto &graph_cfg = graph_builder_->config();
-                const bool has_local_tp =
-                    graph_cfg.local_tp_ctx && graph_cfg.local_tp_ctx->degree() > 1;
-                const bool single_rank_collectives =
-                    injected_collective_ctx_ && injected_collective_ctx_->worldSize() == 1;
-
-                if (has_local_tp && single_rank_collectives)
-                {
-                    const auto backend = graph_cfg.local_tp_ctx->backend();
-                    collective_segmented_backend_supported =
-                        (backend == CollectiveBackendType::NCCL ||
-                         backend == CollectiveBackendType::RCCL);
-
-                    if (!collective_segmented_backend_supported)
-                    {
-                        LOG_DEBUG("[DeviceGraphOrchestrator] Disabling collective segmented GPU-graph replay for non-stream backend");
-                    }
-                }
-                else
-                {
-                    LOG_DEBUG("[DeviceGraphOrchestrator] Disabling collective segmented GPU-graph replay for cross-rank or non-local-TP collectives");
-                }
+                LOG_INFO("[DeviceGraphOrchestrator] Experimental collective segmented GPU-graph replay enabled");
             }
-            const bool can_use_segmented_graph =
-                !has_collective_nodes ||
-                (allow_collective_segmented && collective_segmented_backend_supported);
-            if (allow_fast_decode &&
-                !debugEnv().execution.executor_profiling &&
-                !executor_.config().snapshot_callback)
+
+            if (capture_policy.allow_segmented_capture && !forward_cache_.gpu_stream)
             {
-                // GPU graph capture/replay path: eliminates per-kernel launch overhead
-                // Uses segmented capture to exclude attention/KV-cache stages whose
-                // kernel dimensions change each decode step (kv_len grows).
-                if (debugEnv().execution.gpu_graphs &&
-                    ctx->isGPU() &&
-                    can_use_segmented_graph &&
-                    forward_cache_.segment_cache.consecutive_failures < GraphExecutor::GraphSegmentCache::kMaxFailures)
-                {
-                    if (has_collective_nodes && allow_collective_segmented)
-                    {
-                        LOG_INFO("[DeviceGraphOrchestrator] Experimental collective segmented GPU-graph replay enabled");
-                    }
-                    // Lazily initialize GPU stream and context on first use
-                    if (!forward_cache_.gpu_stream)
-                    {
-                        // Ensure backend factories are registered
-                        DeviceId dev_id = ctx->deviceId();
+                // Ensure backend factories are registered
+                DeviceId dev_id = ctx->deviceId();
 #ifdef HAVE_ROCM
-                        if (dev_id.is_rocm())
-                            ensureAMDFactoryRegistered();
+                if (dev_id.is_rocm())
+                    ensureAMDFactoryRegistered();
 #endif
 #ifdef HAVE_CUDA
-                        if (dev_id.is_cuda())
-                            ensureNvidiaFactoryRegistered();
+                if (dev_id.is_cuda())
+                    ensureNvidiaFactoryRegistered();
 #endif
 
-                        auto &pool = GPUDeviceContextPool::instance();
-                        IWorkerGPUContext *gpu_ctx = nullptr;
-                        if (dev_id.is_rocm())
-                        {
-                            gpu_ctx = &pool.getAMDContext(dev_id.rocm_ordinal());
-                        }
-                        else if (dev_id.is_cuda())
-                        {
-                            gpu_ctx = &pool.getNvidiaContext(dev_id.cuda_ordinal());
-                        }
-                        if (gpu_ctx)
-                        {
-                            forward_cache_.gpu_stream = gpu_ctx->defaultStream();
-                            forward_cache_.gpu_ctx = gpu_ctx;
-                        }
-                    }
-
-                    if (forward_cache_.gpu_stream && forward_cache_.gpu_ctx)
-                    {
-                        success = executor_.executeWithSegmentedGraphCapture(
-                            *forward_cache_.graph, ctx,
-                            forward_cache_.segment_cache,
-                            forward_cache_.gpu_stream,
-                            forward_cache_.gpu_ctx,
-                            &forward_cache_.collective_nodes);
-
-                        // Phase 3 replay doesn't call markCompleted(), so we can
-                        // skip graph.reset() on subsequent steps.
-                        if (success && forward_cache_.segment_cache.initialized &&
-                            !forward_cache_.segment_cache.needs_capture)
-                        {
-                            forward_cache_.phase3_active = true;
-                        }
-
-                        if (!success)
-                        {
-                            forward_cache_.phase3_active = false;
-                            LOG_WARN("[DeviceGraphOrchestrator] Segmented graph failed, falling back to fast decode");
-                            forward_cache_.graph->reset();
-                            success = executor_.executeFastDecode(
-                                *forward_cache_.graph, ctx,
-                                &forward_cache_.collective_nodes);
-                        }
-                    }
-                    else
-                    {
-                        success = executor_.executeFastDecode(
-                            *forward_cache_.graph, ctx,
-                            &forward_cache_.collective_nodes);
-                    }
-                }
-                else
+                auto &pool = GPUDeviceContextPool::instance();
+                IWorkerGPUContext *gpu_ctx = nullptr;
+                if (dev_id.is_rocm())
                 {
-                    success = executor_.executeFastDecode(
-                        *forward_cache_.graph, ctx,
-                        &forward_cache_.collective_nodes);
+                    gpu_ctx = &pool.getAMDContext(dev_id.rocm_ordinal());
                 }
+                else if (dev_id.is_cuda())
+                {
+                    gpu_ctx = &pool.getNvidiaContext(dev_id.cuda_ordinal());
+                }
+                if (gpu_ctx)
+                {
+                    forward_cache_.gpu_stream = gpu_ctx->defaultStream();
+                    forward_cache_.gpu_ctx = gpu_ctx;
+                }
+            }
+
+            bool used_segmented_capture = false;
+            success = executor_.executeDecodeWithCapturePolicy(
+                *forward_cache_.graph,
+                ctx,
+                &forward_cache_.segment_cache,
+                forward_cache_.gpu_stream,
+                forward_cache_.gpu_ctx,
+                &forward_cache_.collective_nodes,
+                capture_policy,
+                &used_segmented_capture);
+
+            if (success && used_segmented_capture &&
+                forward_cache_.segment_cache.initialized &&
+                !forward_cache_.segment_cache.needs_capture)
+            {
+                // Phase 3 replay doesn't call markCompleted(), so we can
+                // skip graph.reset() on subsequent steps.
+                forward_cache_.phase3_active = true;
             }
             else
             {
-                if (debugEnv().execution.fast_decode && has_collective_nodes)
-                {
-                    LOG_DEBUG("[DeviceGraphOrchestrator] Falling back to full executor for collective graph replay");
-                }
-                success = executor_.execute(*forward_cache_.graph, ctx);
+                forward_cache_.phase3_active = false;
             }
 
             // Sync the stream at the forward pass boundary so logits are
@@ -1014,6 +942,75 @@ namespace llaminar2
         }
     }
 
+    DeviceGraphExecutor::DecodeCapturePolicy DeviceGraphOrchestrator::buildDecodeCapturePolicy(
+        bool has_collective_nodes,
+        IDeviceContext *ctx) const
+    {
+        DeviceGraphExecutor::DecodeCapturePolicy policy;
+
+        const auto &env = debugEnv();
+        policy.allow_fast_decode =
+            env.execution.fast_decode &&
+            !env.execution.executor_profiling &&
+            !executor_.config().snapshot_callback;
+
+        if (!policy.allow_fast_decode)
+        {
+            return policy;
+        }
+
+        const bool allow_collective_segmented = env.execution.gpu_graph_collective_segmented;
+        bool collective_segmented_backend_supported = true;
+        if (has_collective_nodes && allow_collective_segmented)
+        {
+            collective_segmented_backend_supported = collectivesSupportSegmentedReplay();
+        }
+
+        policy.collective_segmented_enabled =
+            has_collective_nodes &&
+            allow_collective_segmented &&
+            collective_segmented_backend_supported;
+
+        const bool can_use_segmented_graph =
+            !has_collective_nodes ||
+            policy.collective_segmented_enabled;
+
+        policy.allow_segmented_capture =
+            env.execution.gpu_graphs &&
+            ctx && ctx->isGPU() &&
+            can_use_segmented_graph &&
+            forward_cache_.segment_cache.consecutive_failures < DeviceGraphExecutor::GraphSegmentCache::kMaxFailures;
+
+        policy.max_segment_failures = DeviceGraphExecutor::GraphSegmentCache::kMaxFailures;
+        return policy;
+    }
+
+    bool DeviceGraphOrchestrator::collectivesSupportSegmentedReplay() const
+    {
+        const auto &graph_cfg = graph_builder_->config();
+        const bool has_local_tp = graph_cfg.local_tp_ctx && graph_cfg.local_tp_ctx->degree() > 1;
+        const bool single_rank_collectives =
+            injected_collective_ctx_ && injected_collective_ctx_->worldSize() == 1;
+
+        if (!(has_local_tp && single_rank_collectives))
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Disabling collective segmented GPU-graph replay for cross-rank or non-local-TP collectives");
+            return false;
+        }
+
+        const auto backend = graph_cfg.local_tp_ctx->backend();
+        const bool supported =
+            (backend == CollectiveBackendType::NCCL ||
+             backend == CollectiveBackendType::RCCL);
+
+        if (!supported)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Disabling collective segmented GPU-graph replay for non-stream backend");
+        }
+
+        return supported;
+    }
+
     bool DeviceGraphOrchestrator::execute(ComputeGraph &graph, IDeviceContext *ctx)
     {
         // Ensure GPU workspace is allocated for GEMM kernels
@@ -1023,235 +1020,41 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::ensureDeviceWorkspaceAllocated(const ComputeGraph &graph)
     {
-        // This function has two responsibilities:
-        // 1. Allocate workspace memory on GPU (one-time, expensive)
-        // 2. Bind workspace to stages in the current graph (every forward call)
-        //
-        // The graph is rebuilt for each forward() call with new stage objects,
-        // so we MUST bind workspace to every new graph's consumers.
-
-        LOG_DEBUG("[DeviceGraphOrchestrator] Ensuring device workspace for " << graph.size() << " stage graph");
-
-        // Get actual model dimensions from config (instead of hardcoded defaults)
-        // This ensures workspace is sized appropriately for the loaded model
         const auto &config = graph_builder_->config();
-        const int actual_max_seq_len = config.max_seq_len > 0 ? config.max_seq_len : 4096;
-        const int actual_n_heads = config.n_heads > 0 ? config.n_heads : 128;
-        const int actual_head_dim = config.d_model > 0 && config.n_heads > 0
-                                        ? config.d_model / config.n_heads
-                                        : 128;
-        const int actual_d_model = config.d_model > 0 ? config.d_model : 896;
-        const int actual_batch_size = state_.batch_size > 0 ? state_.batch_size : 1;
-        const int actual_vocab_size = config.vocab_size > 0 ? config.vocab_size : 151936;
-
-        // Dynamic workspace budget calculation:
-        // The LM head stage dominates workspace requirements because it has the largest N dimension
-        // (vocab_size, typically ~150K) vs FFN's ~5K or attention's ~1K.
-        //
-        // ROCm INT8 GEMM requires 3 buffers scaled by M × N:
-        //   1. ACC_INT32:    M × N × sizeof(int32_t)  - main INT32 accumulator
-        //   2. TEMP_C_FP32:  M × N × sizeof(float)    - FP32 output copy for host transfer
-        //   3. ROCM_CK_INT32: M × N × sizeof(int32_t) - CK library accumulator
-        //
-        // Plus smaller buffers:
-        //   - QUANT_A:       M × K × sizeof(int8_t)   - quantized activations
-        //   - SCALES_A:      M × sizeof(float)        - per-row scales
-        //   - TEMP_A_FP32:   M × K × sizeof(float)    - FP32 input copy
-        //   - ROCM_E_PADDED: 8 × N × sizeof(float)    - padded FP32 output for M < 8
-        //   - ROCM_A_PADDED: 8 × K × sizeof(int8_t)   - padded activations for M < 8
-        //   - ROCM_SCALE_A_PADDED: 8 × sizeof(float)  - padded scales
-        //
-        // Embedding kernel requires (when table not on GPU):
-        //   - EMBED_TABLE_TEMP: vocab_size × d_model × sizeof(float) - dequantized embedding table
-        //
-        // Formula: 3 × (M × N × 4) + M×K buffers + embedding table + 10% safety margin
-        const size_t mn_buffer_size = static_cast<size_t>(actual_max_seq_len) * actual_vocab_size * sizeof(float);
-        const size_t lm_head_workspace = 3 * mn_buffer_size; // 3 M×N-sized buffers
-        const size_t mk_overhead = static_cast<size_t>(actual_max_seq_len) * actual_d_model * sizeof(float) * 2;
-        const size_t padded_n_buffer = 8ULL * actual_vocab_size * sizeof(float);                                 // ROCM_E_PADDED
-        const size_t embed_table_temp = static_cast<size_t>(actual_vocab_size) * actual_d_model * sizeof(float); // Embedding table temp
-        const size_t base_workspace = lm_head_workspace + mk_overhead + padded_n_buffer + embed_table_temp;
-        const size_t safety_margin = base_workspace / 10; // 10% safety
-        const size_t min_budget = 768ULL * 1024 * 1024;   // Floor at 768 MB for small models
-        const size_t workspace_budget = std::max(min_budget, base_workspace + safety_margin);
-
-        LOG_DEBUG("[DeviceGraphOrchestrator] Workspace sizing: max_seq_len=" << actual_max_seq_len
-                                                                             << " n_heads=" << actual_n_heads << " head_dim=" << actual_head_dim
-                                                                             << " d_model=" << config.d_model << " vocab_size=" << actual_vocab_size
-                                                                             << " batch_size=" << actual_batch_size);
-        LOG_DEBUG("[DeviceGraphOrchestrator] Workspace budget: " << (workspace_budget / (1024 * 1024)) << " MB"
-                                                                 << " (LM head: 3×" << (mn_buffer_size / (1024 * 1024)) << "MB M×N buffers"
-                                                                 << ", embed_table_temp: " << (embed_table_temp / (1024 * 1024)) << "MB"
-                                                                 << " @ max_seq_len=" << actual_max_seq_len << " × vocab_size=" << actual_vocab_size << ")");
-
-        // Collect all workspace-consuming stages by device
-        // Track extra info for each consumer to customize workspace sizing
-        struct ConsumerInfo
+        if (!buffer_manager_)
         {
-            IWorkspaceConsumer *consumer;
-            bool is_kv_cache = false;
-            bool is_embedding = false;
-            bool is_attention = false;
-        };
-        std::unordered_map<DeviceId, std::vector<ConsumerInfo>> consumers_by_device;
-
-        // Iterate all nodes in the graph
-        for (const auto &node_name : graph.getExecutionOrder())
-        {
-            const ComputeNode *node = graph.getNode(node_name);
-            if (!node || !node->stage)
-                continue;
-
-            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(node->stage.get());
-
-            // Debug: log which nodes are workspace consumers
-            LOG_DEBUG("[DeviceGraphOrchestrator] Checking node '" << node_name
-                                                                  << "' for workspace: consumer=" << (consumer ? "yes" : "no")
-                                                                  << " device=" << node->device.toString());
-
-            if (!consumer)
-                continue;
-
-            DeviceId device = node->device;
-            if (!device.is_gpu())
-                continue; // Only GPU stages need workspace management
-
-            ConsumerInfo info;
-            info.consumer = consumer;
-            info.is_embedding = (node_name == "embedding" || node_name.find("embed") != std::string::npos);
-            info.is_attention = (node_name.find("attention") != std::string::npos);
-            consumers_by_device[device].push_back(info);
+            buffer_manager_ = std::make_unique<DeviceGraphBufferManager>(
+                tensor_factory_, mpi_ctx_.get(), GraphBufferManagerConfig{});
         }
 
-        // Also check if KV cache implements IWorkspaceConsumer (ROCm KV cache does)
-        // This eliminates hipMalloc/hipFree overhead in gather operations
+        WorkspaceSizingHints hints;
+        hints.max_seq_len = config.max_seq_len > 0 ? config.max_seq_len : 4096;
+        hints.n_heads = config.n_heads > 0 ? config.n_heads : 128;
+        hints.head_dim = config.d_model > 0 && config.n_heads > 0
+                             ? config.d_model / config.n_heads
+                             : 128;
+        hints.d_model = config.d_model > 0 ? config.d_model : 896;
+        hints.batch_size = state_.batch_size > 0 ? state_.batch_size : 1;
+        hints.vocab_size = config.vocab_size > 0 ? config.vocab_size : 151936;
+
+        std::vector<WorkspaceConsumerRequest> extras;
         if (state_.kv_cache)
         {
             auto *kv_consumer = dynamic_cast<IWorkspaceConsumer *>(state_.kv_cache.get());
-            if (kv_consumer)
+            if (kv_consumer && state_.device_id.is_gpu())
             {
-                // KV cache is on the same device as inference
-                DeviceId kv_device = state_.device_id;
-                if (kv_device.is_gpu())
-                {
-                    ConsumerInfo kv_info;
-                    kv_info.consumer = kv_consumer;
-                    kv_info.is_kv_cache = true;
-                    consumers_by_device[kv_device].push_back(kv_info);
-                    LOG_DEBUG("[DeviceGraphOrchestrator] KV cache registered as workspace consumer on device "
-                              << kv_device.toString());
-                }
+                extras.push_back(WorkspaceConsumerRequest{
+                    kv_consumer,
+                    state_.device_id,
+                    std::max(1, hints.batch_size),
+                    0,
+                    0,
+                });
             }
         }
 
-        if (consumers_by_device.empty())
-        {
-            LOG_DEBUG("[DeviceGraphOrchestrator] No GPU workspace consumers found in graph");
-            return true;
-        }
-
-        // For each device with consumers
-        for (auto &[device, consumers] : consumers_by_device)
-        {
-            // Check if workspace already exists for this device
-            auto ws_it = device_workspaces_.find(device);
-
-            if (ws_it != device_workspaces_.end() && ws_it->second)
-            {
-                // Workspace already allocated - just bind to new consumers
-                LOG_DEBUG("[DeviceGraphOrchestrator] Binding existing workspace on " << device.toString()
-                                                                                     << " to " << consumers.size() << " consumers");
-                for (const auto &info : consumers)
-                {
-                    info.consumer->bindWorkspace(ws_it->second.get());
-                }
-                continue;
-            }
-
-            // Need to allocate workspace for this device
-            // Merge requirements from all consumers on this device
-            WorkspaceRequirements merged;
-            for (const auto &info : consumers)
-            {
-                // Different consumers need different dimension hints:
-                // - GEMM kernels: m=max_seq_len, n=0 (use kernel's N), k=0 (use kernel's K)
-                //   The kernel knows its actual dimensions (N_, K_) better than us
-                //   CRITICAL: Pass n=0 for GEMM so LM head uses N_=vocab_size, not n_heads!
-                // - Attention kernels: m=batch_size (1), n=n_heads, k=head_dim
-                //   Attention workspace is tiny compared to GEMM (just split buffers)
-                // - KV cache: m=batch_size (number of sequences in gather)
-                // - Embedding: k=d_model (passed via k hint)
-
-                int workspace_m, workspace_n, workspace_k;
-
-                if (info.is_attention)
-                {
-                    // Attention kernel: expects (batch_size, n_heads, head_dim)
-                    // Workspace is small: ~num_splits * n_heads * head_dim per batch
-                    workspace_m = actual_batch_size; // Typically 1
-                    workspace_n = actual_n_heads;    // e.g., 14 for Qwen2-0.5B
-                    workspace_k = actual_head_dim;   // e.g., 64 for Qwen2
-                }
-                else if (info.is_kv_cache)
-                {
-                    workspace_m = actual_batch_size;
-                    workspace_n = 0;
-                    workspace_k = 0;
-                }
-                else if (info.is_embedding)
-                {
-                    workspace_m = actual_max_seq_len;
-                    workspace_n = 0;
-                    workspace_k = actual_d_model;
-                }
-                else
-                {
-                    // GEMM kernels: use max_seq_len for M, let kernel determine N/K
-                    workspace_m = actual_max_seq_len;
-                    workspace_n = 0;
-                    workspace_k = 0;
-                }
-
-                LOG_DEBUG("[DeviceGraphOrchestrator] Consumer workspace params: is_kv=" << info.is_kv_cache
-                                                                                        << " is_embed=" << info.is_embedding
-                                                                                        << " is_attn=" << info.is_attention
-                                                                                        << " m=" << workspace_m << " n=" << workspace_n << " k=" << workspace_k);
-
-                auto reqs = info.consumer->getWorkspaceRequirements(workspace_m, workspace_n, workspace_k);
-                merged.merge(reqs);
-            }
-
-            if (merged.buffers.empty())
-            {
-                LOG_DEBUG("[DeviceGraphOrchestrator] No workspace buffers needed for device " << device.toString());
-                continue;
-            }
-
-            // Create workspace manager for this device
-            auto workspace = std::make_unique<DeviceWorkspaceManager>(device, workspace_budget);
-            if (!workspace->allocate(merged))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate workspace for device " << device.toString()
-                                                                                               << " (needed=" << merged.total_bytes_with_alignment()
-                                                                                               << ", budget=" << workspace_budget << ")");
-                return false;
-            }
-
-            LOG_INFO("[DeviceGraphOrchestrator] Allocated " << (workspace->used() / (1024 * 1024)) << "MB workspace on "
-                                                            << device.toString() << " (" << merged.buffers.size() << " buffers)");
-
-            // Bind workspace to all consumers on this device
-            for (const auto &info : consumers)
-            {
-                info.consumer->bindWorkspace(workspace.get());
-            }
-
-            // Store workspace (keeps it alive)
-            device_workspaces_[device] = std::move(workspace);
-        }
-
-        device_workspace_allocated_ = true;
-        return true;
+        WorkspaceBudgetConfig workspace_budget;
+        return buffer_manager_->allocateDeviceWorkspaceForGraph(graph, hints, extras, workspace_budget);
     }
 
     bool DeviceGraphOrchestrator::executeAttention(

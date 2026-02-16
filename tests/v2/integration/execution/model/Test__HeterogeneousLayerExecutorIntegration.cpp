@@ -17,7 +17,7 @@
 
 #include <gtest/gtest.h>
 #include "execution/local_execution/model/HeterogeneousLayerExecutor.h"
-#include "execution/local_execution/graph/GraphExecutor.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "config/LayerPlacementConfig.h"
 
 using namespace llaminar2;

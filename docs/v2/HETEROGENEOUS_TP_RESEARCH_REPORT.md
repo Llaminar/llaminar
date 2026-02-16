@@ -162,12 +162,12 @@ MPI_Allgatherv(local_output, local_count, MPI_FLOAT,
 
 ## 3. Device-Aware Execution Analysis
 
-### 3.1 Source: [GraphExecutor.cpp](../../src/v2/execution/GraphExecutor.cpp)
+### 3.1 Source: [DeviceGraphExecutor.cpp](../../src/v2/execution/DeviceGraphExecutor.cpp)
 
-The `GraphExecutor` supports **multi-device execution** via `executeMultiDevice()`:
+The `DeviceGraphExecutor` supports **multi-device execution** via `executeMultiDevice()`:
 
 ```cpp
-bool GraphExecutor::executeMultiDevice(
+bool DeviceGraphExecutor::executeMultiDevice(
     ComputeGraph& graph,
     const std::unordered_map<DeviceId, IDeviceContext*>& contexts)
 {
@@ -534,7 +534,7 @@ Llaminar V2 has **solid infrastructure** for heterogeneous GPU tensor parallelis
 | File | Purpose |
 |------|---------|
 | [src/v2/loaders/WeightManager.cpp](../../src/v2/loaders/WeightManager.cpp) | Weight sharding implementation |
-| [src/v2/execution/GraphExecutor.cpp](../../src/v2/execution/GraphExecutor.cpp) | Multi-device execution |
+| [src/v2/execution/DeviceGraphExecutor.cpp](../../src/v2/execution/DeviceGraphExecutor.cpp) | Multi-device execution |
 | [src/v2/collective/DeviceGroup.h](../../src/v2/collective/DeviceGroup.h) | Device group definition |
 | [src/v2/collective/BackendRouter.h](../../src/v2/collective/BackendRouter.h) | Backend selection logic |
 | [src/v2/execution/CollectiveContext.h](../../src/v2/execution/CollectiveContext.h) | Collective operation context |

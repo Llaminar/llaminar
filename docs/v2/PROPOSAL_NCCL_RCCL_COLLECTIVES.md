@@ -369,7 +369,7 @@ TEST(Test__NCCLBackend, AllReduce_Sum_MultiGPU)
 ### Phase 6: Integration and Validation (1-2 days)
 
 **Files to modify:**
-- `src/v2/execution/GraphExecutor.cpp` (if needed)
+- `src/v2/execution/DeviceGraphExecutor.cpp` (if needed)
 - `src/v2/pipelines/qwen/Qwen2Graph.cpp` (if needed)
 
 **Tasks:**

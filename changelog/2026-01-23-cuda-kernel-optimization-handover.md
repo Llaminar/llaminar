@@ -60,7 +60,7 @@ InferenceRunnerFactory
 |------|---------|
 | `src/v2/collective/BackendRouter.cpp` | Added NCCL/RCCL includes; `createBackend()` now instantiates real backends |
 | `src/v2/execution/GraphOrchestrator.h` | Added `setCollectiveContext()`, `collectiveContext()`, `isGpuCollectivesEnabled()` |
-| `src/v2/execution/GraphOrchestrator.cpp` | Implemented CollectiveContext setter that wires to internal GraphExecutor |
+| `src/v2/execution/GraphOrchestrator.cpp` | Implemented CollectiveContext setter that wires to internal DeviceGraphExecutor |
 | `src/v2/execution/InferenceRunnerFactory.cpp` | Added `buildLocalClusterInventory()` helper; creates and wires CollectiveContext |
 | `tests/v2/unit/Test__GraphOrchestrator.cpp` | Added 4 new unit tests for `setCollectiveContext()` |
 
@@ -330,7 +330,7 @@ cmake --build build_v2_integration --parallel
 | Collective Backends | `src/v2/collective/NCCLBackend.cpp`, `RCCLBackend.cpp` |
 | Backend Routing | `src/v2/collective/BackendRouter.cpp` |
 | Context Factory | `src/v2/collective/CollectiveContextFactory.cpp` |
-| GraphExecutor Intercept | `src/v2/execution/GraphExecutor.cpp` (lines 719-731) |
+| DeviceGraphExecutor Intercept | `src/v2/execution/DeviceDeviceGraphExecutor.cpp` (lines 719-731) |
 | Debug Environment | `src/v2/utils/DebugEnv.h` |
 
 ---

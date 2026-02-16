@@ -54,7 +54,7 @@ Llaminar V2 uses a **kernel-centric, operator-free** architecture:
 |                                      v                                       |
 |                        +-------------------------+                          |
 |                        |   ComputeGraph DAG      |                          |
-|                        |  + GraphExecutor        |                          |
+|                        |  + DeviceGraphExecutor        |                          |
 |                        +-------------------------+                          |
 |                                                                              |
 +-----------------------------------------------------------------------------+
@@ -97,7 +97,7 @@ Llaminar V2 uses a **kernel-centric, operator-free** architecture:
 ```
 src/v2/
  inference/          # IInferenceRunner interface and factory
- execution/          # ComputeGraph, GraphExecutor, ComputeStages
+ execution/          # ComputeGraph, DeviceGraphExecutor, ComputeStages
  pipelines/          # Model-specific orchestrators (Qwen2)
    └── qwen/           # GraphOrchestrator, Qwen2Graph, Qwen2BufferSpec
  kernels/            # Compute kernels

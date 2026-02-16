@@ -551,7 +551,7 @@ New orchestrator that manages PP-specific logic for single-node multi-GPU PP.
 
 ```cpp
 class SingleNodePPOrchestrator : public IInferenceRunner {
-    std::vector<std::unique_ptr<GraphExecutor>> stage_executors_;
+    std::vector<std::unique_ptr<DeviceGraphExecutor>> stage_executors_;
     std::vector<TensorBase*> activation_buffers_;
     
     bool forward(const int* tokens, int seq_len) override {

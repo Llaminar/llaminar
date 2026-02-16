@@ -26,7 +26,7 @@ Unnecessary GPU↔CPU data transfers between inference stages, causing performan
 The current coherence flow is:
 
 ```
-GraphExecutor::executeNode()
+DeviceGraphExecutor::executeNode()
 ├─ cohereInputs()      → ensureOnDevice() for inputs
 ├─ cohereOutputs()     → ensureOnDevice() for outputs (allocates GPU buffer)
 ├─ stage->execute()    → Kernel writes to gpu_data_ptr()
@@ -62,7 +62,7 @@ GraphExecutor::executeNode()
 |------|---------|
 | `src/v2/tensors/cpu/CPUTensorBase.cpp` | `ensureOnDevice()`, `ensureOnHost()`, coherence logic |
 | `src/v2/execution/StageCoherence.cpp` | `cohereInputs()`, `cohereOutputs()`, `markOutputsDirty()` |
-| `src/v2/execution/GraphExecutor.cpp` | Orchestrates coherence at stage boundaries |
+| `src/v2/execution/DeviceGraphExecutor.cpp` | Orchestrates coherence at stage boundaries |
 | `src/v2/kernels/rocm/ROCmQuantisedGemmKernel.cpp` | GPU/CPU path selection via `use_gpu_path` |
 
 ### GPU Path Detection (ROCmQuantisedGemmKernel)
@@ -233,7 +233,7 @@ std::unique_ptr<FP32Tensor> TensorFactory::createFP32(
 }
 ```
 
-#### 3.2 GraphBufferManager Mapped Mode
+#### 3.2 DeviceGraphBufferManager Mapped Mode
 
 When `LLAMINAR_SNAPSHOT_USE_MAPPED=1`:
 - Allocate activation buffers with mapped memory
@@ -423,10 +423,10 @@ TEST(Test__GpuResidentDataFlow, NoD2HBetweenStages) {
 - `cohereOutputs()`: Lines 104-175 in `src/v2/execution/StageCoherence.cpp`
 - `markOutputsDirty()`: Lines 177-210 in `src/v2/execution/StageCoherence.cpp`
 
-### GraphExecutor Coherence Integration
-- Entry coherence: Lines 645-680 in `src/v2/execution/GraphExecutor.cpp`
-- Exit marking: Lines 756-768 in `src/v2/execution/GraphExecutor.cpp`
-- Snapshot callback: Lines 818-826 in `src/v2/execution/GraphExecutor.cpp`
+### DeviceGraphExecutor Coherence Integration
+- Entry coherence: Lines 645-680 in `src/v2/execution/DeviceGraphExecutor.cpp`
+- Exit marking: Lines 756-768 in `src/v2/execution/DeviceGraphExecutor.cpp`
+- Snapshot callback: Lines 818-826 in `src/v2/execution/DeviceGraphExecutor.cpp`
 
 ### Kernel GPU Path Selection
 - `use_gpu_path`: Lines 658-660 in `src/v2/kernels/rocm/ROCmQuantisedGemmKernel.cpp`

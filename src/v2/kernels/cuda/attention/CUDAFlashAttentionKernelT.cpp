@@ -473,10 +473,14 @@ namespace llaminar2
                     thread_local std::vector<uint16_t> v_half;
                     k_half.resize(logical_elements);
                     v_half.resize(logical_elements);
-                    if (cudaMemcpy(k_half.data(), K->gpu_data_ptr(), logical_elements * sizeof(uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess ||
-                        cudaMemcpy(v_half.data(), V->gpu_data_ptr(), logical_elements * sizeof(uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess)
+
+                    cudaError_t k_err = cudaMemcpy(k_half.data(), K->gpu_data_ptr(), logical_elements * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+                    cudaError_t v_err = cudaMemcpy(v_half.data(), V->gpu_data_ptr(), logical_elements * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+                    if (k_err != cudaSuccess || v_err != cudaSuccess)
                     {
-                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Failed D2H copy for FP16 KV conversion");
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Failed D2H copy for FP16 KV conversion"
+                                  << " k_err=" << cudaGetErrorString(k_err)
+                                  << " v_err=" << cudaGetErrorString(v_err));
                         return false;
                     }
 

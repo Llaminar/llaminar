@@ -13,7 +13,7 @@ portions via GPU graph launch to eliminate per-kernel dispatch overhead.
 
 ## Problem
 
-During decode, the GraphExecutor issues ~291 individual kernel launches per token
+During decode, the DeviceGraphExecutor issues ~291 individual kernel launches per token
 (for 0.5B, 24 layers) or ~339 per token (for 7B, 28 layers). On ROCm MI50, the
 CPU-side dispatch overhead is ~43ms per token — dominating the actual compute time
 and limiting decode throughput to ~15.88 tok/s vs a kernel-only theoretical
@@ -113,12 +113,12 @@ graphs should recover the majority of this overhead.
 - `isGraphCapturable()` — returns `true` by default; overridden to `false` by
   7 stage types with dynamic parameters
 
-### New Structures (`GraphExecutor.h`)
+### New Structures (`DeviceDeviceGraphExecutor.h`)
 - `GraphSegment` — stage names + capturable flag + graph capture handle
 - `GraphSegmentCache` — persistent segment cache with stream/event lifecycle,
   move semantics, RAII cleanup
 
-### New Execution Path (`GraphExecutor.cpp`)
+### New Execution Path (`DeviceDeviceGraphExecutor.cpp`)
 - `executeWithSegmentedGraphCapture()` — 3-phase capture/replay engine
 
 ### Modified Files

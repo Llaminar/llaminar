@@ -2164,7 +2164,7 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
     ASSERT_TRUE(cuda_kernel_q->multiply_fused_tensor(
         input.get(), projections, M, K, nullptr));
 
-    // Mark outputs as device-dirty (tests bypass GraphExecutor auto-coherence)
+    // Mark outputs as device-dirty (tests bypass DeviceGraphExecutor auto-coherence)
     output_q->mark_device_dirty();
     output_k->mark_device_dirty();
     output_v->mark_device_dirty();
@@ -2355,7 +2355,7 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
         ASSERT_TRUE(kernel_q->multiply_fused_tensor(
             input.get(), projections, M, K, nullptr));
 
-        // Mark outputs as device-dirty (tests bypass GraphExecutor auto-coherence)
+        // Mark outputs as device-dirty (tests bypass DeviceGraphExecutor auto-coherence)
         out_q->mark_device_dirty();
         out_k->mark_device_dirty();
         out_v->mark_device_dirty();

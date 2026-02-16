@@ -578,7 +578,7 @@ namespace llaminar2
                 return false;
             }
 
-            // Coherence handled automatically by GraphExecutor
+            // Coherence handled automatically by DeviceGraphExecutor
 
             // Ensure weights are converted
             ensureWeightsConverted();
@@ -914,7 +914,7 @@ namespace llaminar2
                     LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Failed to cast input to FP32Tensor");
                     return false;
                 }
-                // Coherence handled automatically by GraphExecutor
+                // Coherence handled automatically by DeviceGraphExecutor
                 d_input = static_cast<const float *>(fp32_input->gpu_data_ptr());
                 // NOTE: Don't log fp32_input->data() here - it triggers D2H transfer!
                 LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input);
@@ -999,7 +999,7 @@ namespace llaminar2
                     break;
                 }
 
-                // Coherence handled automatically by GraphExecutor
+                // Coherence handled automatically by DeviceGraphExecutor
                 float *d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
                 if (!d_output)
                 {

@@ -1,5 +1,5 @@
 /**
- * @file Test__MockGraphBufferManager.cpp
+ * @file Test__MockDeviceGraphBufferManager.cpp
  * @brief Unit tests for MockGraphBufferManager
  *
  * Tests the mock graph buffer manager implementation including:
@@ -14,10 +14,10 @@
  */
 
 #include <gtest/gtest.h>
-#include "mocks/MockGraphBufferManager.h"
+#include "mocks/MockDeviceGraphBufferManager.h"
 #include "utils/TestTensorFactory.h"
 #include "execution/local_execution/graph/LivenessAnalyzer.h" // For AliasingGroup
-#include "execution/local_execution/graph/GraphExecutor.h"    // For ComputeGraph
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"    // For ComputeGraph
 #include <memory>
 #include <vector>
 #include <thread>

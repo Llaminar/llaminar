@@ -44,7 +44,7 @@ This analysis examines the full extent of NCCL/RCCL threading concerns in Llamin
 **NCCL Group API Pattern (NCCLBackend.cpp)**:
 ```cpp
 bool NCCLBackend::allreduceMulti(...) {
-    // Thread: CALLER (GraphExecutor thread)
+    // Thread: CALLER (DeviceGraphExecutor thread)
     
     // Start group
     ncclGroupStart();  // ← On caller thread
@@ -69,7 +69,7 @@ bool NCCLBackend::allreduceMulti(...) {
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│ GraphExecutor::execute()                                                │
+│ DeviceGraphExecutor::execute()                                                │
 │   └─► executeStage(node)                                               │
 │         └─► stage->execute(ctx)                                        │
 │               │                                                        │
@@ -177,7 +177,7 @@ if (GPUDeviceWorkerPool::instance().isInitialized()) {
 ### No Explicit Mutex in NCCLBackend
 
 The `NCCLBackend` class has **no mutex** protecting concurrent collective calls. Thread safety relies on:
-1. Single-threaded execution of GraphExecutor
+1. Single-threaded execution of DeviceGraphExecutor
 2. Barrier coordination in `LocalTPContext` for multi-thread scenarios
 
 ---

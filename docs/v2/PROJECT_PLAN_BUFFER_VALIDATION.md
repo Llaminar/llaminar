@@ -153,7 +153,7 @@ public:
     }
     
     /// Called after execute to register produced buffers
-    virtual void registerProducedBuffers(GraphBufferManager& manager) const {}
+    virtual void registerProducedBuffers(DeviceGraphBufferManager& manager) const {}
 };
 ```
 
@@ -255,12 +255,12 @@ struct DebugEnv {
 };
 ```
 
-### 5.2 GraphExecutor Integration
+### 5.2 DeviceGraphExecutor Integration
 
-**File:** `src/v2/execution/GraphExecutor.cpp`
+**File:** `src/v2/execution/DeviceGraphExecutor.cpp`
 
 ```cpp
-void GraphExecutor::executeNode(const ComputeNode& node) {
+void DeviceGraphExecutor::executeNode(const ComputeNode& node) {
     bool success = node.stage->execute(device_ctx);
     
     #ifndef NDEBUG
@@ -485,8 +485,8 @@ bool use_hybrid_mode = isHybridModeActive(mode, buffers);
 
 **Files Modified:**
 - `src/v2/utils/DebugEnv.h` - Added ValidationConfig struct
-- `src/v2/execution/GraphExecutor.h` - Added validateStageOutputs() declaration
-- `src/v2/execution/GraphExecutor.cpp` - Added validation hook and implementation
+- `src/v2/execution/DeviceGraphExecutor.h` - Added validateStageOutputs() declaration
+- `src/v2/execution/DeviceGraphExecutor.cpp` - Added validation hook and implementation
 
 **ValidationConfig Struct:**
 ```cpp
@@ -498,7 +498,7 @@ struct ValidationConfig
 };
 ```
 
-**GraphExecutor Integration:**
+**DeviceGraphExecutor Integration:**
 ```cpp
 // In executeNode(), after stage execution:
 #ifndef NDEBUG
@@ -580,6 +580,6 @@ LLAMINAR_VALIDATE_BUFFERS=1 LLAMINAR_FAIL_ON_ZERO=1 LLAMINAR_FAIL_ON_NAN=1 \
 - `src/v2/execution/BufferRole.h` - Add producer_stage
 - `src/v2/execution/ComputeStage.h` - Add getDeclaredOutputs()
 - `src/v2/execution/ComputeStage.cpp` - KVCacheAppendStage outputs
-- `src/v2/execution/GraphExecutor.cpp` - Validation hook
+- `src/v2/execution/DeviceGraphExecutor.cpp` - Validation hook
 - `src/v2/utils/DebugEnv.h` - Validation flags
 - `src/v2/kernels/cpu/attention/CPUAttentionKernelT.h` - Guards

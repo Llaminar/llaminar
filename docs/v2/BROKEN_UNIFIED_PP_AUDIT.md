@@ -65,7 +65,7 @@ for (const auto &pp_stage : config_.pipeline_config->pp_stages)
 
 ### Why It's Wrong
 - A single `ComputeGraph` cannot span multiple device execution contexts
-- Assumes `GraphExecutor::executeMultiDevice()` can magically switch contexts mid-execution
+- Assumes `DeviceGraphExecutor::executeMultiDevice()` can magically switch contexts mid-execution
 - The "multi-device" execution is a lie - it just picks different contexts per stage node, but real GPU kernels don't work that way
 
 ### Contrast with `buildPartialForwardGraph()`

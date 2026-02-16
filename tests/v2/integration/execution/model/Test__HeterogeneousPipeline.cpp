@@ -27,7 +27,7 @@
 #include "execution/local_execution/model/HeterogeneousLayerExecutor.h"
 #include "execution/local_execution/device/DomainAwareBufferManager.h"
 #include "execution/local_execution/coherence/CrossDomainTransfer.h"
-#include "execution/local_execution/graph/GraphExecutor.h" // Contains ComputeGraph definition
+#include "execution/local_execution/graph/DeviceGraphExecutor.h" // Contains ComputeGraph definition
 #include "config/LayerPlacementConfig.h"
 #include "config/TPDomain.h"
 #include "backends/DeviceId.h"

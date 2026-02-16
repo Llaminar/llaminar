@@ -14,7 +14,7 @@
  */
 
 #include "GraphResolver.h"
-#include "GraphExecutor.h" // For ComputeGraph
+#include "DeviceGraphExecutor.h" // For ComputeGraph
 #include "../../compute_stages/ComputeStages.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../utils/DebugEnv.h"
@@ -701,6 +701,7 @@ namespace llaminar2
             // Phase 5.4: VNNI-safe Q16 KV cache parameters
             params.head_dim = stage.int_params.count("head_dim") ? stage.int_params.at("head_dim") : 128;
             params.kv_cache_scale = stage.float_params.count("kv_cache_scale") ? stage.float_params.at("kv_cache_scale") : 64.0f;
+            params.device_id = stage.device;
             return ComputeStageFactory::createKVCacheAppend(params);
         }
 

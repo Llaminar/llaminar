@@ -99,7 +99,7 @@ namespace llaminar2
         void onGraphReplayed() override
         {
             // Advance the ring buffer head and count on the host side.
-            // Called by GraphExecutor AFTER the captured graph segment replays.
+            // Called by DeviceGraphExecutor AFTER the captured graph segment replays.
             if (params_.kv_cache)
             {
                 params_.kv_cache->advanceHead(params_.layer_idx, params_.seq_idx, params_.num_tokens);
@@ -112,6 +112,7 @@ namespace llaminar2
         StageDumpInfo buildDumpInfoImpl() const override;
 
         bool producesVDequant() const { return params_.V_dequant_out != nullptr; }
+        const Params &getParams() const { return params_; }
 
     private:
         Params params_;
