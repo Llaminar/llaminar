@@ -626,6 +626,29 @@ namespace llaminar2
         }
 
         /**
+         * @brief Multi-GPU AllReduce + Synchronize (single process, atomic submission)
+         *
+         * Executes allreduceMulti followed by synchronize as one logical backend
+         * operation. Backends with coordinator threads should override this to
+         * submit both steps in a single queued task, preventing interleaving
+         * between the collective launch and the completion wait.
+         *
+         * Default implementation falls back to sequential calls.
+         */
+        virtual bool allreduceMultiAndSynchronize(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op)
+        {
+            if (!allreduceMulti(buffers, count, dtype, op))
+            {
+                return false;
+            }
+            return synchronize();
+        }
+
+        /**
          * @brief Multi-GPU AllGather (single process)
          *
          * Each send_bufs[i] on GPU i contributes send_count elements.

@@ -1124,6 +1124,60 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLBackend::allreduceMultiAndSynchronize(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "allreduceMultiAndSynchronize requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer count (" + std::to_string(buffers.size()) +
+                          ") doesn't match GPU count (" + std::to_string(num_ranks_) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_->allreduceMultiAndSynchronize(buffers, count, dtype, op))
+        {
+            last_error_ = "RCCLCoordinator allreduceMultiAndSynchronize failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
     bool RCCLBackend::allgatherMulti(
         const std::vector<const void *> &send_bufs,
         const std::vector<void *> &recv_bufs,

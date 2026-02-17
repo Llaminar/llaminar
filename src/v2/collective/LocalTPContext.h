@@ -268,6 +268,12 @@ namespace llaminar2
         /// Result of allreduce (set by executor, read by all waiters)
         bool barrier_result_{false};
 
+        /// True after the first barrier has completed successfully.
+        /// Used for adaptive timeout: first barrier uses a longer timeout to
+        /// accommodate GPU workspace allocation (hipMalloc) which can take 30-60s
+        /// and is serialized across devices in the same process.
+        std::atomic<bool> first_barrier_completed_{false};
+
         // =====================================================================
         // BAR-Backed Tensor Registry
         // =====================================================================

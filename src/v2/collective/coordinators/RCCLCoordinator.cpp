@@ -742,6 +742,36 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLCoordinator::allreduceMultiAndSynchronize(const std::vector<void *> &buffers, size_t count,
+                                                       CollectiveDataType dtype, CollectiveOp op)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer count (" + std::to_string(buffers.size()) +
+                          ") doesn't match device count (" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+
+        return submitAndWait([&]()
+                             {
+            if (!doAllreduceMulti(buffers, count, toDataTypeInt(dtype), toOpInt(op)))
+            {
+                return false;
+            }
+            return doSynchronizeAll(); });
+#else
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
     bool RCCLCoordinator::allgatherMulti(const std::vector<const void *> &send_buffers,
                                          const std::vector<void *> &recv_buffers,
                                          size_t send_count, CollectiveDataType dtype)
@@ -888,7 +918,16 @@ namespace llaminar2
         }
 
         return submitAndWait([&]()
-                             {
+                             { return doSynchronizeAll(); });
+#else
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::doSynchronizeAll()
+    {
+#ifdef HAVE_RCCL
         for (int i = 0; i < num_devices_; ++i)
         {
             hipError_t err = hipSetDevice(device_ordinals_[i]);
@@ -898,15 +937,17 @@ namespace llaminar2
                 return false;
             }
 
-            err = hipStreamSynchronize(static_cast<hipStream_t>(streams_[i]));
+            // Use hipDeviceSynchronize() instead of hipStreamSynchronize(streams_[i])
+            // to ensure ALL streams complete, including any internal RCCL streams.
+            err = hipDeviceSynchronize();
             if (err != hipSuccess)
             {
-                last_error_ = std::string("hipStreamSynchronize failed for device ") +
+                last_error_ = std::string("hipDeviceSynchronize failed for device ") +
                               std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
                 return false;
             }
         }
-        return true; });
+        return true;
 #else
         last_error_ = "RCCL not available";
         return false;
@@ -1062,6 +1103,30 @@ namespace llaminar2
                                            int dtype_int, int op_int)
     {
 #ifdef HAVE_RCCL
+        // CRITICAL: Synchronize ALL streams on each device before RCCL operations.
+        // Compute kernels run on a dedicated per-device stream (AMDDeviceContext::default_stream_)
+        // created via hipStreamCreateWithFlags — NOT the HIP NULL stream. Using
+        // hipStreamSynchronize(nullptr) only syncs the NULL stream, which is a NO-OP
+        // for compute work. hipDeviceSynchronize() syncs ALL streams including the
+        // dedicated compute stream, ensuring RCCL reads completed data.
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed during pre-allreduce sync: ") + hipGetErrorString(err);
+                return false;
+            }
+            // Sync ALL streams (compute kernels use a dedicated stream, not NULL stream)
+            err = hipDeviceSynchronize();
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipDeviceSynchronize failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                return false;
+            }
+        }
+
         // Start RCCL group for multi-GPU operation
         rccl::ncclResult_t r = rccl::ncclGroupStart();
         if (r != rccl::ncclSuccess)
@@ -1137,6 +1202,24 @@ namespace llaminar2
                                            size_t send_count, int dtype_int)
     {
 #ifdef HAVE_RCCL
+        // Sync ALL device streams before RCCL reads buffers (see doAllreduceMulti comment)
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed during pre-allgather sync: ") + hipGetErrorString(err);
+                return false;
+            }
+            err = hipDeviceSynchronize();
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipDeviceSynchronize failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                return false;
+            }
+        }
+
         // Start RCCL group
         rccl::ncclResult_t r = rccl::ncclGroupStart();
         if (r != rccl::ncclSuccess)
@@ -1210,6 +1293,24 @@ namespace llaminar2
                                            int dtype_int, int root)
     {
 #ifdef HAVE_RCCL
+        // Sync ALL device streams before RCCL reads buffers (see doAllreduceMulti comment)
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed during pre-broadcast sync: ") + hipGetErrorString(err);
+                return false;
+            }
+            err = hipDeviceSynchronize();
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipDeviceSynchronize failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                return false;
+            }
+        }
+
         // Start RCCL group
         rccl::ncclResult_t r = rccl::ncclGroupStart();
         if (r != rccl::ncclSuccess)
@@ -1285,6 +1386,24 @@ namespace llaminar2
                                                size_t recv_count, int dtype_int, int op_int)
     {
 #ifdef HAVE_RCCL
+        // Sync ALL device streams before RCCL reads buffers (see doAllreduceMulti comment)
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed during pre-reducescatter sync: ") + hipGetErrorString(err);
+                return false;
+            }
+            err = hipDeviceSynchronize();
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipDeviceSynchronize failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                return false;
+            }
+        }
+
         // Start RCCL group
         rccl::ncclResult_t r = rccl::ncclGroupStart();
         if (r != rccl::ncclSuccess)

@@ -137,7 +137,8 @@ namespace llaminar2
 
     int LocalTPContext::myIndex() const
     {
-        if (current_device_index_ < 0) {
+        if (current_device_index_ < 0)
+        {
             throw std::runtime_error(
                 "LocalTPContext::myIndex() called before setCurrentDeviceIndex(). "
                 "In orchestrator-driven LOCAL TP, the current device must be set explicitly.");
@@ -147,7 +148,8 @@ namespace llaminar2
 
     void LocalTPContext::setCurrentDeviceIndex(int index)
     {
-        if (index < 0 || index >= static_cast<int>(devices_.size())) {
+        if (index < 0 || index >= static_cast<int>(devices_.size()))
+        {
             throw std::out_of_range(
                 "LocalTPContext::setCurrentDeviceIndex(): index " + std::to_string(index) +
                 " out of range [0, " + std::to_string(devices_.size()) + ")");
@@ -469,7 +471,11 @@ namespace llaminar2
         if (arrival_order + 1 < num_participants)
         {
             // Not the last arrival: wait for completion with timeout
-            constexpr auto BARRIER_TIMEOUT = std::chrono::seconds(30);
+            // Use longer timeout for first barrier to accommodate GPU workspace allocation
+            // (hipMalloc can take 30-60s per device and is serialized within a process)
+            const auto BARRIER_TIMEOUT = first_barrier_completed_.load()
+                                             ? std::chrono::seconds(30)
+                                             : std::chrono::seconds(300);
 
             bool completed = barrier_cv_.wait_for(lock, BARRIER_TIMEOUT, [this, my_generation]()
                                                   { return barrier_generation_.load() > my_generation; });
@@ -477,9 +483,11 @@ namespace llaminar2
             if (!completed)
             {
                 // Timeout - likely a deadlock or missing participant
-                LOG_ERROR("LocalTPContext::allreduceWithBarrier: TIMEOUT after 30s waiting for barrier! "
-                          << "arrival_order=" << arrival_order << ", expected=" << num_participants
-                          << " devices. Possible causes: missing device thread, kernel crash, or deadlock.");
+                int timeout_secs = first_barrier_completed_.load() ? 30 : 300;
+                LOG_ERROR("LocalTPContext::allreduceWithBarrier: TIMEOUT after " << timeout_secs
+                                                                                 << "s waiting for barrier! "
+                                                                                 << "arrival_order=" << arrival_order << ", expected=" << num_participants
+                                                                                 << " devices. Possible causes: missing device thread, kernel crash, or deadlock.");
 
                 // Reset barrier state to allow recovery
                 barrier_count_.store(0);
@@ -514,6 +522,8 @@ namespace llaminar2
 
         // Store result and signal completion
         barrier_result_ = success;
+        if (success)
+            first_barrier_completed_.store(true);
         barrier_tensors_.clear();
         barrier_tensor_ = nullptr;
         barrier_stage_name_.clear();
@@ -604,7 +614,11 @@ namespace llaminar2
         if (arrival_order + 1 < num_participants)
         {
             // Not the last arrival: wait for completion with timeout
-            constexpr auto BARRIER_TIMEOUT = std::chrono::seconds(30);
+            // Use longer timeout for first barrier to accommodate GPU workspace allocation
+            // (hipMalloc can take 30-60s per device and is serialized within a process)
+            const auto BARRIER_TIMEOUT = first_barrier_completed_.load()
+                                             ? std::chrono::seconds(30)
+                                             : std::chrono::seconds(300);
 
             bool completed = barrier_cv_.wait_for(lock, BARRIER_TIMEOUT, [this, my_generation]()
                                                   { return barrier_generation_.load() > my_generation; });
@@ -612,9 +626,11 @@ namespace llaminar2
             if (!completed)
             {
                 // Timeout - likely a deadlock or missing participant
-                LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: TIMEOUT after 30s waiting for barrier! "
-                          << "arrival_order=" << arrival_order << ", expected=" << num_participants
-                          << " devices. Possible causes: missing device thread, kernel crash, or deadlock.");
+                int timeout_secs = first_barrier_completed_.load() ? 30 : 300;
+                LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: TIMEOUT after " << timeout_secs
+                                                                                         << "s waiting for barrier! "
+                                                                                         << "arrival_order=" << arrival_order << ", expected=" << num_participants
+                                                                                         << " devices. Possible causes: missing device thread, kernel crash, or deadlock.");
 
                 // Reset barrier state to allow recovery
                 barrier_count_.store(0);
@@ -702,7 +718,8 @@ namespace llaminar2
             LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: Calling allreduceMulti with "
                       << buffers.size() << " buffers, " << effective_count << " elements");
 
-            bool success = backend_impl_->allreduceMulti(buffers, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM);
+            bool success = backend_impl_->allreduceMultiAndSynchronize(
+                buffers, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM);
 
             if (!success)
             {
@@ -712,17 +729,8 @@ namespace llaminar2
                 goto cleanup;
             }
 
-            // TRACE: Log after allreduce completes
-            LOG_TRACE("LocalTPContext::allreduceWithBarrierMultiGpu: ALLREDUCE COMPLETE, syncing...");
-
-            // Synchronize all GPU streams
-            if (!backend_impl_->synchronize())
-            {
-                LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: synchronize failed: "
-                          << backend_impl_->lastError());
-                barrier_result_ = false;
-                goto cleanup;
-            }
+            // TRACE: Log after allreduce+sync completes
+            LOG_TRACE("LocalTPContext::allreduceWithBarrierMultiGpu: ALLREDUCE+SYNC COMPLETE");
 
             // Mark all tensors as device-dirty (data was modified on GPU)
             for (int i = 0; i < num_participants; ++i)
@@ -744,6 +752,8 @@ namespace llaminar2
         barrier_generation_.fetch_add(1);
 
         bool final_result = barrier_result_;
+        if (final_result)
+            first_barrier_completed_.store(true);
 
         LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: Multi-GPU allreduce completed with result="
                   << final_result << ", releasing waiters (generation=" << barrier_generation_.load() << ")");
@@ -1549,7 +1559,7 @@ namespace llaminar2
             DeviceId dst_device_id = devices_[i].toLocalDeviceId();
 
             LOG_DEBUG("LocalTPContext::broadcast: " << src_device_id.toString()
-                      << " → " << dst_device_id.toString());
+                                                    << " → " << dst_device_id.toString());
 
             // Use tensor's transferTo which uses GlobalBackendRouter
             // For same-vendor this will use NCCL/RCCL P2P or CUDA/HIP memcpy

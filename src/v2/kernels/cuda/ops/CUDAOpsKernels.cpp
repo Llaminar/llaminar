@@ -1305,8 +1305,12 @@ namespace llaminar2
             }
 
             // Check if we need to repack + upload (first call or different tensor for THIS workspace)
-            auto it = s_workspace_embed_cache_.find(workspace_);
-            bool needs_upload = (it == s_workspace_embed_cache_.end()) || (it->second != embed_table);
+            bool needs_upload = false;
+            {
+                std::lock_guard<std::mutex> lock(s_embed_cache_mutex_);
+                auto it = s_workspace_embed_cache_.find(workspace_);
+                needs_upload = (it == s_workspace_embed_cache_.end()) || (it->second != embed_table);
+            }
             if (needs_upload)
             {
                 // CPU-side repack: any quant format → EmbedQ8Block via IINT8Unpackable
@@ -1321,7 +1325,10 @@ namespace llaminar2
                     return false;
                 }
 
-                s_workspace_embed_cache_[workspace_] = embed_table;
+                {
+                    std::lock_guard<std::mutex> lock(s_embed_cache_mutex_);
+                    s_workspace_embed_cache_[workspace_] = embed_table;
+                }
                 LOG_INFO("[CUDAEmbeddingKernelT] Uploaded EmbedQ8 embedding: "
                          << tensorTypeName(embed_table->native_type()) << " "
                          << repacked.vocab_size << "x" << d_model

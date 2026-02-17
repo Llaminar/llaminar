@@ -11,6 +11,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include <unordered_map>
+#include <mutex>
 #include <stdexcept>
 
 namespace llaminar2
@@ -170,6 +171,7 @@ namespace llaminar2
         {
             if (workspace_)
             {
+                std::lock_guard<std::mutex> lock(s_embed_cache_mutex_);
                 s_workspace_embed_cache_.erase(workspace_);
             }
         }
@@ -177,7 +179,11 @@ namespace llaminar2
         /**
          * @brief Static method to clear ALL embedding caches (for model unload)
          */
-        static void clearGlobalEmbeddingCache() { s_workspace_embed_cache_.clear(); }
+        static void clearGlobalEmbeddingCache()
+        {
+            std::lock_guard<std::mutex> lock(s_embed_cache_mutex_);
+            s_workspace_embed_cache_.clear();
+        }
 
     private:
         int device_idx_;
@@ -193,6 +199,8 @@ namespace llaminar2
         // Using static ensures we don't re-upload 500+ MB every decode step.
         // KEY FIX: Use per-workspace cache to support LOCAL TP with multiple devices.
         // Each device has its own workspace, so we cache separately per workspace.
+        // THREAD SAFETY: Protected by s_embed_cache_mutex_ for LocalTP multi-device access.
+        static inline std::mutex s_embed_cache_mutex_;
         static inline std::unordered_map<DeviceWorkspaceManager *, const TensorBase *> s_workspace_embed_cache_;
     };
 

@@ -474,6 +474,38 @@ namespace llaminar2
 
         namespace
         {
+            inline bool validatePointerDeviceOrLog(
+                const void *ptr,
+                int expected_device,
+                const char *pointer_name,
+                const char *scope)
+            {
+                if (!ptr)
+                {
+                    LOG_ERROR("[" << scope << "] " << pointer_name << " is null");
+                    return false;
+                }
+
+                hipPointerAttribute_t attr{};
+                hipError_t err = hipPointerGetAttributes(&attr, ptr);
+                if (err == hipSuccess)
+                {
+                    if (attr.device != expected_device)
+                    {
+                        LOG_ERROR("[" << scope << "] " << pointer_name
+                                      << " on wrong device: ptr=" << ptr
+                                      << " attr.device=" << attr.device
+                                      << " expected=" << expected_device);
+                        return false;
+                    }
+                    return true;
+                }
+
+                LOG_WARN("[" << scope << "] hipPointerGetAttributes failed for " << pointer_name
+                             << " ptr=" << ptr << ": " << hipGetErrorString(err));
+                return true;
+            }
+
             template <typename ImplT>
             inline bool ensureRepackedWeightsForCK(
                 ImplT *impl,
@@ -967,10 +999,33 @@ namespace llaminar2
                 // Temporarily bind passed workspace for this call
                 workspace_ = ws;
             }
+            auto restore_workspace = [&](void *)
+            {
+                if (ws && ws != saved_workspace)
+                {
+                    workspace_ = saved_workspace;
+                }
+            };
+            std::unique_ptr<void, decltype(restore_workspace)> workspace_restore_guard(nullptr, restore_workspace);
 
             if (!A || !C)
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Null tensor");
+                return false;
+            }
+
+            if (!ws)
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Workspace not bound");
+                return false;
+            }
+
+            const DeviceId workspace_device = ws->device();
+            if (!workspace_device.is_rocm() || workspace_device.rocm_ordinal() != rocm_device_id_)
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Workspace bound to wrong device: workspace="
+                          << workspace_device.to_string() << " kernel=ROCm:" << rocm_device_id_
+                          << " workspace_ptr=" << static_cast<void *>(ws));
                 return false;
             }
 
@@ -1031,6 +1086,14 @@ namespace llaminar2
             {
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using GPU-to-GPU path (d_input="
                           << d_input << ", d_output=" << d_output << ")");
+
+                if (!validatePointerDeviceOrLog(
+                        d_input, rocm_device_id_, "d_input", "ROCmQuantisedGemmKernel::multiply_tensor") ||
+                    !validatePointerDeviceOrLog(
+                        d_output, rocm_device_id_, "d_output", "ROCmQuantisedGemmKernel::multiply_tensor"))
+                {
+                    return false;
+                }
             }
 
             // =========================================================================
@@ -1090,6 +1153,36 @@ namespace llaminar2
                     }
 
                     validateWorkspace();
+
+                    if (d_weights_vnni &&
+                        !validatePointerDeviceOrLog(
+                            d_weights_vnni, rocm_device_id_, "d_weights_vnni", "ROCmQuantisedGemmKernel::multiply_tensor"))
+                    {
+                        return false;
+                    }
+                    if (d_weights_ratio_payload &&
+                        !validatePointerDeviceOrLog(
+                            d_weights_ratio_payload, rocm_device_id_, "d_weights_ratio_payload", "ROCmQuantisedGemmKernel::multiply_tensor"))
+                    {
+                        return false;
+                    }
+                    if (d_weights_ratio &&
+                        !validatePointerDeviceOrLog(
+                            d_weights_ratio, rocm_device_id_, "d_weights_ratio", "ROCmQuantisedGemmKernel::multiply_tensor"))
+                    {
+                        return false;
+                    }
+                    if (!validatePointerDeviceOrLog(
+                            d_scales_B, rocm_device_id_, "d_scales_B", "ROCmQuantisedGemmKernel::multiply_tensor") ||
+                        !validatePointerDeviceOrLog(
+                            impl_->d_A_int8, rocm_device_id_, "workspace::QUANT_A", "ROCmQuantisedGemmKernel::multiply_tensor") ||
+                        !validatePointerDeviceOrLog(
+                            impl_->d_scales_A, rocm_device_id_, "workspace::SCALES_A", "ROCmQuantisedGemmKernel::multiply_tensor") ||
+                        !validatePointerDeviceOrLog(
+                            impl_->d_C_int32, rocm_device_id_, "workspace::ACC_INT32", "ROCmQuantisedGemmKernel::multiply_tensor"))
+                    {
+                        return false;
+                    }
 
                     // Use fused FP32→INT8+GEMV+scale kernel when alpha=1, beta=0 AND fused enabled
                     if (alpha == 1.0f && beta == 0.0f && isFusedGemvEnabled())
@@ -1166,8 +1259,6 @@ namespace llaminar2
                         }
                     }
 
-                    if (ws && ws != saved_workspace)
-                        workspace_ = saved_workspace;
                     return true;
                 }
                 // Fall through to CK path if weight pointers unavailable
@@ -1228,6 +1319,12 @@ namespace llaminar2
                 return false;
             }
 
+            if (!validatePointerDeviceOrLog(
+                    d_scales_B, rocm_device_id_, "d_scales_B", "ROCmQuantisedGemmKernel::multiply_tensor"))
+            {
+                return false;
+            }
+
             // Validate and populate workspace pointers (includes d_B_rowmajor_scratch)
             phase_start = std::chrono::high_resolution_clock::now();
             validateWorkspace();
@@ -1259,11 +1356,27 @@ namespace llaminar2
                 return false;
             }
 
+            if (!validatePointerDeviceOrLog(
+                    d_weights_int8, rocm_device_id_, "workspace::ROCM_B_REPACK", "ROCmQuantisedGemmKernel::multiply_tensor"))
+            {
+                return false;
+            }
+
             LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Weight ptrs: int8(scratch)=" << (void *)d_weights_int8 << " scales=" << (void *)d_scales_B);
 
             int8_t *d_A_int8 = impl_->d_A_int8;
             float *d_scales_A = impl_->d_scales_A;
             int32_t *d_C_int32 = impl_->d_C_int32;
+
+            if (!validatePointerDeviceOrLog(
+                    d_A_int8, rocm_device_id_, "workspace::QUANT_A", "ROCmQuantisedGemmKernel::multiply_tensor") ||
+                !validatePointerDeviceOrLog(
+                    d_scales_A, rocm_device_id_, "workspace::SCALES_A", "ROCmQuantisedGemmKernel::multiply_tensor") ||
+                !validatePointerDeviceOrLog(
+                    d_C_int32, rocm_device_id_, "workspace::ACC_INT32", "ROCmQuantisedGemmKernel::multiply_tensor"))
+            {
+                return false;
+            }
 
             LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Work buffers: A_int8=" << (void *)d_A_int8
                                                                                          << " scales_A=" << (void *)d_scales_A << " C_int32=" << (void *)d_C_int32);
@@ -1397,6 +1510,12 @@ namespace llaminar2
                 d_C_fp32_dst = impl_->d_C_fp32;
             }
 
+            if (!validatePointerDeviceOrLog(
+                    d_C_fp32_dst, rocm_device_id_, "d_C_fp32_dst", "ROCmQuantisedGemmKernel::multiply_tensor"))
+            {
+                return false;
+            }
+
             // =========================================================================
             // CK TWO-KERNEL DISPATCH (with M-padding for decode)
             // =========================================================================
@@ -1407,6 +1526,7 @@ namespace llaminar2
             // NOTE: hipBLAS INT8 on gfx906 has N <= K limitation, breaking FFN.
             //       M-padding for CK is more efficient and universally supported.
             //
+
             const int padded_m = getPaddedM(m);
             const bool needs_padding = needsMPadding(m);
             bool success = false;
@@ -1478,11 +1598,6 @@ namespace llaminar2
             }
             LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Completed " << m << "x" << n << "x" << k);
 
-            // Restore original workspace binding
-            if (ws && ws != saved_workspace)
-            {
-                workspace_ = saved_workspace;
-            }
             return true;
         }
 

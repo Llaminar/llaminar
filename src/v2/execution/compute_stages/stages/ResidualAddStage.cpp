@@ -174,7 +174,8 @@ namespace llaminar2
         const size_t n = num_elements;
 
         // Debug logging - use fp32_data() which handles sync properly
-        if (Logger::getInstance().shouldLog(LogLevel::TRACE))
+        // Skip on GPU to avoid D2H transfers in multi-device execution
+        if (Logger::getInstance().shouldLog(LogLevel::TRACE) && !params_.device_id.is_gpu())
         {
             const float *input = params_.input->fp32_data();
             const float *residual = params_.residual->fp32_data();
@@ -206,7 +207,7 @@ namespace llaminar2
         bool ok = cached_kernel_->apply_tensor(input_base, residual_base, output_base, n, params_.mpi_ctx,
                                                params_.device_id.toKernelDeviceIndex());
 
-        if (Logger::getInstance().shouldLog(LogLevel::TRACE))
+        if (Logger::getInstance().shouldLog(LogLevel::TRACE) && !params_.device_id.is_gpu())
         {
             const float *output = params_.output->fp32_data();
             if (output)

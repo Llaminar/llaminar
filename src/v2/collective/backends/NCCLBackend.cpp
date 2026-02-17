@@ -1244,6 +1244,57 @@ namespace llaminar2
 #endif
     }
 
+    bool NCCLBackend::allreduceMultiAndSynchronize(const std::vector<void *> &buffers, size_t count,
+                                                   CollectiveDataType dtype, CollectiveOp op)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "allreduceMultiAndSynchronize requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer count (" + std::to_string(buffers.size()) +
+                          ") does not match GPU count (" + std::to_string(num_ranks_) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "NCCLCoordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_->allreduceMultiAndSynchronize(buffers, count, dtype, op))
+        {
+            last_error_ = "NCCLCoordinator allreduceMultiAndSynchronize failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
     bool NCCLBackend::allgatherMulti(const std::vector<const void *> &send_buffers,
                                      const std::vector<void *> &recv_buffers, size_t send_count,
                                      CollectiveDataType dtype)

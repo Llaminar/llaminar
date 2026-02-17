@@ -569,7 +569,29 @@ namespace llaminar2
 
     bool DeviceGraphExecutor::executeSequential(ComputeGraph &graph, IDeviceContext *ctx)
     {
+        // Set HIP device for this thread (critical for multi-GPU LocalTP prefill)
+        // Without this, std::async threads may not have the correct HIP device context,
+        // causing cross-device memory access faults when coherence or kernels allocate memory.
+        DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(ctx);
+
         const auto &order = graph.getExecutionOrder();
+
+        // =====================================================================
+        // Multi-GPU Stage Sync
+        //
+        // In LocalTP (multi-device) execution, each device runs its own graph
+        // on a separate std::async thread. Without explicit device-wide
+        // synchronization between stages, HIP/ROCm issues memory access faults
+        // because host-to-device coherence transfers (hipMemcpy on NULL stream)
+        // and compute kernels (on AMDDeviceContext::default_stream_) can race.
+        //
+        // The pre-stage sync ensures all prior GPU work (including RCCL
+        // collectives) has completed before the next stage's coherence
+        // operations begin. The post-stage sync ensures kernel output is
+        // available for subsequent stages or collective reads.
+        // =====================================================================
+        const bool multi_gpu_sync = collective_ctx_ && ctx->isGPU();
+        [[maybe_unused]] const int device_ordinal = ctx->isGPU() ? ctx->deviceId().toKernelDeviceIndex() : -1;
 
         auto total_start = std::chrono::high_resolution_clock::now();
 
@@ -587,11 +609,77 @@ namespace llaminar2
 
             auto stage_start = std::chrono::high_resolution_clock::now();
 
+            // Pre-stage device sync for multi-GPU
+#ifdef HAVE_ROCM
+            if (multi_gpu_sync && ctx->deviceId().is_rocm())
+            {
+                HipDeviceGuard::forceSetDevice(device_ordinal);
+                hipError_t sync_err = hipDeviceSynchronize();
+                if (sync_err != hipSuccess)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] PRE-STAGE hipDeviceSynchronize FAILED for stage '"
+                              << name << "' on device " << device_ordinal
+                              << ": " << hipGetErrorString(sync_err)
+                              << " (error " << sync_err << ")"
+                              << " — a PREVIOUS async kernel on this device faulted!");
+                }
+
+                // DIAGNOSTIC: Check all stage tensor GPU pointers are on the correct device.
+                // This catches cross-device pointer bugs BEFORE the kernel launches.
+                {
+                    const StageDumpInfo &dump_info = node->stage->getDumpInfo();
+                    auto check_ptr = [&](const char *category, const char *tname, ITensor *tensor)
+                    {
+                        if (!tensor)
+                            return;
+                        auto *tb = dynamic_cast<TensorBase *>(tensor);
+                        if (!tb)
+                            return;
+                        void *gpu_ptr = tb->gpu_data_ptr();
+                        if (!gpu_ptr)
+                            return;
+                        hipPointerAttribute_t attr{};
+                        hipError_t err = hipPointerGetAttributes(&attr, gpu_ptr);
+                        if (err == hipSuccess && attr.device != device_ordinal)
+                        {
+                            LOG_ERROR("[GPU_PTR_CHECK] WRONG DEVICE! stage='" << name
+                                                                              << "' " << category << " tensor='" << (tname ? tname : "?")
+                                                                              << "' gpu_ptr=" << gpu_ptr
+                                                                              << " is on device " << attr.device
+                                                                              << " but expected device " << device_ordinal);
+                        }
+                    };
+                    for (const auto &inp : dump_info.inputs)
+                        check_ptr("input", inp.name, inp.tensor);
+                    for (const auto &out : dump_info.outputs)
+                        check_ptr("output", out.name, out.tensor);
+                    for (const auto &w : dump_info.weights)
+                        check_ptr("weight", w.name, const_cast<ITensor *>(w.tensor));
+                }
+            }
+#endif
+
             if (!executeNode(*node, ctx))
             {
                 LOG_ERROR("[DeviceGraphExecutor] Stage failed: " << name);
                 return false;
             }
+
+            // Post-stage device sync for multi-GPU
+#ifdef HAVE_ROCM
+            if (multi_gpu_sync && ctx->deviceId().is_rocm())
+            {
+                hipError_t sync_err = hipDeviceSynchronize();
+                if (sync_err != hipSuccess)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] POST-STAGE hipDeviceSynchronize FAILED for stage '"
+                              << name << "' on device " << device_ordinal
+                              << ": " << hipGetErrorString(sync_err)
+                              << " (error " << sync_err << ")"
+                              << " — this stage's async kernel FAULTED!");
+                }
+            }
+#endif
 
             auto stage_end = std::chrono::high_resolution_clock::now();
             double stage_ms = std::chrono::duration<double, std::milli>(stage_end - stage_start).count();
@@ -631,13 +719,40 @@ namespace llaminar2
     }
 
     bool DeviceGraphExecutor::executeFastDecode(ComputeGraph &graph, IDeviceContext *ctx,
-                                          const std::unordered_set<std::string> *collective_nodes)
+                                                const std::unordered_set<std::string> *collective_nodes)
     {
         // Set HIP device once for the entire decode pass — eliminates 339+ redundant hipSetDevice calls
         DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(ctx);
 
         const auto &order = graph.getExecutionOrder();
         const bool profile_full_node_path = config_.enable_profiling;
+
+        // Multi-GPU stage sync (same rationale as executeSequential)
+        const bool multi_gpu_sync = collective_ctx_ && ctx->isGPU();
+        [[maybe_unused]] const int device_ordinal = ctx->isGPU() ? ctx->deviceId().toKernelDeviceIndex() : -1;
+        [[maybe_unused]] const bool is_rocm = ctx->deviceId().is_rocm();
+
+        // Helper lambdas for pre/post stage sync
+#ifdef HAVE_ROCM
+        auto pre_stage_sync = [&]()
+        {
+            if (multi_gpu_sync && is_rocm)
+            {
+                HipDeviceGuard::forceSetDevice(device_ordinal);
+                hipDeviceSynchronize();
+            }
+        };
+        auto post_stage_sync = [&]()
+        {
+            if (multi_gpu_sync && is_rocm)
+            {
+                hipDeviceSynchronize();
+            }
+        };
+#else
+        auto pre_stage_sync = []() {};
+        auto post_stage_sync = []() {};
+#endif
 
         bool collective_graph = (collective_nodes && !collective_nodes->empty());
         if (!collective_graph)
@@ -683,11 +798,13 @@ namespace llaminar2
             // Fast-path bypass remains unchanged when profiling is disabled.
             if (profile_full_node_path)
             {
+                pre_stage_sync();
                 if (!executeNode(*node, ctx))
                 {
                     LOG_ERROR("[DeviceGraphExecutor] Fast decode profiled node failed: " << name);
                     return false;
                 }
+                post_stage_sync();
                 graph.markCompleted(name);
                 continue;
             }
@@ -697,32 +814,39 @@ namespace llaminar2
             {
                 if (collective_ctx_ && stage_type == ComputeStageType::ALLREDUCE)
                 {
+                    pre_stage_sync();
                     if (!executeCollectiveAllreduce(*node, ctx))
                     {
                         LOG_ERROR("[DeviceGraphExecutor] Fast decode collective ALLREDUCE failed: " << name);
                         return false;
                     }
+                    post_stage_sync();
                     graph.markCompleted(name);
                     continue;
                 }
 
                 if (collective_ctx_ && stage_type == ComputeStageType::ALLGATHER)
                 {
+                    pre_stage_sync();
                     if (executeCollectiveStridedAllgather(*node, ctx))
                     {
+                        post_stage_sync();
                         graph.markCompleted(name);
                         continue;
                     }
+                    post_stage_sync();
                 }
 
                 // Collective-aware safe fallback:
                 // Route collective stages through executeNode() so they use the normal
                 // coherence/intercept path instead of raw stage->execute().
+                pre_stage_sync();
                 if (!executeNode(*node, ctx))
                 {
                     LOG_ERROR("[DeviceGraphExecutor] Fast decode collective stage fallback failed: " << name);
                     return false;
                 }
+                post_stage_sync();
                 graph.markCompleted(name);
                 continue;
             }
@@ -732,21 +856,25 @@ namespace llaminar2
                 // Collective graph safety mode:
                 // keep fast topological traversal, but execute nodes through the
                 // normal node path to preserve coherence/intercept semantics.
+                pre_stage_sync();
                 if (!executeNode(*node, ctx))
                 {
                     LOG_ERROR("[DeviceGraphExecutor] Fast decode collective-graph node failed: " << name);
                     return false;
                 }
+                post_stage_sync();
                 graph.markCompleted(name);
                 continue;
             }
 
             // Non-collective graph: maximal fast path
+            pre_stage_sync();
             if (!node->stage->execute(ctx))
             {
                 LOG_ERROR("[DeviceGraphExecutor] Fast decode stage failed: " << name);
                 return false;
             }
+            post_stage_sync();
 
             graph.markCompleted(name);
         }
@@ -755,9 +883,9 @@ namespace llaminar2
     }
 
     bool DeviceGraphExecutor::executeWithGraphCapture(ComputeGraph &graph, IDeviceContext *ctx,
-                                                IGPUGraphCapture *capture,
-                                                const std::unordered_set<std::string> *collective_nodes,
-                                                void *gpu_stream)
+                                                      IGPUGraphCapture *capture,
+                                                      const std::unordered_set<std::string> *collective_nodes,
+                                                      void *gpu_stream)
     {
         if (!capture)
         {
@@ -815,7 +943,7 @@ namespace llaminar2
         if (!exec_success || !capture->endCapture())
         {
             LOG_WARN("[DeviceGraphExecutor] GPU graph capture failed (exec_success=" << exec_success
-                                                                               << "), stream may be in bad state");
+                                                                                     << "), stream may be in bad state");
             // If capture was started but execute failed, we still need to end capture
             // to restore the stream to a usable state
             if (exec_success)
@@ -839,7 +967,7 @@ namespace llaminar2
 
         // Step 4: Instantiate or update + launch
         LOG_WARN("[DeviceGraphExecutor] GPU graph captured " << capture->nodeCount()
-                                                       << " nodes, hasExecutable=" << capture->hasExecutable());
+                                                             << " nodes, hasExecutable=" << capture->hasExecutable());
         if (capture->hasExecutable())
         {
             // Try in-place update
@@ -885,7 +1013,7 @@ namespace llaminar2
                 return false;
             }
             LOG_WARN("[DeviceGraphExecutor] GPU graph instantiated with " << capture->nodeCount()
-                                                                    << " nodes (" << capture->backendName() << ")");
+                                                                          << " nodes (" << capture->backendName() << ")");
         }
 
         // Launch the (newly instantiated) executable
@@ -953,10 +1081,10 @@ namespace llaminar2
     }
 
     bool DeviceGraphExecutor::executeWithSegmentedGraphCapture(ComputeGraph &graph, IDeviceContext *ctx,
-                                                         GraphSegmentCache &segment_cache,
-                                                         void *gpu_stream,
-                                                         IWorkerGPUContext *gpu_ctx,
-                                                         const std::unordered_set<std::string> *collective_nodes)
+                                                               GraphSegmentCache &segment_cache,
+                                                               void *gpu_stream,
+                                                               IWorkerGPUContext *gpu_ctx,
+                                                               const std::unordered_set<std::string> *collective_nodes)
     {
         if (!gpu_stream || !gpu_ctx)
         {
@@ -1413,7 +1541,7 @@ namespace llaminar2
             DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
 
             LOG_DEBUG("[DeviceGraphExecutor] Stage '" << node.name << "' coherencePolicy=" << toString(policy)
-                                                << " target_device=" << target_device.to_string());
+                                                      << " target_device=" << target_device.to_string());
 
             if (policy == CoherencePolicy::INPUT || policy == CoherencePolicy::FULL)
             {
@@ -1547,6 +1675,7 @@ namespace llaminar2
 
         if (profiling)
             phase_start = std::chrono::high_resolution_clock::now();
+
         bool success = node.stage->execute(ctx);
         if (profiling)
         {
@@ -1665,18 +1794,18 @@ namespace llaminar2
                           output_alloc_ms > 0.5 || execute_ms > 0.5 || verify_ms > 0.5 || callback_ms > 0.5))
         {
             LOG_TRACE("[DeviceGraphExecutor::PHASES] " << node.name
-                                                 << " input_cohere=" << input_cohere_ms << "ms"
-                                                 << " weight_cohere=" << weight_cohere_ms << "ms"
-                                                 << " output_alloc=" << output_alloc_ms << "ms"
-                                                 << " dump_input=" << dump_input_ms << "ms"
-                                                 << " execute=" << execute_ms << "ms"
-                                                 << " mark_dirty=" << mark_dirty_ms << "ms"
-                                                 << " dump_out=" << dump_output_ms << "ms"
-                                                 << " verify=" << verify_ms << "ms"
-                                                 << " callback=" << callback_ms << "ms"
-                                                 << " get_dump_info=" << get_dump_info_ms << "ms"
-                                                 << " extract_buffers=" << extract_buffers_ms << "ms"
-                                                 << " total=" << total_ms << "ms");
+                                                       << " input_cohere=" << input_cohere_ms << "ms"
+                                                       << " weight_cohere=" << weight_cohere_ms << "ms"
+                                                       << " output_alloc=" << output_alloc_ms << "ms"
+                                                       << " dump_input=" << dump_input_ms << "ms"
+                                                       << " execute=" << execute_ms << "ms"
+                                                       << " mark_dirty=" << mark_dirty_ms << "ms"
+                                                       << " dump_out=" << dump_output_ms << "ms"
+                                                       << " verify=" << verify_ms << "ms"
+                                                       << " callback=" << callback_ms << "ms"
+                                                       << " get_dump_info=" << get_dump_info_ms << "ms"
+                                                       << " extract_buffers=" << extract_buffers_ms << "ms"
+                                                       << " total=" << total_ms << "ms");
         }
 
         if (config_.enable_profiling)
@@ -1979,7 +2108,7 @@ namespace llaminar2
                                         if (result.appears_zero && numel > 10)
                                         {
                                             LOG_WARN("[DeviceGraphExecutor] Stage '" << node.name << "' output '" << output.name
-                                                                               << "' appears to be all zeros (GPU validation)");
+                                                                                     << "' appears to be all zeros (GPU validation)");
                                             if (validation.fail_on_zero)
                                             {
                                                 LOG_ERROR("[DeviceGraphExecutor] Buffer validation failed: zero tensor detected");
@@ -1990,8 +2119,8 @@ namespace llaminar2
                                         if (result.has_nan || result.has_inf)
                                         {
                                             LOG_WARN("[DeviceGraphExecutor] Stage '" << node.name << "' output '" << output.name
-                                                                               << "' contains " << result.nan_count << " NaN, "
-                                                                               << result.inf_count << " Inf values (GPU validation)");
+                                                                                     << "' contains " << result.nan_count << " NaN, "
+                                                                                     << result.inf_count << " Inf values (GPU validation)");
                                             if (validation.fail_on_nan)
                                             {
                                                 LOG_ERROR("[DeviceGraphExecutor] Buffer validation failed: NaN/Inf detected");
@@ -2052,7 +2181,7 @@ namespace llaminar2
                 if (appears_zero)
                 {
                     LOG_WARN("[DeviceGraphExecutor] Stage '" << node.name << "' output '" << output.name
-                                                       << "' appears to be all zeros (likely uninitialized)");
+                                                             << "' appears to be all zeros (likely uninitialized)");
 
                     if (validation.fail_on_zero)
                     {
@@ -2074,7 +2203,7 @@ namespace llaminar2
                 if (has_nan_inf)
                 {
                     LOG_WARN("[DeviceGraphExecutor] Stage '" << node.name << "' output '" << output.name
-                                                       << "' contains NaN or Inf values");
+                                                             << "' contains NaN or Inf values");
 
                     if (validation.fail_on_nan)
                     {
@@ -2111,8 +2240,8 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[DeviceGraphExecutor] Allocated " << buffer_manager_->bufferCount()
-                                               << " buffers (" << (buffer_manager_->totalAllocatedBytes() / 1024.0 / 1024.0)
-                                               << " MB)");
+                                                     << " buffers (" << (buffer_manager_->totalAllocatedBytes() / 1024.0 / 1024.0)
+                                                     << " MB)");
 
         // Execute the graph with normal execution path
         bool success = execute(graph, ctx);

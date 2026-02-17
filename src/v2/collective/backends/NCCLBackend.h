@@ -221,6 +221,12 @@ namespace llaminar2
             CollectiveDataType dtype,
             CollectiveOp op) override;
 
+        bool allreduceMultiAndSynchronize(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op) override;
+
         /// Multi-GPU AllGather (each GPU sends from send_bufs, receives to recv_bufs)
         bool allgatherMulti(
             const std::vector<const void *> &send_bufs,

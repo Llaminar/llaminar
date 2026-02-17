@@ -29,7 +29,7 @@ namespace llaminar2
     // =========================================================================
 
     DeviceGraphBufferManager::DeviceGraphBufferManager(TensorFactory *factory, const MPIContext *mpi_ctx,
-                                           const GraphBufferManagerConfig &config)
+                                                       const GraphBufferManagerConfig &config)
         : factory_(factory), mpi_ctx_(mpi_ctx), config_(config)
     {
         if (!factory_)
@@ -113,8 +113,8 @@ namespace llaminar2
             if (!desc.device.is_rocm())
             {
                 LOG_TRACE("[DeviceGraphBufferManager] Buffer '" << desc.name
-                                                          << "' requires BAR but device is not ROCm ("
-                                                          << desc.device.toString() << ")");
+                                                                << "' requires BAR but device is not ROCm ("
+                                                                << desc.device.toString() << ")");
                 return false;
             }
 
@@ -133,8 +133,8 @@ namespace llaminar2
             // No collective context yet, but config indicates we need BAR allocation
             // This can happen if collective context is set after buffer allocation
             LOG_TRACE("[DeviceGraphBufferManager] Buffer '" << desc.name
-                                                      << "' identified as needing BAR by Qwen2BufferSpec, "
-                                                      << "but no CollectiveContext with BAR backend available yet");
+                                                            << "' identified as needing BAR by Qwen2BufferSpec, "
+                                                            << "but no CollectiveContext with BAR backend available yet");
         }
 
         return false;
@@ -192,9 +192,9 @@ namespace llaminar2
         }
 
         LOG_DEBUG("DeviceGraphBufferManager: Allocated BAR buffer '" << node_name << "." << desc.name
-                                                               << "' for collective '" << desc.collective_id
-                                                               << "' at offset " << offset
-                                                               << " (" << size_bytes << " bytes)");
+                                                                     << "' for collective '" << desc.collective_id
+                                                                     << "' at offset " << offset
+                                                                     << " (" << size_bytes << " bytes)");
 
         // Create a tensor wrapping the external BAR memory
         // Note: For now, we use the standard factory and rely on the caller
@@ -297,8 +297,8 @@ namespace llaminar2
         }
 
         LOG_DEBUG("DeviceGraphBufferManager: Allocated " << buffers_.size() << " buffers from "
-                                                   << stages_with_requirements << " stages ("
-                                                   << total_requirements << " requirements total)");
+                                                         << stages_with_requirements << " stages ("
+                                                         << total_requirements << " requirements total)");
         LOG_DEBUG("DeviceGraphBufferManager: Total allocated: " << (stats_.total_bytes / 1024.0 / 1024.0) << " MB");
 
         // Allocate GPU workspace for stages that need it (IWorkspaceConsumer implementations)
@@ -323,7 +323,7 @@ namespace llaminar2
         if (buffers_.find(key) != buffers_.end())
         {
             LOG_WARN("DeviceGraphBufferManager: Buffer '" << desc.name << "' already allocated for node '"
-                                                    << node_name << "', skipping");
+                                                          << node_name << "', skipping");
             return true; // Not a failure, just skip
         }
 
@@ -337,7 +337,7 @@ namespace llaminar2
             {
                 // BAR allocation failed - fall back to standard allocation
                 LOG_WARN("DeviceGraphBufferManager: BAR allocation failed for '" << desc.name
-                                                                           << "', falling back to standard allocation");
+                                                                                 << "', falling back to standard allocation");
                 tensor = createTensorFromDescriptor(desc);
             }
         }
@@ -363,9 +363,9 @@ namespace llaminar2
         buffers_[key] = std::move(tensor);
 
         LOG_TRACE("DeviceGraphBufferManager: Allocated " << bufferRoleName(desc.role) << " buffer '"
-                                                   << node_name << "." << desc.name << "' ("
-                                                   << allocated_bytes << " bytes)"
-                                                   << (desc.isCollectiveBuffer() ? " [COLLECTIVE]" : ""));
+                                                         << node_name << "." << desc.name << "' ("
+                                                         << allocated_bytes << " bytes)"
+                                                         << (desc.isCollectiveBuffer() ? " [COLLECTIVE]" : ""));
 
         return true;
     }
@@ -373,7 +373,7 @@ namespace llaminar2
     void DeviceGraphBufferManager::releaseAll()
     {
         LOG_DEBUG("DeviceGraphBufferManager: Releasing " << buffers_.size() << " buffers ("
-                                                   << (stats_.total_bytes / 1024.0 / 1024.0) << " MB)");
+                                                         << (stats_.total_bytes / 1024.0 / 1024.0) << " MB)");
 
         releaseDeviceWorkspace();
         buffers_.clear();
@@ -468,7 +468,7 @@ namespace llaminar2
         }
 
         LOG_DEBUG("DeviceGraphBufferManager: Allocated " << buffers_.size() << " individual buffers + "
-                                                   << aliased_buffers_.size() << " aliased groups");
+                                                         << aliased_buffers_.size() << " aliased groups");
 
         return true;
     }
@@ -554,7 +554,7 @@ namespace llaminar2
                     descriptors_[key] = desc;
 
                     LOG_TRACE("DeviceGraphBufferManager: Buffer '" << key.node_name << "." << short_name
-                                                             << "' -> aliased group " << group_idx);
+                                                                   << "' -> aliased group " << group_idx);
                 }
             }
         }
@@ -619,8 +619,8 @@ namespace llaminar2
     // =========================================================================
 
     bool DeviceGraphBufferManager::bindBuffer(const std::string &node_name,
-                                        const std::string &buffer_name,
-                                        TensorBase **target_ptr)
+                                              const std::string &buffer_name,
+                                              TensorBase **target_ptr)
     {
         if (!target_ptr)
         {
@@ -791,8 +791,8 @@ namespace llaminar2
             // These quantized types need raw data to create
             // For SCRATCH/OUTPUT buffers, we typically use FP32 or Q8_1
             LOG_WARN("DeviceGraphBufferManager: Quantized type " << bufferTensorTypeName(desc.tensor_type)
-                                                           << " not directly creatable without raw data, "
-                                                           << "falling back to FP32 for buffer '" << desc.name << "'");
+                                                                 << " not directly creatable without raw data, "
+                                                                 << "falling back to FP32 for buffer '" << desc.name << "'");
             return factory_->createFP32(shape, device);
 
         case BufferTensorType::UNKNOWN:
@@ -855,7 +855,7 @@ namespace llaminar2
     }
 
     size_t DeviceGraphBufferManager::computeWorkspaceBudget(DeviceId device,
-                                                      const WorkspaceBudgetConfig &config)
+                                                            const WorkspaceBudgetConfig &config)
     {
         size_t available = queryAvailableMemory(device);
         if (available == 0)
@@ -883,9 +883,9 @@ namespace llaminar2
         budget = std::min(budget, config.max_budget);
 
         LOG_INFO("[DeviceGraphBufferManager] " << device.toString()
-                                         << " available=" << (available / (1024 * 1024)) << "MB"
-                                         << ", budget=" << (budget / (1024 * 1024)) << "MB"
-                                         << " (fraction=" << fraction << ", headroom=" << (config.headroom / (1024 * 1024)) << "MB)");
+                                               << " available=" << (available / (1024 * 1024)) << "MB"
+                                               << ", budget=" << (budget / (1024 * 1024)) << "MB"
+                                               << " (fraction=" << fraction << ", headroom=" << (config.headroom / (1024 * 1024)) << "MB)");
 
         return budget;
     }
@@ -925,7 +925,7 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[DeviceGraphBufferManager] Found " << device_consumers.size()
-                                                << " devices with workspace consumers");
+                                                      << " devices with workspace consumers");
 
         // Step 2: For each device, allocate workspace and bind to consumers
         for (const auto &[device, consumers] : device_consumers)
@@ -942,7 +942,7 @@ namespace llaminar2
             if (budget == 0)
             {
                 LOG_WARN("[DeviceGraphBufferManager] Zero budget for " << device.toString()
-                                                                 << ", skipping workspace allocation");
+                                                                       << ", skipping workspace allocation");
                 continue;
             }
 
@@ -966,9 +966,9 @@ namespace llaminar2
             }
 
             LOG_DEBUG("[DeviceGraphBufferManager] Device " << device.toString()
-                                                     << ": " << consumers.size() << " consumers, "
-                                                     << combined.buffers.size() << " buffers, "
-                                                     << combined.total_bytes_with_alignment() << " bytes needed");
+                                                           << ": " << consumers.size() << " consumers, "
+                                                           << combined.buffers.size() << " buffers, "
+                                                           << combined.total_bytes_with_alignment() << " bytes needed");
 
             // Create manager and allocate
             auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
@@ -988,8 +988,8 @@ namespace llaminar2
             }
 
             LOG_INFO("[DeviceGraphBufferManager] Allocated " << (manager->used() / (1024 * 1024))
-                                                       << "MB workspace on " << device.toString()
-                                                       << " (" << manager->bufferCount() << " buffers)");
+                                                             << "MB workspace on " << device.toString()
+                                                             << " (" << manager->bufferCount() << " buffers)");
 
             // Store the manager and budget
             device_workspace_budgets_[device] = budget;
@@ -1074,7 +1074,7 @@ namespace llaminar2
             else if (is_embedding)
             {
                 binding.m = std::max(1, hints.max_seq_len);
-                binding.n = 0;
+                binding.n = std::max(1, hints.vocab_size);
                 binding.k = std::max(0, hints.d_model);
             }
             else
@@ -1164,8 +1164,8 @@ namespace llaminar2
             }
 
             LOG_INFO("[DeviceGraphBufferManager] Allocated " << (manager->used() / (1024 * 1024))
-                                                       << "MB workspace on " << device.toString()
-                                                       << " (" << manager->bufferCount() << " buffers, model-aware budget)");
+                                                             << "MB workspace on " << device.toString()
+                                                             << " (" << manager->bufferCount() << " buffers, model-aware budget)");
 
             device_workspace_budgets_[device] = budget;
             device_workspaces_[device] = std::move(manager);
@@ -1179,7 +1179,7 @@ namespace llaminar2
         if (!device_workspaces_.empty())
         {
             LOG_DEBUG("[DeviceGraphBufferManager] Releasing " << device_workspaces_.size()
-                                                        << " GPU workspace managers");
+                                                              << " GPU workspace managers");
         }
 
         // Clear all workspace managers (destructors release memory)

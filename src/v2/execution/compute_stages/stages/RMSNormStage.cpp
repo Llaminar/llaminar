@@ -71,7 +71,8 @@ namespace llaminar2
                                                      << " device=" << static_cast<int>(dev_type));
 
         // DEBUG: Log input for parity debugging (guard expensive fp32_data() call)
-        if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
+        // Skip on GPU to avoid D2H transfers in multi-device execution
+        if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG) && !params_.device_id.is_gpu())
         {
             const float *in_data = params_.input->fp32_data();
             if (in_data)
@@ -108,7 +109,8 @@ namespace llaminar2
             params_.device_id.toKernelDeviceIndex());
 
         // DEBUG: Log RMSNorm output for parity debugging (guard expensive fp32_data() call)
-        if (success && Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
+        // Skip on GPU to avoid D2H transfers in multi-device execution
+        if (success && Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG) && !params_.device_id.is_gpu())
         {
             // Get output from host after GPU kernel (if GPU, needs sync)
             const float *out_data = params_.output->fp32_data();

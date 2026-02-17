@@ -225,7 +225,8 @@ namespace llaminar2
         }
 
         // DEBUG: Log embedding output for parity debugging (guard expensive fp32_data() call)
-        if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
+        // Skip on GPU to avoid D2H transfers in multi-device execution
+        if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG) && !params_.device_id.is_gpu())
         {
             const float *out_data = params_.output->fp32_data();
             if (out_data && params_.num_tokens > 0)

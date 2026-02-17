@@ -268,6 +268,18 @@ namespace llaminar2
         LOG_TRACE("[ROCmBackend::allocate] ALLOC ptr=" << ptr << " bytes=" << bytes
                                                        << " device_id=" << device_id << " (ROCm ordinal)");
 
+        // DIAGNOSTIC: Verify allocation ended up on the correct device
+        {
+            hipPointerAttribute_t attr = {};
+            hipError_t attr_err = hipPointerGetAttributes(&attr, ptr);
+            if (attr_err == hipSuccess && attr.device != device_id)
+            {
+                LOG_ERROR("[ROCmBackend::allocate] WRONG DEVICE! Requested device_id=" << device_id
+                                                                                       << " but hipPointerGetAttributes says device=" << attr.device
+                                                                                       << " ptr=" << ptr << " bytes=" << bytes);
+            }
+        }
+
         return ptr;
     }
 

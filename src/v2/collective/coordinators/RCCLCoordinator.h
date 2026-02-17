@@ -134,6 +134,15 @@ namespace llaminar2
                             CollectiveDataType dtype, CollectiveOp op);
 
         /**
+         * @brief In-place allreduce across all local GPUs and wait for completion
+         *
+         * Executes launch + completion wait as one coordinator-queue operation
+         * to prevent interleaving between submit calls.
+         */
+        bool allreduceMultiAndSynchronize(const std::vector<void *> &buffers, size_t count,
+                                          CollectiveDataType dtype, CollectiveOp op);
+
+        /**
          * @brief Allgather across all local GPUs
          *
          * Each device contributes send_count elements, receives
@@ -286,6 +295,7 @@ namespace llaminar2
         // Internal collective implementations (called ON coordinator thread)
         bool doAllreduceMulti(const std::vector<void *> &buffers, size_t count,
                               int dtype_int, int op_int);
+        bool doSynchronizeAll();
         bool doAllgatherMulti(const std::vector<const void *> &send_buffers,
                               const std::vector<void *> &recv_buffers,
                               size_t send_count, int dtype_int);

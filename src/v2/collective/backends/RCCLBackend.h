@@ -227,6 +227,12 @@ namespace llaminar2
             CollectiveDataType dtype,
             CollectiveOp op) override;
 
+        bool allreduceMultiAndSynchronize(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op) override;
+
         bool allgatherMulti(
             const std::vector<const void *> &send_bufs,
             const std::vector<void *> &recv_bufs,
