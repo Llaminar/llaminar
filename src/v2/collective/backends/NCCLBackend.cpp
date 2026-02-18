@@ -239,6 +239,19 @@ namespace llaminar2
             return false;
         }
 
+        int cuda_device_count = 0;
+        if (!nccl_backend_detail::cudaGetDeviceCountWrapper(&cuda_device_count))
+        {
+            last_error_ = "NCCLBackend readiness probe failed: cudaGetDeviceCount";
+            LOG_ERROR("[NCCLReady] status=not_ready reason=cuda_get_device_count_failed");
+            return false;
+        }
+
+        LOG_INFO("[NCCLReady] status=probing"
+                 << " requested_group_size=" << group.size()
+                 << " local_rank=" << group.local_rank
+                 << " visible_cuda_devices=" << cuda_device_count);
+
         // Set the CUDA device for this rank BEFORE creating stream/communicator
         DeviceId local_device = group.localDevice();
         CUDA_WRAPPER_CHECK(nccl_backend_detail::cudaSetDeviceOrdinal(local_device.ordinal), "cudaSetDevice");
@@ -349,6 +362,8 @@ namespace llaminar2
             {
                 last_error_ = "NCCLCoordinator initialization failed: " + coordinator_->lastError();
                 LOG_ERROR(last_error_);
+                LOG_ERROR("[NCCLReady] status=not_ready reason=coordinator_init_failed error='"
+                          << coordinator_->lastError() << "'");
                 coordinator_.reset();
                 nccl_backend_detail::cudaDestroyStream(stream_);
                 stream_ = nullptr;
@@ -368,6 +383,10 @@ namespace llaminar2
         }
 
         initialized_ = true;
+        LOG_INFO("[NCCLReady] status=ready"
+             << " mode=" << (is_multi_gpu_single_process_ ? "multi_gpu_single_process" : (is_multi_process ? "multi_process" : "single_gpu"))
+             << " num_ranks=" << num_ranks_
+             << " local_rank=" << local_rank_);
         return true;
 #else
         last_error_ = "NCCL not available (HAVE_NCCL not defined)";

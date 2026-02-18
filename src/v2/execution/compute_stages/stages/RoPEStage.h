@@ -95,8 +95,9 @@ namespace llaminar2
     private:
         Params params_;
 
-        // Cached RoPE kernel for workspace binding
-        mutable std::unique_ptr<ITensorRoPE> cached_kernel_;
+        // Device-scoped cached RoPE kernel (owned by KernelFactory)
+        mutable ITensorRoPE *cached_kernel_ = nullptr;
+        mutable int cached_kernel_tensor_type_ = -1;
 
         // Mutable cache for getDumpInfo() to store transposed Q16 output
         // HybridQ16 RoPE outputs HEAD_MAJOR layout, but snapshot comparison expects SEQ_MAJOR

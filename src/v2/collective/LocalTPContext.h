@@ -47,7 +47,7 @@ namespace llaminar2
             std::vector<float> weights,
             CollectiveBackendType backend);
 
-        ~LocalTPContext() override = default;
+        ~LocalTPContext() override;
 
         // Disable copy (has mutex)
         LocalTPContext(const LocalTPContext &) = delete;
@@ -275,6 +275,16 @@ namespace llaminar2
         std::atomic<bool> first_barrier_completed_{false};
 
         // =====================================================================
+        // NCCL Telemetry
+        // =====================================================================
+        std::atomic<uint64_t> nccl_allreduce_attempts_{0};
+        std::atomic<uint64_t> nccl_allreduce_success_{0};
+        std::atomic<uint64_t> nccl_allreduce_failures_{0};
+        std::atomic<bool> logged_real_path_marker_{false};
+        std::atomic<bool> logged_graph_policy_reject_marker_{false};
+        std::atomic<bool> logged_graph_policy_allow_marker_{false};
+
+        // =====================================================================
         // BAR-Backed Tensor Registry
         // =====================================================================
         // For zero-copy allreduce, we need to know which stage outputs are
@@ -380,6 +390,20 @@ namespace llaminar2
         bool allreduceWithBarrierMultiGpu(TensorBase *tensor, const std::string &stage_name = "", size_t count = 0);
 
         /**
+         * @brief Validate barrier-collected tensors before multi-GPU allreduce launch.
+         *
+         * This method enforces correctness invariants that protect against subtle
+         * LOCAL TP bugs (wrong device mapping, dtype mismatch, invalid element count).
+         *
+         * @param effective_count Number of elements that will be reduced.
+         * @param expected_dtype DType inferred from slot-0 tensor.
+         * @return true when all invariants are satisfied and launch is safe.
+         */
+        bool validateBarrierTensorSetForMultiGpuAllreduce(
+            size_t effective_count,
+            CollectiveDataType expected_dtype) const;
+
+        /**
          * @brief Execute the actual PCIeBAR allreduce operation
          *
          * Called by the last arrival in allreduceWithBarrier(). All other
@@ -427,6 +451,18 @@ namespace llaminar2
          * @brief Build device-to-index lookup map
          */
         void buildDeviceIndex();
+
+        /**
+         * @brief Return true when the current GPU graph configuration supports
+         *        LocalTP NCCL collectives.
+         *
+         * - If GPU graphs are OFF, LocalTP NCCL is supported.
+         * - If GPU graphs are ON, segmented collective mode must also be ON.
+         *
+         * @param reason_out Optional pointer receiving human-readable reason.
+         * @return true when policy permits LocalTP NCCL collective execution.
+         */
+        bool isLocalTPNCCLGraphPolicySupported(std::string *reason_out = nullptr) const;
     };
 
 } // namespace llaminar2

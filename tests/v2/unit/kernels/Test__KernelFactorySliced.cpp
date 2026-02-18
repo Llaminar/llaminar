@@ -110,6 +110,12 @@ protected:
     }
 };
 
+static ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device = DeviceId::cpu())
+{
+    auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, device);
+    return KernelFactory::getOrCreateGemmEngine(prepared);
+}
+
 // =============================================================================
 // Basic Sliced Kernel Creation
 // =============================================================================
@@ -183,7 +189,7 @@ TEST_F(KernelFactorySlicedTest, FullKernelDifferentFromSliced)
     ASSERT_NE(weights, nullptr);
 
     // Get full kernel
-    auto *full = KernelFactory::getOrCreateGemm(weights.get());
+    auto *full = getPreparedKernel(weights.get());
 
     // Get sliced kernel covering full range
     auto *sliced = KernelFactory::getOrCreateGemmSliced(weights.get(), 0, 1024);
@@ -282,7 +288,7 @@ TEST_F(KernelFactorySlicedTest, SlicedGemmProducesCorrectOutput)
     auto output_sliced2 = createFP32(M, N / 2, 0.0f);
 
     // Compute full GEMM
-    auto *full_kernel = KernelFactory::getOrCreateGemm(weights.get());
+    auto *full_kernel = getPreparedKernel(weights.get());
     ASSERT_NE(full_kernel, nullptr);
     bool ok = full_kernel->multiply(
         input->data(),

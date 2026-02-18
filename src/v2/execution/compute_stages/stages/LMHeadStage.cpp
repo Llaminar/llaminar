@@ -4,7 +4,6 @@
  */
 
 #include "LMHeadStage.h"
-#include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../tensors/Tensors.h"
@@ -32,9 +31,12 @@ namespace llaminar2
                                                     << " vocab_size=" << params_.vocab_size);
 
         // Validate inputs
-        if (!params_.hidden_states || !params_.lm_head_weight || !params_.logits)
+        if (!ensureRequiredPointers("LMHeadStage", {
+                                                   {"hidden_states", params_.hidden_states},
+                                                   {"lm_head_weight", params_.lm_head_weight},
+                                                   {"logits", params_.logits},
+                                               }))
         {
-            LOG_ERROR("[LMHeadStage] Null tensor pointers");
             return false;
         }
 
@@ -45,9 +47,9 @@ namespace llaminar2
         }
 
         // Cast ITensor* to TensorBase* (works for both CPU and GPU tensor types)
-        auto *hidden_states = requireTensorBase(params_.hidden_states, "hidden_states");
-        auto *lm_head_weight = requireTensorBase(params_.lm_head_weight, "lm_head_weight");
-        auto *logits = requireTensorBase(params_.logits, "logits");
+        auto *hidden_states = requireTensorBasePtr(params_.hidden_states, "hidden_states");
+        auto *lm_head_weight = requireTensorBasePtr(params_.lm_head_weight, "lm_head_weight");
+        auto *logits = requireTensorBasePtr(params_.logits, "logits");
         if (!hidden_states || !lm_head_weight || !logits)
         {
             LOG_ERROR("[LMHeadStage] Failed to cast tensors to TensorBase");
@@ -62,14 +64,15 @@ namespace llaminar2
                                                                     << ", rocm_ordinal=" << (params_.device_id.is_rocm() ? params_.device_id.rocm_ordinal() : -1) << ")"
                                                                     << " lm_head_weight=" << (void *)lm_head_weight
                                                                     << " shape=" << lm_head_weight->shape()[0] << "x" << lm_head_weight->shape()[1]);
-        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(lm_head_weight, params_.device_id);
+        auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(lm_head_weight, params_.device_id);
+        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
         LOG_DEBUG("[LMHeadStage] Got kernel=" << (void *)lm_gemm);
         if (!lm_gemm)
         {
             LOG_ERROR("[LMHeadStage] Failed to get/create LM head GEMM kernel");
             return false;
         }
-        lm_gemm->setGPUStream(gpuStream());
+        bindStageStream(lm_gemm);
 
         // LM head: logits = hidden @ lm_head^T + bias
         // hidden: [seq_len, d_model], lm_head: [vocab_size, d_model]
@@ -201,14 +204,15 @@ namespace llaminar2
         // The kernel needs workspace for its ACC_INT32 accumulator buffer
         // (vocab_size × M × sizeof(int32_t) can be large, but DeviceGraphOrchestrator
         // now dynamically sizes the budget based on max_seq_len × vocab_size)
-        auto *lm_head_weight = requireTensorBase(params_.lm_head_weight, "lm_head_weight");
+        auto *lm_head_weight = requireTensorBasePtr(params_.lm_head_weight, "lm_head_weight");
         if (!lm_head_weight)
         {
             LOG_DEBUG("[LMHeadStage::getKernelAsWorkspaceConsumer] No weight tensor available");
             return nullptr;
         }
 
-        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(lm_head_weight, params_.device_id);
+        auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(lm_head_weight, params_.device_id);
+        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
         if (!lm_gemm)
         {
             LOG_DEBUG("[LMHeadStage::getKernelAsWorkspaceConsumer] No GEMM kernel available");

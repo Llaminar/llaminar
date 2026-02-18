@@ -362,7 +362,8 @@ namespace llaminar2
          *
          * IMPORTANT: When inner tensor's raw data has been released (after first
          * GEMM packing), we can't re-pack. In that case, we throw an error.
-         * Callers should use KernelFactory::getOrCreateGemm() to get the cached kernel.
+         * Callers should use KernelFactory::getOrCreatePreparedGemmWeights()
+         * and KernelFactory::getOrCreateGemmEngine() to get the cached kernel.
          */
         std::unique_ptr<ITensorGemm> createGemm() override
         {
@@ -373,8 +374,8 @@ namespace llaminar2
                 if (inner()->is_raw_data_released())
                 {
                     LOG_ERROR("TensorSlice: Cannot create row-sliced kernel - inner tensor's raw data was released. "
-                              "Use KernelFactory::getOrCreateGemm() instead of createGemm().");
-                    throw std::runtime_error("Cannot create GEMM kernel: raw weight data was released. Use KernelFactory::getOrCreateGemm().");
+                              "Use KernelFactory::getOrCreatePreparedGemmWeights() + getOrCreateGemmEngine() instead of createGemm().");
+                    throw std::runtime_error("Cannot create GEMM kernel: raw weight data was released. Use KernelFactory::getOrCreatePreparedGemmWeights() and getOrCreateGemmEngine().");
                 }
                 LOG_DEBUG("TensorSlice: Creating row-sliced kernel ["
                           << metadata_.slice_start << ", " << metadata_.slice_end
@@ -392,8 +393,8 @@ namespace llaminar2
                 if (inner()->is_raw_data_released())
                 {
                     LOG_ERROR("TensorSlice: Cannot create kernel - inner tensor's raw data was released. "
-                              "Use KernelFactory::getOrCreateGemm() instead of createGemm().");
-                    throw std::runtime_error("Cannot create GEMM kernel: raw weight data was released. Use KernelFactory::getOrCreateGemm().");
+                              "Use KernelFactory::getOrCreatePreparedGemmWeights() + getOrCreateGemmEngine() instead of createGemm().");
+                    throw std::runtime_error("Cannot create GEMM kernel: raw weight data was released. Use KernelFactory::getOrCreatePreparedGemmWeights() and getOrCreateGemmEngine().");
                 }
                 LOG_DEBUG("TensorSlice: Inner already presliced, using full kernel for "
                           << metadata_.slice_size() << " rows");

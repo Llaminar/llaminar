@@ -54,20 +54,20 @@ namespace llaminar2
     {
         KERNEL_PROFILE_SCOPE(KernelType::ROPE);
 
-        if (!ctx)
+        if (!ensureContext(ctx, "RoPEStage"))
         {
-            LOG_ERROR("[RoPEStage] Null device context");
             return false;
         }
 
-        if (!params_.Q)
+        if (!ensureRequiredPointers("RoPEStage", {
+                                                 {"Q", params_.Q},
+                                             }))
         {
-            LOG_ERROR("[RoPEStage] Null Q tensor");
             return false;
         }
 
         // Cast ITensor* to TensorBase* for CPU operations
-        auto *Q_base = requireTensorBase(params_.Q, "Q");
+        auto *Q_base = requireTensorBasePtr(params_.Q, "Q");
         if (!Q_base)
         {
             LOG_ERROR("[RoPEStage] GPU tensors not yet supported");
@@ -106,31 +106,45 @@ namespace llaminar2
                                                   << " hybrid_q16_mode=" << (hybrid_q16_mode ? "true" : "false")
                                                   << " k_is_q16_1=" << (k_is_q16_1 ? "true" : "false"));
 
-        // Get or create cached kernel via KernelFactory
-        // The kernel is cached in cached_kernel_ and bound to workspace via IWorkspaceConsumerStage
-        if (!cached_kernel_)
-        {
-            auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createRoPE(Q_base, dev_type);
-        }
+        // Get or create device-scoped cached kernel via KernelFactory
+        auto *kernel = getOrRefreshKernelByTensorType(
+            cached_kernel_,
+            cached_kernel_tensor_type_,
+            Q_base,
+            [&]()
+            {
+                return llaminar::v2::kernels::KernelFactory::getOrCreateRoPE(Q_base, params_.device_id);
+            });
 
-        if (!cached_kernel_)
+        if (!kernel)
         {
             LOG_ERROR("[RoPEStage] Failed to create RoPE kernel for type "
                       << Q_base->dtype_name());
             return false;
         }
 
-        ITensorRoPE *kernel = cached_kernel_.get();
-
         // Thread GPU stream for graph capture
-        kernel->setGPUStream(gpuStream());
+        bindStageStream(kernel);
 
         // Use provided position_ids if available (for batched execution with per-token positions)
         // Otherwise, pass nullptr to the kernel to enable zero-copy contiguous path.
         // The kernel computes positions on-the-fly on GPU: pos = pos_offset + seq_idx.
         // This avoids a synchronous hipMemcpy that forces a full GPU pipeline drain.
         const int *position_ids_ptr = params_.position_ids;
+
+        // CPU paths and graph-capture paths both need an explicit position_ids
+        // buffer whenever pos_offset != 0. Otherwise kernels that treat
+        // nullptr as [0..seq_len-1] would ignore the offset.
+        if (!position_ids_ptr && seq_len > 0 && params_.pos_offset != 0)
+        {
+            position_ids_cache_.resize(static_cast<size_t>(seq_len));
+            for (int i = 0; i < seq_len; ++i)
+            {
+                position_ids_cache_[static_cast<size_t>(i)] = params_.pos_offset + i;
+            }
+            position_ids_ptr = position_ids_cache_.data();
+        }
+
         if (gpuStream() != nullptr)
         {
             // Graph-capture path: ensure a stable position_ids pointer so the
@@ -157,9 +171,9 @@ namespace llaminar2
         const int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
 
         // Cast K and output tensors for kernel calls
-        auto *K_base = asTensorBase(params_.K, "K");
-        auto *Q_out_base = asTensorBase(params_.Q_out, "Q_out");
-        auto *K_out_base = asTensorBase(params_.K_out, "K_out");
+        auto *K_base = asTensorBasePtr(params_.K, "K");
+        auto *Q_out_base = asTensorBasePtr(params_.Q_out, "Q_out");
+        auto *K_out_base = asTensorBasePtr(params_.K_out, "K_out");
 
         // Hybrid mode: use apply_q8_1_to_fp32() for Q8_1 → FP32 with no requantization
         if (hybrid_mode)
@@ -556,34 +570,37 @@ namespace llaminar2
 
     IWorkspaceConsumer *RoPEStage::getKernelAsWorkspaceConsumer()
     {
-        // Create kernel if not already cached
-        if (!cached_kernel_)
+        // Create kernel if not already cached (or dtype variant changed)
+        if (!params_.Q)
         {
-            if (!params_.Q)
-            {
-                LOG_WARN("[RoPEStage::getKernelAsWorkspaceConsumer] Q tensor not set");
-                return nullptr;
-            }
+            LOG_WARN("[RoPEStage::getKernelAsWorkspaceConsumer] Q tensor not set");
+            return nullptr;
+        }
 
-            auto *Q_base = dynamic_cast<TensorBase *>(params_.Q);
-            if (!Q_base)
-            {
-                LOG_WARN("[RoPEStage::getKernelAsWorkspaceConsumer] Q is not TensorBase");
-                return nullptr;
-            }
+        auto *Q_base = dynamic_cast<TensorBase *>(params_.Q);
+        if (!Q_base)
+        {
+            LOG_WARN("[RoPEStage::getKernelAsWorkspaceConsumer] Q is not TensorBase");
+            return nullptr;
+        }
 
-            auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createRoPE(Q_base, dev_type);
-
-            if (!cached_kernel_)
+        auto *kernel = getOrRefreshKernelByTensorType(
+            cached_kernel_,
+            cached_kernel_tensor_type_,
+            Q_base,
+            [&]()
             {
-                LOG_WARN("[RoPEStage::getKernelAsWorkspaceConsumer] Failed to create RoPE kernel");
-                return nullptr;
-            }
+                return llaminar::v2::kernels::KernelFactory::getOrCreateRoPE(Q_base, params_.device_id);
+            });
+
+        if (!kernel)
+        {
+            LOG_WARN("[RoPEStage::getKernelAsWorkspaceConsumer] Failed to create RoPE kernel");
+            return nullptr;
         }
 
         // Cast to IWorkspaceConsumer (CUDA/ROCm RoPE kernels implement both ITensorRoPE and IWorkspaceConsumer)
-        return dynamic_cast<IWorkspaceConsumer *>(cached_kernel_.get());
+        return dynamic_cast<IWorkspaceConsumer *>(kernel);
     }
 
 } // namespace llaminar2

@@ -4,7 +4,6 @@
  */
 
 #include "AttentionWithKVCacheStage.h"
-#include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
@@ -23,6 +22,24 @@ namespace llaminar2
         : IComputeStage(params.device_id)
         , params_(std::move(params))
     {
+    }
+
+    ITensorAttention *AttentionWithKVCacheStage::getOrCreateKernel(const ITensor *tensor)
+    {
+        if (!tensor)
+        {
+            LOG_ERROR("[AttentionWithKVCacheStage::getOrCreateKernel] Null tensor");
+            return nullptr;
+        }
+
+        return getOrRefreshKernelByTensorType(
+            cached_kernel_,
+            cached_kernel_tensor_type_,
+            tensor,
+            [&]()
+            {
+                return llaminar::v2::kernels::KernelFactory::getOrCreateAttention(tensor, params_.device_id);
+            });
     }
 
     AttentionWithKVCacheStage::Mode AttentionWithKVCacheStage::effectiveMode() const
@@ -57,16 +74,18 @@ namespace llaminar2
 
     bool AttentionWithKVCacheStage::execute(IDeviceContext *ctx)
     {
-        if (!ctx)
+        if (!ensureContext(ctx, "AttentionWithKVCacheStage"))
         {
-            LOG_ERROR("[AttentionWithKVCacheStage] Null device context");
             return false;
         }
 
-        if (!params_.Q || !params_.K || !params_.V || !params_.output)
-        {
-            LOG_ERROR("[AttentionWithKVCacheStage] Invalid tensors: Q=" << params_.Q
-                                                                        << " K=" << params_.K << " V=" << params_.V << " output=" << params_.output);
+            if (!ensureRequiredPointers("AttentionWithKVCacheStage", {
+                                                                  {"Q", params_.Q},
+                                                                  {"K", params_.K},
+                                                                  {"V", params_.V},
+                                                                  {"output", params_.output},
+                                                              }))
+            {
             return false;
         }
 
@@ -101,10 +120,10 @@ namespace llaminar2
                                                                        << " seq_len=" << params_.seq_len);
 
         // Cast ITensor* to TensorBase* for CPU operations
-        auto *Q_base = requireTensorBase(params_.Q, "Q");
-        auto *K_base = requireTensorBase(params_.K, "K");
-        auto *V_base = requireTensorBase(params_.V, "V");
-        auto *output_base = requireTensorBase(params_.output, "output");
+        auto *Q_base = requireTensorBasePtr(params_.Q, "Q");
+        auto *K_base = requireTensorBasePtr(params_.K, "K");
+        auto *V_base = requireTensorBasePtr(params_.V, "V");
+        auto *output_base = requireTensorBasePtr(params_.output, "output");
         if (!Q_base || !K_base || !V_base || !output_base)
         {
             LOG_ERROR("[AttentionWithKVCacheStage::executePrefill] GPU tensors not yet supported");
@@ -156,16 +175,15 @@ namespace llaminar2
             return false;
         }
 
-        // Step 4: Create attention kernel via KernelFactory (device-aware dispatch)
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-        auto attention_kernel = llaminar::v2::kernels::KernelFactory::createAttention(Q_view.get(), dev_type);
+        // Step 4: Get attention kernel via device-scoped KernelFactory cache
+        auto *attention_kernel = getOrCreateKernel(Q_view.get());
 
         if (!attention_kernel)
         {
             LOG_ERROR("[AttentionWithKVCacheStage::executePrefill] Failed to create attention kernel");
             return false;
         }
-        attention_kernel->setGPUStream(gpuStream());
+        bindStageStream(attention_kernel);
 
         // Step 5: Allocate workspace for attention scores [n_heads, seq_len, kv_len]
         FP32Tensor scores_workspace({static_cast<size_t>(params_.n_heads * params_.seq_len * kv_len)});
@@ -229,10 +247,10 @@ namespace llaminar2
         }
 
         // Cast ITensor* to TensorBase* for CPU operations
-        auto *Q_base = requireTensorBase(params_.Q, "Q");
-        auto *K_base = requireTensorBase(params_.K, "K");
-        auto *V_base = requireTensorBase(params_.V, "V");
-        auto *output_base = requireTensorBase(params_.output, "output");
+        auto *Q_base = requireTensorBasePtr(params_.Q, "Q");
+        auto *K_base = requireTensorBasePtr(params_.K, "K");
+        auto *V_base = requireTensorBasePtr(params_.V, "V");
+        auto *output_base = requireTensorBasePtr(params_.output, "output");
         if (!Q_base || !K_base || !V_base || !output_base)
         {
             LOG_ERROR("[AttentionWithKVCacheStage::executeDecode] GPU tensors not yet supported");
@@ -272,18 +290,16 @@ namespace llaminar2
             return false;
         }
 
-        // Step 4: Create attention kernel via KernelFactory (device-aware dispatch)
-        // This uses the typed kernel path (CPUAttentionKernelT) which properly
-        // handles decode mode where Q.seq_len != K.seq_len
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-        auto attention_kernel = llaminar::v2::kernels::KernelFactory::createAttention(Q_view.get(), dev_type);
+        // Step 4: Get attention kernel via device-scoped KernelFactory cache.
+        // This uses the typed kernel path which properly handles decode mode where Q.seq_len != K.seq_len.
+        auto *attention_kernel = getOrCreateKernel(Q_view.get());
 
         if (!attention_kernel)
         {
             LOG_ERROR("[AttentionWithKVCacheStage::executeDecode] Failed to create attention kernel");
             return false;
         }
-        attention_kernel->setGPUStream(gpuStream());
+        bindStageStream(attention_kernel);
 
         // Step 5: Allocate workspace for attention scores [n_heads, q_seq_len, kv_len]
         // Use simple allocation - in production, use pre-allocated workspace
@@ -340,10 +356,10 @@ namespace llaminar2
                                                                        << (params_.sequence_lengths ? " [0]=" + std::to_string((*params_.sequence_lengths)[0]) : ""));
 
         // Cast ITensor* to TensorBase* for CPU operations
-        auto *Q_base = requireTensorBase(params_.Q, "Q");
-        auto *K_base = requireTensorBase(params_.K, "K");
-        auto *V_base = requireTensorBase(params_.V, "V");
-        auto *output_base = requireTensorBase(params_.output, "output");
+        auto *Q_base = requireTensorBasePtr(params_.Q, "Q");
+        auto *K_base = requireTensorBasePtr(params_.K, "K");
+        auto *V_base = requireTensorBasePtr(params_.V, "V");
+        auto *output_base = requireTensorBasePtr(params_.output, "output");
         if (!Q_base || !K_base || !V_base || !output_base)
         {
             LOG_ERROR("[AttentionWithKVCacheStage::executeBatched] GPU tensors not yet supported");
@@ -378,16 +394,15 @@ namespace llaminar2
             }
         }
 
-        // Create attention kernel via KernelFactory (device-aware dispatch)
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-        auto attention_kernel = llaminar::v2::kernels::KernelFactory::createAttention(Q_base, dev_type);
+        // Get attention kernel via device-scoped KernelFactory cache
+        auto *attention_kernel = getOrCreateKernel(Q_base);
 
         if (!attention_kernel)
         {
             LOG_ERROR("[AttentionWithKVCacheStage::executeBatched] Failed to create attention kernel");
             return false;
         }
-        attention_kernel->setGPUStream(gpuStream());
+        bindStageStream(attention_kernel);
 
         // Allocate workspace for attention scores
         // For batched: [batch_size * n_heads, seq_len, seq_len] but we compute per-batch

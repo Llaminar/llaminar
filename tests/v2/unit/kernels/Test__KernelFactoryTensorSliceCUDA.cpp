@@ -44,6 +44,16 @@ namespace
         return false;
 #endif
     }
+
+    ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id = DeviceId::cpu())
+    {
+        auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, device_id);
+        if (!prepared)
+        {
+            return nullptr;
+        }
+        return KernelFactory::getOrCreateGemmEngine(prepared);
+    }
 } // namespace
 
 class KernelFactoryTensorSliceCUDATest : public ::testing::Test
@@ -206,7 +216,7 @@ TEST_F(KernelFactoryTensorSliceCUDATest, CPUDispatchHandlesTensorSliceQ4_0)
     ASSERT_NE(slice, nullptr);
 
     // Should work on CPU (baseline)
-    auto *kernel = KernelFactory::getOrCreateGemm(slice.get());
+    auto *kernel = getPreparedKernel(slice.get(), DeviceId::cpu());
     EXPECT_NE(kernel, nullptr) << "CPU GEMM kernel creation should succeed with TensorSlice";
 }
 
@@ -216,7 +226,7 @@ TEST_F(KernelFactoryTensorSliceCUDATest, CPUDispatchHandlesTensorSliceQ8_0)
     auto slice = wrapInTensorSlice(std::move(inner), SliceMode::ROW_PARALLEL);
     ASSERT_NE(slice, nullptr);
 
-    auto *kernel = KernelFactory::getOrCreateGemm(slice.get());
+    auto *kernel = getPreparedKernel(slice.get(), DeviceId::cpu());
     EXPECT_NE(kernel, nullptr) << "CPU GEMM kernel creation should succeed with TensorSlice wrapping Q8_0";
 }
 
@@ -226,7 +236,7 @@ TEST_F(KernelFactoryTensorSliceCUDATest, CPUDispatchHandlesTensorSliceIQ4_NL)
     auto slice = wrapInTensorSlice(std::move(inner), SliceMode::COLUMN_PARALLEL);
     ASSERT_NE(slice, nullptr);
 
-    auto *kernel = KernelFactory::getOrCreateGemm(slice.get());
+    auto *kernel = getPreparedKernel(slice.get(), DeviceId::cpu());
     EXPECT_NE(kernel, nullptr) << "CPU GEMM kernel creation should succeed with TensorSlice wrapping IQ4_NL";
 }
 
@@ -240,7 +250,7 @@ TEST_F(KernelFactoryTensorSliceCUDATest, DirectQ4_0TensorStillWorks)
     auto tensor = createQ4_0(1024, 896);
     ASSERT_NE(tensor, nullptr);
 
-    auto *kernel = KernelFactory::getOrCreateGemm(tensor.get());
+    auto *kernel = getPreparedKernel(tensor.get(), DeviceId::cpu());
     EXPECT_NE(kernel, nullptr)
         << "Direct Q4_0Tensor (not wrapped) should still work";
 }
@@ -251,8 +261,8 @@ TEST_F(KernelFactoryTensorSliceCUDATest, KernelCachingWithTensorSlice)
     auto slice = wrapInTensorSlice(std::move(inner), SliceMode::COLUMN_PARALLEL);
 
     // Create kernel twice - should be cached
-    auto *k1 = KernelFactory::getOrCreateGemm(slice.get());
-    auto *k2 = KernelFactory::getOrCreateGemm(slice.get());
+    auto *k1 = getPreparedKernel(slice.get(), DeviceId::cpu());
+    auto *k2 = getPreparedKernel(slice.get(), DeviceId::cpu());
 
     EXPECT_NE(k1, nullptr);
     EXPECT_EQ(k1, k2) << "Same TensorSlice should return cached kernel";
@@ -266,8 +276,8 @@ TEST_F(KernelFactoryTensorSliceCUDATest, DifferentTensorSlicesGetDifferentKernel
     auto inner2 = createQ4_0(1024, 896);
     auto slice2 = wrapInTensorSlice(std::move(inner2), SliceMode::COLUMN_PARALLEL);
 
-    auto *k1 = KernelFactory::getOrCreateGemm(slice1.get());
-    auto *k2 = KernelFactory::getOrCreateGemm(slice2.get());
+    auto *k1 = getPreparedKernel(slice1.get(), DeviceId::cpu());
+    auto *k2 = getPreparedKernel(slice2.get(), DeviceId::cpu());
 
     EXPECT_NE(k1, nullptr);
     EXPECT_NE(k2, nullptr);
@@ -307,7 +317,7 @@ TEST_F(KernelFactoryTensorSliceCUDATest, CUDADispatchUnwrapsTensorSliceQ4_0)
     ASSERT_NE(slice, nullptr);
 
     // This should succeed - previously failed with "unsupported tensor type 10"
-    auto *kernel = KernelFactory::getOrCreateGemm(slice.get());
+    auto *kernel = getPreparedKernel(slice.get(), cuda_device);
     EXPECT_NE(kernel, nullptr)
         << "CUDA GEMM kernel creation should succeed with TensorSlice wrapping Q4_0Tensor. "
         << "If this fails with 'unsupported tensor type 10', the TensorSlice unwrapping fix is missing.";
@@ -334,7 +344,7 @@ TEST_F(KernelFactoryTensorSliceCUDATest, CUDADispatchUnwrapsTensorSliceQ8_0)
     auto slice = wrapInTensorSlice(std::move(inner), SliceMode::ROW_PARALLEL);
     ASSERT_NE(slice, nullptr);
 
-    auto *kernel = KernelFactory::getOrCreateGemm(slice.get());
+    auto *kernel = getPreparedKernel(slice.get(), cuda_device);
     EXPECT_NE(kernel, nullptr)
         << "CUDA GEMM kernel creation should succeed with TensorSlice wrapping Q8_0Tensor";
 }

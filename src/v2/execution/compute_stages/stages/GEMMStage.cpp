@@ -183,7 +183,8 @@ namespace llaminar2
         else
         {
             // Use device-targeted kernel creation
-            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(B_base, params_.device_id);
+            auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(B_base, params_.device_id);
+            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
         }
 
         if (!gemm)
@@ -490,7 +491,8 @@ namespace llaminar2
         else
         {
             // Standard GEMM kernel
-            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(B_base, params_.device_id);
+            auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(B_base, params_.device_id);
+            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
         }
 
         return dynamic_cast<IWorkspaceConsumer *>(gemm);

@@ -54,6 +54,12 @@ static std::unique_ptr<IQ4_NLTensor> createTestTensor()
     return std::make_unique<IQ4_NLTensor>(std::vector<size_t>{rows, cols}, raw_data);
 }
 
+static ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device = DeviceId::cpu())
+{
+    auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, device);
+    return KernelFactory::getOrCreateGemmEngine(prepared);
+}
+
 // ============================================================================
 // Basic Cache Invalidation Tests
 // ============================================================================
@@ -73,7 +79,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, CacheGrowsAfterGetOrCreateGemm)
     EXPECT_EQ(size_before, 0u);
 
     // Create a GEMM kernel via factory (should cache it)
-    auto *kernel = KernelFactory::getOrCreateGemm(tensor.get());
+    auto *kernel = getPreparedKernel(tensor.get());
     ASSERT_NE(kernel, nullptr);
 
     // Verify cache now has one entry
@@ -91,7 +97,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, CacheAutoInvalidatesOnTensorDestruc
         auto tensor = createTestTensor();
 
         // Add to cache
-        auto *kernel = KernelFactory::getOrCreateGemm(tensor.get());
+        auto *kernel = getPreparedKernel(tensor.get());
         ASSERT_NE(kernel, nullptr);
 
         // Verify it's in the cache
@@ -114,8 +120,8 @@ TEST_F(Test__KernelFactoryCacheInvalidation, MultipleTensors_IndependentInvalida
     auto tensor2 = createTestTensor();
 
     // Add both to cache
-    KernelFactory::getOrCreateGemm(tensor1.get());
-    KernelFactory::getOrCreateGemm(tensor2.get());
+    getPreparedKernel(tensor1.get());
+    getPreparedKernel(tensor2.get());
 
     // Should have 2 entries
     auto [size_both, _] = KernelFactory::cacheStats();
@@ -140,7 +146,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, ClearCacheForNonExistentTensor_NoOp
 {
     // Create and cache a tensor
     auto tensor = createTestTensor();
-    KernelFactory::getOrCreateGemm(tensor.get());
+    getPreparedKernel(tensor.get());
 
     auto [size_before, _] = KernelFactory::cacheStats();
     EXPECT_EQ(size_before, 1u);
@@ -160,11 +166,11 @@ TEST_F(Test__KernelFactoryCacheInvalidation, CacheHit_SamePointerReturnssamKerne
     auto tensor = createTestTensor();
 
     // First call creates and caches
-    auto *kernel1 = KernelFactory::getOrCreateGemm(tensor.get());
+    auto *kernel1 = getPreparedKernel(tensor.get());
     ASSERT_NE(kernel1, nullptr);
 
     // Second call should return the SAME kernel (cache hit)
-    auto *kernel2 = KernelFactory::getOrCreateGemm(tensor.get());
+    auto *kernel2 = getPreparedKernel(tensor.get());
     EXPECT_EQ(kernel1, kernel2) << "Cache should return the same kernel pointer";
 
     // Should still have only 1 cache entry
@@ -194,7 +200,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, MemoryReuse_NoStaleKernel)
         auto tensor = createTestTensor();
         captured_ptr = tensor.get();
 
-        KernelFactory::getOrCreateGemm(tensor.get());
+        getPreparedKernel(tensor.get());
 
         auto [size_during, _] = KernelFactory::cacheStats();
         EXPECT_EQ(size_during, 1u);
@@ -205,7 +211,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, MemoryReuse_NoStaleKernel)
     auto [size_after, _] = KernelFactory::cacheStats();
     EXPECT_EQ(size_after, 0u) << "Cache should be empty after tensor destruction";
 
-    // Note: We can't call getOrCreateGemm(captured_ptr) because that would be UB.
+    // Note: We can't call getPreparedKernel(captured_ptr) because that would be UB.
     // The important thing is that the cache is clean, so if a new tensor
     // happens to be allocated at the same address, it won't hit a stale entry.
 }
@@ -223,7 +229,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, FP32Tensor_AutoInvalidation)
         // FP32Tensor constructor takes shape and optional device_idx (defaults to -1 for CPU)
         auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{rows, cols});
 
-        auto *kernel = KernelFactory::getOrCreateGemm(tensor.get());
+        auto *kernel = getPreparedKernel(tensor.get());
         ASSERT_NE(kernel, nullptr);
 
         auto [size_during, _] = KernelFactory::cacheStats();
@@ -259,7 +265,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, RapidCreateDestroy_CacheStaysClean)
     for (int i = 0; i < 100; ++i)
     {
         auto tensor = createTestTensor();
-        KernelFactory::getOrCreateGemm(tensor.get());
+        getPreparedKernel(tensor.get());
     }
 
     // After all destroys, cache should be empty
@@ -283,7 +289,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, CPUPackedWeights_CleanedUpOnDestruc
         EXPECT_FALSE(tensor->cache_.has_value()) << "Fresh tensor should have no cache";
 
         // Create GEMM kernel - this populates tensor->cache_ with packed weights
-        auto *kernel = KernelFactory::getOrCreateGemm(tensor.get());
+        auto *kernel = getPreparedKernel(tensor.get());
         ASSERT_NE(kernel, nullptr);
 
         // Now cache_ should have packed weights
@@ -305,7 +311,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, CPUPackedWeights_ClearedByExplicitC
     auto tensor = createTestTensor();
 
     // Populate cache
-    KernelFactory::getOrCreateGemm(tensor.get());
+    getPreparedKernel(tensor.get());
     EXPECT_TRUE(tensor->cache_.has_value());
 
     // Explicitly clear
@@ -322,8 +328,8 @@ TEST_F(Test__KernelFactoryCacheInvalidation, CPUPackedWeights_ClearedByClearCach
     auto tensor2 = createTestTensor();
 
     // Populate caches
-    KernelFactory::getOrCreateGemm(tensor1.get());
-    KernelFactory::getOrCreateGemm(tensor2.get());
+    getPreparedKernel(tensor1.get());
+    getPreparedKernel(tensor2.get());
 
     EXPECT_TRUE(tensor1->cache_.has_value());
     EXPECT_TRUE(tensor2->cache_.has_value());
@@ -342,7 +348,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, MultiplePackedWeightsCreation_OnlyP
     auto tensor = createTestTensor();
 
     // First call - should create packed weights
-    auto *kernel1 = KernelFactory::getOrCreateGemm(tensor.get());
+    auto *kernel1 = getPreparedKernel(tensor.get());
     ASSERT_NE(kernel1, nullptr);
     EXPECT_TRUE(tensor->cache_.has_value());
 
@@ -358,7 +364,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, MultiplePackedWeightsCreation_OnlyP
     }
 
     // Second call - should reuse existing packed weights
-    auto *kernel2 = KernelFactory::getOrCreateGemm(tensor.get());
+    auto *kernel2 = getPreparedKernel(tensor.get());
     EXPECT_EQ(kernel1, kernel2) << "Should return cached kernel";
     EXPECT_TRUE(tensor->cache_.has_value());
 
@@ -494,7 +500,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, BothCaches_CleanedUpTogether)
         auto tensor = createTestTensor();
 
         // Create CPU GEMM (populates cache_)
-        auto *cpu_kernel = KernelFactory::getOrCreateGemm(tensor.get());
+        auto *cpu_kernel = getPreparedKernel(tensor.get());
         ASSERT_NE(cpu_kernel, nullptr);
         EXPECT_TRUE(tensor->cache_.has_value()) << "Should have CPU packed weights";
 
@@ -522,7 +528,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, BothCaches_CleanedUpTogether)
 // ============================================================================
 // These tests verify that device_targeted_cache_ is properly cleared when
 // a tensor is destroyed. This is a regression test for a bug where
-// device-targeted kernels (created via getOrCreateGemm(tensor, DeviceType))
+// device-specific prepared-handle kernels
 // were NOT being cleared, causing use-after-free when tensor memory was reused.
 
 TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_CUDA_AutoInvalidation)
@@ -560,7 +566,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_CUDA_AutoInvali
 
         // Create device-targeted kernel (this uses device_targeted_cache_)
         // Use DeviceId to properly set the target device ordinal
-        auto *kernel = KernelFactory::getOrCreateGemm(tensor.get(), DeviceId::cuda(0));
+        auto *kernel = getPreparedKernel(tensor.get(), DeviceId::cuda(0));
         ASSERT_NE(kernel, nullptr);
 
         // Verify cache has an entry
@@ -585,7 +591,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_CPU_AutoInvalid
         auto tensor = createTestTensor();
 
         // Create CPU device-targeted kernel
-        auto *kernel = KernelFactory::getOrCreateGemm(tensor.get(), DeviceType::CPU);
+        auto *kernel = getPreparedKernel(tensor.get(), DeviceId::cpu());
         ASSERT_NE(kernel, nullptr);
 
         auto [size_during, _] = KernelFactory::cacheStats();
@@ -624,8 +630,8 @@ TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_MultipleDevices
 
     // Create device-targeted kernels for both tensors
     // Use DeviceId to properly set the target device ordinal
-    auto *kernel1 = KernelFactory::getOrCreateGemm(tensor1.get(), DeviceId::cuda(0));
-    auto *kernel2 = KernelFactory::getOrCreateGemm(tensor2.get(), DeviceId::cuda(0));
+    auto *kernel1 = getPreparedKernel(tensor1.get(), DeviceId::cuda(0));
+    auto *kernel2 = getPreparedKernel(tensor2.get(), DeviceId::cuda(0));
 
     ASSERT_NE(kernel1, nullptr);
     ASSERT_NE(kernel2, nullptr);
@@ -641,7 +647,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_MultipleDevices
     EXPECT_GE(size_one, 1u) << "tensor2's kernel should still be cached";
 
     // Verify we can still get tensor2's kernel (cache hit)
-    auto *kernel2_again = KernelFactory::getOrCreateGemm(tensor2.get(), DeviceId::cuda(0));
+    auto *kernel2_again = getPreparedKernel(tensor2.get(), DeviceId::cuda(0));
     EXPECT_EQ(kernel2, kernel2_again) << "Should return same cached kernel for tensor2";
 
     // Destroy tensor2
@@ -678,8 +684,8 @@ TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_SameTensorBothD
 
         // Create kernels for both device types
         // Use DeviceId to properly set the target device ordinal
-        auto *cpu_kernel = KernelFactory::getOrCreateGemm(tensor.get(), DeviceId::cpu());
-        auto *cuda_kernel = KernelFactory::getOrCreateGemm(tensor.get(), DeviceId::cuda(0));
+        auto *cpu_kernel = getPreparedKernel(tensor.get(), DeviceId::cpu());
+        auto *cuda_kernel = getPreparedKernel(tensor.get(), DeviceId::cuda(0));
 
         ASSERT_NE(cpu_kernel, nullptr);
         ASSERT_NE(cuda_kernel, nullptr);
@@ -723,7 +729,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_ExplicitClearCa
 
     // Create device-targeted kernel
     // Use DeviceId to properly set the target device ordinal
-    auto *kernel = KernelFactory::getOrCreateGemm(tensor.get(), DeviceId::cuda(0));
+    auto *kernel = getPreparedKernel(tensor.get(), DeviceId::cuda(0));
     ASSERT_NE(kernel, nullptr);
 
     auto [size_before, _] = KernelFactory::cacheStats();
@@ -738,7 +744,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_ExplicitClearCa
         << "clearCacheFor should remove device_targeted_cache_ entries";
 
     // Creating a new kernel should result in a cache miss (new kernel)
-    auto *kernel_new = KernelFactory::getOrCreateGemm(tensor.get(), DeviceId::cuda(0));
+    auto *kernel_new = getPreparedKernel(tensor.get(), DeviceId::cuda(0));
     ASSERT_NE(kernel_new, nullptr);
     // Note: kernel_new might equal kernel if the factory creates the same type,
     // but the key point is the cache was cleared
@@ -778,7 +784,7 @@ TEST_F(Test__KernelFactoryCacheInvalidation, DeviceTargetedCache_MemoryReuseSimu
         {
             auto tensor = createTestTensor();
             // Use DeviceId to properly set the target device ordinal
-            auto *kernel = KernelFactory::getOrCreateGemm(tensor.get(), DeviceId::cuda(0));
+            auto *kernel = getPreparedKernel(tensor.get(), DeviceId::cuda(0));
             ASSERT_NE(kernel, nullptr);
             // tensor destroyed here
         }

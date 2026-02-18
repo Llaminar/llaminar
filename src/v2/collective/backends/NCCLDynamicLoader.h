@@ -94,16 +94,18 @@ namespace llaminar2
             ncclFloat64 = 8,
             ncclDouble = 8,
             ncclBfloat16 = 9,
-            ncclNumTypes = 10
+            ncclFloat8e4m3 = 10,
+            ncclFloat8e5m2 = 11,
+            ncclNumTypes = 12
         };
 
-        // Reduction operations
+        // Reduction operations (values must match NCCL ABI)
         enum ncclRedOp_t
         {
             ncclSum = 0,
             ncclProd = 1,
-            ncclMin = 2,
-            ncclMax = 3,
+            ncclMax = 2,
+            ncclMin = 3,
             ncclAvg = 4,
             ncclNumOps = 5
         };

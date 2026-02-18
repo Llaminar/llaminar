@@ -27,6 +27,19 @@
 
 using namespace llaminar2;
 
+namespace
+{
+    ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id = DeviceId::cpu())
+    {
+        auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(tensor, device_id);
+        if (!prepared)
+        {
+            return nullptr;
+        }
+        return llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+    }
+}
+
 // Qwen 2.5 0.5B model constants
 static constexpr int D_MODEL = 896;
 static constexpr int D_FF = 4864;
@@ -273,7 +286,7 @@ TEST_F(Test__MPI_ColumnParallelFFN, GateProjectionLocalOutput)
     ASSERT_NE(output, nullptr);
 
     // Use KernelFactory for sliced tensor GEMM
-    auto *gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(gate_weight.get());
+    auto *gemm = getPreparedKernel(gate_weight.get(), DeviceId::cpu());
     ASSERT_NE(gemm, nullptr);
 
     bool success = gemm->multiply(

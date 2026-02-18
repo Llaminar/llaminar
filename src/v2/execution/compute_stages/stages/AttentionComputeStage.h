@@ -9,7 +9,6 @@
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "kernels/IKVCache.h"
-#include <memory>
 
 namespace llaminar2
 {
@@ -128,7 +127,8 @@ namespace llaminar2
         Params params_;
 
         /// Cached attention kernel for workspace binding
-        std::unique_ptr<ITensorAttention> cached_kernel_;
+        ITensorAttention *cached_kernel_ = nullptr;
+        int cached_kernel_tensor_type_ = -1;
 
         /**
          * @brief Get or create the attention kernel

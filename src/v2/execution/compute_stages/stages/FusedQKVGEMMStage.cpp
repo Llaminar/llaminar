@@ -89,12 +89,9 @@ namespace llaminar2
             auto *wk_base = requireTensorBase(params_.wk, "wk");
             auto *wv_base = requireTensorBase(params_.wv, "wv");
 
-            // Get target device type
-            DeviceType target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-
             // Get cached fused QKV GEMM kernel from KernelFactory
             auto *fused_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateFusedQKVGemm(
-                wq_base, wk_base, wv_base, target_dev_type);
+                wq_base, wk_base, wv_base, params_.device_id);
             if (!fused_kernel)
             {
                 LOG_ERROR("[FusedQKVGEMMStage] Failed to get fused QKV kernel");
@@ -238,12 +235,9 @@ namespace llaminar2
             auto *wk_base2 = requireTensorBase(params_.wk, "wk");
             auto *wv_base2 = requireTensorBase(params_.wv, "wv");
 
-            // Get target device type
-            DeviceType target_dev_type2 = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-
             // Get cached fused QKV GEMM kernel from KernelFactory
             auto *fused_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateFusedQKVGemm(
-                wq_base2, wk_base2, wv_base2, target_dev_type2);
+                wq_base2, wk_base2, wv_base2, params_.device_id);
             if (!fused_kernel)
             {
                 LOG_ERROR("[FusedQKVGEMMStage] Failed to get fused QKV kernel for Q8_1 output");
@@ -317,9 +311,12 @@ namespace llaminar2
 
         // Get cached kernels from KernelFactory with device targeting
         // Use DeviceId overload to ensure correct GPU ordinal is used (e.g., ROCm:1 vs ROCm:0)
-        auto *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq_base, params_.device_id);
-        auto *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk_base, params_.device_id);
-        auto *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv_base, params_.device_id);
+        auto *prepared_q = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wq_base, params_.device_id);
+        auto *prepared_k = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wk_base, params_.device_id);
+        auto *prepared_v = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wv_base, params_.device_id);
+        auto *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_q);
+        auto *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_k);
+        auto *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_v);
         if (gemm_q) gemm_q->setGPUStream(gpuStream());
         if (gemm_k) gemm_k->setGPUStream(gpuStream());
         if (gemm_v) gemm_v->setGPUStream(gpuStream());
@@ -566,7 +563,8 @@ namespace llaminar2
             return nullptr;
         }
 
-        ITensorGemm *gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq_base, params_.device_id);
+        auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wq_base, params_.device_id);
+        ITensorGemm *gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
 
         return dynamic_cast<IWorkspaceConsumer *>(gemm);
     }
@@ -582,7 +580,8 @@ namespace llaminar2
             auto *wq_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wq));
             if (wq_base)
             {
-                ITensorGemm *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq_base, params_.device_id);
+                auto *prepared_q = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wq_base, params_.device_id);
+                ITensorGemm *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_q);
                 if (auto *consumer_q = dynamic_cast<IWorkspaceConsumer *>(gemm_q))
                 {
                     consumer_q->bindWorkspace(workspace);
@@ -597,7 +596,8 @@ namespace llaminar2
             auto *wk_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wk));
             if (wk_base)
             {
-                ITensorGemm *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk_base, params_.device_id);
+                auto *prepared_k = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wk_base, params_.device_id);
+                ITensorGemm *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_k);
                 if (auto *consumer_k = dynamic_cast<IWorkspaceConsumer *>(gemm_k))
                 {
                     consumer_k->bindWorkspace(workspace);
@@ -612,7 +612,8 @@ namespace llaminar2
             auto *wv_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wv));
             if (wv_base)
             {
-                ITensorGemm *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv_base, params_.device_id);
+                auto *prepared_v = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wv_base, params_.device_id);
+                ITensorGemm *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_v);
                 if (auto *consumer_v = dynamic_cast<IWorkspaceConsumer *>(gemm_v))
                 {
                     consumer_v->bindWorkspace(workspace);
@@ -633,7 +634,8 @@ namespace llaminar2
             auto *wq_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wq));
             if (wq_base)
             {
-                ITensorGemm *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq_base, params_.device_id);
+                auto *prepared_q = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wq_base, params_.device_id);
+                ITensorGemm *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_q);
                 if (auto *consumer_q = dynamic_cast<IWorkspaceConsumer *>(gemm_q))
                 {
                     consumer_q->unbindWorkspace();
@@ -646,7 +648,8 @@ namespace llaminar2
             auto *wk_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wk));
             if (wk_base)
             {
-                ITensorGemm *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk_base, params_.device_id);
+                auto *prepared_k = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wk_base, params_.device_id);
+                ITensorGemm *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_k);
                 if (auto *consumer_k = dynamic_cast<IWorkspaceConsumer *>(gemm_k))
                 {
                     consumer_k->unbindWorkspace();
@@ -659,7 +662,8 @@ namespace llaminar2
             auto *wv_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wv));
             if (wv_base)
             {
-                ITensorGemm *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv_base, params_.device_id);
+                auto *prepared_v = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wv_base, params_.device_id);
+                ITensorGemm *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_v);
                 if (auto *consumer_v = dynamic_cast<IWorkspaceConsumer *>(gemm_v))
                 {
                     consumer_v->unbindWorkspace();

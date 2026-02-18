@@ -1644,7 +1644,8 @@ namespace llaminar2
         using namespace llaminar::v2::kernels;
 
         // Create kernel for target device (this creates the kernel with packed weights)
-        auto *kernel = KernelFactory::getOrCreateGemm(tensor, target_device);
+        auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, target_device);
+        auto *kernel = KernelFactory::getOrCreateGemmEngine(prepared);
         if (!kernel)
         {
             LOG_ERROR("[WeightManager] Failed to create GEMM kernel for weight packing");

@@ -4,7 +4,6 @@
  */
 
 #include "EmbeddingStage.h"
-#include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
@@ -27,12 +26,6 @@ namespace llaminar2
 
     ITensorEmbedding *EmbeddingStage::getOrCreateKernel()
     {
-        // Return cached kernel if available
-        if (cached_kernel_)
-        {
-            return cached_kernel_.get();
-        }
-
         // Create kernel using stage's device_id (NOT output tensor's device_ member)
         // This ensures GPU kernels are created when the stage is assigned to GPU,
         // even if the output tensor was allocated with a CPU device initially.
@@ -43,32 +36,32 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Get device type from stage's device_id (set by GraphOrchestrator based on placement)
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-
-        // Dispatch based on output tensor type
-        if (auto *fp32 = dynamic_cast<FP32Tensor *>(output_base))
-        {
-            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createEmbedding(fp32, dev_type);
-        }
-        else if (auto *bf16 = dynamic_cast<BF16Tensor *>(output_base))
-        {
-            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createEmbedding(bf16, dev_type);
-        }
-        else if (auto *fp16 = dynamic_cast<FP16Tensor *>(output_base))
-        {
-            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createEmbedding(fp16, dev_type);
-        }
-        else if (auto *q8_1 = dynamic_cast<Q8_1Tensor *>(output_base))
-        {
-            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createEmbedding(q8_1, dev_type);
-        }
-        else
+        if (!dynamic_cast<FP32Tensor *>(output_base) &&
+            !dynamic_cast<BF16Tensor *>(output_base) &&
+            !dynamic_cast<FP16Tensor *>(output_base) &&
+            !dynamic_cast<Q8_1Tensor *>(output_base))
         {
             LOG_ERROR("[EmbeddingStage::getOrCreateKernel] Unsupported output tensor type: "
                       << output_base->dtype_name());
             return nullptr;
         }
+
+        auto *kernel = getOrRefreshKernelByTensorType(
+            cached_kernel_,
+            cached_kernel_tensor_type_,
+            output_base,
+            [&]()
+            {
+                return llaminar::v2::kernels::KernelFactory::getOrCreateEmbedding(output_base, params_.device_id);
+            });
+        if (!kernel)
+        {
+            LOG_ERROR("[EmbeddingStage::getOrCreateKernel] Failed to resolve embedding kernel for "
+                      << output_base->dtype_name());
+            return nullptr;
+        }
+
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
 
         LOG_DEBUG("[EmbeddingStage::getOrCreateKernel] Created "
                   << (dev_type == DeviceType::CUDA   ? "CUDA"
@@ -76,7 +69,7 @@ namespace llaminar2
                                                      : "CPU")
                   << " embedding kernel for " << output_base->dtype_name() << " output");
 
-        return cached_kernel_.get();
+        return kernel;
     }
 
     IWorkspaceConsumer *EmbeddingStage::getKernelAsWorkspaceConsumer()
@@ -98,9 +91,11 @@ namespace llaminar2
                                                           << " vocab_size=" << params_.vocab_size);
 
         // Validate inputs
-        if (!params_.embed_table || !params_.output)
+        if (!ensureRequiredPointers("EmbeddingStage", {
+                                                     {"embed_table", params_.embed_table},
+                                                     {"output", params_.output},
+                                                 }))
         {
-            LOG_ERROR("[EmbeddingStage] Null tensor pointers");
             return false;
         }
 
@@ -127,8 +122,8 @@ namespace llaminar2
         // This handles automatic type dispatch for FP32, Q8_1, etc.
 
         // Cast ITensor* to TensorBase* for CPU operations
-        auto *embed_table_base = requireTensorBase(params_.embed_table, "embed_table");
-        auto *output_base = requireTensorBase(params_.output, "output");
+        auto *embed_table_base = requireTensorBasePtr(params_.embed_table, "embed_table");
+        auto *output_base = requireTensorBasePtr(params_.output, "output");
         if (!embed_table_base || !output_base)
         {
             LOG_ERROR("[EmbeddingStage] GPU tensors not yet supported");
@@ -151,7 +146,7 @@ namespace llaminar2
         }
 
         // Thread GPU stream for graph capture
-        kernel->setGPUStream(gpuStream());
+        bindStageStream(kernel);
 
         // Handle batched vs single sequence input
         if (params_.token_batches)

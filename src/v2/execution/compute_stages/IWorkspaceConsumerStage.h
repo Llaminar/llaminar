@@ -33,15 +33,17 @@
  * class GEMMStage : public IComputeStage, public IWorkspaceConsumerStage
  * {
  *     IWorkspaceConsumer* getKernelAsWorkspaceConsumer() override {
- *         // KernelFactory caches by (tensor, device) so we always get the same kernel
- *         auto* gemm = KernelFactory::getOrCreateGemm(weights_, target_device_);
+ *         // Resolve through prepared-handle + device-scoped GEMM engine
+ *         auto* prepared = KernelFactory::getOrCreatePreparedGemmWeights(weights_, target_device_);
+ *         auto* engine = KernelFactory::getOrCreateGemmEngine(prepared);
+ *         auto* gemm = engine->resolveKernel(prepared);
  *         return dynamic_cast<IWorkspaceConsumer*>(gemm);
  *     }
  * };
  * @endcode
  *
- * Note: No explicit caching needed at the stage level - KernelFactory already
- * caches kernels by (tensor pointer, target device type).
+ * Note: No explicit caching needed at the stage level. KernelFactory owns both
+ * prepared-weight handles (tensor+device scoped) and device-scoped GEMM engines.
  *
  * @see IWorkspaceConsumer for the base interface
  * @see DeviceGraphBufferManager::allocateDeviceWorkspace() for the binding logic
@@ -62,11 +64,11 @@ namespace llaminar2
      * Implements IWorkspaceConsumer by forwarding all calls to a kernel obtained
      * via getKernelAsWorkspaceConsumer().
      *
-     * ## Kernel Caching
+    * ## Kernel Resolution
      *
-     * KernelFactory caches kernels by (tensor pointer, device type), so stages
-     * don't need their own caching - getKernelAsWorkspaceConsumer() can simply
-     * call KernelFactory::getOrCreateGemm() and will get the same kernel back.
+    * KernelFactory owns prepared GEMM handles and device-scoped GEMM engines,
+    * so stages don't need their own caching. getKernelAsWorkspaceConsumer() can
+    * resolve the active kernel from those shared registries.
      *
      * ## Thread Safety
      *

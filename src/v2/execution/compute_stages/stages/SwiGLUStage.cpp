@@ -4,7 +4,6 @@
  */
 
 #include "SwiGLUStage.h"
-#include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
@@ -27,24 +26,24 @@ namespace llaminar2
     {
         KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
 
-        if (!ctx)
+        if (!ensureContext(ctx, "SwiGLUStage"))
         {
-            LOG_ERROR("[SwiGLUStage] Null device context");
             return false;
         }
 
-        if (!params_.gate || !params_.up || !params_.output)
+        if (!ensureRequiredPointers("SwiGLUStage", {
+                                                   {"gate", params_.gate},
+                                                   {"up", params_.up},
+                                                   {"output", params_.output},
+                                               }))
         {
-            LOG_ERROR("[SwiGLUStage] Null tensor(s): gate=" << params_.gate
-                                                            << " up=" << params_.up
-                                                            << " output=" << params_.output);
             return false;
         }
 
         // Cast ITensor* to TensorBase* for CPU operations
-        auto *gate_base = requireTensorBase(params_.gate, "gate");
-        auto *up_base = requireTensorBase(params_.up, "up");
-        auto *output_base = requireTensorBase(params_.output, "output");
+        auto *gate_base = requireTensorBasePtr(params_.gate, "gate");
+        auto *up_base = requireTensorBasePtr(params_.up, "up");
+        auto *output_base = requireTensorBasePtr(params_.output, "output");
         if (!gate_base || !up_base || !output_base)
         {
             LOG_ERROR("[SwiGLUStage] GPU tensors not yet supported");
@@ -66,23 +65,26 @@ namespace llaminar2
                                                     << " device_id=" << params_.device_id.to_string());
 
         // Create kernel via KernelFactory with automatic type dispatch (cached)
-        if (!cached_kernel_)
-        {
-            auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createSwiGLU(gate_base, dev_type);
-            if (!cached_kernel_)
+        auto *kernel = getOrRefreshKernelByTensorType(
+            cached_kernel_,
+            cached_kernel_tensor_type_,
+            gate_base,
+            [&]()
             {
-                LOG_ERROR("[SwiGLUStage] Failed to create SwiGLU kernel for type "
-                          << gate_base->dtype_name());
-                return false;
-            }
+                return llaminar::v2::kernels::KernelFactory::getOrCreateSwiGLU(gate_base, params_.device_id);
+            });
+        if (!kernel)
+        {
+            LOG_ERROR("[SwiGLUStage] Failed to create SwiGLU kernel for type "
+                      << gate_base->dtype_name());
+            return false;
         }
 
         // Thread GPU stream for graph capture
-        cached_kernel_->setGPUStream(gpuStream());
+        bindStageStream(kernel);
 
         // Apply SwiGLU via kernel's apply_tensor method
-        return cached_kernel_->apply_tensor(
+        return kernel->apply_tensor(
             gate_base,
             up_base,
             output_base,

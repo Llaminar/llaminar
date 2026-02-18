@@ -608,9 +608,12 @@ namespace llaminar2
              * ## Example Usage
              *
              * ```cpp
-             * auto* kernel_q = static_cast<QuantisedGemmKernel*>(KernelFactory::getOrCreateGemm(wq));
-             * auto* kernel_k = static_cast<QuantisedGemmKernel*>(KernelFactory::getOrCreateGemm(wk));
-             * auto* kernel_v = static_cast<QuantisedGemmKernel*>(KernelFactory::getOrCreateGemm(wv));
+             * auto* prepared_q = KernelFactory::getOrCreatePreparedGemmWeights(wq, DeviceId::cpu());
+             * auto* prepared_k = KernelFactory::getOrCreatePreparedGemmWeights(wk, DeviceId::cpu());
+             * auto* prepared_v = KernelFactory::getOrCreatePreparedGemmWeights(wv, DeviceId::cpu());
+             * auto* kernel_q = static_cast<QuantisedGemmKernel*>(KernelFactory::getOrCreateGemmEngine(prepared_q));
+             * auto* kernel_k = static_cast<QuantisedGemmKernel*>(KernelFactory::getOrCreateGemmEngine(prepared_k));
+             * auto* kernel_v = static_cast<QuantisedGemmKernel*>(KernelFactory::getOrCreateGemmEngine(prepared_v));
              *
              * QuantisedGemmKernel::multiply_fused_multi(
              *     normalized->data(),

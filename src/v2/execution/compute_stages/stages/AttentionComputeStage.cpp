@@ -31,12 +31,6 @@ namespace llaminar2
 
     ITensorAttention *AttentionComputeStage::getOrCreateKernel()
     {
-        // Return cached kernel if available
-        if (cached_kernel_)
-        {
-            return cached_kernel_.get();
-        }
-
         // Need Q tensor to determine kernel type
         if (!params_.Q)
         {
@@ -44,13 +38,15 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Determine device type from params_.device_id
-        using DeviceType = llaminar::v2::kernels::DeviceType;
-        DeviceType dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-
-        // Create and cache kernel
-        cached_kernel_ = llaminar::v2::kernels::KernelFactory::createAttention(params_.Q, dev_type);
-        if (!cached_kernel_)
+        auto *kernel = getOrRefreshKernelByTensorType(
+            cached_kernel_,
+            cached_kernel_tensor_type_,
+            params_.Q,
+            [&]() 
+            {
+                return llaminar::v2::kernels::KernelFactory::getOrCreateAttention(params_.Q, params_.device_id);
+            });
+        if (!kernel)
         {
             LOG_ERROR("[AttentionComputeStage::getOrCreateKernel] Failed to create attention kernel for "
                       << params_.Q->dtype_name());
@@ -60,7 +56,7 @@ namespace llaminar2
         LOG_DEBUG("[AttentionComputeStage::getOrCreateKernel] Created and cached attention kernel for "
                   << params_.Q->dtype_name() << " on " << params_.device_id.to_string());
 
-        return cached_kernel_.get();
+        return kernel;
     }
 
     IWorkspaceConsumer *AttentionComputeStage::getKernelAsWorkspaceConsumer()
@@ -110,9 +106,13 @@ namespace llaminar2
                                                             << " output=" << (void *)params_.output);
 
         // Validate inputs
-        if (!params_.Q || !params_.K || !params_.V || !params_.output)
+        if (!ensureRequiredPointers("AttentionComputeStage", {
+                                                         {"Q", params_.Q},
+                                                         {"K", params_.K},
+                                                         {"V", params_.V},
+                                                         {"output", params_.output},
+                                                     }))
         {
-            LOG_ERROR("[AttentionComputeStage] Null tensor pointers");
             return false;
         }
 
@@ -137,7 +137,7 @@ namespace llaminar2
             LOG_ERROR("[AttentionComputeStage] Failed to get attention kernel");
             return false;
         }
-        kernel->setGPUStream(gpuStream());
+        bindStageStream(kernel);
 
         // Get device index using proper ordinal for GPU devices (0-based), not legacy index
         int device_idx = params_.device_id.toKernelDeviceIndex();
@@ -210,9 +210,13 @@ namespace llaminar2
         // Since compute_tensor() now takes ITensor*, we can pass Q/K/V directly without casting.
         // This allows GPU tensor wrappers (like GpuTensorView from CUDA KV cache) to work.
 
-        if (!params_.Q || !params_.K || !params_.V || !params_.output)
+        if (!ensureRequiredPointers("AttentionComputeStage", {
+                                                         {"Q", params_.Q},
+                                                         {"K", params_.K},
+                                                         {"V", params_.V},
+                                                         {"output", params_.output},
+                                                     }))
         {
-            LOG_ERROR("[AttentionComputeStage] Null tensor pointer");
             return false;
         }
 

@@ -61,6 +61,16 @@ using TensorProjectionDesc = llaminar2::ITensorGemm::TensorProjectionDesc;
 namespace
 {
 
+    ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id)
+    {
+        auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(tensor, device_id);
+        if (!prepared)
+        {
+            return nullptr;
+        }
+        return llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+    }
+
     // ============================================================================
     // Cosine Similarity Utilities
     // ============================================================================
@@ -1729,14 +1739,14 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
 // ============================================================================
 
 /**
- * @test Cached kernel parity: getOrCreateGemm() vs createGemm()
+ * @test Cached kernel parity: prepared GEMM engine vs createGemm()
  *
- * This test verifies that kernels obtained via getOrCreateGemm() (the caching API
+ * This test verifies that kernels obtained via prepared GEMM engine lookup (the caching path
  * used by the full pipeline) produce identical results to kernels created via
  * createGemm() (fresh kernel creation).
  *
  * **Why this matters**: If there's a bug in kernel caching (stale weights, incorrect
- * scale factors), this will catch it. The full pipeline uses getOrCreateGemm().
+ * scale factors), this will catch it. The full pipeline uses the prepared GEMM engine path.
  */
 TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
 {
@@ -1778,8 +1788,7 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
     ASSERT_NE(fresh_kernel, nullptr);
 
     // Get cached kernel (this is what the pipeline uses)
-    auto *cached_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(
-        q4_tensor);
+    auto *cached_kernel = getPreparedKernel(q4_tensor, gpu_device_);
     ASSERT_NE(cached_kernel, nullptr);
 
     // Set up SHARED workspace for both kernels
@@ -1881,7 +1890,7 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_MultipleCallsConsistent)
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
 
     // Get cached kernel
-    auto *kernel = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(q4_tensor);
+    auto *kernel = getPreparedKernel(q4_tensor, gpu_device_);
     ASSERT_NE(kernel, nullptr);
 
     // Set up workspace for quantized kernel
@@ -1975,7 +1984,7 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_VaryingBatchSizes)
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
 
     // Get ONE cached kernel
-    auto *kernel = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(q4_tensor);
+    auto *kernel = getPreparedKernel(q4_tensor, gpu_device_);
     ASSERT_NE(kernel, nullptr);
 
     // Set up workspace for quantized kernel (with largest batch size = 128)
@@ -2248,7 +2257,7 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
  * @test Fused QKV using cached kernels (simulating full pipeline)
  *
  * This test mimics the full pipeline's kernel usage:
- * 1. Uses getOrCreateGemm() to get cached kernels
+ * 1. Uses prepared-handle + GEMM engine lookup to get cached kernels
  * 2. Uses real model weights and biases
  * 3. Runs multiple iterations like decode
  */
@@ -2297,9 +2306,9 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
     ASSERT_TRUE(wv->ensureOnDevice(gpu_device_));
 
     // Get CACHED kernels (this is what the pipeline does)
-    auto *kernel_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq);
-    auto *kernel_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk);
-    auto *kernel_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv);
+    auto *kernel_q = getPreparedKernel(wq, gpu_device_);
+    auto *kernel_k = getPreparedKernel(wk, gpu_device_);
+    auto *kernel_v = getPreparedKernel(wv, gpu_device_);
     ASSERT_NE(kernel_q, nullptr);
     ASSERT_NE(kernel_k, nullptr);
     ASSERT_NE(kernel_v, nullptr);

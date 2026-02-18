@@ -7,7 +7,6 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
-#include <memory>
 
 namespace llaminar2
 {
@@ -53,7 +52,8 @@ namespace llaminar2
 
     private:
         Params params_;
-        mutable std::unique_ptr<llaminar2::ITensorSwiGLU> cached_kernel_;
+        mutable llaminar2::ITensorSwiGLU *cached_kernel_ = nullptr;
+        mutable int cached_kernel_tensor_type_ = -1;
     };
 
 } // namespace llaminar2

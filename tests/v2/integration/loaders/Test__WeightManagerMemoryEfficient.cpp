@@ -28,6 +28,19 @@ namespace llaminar2
     namespace test
     {
 
+        namespace
+        {
+            ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id = DeviceId::cpu())
+            {
+                auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(tensor, device_id);
+                if (!prepared)
+                {
+                    return nullptr;
+                }
+                return llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+            }
+        }
+
         class WeightManagerMemoryEfficientTest : public ::testing::Test
         {
         protected:
@@ -170,10 +183,10 @@ namespace llaminar2
             ASSERT_NE(slice, nullptr);
             ASSERT_TRUE(slice->metadata().inner_is_presliced);
 
-            // Get cached GEMM kernel (should work with pre-sliced data)
-            // Note: We use KernelFactory::getOrCreateGemm() because raw data may have been released
+            // Get cached GEMM engine (should work with pre-sliced data)
+            // Note: prepared-weight path is required because raw data may have been released
             // after the WeightManager packed the weights during getWeight()
-            auto *gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(slice);
+            auto *gemm = getPreparedKernel(slice, DeviceId::cpu());
             ASSERT_NE(gemm, nullptr) << "Failed to get GEMM kernel from pre-sliced data";
 
             // Prepare test input: [batch=4, K=896]
@@ -262,7 +275,7 @@ namespace llaminar2
             ASSERT_NE(slice1, nullptr);
 
             // Note: Raw data release happens through WeightPreloader::packWeight() path,
-            // not through direct KernelFactory::getOrCreateGemm() calls.
+            // not through direct GEMM engine lookup calls.
             // The memory-efficient behavior is tested via the preloader tests.
             // Here we just verify that combined slices produce correct GEMM output.
 
@@ -284,9 +297,9 @@ namespace llaminar2
             std::vector<float> output0(m * n_half, 0.0f);
             std::vector<float> output1(m * n_half, 0.0f);
 
-            auto *gemm_full = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(full_weight.get());
-            auto *gemm0 = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(slice0);
-            auto *gemm1 = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(slice1);
+            auto *gemm_full = getPreparedKernel(full_weight.get(), DeviceId::cpu());
+            auto *gemm0 = getPreparedKernel(slice0, DeviceId::cpu());
+            auto *gemm1 = getPreparedKernel(slice1, DeviceId::cpu());
 
             ASSERT_NE(gemm_full, nullptr);
             ASSERT_NE(gemm0, nullptr);

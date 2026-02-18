@@ -9,6 +9,7 @@
 #include "backends/HostBackend.h"
 #include "../tensors/TensorClasses.h"
 #include "../backends/BackendManager.h" // For getCUDABackend, getROCmBackend
+#include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 #include <algorithm>
 #include <chrono>
@@ -35,6 +36,109 @@
 
 namespace llaminar2
 {
+    bool LocalTPContext::isLocalTPNCCLGraphPolicySupported(std::string *reason_out) const
+    {
+        const auto &exec = debugEnv().execution;
+
+        // No graph capture in use: LocalTP NCCL is unaffected.
+        if (!exec.gpu_graphs)
+        {
+            if (reason_out)
+            {
+                *reason_out = "gpu_graphs_off";
+            }
+            return true;
+        }
+
+        // Phase 3 support matrix: collectives under graph mode are only supported
+        // when segmented collective replay is explicitly enabled.
+        if (exec.gpu_graph_collective_segmented)
+        {
+            if (reason_out)
+            {
+                *reason_out = "gpu_graphs_segmented_collectives_enabled";
+            }
+            return true;
+        }
+
+        if (reason_out)
+        {
+            *reason_out = "gpu_graphs_on_without_segmented_collectives";
+        }
+        return false;
+    }
+
+    bool LocalTPContext::validateBarrierTensorSetForMultiGpuAllreduce(
+        size_t effective_count,
+        CollectiveDataType expected_dtype) const
+    {
+        // Junior-friendly note:
+        // The barrier gathers one tensor per LOCAL TP device. Before launching a
+        // grouped NCCL/RCCL collective, we validate that all participants describe
+        // the same logical reduction problem.
+        if (effective_count == 0)
+        {
+            LOG_ERROR("LocalTPContext::validateBarrierTensorSetForMultiGpuAllreduce: "
+                      "effective_count must be > 0");
+            return false;
+        }
+
+        for (int i = 0; i < degree(); ++i)
+        {
+            TensorBase *tensor = barrier_tensors_[i];
+            if (!tensor)
+            {
+                LOG_ERROR("LocalTPContext::validateBarrierTensorSetForMultiGpuAllreduce: "
+                          "null tensor at slot "
+                          << i);
+                return false;
+            }
+
+            auto device = tensor->current_device();
+            if (!device.has_value() || !device->is_gpu())
+            {
+                LOG_ERROR("LocalTPContext::validateBarrierTensorSetForMultiGpuAllreduce: "
+                          "tensor at slot "
+                          << i << " is not resident on a GPU device");
+                return false;
+            }
+
+            DeviceId expected_device = devices_[i].toLocalDeviceId();
+            if (*device != expected_device)
+            {
+                LOG_ERROR("LocalTPContext::validateBarrierTensorSetForMultiGpuAllreduce: "
+                          "device mismatch at slot "
+                          << i
+                          << " expected=" << expected_device.toString()
+                          << " actual=" << device->toString());
+                return false;
+            }
+
+            if (tensor->numel() < effective_count)
+            {
+                LOG_ERROR("LocalTPContext::validateBarrierTensorSetForMultiGpuAllreduce: "
+                          "count exceeds tensor size at slot "
+                          << i
+                          << " count=" << effective_count
+                          << " numel=" << tensor->numel());
+                return false;
+            }
+
+            CollectiveDataType slot_dtype = tensorDTypeToCollective(tensor);
+            if (slot_dtype != expected_dtype)
+            {
+                LOG_ERROR("LocalTPContext::validateBarrierTensorSetForMultiGpuAllreduce: "
+                          "dtype mismatch at slot "
+                          << i
+                          << " expected=" << static_cast<int>(expected_dtype)
+                          << " actual=" << static_cast<int>(slot_dtype));
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     // Helper function to get the appropriate backend for a device
     static IBackend *getBackendForDevice(DeviceId device)
     {
@@ -109,6 +213,24 @@ namespace llaminar2
                          << ", collectives will be no-ops");
             }
         }
+    }
+
+    LocalTPContext::~LocalTPContext()
+    {
+        const uint64_t attempts = nccl_allreduce_attempts_.load();
+        const uint64_t success = nccl_allreduce_success_.load();
+        const uint64_t failures = nccl_allreduce_failures_.load();
+
+        if (attempts == 0)
+        {
+            return;
+        }
+
+        LOG_INFO("[LocalTPContext][Telemetry] "
+                 << "backend=" << collectiveBackendTypeToString(backend_)
+                 << " nccl_allreduce_attempts=" << attempts
+                 << " nccl_allreduce_success=" << success
+                 << " nccl_allreduce_failures=" << failures);
     }
 
     // =========================================================================
@@ -707,6 +829,42 @@ namespace llaminar2
             // Execute the multi-GPU allreduce
             CollectiveDataType dtype = tensorDTypeToCollective(barrier_tensors_[0]);
 
+            // Phase 3 runtime policy: make graph-capture support explicit.
+            // If users enable global GPU graph mode without segmented-collective
+            // support, we fail fast with a clear marker instead of attempting an
+            // undefined collective scheduling path.
+            if (backend_ == CollectiveBackendType::NCCL)
+            {
+                std::string graph_policy_reason;
+                const bool graph_supported = isLocalTPNCCLGraphPolicySupported(&graph_policy_reason);
+                if (!graph_supported)
+                {
+                    if (!logged_graph_policy_reject_marker_.exchange(true))
+                    {
+                        LOG_ERROR("LOCALTP_NCCL_GRAPH_POLICY=UNSUPPORTED reason=" << graph_policy_reason);
+                    }
+
+                    LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: Unsupported LocalTP NCCL graph mode. "
+                              << "Enable LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=1 when LLAMINAR_GPU_GRAPHS=1");
+                    barrier_result_ = false;
+                    goto cleanup;
+                }
+
+                if (!logged_graph_policy_allow_marker_.exchange(true))
+                {
+                    LOG_INFO("LOCALTP_NCCL_GRAPH_POLICY=SUPPORTED reason=" << graph_policy_reason);
+                }
+            }
+
+            // Phase 2 guardrail: fail fast on shape/device/dtype mismatches before
+            // entering backend collective code. This makes bugs deterministic and
+            // easier to diagnose than backend-side "unhandled" failures.
+            if (!validateBarrierTensorSetForMultiGpuAllreduce(effective_count, dtype))
+            {
+                barrier_result_ = false;
+                goto cleanup;
+            }
+
             // TRACE: Log all buffer pointers before allreduce
             LOG_TRACE("LocalTPContext::allreduceWithBarrierMultiGpu: ALLREDUCE START "
                       << "num_buffers=" << buffers.size() << " count=" << effective_count);
@@ -721,10 +879,23 @@ namespace llaminar2
             bool success = backend_impl_->allreduceMultiAndSynchronize(
                 buffers, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM);
 
+            if (backend_ == CollectiveBackendType::NCCL)
+            {
+                nccl_allreduce_attempts_.fetch_add(1);
+            }
+
             if (!success)
             {
-                LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: allreduceMulti failed: "
-                          << backend_impl_->lastError());
+                const std::string backend_error = backend_impl_->lastError();
+
+                if (backend_ == CollectiveBackendType::NCCL)
+                {
+                    nccl_allreduce_failures_.fetch_add(1);
+                }
+
+                LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: allreduceMulti FAILED: "
+                          << backend_error);
+
                 barrier_result_ = false;
                 goto cleanup;
             }
@@ -738,6 +909,16 @@ namespace llaminar2
                 if (barrier_tensors_[i])
                 {
                     barrier_tensors_[i]->mark_device_dirty_with_event();
+                }
+            }
+
+            if (backend_ == CollectiveBackendType::NCCL)
+            {
+                nccl_allreduce_success_.fetch_add(1);
+                if (!logged_real_path_marker_.exchange(true))
+                {
+                    LOG_INFO("LOCALTP_NCCL_PATH=REAL backend=NCCL collective=allreduce_multi count="
+                             << effective_count << " participants=" << num_participants);
                 }
             }
 
@@ -1945,6 +2126,15 @@ namespace llaminar2
         backend_initialized_ = true;
         LOG_INFO("LocalTPContext: Backend " << backend_impl_->name()
                                             << " initialized for " << degree() << " devices");
+
+        if (backend_ == CollectiveBackendType::NCCL)
+        {
+            LOG_INFO("[LocalTPContext][NCCLReady] "
+                     << "status=ready"
+                     << " backend_impl=" << backend_impl_->name()
+                     << " degree=" << degree()
+                     << " multi_gpu_single_process=" << (backend_impl_->isMultiGpuSingleProcess() ? 1 : 0));
+        }
         return true;
     }
 

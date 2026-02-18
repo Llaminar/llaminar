@@ -4,7 +4,6 @@
  */
 
 #include "RMSNormStage.h"
-#include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
@@ -27,24 +26,24 @@ namespace llaminar2
     {
         KERNEL_PROFILE_SCOPE(KernelType::RMS_NORM);
 
-        if (!ctx)
+        if (!ensureContext(ctx, "RMSNormStage"))
         {
-            LOG_ERROR("[RMSNormStage] Null device context");
             return false;
         }
 
-        if (!params_.input || !params_.output || !params_.gamma)
+        if (!ensureRequiredPointers("RMSNormStage", {
+                                                    {"input", params_.input},
+                                                    {"output", params_.output},
+                                                    {"gamma", params_.gamma},
+                                                }))
         {
-            LOG_ERROR("[RMSNormStage] Null tensor(s): input=" << params_.input
-                                                              << " output=" << params_.output
-                                                              << " gamma=" << params_.gamma);
             return false;
         }
 
         // Cast ITensor* to TensorBase* for CPU operations
-        auto *input_base = requireTensorBase(params_.input, "input");
-        auto *gamma_base = requireTensorBase(params_.gamma, "gamma");
-        auto *output_base = requireTensorBase(params_.output, "output");
+        auto *input_base = requireTensorBasePtr(params_.input, "input");
+        auto *gamma_base = requireTensorBasePtr(params_.gamma, "gamma");
+        auto *output_base = requireTensorBasePtr(params_.output, "output");
         if (!input_base || !gamma_base || !output_base)
         {
             LOG_ERROR("[RMSNormStage] GPU tensors not yet supported");
@@ -83,22 +82,26 @@ namespace llaminar2
                                                        << " device_id=" << params_.device_id.to_string());
             }
         }
-        if (!cached_kernel_)
-        {
-            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createRMSNorm(input_base, dev_type);
-            if (!cached_kernel_)
+        auto *kernel = getOrRefreshKernelByTensorType(
+            cached_kernel_,
+            cached_kernel_tensor_type_,
+            input_base,
+            [&]()
             {
-                LOG_ERROR("[RMSNormStage] Failed to create RMSNorm kernel for type "
-                          << input_base->dtype_name());
-                return false;
-            }
+                return llaminar::v2::kernels::KernelFactory::getOrCreateRMSNorm(input_base, params_.device_id);
+            });
+        if (!kernel)
+        {
+            LOG_ERROR("[RMSNormStage] Failed to create RMSNorm kernel for type "
+                      << input_base->dtype_name());
+            return false;
         }
 
         // Thread GPU stream for graph capture
-        cached_kernel_->setGPUStream(gpuStream());
+        bindStageStream(kernel);
 
         // apply_tensor handles input != output cases internally
-        bool success = cached_kernel_->apply_tensor(
+        bool success = kernel->apply_tensor(
             input_base,
             gamma_base,
             output_base,

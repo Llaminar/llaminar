@@ -17,6 +17,7 @@
 #include "cpu/ops/CPUEmbeddingKernelT.h"
 #include "cpu/attention/CPUAttentionKernelT.h"
 #include "cpu/attention/CPUFlashAttentionKernelT.h"
+#include <unordered_set>
 
 // KVCache includes
 #include "cpu/CPURingKVCache.h"
@@ -175,7 +176,7 @@ namespace llaminar
                     // No implicit fallback - require explicit device specification
                     LOG_ERROR("[KernelFactory] Cannot determine CUDA device for kernel creation. "
                               "Tensor is not on a CUDA device and no target device was specified. "
-                              "Use getOrCreateGemm(tensor, DeviceId) to specify the target device explicitly.");
+                              "Use getOrCreatePreparedGemmWeights(tensor, DeviceId) and getOrCreateGemmEngine(prepared) to specify the target device explicitly.");
                     throw std::runtime_error(
                         "KernelFactory: CUDA device must be specified explicitly - tensor is not on CUDA "
                         "and no target device provided via CUDAOrdinalGuard or DeviceId");
@@ -218,7 +219,7 @@ namespace llaminar
                     // No implicit fallback - require explicit device specification
                     LOG_ERROR("[KernelFactory] Cannot determine ROCm device for kernel creation. "
                               "Tensor is not on a ROCm device and no target device was specified. "
-                              "Use getOrCreateGemm(tensor, DeviceId) to specify the target device explicitly.");
+                              "Use getOrCreatePreparedGemmWeights(tensor, DeviceId) and getOrCreateGemmEngine(prepared) to specify the target device explicitly.");
                     throw std::runtime_error(
                         "KernelFactory: ROCm device must be specified explicitly - tensor is not on ROCm "
                         "and no target device provided via ROCmOrdinalGuard or DeviceId");
@@ -2080,6 +2081,31 @@ namespace llaminar
             // Generic TensorBase* Factory Methods - Auto-dispatch by native_type()
             // ==========================================================================
 
+            std::unique_ptr<llaminar2::ITensorSoftmax> KernelFactory::createSoftmax(
+                const llaminar2::TensorBase *tensor, DeviceType dev_type)
+            {
+                if (!tensor)
+                {
+                    throw std::runtime_error("KernelFactory::createSoftmax: null tensor");
+                }
+
+                switch (tensor->native_type())
+                {
+                case llaminar2::TensorType::FP32:
+                    return createSoftmax(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type);
+                case llaminar2::TensorType::BF16:
+                    return createSoftmax(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type);
+                case llaminar2::TensorType::FP16:
+                    return createSoftmax(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type);
+                case llaminar2::TensorType::Q8_1:
+                    return createSoftmax(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type);
+                default:
+                    throw std::runtime_error(
+                        "KernelFactory::createSoftmax: unsupported tensor type " +
+                        std::string(tensor->dtype_name()));
+                }
+            }
+
             std::unique_ptr<llaminar2::ITensorRMSNorm> KernelFactory::createRMSNorm(
                 const llaminar2::TensorBase *tensor, DeviceType dev_type)
             {
@@ -2105,6 +2131,386 @@ namespace llaminar
                         "KernelFactory::createRMSNorm: unsupported tensor type " +
                         std::string(tensor->dtype_name()));
                 }
+            }
+
+            llaminar2::ITensorRoPE *KernelFactory::getOrCreateRoPE(
+                const llaminar2::TensorBase *tensor,
+                llaminar2::DeviceId target_device)
+            {
+                if (!tensor)
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreateRoPE: null tensor");
+                }
+
+                const DeviceKernelKey registry_key{
+                    target_device,
+                    KernelKind::ROPE,
+                    static_cast<int>(tensor->native_type())};
+
+                RoPECacheKey key{target_device, static_cast<int>(tensor->native_type())};
+
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+
+                // Phase A registry front-door (behavior-preserving shim)
+                auto reg_it = device_kernel_registry_.find(registry_key);
+                if (reg_it != device_kernel_registry_.end())
+                {
+                    LOG_DEBUG("[KernelFactory][Registry] hit kind=ROPE dev=" << static_cast<int>(target_device.type)
+                                                                               << ":" << target_device.ordinal
+                                                                               << " variant=" << static_cast<int>(tensor->native_type())
+                                                                               << " ptr=" << reg_it->second.get());
+                    return static_cast<llaminar2::ITensorRoPE *>(reg_it->second.get());
+                }
+
+                auto it = rope_cache_.find(key);
+                if (it != rope_cache_.end())
+                {
+                    auto *raw_ptr = it->second.get();
+                    device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                    LOG_DEBUG("[KernelFactory][Registry] backfill kind=ROPE dev=" << static_cast<int>(target_device.type)
+                                                                                    << ":" << target_device.ordinal
+                                                                                    << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                    << " ptr=" << raw_ptr);
+                    return raw_ptr;
+                }
+
+                auto kernel = createRoPE(tensor, getDeviceType(target_device));
+                auto *raw_ptr = kernel.get();
+                rope_cache_[key] = std::move(kernel);
+                device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                LOG_DEBUG("[KernelFactory][Registry] create kind=ROPE dev=" << static_cast<int>(target_device.type)
+                                                                              << ":" << target_device.ordinal
+                                                                              << " variant=" << static_cast<int>(tensor->native_type())
+                                                                              << " ptr=" << raw_ptr);
+                return raw_ptr;
+            }
+
+            llaminar2::ITensorRMSNorm *KernelFactory::getOrCreateRMSNorm(
+                const llaminar2::TensorBase *tensor,
+                llaminar2::DeviceId target_device)
+            {
+                if (!tensor)
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreateRMSNorm: null tensor");
+                }
+
+                const DeviceKernelKey registry_key{
+                    target_device,
+                    KernelKind::RMSNORM,
+                    static_cast<int>(tensor->native_type())};
+
+                RMSNormCacheKey key{target_device, static_cast<int>(tensor->native_type())};
+
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+
+                auto reg_it = device_kernel_registry_.find(registry_key);
+                if (reg_it != device_kernel_registry_.end())
+                {
+                    LOG_DEBUG("[KernelFactory][Registry] hit kind=RMSNORM dev=" << static_cast<int>(target_device.type)
+                                                                                  << ":" << target_device.ordinal
+                                                                                  << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                  << " ptr=" << reg_it->second.get());
+                    return static_cast<llaminar2::ITensorRMSNorm *>(reg_it->second.get());
+                }
+
+                auto it = rmsnorm_cache_.find(key);
+                if (it != rmsnorm_cache_.end())
+                {
+                    auto *raw_ptr = it->second.get();
+                    device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                    LOG_DEBUG("[KernelFactory][Registry] backfill kind=RMSNORM dev=" << static_cast<int>(target_device.type)
+                                                                                       << ":" << target_device.ordinal
+                                                                                       << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                       << " ptr=" << raw_ptr);
+                    return raw_ptr;
+                }
+
+                auto kernel = createRMSNorm(tensor, getDeviceType(target_device));
+                auto *raw_ptr = kernel.get();
+                rmsnorm_cache_[key] = std::move(kernel);
+                device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                LOG_DEBUG("[KernelFactory][Registry] create kind=RMSNORM dev=" << static_cast<int>(target_device.type)
+                                                                                 << ":" << target_device.ordinal
+                                                                                 << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                 << " ptr=" << raw_ptr);
+                return raw_ptr;
+            }
+
+            llaminar2::ITensorSwiGLU *KernelFactory::getOrCreateSwiGLU(
+                const llaminar2::TensorBase *tensor,
+                llaminar2::DeviceId target_device)
+            {
+                if (!tensor)
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreateSwiGLU: null tensor");
+                }
+
+                const DeviceKernelKey registry_key{
+                    target_device,
+                    KernelKind::SWIGLU,
+                    static_cast<int>(tensor->native_type())};
+
+                SwiGLUCacheKey key{target_device, static_cast<int>(tensor->native_type())};
+
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+
+                auto reg_it = device_kernel_registry_.find(registry_key);
+                if (reg_it != device_kernel_registry_.end())
+                {
+                    LOG_DEBUG("[KernelFactory][Registry] hit kind=SWIGLU dev=" << static_cast<int>(target_device.type)
+                                                                                 << ":" << target_device.ordinal
+                                                                                 << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                 << " ptr=" << reg_it->second.get());
+                    return static_cast<llaminar2::ITensorSwiGLU *>(reg_it->second.get());
+                }
+
+                auto it = swiglu_cache_.find(key);
+                if (it != swiglu_cache_.end())
+                {
+                    auto *raw_ptr = it->second.get();
+                    device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                    LOG_DEBUG("[KernelFactory][Registry] backfill kind=SWIGLU dev=" << static_cast<int>(target_device.type)
+                                                                                      << ":" << target_device.ordinal
+                                                                                      << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                      << " ptr=" << raw_ptr);
+                    return raw_ptr;
+                }
+
+                auto kernel = createSwiGLU(tensor, getDeviceType(target_device));
+                auto *raw_ptr = kernel.get();
+                swiglu_cache_[key] = std::move(kernel);
+                device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                LOG_DEBUG("[KernelFactory][Registry] create kind=SWIGLU dev=" << static_cast<int>(target_device.type)
+                                                                                << ":" << target_device.ordinal
+                                                                                << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                << " ptr=" << raw_ptr);
+                return raw_ptr;
+            }
+
+            llaminar2::ITensorSoftmax *KernelFactory::getOrCreateSoftmax(
+                const llaminar2::TensorBase *tensor,
+                llaminar2::DeviceId target_device)
+            {
+                if (!tensor)
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreateSoftmax: null tensor");
+                }
+
+                const DeviceKernelKey registry_key{
+                    target_device,
+                    KernelKind::SOFTMAX,
+                    static_cast<int>(tensor->native_type())};
+
+                SoftmaxCacheKey key{target_device, static_cast<int>(tensor->native_type())};
+
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+
+                auto reg_it = device_kernel_registry_.find(registry_key);
+                if (reg_it != device_kernel_registry_.end())
+                {
+                    LOG_DEBUG("[KernelFactory][Registry] hit kind=SOFTMAX dev=" << static_cast<int>(target_device.type)
+                                                                                  << ":" << target_device.ordinal
+                                                                                  << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                  << " ptr=" << reg_it->second.get());
+                    return static_cast<llaminar2::ITensorSoftmax *>(reg_it->second.get());
+                }
+
+                auto it = softmax_cache_.find(key);
+                if (it != softmax_cache_.end())
+                {
+                    auto *raw_ptr = it->second.get();
+                    device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                    LOG_DEBUG("[KernelFactory][Registry] backfill kind=SOFTMAX dev=" << static_cast<int>(target_device.type)
+                                                                                       << ":" << target_device.ordinal
+                                                                                       << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                       << " ptr=" << raw_ptr);
+                    return raw_ptr;
+                }
+
+                auto kernel = createSoftmax(tensor, getDeviceType(target_device));
+                auto *raw_ptr = kernel.get();
+                softmax_cache_[key] = std::move(kernel);
+                device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                LOG_DEBUG("[KernelFactory][Registry] create kind=SOFTMAX dev=" << static_cast<int>(target_device.type)
+                                                                                 << ":" << target_device.ordinal
+                                                                                 << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                 << " ptr=" << raw_ptr);
+                return raw_ptr;
+            }
+
+            llaminar2::ITensorResidualAdd *KernelFactory::getOrCreateResidualAdd(
+                const llaminar2::TensorBase *tensor,
+                llaminar2::DeviceId target_device)
+            {
+                if (!tensor)
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreateResidualAdd: null tensor");
+                }
+
+                const DeviceKernelKey registry_key{
+                    target_device,
+                    KernelKind::RESIDUAL_ADD,
+                    static_cast<int>(tensor->native_type())};
+
+                ResidualAddCacheKey key{target_device, static_cast<int>(tensor->native_type())};
+
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+
+                auto reg_it = device_kernel_registry_.find(registry_key);
+                if (reg_it != device_kernel_registry_.end())
+                {
+                    LOG_DEBUG("[KernelFactory][Registry] hit kind=RESIDUAL_ADD dev=" << static_cast<int>(target_device.type)
+                                                                                       << ":" << target_device.ordinal
+                                                                                       << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                       << " ptr=" << reg_it->second.get());
+                    return static_cast<llaminar2::ITensorResidualAdd *>(reg_it->second.get());
+                }
+
+                auto it = residual_add_cache_.find(key);
+                if (it != residual_add_cache_.end())
+                {
+                    auto *raw_ptr = it->second.get();
+                    device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                    LOG_DEBUG("[KernelFactory][Registry] backfill kind=RESIDUAL_ADD dev=" << static_cast<int>(target_device.type)
+                                                                                            << ":" << target_device.ordinal
+                                                                                            << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                            << " ptr=" << raw_ptr);
+                    return raw_ptr;
+                }
+
+                auto kernel = createResidualAdd(tensor, getDeviceType(target_device));
+                auto *raw_ptr = kernel.get();
+                residual_add_cache_[key] = std::move(kernel);
+                device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                LOG_DEBUG("[KernelFactory][Registry] create kind=RESIDUAL_ADD dev=" << static_cast<int>(target_device.type)
+                                                                                      << ":" << target_device.ordinal
+                                                                                      << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                      << " ptr=" << raw_ptr);
+                return raw_ptr;
+            }
+
+            llaminar2::ITensorAttention *KernelFactory::getOrCreateAttention(
+                const llaminar2::ITensor *tensor,
+                llaminar2::DeviceId target_device)
+            {
+                if (!tensor)
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreateAttention: null tensor");
+                }
+
+                const DeviceKernelKey registry_key{
+                    target_device,
+                    KernelKind::ATTENTION,
+                    static_cast<int>(tensor->native_type())};
+
+                AttentionCacheKey key{target_device, static_cast<int>(tensor->native_type())};
+
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+
+                auto reg_it = device_kernel_registry_.find(registry_key);
+                if (reg_it != device_kernel_registry_.end())
+                {
+                    LOG_DEBUG("[KernelFactory][Registry] hit kind=ATTENTION dev=" << static_cast<int>(target_device.type)
+                                                                                    << ":" << target_device.ordinal
+                                                                                    << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                    << " ptr=" << reg_it->second.get());
+                    return static_cast<llaminar2::ITensorAttention *>(reg_it->second.get());
+                }
+
+                auto it = attention_cache_.find(key);
+                if (it != attention_cache_.end())
+                {
+                    auto *raw_ptr = it->second.get();
+                    device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                    LOG_DEBUG("[KernelFactory][Registry] backfill kind=ATTENTION dev=" << static_cast<int>(target_device.type)
+                                                                                         << ":" << target_device.ordinal
+                                                                                         << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                         << " ptr=" << raw_ptr);
+                    return raw_ptr;
+                }
+
+                auto kernel = createAttention(tensor, getDeviceType(target_device));
+                auto *raw_ptr = kernel.get();
+                attention_cache_[key] = std::move(kernel);
+                device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                LOG_DEBUG("[KernelFactory][Registry] create kind=ATTENTION dev=" << static_cast<int>(target_device.type)
+                                                                                   << ":" << target_device.ordinal
+                                                                                   << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                   << " ptr=" << raw_ptr);
+                return raw_ptr;
+            }
+
+            llaminar2::ITensorEmbedding *KernelFactory::getOrCreateEmbedding(
+                const llaminar2::TensorBase *tensor,
+                llaminar2::DeviceId target_device)
+            {
+                if (!tensor)
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreateEmbedding: null tensor");
+                }
+
+                const DeviceKernelKey registry_key{
+                    target_device,
+                    KernelKind::EMBEDDING,
+                    static_cast<int>(tensor->native_type())};
+
+                EmbeddingCacheKey key{target_device, static_cast<int>(tensor->native_type())};
+
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+
+                auto reg_it = device_kernel_registry_.find(registry_key);
+                if (reg_it != device_kernel_registry_.end())
+                {
+                    LOG_DEBUG("[KernelFactory][Registry] hit kind=EMBEDDING dev=" << static_cast<int>(target_device.type)
+                                                                                    << ":" << target_device.ordinal
+                                                                                    << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                    << " ptr=" << reg_it->second.get());
+                    return static_cast<llaminar2::ITensorEmbedding *>(reg_it->second.get());
+                }
+
+                auto it = embedding_cache_.find(key);
+                if (it != embedding_cache_.end())
+                {
+                    auto *raw_ptr = it->second.get();
+                    device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                    LOG_DEBUG("[KernelFactory][Registry] backfill kind=EMBEDDING dev=" << static_cast<int>(target_device.type)
+                                                                                         << ":" << target_device.ordinal
+                                                                                         << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                         << " ptr=" << raw_ptr);
+                    return raw_ptr;
+                }
+
+                auto dev_type = getDeviceType(target_device);
+                std::unique_ptr<llaminar2::ITensorEmbedding> kernel;
+
+                switch (tensor->native_type())
+                {
+                case llaminar2::TensorType::FP32:
+                    kernel = createEmbedding(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type);
+                    break;
+                case llaminar2::TensorType::BF16:
+                    kernel = createEmbedding(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type);
+                    break;
+                case llaminar2::TensorType::FP16:
+                    kernel = createEmbedding(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type);
+                    break;
+                case llaminar2::TensorType::Q8_1:
+                    kernel = createEmbedding(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type);
+                    break;
+                default:
+                    throw std::runtime_error(
+                        "KernelFactory::getOrCreateEmbedding: unsupported tensor type " +
+                        std::string(tensor->dtype_name()));
+                }
+
+                auto *raw_ptr = kernel.get();
+                embedding_cache_[key] = std::move(kernel);
+                device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                LOG_DEBUG("[KernelFactory][Registry] create kind=EMBEDDING dev=" << static_cast<int>(target_device.type)
+                                                                                   << ":" << target_device.ordinal
+                                                                                   << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                   << " ptr=" << raw_ptr);
+                return raw_ptr;
             }
 
             std::unique_ptr<llaminar2::ITensorRoPE> KernelFactory::createRoPE(
@@ -2475,12 +2881,20 @@ namespace llaminar
             // Kernel Cache - Static Members
             // ==========================================================================
 
-            std::unordered_map<const llaminar2::TensorBase *, std::unique_ptr<llaminar2::ITensorGemm>> KernelFactory::kernel_cache_;
             std::mutex KernelFactory::cache_mutex_;
             std::unordered_map<KernelFactory::SlicedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, KernelFactory::SlicedKeyHash> KernelFactory::sliced_cache_;
-            std::unordered_map<KernelFactory::DeviceTargetedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, KernelFactory::DeviceTargetedKeyHash> KernelFactory::device_targeted_cache_;
             std::unordered_map<KernelFactory::FusedQKVCacheKey, std::unique_ptr<llaminar2::ITensorFusedQKVGemm>, KernelFactory::FusedQKVKeyHash> KernelFactory::fused_qkv_cache_;
             std::unordered_map<KernelFactory::FusedGateUpCacheKey, std::unique_ptr<llaminar2::ITensorFusedGateUpGemm>, KernelFactory::FusedGateUpKeyHash> KernelFactory::fused_gate_up_cache_;
+            std::unordered_map<KernelFactory::RoPECacheKey, std::unique_ptr<llaminar2::ITensorRoPE>, KernelFactory::RoPECacheKeyHash> KernelFactory::rope_cache_;
+            std::unordered_map<KernelFactory::RMSNormCacheKey, std::unique_ptr<llaminar2::ITensorRMSNorm>, KernelFactory::RMSNormCacheKeyHash> KernelFactory::rmsnorm_cache_;
+            std::unordered_map<KernelFactory::SwiGLUCacheKey, std::unique_ptr<llaminar2::ITensorSwiGLU>, KernelFactory::SwiGLUCacheKeyHash> KernelFactory::swiglu_cache_;
+            std::unordered_map<KernelFactory::SoftmaxCacheKey, std::unique_ptr<llaminar2::ITensorSoftmax>, KernelFactory::SoftmaxCacheKeyHash> KernelFactory::softmax_cache_;
+            std::unordered_map<KernelFactory::ResidualAddCacheKey, std::unique_ptr<llaminar2::ITensorResidualAdd>, KernelFactory::ResidualAddCacheKeyHash> KernelFactory::residual_add_cache_;
+            std::unordered_map<KernelFactory::AttentionCacheKey, std::unique_ptr<llaminar2::ITensorAttention>, KernelFactory::AttentionCacheKeyHash> KernelFactory::attention_cache_;
+            std::unordered_map<KernelFactory::EmbeddingCacheKey, std::unique_ptr<llaminar2::ITensorEmbedding>, KernelFactory::EmbeddingCacheKeyHash> KernelFactory::embedding_cache_;
+            std::unordered_map<DeviceKernelKey, std::shared_ptr<void>, DeviceKernelKeyHash> KernelFactory::device_kernel_registry_;
+            std::unordered_map<KernelFactory::PreparedGemmKey, std::shared_ptr<KernelFactory::PreparedGemmHandle>, KernelFactory::PreparedGemmKeyHash> KernelFactory::prepared_gemm_registry_;
+            std::unordered_map<DeviceKernelKey, std::shared_ptr<KernelFactory::IGemmEngine>, DeviceKernelKeyHash> KernelFactory::device_gemm_engine_registry_;
 
             // NOTE: Device-level kernel caching (hipBLAS, cuBLAS handles, etc.)
             // has moved to DeviceKernelCache. See kernels/DeviceKernelCache.h
@@ -2669,499 +3083,6 @@ namespace llaminar
             // NOTE: Shared device kernel caching (hipBLAS, cuBLAS handles, etc.)
             // has been moved to DeviceKernelCache. See kernels/DeviceKernelCache.h
 
-            llaminar2::ITensorGemm *KernelFactory::getOrCreateGemm(const llaminar2::TensorBase *tensor)
-            {
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-
-                // Get tensor dimensions for validation
-                const auto &shape = tensor->shape();
-                if (shape.size() != 2)
-                {
-                    LOG_ERROR("[KernelFactory] Tensor must be 2D for GEMM, got " << shape.size() << "D");
-                    throw std::runtime_error("KernelFactory: tensor must be 2D");
-                }
-                int tensor_n = static_cast<int>(shape[0]); // rows = output features
-                int tensor_k = static_cast<int>(shape[1]); // cols = input features
-
-                // Debug: Log cache lookup for Q weight tensors
-                if (tensor_n == 896 && tensor_k == 896)
-                {
-                    LOG_TRACE("[KernelFactory::getOrCreateGemm] Looking up tensor=" << static_cast<const void *>(tensor)
-                                                                                    << " shape=[" << tensor_n << "," << tensor_k << "]"
-                                                                                    << " cache_size=" << kernel_cache_.size());
-                }
-
-                // Check kernel cache first
-                auto it = kernel_cache_.find(tensor);
-                if (it != kernel_cache_.end())
-                {
-                    // Validate cached kernel dimensions match tensor (handles memory reuse)
-                    auto *quantised = dynamic_cast<llaminar2::gemm_v4::QuantisedGemmKernel *>(it->second.get());
-                    if (quantised)
-                    {
-                        if (quantised->get_n() == tensor_n && quantised->get_k() == tensor_k)
-                        {
-                            if (tensor_n == 896 && tensor_k == 896)
-                            {
-                                LOG_TRACE("[KernelFactory::getOrCreateGemm] CACHE HIT: returning cached kernel=" << static_cast<const void *>(it->second.get()));
-                            }
-                            return it->second.get();
-                        }
-                        // Dimensions mismatch - tensor memory was reused, evict stale entry
-                        LOG_DEBUG("[KernelFactory] Cache eviction due to dimension mismatch: "
-                                  << "cached N=" << quantised->get_n() << ", K=" << quantised->get_k()
-                                  << " vs tensor N=" << tensor_n << ", K=" << tensor_k);
-                        kernel_cache_.erase(it);
-                    }
-                    else
-                    {
-                        // Non-quantised kernel (FP32/FP16/BF16) - just return it
-                        // TODO: Add dimension validation for floating-point kernels too
-                        return it->second.get();
-                    }
-                }
-
-                // Get device type from tensor's current location
-                auto current_dev = tensor->current_device();
-                DeviceType dev_type = DeviceType::CPU;
-                if (current_dev.has_value() && current_dev->is_gpu())
-                {
-                    dev_type = current_dev->is_cuda() ? DeviceType::CUDA : DeviceType::ROCm;
-                }
-
-                // Handle TensorSlice: delegate to inner tensor's kernel creation
-                // TensorSlice always implements IINT8Unpackable, but the inner tensor may not
-                if (auto *slice = dynamic_cast<const llaminar2::TensorSlice *>(tensor))
-                {
-                    // Check if inner tensor actually supports quantized GEMM
-                    if (!slice->supports_int8_unpack())
-                    {
-                        // Inner tensor is FP32/FP16/BF16 - dispatch based on inner type
-                        const auto *inner = slice->inner();
-                        if (auto *t = dynamic_cast<const llaminar2::FP32Tensor *>(inner))
-                        {
-                            auto kernel = createGemm(t, dev_type);
-                            auto *raw_ptr = kernel.get();
-                            kernel_cache_[tensor] = std::move(kernel);
-                            return raw_ptr;
-                        }
-                        else if (auto *t = dynamic_cast<const llaminar2::FP16Tensor *>(inner))
-                        {
-                            auto kernel = createGemm(t, dev_type);
-                            auto *raw_ptr = kernel.get();
-                            kernel_cache_[tensor] = std::move(kernel);
-                            return raw_ptr;
-                        }
-                        else if (auto *t = dynamic_cast<const llaminar2::BF16Tensor *>(inner))
-                        {
-                            auto kernel = createGemm(t, dev_type);
-                            auto *raw_ptr = kernel.get();
-                            kernel_cache_[tensor] = std::move(kernel);
-                            return raw_ptr;
-                        }
-                        else
-                        {
-                            LOG_ERROR("[KernelFactory] TensorSlice wraps unknown non-quantized type: "
-                                      << static_cast<int>(inner->native_type()));
-                            throw std::runtime_error("KernelFactory: TensorSlice wraps unknown type");
-                        }
-                    }
-                    // Inner tensor supports INT8 unpack - fall through to quantized path below
-                }
-
-                // For CPU quantized tensors, use tensor-owned packed weights pattern
-                if (dev_type == DeviceType::CPU)
-                {
-                    // Check if tensor implements IINT8Unpackable (quantized weight tensor)
-                    const auto *unpackable = dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor);
-                    if (unpackable)
-                    {
-                        // For TensorSlice, verify inner actually supports it (already checked above but be safe)
-                        if (auto *slice = dynamic_cast<const llaminar2::TensorSlice *>(tensor))
-                        {
-                            if (!slice->supports_int8_unpack())
-                            {
-                                // This should not happen if the above check passed
-                                LOG_ERROR("[KernelFactory] TensorSlice passed IINT8Unpackable check but supports_int8_unpack=false");
-                                throw std::runtime_error("KernelFactory: TensorSlice type mismatch");
-                            }
-                        }
-
-                        // Get or create packed weights in tensor's cache_
-                        TensorPackedWeightsCache *packed_cache = nullptr;
-
-                        // Check if tensor already has packed weights cached
-                        if (tensor->cache_.has_value())
-                        {
-                            try
-                            {
-                                packed_cache = std::any_cast<TensorPackedWeightsCache *>(tensor->cache_);
-                            }
-                            catch (const std::bad_any_cast &)
-                            {
-                                // cache_ contains something else (e.g., different type) - overwrite
-                                packed_cache = nullptr;
-                            }
-                        }
-
-                        if (!packed_cache)
-                        {
-                            // Pack weights into tensor's cache_
-                            auto *new_cache = new TensorPackedWeightsCache();
-                            if (!llaminar2::gemm_v4::QuantisedGemmKernel::packWeightsInto(
-                                    tensor, new_cache->packed, 0, -1))
-                            {
-                                delete new_cache;
-                                LOG_ERROR("[KernelFactory] Failed to pack weights for tensor type "
-                                          << static_cast<int>(tensor->native_type()));
-                                throw std::runtime_error("KernelFactory: failed to pack weights");
-                            }
-
-                            // Store in tensor's cache_ (tensor owns the packed data)
-                            tensor->cache_ = new_cache;
-                            packed_cache = new_cache;
-
-                            LOG_TRACE("[KernelFactory] Packed weights for tensor "
-                                      << tensor << " (" << packed_cache->packed.N << "x" << packed_cache->packed.K << ")");
-                        }
-
-                        // Create lightweight kernel referencing tensor's packed data
-                        auto kernel = std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(
-                            &packed_cache->packed);
-
-                        auto *raw_ptr = kernel.get();
-
-                        // Debug: Log cache miss for Q weight tensors
-                        if (tensor_n == 896 && tensor_k == 896)
-                        {
-                            LOG_TRACE("[KernelFactory::getOrCreateGemm] CACHE MISS: created new kernel=" << static_cast<const void *>(raw_ptr)
-                                                                                                         << " for tensor=" << static_cast<const void *>(tensor)
-                                                                                                         << " pw.data=" << static_cast<const void *>(packed_cache->packed.packed_data.data()));
-                        }
-
-                        kernel_cache_[tensor] = std::move(kernel);
-                        return raw_ptr;
-                    }
-                }
-
-                // Fall through to legacy per-type dispatch for FP32/FP16/BF16 and GPU backends
-                std::unique_ptr<llaminar2::ITensorGemm> kernel;
-
-                // Floating-point tensors (no packing needed)
-                if (auto *t = dynamic_cast<const llaminar2::FP32Tensor *>(tensor))
-                {
-                    kernel = createGemm(t, dev_type);
-                }
-                else if (auto *t = dynamic_cast<const llaminar2::FP16Tensor *>(tensor))
-                {
-                    kernel = createGemm(t, dev_type);
-                }
-                else if (auto *t = dynamic_cast<const llaminar2::BF16Tensor *>(tensor))
-                {
-                    kernel = createGemm(t, dev_type);
-                }
-#ifdef HAVE_CUDA
-                // GPU backends for quantized types (CUDA uses different packing)
-                else if (dev_type != DeviceType::CPU)
-                {
-                    // Handle TensorSlice: unwrap to get inner tensor type for dispatch
-                    // This occurs when weights are sharded across MPI ranks
-                    const llaminar2::TensorBase *dispatch_tensor = tensor;
-                    if (auto *slice = dynamic_cast<const llaminar2::TensorSlice *>(tensor))
-                    {
-                        dispatch_tensor = slice->inner();
-                        LOG_DEBUG("[KernelFactory] CUDA: Unwrapping TensorSlice -> inner type "
-                                  << static_cast<int>(dispatch_tensor->native_type()));
-                    }
-
-                    // Type-based dispatch for GPU backends
-                    if (auto *t = dynamic_cast<const llaminar2::IQ4_NLTensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q4_0Tensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q4_1Tensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q5_0Tensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q5_1Tensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q6_KTensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q8_0Tensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q8_1Tensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q2_KTensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q3_KTensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q4_KTensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q5_KTensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q8_KTensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ1_MTensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ1_STensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ2_STensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ2_XSTensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ2_XXSTensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ3_STensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ3_XXSTensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ4_XSTensor *>(dispatch_tensor))
-                    {
-                        kernel = createGemm(t, dev_type);
-                    }
-                    else
-                    {
-                        LOG_ERROR("[KernelFactory] Unknown tensor type for GPU: " << static_cast<int>(tensor->native_type()));
-                        throw std::runtime_error("KernelFactory::getOrCreateGemm: unknown tensor type for GPU");
-                    }
-                }
-#endif
-                else
-                {
-                    LOG_ERROR("[KernelFactory] Unknown tensor type: " << static_cast<int>(tensor->native_type()));
-                    throw std::runtime_error("KernelFactory::getOrCreateGemm: unknown tensor type");
-                }
-
-                // Cache and return
-                auto *raw_ptr = kernel.get();
-                kernel_cache_[tensor] = std::move(kernel);
-                return raw_ptr;
-            }
-
-            llaminar2::ITensorGemm *KernelFactory::getOrCreateGemm(
-                const llaminar2::TensorBase *tensor,
-                DeviceType target_device)
-            {
-                // If target is CPU, just delegate to the regular version
-                // Do this BEFORE acquiring lock to avoid deadlock
-                if (target_device == DeviceType::CPU)
-                {
-                    return getOrCreateGemm(tensor);
-                }
-
-                // Get the target ordinal from thread-local storage (set by ROCmOrdinalGuard/CUDAOrdinalGuard)
-                // This is critical for multi-GPU correctness: each GPU has separate memory and kernels
-                // packed on one GPU cannot be used on another.
-                int target_ordinal = 0;
-#ifdef HAVE_ROCM
-                if (target_device == DeviceType::ROCm && tl_target_rocm_ordinal.has_value())
-                {
-                    target_ordinal = tl_target_rocm_ordinal.value();
-                }
-#endif
-#ifdef HAVE_CUDA
-                if (target_device == DeviceType::CUDA && tl_target_cuda_ordinal.has_value())
-                {
-                    target_ordinal = tl_target_cuda_ordinal.value();
-                }
-#endif
-                // If ordinal not set via guard, try to get from tensor's current device
-                if (target_ordinal == 0)
-                {
-                    auto current_dev = tensor->current_device();
-                    if (current_dev.has_value() && current_dev->is_gpu())
-                    {
-                        target_ordinal = current_dev->gpu_ordinal();
-                    }
-                }
-
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-
-                // Check device-targeted cache first (now includes ordinal for per-GPU caching)
-                DeviceTargetedCacheKey key{tensor, target_device, target_ordinal};
-                auto it = device_targeted_cache_.find(key);
-                if (it != device_targeted_cache_.end())
-                {
-                    LOG_DEBUG("[KernelFactory::getOrCreateGemm(tensor,device)] Cache hit: tensor="
-                              << (void *)tensor << " device=" << static_cast<int>(target_device)
-                              << " ordinal=" << target_ordinal
-                              << " returning kernel=" << (void *)it->second.get());
-                    return it->second.get();
-                }
-
-                LOG_DEBUG("[KernelFactory::getOrCreateGemm(tensor,device)] Cache miss: tensor="
-                          << (void *)tensor << " shape=" << tensor->shape()[0] << "x" << tensor->shape()[1]
-                          << " device=" << static_cast<int>(target_device) << " ordinal=" << target_ordinal);
-
-                // Get tensor dimensions for validation
-                const auto &shape = tensor->shape();
-                if (shape.size() != 2)
-                {
-                    LOG_ERROR("[KernelFactory] Tensor must be 2D for GEMM, got " << shape.size() << "D");
-                    throw std::runtime_error("KernelFactory: tensor must be 2D");
-                }
-
-                // Get device type from tensor's current location
-                auto current_dev = tensor->current_device();
-                DeviceType tensor_dev_type = DeviceType::CPU;
-                if (current_dev.has_value() && current_dev->is_gpu())
-                {
-                    tensor_dev_type = current_dev->is_cuda() ? DeviceType::CUDA : DeviceType::ROCm;
-                }
-                LOG_DEBUG("[KernelFactory::getOrCreateGemm] Creating kernel with target device "
-                          << static_cast<int>(target_device)
-                          << " for tensor on device " << static_cast<int>(tensor_dev_type));
-
-                std::unique_ptr<llaminar2::ITensorGemm> kernel;
-
-                // Dispatch by tensor type, creating kernel for target_device
-#ifdef HAVE_CUDA
-                if (target_device == DeviceType::CUDA)
-                {
-                    // For CUDA target, create CUDA kernel regardless of where weights are stored
-                    // The weights will be uploaded to GPU on first use
-                    const auto *dispatch_tensor = tensor;
-
-                    // Handle TensorSlice - get inner tensor for type dispatch
-                    if (auto *slice = dynamic_cast<const llaminar2::TensorSlice *>(tensor))
-                    {
-                        if (!slice->supports_int8_unpack())
-                        {
-                            // NO FALLBACK: TensorSlice of non-quantized type not supported on CUDA
-                            throw std::runtime_error(
-                                "TensorSlice of non-quantized type not supported on CUDA - no silent fallback to CPU");
-                        }
-                        // Use the inner tensor for type dispatch
-                        dispatch_tensor = slice->inner();
-                    }
-
-                    // Dispatch to type-specific createGemm via dynamic dispatch
-                    kernel = createGemm(dispatch_tensor, target_device);
-                }
-#endif
-#ifdef HAVE_ROCM
-                if (target_device == DeviceType::ROCm)
-                {
-                    // For ROCm target, create ROCm kernel
-                    const auto *dispatch_tensor = tensor;
-
-                    // Handle TensorSlice - get inner tensor for type dispatch
-                    if (auto *slice = dynamic_cast<const llaminar2::TensorSlice *>(tensor))
-                    {
-                        if (!slice->supports_int8_unpack())
-                        {
-                            throw std::runtime_error(
-                                "TensorSlice of non-quantized type not supported on ROCm - no silent fallback to CPU");
-                        }
-                        // Use the inner tensor for type dispatch
-                        dispatch_tensor = slice->inner();
-                    }
-
-                    // Dispatch to type-specific createGemm via dynamic dispatch
-                    kernel = createGemm(dispatch_tensor, target_device);
-                }
-#endif
-
-#if !defined(HAVE_CUDA) && !defined(HAVE_ROCM)
-                // Neither CUDA nor ROCm - only CPU supported
-                if (target_device != DeviceType::CPU)
-                {
-                    throw std::runtime_error("Unsupported target device type: " + std::to_string(static_cast<int>(target_device)) + " - no GPU backends compiled");
-                }
-#else
-                // Validate that we handled the target device (CUDA or ROCm path should have run)
-                if (target_device != DeviceType::CPU && target_device != DeviceType::CUDA && target_device != DeviceType::ROCm)
-                {
-                    throw std::runtime_error("Unsupported target device type: " + std::to_string(static_cast<int>(target_device)));
-                }
-#endif
-
-                // We should always have a kernel if we get here (all error paths throw)
-                if (!kernel)
-                {
-                    throw std::runtime_error("[KernelFactory] Internal error: Failed to create kernel for target device");
-                }
-
-                // Cache and return
-                auto *raw_ptr = kernel.get();
-                device_targeted_cache_[key] = std::move(kernel);
-                LOG_DEBUG("[KernelFactory] Cached device-targeted kernel: tensor="
-                          << static_cast<const void *>(tensor) << " device=" << static_cast<int>(target_device)
-                          << " ordinal=" << target_ordinal);
-                return raw_ptr;
-            }
-
-            // =========================================================================
-            // getOrCreateGemm with DeviceId (extracts type AND ordinal)
-            // =========================================================================
-            llaminar2::ITensorGemm *KernelFactory::getOrCreateGemm(
-                const llaminar2::TensorBase *tensor,
-                llaminar2::DeviceId target_device)
-            {
-                DeviceType dev_type = getDeviceType(target_device);
-
-#ifdef HAVE_ROCM
-                // For ROCm: set the target ordinal so getROCmDeviceIdForKernel uses it
-                if (dev_type == DeviceType::ROCm)
-                {
-                    ROCmOrdinalGuard guard(target_device.rocm_ordinal());
-                    return getOrCreateGemm(tensor, dev_type);
-                }
-#endif
-
-#ifdef HAVE_CUDA
-                // For CUDA: set the target ordinal so getCUDADeviceIdForKernel uses it
-                if (dev_type == DeviceType::CUDA)
-                {
-                    CUDAOrdinalGuard guard(target_device.cuda_ordinal());
-                    return getOrCreateGemm(tensor, dev_type);
-                }
-#endif
-
-                // For CPU or if GPU-specific handling not needed, just delegate
-                return getOrCreateGemm(tensor, dev_type);
-            }
-
             llaminar2::ITensorGemm *KernelFactory::getOrCreateGemmSliced(
                 const llaminar2::TensorBase *tensor,
                 size_t row_start,
@@ -3234,7 +3155,6 @@ namespace llaminar
             void KernelFactory::clearCacheFor(const llaminar2::TensorBase *tensor)
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
-                kernel_cache_.erase(tensor);
 
                 // Also clear any sliced kernels for this tensor
                 for (auto it = sliced_cache_.begin(); it != sliced_cache_.end();)
@@ -3310,7 +3230,15 @@ namespace llaminar
                 // Clear any fused QKV kernels that reference this tensor
                 for (auto it = fused_qkv_cache_.begin(); it != fused_qkv_cache_.end();)
                 {
-                    if (it->first.wq == tensor || it->first.wk == tensor || it->first.wv == tensor)
+                    const auto *wq_handle = it->first.wq_handle;
+                    const auto *wk_handle = it->first.wk_handle;
+                    const auto *wv_handle = it->first.wv_handle;
+                    const bool references_tensor =
+                        (wq_handle && wq_handle->tensor == tensor) ||
+                        (wk_handle && wk_handle->tensor == tensor) ||
+                        (wv_handle && wv_handle->tensor == tensor);
+
+                    if (references_tensor)
                     {
                         it = fused_qkv_cache_.erase(it);
                     }
@@ -3323,7 +3251,13 @@ namespace llaminar
                 // Clear any fused Gate/Up kernels that reference this tensor
                 for (auto it = fused_gate_up_cache_.begin(); it != fused_gate_up_cache_.end();)
                 {
-                    if (it->first.w_gate == tensor || it->first.w_up == tensor)
+                    const auto *gate_handle = it->first.w_gate_handle;
+                    const auto *up_handle = it->first.w_up_handle;
+                    const bool references_tensor =
+                        (gate_handle && gate_handle->tensor == tensor) ||
+                        (up_handle && up_handle->tensor == tensor);
+
+                    if (references_tensor)
                     {
                         it = fused_gate_up_cache_.erase(it);
                     }
@@ -3333,12 +3267,11 @@ namespace llaminar
                     }
                 }
 
-                // Clear any device-targeted kernels that reference this tensor
-                for (auto it = device_targeted_cache_.begin(); it != device_targeted_cache_.end();)
+                for (auto it = prepared_gemm_registry_.begin(); it != prepared_gemm_registry_.end();)
                 {
                     if (it->first.tensor == tensor)
                     {
-                        it = device_targeted_cache_.erase(it);
+                        it = prepared_gemm_registry_.erase(it);
                     }
                     else
                     {
@@ -3351,77 +3284,130 @@ namespace llaminar
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
 
-                // Clean up all tensor packed weights caches (CPU VNNI and CUDA INT8)
-                for (auto &pair : kernel_cache_)
+                std::unordered_set<const llaminar2::TensorBase *> tracked_tensors;
+                tracked_tensors.reserve(prepared_gemm_registry_.size() + sliced_cache_.size() + fused_qkv_cache_.size() + fused_gate_up_cache_.size());
+
+                for (const auto &entry : prepared_gemm_registry_)
                 {
-                    const auto *tensor = pair.first;
-                    if (tensor)
+                    if (entry.first.tensor)
                     {
-                        // Clean up CPU packed weights
-                        if (tensor->cache_.has_value())
-                        {
-                            try
-                            {
-                                auto *packed_cache = std::any_cast<TensorPackedWeightsCache *>(tensor->cache_);
-                                if (packed_cache)
-                                {
-                                    delete packed_cache;
-                                    tensor->cache_.reset();
-                                }
-                            }
-                            catch (const std::bad_any_cast &)
-                            {
-                                // cache_ contains something else - leave it alone
-                            }
-                        }
-
-#ifdef HAVE_CUDA
-                        // Clean up CUDA packed weights
-                        if (tensor->cuda_cache_.has_value())
-                        {
-                            try
-                            {
-                                auto *cuda_packed_cache = std::any_cast<TensorCUDAPackedWeightsCache *>(tensor->cuda_cache_);
-                                if (cuda_packed_cache)
-                                {
-                                    delete cuda_packed_cache; // ~CUDAPackedWeights frees device memory
-                                    tensor->cuda_cache_.reset();
-                                }
-                            }
-                            catch (const std::bad_any_cast &)
-                            {
-                                // cuda_cache_ contains something else - leave it alone
-                            }
-                        }
-#endif
-
-#ifdef HAVE_ROCM
-                        // Clean up ROCm packed weights
-                        if (tensor->rocm_cache_.has_value())
-                        {
-                            try
-                            {
-                                auto *rocm_packed_cache = std::any_cast<TensorROCmPackedWeightsCache *>(tensor->rocm_cache_);
-                                if (rocm_packed_cache)
-                                {
-                                    delete rocm_packed_cache; // ~ROCmPackedWeights frees device memory
-                                    tensor->rocm_cache_.reset();
-                                }
-                            }
-                            catch (const std::bad_any_cast &)
-                            {
-                                // rocm_cache_ contains something else - leave it alone
-                            }
-                        }
-#endif
+                        tracked_tensors.insert(entry.first.tensor);
+                    }
+                }
+                for (const auto &entry : sliced_cache_)
+                {
+                    if (entry.first.tensor)
+                    {
+                        tracked_tensors.insert(entry.first.tensor);
+                    }
+                }
+                for (const auto &entry : fused_qkv_cache_)
+                {
+                    if (entry.first.wq_handle && entry.first.wq_handle->tensor)
+                    {
+                        tracked_tensors.insert(entry.first.wq_handle->tensor);
+                    }
+                    if (entry.first.wk_handle && entry.first.wk_handle->tensor)
+                    {
+                        tracked_tensors.insert(entry.first.wk_handle->tensor);
+                    }
+                    if (entry.first.wv_handle && entry.first.wv_handle->tensor)
+                    {
+                        tracked_tensors.insert(entry.first.wv_handle->tensor);
+                    }
+                }
+                for (const auto &entry : fused_gate_up_cache_)
+                {
+                    if (entry.first.w_gate_handle && entry.first.w_gate_handle->tensor)
+                    {
+                        tracked_tensors.insert(entry.first.w_gate_handle->tensor);
+                    }
+                    if (entry.first.w_up_handle && entry.first.w_up_handle->tensor)
+                    {
+                        tracked_tensors.insert(entry.first.w_up_handle->tensor);
                     }
                 }
 
-                kernel_cache_.clear();
+                // Clean up all tensor packed weights caches (CPU VNNI and CUDA INT8)
+                for (const auto *tensor : tracked_tensors)
+                {
+                    if (!tensor)
+                    {
+                        continue;
+                    }
+
+                    // Clean up CPU packed weights
+                    if (tensor->cache_.has_value())
+                    {
+                        try
+                        {
+                            auto *packed_cache = std::any_cast<TensorPackedWeightsCache *>(tensor->cache_);
+                            if (packed_cache)
+                            {
+                                delete packed_cache;
+                                tensor->cache_.reset();
+                            }
+                        }
+                        catch (const std::bad_any_cast &)
+                        {
+                            // cache_ contains something else - leave it alone
+                        }
+                    }
+
+#ifdef HAVE_CUDA
+                    // Clean up CUDA packed weights
+                    if (tensor->cuda_cache_.has_value())
+                    {
+                        try
+                        {
+                            auto *cuda_packed_cache = std::any_cast<TensorCUDAPackedWeightsCache *>(tensor->cuda_cache_);
+                            if (cuda_packed_cache)
+                            {
+                                delete cuda_packed_cache; // ~CUDAPackedWeights frees device memory
+                                tensor->cuda_cache_.reset();
+                            }
+                        }
+                        catch (const std::bad_any_cast &)
+                        {
+                            // cuda_cache_ contains something else - leave it alone
+                        }
+                    }
+#endif
+
+#ifdef HAVE_ROCM
+                    // Clean up ROCm packed weights
+                    if (tensor->rocm_cache_.has_value())
+                    {
+                        try
+                        {
+                            auto *rocm_packed_cache = std::any_cast<TensorROCmPackedWeightsCache *>(tensor->rocm_cache_);
+                            if (rocm_packed_cache)
+                            {
+                                delete rocm_packed_cache; // ~ROCmPackedWeights frees device memory
+                                tensor->rocm_cache_.reset();
+                            }
+                        }
+                        catch (const std::bad_any_cast &)
+                        {
+                            // rocm_cache_ contains something else - leave it alone
+                        }
+                    }
+#endif
+                }
+
                 sliced_cache_.clear();
-                device_targeted_cache_.clear();
                 fused_qkv_cache_.clear();
                 fused_gate_up_cache_.clear();
+                rope_cache_.clear();
+                rmsnorm_cache_.clear();
+                swiglu_cache_.clear();
+                softmax_cache_.clear();
+                residual_add_cache_.clear();
+                attention_cache_.clear();
+                embedding_cache_.clear();
+                device_kernel_registry_.clear();
+                prepared_gemm_registry_.clear();
+                device_gemm_engine_registry_.clear();
             }
 
             std::pair<size_t, size_t> KernelFactory::cacheStats()
@@ -3430,7 +3416,347 @@ namespace llaminar
                 size_t total_bytes = 0;
                 // Note: Can't easily compute packed_bytes without RTTI to QuantisedGemmKernel
                 // For now, just return count (includes all caches)
-                return {kernel_cache_.size() + sliced_cache_.size() + device_targeted_cache_.size() + fused_qkv_cache_.size() + fused_gate_up_cache_.size(), total_bytes};
+                return {sliced_cache_.size() + fused_qkv_cache_.size() + fused_gate_up_cache_.size() + rope_cache_.size() + rmsnorm_cache_.size() + swiglu_cache_.size() + softmax_cache_.size() + residual_add_cache_.size() + attention_cache_.size() + embedding_cache_.size() + device_kernel_registry_.size() + prepared_gemm_registry_.size(), total_bytes};
+            }
+
+            std::shared_ptr<void> KernelFactory::getDeviceKernelEntry(const DeviceKernelKey &key)
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                auto it = device_kernel_registry_.find(key);
+                if (it == device_kernel_registry_.end())
+                {
+                    return {};
+                }
+                return it->second;
+            }
+
+            void KernelFactory::putDeviceKernelEntry(const DeviceKernelKey &key, std::shared_ptr<void> entry)
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                device_kernel_registry_[key] = std::move(entry);
+            }
+
+            void KernelFactory::clearDeviceKernelRegistry()
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                device_kernel_registry_.clear();
+            }
+
+            size_t KernelFactory::deviceKernelRegistrySize()
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                return device_kernel_registry_.size();
+            }
+
+            namespace
+            {
+                static std::unique_ptr<llaminar2::ITensorGemm> createPreparedKernelForDevice(
+                    const llaminar2::TensorBase *tensor,
+                    llaminar2::DeviceId target_device)
+                {
+                    const auto dev_type = KernelFactory::getDeviceType(target_device);
+
+#ifdef HAVE_ROCM
+                    if (dev_type == DeviceType::ROCm)
+                    {
+                        KernelFactory::ROCmOrdinalGuard guard(target_device.rocm_ordinal());
+                        return KernelFactory::createGemm(tensor, dev_type);
+                    }
+#endif
+
+#ifdef HAVE_CUDA
+                    if (dev_type == DeviceType::CUDA)
+                    {
+                        KernelFactory::CUDAOrdinalGuard guard(target_device.cuda_ordinal());
+                        return KernelFactory::createGemm(tensor, dev_type);
+                    }
+#endif
+
+                    return KernelFactory::createGemm(tensor, dev_type);
+                }
+
+                class PhaseCGemmDeviceEngine : public KernelFactory::IGemmEngine
+                {
+                public:
+                    PhaseCGemmDeviceEngine(llaminar2::DeviceId device_id, int variant)
+                        : device_id_(device_id), variant_(variant)
+                    {
+                    }
+
+                    llaminar2::ITensorGemm *resolveKernel(
+                        const llaminar::v2::kernels::KernelFactory::PreparedGemmHandle *prepared) const override
+                    {
+                        if (!prepared || !prepared->tensor)
+                        {
+                            throw std::runtime_error("PhaseCGemmDeviceEngine::resolveKernel: null input");
+                        }
+
+                        if (prepared->variant != variant_)
+                        {
+                            throw std::runtime_error("PhaseCGemmDeviceEngine::resolveKernel: variant mismatch");
+                        }
+
+                        if (prepared->device_id != device_id_)
+                        {
+                            throw std::runtime_error("PhaseCGemmDeviceEngine::resolveKernel: device mismatch");
+                        }
+
+                        if (!prepared->prepared_weights)
+                        {
+                            throw std::runtime_error("PhaseCGemmDeviceEngine::resolveKernel: missing prepared weights");
+                        }
+
+                        if (prepared->prepared_weights->kind != prepared->kind)
+                        {
+                            throw std::runtime_error("PhaseCGemmDeviceEngine::resolveKernel: prepared kind mismatch");
+                        }
+
+                        if (!prepared->prepared_weights->kernel)
+                        {
+                            throw std::runtime_error("PhaseCGemmDeviceEngine::resolveKernel: missing prepared kernel binding");
+                        }
+
+                        return prepared->prepared_weights->kernel;
+                    }
+
+                    llaminar2::DeviceId device_id() const { return device_id_; }
+                    int variant() const { return variant_; }
+
+                private:
+                    llaminar2::DeviceId device_id_;
+                    int variant_{0};
+                };
+            } // namespace
+
+            llaminar2::ITensorGemm *KernelFactory::getOrCreateGemmEngine(
+                const PreparedGemmHandle *prepared)
+            {
+                if (!prepared)
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreateGemmEngine: null prepared handle");
+                }
+                if (!prepared->tensor)
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreateGemmEngine: prepared handle has null tensor");
+                }
+
+                const DeviceKernelKey device_engine_key{
+                    prepared->device_id,
+                    KernelKind::GEMM,
+                    prepared->variant};
+
+                std::shared_ptr<IGemmEngine> device_engine;
+                {
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    auto dev_it = device_gemm_engine_registry_.find(device_engine_key);
+                    if (dev_it == device_gemm_engine_registry_.end())
+                    {
+                        device_engine = std::make_shared<PhaseCGemmDeviceEngine>(prepared->device_id, prepared->variant);
+                        device_gemm_engine_registry_[device_engine_key] = device_engine;
+                        LOG_DEBUG("[KernelFactory][PhaseC] device GEMM engine create dev=" << static_cast<int>(prepared->device_id.type)
+                                                                                            << ":" << prepared->device_id.ordinal
+                                                                                            << " variant=" << prepared->variant);
+                    }
+                    else
+                    {
+                        device_engine = dev_it->second;
+                        LOG_DEBUG("[KernelFactory][PhaseC] device GEMM engine hit dev=" << static_cast<int>(prepared->device_id.type)
+                                                                                          << ":" << prepared->device_id.ordinal
+                                                                                          << " variant=" << prepared->variant);
+                    }
+                }
+
+                auto *kernel = device_engine->resolveKernel(prepared);
+                LOG_DEBUG("[KernelFactory][PhaseC] GEMM kernel via device engine dev=" << static_cast<int>(prepared->device_id.type)
+                                                                                        << ":" << prepared->device_id.ordinal
+                                                                                        << " prepared=" << prepared
+                                                                                        << " tensor=" << prepared->tensor
+                                                                                        << " variant=" << prepared->variant
+                                                                                        << " ptr=" << kernel);
+                return kernel;
+            }
+
+            const KernelFactory::PreparedGemmHandle *KernelFactory::getOrCreatePreparedGemmWeights(
+                const llaminar2::TensorBase *tensor,
+                llaminar2::DeviceId target_device,
+                GemmPreparationKind prep_kind)
+            {
+                if (!tensor)
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreatePreparedGemmWeights: null tensor");
+                }
+
+                const bool quantized = dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor) != nullptr;
+
+                GemmPreparationKind resolved_kind = prep_kind;
+                if (resolved_kind == GemmPreparationKind::AUTO)
+                {
+                    if (!quantized)
+                    {
+                        resolved_kind = GemmPreparationKind::FLOATING_POINT;
+                    }
+                    else
+                    {
+                        switch (getDeviceType(target_device))
+                        {
+                        case DeviceType::CPU:
+                            resolved_kind = GemmPreparationKind::CPU_PACKED;
+                            break;
+                        case DeviceType::CUDA:
+                            resolved_kind = GemmPreparationKind::CUDA_INT8_PACKED;
+                            break;
+                        case DeviceType::ROCm:
+                            resolved_kind = GemmPreparationKind::ROCM_INT8_PACKED;
+                            break;
+                        default:
+                            resolved_kind = GemmPreparationKind::FLOATING_POINT;
+                            break;
+                        }
+                    }
+                }
+
+                const PreparedGemmKey key{
+                    tensor,
+                    target_device,
+                    static_cast<int>(resolved_kind)};
+
+                {
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    auto it = prepared_gemm_registry_.find(key);
+                    if (it != prepared_gemm_registry_.end())
+                    {
+                        LOG_DEBUG("[KernelFactory][PhaseC] prepared weights hit dev=" << static_cast<int>(target_device.type)
+                                                                                        << ":" << target_device.ordinal
+                                                                                        << " kind=" << static_cast<int>(resolved_kind)
+                                                                                        << " tensor=" << tensor);
+                        return it->second.get();
+                    }
+                }
+
+                if (quantized)
+                {
+                    switch (resolved_kind)
+                    {
+                    case GemmPreparationKind::CPU_PACKED:
+                        (void)ensurePackedWeightsInTensorCache(tensor);
+                        break;
+                    case GemmPreparationKind::CUDA_INT8_PACKED:
+#ifdef HAVE_CUDA
+                        (void)ensureCUDAPackedWeightsInTensorCache(tensor);
+#endif
+                        break;
+                    case GemmPreparationKind::ROCM_INT8_PACKED:
+#ifdef HAVE_ROCM
+                        (void)ensureROCmPackedWeightsInTensorCache(tensor);
+#endif
+                        break;
+                    default:
+                        break;
+                    }
+                }
+
+                auto handle = std::make_shared<PreparedGemmHandle>();
+                handle->tensor = tensor;
+                handle->device_id = target_device;
+                handle->kind = resolved_kind;
+                handle->variant = static_cast<int>(tensor->native_type());
+                handle->prepared_weights = std::make_shared<PreparedGemmWeights>();
+                handle->prepared_weights->kind = resolved_kind;
+
+                // Bind executable GEMM kernel via explicit-device create path.
+                // This avoids direct dependency on legacy tensor-keyed
+                // legacy GEMM cache-style behavior in the prepared path.
+                auto bound_kernel = createPreparedKernelForDevice(tensor, target_device);
+                if (!bound_kernel)
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreatePreparedGemmWeights: failed to bind prepared kernel");
+                }
+                handle->prepared_weights->owned_kernel = std::shared_ptr<llaminar2::ITensorGemm>(std::move(bound_kernel));
+                handle->prepared_weights->kernel = handle->prepared_weights->owned_kernel.get();
+
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                auto [it, inserted] = prepared_gemm_registry_.emplace(key, std::move(handle));
+                LOG_DEBUG("[KernelFactory][PhaseC] prepared weights " << (inserted ? "create" : "race-hit")
+                                                                        << " dev=" << static_cast<int>(target_device.type)
+                                                                        << ":" << target_device.ordinal
+                                                                        << " kind=" << static_cast<int>(resolved_kind)
+                                                                        << " tensor=" << tensor);
+                return it->second.get();
+            }
+
+            void KernelFactory::clearPreparedGemmWeightsFor(const llaminar2::TensorBase *tensor)
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+
+                // Evict fused cache entries that reference prepared handles for this tensor.
+                // This prevents stale prepared-handle keys after prepared_gemm_registry_ erase.
+                for (auto it = fused_qkv_cache_.begin(); it != fused_qkv_cache_.end();)
+                {
+                    const auto *wq_handle = it->first.wq_handle;
+                    const auto *wk_handle = it->first.wk_handle;
+                    const auto *wv_handle = it->first.wv_handle;
+                    const bool references_tensor =
+                        (wq_handle && wq_handle->tensor == tensor) ||
+                        (wk_handle && wk_handle->tensor == tensor) ||
+                        (wv_handle && wv_handle->tensor == tensor);
+
+                    if (references_tensor)
+                    {
+                        it = fused_qkv_cache_.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+
+                for (auto it = fused_gate_up_cache_.begin(); it != fused_gate_up_cache_.end();)
+                {
+                    const auto *gate_handle = it->first.w_gate_handle;
+                    const auto *up_handle = it->first.w_up_handle;
+                    const bool references_tensor =
+                        (gate_handle && gate_handle->tensor == tensor) ||
+                        (up_handle && up_handle->tensor == tensor);
+
+                    if (references_tensor)
+                    {
+                        it = fused_gate_up_cache_.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+
+                for (auto it = prepared_gemm_registry_.begin(); it != prepared_gemm_registry_.end();)
+                {
+                    if (it->first.tensor == tensor)
+                    {
+                        it = prepared_gemm_registry_.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+            }
+
+            size_t KernelFactory::gemmEngineRegistrySize()
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                return device_gemm_engine_registry_.size();
+            }
+
+            size_t KernelFactory::preparedGemmRegistrySize()
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                return prepared_gemm_registry_.size();
+            }
+
+            size_t KernelFactory::deviceScopedGemmEngineRegistrySize()
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                return device_gemm_engine_registry_.size();
             }
 
             // ==========================================================================
@@ -3523,25 +3849,83 @@ namespace llaminar
                 std::unique_ptr<llaminar2::FusedGEMM> impl_;
             };
 
+            /**
+             * @brief Build fused QKV adapter from already-resolved prepared handles
+             *
+             * This helper centralizes fused QKV construction semantics so both
+             * public `createFusedQKVGemm(..., DeviceId)` and cache-miss handling in
+             * `getOrCreateFusedQKVGemm(..., DeviceId)` use exactly the same path.
+             *
+             * Why this helper exists:
+             * - Keeps a single authority for validation and adapter construction.
+             * - Avoids repeating prepared-handle resolution in cache-miss paths.
+             * - Maintains prepared-handle-first architecture for fused cache identity.
+             */
+            static std::unique_ptr<llaminar2::ITensorFusedQKVGemm> createFusedQKVAdapterFromPrepared(
+                const KernelFactory::PreparedGemmHandle *prepared_q,
+                const KernelFactory::PreparedGemmHandle *prepared_k,
+                const KernelFactory::PreparedGemmHandle *prepared_v,
+                llaminar2::DeviceId target_device)
+            {
+                // Prepared-handle-native contract: callers provide already-resolved
+                // handle identities, and this helper performs only construction-time
+                // validation plus adapter creation. This keeps cache miss behavior
+                // and explicit create behavior semantically identical.
+                if (!prepared_q || !prepared_k || !prepared_v)
+                {
+                    LOG_ERROR("[KernelFactory] createFusedQKVAdapterFromPrepared: null prepared handle(s)");
+                    throw std::runtime_error("FusedQKVGemm requires non-null prepared handles");
+                }
+
+                if (!prepared_q->tensor || !prepared_k->tensor || !prepared_v->tensor)
+                {
+                    LOG_ERROR("[KernelFactory] createFusedQKVAdapterFromPrepared: null tensor in prepared handle(s)");
+                    throw std::runtime_error("FusedQKVGemm prepared handles must reference valid tensors");
+                }
+
+                // Current fused QKV adapter implementation is CPU-only.
+                // Keeping this check here ensures both create() and getOrCreate() paths
+                // apply identical device support validation.
+                if (target_device.type != DeviceType::CPU)
+                {
+                    LOG_ERROR("[KernelFactory] FusedQKVGemm currently only supports CPU device");
+                    throw std::runtime_error("FusedQKVGemm only supports CPU device");
+                }
+
+                return std::make_unique<FusedQKVGemmAdapter>(
+                    prepared_q->tensor,
+                    prepared_k->tensor,
+                    prepared_v->tensor);
+            }
+
             std::unique_ptr<llaminar2::ITensorFusedQKVGemm> KernelFactory::createFusedQKVGemm(
                 const llaminar2::TensorBase *wq,
                 const llaminar2::TensorBase *wk,
                 const llaminar2::TensorBase *wv,
                 DeviceType dev_type)
             {
-                if (dev_type != DeviceType::CPU)
-                {
-                    LOG_ERROR("[KernelFactory] FusedQKVGemm currently only supports CPU device");
-                    throw std::runtime_error("FusedQKVGemm only supports CPU device");
-                }
+                return createFusedQKVGemm(wq, wk, wv, llaminar2::DeviceId(dev_type, 0));
+            }
 
+            std::unique_ptr<llaminar2::ITensorFusedQKVGemm> KernelFactory::createFusedQKVGemm(
+                const llaminar2::TensorBase *wq,
+                const llaminar2::TensorBase *wk,
+                const llaminar2::TensorBase *wv,
+                llaminar2::DeviceId target_device)
+            {
                 if (!wq || !wk || !wv)
                 {
                     LOG_ERROR("[KernelFactory] createFusedQKVGemm: null weight tensor(s)");
                     throw std::runtime_error("FusedQKVGemm requires non-null weight tensors");
                 }
 
-                return std::make_unique<FusedQKVGemmAdapter>(wq, wk, wv);
+                const auto *prepared_q = getOrCreatePreparedGemmWeights(wq, target_device);
+                const auto *prepared_k = getOrCreatePreparedGemmWeights(wk, target_device);
+                const auto *prepared_v = getOrCreatePreparedGemmWeights(wv, target_device);
+
+                // Use the same helper as cache-miss path so explicit creation and
+                // cached creation cannot diverge in validation or adapter wiring.
+                return createFusedQKVAdapterFromPrepared(prepared_q, prepared_k, prepared_v, target_device);
             }
 
             llaminar2::ITensorFusedQKVGemm *KernelFactory::getOrCreateFusedQKVGemm(
@@ -3565,9 +3949,25 @@ namespace llaminar
                 }
 #endif
 
-                FusedQKVCacheKey key{wq, wk, wv, dev_type, target_ordinal};
+                const llaminar2::DeviceId target_device_id(dev_type, target_ordinal);
+                return getOrCreateFusedQKVGemm(wq, wk, wv, target_device_id);
+            }
 
-                // Check cache with lock held
+            llaminar2::ITensorFusedQKVGemm *KernelFactory::getOrCreateFusedQKVGemm(
+                const llaminar2::TensorBase *wq,
+                const llaminar2::TensorBase *wk,
+                const llaminar2::TensorBase *wv,
+                llaminar2::DeviceId target_device)
+            {
+                const auto *prepared_q = getOrCreatePreparedGemmWeights(wq, target_device);
+                const auto *prepared_k = getOrCreatePreparedGemmWeights(wk, target_device);
+                const auto *prepared_v = getOrCreatePreparedGemmWeights(wv, target_device);
+
+                FusedQKVCacheKey key{prepared_q, prepared_k, prepared_v, target_device};
+
+                // Fast path: check cache under lock.
+                // Cache key is prepared-handle identity + device, so hits are aligned
+                // with backend-ready weight state, not just raw tensor pointers.
                 {
                     std::lock_guard<std::mutex> lock(cache_mutex_);
                     auto it = fused_qkv_cache_.find(key);
@@ -3580,11 +3980,12 @@ namespace llaminar
 
                 LOG_DEBUG("[KernelFactory::getOrCreateFusedQKVGemm] CACHE MISS - creating new kernel");
 
-                // Create kernel WITHOUT holding cache_mutex_ to avoid deadlock
-                // (FusedGEMM constructor calls getOrCreateGemm which also needs the mutex)
-                auto kernel = createFusedQKVGemm(wq, wk, wv, dev_type);
+                // Create kernel WITHOUT holding cache_mutex_. Use already-resolved
+                // prepared handles so cache-miss path does not repeat preparation lookup.
+                auto kernel = createFusedQKVAdapterFromPrepared(prepared_q, prepared_k, prepared_v, target_device);
 
-                // Re-acquire lock to insert into cache (double-checked locking)
+                // Re-acquire lock to insert into cache (double-checked locking).
+                // Another thread may have populated the same key while construction ran.
                 {
                     std::lock_guard<std::mutex> lock(cache_mutex_);
 
@@ -3610,7 +4011,8 @@ namespace llaminar
              * @brief Adapter class that wraps two ITensorGemm kernels for Gate/Up fusion
              *
              * This adapter holds raw pointers to cached GEMM kernels from KernelFactory.
-             * The kernels are obtained via getOrCreateGemm() which ensures proper caching.
+             * The kernels are obtained via prepared-handle + getOrCreateGemmEngine()
+             * which ensures proper caching.
              *
              * Note: The adapter does NOT own the GEMM kernels - they are owned by
              * KernelFactory's kernel cache. The adapter must not outlive the cache.
@@ -3838,6 +4240,43 @@ namespace llaminar
                 llaminar2::DeviceWorkspaceManager *bound_workspace_ = nullptr;
             };
 
+            /**
+             * @brief Build fused Gate/Up adapter from already-resolved prepared handles.
+             *
+             * Mirrors fused QKV helper semantics:
+             * - prepared-handle-native input contract
+             * - centralized validation and adapter creation
+             * - shared by explicit create and cache-miss paths
+             */
+            static std::unique_ptr<llaminar2::ITensorFusedGateUpGemm> createFusedGateUpAdapterFromPrepared(
+                const KernelFactory::PreparedGemmHandle *prepared_gate,
+                const KernelFactory::PreparedGemmHandle *prepared_up,
+                llaminar2::DeviceId target_device)
+            {
+                // This helper keeps fused Gate/Up construction prepared-handle-native.
+                // Both create() and getOrCreate() cache-miss paths call into this logic,
+                // preventing behavioral drift between those two entrypoints.
+                if (!prepared_gate || !prepared_up)
+                {
+                    LOG_ERROR("[KernelFactory] createFusedGateUpAdapterFromPrepared: null prepared handle(s)");
+                    throw std::runtime_error("FusedGateUpGemm requires non-null prepared handles");
+                }
+
+                auto *gemm_gate = KernelFactory::getOrCreateGemmEngine(prepared_gate);
+                auto *gemm_up = KernelFactory::getOrCreateGemmEngine(prepared_up);
+
+                if (!gemm_gate || !gemm_up)
+                {
+                    LOG_ERROR("[KernelFactory] createFusedGateUpAdapterFromPrepared: Failed to create GEMM kernels");
+                    throw std::runtime_error("FusedGateUpGemm failed to create underlying GEMM kernels");
+                }
+
+                // Underlying GEMM kernels are already resolved for the exact DeviceId
+                // through prepared handles; adapter keeps device type metadata for
+                // runtime capability checks.
+                return std::make_unique<FusedGateUpGemmAdapter>(gemm_gate, gemm_up, target_device.type);
+            }
+
             std::unique_ptr<llaminar2::ITensorFusedGateUpGemm> KernelFactory::createFusedGateUpGemm(
                 const llaminar2::TensorBase *w_gate,
                 const llaminar2::TensorBase *w_up,
@@ -3858,17 +4297,9 @@ namespace llaminar
                     throw std::runtime_error("FusedGateUpGemm requires non-null weight tensors");
                 }
 
-                // Get or create GEMM kernels for each weight using explicit DeviceId
-                auto *gemm_gate = getOrCreateGemm(w_gate, target_device);
-                auto *gemm_up = getOrCreateGemm(w_up, target_device);
-
-                if (!gemm_gate || !gemm_up)
-                {
-                    LOG_ERROR("[KernelFactory] createFusedGateUpGemm: Failed to create GEMM kernels");
-                    throw std::runtime_error("FusedGateUpGemm failed to create underlying GEMM kernels");
-                }
-
-                return std::make_unique<FusedGateUpGemmAdapter>(gemm_gate, gemm_up, target_device.type);
+                const auto *prepared_gate = getOrCreatePreparedGemmWeights(w_gate, target_device);
+                const auto *prepared_up = getOrCreatePreparedGemmWeights(w_up, target_device);
+                return createFusedGateUpAdapterFromPrepared(prepared_gate, prepared_up, target_device);
             }
 
             llaminar2::ITensorFusedGateUpGemm *KernelFactory::getOrCreateFusedGateUpGemm(
@@ -3885,9 +4316,13 @@ namespace llaminar
                 const llaminar2::TensorBase *w_up,
                 llaminar2::DeviceId target_device)
             {
-                FusedGateUpCacheKey key{w_gate, w_up, target_device};
+                const auto *prepared_gate = getOrCreatePreparedGemmWeights(w_gate, target_device);
+                const auto *prepared_up = getOrCreatePreparedGemmWeights(w_up, target_device);
+                FusedGateUpCacheKey key{prepared_gate, prepared_up, target_device};
 
-                // First check: acquire lock and check cache
+                // Fast path: acquire lock and check cache.
+                // Key uses prepared-handle identity + device so it tracks per-device
+                // prepared state rather than only raw tensor addresses.
                 {
                     std::lock_guard<std::mutex> lock(cache_mutex_);
                     auto it = fused_gate_up_cache_.find(key);
@@ -3902,9 +4337,9 @@ namespace llaminar
                 LOG_DEBUG("[KernelFactory::getOrCreateFusedGateUpGemm] CACHE MISS for "
                           << target_device.to_string() << " - creating new kernel");
 
-                // Create kernel WITHOUT holding lock (createFusedGateUpGemm calls getOrCreateGemm
-                // which also acquires cache_mutex_, so we must release first to avoid deadlock)
-                auto kernel = createFusedGateUpGemm(w_gate, w_up, target_device);
+                // Create kernel WITHOUT holding lock. Reuse already-resolved prepared handles
+                // to avoid duplicate prepared lookup on cache miss.
+                auto kernel = createFusedGateUpAdapterFromPrepared(prepared_gate, prepared_up, target_device);
 
                 // Second check: re-acquire lock and insert (double-checked locking)
                 {

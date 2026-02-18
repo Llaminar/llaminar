@@ -4,7 +4,6 @@
  */
 
 #include "ResidualAddStage.h"
-#include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
@@ -29,17 +28,17 @@ namespace llaminar2
     {
         KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
 
-        if (!ctx)
+        if (!ensureContext(ctx, "ResidualAddStage"))
         {
-            LOG_ERROR("[ResidualAddStage] Null device context");
             return false;
         }
 
-        if (!params_.input || !params_.residual || !params_.output)
+        if (!ensureRequiredPointers("ResidualAddStage", {
+                                                        {"input", params_.input},
+                                                        {"residual", params_.residual},
+                                                        {"output", params_.output},
+                                                    }))
         {
-            LOG_ERROR("[ResidualAddStage] Null tensor(s): input=" << params_.input
-                                                                  << " residual=" << params_.residual
-                                                                  << " output=" << params_.output);
             return false;
         }
 
@@ -162,9 +161,9 @@ namespace llaminar2
         (void)ctx; // Now unused - KernelFactory handles device dispatch
 
         // Cast ITensor* to TensorBase* for kernel dispatch
-        auto *input_base = requireTensorBase(params_.input, "input");
-        auto *residual_base = requireTensorBase(params_.residual, "residual");
-        auto *output_base = requireTensorBase(params_.output, "output");
+        auto *input_base = requireTensorBasePtr(params_.input, "input");
+        auto *residual_base = requireTensorBasePtr(params_.residual, "residual");
+        auto *output_base = requireTensorBasePtr(params_.output, "output");
         if (!input_base || !residual_base || !output_base)
         {
             LOG_ERROR("[ResidualAddStage::FP32] Failed to cast tensors to TensorBase");
@@ -189,23 +188,26 @@ namespace llaminar2
         }
 
         // Create kernel via KernelFactory with automatic device dispatch (cached)
-        if (!cached_kernel_)
-        {
-            auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createResidualAdd(input_base, dev_type);
-            if (!cached_kernel_)
+        auto *kernel = getOrRefreshKernelByTensorType(
+            cached_kernel_,
+            cached_kernel_tensor_type_,
+            input_base,
+            [&]()
             {
-                LOG_ERROR("[ResidualAddStage::FP32] Failed to create ResidualAdd kernel");
-                return false;
-            }
+                return llaminar::v2::kernels::KernelFactory::getOrCreateResidualAdd(input_base, params_.device_id);
+            });
+        if (!kernel)
+        {
+            LOG_ERROR("[ResidualAddStage::FP32] Failed to create ResidualAdd kernel");
+            return false;
         }
 
         // Thread GPU stream for graph capture
-        cached_kernel_->setGPUStream(gpuStream());
+        bindStageStream(kernel);
 
         // Use apply_tensor() which handles GPU pointers correctly via active_data_ptr()
-        bool ok = cached_kernel_->apply_tensor(input_base, residual_base, output_base, n, params_.mpi_ctx,
-                                               params_.device_id.toKernelDeviceIndex());
+        bool ok = kernel->apply_tensor(input_base, residual_base, output_base, n, params_.mpi_ctx,
+                           params_.device_id.toKernelDeviceIndex());
 
         if (Logger::getInstance().shouldLog(LogLevel::TRACE) && !params_.device_id.is_gpu())
         {
@@ -225,7 +227,7 @@ namespace llaminar2
         (void)ctx; // Now unused - KernelFactory handles device dispatch
 
         // Cast ITensor* to TensorBase* for CPU operations
-        auto *input_base = requireTensorBase(params_.input, "input");
+        auto *input_base = requireTensorBasePtr(params_.input, "input");
         if (!input_base)
         {
             LOG_ERROR("[ResidualAddStage::BF16] GPU tensors not yet supported");
@@ -240,19 +242,22 @@ namespace llaminar2
         LOG_DEBUG("[ResidualAddStage::BF16] Converting and adding " << n << " elements");
 
         // Create kernel via KernelFactory with automatic device dispatch (cached)
-        if (!cached_kernel_)
-        {
-            auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createResidualAdd(input_base, dev_type);
-            if (!cached_kernel_)
+        auto *kernel = getOrRefreshKernelByTensorType(
+            cached_kernel_,
+            cached_kernel_tensor_type_,
+            input_base,
+            [&]()
             {
-                LOG_ERROR("[ResidualAddStage::BF16] Failed to create ResidualAdd kernel");
-                return false;
-            }
+                return llaminar::v2::kernels::KernelFactory::getOrCreateResidualAdd(input_base, params_.device_id);
+            });
+        if (!kernel)
+        {
+            LOG_ERROR("[ResidualAddStage::BF16] Failed to create ResidualAdd kernel");
+            return false;
         }
 
-        cached_kernel_->setGPUStream(gpuStream());
-        return cached_kernel_->apply_bf16(input, residual, output, n, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
+        bindStageStream(kernel);
+        return kernel->apply_bf16(input, residual, output, n, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
     }
 
     bool ResidualAddStage::executeFP16(IDeviceContext *ctx, size_t num_elements)
@@ -260,7 +265,7 @@ namespace llaminar2
         (void)ctx; // Now unused - KernelFactory handles device dispatch
 
         // Cast ITensor* to TensorBase* for CPU operations
-        auto *input_base = requireTensorBase(params_.input, "input");
+        auto *input_base = requireTensorBasePtr(params_.input, "input");
         if (!input_base)
         {
             LOG_ERROR("[ResidualAddStage::FP16] GPU tensors not yet supported");
@@ -275,19 +280,22 @@ namespace llaminar2
         LOG_DEBUG("[ResidualAddStage::FP16] Converting and adding " << n << " elements");
 
         // Create kernel via KernelFactory with automatic device dispatch (cached)
-        if (!cached_kernel_)
-        {
-            auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createResidualAdd(input_base, dev_type);
-            if (!cached_kernel_)
+        auto *kernel = getOrRefreshKernelByTensorType(
+            cached_kernel_,
+            cached_kernel_tensor_type_,
+            input_base,
+            [&]()
             {
-                LOG_ERROR("[ResidualAddStage::FP16] Failed to create ResidualAdd kernel");
-                return false;
-            }
+                return llaminar::v2::kernels::KernelFactory::getOrCreateResidualAdd(input_base, params_.device_id);
+            });
+        if (!kernel)
+        {
+            LOG_ERROR("[ResidualAddStage::FP16] Failed to create ResidualAdd kernel");
+            return false;
         }
 
-        cached_kernel_->setGPUStream(gpuStream());
-        return cached_kernel_->apply_fp16(input, residual, output, n, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
+        bindStageStream(kernel);
+        return kernel->apply_fp16(input, residual, output, n, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
     }
 
     bool ResidualAddStage::executeQ8_1(IDeviceContext *ctx, size_t num_elements)

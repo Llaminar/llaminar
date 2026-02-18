@@ -33,10 +33,66 @@
 #include "backends/ComputeBackend.h"
 #include "tensors/TensorClasses.h"
 #include "backends/DeviceId.h"
+#include "utils/DebugEnv.h"
 #include "../../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
+
+namespace
+{
+    /**
+     * @brief RAII helper for temporarily overriding an environment variable in a test.
+     *
+     * Why this helper exists:
+     * - Tests should not leak process-wide env changes into later tests.
+     * - `DebugEnv` caches values, so we also reload config on entry/exit.
+     */
+    class ScopedEnvVar
+    {
+    public:
+        /**
+         * @brief Set @p name to @p value for this scope, preserving prior state.
+         */
+        ScopedEnvVar(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *prev = std::getenv(name_);
+            if (prev)
+            {
+                had_previous_ = true;
+                previous_value_ = prev;
+            }
+
+            setenv(name_, value, 1);
+            mutableDebugEnv().reload();
+        }
+
+        /**
+         * @brief Restore original env state and reload DebugEnv cache.
+         */
+        ~ScopedEnvVar()
+        {
+            if (had_previous_)
+            {
+                setenv(name_, previous_value_.c_str(), 1);
+            }
+            else
+            {
+                unsetenv(name_);
+            }
+            mutableDebugEnv().reload();
+        }
+
+        ScopedEnvVar(const ScopedEnvVar &) = delete;
+        ScopedEnvVar &operator=(const ScopedEnvVar &) = delete;
+
+    private:
+        const char *name_;
+        bool had_previous_ = false;
+        std::string previous_value_;
+    };
+} // namespace
 
 // =============================================================================
 // Test Fixture
@@ -145,6 +201,184 @@ TEST_F(Test__LocalTPBackendBehavior, AutoBackend_AllRocm_SelectsRCCL)
     ASSERT_NE(ctx, nullptr);
     EXPECT_EQ(ctx->backend(), CollectiveBackendType::RCCL)
         << "AUTO backend should select RCCL for all-ROCm configuration";
+}
+
+/**
+ * @test LocalTP multi-GPU allreduce fails fast when requested count exceeds tensor size
+ *
+ * This is a Phase 2 correctness guardrail test. A bad element count can otherwise
+ * produce backend-side undefined behavior. We assert that LocalTP validation catches
+ * this before entering NCCL collective launch.
+ */
+TEST_F(Test__LocalTPBackendBehavior, NCCLAllreduce_CountExceedsTensorNumel_FailsFast)
+{
+    if (cuda_count_ < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ CUDA GPUs, found " << cuda_count_;
+    }
+
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::cuda(0),
+        GlobalDeviceAddress::cuda(1)};
+
+    auto ctx = createLocalTPContext(devices, {}, CollectiveBackendType::NCCL);
+    ASSERT_NE(ctx, nullptr);
+
+    auto tensor0 = TestTensorFactory::createFP32({4, 4});
+    auto tensor1 = TestTensorFactory::createFP32({4, 4});
+
+    ASSERT_TRUE(tensor0->ensureOnDevice(DeviceId::cuda(0)));
+    ASSERT_TRUE(tensor1->ensureOnDevice(DeviceId::cuda(1)));
+
+    const size_t invalid_count = tensor0->numel() + 8;
+
+    std::atomic<bool> result0{true};
+    std::atomic<bool> result1{true};
+
+    std::thread t0([&]()
+                   { result0.store(ctx->allreduce(tensor0.get(), "invalid_count_test", invalid_count)); });
+    std::thread t1([&]()
+                   { result1.store(ctx->allreduce(tensor1.get(), "invalid_count_test", invalid_count)); });
+
+    t0.join();
+    t1.join();
+
+    EXPECT_FALSE(result0.load());
+    EXPECT_FALSE(result1.load());
+}
+
+/**
+ * @test LocalTP multi-GPU allreduce fails fast when participant dtypes differ
+ *
+ * This verifies the Phase 2 dtype-consistency invariant. NCCL allreduce assumes
+ * all participants use the same element type; mixed dtypes should be rejected
+ * by LocalTP validation before backend launch.
+ */
+TEST_F(Test__LocalTPBackendBehavior, NCCLAllreduce_DTypeMismatchAcrossParticipants_FailsFast)
+{
+    if (cuda_count_ < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ CUDA GPUs, found " << cuda_count_;
+    }
+
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::cuda(0),
+        GlobalDeviceAddress::cuda(1)};
+
+    auto ctx = createLocalTPContext(devices, {}, CollectiveBackendType::NCCL);
+    ASSERT_NE(ctx, nullptr);
+
+    // Intentionally use different tensor dtypes across participants.
+    auto tensor_fp32 = TestTensorFactory::createFP32({4, 4});
+    auto tensor_int32 = std::make_unique<INT32Tensor>(std::vector<size_t>{4, 4});
+
+    ASSERT_TRUE(tensor_fp32->ensureOnDevice(DeviceId::cuda(0)));
+    ASSERT_TRUE(tensor_int32->ensureOnDevice(DeviceId::cuda(1)));
+
+    const size_t count = tensor_fp32->numel();
+
+    std::atomic<bool> result0{true};
+    std::atomic<bool> result1{true};
+
+    std::thread t0([&]()
+                   { result0.store(ctx->allreduce(tensor_fp32.get(), "dtype_mismatch_test", count)); });
+    std::thread t1([&]()
+                   { result1.store(ctx->allreduce(tensor_int32.get(), "dtype_mismatch_test", count)); });
+
+    t0.join();
+    t1.join();
+
+    EXPECT_FALSE(result0.load());
+    EXPECT_FALSE(result1.load());
+}
+
+/**
+ * @test LocalTP NCCL fails fast when GPU graphs are enabled without segmented collectives
+ *
+ * Phase 3 support policy requires segmented collective mode when running LocalTP
+ * NCCL collectives under GPU graph mode.
+ */
+TEST_F(Test__LocalTPBackendBehavior, NCCLGraphPolicy_GraphsWithoutSegmentedCollectives_FailsFast)
+{
+    if (cuda_count_ < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ CUDA GPUs, found " << cuda_count_;
+    }
+
+    ScopedEnvVar graphs_guard("LLAMINAR_GPU_GRAPHS", "1");
+    ScopedEnvVar segmented_guard("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0");
+
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::cuda(0),
+        GlobalDeviceAddress::cuda(1)};
+
+    auto ctx = createLocalTPContext(devices, {}, CollectiveBackendType::NCCL);
+    ASSERT_NE(ctx, nullptr);
+
+    auto tensor0 = TestTensorFactory::createFP32({8, 8});
+    auto tensor1 = TestTensorFactory::createFP32({8, 8});
+
+    ASSERT_TRUE(tensor0->ensureOnDevice(DeviceId::cuda(0)));
+    ASSERT_TRUE(tensor1->ensureOnDevice(DeviceId::cuda(1)));
+
+    std::atomic<bool> result0{true};
+    std::atomic<bool> result1{true};
+
+    std::thread t0([&]()
+                   { result0.store(ctx->allreduce(tensor0.get(), "graph_policy_reject", tensor0->numel())); });
+    std::thread t1([&]()
+                   { result1.store(ctx->allreduce(tensor1.get(), "graph_policy_reject", tensor1->numel())); });
+
+    t0.join();
+    t1.join();
+
+    EXPECT_FALSE(result0.load());
+    EXPECT_FALSE(result1.load());
+}
+
+/**
+ * @test LocalTP NCCL accepts segmented collective mode when GPU graphs are enabled
+ *
+ * This validates the supported Phase 3 graph policy. In this mode, LocalTP should
+ * proceed through normal NCCL execution.
+ */
+TEST_F(Test__LocalTPBackendBehavior, NCCLGraphPolicy_GraphsWithSegmentedCollectives_AllowsExecution)
+{
+    if (cuda_count_ < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ CUDA GPUs, found " << cuda_count_;
+    }
+
+    ScopedEnvVar graphs_guard("LLAMINAR_GPU_GRAPHS", "1");
+    ScopedEnvVar segmented_guard("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1");
+
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::cuda(0),
+        GlobalDeviceAddress::cuda(1)};
+
+    auto ctx = createLocalTPContext(devices, {}, CollectiveBackendType::NCCL);
+    ASSERT_NE(ctx, nullptr);
+
+    auto tensor0 = TestTensorFactory::createFP32({8, 8});
+    auto tensor1 = TestTensorFactory::createFP32({8, 8});
+
+    ASSERT_TRUE(tensor0->ensureOnDevice(DeviceId::cuda(0)));
+    ASSERT_TRUE(tensor1->ensureOnDevice(DeviceId::cuda(1)));
+
+    std::atomic<bool> result0{false};
+    std::atomic<bool> result1{false};
+
+    std::thread t0([&]()
+                   { result0.store(ctx->allreduce(tensor0.get(), "graph_policy_allow", tensor0->numel())); });
+    std::thread t1([&]()
+                   { result1.store(ctx->allreduce(tensor1.get(), "graph_policy_allow", tensor1->numel())); });
+
+    t0.join();
+    t1.join();
+
+    // NCCL allreduce should succeed under supported graph policy.
+    EXPECT_TRUE(result0.load());
+    EXPECT_TRUE(result1.load());
 }
 
 /**

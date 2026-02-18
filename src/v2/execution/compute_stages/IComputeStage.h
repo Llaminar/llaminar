@@ -27,6 +27,7 @@
 #include "../debug/BufferRole.h"
 #include "../config/RuntimeConfig.h"
 #include "../local_execution/coherence/StageCoherence.h"
+#include "ComputeStageUtils.h"
 #include "../../tensors/BlockStructures.h"
 #include "../../tensors/TensorKernels.h"
 #include "../../utils/MPITopology.h"
@@ -331,6 +332,12 @@ namespace llaminar2
     class IComputeStage
     {
     public:
+        struct RequiredPointer
+        {
+            const char *name = nullptr;
+            const void *ptr = nullptr;
+        };
+
         /**
          * @brief Construct a stage with required device assignment
          *
@@ -671,6 +678,154 @@ namespace llaminar2
          * @brief Format float array for logging (first N elements).
          */
         static std::string formatFloatArray(const float *data, size_t count);
+
+        /**
+         * @brief Get or refresh a stage-cached kernel pointer by tensor dtype variant
+         *
+         * Many compute stages cache non-owning kernel pointers sourced from
+         * KernelFactory device-scoped caches. This helper centralizes the
+         * repeated refresh pattern:
+         * - First use: create/resolve kernel
+         * - DType change: refresh kernel pointer for new tensor variant
+         * - Same dtype: reuse existing pointer
+         *
+         * @tparam KernelT Cached kernel interface type (e.g., ITensorRoPE)
+         * @tparam TensorLike Tensor type exposing native_type()
+         * @tparam FactoryFn Callable returning KernelT*
+         * @param cached_kernel Stage-local non-owning kernel pointer
+         * @param cached_tensor_type Stage-local cached tensor type discriminator
+         * @param tensor Tensor whose dtype determines kernel variant
+         * @param factory Callable to create/resolve kernel pointer
+         * @return Kernel pointer (may be nullptr if factory fails)
+         */
+        template <typename KernelT, typename TensorLike, typename FactoryFn>
+        KernelT *getOrRefreshKernelByTensorType(
+            KernelT *&cached_kernel,
+            int &cached_tensor_type,
+            const TensorLike *tensor,
+            FactoryFn factory) const
+        {
+            if (!tensor)
+            {
+                return nullptr;
+            }
+
+            const int tensor_type = static_cast<int>(tensor->native_type());
+            if (!cached_kernel || cached_tensor_type != tensor_type)
+            {
+                cached_kernel = factory();
+                cached_tensor_type = tensor_type;
+            }
+
+            return cached_kernel;
+        }
+
+        /**
+         * @brief Validate stage execution context pointer and emit consistent error log
+         *
+         * @param ctx Device context pointer passed to execute()
+         * @param stage_name Human-readable stage tag for logs (e.g., "RMSNormStage")
+         * @return true if ctx is valid, false otherwise
+         */
+        bool ensureContext(const IDeviceContext *ctx, const char *stage_name) const
+        {
+            if (ctx)
+            {
+                return true;
+            }
+
+            LOG_ERROR("[" << (stage_name ? stage_name : "ComputeStage") << "] Null device context");
+            return false;
+        }
+
+        /**
+         * @brief Bind this stage's GPU stream to a kernel when available
+         *
+         * Many stages repeat `kernel->setGPUStream(gpuStream())`. This helper
+         * centralizes that pattern while keeping behavior unchanged.
+         *
+         * @tparam KernelT Kernel type exposing setGPUStream(void*)
+         * @param kernel Kernel pointer (may be nullptr)
+         * @return The same kernel pointer for fluent usage
+         */
+        template <typename KernelT>
+        KernelT *bindStageStream(KernelT *kernel) const
+        {
+            if (kernel)
+            {
+                kernel->setGPUStream(gpuStream());
+            }
+            return kernel;
+        }
+
+        /**
+         * @brief Shared stage wrapper for optional ITensor->TensorBase cast (mutable)
+         */
+        TensorBase *asTensorBasePtr(ITensor *tensor, const char *name = nullptr) const
+        {
+            return llaminar2::asTensorBase(tensor, name);
+        }
+
+        /**
+         * @brief Shared stage wrapper for optional ITensor->TensorBase cast (const)
+         */
+        const TensorBase *asTensorBasePtr(const ITensor *tensor, const char *name = nullptr) const
+        {
+            return llaminar2::asTensorBase(tensor, name);
+        }
+
+        /**
+         * @brief Shared stage wrapper for required ITensor->TensorBase cast (mutable)
+         */
+        TensorBase *requireTensorBasePtr(ITensor *tensor, const char *name) const
+        {
+            return llaminar2::requireTensorBase(tensor, name);
+        }
+
+        /**
+         * @brief Shared stage wrapper for required ITensor->TensorBase cast (const)
+         */
+        const TensorBase *requireTensorBasePtr(const ITensor *tensor, const char *name) const
+        {
+            return llaminar2::requireTensorBase(tensor, name);
+        }
+
+        /**
+         * @brief Validate required pointers and emit consistent error log
+         *
+         * Useful for stage preflight checks where multiple required pointers
+         * must be present before execution.
+         *
+         * @param stage_name Human-readable stage tag for logs
+         * @param required List of pointers with names
+         * @return true if all pointers are non-null, false otherwise
+         */
+        bool ensureRequiredPointers(
+            const char *stage_name,
+            std::initializer_list<RequiredPointer> required) const
+        {
+            std::string missing;
+            for (const auto &item : required)
+            {
+                if (!item.ptr)
+                {
+                    if (!missing.empty())
+                    {
+                        missing += ", ";
+                    }
+                    missing += (item.name ? item.name : "<unnamed>");
+                }
+            }
+
+            if (missing.empty())
+            {
+                return true;
+            }
+
+            LOG_ERROR("[" << (stage_name ? stage_name : "ComputeStage")
+                           << "] Missing required pointer(s): " << missing);
+            return false;
+        }
 
         // =========================================================================
         // Shape Validation Infrastructure (Task 7: Debugging)

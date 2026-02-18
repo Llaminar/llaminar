@@ -47,6 +47,19 @@
 using namespace llaminar2;
 using namespace llaminar2::gemm_v4;
 
+namespace
+{
+    ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id = DeviceId::cpu())
+    {
+        auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(tensor, device_id);
+        if (!prepared)
+        {
+            return nullptr;
+        }
+        return llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+    }
+}
+
 /**
  * @brief Model attention configuration for test cases
  */
@@ -1710,10 +1723,10 @@ TEST_F(Test__Q8_1_FusedAttention, JIT_vs_FP32_Strided_Qwen05B_CausalMask)
     std::vector<float> V_fp32(kv_len * n_kv_heads * head_dim);
     std::vector<float> ref_output(seq_len * n_heads * head_dim, 0.0f);
 
-    // Get cached GEMM kernels (weights already packed during getWeight())
-    auto *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq.get());
-    auto *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk.get());
-    auto *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv.get());
+    // Get cached GEMM engines (weights already packed during getWeight())
+    auto *gemm_q = getPreparedKernel(wq.get(), DeviceId::cpu());
+    auto *gemm_k = getPreparedKernel(wk.get(), DeviceId::cpu());
+    auto *gemm_v = getPreparedKernel(wv.get(), DeviceId::cpu());
 
     if (!gemm_q || !gemm_k || !gemm_v)
     {

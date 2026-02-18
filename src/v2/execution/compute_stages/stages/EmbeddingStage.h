@@ -63,7 +63,8 @@ namespace llaminar2
 
     private:
         Params params_;
-        std::unique_ptr<ITensorEmbedding> cached_kernel_;
+        ITensorEmbedding *cached_kernel_ = nullptr;
+        int cached_kernel_tensor_type_ = -1;
 
         bool executeQ16_1Output();
         static void zero_output_row(ITensor *output, int row_idx, int d_model);

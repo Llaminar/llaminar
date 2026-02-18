@@ -103,6 +103,10 @@ namespace llaminar2
 
     private:
         Params params_;
+        ITensorAttention *cached_kernel_ = nullptr;
+        int cached_kernel_tensor_type_ = -1;
+
+        ITensorAttention *getOrCreateKernel(const ITensor *tensor);
 
         bool executePrefill(IDeviceContext *ctx);
         bool executeDecode(IDeviceContext *ctx);

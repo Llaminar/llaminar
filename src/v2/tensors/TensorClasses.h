@@ -1120,7 +1120,8 @@ namespace llaminar2
          * original GGUF format data after the GEMM kernel has repacked it into
          * INT8 VNNI format. This cuts weight memory usage roughly in half.
          *
-         * Call this after getOrCreateGemm() to free the original quantized data.
+         * Call this after preparing GEMM weights / creating the GEMM engine to free
+         * the original quantized data.
          * The tensor remains usable for GEMM operations via the cached kernel,
          * but other operations (to_fp32, decode_block_at, etc.) will fail.
          *

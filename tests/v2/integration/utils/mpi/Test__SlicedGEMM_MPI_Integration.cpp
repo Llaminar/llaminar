@@ -28,6 +28,19 @@
 using namespace llaminar2;
 using namespace llaminar::v2::kernels;
 
+namespace
+{
+    ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id = DeviceId::cpu())
+    {
+        auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, device_id);
+        if (!prepared)
+        {
+            return nullptr;
+        }
+        return KernelFactory::getOrCreateGemmEngine(prepared);
+    }
+}
+
 /**
  * @brief Test fixture for sliced GEMM MPI integration tests
  */
@@ -208,7 +221,7 @@ TEST_F(Test__SlicedGEMM_MPI_Integration, RowParallelGEMM_SlicesMatchFullOutput)
     if (rank_ == 0)
     {
         auto reference_output = createFP32(M, N);
-        auto *full_kernel = KernelFactory::getOrCreateGemm(weights.get());
+        auto *full_kernel = getPreparedKernel(weights.get(), DeviceId::cpu());
         ASSERT_NE(full_kernel, nullptr);
 
         bool ref_success = full_kernel->multiply(
@@ -335,7 +348,7 @@ TEST_F(Test__SlicedGEMM_MPI_Integration, ColumnParallelGEMM_AllreduceSumsCorrect
 
     // Compute local output
     auto local_output = createFP32(M, N);
-    auto *full_kernel = KernelFactory::getOrCreateGemm(full_weights.get());
+    auto *full_kernel = getPreparedKernel(full_weights.get(), DeviceId::cpu());
     ASSERT_NE(full_kernel, nullptr);
 
     // For a true column-parallel test, we'd need weight slicing

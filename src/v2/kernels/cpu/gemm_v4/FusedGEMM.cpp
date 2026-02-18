@@ -66,12 +66,17 @@ namespace llaminar2
         for (size_t i = 0; i < weights.size(); ++i)
         {
             const auto *weight = weights[i];
-            // KernelFactory::getOrCreateGemm() returns cached ITensorGemm*
-            auto *gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(weight);
+            // Resolve through prepared-handle + device-engine path (Phase C API).
+            // FusedGEMM currently targets CPU kernels, so we resolve prepared state
+            // explicitly on CPU:0.
+            const auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(
+                weight,
+                llaminar2::DeviceId(llaminar2::DeviceType::CPU, 0));
+            auto *gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
             auto *quantised_gemm = dynamic_cast<gemm_v4::QuantisedGemmKernel *>(gemm);
             if (!quantised_gemm)
             {
-                throw std::runtime_error("[FusedGEMM] Weight tensor returned non-QuantisedGemmKernel from KernelFactory::getOrCreateGemm()");
+                throw std::runtime_error("[FusedGEMM] Weight tensor returned non-QuantisedGemmKernel from prepared GEMM engine resolution");
             }
             LOG_DEBUG("[FusedGEMM] Got kernel " << i << " ptr=" << static_cast<const void *>(gemm)
                                                 << " weight ptr=" << static_cast<const void *>(weight));

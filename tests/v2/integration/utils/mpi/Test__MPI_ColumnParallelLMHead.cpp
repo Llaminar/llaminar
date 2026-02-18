@@ -33,6 +33,19 @@
 
 using namespace llaminar2;
 
+namespace
+{
+    ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id = DeviceId::cpu())
+    {
+        auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(tensor, device_id);
+        if (!prepared)
+        {
+            return nullptr;
+        }
+        return llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+    }
+}
+
 // Qwen 2.5 0.5B model constants
 static constexpr int D_MODEL = 896;
 static constexpr int VOCAB_SIZE = 151936;
@@ -304,7 +317,7 @@ TEST_F(Test__MPI_ColumnParallelLMHead, FullForwardDataFlow)
 
     // Compute local logits: hidden @ lm_head.T
     // (This would be done by GEMMStage in full pipeline)
-    auto gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(lm_head.get());
+    auto gemm = getPreparedKernel(lm_head.get(), DeviceId::cpu());
     ASSERT_NE(gemm, nullptr) << "Failed to create GEMM kernel for LM head";
 
     bool gemm_success = gemm->multiply(

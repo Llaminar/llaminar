@@ -279,7 +279,8 @@ namespace llaminar2
 
         // Create kernel for target device (this also packs weights appropriately)
         // Use the DeviceId overload to preserve device ordinal for multi-GPU
-        auto *kernel = KernelFactory::getOrCreateGemm(tensor, target_device);
+        auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, target_device);
+        auto *kernel = KernelFactory::getOrCreateGemmEngine(prepared);
         bool success = (kernel != nullptr);
 
         if (success)

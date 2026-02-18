@@ -62,8 +62,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Graphics libraries (for GPU compute / transfer)
     libgbm-dev \
     libdrm-dev \
-    libnccl2 \
-    libnccl-dev \
     # Additional tools
     git \
     curl \
@@ -121,11 +119,13 @@ ENV CUTLASS_DIR=/opt/cutlass
 # Install CUDA 13.0 toolkit (conditional)
 # NOTE: Do NOT install nvidia-driver-* inside container - the host driver is
 # injected at runtime via --gpus=all and nvidia-container-toolkit
+# Pin libnccl2/libnccl-dev to +cuda13.0 variant to avoid NCCL/CUDA version
+# mismatch (older NCCL built for cuda12.0 reports "stub library" errors)
 RUN if [ "$INSTALL_CUDA" = "true" ]; then \
     wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -O cuda-keyring.deb && \
     dpkg -i cuda-keyring.deb && \
     apt-get update && \
-    apt-get -y install cuda-toolkit-13-0 && \
+    apt-get -y install cuda-toolkit-13-0 'libnccl2=*+cuda13.0' 'libnccl-dev=*+cuda13.0' && \
     rm cuda-keyring.deb; \
     else \
     echo "Skipping CUDA installation"; \
