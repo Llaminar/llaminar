@@ -1188,6 +1188,8 @@ add_library(llaminar2_core STATIC
     # Orchestration configuration (Phase 0 - CLI/Config architecture for heterogeneous orchestration)
     config/OrchestrationConfig.cpp
     config/OrchestrationConfigParser.cpp
+    # Declarative config validation rule framework (device selection conflict detection)
+    config/ConfigValidator.cpp
     # ParallelismTree parser (Phase 7 - CLI/YAML parser for ParallelismTree)
     config/ParallelismTreeParser.cpp
     # Backend selector (Part 2 - automatic backend selection for PP/TP)

@@ -7,6 +7,7 @@
  */
 
 #include "OrchestrationConfig.h"
+#include "config/ConfigValidator.h"
 #include "execution/parallelism_tree/ParallelismTree.h"
 #include "utils/Logger.h"
 #include <sstream>
@@ -483,6 +484,18 @@ namespace llaminar2
     std::vector<std::string> OrchestrationConfig::validate() const
     {
         std::vector<std::string> errors;
+
+        // =====================================================================
+        // Device Selection Validation (declarative rule framework)
+        // =====================================================================
+        {
+            auto device_errors = ConfigValidator::createStandard().validateToStrings(*this);
+            errors.insert(errors.end(), device_errors.begin(), device_errors.end());
+        }
+
+        // =====================================================================
+        // Structural Validation (domain/PP/precision checks)
+        // =====================================================================
 
         // Validate topology tree if present
         if (topology_tree)

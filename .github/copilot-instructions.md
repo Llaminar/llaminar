@@ -178,23 +178,79 @@ Valid backends: `auto`, `nccl`, `rccl`, `pcie_bar`, `upi`, `mpi`, `host`
 |--------|-------------|----------|
 | `--config <path>` | Load configuration from YAML file | `--config orchestration.yaml` |
 
+### Device Selection Modes
+
+Llaminar has **five mutually exclusive device selection modes**. The `ConfigValidator` (in `src/v2/config/ConfigValidator.cpp`) enforces that only one mode is active at a time.
+
+| Mode | Primary Flags | When to Use |
+|------|---------------|-------------|
+| **Single Device** | `-d cuda:0` | One GPU, no parallelism |
+| **Simple TP** | `-tp 2` (no `--tp-devices`) | TP with auto-picked devices |
+| **Explicit TP** | `--tp-devices "cuda:0,cuda:1"` | TP with specific device list |
+| **Named Domains** | `--define-domain` + `--pp-stage` | Heterogeneous PP+TP setups |
+| **Device Map** | `--device-map "0=cuda:0,1=cuda:1"` | Per-MPI-rank device assignment |
+
+**Mutual Exclusion Rules** — the following flag combinations are **invalid** and will produce a validation error:
+
+| Flag A | Flag B | Why |
+|--------|--------|-----|
+| `-d` | `--tp-devices` | TP devices list implies the primary device (first entry) |
+| `-d` | `-tp N` | With `-tp N`, the system auto-picks N devices; `-d` is ambiguous |
+| `-d` | `--define-domain` | Named domains fully control device assignment |
+| `-d` | `--device-map` | Both specify single-device assignment differently |
+| `--tp-devices` | `--define-domain` | Named domains include their own device lists |
+| `--device-map` | `--tp-devices` | Device map is per-rank; TP devices are intra-rank |
+| `--device-map` | `--define-domain` | Named domains fully control device assignment |
+
+**Co-Requirement Rules** — these options depend on others:
+
+| Option | Requires | Example |
+|--------|----------|---------|
+| `--tp-weights` | `--tp-devices` | `--tp-devices "cuda:0,rocm:0" --tp-weights "0.73,0.27"` |
+| `--pp-stage` | `--define-domain` | `--define-domain "gpu_tp=cuda:0,cuda:1" --pp-stage "0=gpu_tp:0-13"` |
+| `--device-mode explicit` | `--device-map` | `--device-mode explicit --device-map "0=cuda:0,1=cuda:1"` |
+
+**Consistency Rules**:
+
+| Rule | Description |
+|------|-------------|
+| TP device count must match degree | If both `--tp-devices` and `-tp N` are set, the device count must equal N |
+| No duplicate TP devices | Each device in `--tp-devices` must be distinct |
+| `--tp-scope global` incompatible with `--tp-devices` | Global TP uses MPI ranks (one device per rank); `--tp-devices` is for local multi-device |
+
 ### Named Domains (Advanced)
 
-For complex heterogeneous setups, define named TP domains and PP stage mappings:
+For complex heterogeneous setups, define named TP domains and PP stage mappings. Named domains combine tensor parallelism and pipeline parallelism in a single declaration:
 
 ```bash
-# Define named domains with devices and optional weights/backend
---define-domain "gpu_fast=cuda:0,cuda:1;weights=0.6,0.4;backend=nccl"
---define-domain "gpu_slow=rocm:0,rocm:1;backend=rccl"
+# Heterogeneous PP+TP: 2 CUDA GPUs for layers 0-13, 2 ROCm GPUs for layers 14-27
+./build_v2_release/llaminar2 \
+  --define-domain "gpu_fast=cuda:0,cuda:1;weights=0.6,0.4;backend=nccl" \
+  --define-domain "gpu_slow=rocm:0,rocm:1;backend=rccl" \
+  --pp-stage "0=gpu_fast:0-13" \
+  --pp-stage "1=gpu_slow:14-27" \
+  -m model.gguf -p "Hello" -n 50
 
-# Map PP stages to domains and layer ranges
---pp-stage "0=gpu_fast:0-13"   # Layers 0-13 on gpu_fast domain
---pp-stage "1=gpu_slow:14-27"  # Layers 14-27 on gpu_slow domain
+# Single domain (equivalent to --tp-devices but with explicit backend)
+./build_v2_release/llaminar2 \
+  --define-domain "tp_group=cuda:0,cuda:1;backend=nccl" \
+  --pp-stage "0=tp_group:0-27" \
+  -m model.gguf -p "Hello"
+
+# Preview domain configuration without running
+./build_v2_release/llaminar2 \
+  --define-domain "gpu_fast=cuda:0,cuda:1;backend=nccl" \
+  --define-domain "gpu_slow=rocm:0,rocm:1;backend=rccl" \
+  --pp-stage "0=gpu_fast:0-13" \
+  --pp-stage "1=gpu_slow:14-27" \
+  --explain-placement --dry-run -m model.gguf
 ```
 
 **Domain Definition Format**: `name=device1,device2[;weights=w1,w2][;backend=type]`
 
 **PP Stage Format**: `stage_id=domain_name:first_layer-last_layer`
+
+> **Note**: When using named domains, do NOT combine with `-d`, `-tp N`, `--tp-devices`, or `--device-map`. Named domains fully control device assignment and parallelism.
 
 ---
 
@@ -723,7 +779,7 @@ ctest --test-dir build_v2_integration -R "V2_Integration_Parity_Qwen2" -V
 **Step 4**: Enable stage tracing for full visibility:
 ```bash
 LLAMINAR_STAGE_DUMP_ENABLED=1 LLAMINAR_MPI_LOG_COLLECTIVES=1 \
-./build_v2_release/llaminar2 --tp 2 --explain-placement -m model.gguf -p "test"
+./build_v2_release/llaminar2 -tp 2 --explain-placement -m model.gguf -p "test"
 ```
 
 ---

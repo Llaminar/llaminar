@@ -485,12 +485,24 @@ TEST(Test__OrchestrationConfig, Validate_DuplicateDomainName_ReturnsError)
 TEST(Test__OrchestrationConfig, Validate_DuplicatePPStageId_ReturnsError)
 {
     OrchestrationConfig config;
+    config.domain_definitions.push_back(DomainDefinition::parse("test1=cuda:0"));
+    config.domain_definitions.push_back(DomainDefinition::parse("test2=cuda:1"));
     config.pp_stage_definitions.push_back(PPStageDefinition::parse("0=test1:0-5"));
     config.pp_stage_definitions.push_back(PPStageDefinition::parse("0=test2:6-10"));
 
     auto errors = config.validate();
     EXPECT_FALSE(errors.empty());
-    EXPECT_TRUE(errors[0].find("Duplicate") != std::string::npos);
+    // Find the duplicate error anywhere in the list (device selection rules may also fire)
+    bool found_duplicate = false;
+    for (const auto &e : errors)
+    {
+        if (e.find("Duplicate") != std::string::npos)
+        {
+            found_duplicate = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found_duplicate) << "Expected 'Duplicate' error for duplicate PP stage ID";
 }
 
 TEST(Test__OrchestrationConfig, Validate_PPStageReferencesUndefinedDomain_ReturnsError)

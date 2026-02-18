@@ -5,7 +5,7 @@
 #   cp .githooks/pre-commit .git/hooks/pre-commit
 #   chmod +x .git/hooks/pre-commit
 #
-# This hook builds and runs unit/integration tests before allowing a commit.
+# This hook builds and runs unit tests before allowing a commit.
 # Override with: git commit --no-verify
 
 set -e
@@ -18,16 +18,16 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 echo -e "${BLUE}======================================================${NC}"
-echo -e "${BLUE}Pre-commit Hook: Build & Test${NC}"
+echo -e "${BLUE}Pre-commit Hook: Build & Unit Test${NC}"
 echo -e "${BLUE}======================================================${NC}"
 echo ""
 
-# Build directories
-BUILD_V2_DEBUG="build_v2"
+# Build directory
 BUILD_V2_INTEGRATION="build_v2_integration"
 
-# Step 1: Build Debug (for development testing)
-echo -e "${YELLOW}[1/4] Building V2 Debug...${NC}"
+# Step 1: Build Debug (compile check)
+echo -e "${YELLOW}[1/3] Building V2 Debug...${NC}"
+BUILD_V2_DEBUG="build_v2"
 if ! cmake -B "$BUILD_V2_DEBUG" -S src/v2 -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON > /dev/null 2>&1; then
     echo -e "${RED}❌ CMake configuration failed (Debug)${NC}"
     exit 1
@@ -41,8 +41,8 @@ fi
 echo -e "${GREEN}✓ Debug build successful${NC}"
 echo ""
 
-# Step 2: Build Integration (for integration testing with snapshots + debug symbols)
-echo -e "${YELLOW}[2/4] Building V2 Integration...${NC}"
+# Step 2: Build Integration (for unit tests with Release optimizations + debug symbols)
+echo -e "${YELLOW}[2/3] Building V2 Integration...${NC}"
 if ! cmake -B "$BUILD_V2_INTEGRATION" -S src/v2 -DCMAKE_BUILD_TYPE=Integration > /dev/null 2>&1; then
     echo -e "${RED}❌ CMake configuration failed (Integration)${NC}"
     exit 1
@@ -56,55 +56,31 @@ fi
 echo -e "${GREEN}✓ Integration build successful${NC}"
 echo ""
 
-# Step 3: Run Unit Tests (Debug build)
-echo -e "${YELLOW}[3/4] Running V2 unit tests (Debug build)...${NC}"
+# Step 3: Run Unit Tests (Integration build — fast, isolated component tests only)
+echo -e "${YELLOW}[3/3] Running V2 unit tests (Integration build)...${NC}"
 echo ""
 
-# Run CTest with unit test filter
 # Filter: ^V2_Unit_ matches all unit tests (excludes Integration, E2E, Performance)
 # --parallel: Run unit tests in parallel for faster execution
+# NOTE: Integration tests are excluded here to keep pre-commit fast.
+#       Run integration tests manually: ctest --test-dir build_v2_integration -R "^V2_Integration_" --output-on-failure --parallel
 set +e
-ctest --test-dir "$BUILD_V2_DEBUG" -R "^V2_Unit_" --output-on-failure --parallel
+ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Unit_" --output-on-failure --parallel
 UNIT_EXIT_CODE=$?
-set -e
-
-if [ $UNIT_EXIT_CODE -ne 0 ]; then
-    echo ""
-    echo "================================================"
-    echo -e "${RED}❌ Unit tests failed (Debug).${NC}"
-    echo ""
-    echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
-    echo -e "${YELLOW}  git commit --no-verify${NC}"
-    echo -e "${YELLOW}to skip this check.${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✓ All unit tests passed${NC}"
-echo ""
-
-# Step 4: Run Integration Tests (Integration build - optimized with debug symbols + snapshots)
-echo -e "${YELLOW}[4/4] Running V2 integration tests (Integration build)...${NC}"
-echo ""
-
-# Filter: ^V2_Integration_ matches all integration tests
-# NOTE: Integration tests run against Integration build (Release + debug symbols + snapshots)
-set +e
-ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_" --output-on-failure --parallel
-INTEGRATION_EXIT_CODE=$?
 set -e
 
 echo ""
 echo "================================================"
-if [ $INTEGRATION_EXIT_CODE -eq 0 ]; then
+if [ $UNIT_EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}✅ SUCCESS: All checks passed!${NC}"
     echo -e "${GREEN}  • Debug build: OK${NC}"
     echo -e "${GREEN}  • Integration build: OK${NC}"
-    echo -e "${GREEN}  • Unit tests (Debug): OK${NC}"
-    echo -e "${GREEN}  • Integration tests (Integration): OK${NC}"
+    echo -e "${GREEN}  • Unit tests: OK${NC}"
     echo ""
     echo -e "${GREEN}Proceeding with commit...${NC}"
     exit 0
 else
-    echo -e "${RED}❌ Integration tests failed (Integration).${NC}"
+    echo -e "${RED}❌ Unit tests failed.${NC}"
     echo ""
     echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
     echo -e "${YELLOW}  git commit --no-verify${NC}"

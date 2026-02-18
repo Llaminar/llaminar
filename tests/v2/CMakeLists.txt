@@ -4748,6 +4748,17 @@ add_v2_test(V2_Unit_OrchestrationConfigParser
     MPI_PROCS 1
 )
 
+# Test: ConfigValidator (declarative device selection validation rules)
+# Tests mutual exclusion, co-requirements, intra-mode consistency, mode detection.
+# Part of CLI Device Selection Cleanup
+add_executable(v2_test_config_validator unit/config/Test__ConfigValidator.cpp)
+target_link_libraries(v2_test_config_validator llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ConfigValidator
+    COMMAND $<TARGET_FILE:v2_test_config_validator>
+    LABELS "V2;Unit;Config;Validation;CLI;DeviceSelection"
+    MPI_PROCS 1
+)
+
 # Test: ParallelismTreeParser (YAML and CLI parsing for ParallelismTree construction)
 # Tests YAML parsing, CLI inline format, error handling, round-trip serialization.
 # Part of Phase 7: Global PP Implementation - ParallelismTree Configuration
