@@ -268,6 +268,12 @@ namespace llaminar2
         /// Result of allreduce (set by executor, read by all waiters)
         bool barrier_result_{false};
 
+        /// Optional watched-pointer checksum captured at barrier arrival (per slot)
+        std::vector<uint64_t> barrier_watch_checksums_;
+        std::vector<size_t> barrier_watch_sample_bytes_;
+        std::vector<size_t> barrier_watch_sample_offsets_;
+        std::vector<bool> barrier_watch_checksum_valid_;
+
         /// True after the first barrier has completed successfully.
         /// Used for adaptive timeout: first barrier uses a longer timeout to
         /// accommodate GPU workspace allocation (hipMalloc) which can take 30-60s

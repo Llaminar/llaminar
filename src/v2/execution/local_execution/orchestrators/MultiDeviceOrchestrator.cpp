@@ -1147,6 +1147,10 @@ namespace llaminar2
         LOG_DEBUG("MultiDeviceOrchestrator::forwardTP: seq_len=" << seq_len
                                                                  << ", devices=" << device_runners_.size());
 
+        // DIAGNOSTIC: Run forward passes SEQUENTIALLY to test if concurrency causes crash.
+        // If sequential execution works but parallel crashes, it's a concurrent HIP issue.
+        const bool serialize_devices = (std::getenv("LLAMINAR_SERIALIZE_TP_FORWARD") != nullptr);
+        
         // Launch parallel forward passes on all devices
         std::vector<std::future<bool>> futures;
         futures.reserve(device_runners_.size());
@@ -1160,11 +1164,22 @@ namespace llaminar2
                 // DeviceGraphOrchestrator has both forward(tokens, seq_len) -> bool
                 // and forward(tokens, seq_len, batch_size=1) -> const float*
                 IInferenceRunner *runner_iface = runner.get();
-                futures.push_back(std::async(std::launch::async,
-                                             [runner_iface, tokens, seq_len]() -> bool
-                                             {
-                                                 return runner_iface->forward(tokens, seq_len);
-                                             }));
+                
+                if (serialize_devices)
+                {
+                    // SERIAL mode: run each device's forward completely before starting the next
+                    LOG_WARN("MultiDeviceOrchestrator::forwardTP: SERIAL mode - device " << i << " running synchronously");
+                    bool ok = runner_iface->forward(tokens, seq_len);
+                    futures.push_back(std::async(std::launch::deferred, [ok]() { return ok; }));
+                }
+                else
+                {
+                    futures.push_back(std::async(std::launch::async,
+                                                 [runner_iface, tokens, seq_len]() -> bool
+                                                 {
+                                                     return runner_iface->forward(tokens, seq_len);
+                                                 }));
+                }
             }
         }
 

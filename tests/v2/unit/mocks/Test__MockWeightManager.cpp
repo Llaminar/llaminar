@@ -53,7 +53,7 @@ TEST(Test__MockWeightManager, AddFP32RandomWeight) {
     EXPECT_TRUE(mock->hasWeight("test_weight"));
     EXPECT_EQ(mock->cacheSize(), 1);
 
-    auto weight = mock->getWeight("test_weight");
+    auto weight = mock->getWeightForDevice("test_weight");
     ASSERT_NE(weight, nullptr);
     EXPECT_EQ(weight->rows(), 64);
     EXPECT_EQ(weight->cols(), 128);
@@ -75,7 +75,7 @@ TEST(Test__MockWeightManager, AddFP32ZerosWeight) {
         .addFP32ZerosWeight("zeros", {32, 64})
         .build();
 
-    auto weight = mock->getWeight("zeros");
+    auto weight = mock->getWeightForDevice("zeros");
     ASSERT_NE(weight, nullptr);
 
     auto* fp32 = dynamic_cast<FP32Tensor*>(weight.get());
@@ -92,7 +92,7 @@ TEST(Test__MockWeightManager, AddFP32OnesWeight) {
         .addFP32OnesWeight("ones", {16, 32})
         .build();
 
-    auto weight = mock->getWeight("ones");
+    auto weight = mock->getWeightForDevice("ones");
     ASSERT_NE(weight, nullptr);
 
     auto* fp32 = dynamic_cast<FP32Tensor*>(weight.get());
@@ -109,7 +109,7 @@ TEST(Test__MockWeightManager, AddQ4_0RandomWeight) {
         .addQ4_0RandomWeight("q4_weight", {64, 128}, -1.0f, 1.0f, 42)
         .build();
 
-    auto weight = mock->getWeight("q4_weight");
+    auto weight = mock->getWeightForDevice("q4_weight");
     ASSERT_NE(weight, nullptr);
     EXPECT_EQ(weight->rows(), 64);
     EXPECT_EQ(weight->cols(), 128);
@@ -124,7 +124,7 @@ TEST(Test__MockWeightManager, AddQ8_0RandomWeight) {
         .addQ8_0RandomWeight("q8_weight", {32, 64}, -0.5f, 0.5f, 123)
         .build();
 
-    auto weight = mock->getWeight("q8_weight");
+    auto weight = mock->getWeightForDevice("q8_weight");
     ASSERT_NE(weight, nullptr);
     EXPECT_EQ(weight->rows(), 32);
     EXPECT_EQ(weight->cols(), 64);
@@ -140,7 +140,7 @@ TEST(Test__MockWeightManager, Add1DTensor) {
         .addFP32OnesWeight("norm_weight", {896})
         .build();
 
-    auto weight = mock->getWeight("norm_weight");
+    auto weight = mock->getWeightForDevice("norm_weight");
     ASSERT_NE(weight, nullptr);
     EXPECT_EQ(weight->rows(), 896);
     EXPECT_EQ(weight->cols(), 1);
@@ -276,7 +276,7 @@ TEST(Test__MockWeightManager, DecodeWeightFallbackToMain) {
     auto decode = mock->getDecodeWeight("blk.0.attn_q.weight", DeviceId::cpu(), 0.2f);
     ASSERT_NE(decode, nullptr);
 
-    auto main = mock->getWeight("blk.0.attn_q.weight");
+    auto main = mock->getWeightForDevice("blk.0.attn_q.weight");
     EXPECT_EQ(decode.get(), main.get());
 }
 
@@ -307,7 +307,7 @@ TEST(Test__MockWeightManager, AddAttentionLayer) {
     EXPECT_TRUE(mock->hasWeight("blk.0.attn_q.weight"));
     EXPECT_EQ(mock->getShardingMode("blk.0.attn_q.weight"), ShardingMode::COLUMN_PARALLEL);
 
-    auto q = mock->getWeight("blk.0.attn_q.weight");
+    auto q = mock->getWeightForDevice("blk.0.attn_q.weight");
     ASSERT_NE(q, nullptr);
     EXPECT_EQ(q->rows(), 4 * 32);   // num_heads * head_dim = 128
     EXPECT_EQ(q->cols(), 128);      // hidden_dim
@@ -316,7 +316,7 @@ TEST(Test__MockWeightManager, AddAttentionLayer) {
     EXPECT_TRUE(mock->hasWeight("blk.0.attn_k.weight"));
     EXPECT_EQ(mock->getShardingMode("blk.0.attn_k.weight"), ShardingMode::COLUMN_PARALLEL);
 
-    auto k = mock->getWeight("blk.0.attn_k.weight");
+    auto k = mock->getWeightForDevice("blk.0.attn_k.weight");
     ASSERT_NE(k, nullptr);
     EXPECT_EQ(k->rows(), 2 * 32);   // num_kv_heads * head_dim = 64
     EXPECT_EQ(k->cols(), 128);
@@ -329,7 +329,7 @@ TEST(Test__MockWeightManager, AddAttentionLayer) {
     EXPECT_TRUE(mock->hasWeight("blk.0.attn_output.weight"));
     EXPECT_EQ(mock->getShardingMode("blk.0.attn_output.weight"), ShardingMode::ROW_PARALLEL);
 
-    auto wo = mock->getWeight("blk.0.attn_output.weight");
+    auto wo = mock->getWeightForDevice("blk.0.attn_output.weight");
     ASSERT_NE(wo, nullptr);
     EXPECT_EQ(wo->rows(), 128);      // hidden_dim
     EXPECT_EQ(wo->cols(), 4 * 32);   // q_dim
@@ -346,7 +346,7 @@ TEST(Test__MockWeightManager, AddFFNLayer) {
     EXPECT_TRUE(mock->hasWeight("blk.0.ffn_gate.weight"));
     EXPECT_EQ(mock->getShardingMode("blk.0.ffn_gate.weight"), ShardingMode::COLUMN_PARALLEL);
 
-    auto gate = mock->getWeight("blk.0.ffn_gate.weight");
+    auto gate = mock->getWeightForDevice("blk.0.ffn_gate.weight");
     ASSERT_NE(gate, nullptr);
     EXPECT_EQ(gate->rows(), 512);
     EXPECT_EQ(gate->cols(), 128);
@@ -359,7 +359,7 @@ TEST(Test__MockWeightManager, AddFFNLayer) {
     EXPECT_TRUE(mock->hasWeight("blk.0.ffn_down.weight"));
     EXPECT_EQ(mock->getShardingMode("blk.0.ffn_down.weight"), ShardingMode::INPUT_PARALLEL);
 
-    auto down = mock->getWeight("blk.0.ffn_down.weight");
+    auto down = mock->getWeightForDevice("blk.0.ffn_down.weight");
     ASSERT_NE(down, nullptr);
     EXPECT_EQ(down->rows(), 128);
     EXPECT_EQ(down->cols(), 512);
@@ -391,7 +391,7 @@ TEST(Test__MockWeightManager, AddEmbedding) {
     EXPECT_EQ(mock->getShardingMode("token_embd.weight"), ShardingMode::REPLICATE);
     EXPECT_FALSE(mock->isGemmWeight("token_embd.weight"));
 
-    auto embd = mock->getWeight("token_embd.weight");
+    auto embd = mock->getWeightForDevice("token_embd.weight");
     ASSERT_NE(embd, nullptr);
     EXPECT_EQ(embd->rows(), 1000);
     EXPECT_EQ(embd->cols(), 128);
@@ -421,13 +421,13 @@ TEST(Test__MockWeightManager, TrackGetWeightCalls) {
 
     EXPECT_EQ(mock->getWeightCallCount(), 0);
 
-    mock->getWeight("weight1");
+    mock->getWeightForDevice("weight1");
     EXPECT_EQ(mock->getWeightCallCount(), 1);
 
-    mock->getWeight("weight2");
+    mock->getWeightForDevice("weight2");
     EXPECT_EQ(mock->getWeightCallCount(), 2);
 
-    mock->getWeight("weight1");  // Same weight again
+    mock->getWeightForDevice("weight1");  // Same weight again
     EXPECT_EQ(mock->getWeightCallCount(), 3);
 }
 
@@ -436,9 +436,9 @@ TEST(Test__MockWeightManager, TrackMissingRequests) {
         .addFP32RandomWeight("exists", {64, 64})
         .build();
 
-    mock->getWeight("exists");
-    mock->getWeight("does_not_exist");
-    mock->getWeight("also_missing");
+    mock->getWeightForDevice("exists");
+    mock->getWeightForDevice("does_not_exist");
+    mock->getWeightForDevice("also_missing");
 
     auto& missing = mock->missingWeightRequests();
     EXPECT_EQ(missing.size(), 2);
@@ -451,8 +451,8 @@ TEST(Test__MockWeightManager, ResetCounters) {
         .addFP32RandomWeight("exists", {64, 64})
         .build();
 
-    mock->getWeight("exists");
-    mock->getWeight("missing");
+    mock->getWeightForDevice("exists");
+    mock->getWeightForDevice("missing");
 
     EXPECT_EQ(mock->getWeightCallCount(), 2);
     EXPECT_EQ(mock->missingWeightRequests().size(), 1);
@@ -534,7 +534,7 @@ TEST(Test__MockWeightManager, ImplementsIWeightManager) {
     EXPECT_EQ(interface->getShardingMode("test"), ShardingMode::COLUMN_PARALLEL);
     EXPECT_TRUE(interface->isGemmWeight("test"));
 
-    auto weight = interface->getWeight("test");
+    auto weight = interface->getWeightForDevice("test");
     ASSERT_NE(weight, nullptr);
 
     interface->clearCache();

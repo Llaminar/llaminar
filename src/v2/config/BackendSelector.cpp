@@ -4,16 +4,76 @@
  */
 
 #include "BackendSelector.h"
+#include "../backends/ComputeBackend.h"
 #include "../utils/Logger.h"
 #include <algorithm>
 
 namespace llaminar2 {
 
 // =========================================================================
+// NUMA Lookup Helper
+// =========================================================================
+
+/**
+ * @brief Look up the NUMA node for a DeviceId via DeviceManager inventory.
+ * @return NUMA node (>=0), or -1 if device not found or DeviceManager not initialized.
+ */
+static int numaNodeForDevice(const DeviceId& dev) {
+    const auto& dm = DeviceManager::instance();
+    for (const auto& cd : dm.devices()) {
+        bool type_match = false;
+        switch (dev.type) {
+            case DeviceType::CUDA: type_match = (cd.type == ComputeBackendType::GPU_CUDA); break;
+            case DeviceType::ROCm: type_match = (cd.type == ComputeBackendType::GPU_ROCM); break;
+            case DeviceType::CPU:  type_match = (cd.type == ComputeBackendType::CPU);      break;
+        }
+        if (type_match && cd.device_id == dev.ordinal) {
+            return cd.numa_node;
+        }
+    }
+    return -1;  // Unknown
+}
+
+/**
+ * @brief Check if all GPU devices in the list are on the same NUMA node.
+ * @return true if same NUMA (or only one GPU, or NUMA info unavailable)
+ */
+static bool areDevicesSameNuma(const std::vector<DeviceId>& devices) {
+    int first_numa = -1;
+    for (const auto& dev : devices) {
+        if (!dev.is_gpu()) continue;
+        int numa = numaNodeForDevice(dev);
+        if (numa < 0) continue;  // Unknown NUMA — don't block
+        if (first_numa < 0) {
+            first_numa = numa;
+        } else if (numa != first_numa) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// =========================================================================
 // PP Transfer Backend Selection
 // =========================================================================
 
 CollectiveBackendType BackendSelector::selectForTransfer(DeviceId src, DeviceId dst) {
+    // For cross-vendor GPU pairs, check NUMA before delegating to type-only overload
+    bool src_gpu = src.is_gpu();
+    bool dst_gpu = dst.is_gpu();
+    if (src_gpu && dst_gpu && src.type != dst.type) {
+        int src_numa = numaNodeForDevice(src);
+        int dst_numa = numaNodeForDevice(dst);
+        if (src_numa >= 0 && dst_numa >= 0 && src_numa != dst_numa) {
+            LOG_WARN("Cross-NUMA heterogeneous GPU PP transfer (" << src.to_string()
+                     << " NUMA " << src_numa << " → " << dst.to_string()
+                     << " NUMA " << dst_numa << "): HOST backend selected "
+                     "instead of PCIeBAR — this will be slow! "
+                     "For best performance, use GPUs on the same NUMA node "
+                     "so PCIeBAR peer-to-peer transfers can be used.");
+            return CollectiveBackendType::HOST;
+        }
+    }
     return selectForTransfer(src.type, dst.type);
 }
 
@@ -36,7 +96,7 @@ CollectiveBackendType BackendSelector::selectForTransfer(DeviceType src_type, De
     bool dst_gpu = (dst_type == DeviceType::CUDA || dst_type == DeviceType::ROCm);
 
     if (src_gpu && dst_gpu) {
-        // CUDA ↔ ROCm: use PCIeBAR for direct P2P
+        // CUDA ↔ ROCm: PCIeBAR (caller with DeviceId checks NUMA before reaching here)
         return CollectiveBackendType::PCIE_BAR;
     }
 
@@ -90,9 +150,17 @@ CollectiveBackendType BackendSelector::selectForTPDomain(const std::vector<Devic
 
     // Mixed CUDA + ROCm (no CPU)
     if (has_cuda && has_rocm && !has_cpu) {
-        if (devices.size() == 2) {
-            // 2-device cross-vendor: PCIeBAR
+        if (devices.size() == 2 && areDevicesSameNuma(devices)) {
+            // 2-device cross-vendor on same NUMA: PCIeBAR
             return CollectiveBackendType::PCIE_BAR;
+        } else if (devices.size() == 2) {
+            // 2-device cross-vendor but cross-NUMA: HOST staging
+            LOG_WARN("Cross-NUMA heterogeneous GPU TP (" << devices[0].to_string()
+                     << ", " << devices[1].to_string() << "): HOST backend selected "
+                     "instead of PCIeBAR — this will be slow! "
+                     "For best performance, use GPUs on the same NUMA node "
+                     "so PCIeBAR peer-to-peer transfers can be used.");
+            return CollectiveBackendType::HOST;
         } else {
             // 3+ device cross-vendor: orchestrated heterogeneous
             return CollectiveBackendType::HETEROGENEOUS;
@@ -176,10 +244,11 @@ bool BackendSelector::isBackendUsable(CollectiveBackendType backend,
                 [](const DeviceId& d) { return d.type == DeviceType::ROCm; });
 
         case CollectiveBackendType::PCIE_BAR:
-            // PCIeBAR requires exactly 2 GPU devices
+            // PCIeBAR requires exactly 2 GPU devices on the same NUMA node
             if (devices.size() != 2) return false;
-            return std::all_of(devices.begin(), devices.end(),
-                [](const DeviceId& d) { return d.is_gpu(); });
+            if (!std::all_of(devices.begin(), devices.end(),
+                [](const DeviceId& d) { return d.is_gpu(); })) return false;
+            return areDevicesSameNuma(devices);
 
         case CollectiveBackendType::HETEROGENEOUS:
             // Heterogeneous requires mixed GPU vendors

@@ -10,7 +10,6 @@
 #include "../../../tensors/BlockStructures.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
-#include "../../../utils/KernelProfiler.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include <cstring>
@@ -52,8 +51,6 @@ namespace llaminar2
 
     bool RoPEStage::execute(IDeviceContext *ctx)
     {
-        KERNEL_PROFILE_SCOPE(KernelType::ROPE);
-
         if (!ensureContext(ctx, "RoPEStage"))
         {
             return false;

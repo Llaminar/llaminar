@@ -447,7 +447,7 @@ TEST_F(WeightManagerInstanceTest, GetWeight_LoadsTensorOnFirstCall)
                      WeightDistributionStrategy::REPLICATED,
                      WeightPrecision::NATIVE);
 
-    auto tensor = wm.getWeight("token_embd.weight", DeviceId::cpu(), 0);
+    auto tensor = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
 
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->shape().size(), 2);
@@ -461,8 +461,8 @@ TEST_F(WeightManagerInstanceTest, GetWeight_CacheHitOnSecondCall)
                      WeightDistributionStrategy::REPLICATED,
                      WeightPrecision::NATIVE);
 
-    auto tensor1 = wm.getWeight("token_embd.weight", DeviceId::cpu(), 0);
-    auto tensor2 = wm.getWeight("token_embd.weight", DeviceId::cpu(), 0);
+    auto tensor1 = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
+    auto tensor2 = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
 
     // Should return same pointer (cache hit)
     ASSERT_NE(tensor1, nullptr);
@@ -476,8 +476,8 @@ TEST_F(WeightManagerInstanceTest, GetWeight_DifferentWeightsAreCachedSeparately)
                      WeightDistributionStrategy::REPLICATED,
                      WeightPrecision::NATIVE);
 
-    auto embd = wm.getWeight("token_embd.weight", DeviceId::cpu(), 0);
-    auto norm = wm.getWeight("output_norm.weight", DeviceId::cpu(), 0);
+    auto embd = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
+    auto norm = wm.getWeightForDevice("output_norm.weight", DeviceId::cpu(), 0);
 
     ASSERT_NE(embd, nullptr);
     ASSERT_NE(norm, nullptr);
@@ -491,7 +491,7 @@ TEST_F(WeightManagerInstanceTest, GetWeight_1DTensor)
                      WeightDistributionStrategy::REPLICATED,
                      WeightPrecision::NATIVE);
 
-    auto tensor = wm.getWeight("output_norm.weight", DeviceId::cpu(), 0);
+    auto tensor = wm.getWeightForDevice("output_norm.weight", DeviceId::cpu(), 0);
 
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->shape().size(), 1);
@@ -504,7 +504,7 @@ TEST_F(WeightManagerInstanceTest, GetWeight_NonexistentTensor_ReturnsNull)
                      WeightDistributionStrategy::REPLICATED,
                      WeightPrecision::NATIVE);
 
-    auto tensor = wm.getWeight("nonexistent.weight", DeviceId::cpu(), 0);
+    auto tensor = wm.getWeightForDevice("nonexistent.weight", DeviceId::cpu(), 0);
 
     EXPECT_EQ(tensor, nullptr);
 }
@@ -516,9 +516,9 @@ TEST_F(WeightManagerInstanceTest, GetWeight_MultipleLayers)
                      WeightPrecision::NATIVE);
 
     // Load weights from layer 0
-    auto q = wm.getWeight("blk.0.attn_q.weight", DeviceId::cpu(), 0);
-    auto k = wm.getWeight("blk.0.attn_k.weight", DeviceId::cpu(), 0);
-    auto v = wm.getWeight("blk.0.attn_v.weight", DeviceId::cpu(), 0);
+    auto q = wm.getWeightForDevice("blk.0.attn_q.weight", DeviceId::cpu(), 0);
+    auto k = wm.getWeightForDevice("blk.0.attn_k.weight", DeviceId::cpu(), 0);
+    auto v = wm.getWeightForDevice("blk.0.attn_v.weight", DeviceId::cpu(), 0);
 
     ASSERT_NE(q, nullptr);
     ASSERT_NE(k, nullptr);
@@ -549,14 +549,14 @@ TEST_F(WeightManagerInstanceTest, CacheSize_IncrementsOnLoad)
                      WeightDistributionStrategy::REPLICATED,
                      WeightPrecision::NATIVE);
 
-    wm.getWeight("token_embd.weight", DeviceId::cpu(), 0);
+    wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     EXPECT_EQ(wm.cacheSize(), 1);
 
-    wm.getWeight("output_norm.weight", DeviceId::cpu(), 0);
+    wm.getWeightForDevice("output_norm.weight", DeviceId::cpu(), 0);
     EXPECT_EQ(wm.cacheSize(), 2);
 
     // Cache hit should not increment
-    wm.getWeight("token_embd.weight", DeviceId::cpu(), 0);
+    wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     EXPECT_EQ(wm.cacheSize(), 2);
 }
 
@@ -566,8 +566,8 @@ TEST_F(WeightManagerInstanceTest, ClearCache_RemovesAllEntries)
                      WeightDistributionStrategy::REPLICATED,
                      WeightPrecision::NATIVE);
 
-    wm.getWeight("token_embd.weight", DeviceId::cpu(), 0);
-    wm.getWeight("output_norm.weight", DeviceId::cpu(), 0);
+    wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
+    wm.getWeightForDevice("output_norm.weight", DeviceId::cpu(), 0);
     EXPECT_EQ(wm.cacheSize(), 2);
 
     wm.clearCache();
@@ -580,12 +580,12 @@ TEST_F(WeightManagerInstanceTest, ClearCache_AllowsReload)
                      WeightDistributionStrategy::REPLICATED,
                      WeightPrecision::NATIVE);
 
-    auto tensor1 = wm.getWeight("token_embd.weight", DeviceId::cpu(), 0);
+    auto tensor1 = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     ASSERT_NE(tensor1, nullptr);
 
     wm.clearCache();
 
-    auto tensor2 = wm.getWeight("token_embd.weight", DeviceId::cpu(), 0);
+    auto tensor2 = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     ASSERT_NE(tensor2, nullptr);
 
     // Should be a different instance after cache clear
@@ -629,7 +629,7 @@ TEST_F(WeightManagerInstanceTest, Sharded_ReplicatesNormWeights)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Norm weights should be fully replicated
-    auto norm = wm.getWeight("blk.0.attn_norm.weight", DeviceId::cpu(), 0);
+    auto norm = wm.getWeightForDevice("blk.0.attn_norm.weight", DeviceId::cpu(), 0);
     ASSERT_NE(norm, nullptr);
     EXPECT_EQ(norm->shape()[0], 128); // Full size, not sharded
 }
@@ -646,7 +646,7 @@ TEST_F(WeightManagerInstanceTest, Sharded_ReplicatesEmbedding)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Embedding should be fully replicated
-    auto embd = wm.getWeight("token_embd.weight", DeviceId::cpu(), 0);
+    auto embd = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     ASSERT_NE(embd, nullptr);
     EXPECT_EQ(embd->shape()[0], 1000);
     EXPECT_EQ(embd->shape()[1], 128);
@@ -948,7 +948,7 @@ TEST_F(WeightManagerInstanceTest, InterleavedStrategy_LoadsTensor)
                      WeightPrecision::NATIVE);
 
     // INTERLEAVED strategy should still load tensors (falls back to replicated for now)
-    auto tensor = wm.getWeight("token_embd.weight", DeviceId::cpu(), 0);
+    auto tensor = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
 
     // May return nullptr if not implemented, or tensor if fallback works
     // The important thing is it doesn't crash
@@ -1043,7 +1043,7 @@ TEST_F(WeightManagerInstanceTest, GetDecodeWeight_CachesSeparately)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Load both regular and decode weights
-    auto regular = wm.getWeight("blk.0.attn_q.weight", DeviceId::cpu(), 0);
+    auto regular = wm.getWeightForDevice("blk.0.attn_q.weight", DeviceId::cpu(), 0);
     auto decode = wm.getDecodeWeight("blk.0.attn_q.weight", DeviceId::cpu(), 0.5f, 0);
 
     ASSERT_NE(regular, nullptr);
@@ -1137,7 +1137,7 @@ TEST_F(WeightManagerInstanceTest, Sharded_TwoRanks_Rank0GetsFirstHalf)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Q weight [128, 128] should be column-sliced to [64, 128] for rank 0
-    auto q = wm.getWeight("blk.0.attn_q.weight", DeviceId::cpu(), 0);
+    auto q = wm.getWeightForDevice("blk.0.attn_q.weight", DeviceId::cpu(), 0);
     ASSERT_NE(q, nullptr);
     EXPECT_EQ(q->shape()[0], 64);  // half of 128
     EXPECT_EQ(q->shape()[1], 128); // input dim unchanged
@@ -1155,7 +1155,7 @@ TEST_F(WeightManagerInstanceTest, Sharded_TwoRanks_Rank1GetsSecondHalf)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Q weight [128, 128] should be column-sliced to [64, 128] for rank 1
-    auto q = wm.getWeight("blk.0.attn_q.weight", DeviceId::cpu(), 0);
+    auto q = wm.getWeightForDevice("blk.0.attn_q.weight", DeviceId::cpu(), 0);
     ASSERT_NE(q, nullptr);
     EXPECT_EQ(q->shape()[0], 64);  // half of 128
     EXPECT_EQ(q->shape()[1], 128); // input dim unchanged
@@ -1173,7 +1173,7 @@ TEST_F(WeightManagerInstanceTest, Sharded_InputParallel_SlicesColumns)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // FFN down [128, 512] is input-parallel, should slice columns to [128, 256]
-    auto down = wm.getWeight("blk.0.ffn_down.weight", DeviceId::cpu(), 0);
+    auto down = wm.getWeightForDevice("blk.0.ffn_down.weight", DeviceId::cpu(), 0);
     ASSERT_NE(down, nullptr);
     EXPECT_EQ(down->shape()[0], 128); // output dim unchanged
     EXPECT_EQ(down->shape()[1], 256); // half of 512
@@ -1191,13 +1191,13 @@ TEST_F(WeightManagerInstanceTest, Sharded_ColumnParallel_GateUp)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Gate [512, 128] is column-parallel, should slice rows to [256, 128]
-    auto gate = wm.getWeight("blk.0.ffn_gate.weight", DeviceId::cpu(), 0);
+    auto gate = wm.getWeightForDevice("blk.0.ffn_gate.weight", DeviceId::cpu(), 0);
     ASSERT_NE(gate, nullptr);
     EXPECT_EQ(gate->shape()[0], 256); // half of 512
     EXPECT_EQ(gate->shape()[1], 128); // input dim unchanged
 
     // Up should be same
-    auto up = wm.getWeight("blk.0.ffn_up.weight", DeviceId::cpu(), 0);
+    auto up = wm.getWeightForDevice("blk.0.ffn_up.weight", DeviceId::cpu(), 0);
     ASSERT_NE(up, nullptr);
     EXPECT_EQ(up->shape()[0], 256);
     EXPECT_EQ(up->shape()[1], 128);
@@ -1723,8 +1723,8 @@ TEST_F(WeightManagerInstanceTest, PreloadForDevices_SingleDevice)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // First load some weights
-    wm.getWeight("token_embd.weight", DeviceId::cpu(), 0);
-    wm.getWeight("blk.0.attn_q.weight", DeviceId::cpu(), 0);
+    wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
+    wm.getWeightForDevice("blk.0.attn_q.weight", DeviceId::cpu(), 0);
 
     // Preload for devices
     std::vector<DeviceId> devices = {DeviceId::cpu()};
@@ -1744,7 +1744,7 @@ TEST_F(WeightManagerInstanceTest, PreloadForDevices_MultipleDevices)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Load a weight first
-    wm.getWeight("token_embd.weight", DeviceId::cpu(), 0);
+    wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
 
     // Preload for multiple devices
     std::vector<DeviceId> devices = {

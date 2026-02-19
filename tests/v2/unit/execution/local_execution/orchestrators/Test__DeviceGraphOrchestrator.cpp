@@ -642,7 +642,7 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_FP32_UsesPositionMajor)
     EXPECT_EQ(cpu_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, KVCacheImplementation_FP32_DefaultsToRingCPUKVCache)
+TEST_F(Test__DeviceGraphOrchestrator, KVCacheImplementation_FP32Activation_DefaultsToFP16RingCPUKVCache)
 {
     auto fp32_config = config_;
     fp32_config.activation_precision = ActivationPrecision::FP32;
@@ -655,7 +655,8 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheImplementation_FP32_DefaultsToRingC
     ASSERT_NE(state.kv_cache, nullptr);
     auto *cpu_cache = dynamic_cast<ICPUKVCache *>(state.kv_cache.get());
     ASSERT_NE(cpu_cache, nullptr);
-    EXPECT_NE(dynamic_cast<CPURingKVCache<ActivationPrecision::FP32> *>(cpu_cache), nullptr);
+    // KV cache precision defaults to AUTO→FP16, independent of activation precision
+    EXPECT_NE(dynamic_cast<CPURingKVCache<ActivationPrecision::FP16> *>(cpu_cache), nullptr);
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_BF16_UsesPositionMajor)

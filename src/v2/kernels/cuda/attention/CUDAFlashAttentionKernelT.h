@@ -97,7 +97,7 @@ namespace llaminar2
              * @brief Construct a CUDA Flash Attention kernel
              * @param device_idx CUDA device index (0-based)
              */
-            explicit CUDAFlashAttentionKernelT(int device_idx = 0);
+            explicit CUDAFlashAttentionKernelT(int device_idx = -1);
             ~CUDAFlashAttentionKernelT() override;
 
             // Non-copyable, moveable
@@ -254,7 +254,7 @@ namespace llaminar2
              * @brief Create CUDA Flash Attention kernel (legacy constructor)
              * @param device_idx CUDA device index (0-based)
              */
-            explicit CUDAFlashAttentionKernelT(int device_idx = 0);
+            explicit CUDAFlashAttentionKernelT(int device_idx = -1);
 
             /**
              * @brief Create CUDA Flash Attention kernel using device context
@@ -445,7 +445,7 @@ namespace llaminar2
              * @brief Create CUDA Flash Attention kernel (legacy constructor)
              * @param device_idx CUDA device index (0-based)
              */
-            explicit CUDAFlashAttentionKernelT(int device_idx = 0);
+            explicit CUDAFlashAttentionKernelT(int device_idx = -1);
 
             /**
              * @brief Create CUDA Flash Attention kernel using device context
@@ -584,7 +584,7 @@ namespace llaminar2
              * @brief Create CUDA Flash Attention kernel (legacy constructor)
              * @param device_idx CUDA device index (0-based)
              */
-            explicit CUDAFlashAttentionKernelT(int device_idx = 0);
+            explicit CUDAFlashAttentionKernelT(int device_idx = -1);
 
             /**
              * @brief Create CUDA Flash Attention kernel using device context

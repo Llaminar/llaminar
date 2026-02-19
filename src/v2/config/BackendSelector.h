@@ -35,7 +35,8 @@ public:
      * Rules:
      * - CUDA → CUDA: NCCL (low latency, high bandwidth)
      * - ROCm → ROCm: RCCL (AMD equivalent)
-     * - CUDA ↔ ROCm: PCIE_BAR (cross-vendor GPU P2P)
+     * - CUDA ↔ ROCm (same NUMA): PCIE_BAR (cross-vendor GPU P2P)
+     * - CUDA ↔ ROCm (cross NUMA): HOST (PCIeBAR requires same-NUMA)
      * - GPU → CPU or CPU → GPU: HOST (staging through host memory)
      * - CPU → CPU: HOST
      *
@@ -66,7 +67,8 @@ public:
      * Rules:
      * - All CUDA: NCCL
      * - All ROCm: RCCL
-     * - Mixed CUDA+ROCm (2 devices): PCIE_BAR
+     * - Mixed CUDA+ROCm (2 devices, same NUMA): PCIE_BAR
+     * - Mixed CUDA+ROCm (2 devices, cross NUMA): HOST
      * - Mixed CUDA+ROCm (3+ devices): HETEROGENEOUS
      * - All CPU: MPI (or HOST for single-node)
      * - Single device: HOST (no collective needed)

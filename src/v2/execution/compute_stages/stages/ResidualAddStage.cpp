@@ -7,7 +7,6 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
-#include "../../../utils/KernelProfiler.h"
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../local_execution/device/DeviceContext.h"
 #include "../../../kernels/KernelFactory.h"
@@ -26,8 +25,6 @@ namespace llaminar2
 
     bool ResidualAddStage::execute(IDeviceContext *ctx)
     {
-        KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
-
         if (!ensureContext(ctx, "ResidualAddStage"))
         {
             return false;

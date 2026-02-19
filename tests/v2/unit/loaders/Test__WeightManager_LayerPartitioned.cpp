@@ -67,13 +67,13 @@ TEST_F(Test__WeightManager_LayerPartitioned, EmbeddingWeight_FilteredByFlag)
     // Stage 0: has embedding
     auto ctx0 = createPPStageContext(0, 12, true, false);
     ASSERT_NE(ctx0, nullptr);
-    auto emb0 = ctx0->getWeight("token_embd.weight");
+    auto emb0 = ctx0->getWeightForDevice("token_embd.weight");
     EXPECT_NE(emb0, nullptr) << "Stage 0 should have embedding";
 
     // Stage 1: no embedding
     auto ctx1 = createPPStageContext(12, 24, false, true);
     ASSERT_NE(ctx1, nullptr);
-    auto emb1 = ctx1->getWeight("token_embd.weight");
+    auto emb1 = ctx1->getWeightForDevice("token_embd.weight");
     EXPECT_EQ(emb1, nullptr) << "Stage 1 should NOT have embedding";
 }
 
@@ -85,13 +85,13 @@ TEST_F(Test__WeightManager_LayerPartitioned, OutputNormWeight_FilteredByFlag)
     // Stage 0: no LM head
     auto ctx0 = createPPStageContext(0, 12, true, false);
     ASSERT_NE(ctx0, nullptr);
-    auto norm0 = ctx0->getWeight("output_norm.weight");
+    auto norm0 = ctx0->getWeightForDevice("output_norm.weight");
     EXPECT_EQ(norm0, nullptr) << "Stage 0 should NOT have output_norm";
 
     // Stage 1: has LM head
     auto ctx1 = createPPStageContext(12, 24, false, true);
     ASSERT_NE(ctx1, nullptr);
-    auto norm1 = ctx1->getWeight("output_norm.weight");
+    auto norm1 = ctx1->getWeightForDevice("output_norm.weight");
     EXPECT_NE(norm1, nullptr) << "Stage 1 should have output_norm";
 }
 
@@ -103,13 +103,13 @@ TEST_F(Test__WeightManager_LayerPartitioned, LMHeadWeight_FilteredByFlag)
     // Stage 0: no LM head
     auto ctx0 = createPPStageContext(0, 12, true, false);
     ASSERT_NE(ctx0, nullptr);
-    auto head0 = ctx0->getWeight("output.weight");
+    auto head0 = ctx0->getWeightForDevice("output.weight");
     EXPECT_EQ(head0, nullptr) << "Stage 0 should NOT have output.weight";
 
     // Stage 1: has LM head
     auto ctx1 = createPPStageContext(12, 24, false, true);
     ASSERT_NE(ctx1, nullptr);
-    auto head1 = ctx1->getWeight("output.weight");
+    auto head1 = ctx1->getWeightForDevice("output.weight");
     EXPECT_NE(head1, nullptr) << "Stage 1 should have output.weight";
 }
 
@@ -123,19 +123,19 @@ TEST_F(Test__WeightManager_LayerPartitioned, LayerWeight_OutsideRange_ReturnsNul
     ASSERT_NE(ctx0, nullptr);
 
     // Layer 0 attention Q should be loaded
-    auto layer0_q = ctx0->getWeight("blk.0.attn_q.weight");
+    auto layer0_q = ctx0->getWeightForDevice("blk.0.attn_q.weight");
     EXPECT_NE(layer0_q, nullptr) << "Layer 0 should be in range";
 
     // Layer 11 should also be loaded (last layer in range)
-    auto layer11_q = ctx0->getWeight("blk.11.attn_q.weight");
+    auto layer11_q = ctx0->getWeightForDevice("blk.11.attn_q.weight");
     EXPECT_NE(layer11_q, nullptr) << "Layer 11 should be in range";
 
     // Layer 12 should NOT be loaded (outside range)
-    auto layer12_q = ctx0->getWeight("blk.12.attn_q.weight");
+    auto layer12_q = ctx0->getWeightForDevice("blk.12.attn_q.weight");
     EXPECT_EQ(layer12_q, nullptr) << "Layer 12 should NOT be in range for stage 0";
 
     // Layer 23 should NOT be loaded
-    auto layer23_q = ctx0->getWeight("blk.23.attn_q.weight");
+    auto layer23_q = ctx0->getWeightForDevice("blk.23.attn_q.weight");
     EXPECT_EQ(layer23_q, nullptr) << "Layer 23 should NOT be in range for stage 0";
 }
 
@@ -149,19 +149,19 @@ TEST_F(Test__WeightManager_LayerPartitioned, LayerWeight_InsideRange_Loaded)
     ASSERT_NE(ctx1, nullptr);
 
     // Layer 0 should NOT be loaded (before range)
-    auto layer0_q = ctx1->getWeight("blk.0.attn_q.weight");
+    auto layer0_q = ctx1->getWeightForDevice("blk.0.attn_q.weight");
     EXPECT_EQ(layer0_q, nullptr) << "Layer 0 should NOT be in range for stage 1";
 
     // Layer 11 should NOT be loaded (before range)
-    auto layer11_q = ctx1->getWeight("blk.11.attn_q.weight");
+    auto layer11_q = ctx1->getWeightForDevice("blk.11.attn_q.weight");
     EXPECT_EQ(layer11_q, nullptr) << "Layer 11 should NOT be in range for stage 1";
 
     // Layer 12 should be loaded (first in range)
-    auto layer12_q = ctx1->getWeight("blk.12.attn_q.weight");
+    auto layer12_q = ctx1->getWeightForDevice("blk.12.attn_q.weight");
     EXPECT_NE(layer12_q, nullptr) << "Layer 12 should be in range for stage 1";
 
     // Layer 23 should be loaded (last in range)
-    auto layer23_q = ctx1->getWeight("blk.23.attn_q.weight");
+    auto layer23_q = ctx1->getWeightForDevice("blk.23.attn_q.weight");
     EXPECT_NE(layer23_q, nullptr) << "Layer 23 should be in range for stage 1";
 }
 
@@ -174,11 +174,11 @@ TEST_F(Test__WeightManager_LayerPartitioned, AllAttentionWeights_InsideRange_Loa
     ASSERT_NE(ctx, nullptr);
 
     // Check all attention weights for layer 5
-    EXPECT_NE(ctx->getWeight("blk.5.attn_q.weight"), nullptr);
-    EXPECT_NE(ctx->getWeight("blk.5.attn_k.weight"), nullptr);
-    EXPECT_NE(ctx->getWeight("blk.5.attn_v.weight"), nullptr);
-    EXPECT_NE(ctx->getWeight("blk.5.attn_output.weight"), nullptr);
-    EXPECT_NE(ctx->getWeight("blk.5.attn_norm.weight"), nullptr);
+    EXPECT_NE(ctx->getWeightForDevice("blk.5.attn_q.weight"), nullptr);
+    EXPECT_NE(ctx->getWeightForDevice("blk.5.attn_k.weight"), nullptr);
+    EXPECT_NE(ctx->getWeightForDevice("blk.5.attn_v.weight"), nullptr);
+    EXPECT_NE(ctx->getWeightForDevice("blk.5.attn_output.weight"), nullptr);
+    EXPECT_NE(ctx->getWeightForDevice("blk.5.attn_norm.weight"), nullptr);
 }
 
 /**
@@ -190,10 +190,10 @@ TEST_F(Test__WeightManager_LayerPartitioned, AllFFNWeights_InsideRange_Loaded)
     ASSERT_NE(ctx, nullptr);
 
     // Check all FFN weights for layer 5
-    EXPECT_NE(ctx->getWeight("blk.5.ffn_gate.weight"), nullptr);
-    EXPECT_NE(ctx->getWeight("blk.5.ffn_up.weight"), nullptr);
-    EXPECT_NE(ctx->getWeight("blk.5.ffn_down.weight"), nullptr);
-    EXPECT_NE(ctx->getWeight("blk.5.ffn_norm.weight"), nullptr);
+    EXPECT_NE(ctx->getWeightForDevice("blk.5.ffn_gate.weight"), nullptr);
+    EXPECT_NE(ctx->getWeightForDevice("blk.5.ffn_up.weight"), nullptr);
+    EXPECT_NE(ctx->getWeightForDevice("blk.5.ffn_down.weight"), nullptr);
+    EXPECT_NE(ctx->getWeightForDevice("blk.5.ffn_norm.weight"), nullptr);
 }
 
 /**
@@ -267,8 +267,8 @@ TEST_F(Test__WeightManager_LayerPartitioned, Stage0_LoadsFewerWeights)
 
     for (const auto& name : test_weights)
     {
-        if (full_ctx->getWeight(name) != nullptr) full_count++;
-        if (stage0_ctx->getWeight(name) != nullptr) stage0_count++;
+        if (full_ctx->getWeightForDevice(name) != nullptr) full_count++;
+        if (stage0_ctx->getWeightForDevice(name) != nullptr) stage0_count++;
     }
 
     // Stage 0 should load embedding + layers 0-11
@@ -297,19 +297,19 @@ TEST_F(Test__WeightManager_LayerPartitioned, Stage1_LoadsSecondHalf)
     ASSERT_NE(stage1_ctx, nullptr);
 
     // Check what's loaded
-    EXPECT_EQ(stage1_ctx->getWeight("token_embd.weight"), nullptr)
+    EXPECT_EQ(stage1_ctx->getWeightForDevice("token_embd.weight"), nullptr)
         << "Stage 1 should NOT have embedding";
-    EXPECT_NE(stage1_ctx->getWeight("output_norm.weight"), nullptr)
+    EXPECT_NE(stage1_ctx->getWeightForDevice("output_norm.weight"), nullptr)
         << "Stage 1 should have output_norm";
-    EXPECT_NE(stage1_ctx->getWeight("output.weight"), nullptr)
+    EXPECT_NE(stage1_ctx->getWeightForDevice("output.weight"), nullptr)
         << "Stage 1 should have LM head";
 
     // Layer 11 (before range)
-    EXPECT_EQ(stage1_ctx->getWeight("blk.11.attn_q.weight"), nullptr)
+    EXPECT_EQ(stage1_ctx->getWeightForDevice("blk.11.attn_q.weight"), nullptr)
         << "Layer 11 should NOT be in stage 1";
 
     // Layer 12 (first in range)
-    EXPECT_NE(stage1_ctx->getWeight("blk.12.attn_q.weight"), nullptr)
+    EXPECT_NE(stage1_ctx->getWeightForDevice("blk.12.attn_q.weight"), nullptr)
         << "Layer 12 should be in stage 1";
 }
 

@@ -75,6 +75,9 @@ namespace llaminar2
         return nullptr;
     }
 
+    static bool waitForEventWithProxy(IBackend *backend, void *event, int device_id,
+                                      const DeviceId &gpu_device);
+
     // ===== Legacy helper functions for global device index mapping =====
 
     /**
@@ -958,6 +961,12 @@ namespace llaminar2
 #ifdef HAVE_ROCM
         if (!success && gpu_device_.has_value() && gpu_device_->is_rocm())
         {
+            // Ensure thread-local HIP device is set correctly before registration.
+            // hipHostRegisterDefault (used inside hipHostRegisterBuffer) only registers
+            // for the current device. The device should already be set by the caller
+            // (ensureOnDevice → backend->allocate → hipSetDevice), but we set it
+            // explicitly for safety in case ensureHostPinned is called from another path.
+            hipSetDevice(gpu_device_->gpu_ordinal());
             success = host_backend_detail::hipHostRegisterBuffer(host_ptr, bytes);
             if (success)
             {
@@ -1094,6 +1103,8 @@ namespace llaminar2
 
     void TensorBase::invalidateGpuData()
     {
+        std::lock_guard<std::mutex> lock(coherence_mutex_);
+
         // Mark GPU data as stale - next ensureOnDevice() will re-upload from host
         // Mark device as invalid (stale) - do NOT free GPU memory
         // This is called when host data is modified and GPU copy is now stale.
@@ -1114,6 +1125,8 @@ namespace llaminar2
 
     bool TensorBase::ensureOnDevice(DeviceId target_device)
     {
+        std::lock_guard<std::mutex> lock(coherence_mutex_);
+
         // Validate target device - must be a GPU
         if (!target_device.is_gpu())
         {
@@ -1204,10 +1217,36 @@ namespace llaminar2
             return true;
         }
 
-        // Check if already on target device with valid data
+        // Check if already on target device with valid data.
+        // Even when device_valid_ is true, the last writer may still be in-flight
+        // on an async stream. If we have a completion event, wait for readiness
+        // before returning to the consumer stage.
         if (gpu_data_ptr_ && gpu_device_.has_value() && *gpu_device_ == target_device && device_valid_)
         {
-            // Already on correct device with valid GPU data - nothing to do
+            if (device_completion_event_)
+            {
+                IBackend *backend = getBackendForDevice(target_device);
+                if (backend)
+                {
+                    const int backend_device_id = target_device.gpu_ordinal();
+                    if (!waitForEventWithProxy(backend, device_completion_event_, backend_device_id, target_device))
+                    {
+                        LOG_WARN("[TensorBase::ensureOnDevice] Event wait failed for tensor "
+                                 << (debug_name_.empty() ? "(unnamed)" : debug_name_)
+                                 << " on " << target_device.toString()
+                                 << ", falling back to backend synchronize");
+                        if (!backend->synchronize(backend_device_id))
+                        {
+                            LOG_ERROR("[TensorBase::ensureOnDevice] backend synchronize failed for tensor "
+                                      << (debug_name_.empty() ? "(unnamed)" : debug_name_)
+                                      << " on " << target_device.toString());
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            // Already on correct device with valid GPU data
             return true;
         }
 
@@ -1222,7 +1261,9 @@ namespace llaminar2
         // Get backend-specific device ordinal (e.g., CUDA:0 -> 0, ROCm:1 -> 1)
         int backend_device_id = target_device.gpu_ordinal();
 
-        // Free existing device memory if on different device
+        // If currently on a different device, first try to promote an existing
+        // secondary buffer for target_device. If none exists, park current primary
+        // in secondary storage (do not free) so the other device can keep using it.
         LOG_DEBUG("[TensorBase::ensureOnDevice] tensor=" << static_cast<void *>(this)
                                                          << " target_device=" << target_device.toString()
                                                          << " gpu_data_ptr_=" << gpu_data_ptr_
@@ -1230,27 +1271,92 @@ namespace llaminar2
                                                          << " device_completion_event_=" << device_completion_event_);
         if (gpu_data_ptr_ && gpu_device_.has_value() && *gpu_device_ != target_device)
         {
+            DeviceId old_device = *gpu_device_;
             LOG_DEBUG("[TensorBase::ensureOnDevice] Device migration: " << gpu_device_->toString()
                                                                         << " -> " << target_device.toString());
-            // Use the OLD device's backend for freeing
-            IBackend *old_backend = getBackendForDevice(*gpu_device_);
-            int old_backend_device_id = gpu_device_->gpu_ordinal();
-            if (old_backend)
+
+            const int target_key = packDeviceId(target_device);
+            auto sec_it = secondary_device_buffers_.find(target_key);
+            if (sec_it != secondary_device_buffers_.end() && sec_it->second != nullptr)
             {
-                // Destroy completion event from old device before freeing memory
-                // The event was created by the old backend and cannot be reused on a different device
+                // Preserve current primary in secondary map (if not already tracked)
+                int old_key = packDeviceId(*gpu_device_);
+                if (secondary_device_buffers_.find(old_key) == secondary_device_buffers_.end())
+                {
+                    secondary_device_buffers_[old_key] = gpu_data_ptr_;
+                    if (is_bar_backed_)
+                    {
+                        secondary_bar_allocated_keys_.insert(old_key);
+                    }
+                }
+
+                // Promote target secondary buffer to primary
+                void *promoted_ptr = sec_it->second;
+                secondary_device_buffers_.erase(sec_it);
+
+                gpu_data_ptr_ = promoted_ptr;
+                gpu_device_ = target_device;
+                device_valid_ = false;
+
+                bool was_bar = (secondary_bar_allocated_keys_.count(target_key) > 0);
+                if (was_bar)
+                {
+                    secondary_bar_allocated_keys_.erase(target_key);
+                }
+                is_bar_backed_ = was_bar;
+
                 if (device_completion_event_)
                 {
-                    LOG_DEBUG("[TensorBase::ensureOnDevice] Destroying old completion event on device "
-                              << gpu_device_->toString() << " before migrating to " << target_device.toString());
-                    old_backend->destroyEvent(device_completion_event_, old_backend_device_id);
+                    IBackend *old_backend = getBackendForDevice(old_device);
+                    int old_backend_device_id = old_device.gpu_ordinal();
+                    if (old_backend)
+                    {
+                        old_backend->destroyEvent(device_completion_event_, old_backend_device_id);
+                    }
                     device_completion_event_ = nullptr;
+                    event_device_.reset();
                 }
-                old_backend->free(gpu_data_ptr_, old_backend_device_id);
+
+                LOG_DEBUG("[TensorBase::ensureOnDevice] Promoted secondary buffer to primary for "
+                          << target_device.toString() << " ptr=" << promoted_ptr);
             }
-            gpu_data_ptr_ = nullptr;
-            gpu_device_.reset();
-            device_valid_ = false;
+            else
+            {
+                // No existing target secondary buffer. Park current primary so
+                // other device threads can continue using it safely.
+                int old_key = packDeviceId(*gpu_device_);
+                if (secondary_device_buffers_.find(old_key) == secondary_device_buffers_.end())
+                {
+                    secondary_device_buffers_[old_key] = gpu_data_ptr_;
+                    if (is_bar_backed_)
+                    {
+                        secondary_bar_allocated_keys_.insert(old_key);
+                    }
+                }
+
+                if (device_completion_event_)
+                {
+                    IBackend *old_backend = getBackendForDevice(*gpu_device_);
+                    int old_backend_device_id = gpu_device_->gpu_ordinal();
+                    if (old_backend)
+                    {
+                        LOG_DEBUG("[TensorBase::ensureOnDevice] Destroying old completion event on device "
+                                  << gpu_device_->toString() << " before migrating to " << target_device.toString());
+                        old_backend->destroyEvent(device_completion_event_, old_backend_device_id);
+                    }
+                    device_completion_event_ = nullptr;
+                    event_device_.reset();
+                }
+
+                gpu_data_ptr_ = nullptr;
+                gpu_device_.reset();
+                device_valid_ = false;
+                is_bar_backed_ = false;
+
+                LOG_DEBUG("[TensorBase::ensureOnDevice] Parked previous primary buffer for "
+                          << old_device.toString() << " and allocating fresh buffer for "
+                          << target_device.toString());
+            }
         }
         else
         {
@@ -1271,12 +1377,12 @@ namespace llaminar2
                 LOG_INFO("[TensorBase::ensureOnDevice] backend->allocate(" << bytes << " bytes) took " << alloc_us << " us");
             }
 
-            // TRACE: Log tensor allocation with identity for debugging multi-GPU memory issues
-            LOG_TRACE("[TensorBase::ensureOnDevice] TENSOR ALLOC: tensor=" << static_cast<void *>(this)
-                                                                           << " name=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
-                                                                           << " gpu_ptr=" << gpu_data_ptr_ << " bytes=" << bytes
-                                                                           << " device=" << target_device.toString()
-                                                                           << " backend_device_id=" << backend_device_id);
+            // Log tensor GPU allocation with identity for debugging multi-GPU memory issues
+            LOG_DEBUG("[GPU_ALLOC] tensor=" << static_cast<void *>(this)
+                                            << " name=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
+                                            << " gpu_ptr=" << gpu_data_ptr_ << " bytes=" << bytes
+                                            << " device=" << target_device.toString()
+                                            << " ordinal=" << backend_device_id);
 
             if (!gpu_data_ptr_)
             {
@@ -1397,6 +1503,8 @@ namespace llaminar2
 
     bool TensorBase::allocateOnDevice(DeviceId target_device)
     {
+        std::lock_guard<std::mutex> lock(coherence_mutex_);
+
         // Validate target device - must be a GPU
         if (!target_device.is_gpu())
         {
@@ -1670,6 +1778,8 @@ namespace llaminar2
 
     bool TensorBase::ensureOnHost()
     {
+        std::lock_guard<std::mutex> lock(coherence_mutex_);
+
         // ===== ZERO-COPY MAPPED MEMORY PATH =====
         // If tensor uses mapped memory, host and device share the same memory.
         // No memcpy needed, BUT we still need to synchronize if GPU wrote to buffer.
@@ -1880,6 +1990,8 @@ namespace llaminar2
 
     void TensorBase::mark_device_dirty_with_event(void *stream)
     {
+        std::lock_guard<std::mutex> lock(coherence_mutex_);
+
         LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] ENTRY: tensor=" << static_cast<void *>(this)
                                                                               << " name=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
                                                                               << " gpu_device_=" << (gpu_device_.has_value() ? gpu_device_->toString() : "none")

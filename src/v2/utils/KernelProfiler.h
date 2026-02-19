@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
+#include <print>
 #include <string>
 #include <sstream>
 #include <iomanip>
@@ -474,14 +475,14 @@ namespace llaminar2
         }
 
         /**
-         * @brief Print summary to stderr
+         * @brief Print summary to stdout
          */
         static void printSummary()
         {
             std::string summary = getSummary();
             if (!summary.empty())
             {
-                fprintf(stderr, "%s", summary.c_str());
+                std::print("{}", summary);
             }
         }
 
@@ -751,7 +752,7 @@ namespace llaminar2
                 }
                 else
                 {
-                    title << "KERNEL PROFILING SUMMARY" << fort::endr;
+                    title << "CPU KERNEL PROFILING SUMMARY" << fort::endr;
                 }
                 title[0][0].set_cell_text_align(fort::text_align::center);
                 title.row(0).set_cell_row_type(fort::row_type::header);
@@ -923,11 +924,11 @@ namespace llaminar2
         }
 
         /**
-         * @brief Print summary to stderr
+         * @brief Print summary to stdout
          */
         static void printSummary(uint64_t total_tokens = 0)
         {
-            fprintf(stderr, "%s", getSummary(total_tokens).c_str());
+            std::print("{}", getSummary(total_tokens));
         }
 
         /**

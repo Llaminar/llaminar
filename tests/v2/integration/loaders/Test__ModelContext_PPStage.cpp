@@ -66,31 +66,31 @@ TEST_F(Test__ModelContext_PPStage, FirstStage_LoadsEmbedding_NotLmHead)
     ASSERT_NE(weight_mgr, nullptr);
 
     // Embedding should be loadable
-    auto embedding = weight_mgr->getWeight("token_embd.weight");
+    auto embedding = weight_mgr->getWeightForDevice("token_embd.weight");
     EXPECT_NE(embedding, nullptr) << "Stage 0 should have embedding";
 
     // LM head should NOT be loadable (filtered out)
-    auto lm_head = weight_mgr->getWeight("output.weight");
+    auto lm_head = weight_mgr->getWeightForDevice("output.weight");
     EXPECT_EQ(lm_head, nullptr) << "Stage 0 should NOT have lm_head";
 
-    auto output_norm = weight_mgr->getWeight("output_norm.weight");
+    auto output_norm = weight_mgr->getWeightForDevice("output_norm.weight");
     EXPECT_EQ(output_norm, nullptr) << "Stage 0 should NOT have output_norm";
 
     // Layer 0 weights should be available
-    auto layer0_q = weight_mgr->getWeight("blk.0.attn_q.weight");
+    auto layer0_q = weight_mgr->getWeightForDevice("blk.0.attn_q.weight");
     EXPECT_NE(layer0_q, nullptr) << "Stage 0 should have layer 0";
 
     // Layer 10 (second to last in actual loaded range) should be available
-    auto layer10_q = weight_mgr->getWeight("blk.10.attn_q.weight");
+    auto layer10_q = weight_mgr->getWeightForDevice("blk.10.attn_q.weight");
     EXPECT_NE(layer10_q, nullptr) << "Stage 0 should have layer 10";
 
     // Layer 11 should NOT be available (due to exclusive interpretation)
     // NOTE: This is the actual behavior - last_layer is exclusive in WeightManager
-    auto layer11_q = weight_mgr->getWeight("blk.11.attn_q.weight");
+    auto layer11_q = weight_mgr->getWeightForDevice("blk.11.attn_q.weight");
     EXPECT_EQ(layer11_q, nullptr) << "Stage 0 should NOT have layer 11 (exclusive boundary)";
 
     // Layer 12 should NOT be available (outside range)
-    auto layer12_q = weight_mgr->getWeight("blk.12.attn_q.weight");
+    auto layer12_q = weight_mgr->getWeightForDevice("blk.12.attn_q.weight");
     EXPECT_EQ(layer12_q, nullptr) << "Stage 0 should NOT have layer 12";
 }
 
@@ -114,30 +114,30 @@ TEST_F(Test__ModelContext_PPStage, LastStage_LoadsLmHead_NotEmbedding)
     auto weight_mgr = ctx->concreteWeightManager();
 
     // LM head should be loadable
-    auto lm_head = weight_mgr->getWeight("output.weight");
+    auto lm_head = weight_mgr->getWeightForDevice("output.weight");
     EXPECT_NE(lm_head, nullptr) << "Stage 1 should have lm_head";
 
-    auto output_norm = weight_mgr->getWeight("output_norm.weight");
+    auto output_norm = weight_mgr->getWeightForDevice("output_norm.weight");
     EXPECT_NE(output_norm, nullptr) << "Stage 1 should have output_norm";
 
     // Embedding should NOT be loadable
-    auto embedding = weight_mgr->getWeight("token_embd.weight");
+    auto embedding = weight_mgr->getWeightForDevice("token_embd.weight");
     EXPECT_EQ(embedding, nullptr) << "Stage 1 should NOT have embedding";
 
     // Layer 12 should be available
-    auto layer12_q = weight_mgr->getWeight("blk.12.attn_q.weight");
+    auto layer12_q = weight_mgr->getWeightForDevice("blk.12.attn_q.weight");
     EXPECT_NE(layer12_q, nullptr) << "Stage 1 should have layer 12";
 
     // Layer 22 (second to last in actual loaded range) should be available
-    auto layer22_q = weight_mgr->getWeight("blk.22.attn_q.weight");
+    auto layer22_q = weight_mgr->getWeightForDevice("blk.22.attn_q.weight");
     EXPECT_NE(layer22_q, nullptr) << "Stage 1 should have layer 22";
 
     // Layer 23 should NOT be available (due to exclusive interpretation)
-    auto layer23_q = weight_mgr->getWeight("blk.23.attn_q.weight");
+    auto layer23_q = weight_mgr->getWeightForDevice("blk.23.attn_q.weight");
     EXPECT_EQ(layer23_q, nullptr) << "Stage 1 should NOT have layer 23 (exclusive boundary)";
 
     // Layer 11 should NOT be available
-    auto layer11_q = weight_mgr->getWeight("blk.11.attn_q.weight");
+    auto layer11_q = weight_mgr->getWeightForDevice("blk.11.attn_q.weight");
     EXPECT_EQ(layer11_q, nullptr) << "Stage 1 should NOT have layer 11";
 }
 
@@ -152,15 +152,15 @@ TEST_F(Test__ModelContext_PPStage, FullModel_LoadsEverything)
     auto weight_mgr = ctx->concreteWeightManager();
 
     // All global weights should be available
-    EXPECT_NE(weight_mgr->getWeight("token_embd.weight"), nullptr);
-    EXPECT_NE(weight_mgr->getWeight("output.weight"), nullptr);
-    EXPECT_NE(weight_mgr->getWeight("output_norm.weight"), nullptr);
+    EXPECT_NE(weight_mgr->getWeightForDevice("token_embd.weight"), nullptr);
+    EXPECT_NE(weight_mgr->getWeightForDevice("output.weight"), nullptr);
+    EXPECT_NE(weight_mgr->getWeightForDevice("output_norm.weight"), nullptr);
 
     // All layers should be available
     for (int i = 0; i < 24; ++i)
     {
         std::string name = "blk." + std::to_string(i) + ".attn_q.weight";
-        EXPECT_NE(weight_mgr->getWeight(name), nullptr)
+        EXPECT_NE(weight_mgr->getWeightForDevice(name), nullptr)
             << "Full model should have layer " << i;
     }
 }
@@ -180,12 +180,12 @@ TEST_F(Test__ModelContext_PPStage, ThreeStages_DividesCorrectly)
     ASSERT_NE(ctx0, nullptr);
     auto wm0 = ctx0->concreteWeightManager();
 
-    EXPECT_NE(wm0->getWeight("token_embd.weight"), nullptr) << "Stage 0 has embedding";
-    EXPECT_EQ(wm0->getWeight("output.weight"), nullptr) << "Stage 0 no lm_head";
-    EXPECT_NE(wm0->getWeight("blk.0.attn_q.weight"), nullptr);
-    EXPECT_NE(wm0->getWeight("blk.6.attn_q.weight"), nullptr);
-    EXPECT_EQ(wm0->getWeight("blk.7.attn_q.weight"), nullptr) << "Exclusive boundary";
-    EXPECT_EQ(wm0->getWeight("blk.8.attn_q.weight"), nullptr);
+    EXPECT_NE(wm0->getWeightForDevice("token_embd.weight"), nullptr) << "Stage 0 has embedding";
+    EXPECT_EQ(wm0->getWeightForDevice("output.weight"), nullptr) << "Stage 0 no lm_head";
+    EXPECT_NE(wm0->getWeightForDevice("blk.0.attn_q.weight"), nullptr);
+    EXPECT_NE(wm0->getWeightForDevice("blk.6.attn_q.weight"), nullptr);
+    EXPECT_EQ(wm0->getWeightForDevice("blk.7.attn_q.weight"), nullptr) << "Exclusive boundary";
+    EXPECT_EQ(wm0->getWeightForDevice("blk.8.attn_q.weight"), nullptr);
 
     // Stage 1: layers 8-15 (inclusive), actual: 8-14 (exclusive)
     auto config1 = ModelContextConfig::forPPStage(1, 3, 24);
@@ -196,13 +196,13 @@ TEST_F(Test__ModelContext_PPStage, ThreeStages_DividesCorrectly)
     ASSERT_NE(ctx1, nullptr);
     auto wm1 = ctx1->concreteWeightManager();
 
-    EXPECT_EQ(wm1->getWeight("token_embd.weight"), nullptr) << "Stage 1 no embedding";
-    EXPECT_EQ(wm1->getWeight("output.weight"), nullptr) << "Stage 1 no lm_head";
-    EXPECT_EQ(wm1->getWeight("blk.7.attn_q.weight"), nullptr);
-    EXPECT_NE(wm1->getWeight("blk.8.attn_q.weight"), nullptr);
-    EXPECT_NE(wm1->getWeight("blk.14.attn_q.weight"), nullptr);
-    EXPECT_EQ(wm1->getWeight("blk.15.attn_q.weight"), nullptr) << "Exclusive boundary";
-    EXPECT_EQ(wm1->getWeight("blk.16.attn_q.weight"), nullptr);
+    EXPECT_EQ(wm1->getWeightForDevice("token_embd.weight"), nullptr) << "Stage 1 no embedding";
+    EXPECT_EQ(wm1->getWeightForDevice("output.weight"), nullptr) << "Stage 1 no lm_head";
+    EXPECT_EQ(wm1->getWeightForDevice("blk.7.attn_q.weight"), nullptr);
+    EXPECT_NE(wm1->getWeightForDevice("blk.8.attn_q.weight"), nullptr);
+    EXPECT_NE(wm1->getWeightForDevice("blk.14.attn_q.weight"), nullptr);
+    EXPECT_EQ(wm1->getWeightForDevice("blk.15.attn_q.weight"), nullptr) << "Exclusive boundary";
+    EXPECT_EQ(wm1->getWeightForDevice("blk.16.attn_q.weight"), nullptr);
 
     // Stage 2: layers 16-23 (inclusive), actual: 16-22 (exclusive)
     auto config2 = ModelContextConfig::forPPStage(2, 3, 24);
@@ -213,12 +213,12 @@ TEST_F(Test__ModelContext_PPStage, ThreeStages_DividesCorrectly)
     ASSERT_NE(ctx2, nullptr);
     auto wm2 = ctx2->concreteWeightManager();
 
-    EXPECT_EQ(wm2->getWeight("token_embd.weight"), nullptr) << "Stage 2 no embedding";
-    EXPECT_NE(wm2->getWeight("output.weight"), nullptr) << "Stage 2 has lm_head";
-    EXPECT_EQ(wm2->getWeight("blk.15.attn_q.weight"), nullptr);
-    EXPECT_NE(wm2->getWeight("blk.16.attn_q.weight"), nullptr);
-    EXPECT_NE(wm2->getWeight("blk.22.attn_q.weight"), nullptr);
-    EXPECT_EQ(wm2->getWeight("blk.23.attn_q.weight"), nullptr) << "Exclusive boundary";
+    EXPECT_EQ(wm2->getWeightForDevice("token_embd.weight"), nullptr) << "Stage 2 no embedding";
+    EXPECT_NE(wm2->getWeightForDevice("output.weight"), nullptr) << "Stage 2 has lm_head";
+    EXPECT_EQ(wm2->getWeightForDevice("blk.15.attn_q.weight"), nullptr);
+    EXPECT_NE(wm2->getWeightForDevice("blk.16.attn_q.weight"), nullptr);
+    EXPECT_NE(wm2->getWeightForDevice("blk.22.attn_q.weight"), nullptr);
+    EXPECT_EQ(wm2->getWeightForDevice("blk.23.attn_q.weight"), nullptr) << "Exclusive boundary";
 }
 
 // Test 5: Explicit config (not using forPPStage helper)
@@ -237,15 +237,15 @@ TEST_F(Test__ModelContext_PPStage, ExplicitConfig_WorksCorrectly)
     auto wm = ctx->concreteWeightManager();
 
     // No global weights
-    EXPECT_EQ(wm->getWeight("token_embd.weight"), nullptr);
-    EXPECT_EQ(wm->getWeight("output.weight"), nullptr);
+    EXPECT_EQ(wm->getWeightForDevice("token_embd.weight"), nullptr);
+    EXPECT_EQ(wm->getWeightForDevice("output.weight"), nullptr);
 
     // Only layers 5-9 (exclusive boundary at 10)
-    EXPECT_EQ(wm->getWeight("blk.4.attn_q.weight"), nullptr);
-    EXPECT_NE(wm->getWeight("blk.5.attn_q.weight"), nullptr);
-    EXPECT_NE(wm->getWeight("blk.9.attn_q.weight"), nullptr);
-    EXPECT_EQ(wm->getWeight("blk.10.attn_q.weight"), nullptr) << "Exclusive boundary";
-    EXPECT_EQ(wm->getWeight("blk.11.attn_q.weight"), nullptr);
+    EXPECT_EQ(wm->getWeightForDevice("blk.4.attn_q.weight"), nullptr);
+    EXPECT_NE(wm->getWeightForDevice("blk.5.attn_q.weight"), nullptr);
+    EXPECT_NE(wm->getWeightForDevice("blk.9.attn_q.weight"), nullptr);
+    EXPECT_EQ(wm->getWeightForDevice("blk.10.attn_q.weight"), nullptr) << "Exclusive boundary";
+    EXPECT_EQ(wm->getWeightForDevice("blk.11.attn_q.weight"), nullptr);
 }
 
 // Test 6: Config validation for isLayerPartitioned
@@ -314,9 +314,9 @@ TEST_F(Test__ModelContext_PPStage, PPStage_ReducesLoadedWeightCount)
     for (int i = 0; i < 24; ++i)
     {
         std::string name = "blk." + std::to_string(i) + ".attn_q.weight";
-        if (full_wm->getWeight(name))
+        if (full_wm->getWeightForDevice(name))
             full_layer_count++;
-        if (stage0_wm->getWeight(name))
+        if (stage0_wm->getWeightForDevice(name))
             stage0_layer_count++;
     }
 
@@ -345,8 +345,8 @@ TEST_F(Test__ModelContext_PPStage, DocumentsInclusiveExclusiveMismatch)
     
     // But WeightManager treats it as exclusive, so layer 11 is NOT loaded
     // This is the CURRENT (potentially buggy) behavior
-    auto layer10 = wm->getWeight("blk.10.attn_q.weight");
-    auto layer11 = wm->getWeight("blk.11.attn_q.weight");
+    auto layer10 = wm->getWeightForDevice("blk.10.attn_q.weight");
+    auto layer11 = wm->getWeightForDevice("blk.11.attn_q.weight");
     
     EXPECT_NE(layer10, nullptr) << "Layer 10 should be loaded";
     

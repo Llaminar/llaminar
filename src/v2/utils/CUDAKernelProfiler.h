@@ -343,7 +343,9 @@ namespace llaminar2
         /**
          * @brief Get summary string
          */
-        static std::string getSummary(uint64_t total_tokens = 0)
+        static std::string getSummary(uint64_t total_tokens = 0,
+                                       double wall_clock_prefill_ms = 0,
+                                       double wall_clock_decode_ms = 0)
         {
             auto &inst = getInstance();
             std::lock_guard<std::mutex> lock(inst.mutex_);
@@ -371,12 +373,18 @@ namespace llaminar2
             }
             std::sort(devices.begin(), devices.end());
 
-            // Calculate total time for percentage
+            // Calculate total GPU time
             double total_time_us = 0.0;
             for (const auto &stats : inst.stats_)
             {
                 total_time_us += stats.total_us;
             }
+
+            // When wall clock is available, use it as the denominator for %
+            double wall_clock_total_ms = wall_clock_prefill_ms + wall_clock_decode_ms;
+            double pct_base_us = (wall_clock_total_ms > 0)
+                                     ? wall_clock_total_ms * 1000.0
+                                     : total_time_us;
 
             std::ostringstream oss;
 
@@ -521,14 +529,14 @@ namespace llaminar2
                         continue;
 
                     double avg_us = stats.total_us / static_cast<double>(stats.call_count);
-                    double pct = (total_time_us > 0) ? (stats.total_us / total_time_us * 100.0) : 0.0;
+                    double pct = (pct_base_us > 0) ? (stats.total_us / pct_base_us * 100.0) : 0.0;
                     double total_ms = stats.total_us / 1000.0;
 
                     std::ostringstream total_ss, avg_ss, max_ss, pct_ss;
                     total_ss << std::fixed << std::setprecision(2) << total_ms;
                     avg_ss << std::fixed << std::setprecision(1) << avg_us;
                     max_ss << std::fixed << std::setprecision(1) << stats.max_us;
-                    pct_ss << static_cast<int>(pct) << "%";
+                    pct_ss << std::fixed << std::setprecision(1) << pct << "%";
 
                     table << cudaKernelTypeName(static_cast<CUDAKernelType>(idx))
                           << stats.call_count
@@ -539,22 +547,40 @@ namespace llaminar2
                           << fort::endr;
                 }
 
+                // "Other (unprofiled)" row when wall clock is available
+                if (wall_clock_total_ms > 0)
+                {
+                    double unprofiled_ms = wall_clock_total_ms - (total_time_us / 1000.0);
+                    if (unprofiled_ms > 0.01)
+                    {
+                        double unprofiled_pct = (unprofiled_ms * 1000.0 / pct_base_us) * 100.0;
+                        std::ostringstream unp_ms_ss, unp_pct_ss;
+                        unp_ms_ss << std::fixed << std::setprecision(2) << unprofiled_ms;
+                        unp_pct_ss << std::fixed << std::setprecision(1) << unprofiled_pct << "%";
+                        table << "Other (unprofiled)" << "" << unp_ms_ss.str() << "" << "" << unp_pct_ss.str() << fort::endr;
+                    }
+                }
+
                 // Separator and total row
                 table << fort::separator;
 
-                std::ostringstream total_ss;
-                total_ss << std::fixed << std::setprecision(2) << (total_time_us / 1000.0) << " ms";
+                {
+                    // Show wall clock as total when available, otherwise GPU time
+                    double display_total_ms = (wall_clock_total_ms > 0) ? wall_clock_total_ms : (total_time_us / 1000.0);
+                    std::ostringstream total_ss;
+                    total_ss << std::fixed << std::setprecision(2) << display_total_ms << " ms";
 
-                if (total_tokens > 0)
-                {
-                    double ms_per_token = (total_time_us / 1000.0) / static_cast<double>(total_tokens);
-                    std::ostringstream throughput_ss;
-                    throughput_ss << std::fixed << std::setprecision(2) << ms_per_token << " ms/tok";
-                    table << "TOTAL GPU TIME" << "" << total_ss.str() << "" << "" << throughput_ss.str() << fort::endr;
-                }
-                else
-                {
-                    table << "TOTAL GPU TIME" << "" << total_ss.str() << "" << "" << "" << fort::endr;
+                    if (total_tokens > 0)
+                    {
+                        double ms_per_token = display_total_ms / static_cast<double>(total_tokens);
+                        std::ostringstream throughput_ss;
+                        throughput_ss << std::fixed << std::setprecision(2) << ms_per_token << " ms/tok";
+                        table << "TOTAL" << "" << total_ss.str() << "" << "" << throughput_ss.str() << fort::endr;
+                    }
+                    else
+                    {
+                        table << "TOTAL" << "" << total_ss.str() << "" << "" << "" << fort::endr;
+                    }
                 }
             }
 
@@ -581,7 +607,8 @@ namespace llaminar2
                 phase_table.column(2).set_cell_text_align(fort::text_align::right);
                 phase_table.column(3).set_cell_text_align(fort::text_align::right);
 
-                double decode_total_us = 0.0;
+                double prefill_gpu_total_us = 0.0;
+                double decode_gpu_total_us = 0.0;
                 for (size_t idx : indices)
                 {
                     const auto &pf = inst.prefill_stats_[idx];
@@ -589,24 +616,44 @@ namespace llaminar2
                     if (pf.call_count == 0 && dc.call_count == 0)
                         continue;
 
-                    decode_total_us += dc.total_us;
+                    prefill_gpu_total_us += pf.total_us;
+                    decode_gpu_total_us += dc.total_us;
 
+                    double decode_pct_base = (wall_clock_decode_ms > 0) ? (wall_clock_decode_ms * 1000.0) : total_time_us;
                     std::ostringstream pf_ss, dc_ss, pct_ss;
                     pf_ss << std::fixed << std::setprecision(2) << (pf.total_us / 1000.0);
                     dc_ss << std::fixed << std::setprecision(2) << (dc.total_us / 1000.0);
-                    double dc_pct = total_time_us > 0 ? (dc.total_us / total_time_us) * 100.0 : 0;
-                    pct_ss << static_cast<int>(dc_pct) << "%";
+                    double dc_pct = decode_pct_base > 0 ? (dc.total_us / decode_pct_base) * 100.0 : 0;
+                    pct_ss << std::fixed << std::setprecision(1) << dc_pct << "%";
 
                     phase_table << cudaKernelTypeName(static_cast<CUDAKernelType>(idx))
                                 << pf_ss.str() << dc_ss.str() << pct_ss.str() << fort::endr;
                 }
 
+                // "Other (unprofiled)" row in phase table
+                if (wall_clock_prefill_ms > 0 || wall_clock_decode_ms > 0)
+                {
+                    double prefill_unp_ms = (wall_clock_prefill_ms > 0) ? (wall_clock_prefill_ms - prefill_gpu_total_us / 1000.0) : 0;
+                    double decode_unp_ms = (wall_clock_decode_ms > 0) ? (wall_clock_decode_ms - decode_gpu_total_us / 1000.0) : 0;
+                    if (prefill_unp_ms > 0.01 || decode_unp_ms > 0.01)
+                    {
+                        double decode_pct_base = (wall_clock_decode_ms > 0) ? (wall_clock_decode_ms * 1000.0) : total_time_us;
+                        double unp_decode_pct = (decode_pct_base > 0) ? (decode_unp_ms * 1000.0 / decode_pct_base * 100.0) : 0;
+                        std::ostringstream upf_ss, udc_ss, upct_ss;
+                        upf_ss << std::fixed << std::setprecision(2) << std::max(0.0, prefill_unp_ms);
+                        udc_ss << std::fixed << std::setprecision(2) << std::max(0.0, decode_unp_ms);
+                        upct_ss << std::fixed << std::setprecision(1) << std::max(0.0, unp_decode_pct) << "%";
+                        phase_table << "Other (unprofiled)" << upf_ss.str() << udc_ss.str() << upct_ss.str() << fort::endr;
+                    }
+                }
+
                 phase_table << fort::separator;
                 {
-                    double prefill_total_us = total_time_us - decode_total_us;
+                    double display_prefill_ms = (wall_clock_prefill_ms > 0) ? wall_clock_prefill_ms : (prefill_gpu_total_us / 1000.0);
+                    double display_decode_ms = (wall_clock_decode_ms > 0) ? wall_clock_decode_ms : (decode_gpu_total_us / 1000.0);
                     std::ostringstream pf_ss, dc_ss;
-                    pf_ss << std::fixed << std::setprecision(2) << (prefill_total_us / 1000.0);
-                    dc_ss << std::fixed << std::setprecision(2) << (decode_total_us / 1000.0);
+                    pf_ss << std::fixed << std::setprecision(2) << display_prefill_ms;
+                    dc_ss << std::fixed << std::setprecision(2) << display_decode_ms;
                     phase_table << "PHASE TOTAL" << pf_ss.str() << dc_ss.str() << "" << fort::endr;
                 }
 
@@ -618,15 +665,75 @@ namespace llaminar2
         }
 
         /**
-         * @brief Print summary to stderr
+         * @brief Print summary to stdout
          */
-        static void printSummary(uint64_t total_tokens = 0)
+        static void printSummary(uint64_t total_tokens = 0, double wall_clock_prefill_ms = 0, double wall_clock_decode_ms = 0)
         {
-            std::string summary = getSummary(total_tokens);
+            std::string summary = getSummary(total_tokens, wall_clock_prefill_ms, wall_clock_decode_ms);
             if (!summary.empty())
             {
-                fprintf(stderr, "%s", summary.c_str());
+                fprintf(stdout, "%s", summary.c_str());
             }
+        }
+
+        /**
+         * @brief Get total GPU kernel time for decode phase (milliseconds)
+         */
+        static double getTotalDecodeTimeMs()
+        {
+            auto &inst = getInstance();
+            std::lock_guard<std::mutex> lock(inst.mutex_);
+            double total_us = 0.0;
+            for (size_t i = 0; i < static_cast<size_t>(CUDAKernelType::COUNT); ++i)
+            {
+                total_us += inst.decode_stats_[i].total_us;
+            }
+            return total_us / 1000.0;
+        }
+
+        /**
+         * @brief Get total GPU kernel time for prefill phase (milliseconds)
+         */
+        static double getTotalPrefillTimeMs()
+        {
+            auto &inst = getInstance();
+            std::lock_guard<std::mutex> lock(inst.mutex_);
+            double total_us = 0.0;
+            for (size_t i = 0; i < static_cast<size_t>(CUDAKernelType::COUNT); ++i)
+            {
+                total_us += inst.prefill_stats_[i].total_us;
+            }
+            return total_us / 1000.0;
+        }
+
+        /**
+         * @brief Get total GPU kernel time across all phases (milliseconds)
+         */
+        static double getTotalTimeMs()
+        {
+            auto &inst = getInstance();
+            std::lock_guard<std::mutex> lock(inst.mutex_);
+            double total_us = 0.0;
+            for (size_t i = 0; i < static_cast<size_t>(CUDAKernelType::COUNT); ++i)
+            {
+                total_us += inst.stats_[i].total_us;
+            }
+            return total_us / 1000.0;
+        }
+
+        /**
+         * @brief Check if any data has been recorded
+         */
+        static bool hasData()
+        {
+            auto &inst = getInstance();
+            std::lock_guard<std::mutex> lock(inst.mutex_);
+            for (size_t i = 0; i < static_cast<size_t>(CUDAKernelType::COUNT); ++i)
+            {
+                if (inst.stats_[i].call_count > 0)
+                    return true;
+            }
+            return false;
         }
 
     private:

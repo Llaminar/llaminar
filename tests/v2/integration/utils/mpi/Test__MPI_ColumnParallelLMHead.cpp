@@ -168,7 +168,7 @@ TEST_F(Test__MPI_ColumnParallelLMHead, WeightShapeValidation)
     int vocab_local = VOCAB_SIZE / world_size;
 
     // Get sharded LM head weight
-    auto lm_head = weight_manager_->getWeight("output.weight");
+    auto lm_head = weight_manager_->getWeightForDevice("output.weight");
     ASSERT_NE(lm_head, nullptr) << "Failed to load output.weight";
 
     // Check shape: should be [vocab_local, d_model]
@@ -306,7 +306,7 @@ TEST_F(Test__MPI_ColumnParallelLMHead, FullForwardDataFlow)
     }
 
     // Get sharded LM head weight
-    auto lm_head = weight_manager_->getWeight("output.weight");
+    auto lm_head = weight_manager_->getWeightForDevice("output.weight");
     ASSERT_NE(lm_head, nullptr) << "Failed to load output.weight";
 
     // Create local and full logits buffers

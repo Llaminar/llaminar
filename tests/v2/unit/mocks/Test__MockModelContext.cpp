@@ -206,7 +206,7 @@ TEST(Test__MockModelContext, AddFP32RandomTensor) {
     EXPECT_TRUE(ctx->hasTensor("custom_weight"));
 
     // Should be retrievable as weight
-    auto weight = ctx->getWeight("custom_weight");
+    auto weight = ctx->getWeightForDevice("custom_weight");
     ASSERT_NE(weight, nullptr);
     EXPECT_EQ(weight->rows(), 64);
     EXPECT_EQ(weight->cols(), 128);
@@ -221,7 +221,7 @@ TEST(Test__MockModelContext, AddFP32ZerosTensor) {
         .addFP32ZerosTensor("zeros", {32, 64})
         .build();
 
-    auto weight = ctx->getWeight("zeros");
+    auto weight = ctx->getWeightForDevice("zeros");
     ASSERT_NE(weight, nullptr);
 
     auto* fp32 = dynamic_cast<FP32Tensor*>(weight.get());
@@ -239,7 +239,7 @@ TEST(Test__MockModelContext, AddFP32OnesTensor) {
         .addFP32OnesTensor("ones", {16, 32})
         .build();
 
-    auto weight = ctx->getWeight("ones");
+    auto weight = ctx->getWeightForDevice("ones");
     ASSERT_NE(weight, nullptr);
 
     auto* fp32 = dynamic_cast<FP32Tensor*>(weight.get());
@@ -258,7 +258,7 @@ TEST(Test__MockModelContext, AddQ4_0RandomTensor) {
         .build();
 
     EXPECT_TRUE(ctx->hasTensor("q4_weight"));
-    auto weight = ctx->getWeight("q4_weight");
+    auto weight = ctx->getWeightForDevice("q4_weight");
     ASSERT_NE(weight, nullptr);
 
     // Should be Q4_0 tensor
@@ -272,7 +272,7 @@ TEST(Test__MockModelContext, AddQ8_0RandomTensor) {
         .build();
 
     EXPECT_TRUE(ctx->hasTensor("q8_weight"));
-    auto weight = ctx->getWeight("q8_weight");
+    auto weight = ctx->getWeightForDevice("q8_weight");
     ASSERT_NE(weight, nullptr);
 
     auto* q8 = dynamic_cast<Q8_0Tensor*>(weight.get());
@@ -291,7 +291,7 @@ TEST(Test__MockModelContext, AddPrebuiltTensor) {
         .addTensor("custom_tensor", custom)
         .build();
 
-    auto weight = ctx->getWeight("custom_tensor");
+    auto weight = ctx->getWeightForDevice("custom_tensor");
     ASSERT_NE(weight, nullptr);
     EXPECT_EQ(weight->rows(), 100);
     EXPECT_EQ(weight->cols(), 200);
@@ -354,7 +354,7 @@ TEST(Test__MockModelContext, AddEmbeddingLayer) {
         .build();
 
     EXPECT_TRUE(ctx->hasTensor("token_embd.weight"));
-    auto embd = ctx->getWeight("token_embd.weight");
+    auto embd = ctx->getWeightForDevice("token_embd.weight");
     ASSERT_NE(embd, nullptr);
 
     // Minimal preset: vocab=1000, embedding=128
@@ -443,11 +443,11 @@ TEST(Test__MockModelContext, TrackGetWeightCalls) {
 
     EXPECT_EQ(ctx->getWeightCallCount(), 0);
 
-    ctx->getWeight("token_embd.weight");
+    ctx->getWeightForDevice("token_embd.weight");
     EXPECT_EQ(ctx->getWeightCallCount(), 1);
 
-    ctx->getWeight("blk.0.attn_q.weight");
-    ctx->getWeight("output.weight");
+    ctx->getWeightForDevice("blk.0.attn_q.weight");
+    ctx->getWeightForDevice("output.weight");
     EXPECT_EQ(ctx->getWeightCallCount(), 3);
 
     ctx->resetCounters();
@@ -488,12 +488,12 @@ TEST(Test__MockModelContext, FullPipelineSetup) {
     EXPECT_EQ(ctx->embeddingLength(), 128);
 
     // Verify weight dimensions
-    auto embd = ctx->getWeight("token_embd.weight");
+    auto embd = ctx->getWeightForDevice("token_embd.weight");
     ASSERT_NE(embd, nullptr);
     EXPECT_EQ(embd->rows(), 1000);   // vocab_size (MINIMAL)
     EXPECT_EQ(embd->cols(), 128);    // embedding_length (MINIMAL)
 
-    auto attn_q = ctx->getWeight("blk.0.attn_q.weight");
+    auto attn_q = ctx->getWeightForDevice("blk.0.attn_q.weight");
     ASSERT_NE(attn_q, nullptr);
     EXPECT_EQ(attn_q->rows(), 128);
     EXPECT_EQ(attn_q->cols(), 128);
@@ -514,7 +514,7 @@ TEST(Test__MockModelContext, ComposedMocksAreConsistent) {
     EXPECT_TRUE(ctx->loader()->hasTensor("test_weight"));
 
     auto from_loader = ctx->loader()->loadTensor("test_weight");
-    auto from_wm = ctx->weightManager()->getWeight("test_weight");
+    auto from_wm = ctx->weightManager()->getWeightForDevice("test_weight");
 
     ASSERT_NE(from_loader, nullptr);
     ASSERT_NE(from_wm, nullptr);
@@ -539,7 +539,7 @@ TEST(Test__MockModelContext, CanModifyAfterBuild) {
     // Verify modifications
     EXPECT_EQ(ctx->blockCount(), 4);
     EXPECT_TRUE(ctx->hasTensor("new_weight"));
-    EXPECT_NE(ctx->getWeight("new_weight"), nullptr);
+    EXPECT_NE(ctx->getWeightForDevice("new_weight"), nullptr);
 }
 
 // =============================================================================

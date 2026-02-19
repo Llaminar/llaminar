@@ -10,8 +10,8 @@
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
-#include <unordered_map>
 #include <mutex>
+#include <unordered_map>
 #include <stdexcept>
 
 namespace llaminar2
@@ -39,27 +39,29 @@ namespace llaminar2
          * @brief Construct with optional default device index
          * @param device_idx Default HIP device index (-1 for current device)
          */
-        explicit ROCmEmbeddingKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+        explicit ROCmEmbeddingKernelT(int device_idx = -1) : device_idx_(device_idx) {}
 
         /**
          * @brief Construct with device context (Phase 4 pattern)
          * @param ctx Device context for shared handles/streams
          */
-        explicit ROCmEmbeddingKernelT(IWorkerGPUContext* ctx)
+        explicit ROCmEmbeddingKernelT(IWorkerGPUContext *ctx)
         {
-            if (!ctx) throw std::runtime_error("ROCmEmbeddingKernelT: Device context is null");
-            if (!ctx->isInitialized()) throw std::runtime_error("ROCmEmbeddingKernelT: Device context not initialized");
+            if (!ctx)
+                throw std::runtime_error("ROCmEmbeddingKernelT: Device context is null");
+            if (!ctx->isInitialized())
+                throw std::runtime_error("ROCmEmbeddingKernelT: Device context not initialized");
             device_ctx_ = ctx;
             device_idx_ = ctx->deviceOrdinal();
         }
 
-        ~ROCmEmbeddingKernelT() override = default;
+        ~ROCmEmbeddingKernelT() override;
 
         // ===== Device Context Support (Phase 4) =====
-        void setDeviceContext(IWorkerGPUContext* ctx) { device_ctx_ = ctx; }
-        IWorkerGPUContext* deviceContext() const { return device_ctx_; }
+        void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+        IWorkerGPUContext *deviceContext() const { return device_ctx_; }
         bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-        void* getStream() const { return gpu_stream_ ? gpu_stream_ : (device_ctx_ ? device_ctx_->defaultStream() : nullptr); }
+        void *getStream() const;
 
         // ITensorKernel interface
         bool supports_device(int device_idx) const override
@@ -67,7 +69,7 @@ namespace llaminar2
             return device_idx >= 0; // ROCm supports any valid device index
         }
 
-        void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+        void setGPUStream(void *stream) override;
 
         // ITensorEmbedding interface - FP32 output
         bool apply(
@@ -169,39 +171,41 @@ namespace llaminar2
          */
         void clearEmbeddingCache()
         {
-            if (workspace_)
-            {
-                std::lock_guard<std::mutex> lock(s_embed_cache_mutex_);
-                s_workspace_embed_cache_.erase(workspace_);
-            }
-        }
-
-        /**
-         * @brief Static method to clear ALL embedding caches (for model unload)
-         */
-        static void clearGlobalEmbeddingCache()
-        {
-            std::lock_guard<std::mutex> lock(s_embed_cache_mutex_);
-            s_workspace_embed_cache_.clear();
+            std::lock_guard<std::mutex> lock(embed_cache_mutex_);
+            cached_embed_table_ = nullptr;
+            cached_embed_table_by_device_.clear();
         }
 
     private:
         int device_idx_;
-        IWorkerGPUContext* device_ctx_ = nullptr;
+        IWorkerGPUContext *device_ctx_ = nullptr;
         void *gpu_stream_ = nullptr;
+
+        mutable std::mutex stream_mutex_;
+        std::unordered_map<int, void *> stream_by_device_;
 
         // IWorkspaceConsumer state
         DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned)
+        mutable std::mutex workspace_mutex_;
+        std::unordered_map<int, DeviceWorkspaceManager *> workspace_by_device_;
 
-        // Embedding table caching state (STATIC MAP - per-workspace cache)
-        // This is critical for performance: kernel instances are recreated every forward pass
-        // due to graph rebuild, but the embedding table in GPU workspace is persistent.
-        // Using static ensures we don't re-upload 500+ MB every decode step.
-        // KEY FIX: Use per-workspace cache to support LOCAL TP with multiple devices.
-        // Each device has its own workspace, so we cache separately per workspace.
-        // THREAD SAFETY: Protected by s_embed_cache_mutex_ for LocalTP multi-device access.
-        static inline std::mutex s_embed_cache_mutex_;
-        static inline std::unordered_map<DeviceWorkspaceManager *, const TensorBase *> s_workspace_embed_cache_;
+        // Embedding table caching state (instance-owned).
+        mutable std::mutex serialize_embedding_mutex_;
+        mutable std::mutex embed_cache_mutex_;
+        const TensorBase *cached_embed_table_ = nullptr;
+        std::unordered_map<int, const TensorBase *> cached_embed_table_by_device_;
+
+        struct DebugCanaryBuffer
+        {
+            void *base = nullptr;
+            float *payload = nullptr;
+            size_t guard_bytes = 0;
+            size_t payload_bytes = 0;
+            size_t total_bytes = 0;
+        };
+
+        mutable std::mutex canary_mutex_;
+        std::unordered_map<int, DebugCanaryBuffer> canary_by_device_;
     };
 
 } // namespace llaminar2

@@ -17,6 +17,9 @@
 
 #include "RCCLCoordinator.h"
 #include "../../utils/Logger.h"
+#include "../../utils/DebugEnv.h"
+
+#include <functional>
 
 #ifdef HAVE_RCCL
 #include <hip/hip_runtime.h>
@@ -322,6 +325,17 @@ namespace llaminar2
 
         hipStream_t stream = static_cast<hipStream_t>(streams_[device_idx]);
         hipEvent_t event = static_cast<hipEvent_t>(worker_event);
+
+        if (debugEnv().validation.validate_gpu_ptrs)
+        {
+            int current_dev = -1;
+            (void)hipGetDevice(&current_dev);
+            LOG_DEBUG("[RCCL_STREAM_WAIT] slot=" << device_idx
+                                                 << " target_device=" << device_ordinals_[device_idx]
+                                                 << " current_device=" << current_dev
+                                                 << " stream=" << stream
+                                                 << " event=" << event);
+        }
 
         HIP_CHECK_VOID(hipStreamWaitEvent(stream, event, 0));
 #endif
@@ -1103,6 +1117,9 @@ namespace llaminar2
                                            int dtype_int, int op_int)
     {
 #ifdef HAVE_RCCL
+        const bool trace_device_state = debugEnv().validation.validate_gpu_ptrs;
+        const size_t thread_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
+
         // CRITICAL: Synchronize ALL streams on each device before RCCL operations.
         // Compute kernels run on a dedicated per-device stream (AMDDeviceContext::default_stream_)
         // created via hipStreamCreateWithFlags — NOT the HIP NULL stream. Using
@@ -1111,12 +1128,41 @@ namespace llaminar2
         // dedicated compute stream, ensuring RCCL reads completed data.
         for (int i = 0; i < num_devices_; ++i)
         {
+            if (trace_device_state)
+            {
+                int before_dev = -1;
+                hipError_t get_before = hipGetDevice(&before_dev);
+                if (get_before == hipSuccess)
+                {
+                    LOG_DEBUG("[RCCL_DEVICE_STATE] phase=pre_sync thread=" << thread_hash
+                                                                           << " slot=" << i
+                                                                           << " current=" << before_dev
+                                                                           << " target=" << device_ordinals_[i]);
+                }
+            }
+
             hipError_t err = hipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed during pre-allreduce sync: ") + hipGetErrorString(err);
                 return false;
             }
+
+            if (trace_device_state)
+            {
+                int after_dev = -1;
+                hipError_t get_after = hipGetDevice(&after_dev);
+                if (get_after == hipSuccess && after_dev != device_ordinals_[i])
+                {
+                    LOG_ERROR("[RCCL_DEVICE_STATE_MISMATCH] phase=post_set_pre_sync thread=" << thread_hash
+                                                                                             << " slot=" << i
+                                                                                             << " expected=" << device_ordinals_[i]
+                                                                                             << " actual=" << after_dev);
+                    last_error_ = "RCCLCoordinator device mismatch after hipSetDevice (pre-sync)";
+                    return false;
+                }
+            }
+
             // Sync ALL streams (compute kernels use a dedicated stream, not NULL stream)
             err = hipDeviceSynchronize();
             if (err != hipSuccess)
@@ -1146,8 +1192,40 @@ namespace llaminar2
                 return false;
             }
 
+            if (trace_device_state)
+            {
+                int after_dev = -1;
+                hipError_t get_after = hipGetDevice(&after_dev);
+                if (get_after == hipSuccess && after_dev != device_ordinals_[i])
+                {
+                    LOG_ERROR("[RCCL_DEVICE_STATE_MISMATCH] phase=post_set_launch thread=" << thread_hash
+                                                                                           << " slot=" << i
+                                                                                           << " expected=" << device_ordinals_[i]
+                                                                                           << " actual=" << after_dev);
+                    last_error_ = "RCCLCoordinator device mismatch after hipSetDevice (launch)";
+                    rccl::ncclGroupEnd();
+                    return false;
+                }
+            }
+
             rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[i]);
             hipStream_t stream = static_cast<hipStream_t>(streams_[i]);
+
+            if (trace_device_state)
+            {
+                int launch_dev = -1;
+                hipError_t get_launch_dev = hipGetDevice(&launch_dev);
+                if (get_launch_dev == hipSuccess)
+                {
+                    LOG_DEBUG("[RCCL_STREAM_LAUNCH] thread=" << thread_hash
+                                                             << " slot=" << i
+                                                             << " target_device=" << device_ordinals_[i]
+                                                             << " current_device=" << launch_dev
+                                                             << " stream=" << stream
+                                                             << " buffer=" << buffers[i]
+                                                             << " count=" << count);
+                }
+            }
 
             r = rccl::ncclAllReduce(buffers[i], buffers[i], count,
                                     toRcclDataTypeInt(dtype_int), toRcclRedOpInt(op_int),

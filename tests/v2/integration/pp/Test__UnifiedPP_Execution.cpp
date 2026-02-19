@@ -219,9 +219,9 @@ namespace
             Qwen2ModelWeights weights;
 
             // Load global weights
-            embedding_table_ = model_ctx_->getWeight("token_embd.weight", cpu_device_);
-            final_norm_ = model_ctx_->getWeight("output_norm.weight", cpu_device_);
-            lm_head_ = model_ctx_->getWeight("output.weight", cpu_device_);
+            embedding_table_ = model_ctx_->getWeightForDevice("token_embd.weight", cpu_device_);
+            final_norm_ = model_ctx_->getWeightForDevice("output_norm.weight", cpu_device_);
+            lm_head_ = model_ctx_->getWeightForDevice("output.weight", cpu_device_);
 
             weights.embedding_table = embedding_table_.get();
             weights.final_norm = final_norm_.get();
@@ -250,28 +250,28 @@ namespace
             std::string prefix = "blk." + std::to_string(layer_idx) + ".";
 
             LayerWeightsStorage storage;
-            storage.wq = model_ctx_->getWeight(prefix + "attn_q.weight", cpu_device_);
-            storage.wk = model_ctx_->getWeight(prefix + "attn_k.weight", cpu_device_);
-            storage.wv = model_ctx_->getWeight(prefix + "attn_v.weight", cpu_device_);
-            storage.wo = model_ctx_->getWeight(prefix + "attn_output.weight", cpu_device_);
-            storage.attn_norm = model_ctx_->getWeight(prefix + "attn_norm.weight", cpu_device_);
-            storage.gate_proj = model_ctx_->getWeight(prefix + "ffn_gate.weight", cpu_device_);
-            storage.up_proj = model_ctx_->getWeight(prefix + "ffn_up.weight", cpu_device_);
-            storage.down_proj = model_ctx_->getWeight(prefix + "ffn_down.weight", cpu_device_);
-            storage.ffn_norm = model_ctx_->getWeight(prefix + "ffn_norm.weight", cpu_device_);
+            storage.wq = model_ctx_->getWeightForDevice(prefix + "attn_q.weight", cpu_device_);
+            storage.wk = model_ctx_->getWeightForDevice(prefix + "attn_k.weight", cpu_device_);
+            storage.wv = model_ctx_->getWeightForDevice(prefix + "attn_v.weight", cpu_device_);
+            storage.wo = model_ctx_->getWeightForDevice(prefix + "attn_output.weight", cpu_device_);
+            storage.attn_norm = model_ctx_->getWeightForDevice(prefix + "attn_norm.weight", cpu_device_);
+            storage.gate_proj = model_ctx_->getWeightForDevice(prefix + "ffn_gate.weight", cpu_device_);
+            storage.up_proj = model_ctx_->getWeightForDevice(prefix + "ffn_up.weight", cpu_device_);
+            storage.down_proj = model_ctx_->getWeightForDevice(prefix + "ffn_down.weight", cpu_device_);
+            storage.ffn_norm = model_ctx_->getWeightForDevice(prefix + "ffn_norm.weight", cpu_device_);
 
             // Optional biases
             if (model_ctx_->hasTensor(prefix + "attn_q.bias"))
             {
-                storage.q_bias = model_ctx_->getWeight(prefix + "attn_q.bias", cpu_device_);
+                storage.q_bias = model_ctx_->getWeightForDevice(prefix + "attn_q.bias", cpu_device_);
             }
             if (model_ctx_->hasTensor(prefix + "attn_k.bias"))
             {
-                storage.k_bias = model_ctx_->getWeight(prefix + "attn_k.bias", cpu_device_);
+                storage.k_bias = model_ctx_->getWeightForDevice(prefix + "attn_k.bias", cpu_device_);
             }
             if (model_ctx_->hasTensor(prefix + "attn_v.bias"))
             {
-                storage.v_bias = model_ctx_->getWeight(prefix + "attn_v.bias", cpu_device_);
+                storage.v_bias = model_ctx_->getWeightForDevice(prefix + "attn_v.bias", cpu_device_);
             }
 
             // Build weights struct

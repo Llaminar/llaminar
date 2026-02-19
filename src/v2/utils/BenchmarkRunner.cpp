@@ -12,10 +12,11 @@
 #include "KVCacheProfiler.h"
 #include "CUDAKernelProfiler.h"
 #include "ROCmKernelProfiler.h"
+#include "WeightLoadingProfiler.h"
 #include "../execution/local_execution/graph/IGraphExecutor.h"
 #include "fort.hpp"
-#include <iostream>
 #include <iomanip>
+#include <print>
 #include <sstream>
 #include <mpi.h>
 #include <numeric>
@@ -428,7 +429,7 @@ namespace llaminar2
             return; // Only rank 0 prints
         }
 
-        std::cout << "\n";
+        std::print("\n");
 
         // Title table
         {
@@ -439,7 +440,7 @@ namespace llaminar2
             title << title_ss.str() << fort::endr;
             title[0][0].set_cell_text_align(fort::text_align::center);
             title.row(0).set_cell_row_type(fort::row_type::header);
-            std::cout << title.to_string();
+            std::print("{}", title.to_string());
         }
 
         // Results table
@@ -505,16 +506,18 @@ namespace llaminar2
             }
         }
 
-        std::cout << table.to_string();
+        std::print("{}", table.to_string());
 
         // Print kernel profiling summary if enabled
         if (KernelProfiler::isEnabled())
         {
             uint64_t total_tokens = result.prefill_tokens + result.decode_tokens;
+
             KernelProfiler::printSummary(total_tokens);
+
             KVCacheProfiler::printSummary();
-            CUDAKernelProfiler::printSummary(total_tokens);
-            ROCmKernelProfiler::printSummary(total_tokens);
+            CUDAKernelProfiler::printSummary(total_tokens, result.prefill_time_ms, result.decode_time_ms);
+            ROCmKernelProfiler::printSummary(total_tokens, result.prefill_time_ms, result.decode_time_ms);
         }
 
         // Print executor overhead profiling if enabled (LLAMINAR_PROFILING=1)
@@ -528,17 +531,27 @@ namespace llaminar2
             }
         }
 
+        // Print weight loading profiling if enabled
+        if (KernelProfiler::isEnabled())
+        {
+            std::string wl_summary = WeightLoadingProfiler::getSummary();
+            if (!wl_summary.empty())
+            {
+                std::print("{}", wl_summary);
+            }
+        }
+
         // Status
         if (result.success)
         {
-            std::cout << "\n✓ Benchmark completed successfully.\n";
+            std::print("\n✓ Benchmark completed successfully.\n");
         }
         else
         {
-            std::cout << "\n✗ Benchmark failed.\n";
+            std::print("\n✗ Benchmark failed.\n");
         }
 
-        std::cout << std::endl;
+        std::println("");
     }
 
 } // namespace llaminar2

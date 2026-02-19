@@ -576,6 +576,9 @@ namespace llaminar2
         // Separate from cache_ and cuda_cache_ to allow CPU, CUDA, and ROCm paths to coexist
         mutable std::any rocm_cache_;
 
+        // Synchronizes cache_ / cuda_cache_ / rocm_cache_ initialization and reset
+        mutable std::mutex packed_cache_mutex_;
+
         // Shape and type - each concrete tensor class has its own shape_ member
         // and overrides shape() to return it.
         virtual TensorType native_type() const = 0;
@@ -1559,6 +1562,11 @@ namespace llaminar2
         std::optional<DeviceId> authoritative_device_;
 
         // ===== Multi-Device Buffer Management =====
+
+        // Serializes host/device coherence and primary/secondary buffer transitions.
+        // Required for LOCAL TP where the same tensor can be touched from multiple
+        // device worker threads.
+        mutable std::mutex coherence_mutex_;
 
         /**
          * @brief Map of secondary device buffers (for multi-device scenarios)

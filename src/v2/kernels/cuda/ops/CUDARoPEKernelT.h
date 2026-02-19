@@ -61,7 +61,7 @@ namespace llaminar2
             /// Maximum head_dim/2 for worst-case workspace allocation (covers head_dim up to 256)
             static constexpr int MAX_HALF_DIM = 128;
 
-            explicit CUDARoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
+            explicit CUDARoPEKernelT(int device_idx = -1, float rope_theta = 10000.0f)
                 : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
                   inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
             ~CUDARoPEKernelT() override;
@@ -302,7 +302,7 @@ namespace llaminar2
             /// Maximum head_dim/2 for worst-case workspace allocation (covers head_dim up to 256)
             static constexpr int MAX_HALF_DIM = 128;
 
-            explicit CUDARoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
+            explicit CUDARoPEKernelT(int device_idx = -1, float rope_theta = 10000.0f)
                 : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
                   inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
 
@@ -565,7 +565,7 @@ namespace llaminar2
             /// Maximum head_dim/2 for worst-case workspace allocation (covers head_dim up to 256)
             static constexpr int MAX_HALF_DIM = 128;
 
-            explicit CUDARoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
+            explicit CUDARoPEKernelT(int device_idx = -1, float rope_theta = 10000.0f)
                 : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
                   inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
 

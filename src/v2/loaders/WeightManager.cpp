@@ -79,84 +79,6 @@ namespace llaminar2
         }
     }
 
-    std::shared_ptr<TensorBase> WeightManager::getWeight(const std::string &name, DeviceId device, int layer_idx)
-    {
-        std::lock_guard<std::mutex> lock(cache_mutex_);
-
-        // For LAYER_PARTITIONED strategy, filter out weights not in our layer range
-        if (strategy_ == WeightDistributionStrategy::LAYER_PARTITIONED && has_layer_range_)
-        {
-            if (!isWeightInLayerRange(name))
-            {
-                LOG_DEBUG("[WeightManager] Layer filter: skipping " << name << " (not in range ["
-                                                                    << layer_first_ << ", " << layer_last_ << "))");
-                return nullptr;
-            }
-        }
-
-        // Check cache first
-        auto it = cache_.find(name);
-        if (it != cache_.end())
-        {
-            LOG_TRACE("[WeightManager] Cache hit: " << name << " ptr=" << (void *)it->second.get());
-            return it->second;
-        }
-        LOG_DEBUG("[WeightManager] Cache miss: " << name << " (loading now)");
-
-        // Determine device from placement map if not explicitly provided
-        DeviceId target_device = device;
-        if (!target_device.is_valid() && placement_map_)
-        {
-            target_device = placement_map_->getDeviceForWeight(name, layer_idx);
-        }
-        if (!target_device.is_valid())
-        {
-            target_device = DeviceId::cpu(); // Default to CPU
-        }
-
-        // Load based on strategy
-        std::shared_ptr<TensorBase> tensor;
-
-        switch (strategy_)
-        {
-        case WeightDistributionStrategy::REPLICATED:
-        case WeightDistributionStrategy::LAYER_PARTITIONED:
-            // LAYER_PARTITIONED uses same loading as REPLICATED, but getWeight()
-            // filters which weights are allowed based on layer range
-            tensor = getReplicatedWeight(name, target_device);
-            break;
-
-        case WeightDistributionStrategy::SHARDED:
-            tensor = getShardedWeight(name, target_device);
-            break;
-
-        case WeightDistributionStrategy::INTERLEAVED:
-            tensor = getInterleavedWeight(name, target_device);
-            break;
-
-        default:
-            LOG_ERROR("[WeightManager] Unknown strategy: " << static_cast<int>(strategy_));
-            return nullptr;
-        }
-
-        // NOTE: Weight packing is now handled by WeightPreloader, NOT here.
-        // WeightPreloader.preloadAll() or preloadForDevice() should be called
-        // after all weights are loaded to pack them for the target device.
-        // This separation ensures:
-        // 1. WeightManager only handles loading and distribution
-        // 2. WeightPreloader handles device-specific packing
-        // 3. Raw data isn't released until we know the target device
-
-        // Cache the loaded tensor
-        if (tensor)
-        {
-            cache_[name] = tensor;
-            LOG_DEBUG("[WeightManager] Cached NEW tensor: " << name << " -> " << (void *)tensor.get());
-        }
-
-        return tensor;
-    }
-
     bool WeightManager::isGemmWeight(const std::string &name) const
     {
         if (!has_sharding_config_)
@@ -698,7 +620,7 @@ namespace llaminar2
         }
 
         // Get the full weight tensor from cache or load fresh
-        // NOTE: We cannot call getWeight() here because we already hold cache_mutex_
+        // NOTE: We cannot call getWeightForDevice() here because we already hold cache_mutex_
         // Instead, check cache directly and load via getReplicatedWeight if needed
         std::shared_ptr<TensorBase> full_tensor;
         auto cache_it = cache_.find(name);
@@ -1314,6 +1236,17 @@ namespace llaminar2
     {
         std::lock_guard<std::mutex> lock(cache_mutex_);
 
+        // For LAYER_PARTITIONED strategy, filter out weights not in our layer range
+        if (strategy_ == WeightDistributionStrategy::LAYER_PARTITIONED && has_layer_range_)
+        {
+            if (!isWeightInLayerRange(name))
+            {
+                LOG_DEBUG("[WeightManager] Layer filter: skipping " << name << " (not in range ["
+                                                                    << layer_first_ << ", " << layer_last_ << "))");
+                return nullptr;
+            }
+        }
+
         // =======================================================================
         // LOCAL TP support: Check TensorParallelConfig FIRST for device-specific slicing
         // =======================================================================
@@ -1376,7 +1309,7 @@ namespace llaminar2
             {
             case WeightDistributionStrategy::REPLICATED:
             case WeightDistributionStrategy::LAYER_PARTITIONED:
-                // LAYER_PARTITIONED uses same loading as REPLICATED, but getWeight()
+                // LAYER_PARTITIONED uses same loading as REPLICATED, but getWeightForDevice()
                 // filters which weights are allowed based on layer range
                 tensor = getReplicatedWeight(name, target_device);
                 break;
@@ -1460,89 +1393,91 @@ namespace llaminar2
 
         LOG_INFO("[WeightManager] Pre-loading weights for " << devices.size() << " devices");
 
-        std::lock_guard<std::mutex> lock(cache_mutex_);
-
-        // Set first device if not already set
-        if (!first_device_.has_value())
-        {
-            first_device_ = devices[0];
-            LOG_DEBUG("[WeightManager] First device set to: " << devices[0].to_string());
-        }
-
-        // Get all weight names from cache
         std::vector<std::string> weight_names;
-        weight_names.reserve(cache_.size());
-        for (const auto &[name, _] : cache_)
+        bool seeded_from_loader = false;
         {
-            weight_names.push_back(name);
-        }
+            std::lock_guard<std::mutex> lock(cache_mutex_);
 
-        if (weight_names.empty())
-        {
-            LOG_WARN("[WeightManager] No weights in cache - call getWeight() first to load weights");
-            return true;
-        }
-
-        size_t total_clones = 0;
-        size_t total_uploads = 0;
-
-        // For each device (except first), create clones and upload
-        for (size_t dev_idx = 0; dev_idx < devices.size(); ++dev_idx)
-        {
-            const DeviceId &device = devices[dev_idx];
-
-            // First device uses original tensors, just upload them
-            if (device == first_device_.value())
+            // Set first device if not already set
+            if (!first_device_.has_value())
             {
-                LOG_DEBUG("[WeightManager] Device " << device.to_string()
-                                                    << " is first device, uploading original tensors");
-                for (const auto &name : weight_names)
-                {
-                    auto &tensor = cache_[name];
-                    if (tensor && device.type != DeviceType::CPU)
-                    {
-                        if (tensor->ensureOnDevice(device))
-                        {
-                            ++total_uploads;
-                        }
-                    }
-                }
-                continue;
+                first_device_ = devices[0];
+                LOG_DEBUG("[WeightManager] First device set to: " << devices[0].to_string());
             }
 
-            // Subsequent devices need clones
-            LOG_DEBUG("[WeightManager] Creating clones for device " << device.to_string());
+            // Prefer already-cached names (fast path)
+            weight_names.reserve(cache_.size());
+            for (const auto &[name, _] : cache_)
+            {
+                weight_names.push_back(name);
+            }
+        }
+
+        // If cache is empty, seed from model tensor list and let getWeightForDevice()
+        // materialize/cache per-device tensors on demand.
+        if (weight_names.empty())
+        {
+            weight_names = loader_.tensorNames();
+            seeded_from_loader = true;
+
+            if (weight_names.empty())
+            {
+                LOG_WARN("[WeightManager] No tensor names available for preloading");
+                return true;
+            }
+
+            LOG_INFO("[WeightManager] Cache empty; seeding preload from model tensor list ("
+                     << weight_names.size() << " tensors)");
+        }
+
+        size_t loaded_tensors = 0;
+        size_t total_uploads = 0;
+        size_t load_failures = 0;
+
+        for (const auto &device : devices)
+        {
+            LOG_DEBUG("[WeightManager] Preloading weights for device " << device.to_string());
+
             for (const auto &name : weight_names)
             {
-                std::string cache_key = device.to_string() + ":" + name;
-
-                // Skip if already cloned
-                if (per_device_cache_.find(cache_key) != per_device_cache_.end())
+                // Respect PP layer filtering semantics during seeded preload.
+                if (strategy_ == WeightDistributionStrategy::LAYER_PARTITIONED && has_layer_range_)
                 {
+                    if (!isWeightInLayerRange(name))
+                    {
+                        continue;
+                    }
+                }
+
+                auto tensor = getWeightForDevice(name, device);
+                if (!tensor)
+                {
+                    ++load_failures;
                     continue;
                 }
 
-                auto &original = cache_[name];
-                auto clone = cloneTensorForDevice(name, original, device);
-                if (clone)
+                ++loaded_tensors;
+
+                if (device.type != DeviceType::CPU)
                 {
-                    // Upload to device
-                    if (device.type != DeviceType::CPU)
+                    if (tensor->ensureOnDevice(device))
                     {
-                        if (clone->ensureOnDevice(device))
-                        {
-                            ++total_uploads;
-                        }
+                        ++total_uploads;
                     }
-                    per_device_cache_[cache_key] = clone;
-                    ++total_clones;
+                    else
+                    {
+                        ++load_failures;
+                        LOG_WARN("[WeightManager] Failed to upload preloaded tensor "
+                                 << name << " to " << device.to_string());
+                    }
                 }
             }
         }
 
-        LOG_INFO("[WeightManager] Pre-loaded " << total_clones << " clones, "
-                                               << total_uploads << " uploads for "
-                                               << devices.size() << " devices");
+        LOG_INFO("[WeightManager] Preload complete: loaded=" << loaded_tensors
+                                                               << ", uploads=" << total_uploads
+                                                               << ", failures=" << load_failures
+                                                               << (seeded_from_loader ? " (seeded from loader names)" : ""));
         return true;
     }
 

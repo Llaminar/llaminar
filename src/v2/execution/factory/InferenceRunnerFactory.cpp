@@ -23,6 +23,7 @@
 #include "../../config/PipelineConfig.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
+#include "../../utils/WeightLoadingProfiler.h"
 
 namespace llaminar2
 {
@@ -707,9 +708,9 @@ namespace llaminar2
         Qwen2ModelWeights weights;
 
         // Get global weights
-        auto embedding = weight_mgr->getWeight("token_embd.weight");
-        auto final_norm = weight_mgr->getWeight("output_norm.weight");
-        auto lm_head = weight_mgr->getWeight("output.weight");
+        auto embedding = weight_mgr->getWeightForDevice("token_embd.weight");
+        auto final_norm = weight_mgr->getWeightForDevice("output_norm.weight");
+        auto lm_head = weight_mgr->getWeightForDevice("output.weight");
 
         if (!embedding || !final_norm || !lm_head)
         {
@@ -732,6 +733,7 @@ namespace llaminar2
 
         int n_layers = model_ctx->blockCount();
         LOG_DEBUG("[InferenceRunner] Eagerly loading " << n_layers << " layers of weights...");
+        WeightLoadingProfiler::begin(WeightLoadPhase::TENSOR_LOAD);
         for (int layer_idx = 0; layer_idx < n_layers; ++layer_idx)
         {
             std::string prefix = "blk." + std::to_string(layer_idx) + ".";
@@ -756,7 +758,7 @@ namespace llaminar2
 
             for (const auto &weight_name : layer_weights)
             {
-                auto weight = weight_mgr->getWeight(weight_name);
+                auto weight = weight_mgr->getWeightForDevice(weight_name);
                 bool is_optional = schema_factory->isWeightOptional(weight_name);
 
                 if (!weight)
@@ -776,31 +778,38 @@ namespace llaminar2
             }
         }
         LOG_DEBUG("[InferenceRunner] All layer weights loaded into cache");
+        WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
 
         // =====================================================================
         // NOW preload weights for target device (GPU packing/upload)
         // =====================================================================
         // Pack GEMM weights (creates kernels and uploads to GPU for GPU targets)
-        if (!weight_mgr->packGemmWeights(device))
         {
-            LOG_WARN("[InferenceRunner] Weight packing failed for device "
-                     << device_name << ", will use lazy kernel creation");
-            // Not fatal - kernels will be created lazily on first use
-        }
-        else
-        {
-            LOG_DEBUG("[InferenceRunner] Packed GEMM weights for " << device_name);
+            ScopedWeightLoadTimer timer(WeightLoadPhase::GEMM_PACK);
+            if (!weight_mgr->packGemmWeights(device))
+            {
+                LOG_WARN("[InferenceRunner] Weight packing failed for device "
+                         << device_name << ", will use lazy kernel creation");
+                // Not fatal - kernels will be created lazily on first use
+            }
+            else
+            {
+                LOG_DEBUG("[InferenceRunner] Packed GEMM weights for " << device_name);
+            }
         }
 
         // Upload non-GEMM weights (norms, embeddings) to GPU
-        if (!weight_mgr->uploadNonGemmWeights(device))
         {
-            LOG_WARN("[InferenceRunner] Non-GEMM weight upload failed for device "
-                     << device_name);
-        }
-        else
-        {
-            LOG_DEBUG("[InferenceRunner] Uploaded non-GEMM weights for " << device_name);
+            ScopedWeightLoadTimer timer(WeightLoadPhase::DEVICE_UPLOAD);
+            if (!weight_mgr->uploadNonGemmWeights(device))
+            {
+                LOG_WARN("[InferenceRunner] Non-GEMM weight upload failed for device "
+                         << device_name);
+            }
+            else
+            {
+                LOG_DEBUG("[InferenceRunner] Uploaded non-GEMM weights for " << device_name);
+            }
         }
 
         // Layer weight accessor - capture weight_mgr by value (shared_ptr copy)
@@ -811,11 +820,11 @@ namespace llaminar2
             std::string prefix = "blk." + std::to_string(layer_idx) + ".";
 
             // Attention weights - all required (should be in cache from eager load)
-            auto wq = weight_mgr->getWeight(prefix + "attn_q.weight");
-            auto wk = weight_mgr->getWeight(prefix + "attn_k.weight");
-            auto wv = weight_mgr->getWeight(prefix + "attn_v.weight");
-            auto wo = weight_mgr->getWeight(prefix + "attn_output.weight");
-            auto attn_norm = weight_mgr->getWeight(prefix + "attn_norm.weight");
+            auto wq = weight_mgr->getWeightForDevice(prefix + "attn_q.weight");
+            auto wk = weight_mgr->getWeightForDevice(prefix + "attn_k.weight");
+            auto wv = weight_mgr->getWeightForDevice(prefix + "attn_v.weight");
+            auto wo = weight_mgr->getWeightForDevice(prefix + "attn_output.weight");
+            auto attn_norm = weight_mgr->getWeightForDevice(prefix + "attn_norm.weight");
 
             // Validate required attention weights
             if (!wq || !wk || !wv || !wo || !attn_norm)
@@ -832,18 +841,18 @@ namespace llaminar2
             layer.attn_norm = attn_norm.get();
 
             // Attention biases (may be null)
-            auto q_bias = weight_mgr->getWeight(prefix + "attn_q.bias");
-            auto k_bias = weight_mgr->getWeight(prefix + "attn_k.bias");
-            auto v_bias = weight_mgr->getWeight(prefix + "attn_v.bias");
+            auto q_bias = weight_mgr->getWeightForDevice(prefix + "attn_q.bias");
+            auto k_bias = weight_mgr->getWeightForDevice(prefix + "attn_k.bias");
+            auto v_bias = weight_mgr->getWeightForDevice(prefix + "attn_v.bias");
             layer.q_bias = q_bias ? q_bias.get() : nullptr;
             layer.k_bias = k_bias ? k_bias.get() : nullptr;
             layer.v_bias = v_bias ? v_bias.get() : nullptr;
 
             // FFN weights - all required
-            auto gate_proj = weight_mgr->getWeight(prefix + "ffn_gate.weight");
-            auto up_proj = weight_mgr->getWeight(prefix + "ffn_up.weight");
-            auto down_proj = weight_mgr->getWeight(prefix + "ffn_down.weight");
-            auto ffn_norm = weight_mgr->getWeight(prefix + "ffn_norm.weight");
+            auto gate_proj = weight_mgr->getWeightForDevice(prefix + "ffn_gate.weight");
+            auto up_proj = weight_mgr->getWeightForDevice(prefix + "ffn_up.weight");
+            auto down_proj = weight_mgr->getWeightForDevice(prefix + "ffn_down.weight");
+            auto ffn_norm = weight_mgr->getWeightForDevice(prefix + "ffn_norm.weight");
 
             if (!gate_proj || !up_proj || !down_proj || !ffn_norm)
             {
@@ -928,7 +937,7 @@ namespace llaminar2
         // =====================================================================
         if (pp_config.has_embedding)
         {
-            auto embedding = weight_mgr->getWeight("token_embd.weight");
+            auto embedding = weight_mgr->getWeightForDevice("token_embd.weight");
             if (!embedding)
             {
                 LOG_ERROR("[PPStageRunner] Stage has_embedding=true but token_embd.weight missing");
@@ -945,8 +954,8 @@ namespace llaminar2
 
         if (pp_config.has_lm_head)
         {
-            auto final_norm = weight_mgr->getWeight("output_norm.weight");
-            auto lm_head = weight_mgr->getWeight("output.weight");
+            auto final_norm = weight_mgr->getWeightForDevice("output_norm.weight");
+            auto lm_head = weight_mgr->getWeightForDevice("output.weight");
             if (!final_norm || !lm_head)
             {
                 LOG_ERROR("[PPStageRunner] Stage has_lm_head=true but output_norm/output weights missing");
@@ -998,7 +1007,7 @@ namespace llaminar2
 
             for (const auto &weight_name : layer_weights)
             {
-                auto weight = weight_mgr->getWeight(weight_name);
+                auto weight = weight_mgr->getWeightForDevice(weight_name);
                 bool is_optional = schema_factory->isWeightOptional(weight_name);
 
                 if (!weight)
@@ -1020,23 +1029,29 @@ namespace llaminar2
         // =====================================================================
         // Preload weights for target device (GPU packing/upload)
         // =====================================================================
-        if (!weight_mgr->packGemmWeights(device))
         {
-            LOG_WARN("[PPStageRunner] Weight packing failed for device "
-                     << device_name << ", will use lazy kernel creation");
-        }
-        else
-        {
-            LOG_DEBUG("[PPStageRunner] Packed GEMM weights for " << device_name);
+            ScopedWeightLoadTimer timer(WeightLoadPhase::GEMM_PACK);
+            if (!weight_mgr->packGemmWeights(device))
+            {
+                LOG_WARN("[PPStageRunner] Weight packing failed for device "
+                         << device_name << ", will use lazy kernel creation");
+            }
+            else
+            {
+                LOG_DEBUG("[PPStageRunner] Packed GEMM weights for " << device_name);
+            }
         }
 
-        if (!weight_mgr->uploadNonGemmWeights(device))
         {
-            LOG_WARN("[PPStageRunner] Non-GEMM weight upload failed for device " << device_name);
-        }
-        else
-        {
-            LOG_DEBUG("[PPStageRunner] Uploaded non-GEMM weights for " << device_name);
+            ScopedWeightLoadTimer timer(WeightLoadPhase::DEVICE_UPLOAD);
+            if (!weight_mgr->uploadNonGemmWeights(device))
+            {
+                LOG_WARN("[PPStageRunner] Non-GEMM weight upload failed for device " << device_name);
+            }
+            else
+            {
+                LOG_DEBUG("[PPStageRunner] Uploaded non-GEMM weights for " << device_name);
+            }
         }
 
         // =====================================================================
@@ -1061,11 +1076,11 @@ namespace llaminar2
             std::string prefix = "blk." + std::to_string(layer_idx) + ".";
 
             // Attention weights - all required
-            auto wq = weight_mgr->getWeight(prefix + "attn_q.weight");
-            auto wk = weight_mgr->getWeight(prefix + "attn_k.weight");
-            auto wv = weight_mgr->getWeight(prefix + "attn_v.weight");
-            auto wo = weight_mgr->getWeight(prefix + "attn_output.weight");
-            auto attn_norm = weight_mgr->getWeight(prefix + "attn_norm.weight");
+            auto wq = weight_mgr->getWeightForDevice(prefix + "attn_q.weight");
+            auto wk = weight_mgr->getWeightForDevice(prefix + "attn_k.weight");
+            auto wv = weight_mgr->getWeightForDevice(prefix + "attn_v.weight");
+            auto wo = weight_mgr->getWeightForDevice(prefix + "attn_output.weight");
+            auto attn_norm = weight_mgr->getWeightForDevice(prefix + "attn_norm.weight");
 
             if (!wq || !wk || !wv || !wo || !attn_norm)
             {
@@ -1080,18 +1095,18 @@ namespace llaminar2
             layer.attn_norm = attn_norm.get();
 
             // Attention biases (may be null)
-            auto q_bias = weight_mgr->getWeight(prefix + "attn_q.bias");
-            auto k_bias = weight_mgr->getWeight(prefix + "attn_k.bias");
-            auto v_bias = weight_mgr->getWeight(prefix + "attn_v.bias");
+            auto q_bias = weight_mgr->getWeightForDevice(prefix + "attn_q.bias");
+            auto k_bias = weight_mgr->getWeightForDevice(prefix + "attn_k.bias");
+            auto v_bias = weight_mgr->getWeightForDevice(prefix + "attn_v.bias");
             layer.q_bias = q_bias ? q_bias.get() : nullptr;
             layer.k_bias = k_bias ? k_bias.get() : nullptr;
             layer.v_bias = v_bias ? v_bias.get() : nullptr;
 
             // FFN weights - all required
-            auto gate_proj = weight_mgr->getWeight(prefix + "ffn_gate.weight");
-            auto up_proj = weight_mgr->getWeight(prefix + "ffn_up.weight");
-            auto down_proj = weight_mgr->getWeight(prefix + "ffn_down.weight");
-            auto ffn_norm = weight_mgr->getWeight(prefix + "ffn_norm.weight");
+            auto gate_proj = weight_mgr->getWeightForDevice(prefix + "ffn_gate.weight");
+            auto up_proj = weight_mgr->getWeightForDevice(prefix + "ffn_up.weight");
+            auto down_proj = weight_mgr->getWeightForDevice(prefix + "ffn_down.weight");
+            auto ffn_norm = weight_mgr->getWeightForDevice(prefix + "ffn_norm.weight");
 
             if (!gate_proj || !up_proj || !down_proj || !ffn_norm)
             {
@@ -1765,7 +1780,7 @@ namespace llaminar2
         // Configure weights from IModelContext
         // Build Qwen2ModelWeights using IModelContext::getWeightForDevice
         //
-        // IMPORTANT: Use getWeightForDevice() instead of getWeight() to get
+        // IMPORTANT: Use getWeightForDevice() instead of getWeightForDevice() to get
         // device-specific tensor instances. This is critical for multi-device
         // scenarios where each device needs its own tensor for coherence tracking.
         // The WeightManager handles cloning automatically when called from

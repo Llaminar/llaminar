@@ -17,6 +17,7 @@
 #include "../../../tensors/BlockStructures.h"
 #include "../../../tensors/Tensors.h" // For FP32Tensor, BF16Tensor, etc.
 #include "../../../utils/Logger.h"
+#include "../../../utils/KernelProfiler.h"
 #include <cstring>
 
 namespace llaminar2
@@ -391,6 +392,7 @@ namespace llaminar2
         int device_idx,
         int pos_offset)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::ROPE);
         (void)mpi_ctx;
         (void)pos_offset; // CPU kernel doesn't need this optimization
 
@@ -444,6 +446,7 @@ namespace llaminar2
         int device_idx,
         int pos_offset)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::ROPE);
         (void)mpi_ctx;
         (void)pos_offset; // CPU kernel doesn't need this optimization
 
@@ -497,6 +500,7 @@ namespace llaminar2
         int device_idx,
         int pos_offset)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::ROPE);
         (void)mpi_ctx;
         (void)pos_offset; // CPU kernel doesn't need this optimization
 
@@ -553,6 +557,7 @@ namespace llaminar2
         int device_idx,
         int pos_offset)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::ROPE);
         (void)mpi_ctx;
         (void)pos_offset; // CPU kernel doesn't need this optimization
 
@@ -1093,6 +1098,7 @@ namespace llaminar2
         int device_idx,
         int pos_offset)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::ROPE);
         (void)mpi_ctx;
         (void)pos_offset; // CPU kernel doesn't need this optimization
 

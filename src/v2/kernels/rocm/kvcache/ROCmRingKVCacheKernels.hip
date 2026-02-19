@@ -290,6 +290,90 @@ namespace llaminar2
         dst[row * blocks_per_row + block_col].qs[lane] = static_cast<int8_t>(s_q[lane]);
     }
 
+    // =========================================================================
+    // FP16/BF16/Q8_1 → FP32 GPU conversion kernel
+    // Used by flash attention to convert KV cache data on-device instead of
+    // the catastrophically slow CPU D2H → convert → H2D round-trip.
+    // =========================================================================
+    template <typename SrcT>
+    __global__ void convert_to_fp32_kernel(
+        const SrcT *__restrict__ src,
+        float *__restrict__ dst,
+        int count)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= count)
+            return;
+        dst[idx] = to_float_device(src[idx]);
+    }
+
+    __global__ void convert_q8_1_to_fp32_kernel(
+        const Q8_1Block *__restrict__ src,
+        float *__restrict__ dst,
+        int rows,
+        int cols,
+        int blocks_per_row)
+    {
+        const int row = blockIdx.y;
+        const int col = blockIdx.x * blockDim.x + threadIdx.x;
+        if (row >= rows || col >= cols)
+            return;
+
+        const int block_col = col / Q8_1Block::BLOCK_SIZE;
+        const int lane = col % Q8_1Block::BLOCK_SIZE;
+        const Q8_1Block &blk = src[row * blocks_per_row + block_col];
+        const float d = __half2float(__ushort_as_half(blk.d));
+        dst[row * cols + col] = d * static_cast<float>(blk.qs[lane]);
+    }
+
+    extern "C" bool hip_convert_tensor_to_fp32(
+        const void *d_src,
+        TensorType src_type,
+        float *d_dst,
+        int count,
+        int rows,
+        int cols,
+        hipStream_t stream)
+    {
+        if (!d_src || !d_dst || count <= 0)
+            return false;
+
+        dim3 block(256);
+        dim3 grid((count + block.x - 1) / block.x);
+
+        switch (src_type)
+        {
+        case TensorType::FP16:
+            hipLaunchKernelGGL(convert_to_fp32_kernel<half>, grid, block, 0, stream,
+                               reinterpret_cast<const half *>(d_src), d_dst, count);
+            break;
+        case TensorType::BF16:
+            hipLaunchKernelGGL(convert_to_fp32_kernel<hip_bfloat16>, grid, block, 0, stream,
+                               static_cast<const hip_bfloat16 *>(d_src), d_dst, count);
+            break;
+        case TensorType::FP32:
+            hipMemcpyAsync(d_dst, d_src, static_cast<size_t>(count) * sizeof(float),
+                           hipMemcpyDeviceToDevice, stream);
+            break;
+        case TensorType::Q8_1:
+        {
+            if (rows <= 0 || cols <= 0)
+                return false;
+            const int blocks_per_row = (cols + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+            dim3 q_block(256);
+            dim3 q_grid((cols + q_block.x - 1) / q_block.x, rows);
+            hipLaunchKernelGGL(convert_q8_1_to_fp32_kernel, q_grid, q_block, 0, stream,
+                               static_cast<const Q8_1Block *>(d_src), d_dst,
+                               rows, cols, blocks_per_row);
+            break;
+        }
+        default:
+            return false;
+        }
+
+        return hipGetLastError() == hipSuccess;
+    }
+
     extern "C" bool hip_convert_tensor_to_fp16(
         const void *d_src,
         TensorType src_type,

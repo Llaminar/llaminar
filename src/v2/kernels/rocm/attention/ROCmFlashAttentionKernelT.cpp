@@ -14,15 +14,13 @@
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
-#include "../../../tensors/BlockStructures.h"
-#include "../../../tensors/FP16Utils.h"
+#include "../ROCmKernelBase.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/ROCmKernelProfiler.h"
 #include "../../attention/AttentionDeviceParams.h"
 #include <hip/hip_runtime.h>
 #include <cstring>
 #include <stdexcept>
-#include <vector>
 
 // Extern "C" declarations for HIP kernel wrappers
 extern "C"
@@ -55,6 +53,16 @@ extern "C"
 
     int hipFlashAttn_setDevice(int device_idx);
     // hipFlashAttn_synchronize() removed - caller manages coherence via events
+
+    // GPU-side tensor type conversion (avoids catastrophic CPU D2H → convert → H2D round-trip)
+    bool hip_convert_tensor_to_fp32(
+        const void *d_src,
+        llaminar2::TensorType src_type,
+        float *d_dst,
+        int count,
+        int rows,
+        int cols,
+        hipStream_t stream);
 }
 
 namespace llaminar2
@@ -73,6 +81,12 @@ namespace llaminar2
               partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
               workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
         {
+            if (device_idx < 0)
+            {
+                throw std::runtime_error(
+                    "[ROCmFlashAttentionKernelT<FP32>] Invalid device_idx=" + std::to_string(device_idx) +
+                    " — caller must pass explicit device ordinal");
+            }
             LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>] Created for device " << device_idx);
         }
 
@@ -177,10 +191,8 @@ namespace llaminar2
             int n_heads, int head_dim, int num_splits)
         {
             // Workspace is now REQUIRED - no legacy allocation path
-            if (!hasWorkspace())
+            if (!validateROCmWorkspaceBinding(workspace_, device_idx_, "ROCmFlashAttentionKernelT<FP32>"))
             {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Workspace not bound - hot-path allocation disabled. "
-                          "Call bindWorkspace() before allocateWorkspace()");
                 partial_output_buf_ = nullptr;
                 partial_m_buf_ = nullptr;
                 partial_l_buf_ = nullptr;
@@ -457,9 +469,6 @@ namespace llaminar2
             const float *V_ptr = static_cast<const float *>(V->gpu_data_ptr());
             float *O_ptr = static_cast<float *>(output->gpu_data_ptr());
 
-            thread_local std::vector<float> k_host_fp32;
-            thread_local std::vector<float> v_host_fp32;
-
             if (K->native_type() != TensorType::FP32 || V->native_type() != TensorType::FP32)
             {
                 if (K->native_type() != V->native_type())
@@ -478,71 +487,6 @@ namespace llaminar2
                 const size_t rows = static_cast<size_t>(batch_size) * static_cast<size_t>(kv_len);
                 const size_t logical_cols = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
                 const size_t logical_elements = rows * logical_cols;
-                k_host_fp32.resize(logical_elements);
-                v_host_fp32.resize(logical_elements);
-
-                if (K->native_type() == TensorType::FP16)
-                {
-                    thread_local std::vector<uint16_t> k_half;
-                    thread_local std::vector<uint16_t> v_half;
-                    k_half.resize(logical_elements);
-                    v_half.resize(logical_elements);
-                    if (hipMemcpy(k_half.data(), K->gpu_data_ptr(), logical_elements * sizeof(uint16_t), hipMemcpyDeviceToHost) != hipSuccess ||
-                        hipMemcpy(v_half.data(), V->gpu_data_ptr(), logical_elements * sizeof(uint16_t), hipMemcpyDeviceToHost) != hipSuccess)
-                    {
-                        LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Failed D2H copy for FP16 KV conversion");
-                        return false;
-                    }
-
-                    for (size_t i = 0; i < logical_elements; ++i)
-                    {
-                        k_host_fp32[i] = fp16_to_fp32(k_half[i]);
-                        v_host_fp32[i] = fp16_to_fp32(v_half[i]);
-                    }
-                }
-                else if (K->native_type() == TensorType::Q8_1)
-                {
-                    const size_t blocks_per_row = (logical_cols + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-                    const size_t block_count = rows * blocks_per_row;
-
-                    thread_local std::vector<Q8_1Block> k_blocks;
-                    thread_local std::vector<Q8_1Block> v_blocks;
-                    k_blocks.resize(block_count);
-                    v_blocks.resize(block_count);
-                    if (hipMemcpy(k_blocks.data(), K->gpu_data_ptr(), block_count * sizeof(Q8_1Block), hipMemcpyDeviceToHost) != hipSuccess ||
-                        hipMemcpy(v_blocks.data(), V->gpu_data_ptr(), block_count * sizeof(Q8_1Block), hipMemcpyDeviceToHost) != hipSuccess)
-                    {
-                        LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Failed D2H copy for Q8_1 KV conversion");
-                        return false;
-                    }
-
-                    for (size_t r = 0; r < rows; ++r)
-                    {
-                        const size_t row_base = r * logical_cols;
-                        for (size_t b = 0; b < blocks_per_row; ++b)
-                        {
-                            const Q8_1Block &kb = k_blocks[r * blocks_per_row + b];
-                            const Q8_1Block &vb = v_blocks[r * blocks_per_row + b];
-                            const float k_scale = fp16_to_fp32(kb.d);
-                            const float v_scale = fp16_to_fp32(vb.d);
-                            const size_t col_base = b * Q8_1Block::BLOCK_SIZE;
-                            for (size_t i = 0; i < Q8_1Block::BLOCK_SIZE; ++i)
-                            {
-                                const size_t col = col_base + i;
-                                if (col >= logical_cols)
-                                    break;
-                                k_host_fp32[row_base + col] = k_scale * static_cast<float>(kb.qs[i]);
-                                v_host_fp32[row_base + col] = v_scale * static_cast<float>(vb.qs[i]);
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Unsupported KV tensor type for FP32 attention: "
-                              << K->dtype_name());
-                    return false;
-                }
 
                 float *d_k_tmp = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::K_TMP_FP32));
                 float *d_v_tmp = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::V_TMP_FP32));
@@ -554,10 +498,24 @@ namespace llaminar2
                     return false;
                 }
 
-                if (hipMemcpy(d_k_tmp, k_host_fp32.data(), logical_elements * sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
-                    hipMemcpy(d_v_tmp, v_host_fp32.data(), logical_elements * sizeof(float), hipMemcpyHostToDevice) != hipSuccess)
+                // GPU-side conversion: launch async kernels instead of the catastrophic
+                // D2H → CPU convert → H2D round-trip that caused 112 synchronous hipMemcpy
+                // calls per decode token (4 per layer × 28 layers).
+                const auto hip_stream = static_cast<hipStream_t>(stream_);
+                const bool k_ok = hip_convert_tensor_to_fp32(
+                    K->gpu_data_ptr(), K->native_type(), d_k_tmp,
+                    static_cast<int>(logical_elements),
+                    static_cast<int>(rows), static_cast<int>(logical_cols),
+                    hip_stream);
+                const bool v_ok = hip_convert_tensor_to_fp32(
+                    V->gpu_data_ptr(), V->native_type(), d_v_tmp,
+                    static_cast<int>(logical_elements),
+                    static_cast<int>(rows), static_cast<int>(logical_cols),
+                    hip_stream);
+                if (!k_ok || !v_ok)
                 {
-                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Failed H2D copy for temporary FP32 KV buffers");
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] GPU-side KV conversion failed for type "
+                              << K->dtype_name());
                     return false;
                 }
 
@@ -714,6 +672,12 @@ namespace llaminar2
               partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
               workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
         {
+            if (device_idx < 0)
+            {
+                throw std::runtime_error(
+                    "[ROCmFlashAttentionKernelT<FP16>] Invalid device_idx=" + std::to_string(device_idx) +
+                    " — caller must pass explicit device ordinal");
+            }
             LOG_DEBUG("[ROCmFlashAttentionKernelT<FP16>] Created for device " << device_idx);
         }
 
@@ -802,10 +766,8 @@ namespace llaminar2
             int n_heads, int head_dim, int num_splits)
         {
             // Workspace is now REQUIRED - no legacy allocation path
-            if (!hasWorkspace())
+            if (!validateROCmWorkspaceBinding(workspace_, device_idx_, "ROCmFlashAttentionKernelT<FP16>"))
             {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP16>] Workspace not bound - hot-path allocation disabled. "
-                          "Call bindWorkspace() before allocateWorkspace()");
                 partial_output_buf_ = nullptr;
                 partial_m_buf_ = nullptr;
                 partial_l_buf_ = nullptr;
@@ -1076,6 +1038,12 @@ namespace llaminar2
               partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
               workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
         {
+            if (device_idx < 0)
+            {
+                throw std::runtime_error(
+                    "[ROCmFlashAttentionKernelT<BF16>] Invalid device_idx=" + std::to_string(device_idx) +
+                    " — caller must pass explicit device ordinal");
+            }
             // Note: MI50 has limited BF16 support - may fall back to FP32
             LOG_DEBUG("[ROCmFlashAttentionKernelT<BF16>] Created for device " << device_idx
                                                                               << " (Note: MI50 has limited BF16 support)");
@@ -1161,10 +1129,8 @@ namespace llaminar2
             int n_heads, int head_dim, int num_splits)
         {
             // Workspace is now REQUIRED - no legacy allocation path
-            if (!hasWorkspace())
+            if (!validateROCmWorkspaceBinding(workspace_, device_idx_, "ROCmFlashAttentionKernelT<BF16>"))
             {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<BF16>] Workspace not bound - hot-path allocation disabled. "
-                          "Call bindWorkspace() before allocateWorkspace()");
                 partial_output_buf_ = nullptr;
                 partial_m_buf_ = nullptr;
                 partial_l_buf_ = nullptr;

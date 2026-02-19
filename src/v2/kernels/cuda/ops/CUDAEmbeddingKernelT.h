@@ -42,7 +42,7 @@ namespace llaminar2
     class CUDAEmbeddingKernelT : public ITensorEmbedding, public IWorkspaceConsumer
     {
     public:
-        explicit CUDAEmbeddingKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+        explicit CUDAEmbeddingKernelT(int device_idx = -1) : device_idx_(device_idx) {}
 
         /**
          * @brief Construct with device context (Phase 4 pattern)
@@ -84,7 +84,7 @@ namespace llaminar2
             int d_model,
             float *output,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = 0) override;
+            int device_idx = -1) override;
 
         /**
          * @brief Execute embedding lookup with BF16 output (not yet implemented)
@@ -96,7 +96,7 @@ namespace llaminar2
             int d_model,
             uint16_t *output,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = 0) override;
+            int device_idx = -1) override;
 
         /**
          * @brief Execute embedding lookup with FP16 output (not yet implemented)
@@ -108,7 +108,7 @@ namespace llaminar2
             int d_model,
             uint16_t *output,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = 0) override;
+            int device_idx = -1) override;
 
         /**
          * @brief Execute embedding lookup with Q8_1 output (not yet implemented)
@@ -120,7 +120,7 @@ namespace llaminar2
             int d_model,
             void *output,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = 0) override;
+            int device_idx = -1) override;
 
         /**
          * @brief Apply embedding lookup using tensor objects with automatic type dispatch
@@ -132,7 +132,7 @@ namespace llaminar2
             int d_model,
             TensorBase *output,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = 0) override;
+            int device_idx = -1) override;
 
         KernelSnapshotInfo getKernelSnapshotInfo() const override
         {

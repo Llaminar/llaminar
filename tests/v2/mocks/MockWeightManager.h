@@ -58,7 +58,7 @@ namespace llaminar2::test
      *     .setSharded("blk.0.attn_q.weight", ShardingMode::COLUMN_PARALLEL)
      *     .build();
      *
-     * auto weight = mock->getWeight("blk.0.attn_q.weight");
+     * auto weight = mock->getWeightForDevice("blk.0.attn_q.weight");
      * bool is_sharded = mock->isWeightSharded("blk.0.attn_q.weight");
      * @endcode
      */
@@ -98,14 +98,9 @@ namespace llaminar2::test
         // IWeightManager Implementation
         // =========================================================================
 
-        std::shared_ptr<TensorBase> getWeight(
-            const std::string &name,
-            DeviceId device = DeviceId::cpu(),
-            int layer_idx = -1) override;
-
         std::shared_ptr<TensorBase> getWeightForDevice(
             const std::string &name,
-            DeviceId device,
+            DeviceId device = DeviceId::cpu(),
             int layer_idx = -1) override;
 
         bool preloadForDevices(const std::vector<DeviceId> &devices) override;
@@ -389,7 +384,7 @@ namespace llaminar2::test
 
     inline MockWeightManager::MockWeightManager() = default;
 
-    inline std::shared_ptr<TensorBase> MockWeightManager::getWeight(
+    inline std::shared_ptr<TensorBase> MockWeightManager::getWeightForDevice(
         const std::string &name,
         DeviceId device,
         int layer_idx)
@@ -405,15 +400,6 @@ namespace llaminar2::test
             return nullptr;
         }
         return it->second;
-    }
-
-    inline std::shared_ptr<TensorBase> MockWeightManager::getWeightForDevice(
-        const std::string &name,
-        DeviceId device,
-        int layer_idx)
-    {
-        // For mock, just delegate to getWeight - no per-device cloning needed
-        return getWeight(name, device, layer_idx);
     }
 
     inline bool MockWeightManager::preloadForDevices(const std::vector<DeviceId> &devices)
@@ -441,7 +427,7 @@ namespace llaminar2::test
         }
 
         // Fall back to main weight (for simple tests)
-        return getWeight(name);
+        return getWeightForDevice(name);
     }
 
     inline bool MockWeightManager::isWeightSharded(const std::string &name) const

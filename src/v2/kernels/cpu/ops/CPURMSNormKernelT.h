@@ -29,6 +29,7 @@
 #include "../../../tensors/BlockStructures.h"
 #include "../../../tensors/Tensors.h" // For FP32Tensor, BF16Tensor, etc. (apply_tensor)
 #include "../CPUKernelBase.h"
+#include "../../../utils/KernelProfiler.h"
 #include <memory>
 #include <cstdint>
 
@@ -281,6 +282,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override
         {
+            KERNEL_PROFILE_SCOPE(KernelType::RMS_NORM);
             (void)mpi_ctx;
             // Type check: this kernel only handles FP32
             if (!input || !weight || !output)
@@ -416,6 +418,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override
         {
+            KERNEL_PROFILE_SCOPE(KernelType::RMS_NORM);
             (void)mpi_ctx;
             // Type check: this kernel only handles BF16
             if (!input || !weight || !output)
@@ -558,6 +561,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override
         {
+            KERNEL_PROFILE_SCOPE(KernelType::RMS_NORM);
             (void)mpi_ctx;
             // Type check: this kernel only handles FP16
             if (!input || !weight || !output)
@@ -686,6 +690,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override
         {
+            KERNEL_PROFILE_SCOPE(KernelType::RMS_NORM);
             (void)mpi_ctx;
             // Type check: this kernel only handles Q8_1
             if (!input || !weight || !output)
@@ -864,6 +869,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override
         {
+            KERNEL_PROFILE_SCOPE(KernelType::RMS_NORM);
             (void)mpi_ctx;
             // Type check: Q16_1 input → FP32 output
             if (!input || !weight || !output)

@@ -72,6 +72,12 @@ namespace llaminar2
               partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
               workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
         {
+            if (device_idx < 0)
+            {
+                throw std::runtime_error(
+                    "[CUDAFlashAttentionKernelT<FP32>] Invalid device_idx=" + std::to_string(device_idx) +
+                    " — caller must pass explicit device ordinal");
+            }
             LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Created for device " << device_idx);
         }
 
@@ -756,6 +762,12 @@ namespace llaminar2
               partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
               workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
         {
+            if (device_idx < 0)
+            {
+                throw std::runtime_error(
+                    "[CUDAFlashAttentionKernelT<FP16>] Invalid device_idx=" + std::to_string(device_idx) +
+                    " — caller must pass explicit device ordinal");
+            }
             LOG_DEBUG("[CUDAFlashAttentionKernelT<FP16>] Created for device " << device_idx);
         }
 
@@ -1055,6 +1067,12 @@ namespace llaminar2
               partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
               workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
         {
+            if (device_idx < 0)
+            {
+                throw std::runtime_error(
+                    "[CUDAFlashAttentionKernelT<BF16>] Invalid device_idx=" + std::to_string(device_idx) +
+                    " — caller must pass explicit device ordinal");
+            }
             LOG_DEBUG("[CUDAFlashAttentionKernelT<BF16>] Created for device " << device_idx);
         }
 

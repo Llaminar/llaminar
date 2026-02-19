@@ -1644,7 +1644,7 @@ TEST_F(Test__Q8_1_FusedAttention, JIT_vs_FP32_Strided_Qwen05B_CausalMask)
         GTEST_SKIP() << "Model not found: " << model_path;
     }
 
-    // Configure weight sharding from Qwen2 schema (required before getWeight())
+    // Configure weight sharding from Qwen2 schema (required before getWeightForDevice())
     Qwen2SchemaFactory schema_factory;
     model_ctx->weightManager()->setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
@@ -1678,10 +1678,10 @@ TEST_F(Test__Q8_1_FusedAttention, JIT_vs_FP32_Strided_Qwen05B_CausalMask)
     // ========================================================================
     // Load embedding and QKV projection weights from layer 0
     // ========================================================================
-    auto embd_weight = model_ctx->getWeight("token_embd.weight");
-    auto wq = model_ctx->getWeight("blk.0.attn_q.weight");
-    auto wk = model_ctx->getWeight("blk.0.attn_k.weight");
-    auto wv = model_ctx->getWeight("blk.0.attn_v.weight");
+    auto embd_weight = model_ctx->getWeightForDevice("token_embd.weight");
+    auto wq = model_ctx->getWeightForDevice("blk.0.attn_q.weight");
+    auto wk = model_ctx->getWeightForDevice("blk.0.attn_k.weight");
+    auto wv = model_ctx->getWeightForDevice("blk.0.attn_v.weight");
 
     if (!embd_weight || !wq || !wk || !wv)
     {
@@ -1723,7 +1723,7 @@ TEST_F(Test__Q8_1_FusedAttention, JIT_vs_FP32_Strided_Qwen05B_CausalMask)
     std::vector<float> V_fp32(kv_len * n_kv_heads * head_dim);
     std::vector<float> ref_output(seq_len * n_heads * head_dim, 0.0f);
 
-    // Get cached GEMM engines (weights already packed during getWeight())
+    // Get cached GEMM engines (weights already packed during getWeightForDevice())
     auto *gemm_q = getPreparedKernel(wq.get(), DeviceId::cpu());
     auto *gemm_k = getPreparedKernel(wk.get(), DeviceId::cpu());
     auto *gemm_v = getPreparedKernel(wv.get(), DeviceId::cpu());

@@ -184,11 +184,13 @@ namespace llaminar2
     /**
      * @brief Explicit KV cache storage precision mode
      *
-     * AUTO preserves legacy behavior (derive KV cache precision from activation mode).
+     * AUTO defaults to FP16 — half the VRAM of FP32 with <2% decode throughput impact
+     * (GPU-side conversion via hip_convert_tensor_to_fp32).
      */
     enum class KVCachePrecision
     {
         AUTO,
+        FP32,
         FP16,
         Q8_1
     };
@@ -198,7 +200,9 @@ namespace llaminar2
         switch (precision)
         {
         case KVCachePrecision::AUTO:
-            return "AUTO";
+            return "AUTO (FP16)";
+        case KVCachePrecision::FP32:
+            return "FP32";
         case KVCachePrecision::FP16:
             return "FP16";
         case KVCachePrecision::Q8_1:
@@ -215,7 +219,9 @@ namespace llaminar2
                        [](unsigned char c)
                        { return static_cast<char>(std::tolower(c)); });
 
-        if (lower == "fp16")
+        if (lower == "fp32" || lower == "f32")
+            return KVCachePrecision::FP32;
+        if (lower == "fp16" || lower == "f16")
             return KVCachePrecision::FP16;
         if (lower == "q8_1" || lower == "q8" || lower == "q81")
             return KVCachePrecision::Q8_1;
@@ -223,18 +229,20 @@ namespace llaminar2
     }
 
     inline ActivationPrecision resolveKVCacheStoragePrecision(
-        KVCachePrecision mode,
-        ActivationPrecision fallback_precision)
+        KVCachePrecision mode)
     {
         switch (mode)
         {
+        case KVCachePrecision::FP32:
+            return ActivationPrecision::FP32;
         case KVCachePrecision::FP16:
             return ActivationPrecision::FP16;
         case KVCachePrecision::Q8_1:
             return ActivationPrecision::Q8_1;
         case KVCachePrecision::AUTO:
         default:
-            return fallback_precision;
+            // Default to FP16: half the VRAM with <2% decode throughput cost
+            return ActivationPrecision::FP16;
         }
     }
 

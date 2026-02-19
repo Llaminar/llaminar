@@ -98,6 +98,8 @@
 #include <memory>
 #include <cstdint>
 #include <vector>
+#include <unordered_map>
+#include <mutex>
 
 namespace llaminar2
 {
@@ -149,6 +151,14 @@ namespace llaminar2
          */
         struct ROCmPackedWeights
         {
+            struct DeviceUpload
+            {
+                int8_t *d_int8_data_vnni = nullptr;
+                uint8_t *d_ratio_vnni_payload = nullptr;
+                int8_t *d_ratio_vnni_ratio = nullptr;
+                float *d_scales = nullptr;
+            };
+
             std::vector<int8_t> int8_data;      ///< [K × N] RowMajor INT8 weights (host only, not uploaded to device)
             std::vector<int8_t> int8_data_vnni; ///< [K/4 × N × 4] VNNI layout (the sole device layout)
             std::vector<float> scales;          ///< [N] per-column (per-output-feature) scale factors
@@ -165,7 +175,11 @@ namespace llaminar2
             int K = 0; ///< Input features (rows in CK B matrix)
             int N = 0; ///< Output features (cols in CK B matrix)
 
+            mutable std::mutex upload_mutex;
+            std::unordered_map<int, DeviceUpload> device_uploads;
+
             // Device memory pointers (uploaded once, cached)
+            // Legacy compatibility fields, mirrored from the active device upload.
             // Option B: Only VNNI layout is uploaded to device. Row-major is repacked
             // on-demand into a shared workspace scratch buffer for CK GEMM prefill.
             int8_t *d_int8_data_vnni = nullptr;      ///< Device pointer to VNNI-packed weights (sole device copy)
@@ -174,6 +188,52 @@ namespace llaminar2
             float *d_scales = nullptr;               ///< Device pointer to scales
             int rocm_device_id = -1;                 ///< Device where data is uploaded
             bool uploaded = false;                   ///< Whether device memory is allocated
+
+            ROCmPackedWeights() = default;
+            ROCmPackedWeights(const ROCmPackedWeights &) = delete;
+            ROCmPackedWeights &operator=(const ROCmPackedWeights &) = delete;
+
+            ROCmPackedWeights(ROCmPackedWeights &&other) noexcept
+            {
+                *this = std::move(other);
+            }
+
+            ROCmPackedWeights &operator=(ROCmPackedWeights &&other) noexcept
+            {
+                if (this != &other)
+                {
+                    std::scoped_lock guard(upload_mutex, other.upload_mutex);
+                    int8_data = std::move(other.int8_data);
+                    int8_data_vnni = std::move(other.int8_data_vnni);
+                    scales = std::move(other.scales);
+                    ratio_vnni_payload = std::move(other.ratio_vnni_payload);
+                    ratio_vnni_ratio = std::move(other.ratio_vnni_ratio);
+                    ratio_vnni_bitwidth = other.ratio_vnni_bitwidth;
+                    ratio_vnni_codebook_id = other.ratio_vnni_codebook_id;
+                    ratio_vnni_has_min = other.ratio_vnni_has_min;
+                    ratio_vnni_block_size = other.ratio_vnni_block_size;
+                    ratio_vnni_payload_bytes = other.ratio_vnni_payload_bytes;
+                    K = other.K;
+                    N = other.N;
+                    device_uploads = std::move(other.device_uploads);
+                    d_int8_data_vnni = other.d_int8_data_vnni;
+                    d_ratio_vnni_payload = other.d_ratio_vnni_payload;
+                    d_ratio_vnni_ratio = other.d_ratio_vnni_ratio;
+                    d_scales = other.d_scales;
+                    rocm_device_id = other.rocm_device_id;
+                    uploaded = other.uploaded;
+
+                    other.d_int8_data_vnni = nullptr;
+                    other.d_ratio_vnni_payload = nullptr;
+                    other.d_ratio_vnni_ratio = nullptr;
+                    other.d_scales = nullptr;
+                    other.rocm_device_id = -1;
+                    other.uploaded = false;
+                    other.K = 0;
+                    other.N = 0;
+                }
+                return *this;
+            }
 
             ~ROCmPackedWeights();
         };
@@ -594,6 +654,13 @@ namespace llaminar2
              */
             void validateWorkspace() const;
 
+            /**
+             * @brief Return whether fused GEMV fast path is enabled.
+             *
+             * Uses per-instance log-once state to avoid process-global mutable state.
+             */
+            bool isFusedGemvEnabled();
+
             // =========================================================================
             // Member data
             // =========================================================================
@@ -618,6 +685,10 @@ namespace llaminar2
 
             // GPU stream for graph capture (nullptr = default stream)
             void *gpu_stream_ = nullptr;
+
+            // Per-instance synchronization/logging state (no process-global mutable statics)
+            std::unique_ptr<std::mutex> ck_dispatch_mutex_;
+            bool fused_gemv_logged_enabled_once_ = false;
 
             // PIMPL for CK implementation (avoids CK headers in this header)
             struct Impl;
@@ -667,7 +738,9 @@ extern "C"
         const int8_t *d_A, const int8_t *d_B, float *d_E,
         const float *d_scaleA, const float *d_scaleB,
         int M, int N, int K,
-        int rocm_device_id);
+        int rocm_device_id,
+        void *stream,
+        void *kernel_ctx);
 
     /**
      * @brief Execute Two-Kernel INT8 GEMM with HIP event timing (for benchmarking)
@@ -683,7 +756,8 @@ extern "C"
         int32_t *d_C_int32,
         int M, int N, int K,
         int rocm_device_id,
-        float *kernel_time_ms, void *stream);
+        float *kernel_time_ms, void *stream,
+        void *kernel_ctx);
 
     /**
      * @brief Execute hipBLAS INT8 GEMM fallback

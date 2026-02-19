@@ -13,6 +13,7 @@
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
+#include "../../../utils/KernelProfiler.h"
 #include "../CPUKernelBase.h"
 
 namespace llaminar2
@@ -67,6 +68,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override
         {
+            KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
             if (!input || !residual || !output)
                 return false;
             if (input->native_type() != TensorType::FP32)
@@ -145,6 +147,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override
         {
+            KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
             if (!input || !residual || !output)
                 return false;
             if (input->native_type() != TensorType::BF16)
@@ -223,6 +226,7 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override
         {
+            KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
             if (!input || !residual || !output)
                 return false;
             if (input->native_type() != TensorType::FP16)

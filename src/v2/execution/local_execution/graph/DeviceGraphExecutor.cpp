@@ -20,8 +20,10 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
+#include "../../../backends/GPUDeviceContextPool.h"
 #ifdef HAVE_ROCM
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../backends/rocm/ROCmBackend.h"
 #endif
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
@@ -29,15 +31,71 @@
 #include <chrono>
 #include <cstdlib>
 #include <iomanip>
-#include <iostream>
+#include <print>
 #include "fort.hpp"
 #include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
+#include <cstdint>
 
 namespace llaminar2
 {
+    namespace
+    {
+        void *resolveWorkerDefaultStream(const DeviceId &device)
+        {
+            auto &pool = GPUDeviceContextPool::instance();
+
+            try
+            {
+#ifdef HAVE_ROCM
+                if (device.is_rocm() && pool.hasAMDSupport() &&
+                    device.rocm_ordinal() >= 0 &&
+                    device.rocm_ordinal() < pool.amdDeviceCount())
+                {
+                    return pool.getAMDContext(device.rocm_ordinal()).defaultStream();
+                }
+#endif
+
+#ifdef HAVE_CUDA
+                if (device.is_cuda() && pool.hasNvidiaSupport() &&
+                    device.cuda_ordinal() >= 0 &&
+                    device.cuda_ordinal() < pool.nvidiaDeviceCount())
+                {
+                    return pool.getNvidiaContext(device.cuda_ordinal()).defaultStream();
+                }
+#endif
+            }
+            catch (const std::exception &e)
+            {
+                LOG_DEBUG("[DeviceGraphExecutor] Failed to resolve worker default stream for "
+                          << device.to_string() << ": " << e.what());
+            }
+
+            return nullptr;
+        }
+
+        void ensureStageGPUStreamBound(ComputeNode &node, IDeviceContext *ctx)
+        {
+            if (!node.stage || node.stage->gpuStream() != nullptr)
+            {
+                return;
+            }
+
+            DeviceId device = node.device.is_valid() ? node.device : node.stage->device();
+            if (!device.is_valid() && ctx)
+            {
+                device = ctx->deviceId();
+            }
+
+            void *stream = resolveWorkerDefaultStream(device);
+            if (stream)
+            {
+                node.stage->setGPUStream(stream);
+            }
+        }
+    }
 
     // =========================================================================
     // GraphSegmentCache — capture stream management
@@ -226,8 +284,7 @@ namespace llaminar2
             table[table.row_count() - 1][0].set_cell_span(4);
         }
 
-        std::cout << "\n"
-                  << table.to_string() << std::endl;
+        std::print("\n{}", table.to_string());
     }
 
     // =============================================================================
@@ -606,6 +663,8 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphExecutor] Invalid node: " << name);
                 return false;
             }
+
+            ensureStageGPUStreamBound(*node, ctx);
 
             auto stage_start = std::chrono::high_resolution_clock::now();
 
@@ -1455,6 +1514,66 @@ namespace llaminar2
         }
     }
 
+#ifdef HAVE_ROCM
+    static void logWatchedPointerProducer(const std::string &stage_name, const StageDumpInfo &dump_info)
+    {
+        const auto &validation = debugEnv().validation;
+        if (!validation.trace_local_tp_pointer)
+        {
+            return;
+        }
+
+        const uintptr_t watch = static_cast<uintptr_t>(validation.trace_local_tp_pointer_address);
+        for (const auto &output : dump_info.outputs)
+        {
+            if (!output.tensor)
+            {
+                continue;
+            }
+
+            auto *tb = dynamic_cast<TensorBase *>(output.tensor);
+            if (!tb)
+            {
+                continue;
+            }
+
+            void *gpu_ptr = tb->gpu_data_ptr();
+            if (!gpu_ptr)
+            {
+                continue;
+            }
+
+            ROCmPointerOwnerInfo owner;
+            if (!ROCmBackend::queryPointerOwner(gpu_ptr, owner) || !owner.active)
+            {
+                continue;
+            }
+
+            const uintptr_t begin = reinterpret_cast<uintptr_t>(owner.base_ptr);
+            const uintptr_t end = begin + owner.size_bytes;
+            if (watch < begin || watch >= end)
+            {
+                continue;
+            }
+
+            const size_t offset = static_cast<size_t>(watch - begin);
+            LOG_WARN("[LOCALTP_PTR_PRODUCER]"
+                     << " stage=" << stage_name
+                     << " output=" << (output.name ? output.name : "(unnamed)")
+                     << " watch=" << reinterpret_cast<const void *>(watch)
+                     << " output_ptr=" << gpu_ptr
+                     << " owner_base=" << owner.base_ptr
+                     << " owner_bytes=" << owner.size_bytes
+                     << " owner_device=" << owner.device_id
+                     << " owner_seq=" << owner.sequence
+                     << " owner_thread=" << owner.thread_hash
+                     << " offset=" << offset
+                     << " tensor=" << static_cast<void *>(tb)
+                     << " tensor_name=" << (tb->debugName().empty() ? "(unnamed)" : tb->debugName()));
+        }
+    }
+#endif
+
     bool DeviceGraphExecutor::executeNode(ComputeNode &node, IDeviceContext *ctx)
     {
         if (!node.stage)
@@ -1673,10 +1792,146 @@ namespace llaminar2
             }
         }
 
+        // =========================================================================
+        // GPU Pointer Device Validation (diagnostic for multi-GPU memory faults)
+        // Validates all GPU pointers belong to the expected device before execution.
+        // Gated by LLAMINAR_VALIDATE_GPU_PTRS=1 to avoid hipPointerGetAttributes overhead.
+        // =========================================================================
+#ifdef HAVE_ROCM
+        if (debugEnv().validation.validate_gpu_ptrs)
+        {
+            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
+            if (target_device.is_rocm())
+            {
+                int expected_ordinal = target_device.rocm_ordinal();
+                bool ptr_validation_failed = false;
+                auto validatePtr = [&](const char *label, const char *tensor_name, void *gpu_ptr)
+                {
+                    if (!gpu_ptr)
+                        return;
+                    hipPointerAttribute_t attr = {};
+                    hipError_t err = hipPointerGetAttributes(&attr, gpu_ptr);
+                    if (err == hipSuccess && attr.device != expected_ordinal)
+                    {
+                        ptr_validation_failed = true;
+                        ROCmPointerOwnerInfo owner;
+                        const bool has_owner = ROCmBackend::queryPointerOwner(gpu_ptr, owner);
+                        if (has_owner)
+                        {
+                            LOG_ERROR("[GPU_PTR_VIOLATION] Stage='" << node.name
+                                                                    << "' tensor=" << tensor_name << " (" << label << ")"
+                                                                    << " gpu_ptr=" << gpu_ptr
+                                                                    << " attr.device=" << attr.device
+                                                                    << " expected=" << expected_ordinal
+                                                                    << " target=" << target_device.to_string()
+                                                                    << " owner.base=" << owner.base_ptr
+                                                                    << " owner.dev=" << owner.device_id
+                                                                    << " owner.bytes=" << owner.size_bytes
+                                                                    << " owner.seq=" << owner.sequence
+                                                                    << " owner.thread=" << owner.thread_hash
+                                                                    << " owner.active=" << owner.active);
+                        }
+                        else
+                        {
+                            LOG_ERROR("[GPU_PTR_VIOLATION] Stage='" << node.name
+                                                                    << "' tensor=" << tensor_name << " (" << label << ")"
+                                                                    << " gpu_ptr=" << gpu_ptr
+                                                                    << " attr.device=" << attr.device
+                                                                    << " expected=" << expected_ordinal
+                                                                    << " target=" << target_device.to_string()
+                                                                    << " owner=unknown");
+                        }
+                        ROCmBackend::dumpRecentPointerEvents(48);
+                    }
+                    else if (err != hipSuccess)
+                    {
+                        ptr_validation_failed = true;
+                        ROCmPointerOwnerInfo owner;
+                        const bool has_owner = ROCmBackend::queryPointerOwner(gpu_ptr, owner);
+                        LOG_ERROR("[GPU_PTR_ATTR_ERROR] Stage='" << node.name
+                                                                 << "' tensor=" << tensor_name << " (" << label << ")"
+                                                                 << " gpu_ptr=" << gpu_ptr
+                                                                 << " hipError=" << hipGetErrorString(err)
+                                                                 << (has_owner ? (std::string(" owner.dev=") + std::to_string(owner.device_id) +
+                                                                                  " owner.bytes=" + std::to_string(owner.size_bytes) +
+                                                                                  " owner.seq=" + std::to_string(owner.sequence))
+                                                                               : std::string(" owner=unknown")));
+                    }
+                };
+
+                // Validate inputs from dump info
+                for (const auto &input : cached_dump_info.inputs)
+                {
+                    if (input.tensor)
+                    {
+                        if (auto *tb = dynamic_cast<TensorBase *>(const_cast<ITensor *>(input.tensor)))
+                        {
+                            validatePtr("input", input.name ? input.name : "(unnamed)", tb->gpu_data_ptr());
+                        }
+                    }
+                }
+                // Validate outputs from dump info
+                for (const auto &output : cached_dump_info.outputs)
+                {
+                    if (output.tensor)
+                    {
+                        if (auto *tb = dynamic_cast<TensorBase *>(output.tensor))
+                        {
+                            validatePtr("output", output.name ? output.name : "(unnamed)", tb->gpu_data_ptr());
+                        }
+                    }
+                }
+                // Validate weights from dump info
+                for (const auto &weight : cached_dump_info.weights)
+                {
+                    if (weight.tensor)
+                    {
+                        if (auto *tb = dynamic_cast<TensorBase *>(const_cast<ITensor *>(weight.tensor)))
+                        {
+                            validatePtr("weight", weight.name ? weight.name : "(unnamed)", tb->gpu_data_ptr());
+                        }
+                    }
+                }
+
+                if (ptr_validation_failed)
+                {
+                    LOG_ERROR("[GPU_PTR_VIOLATION_ABORT] Aborting stage execute before kernel launch: stage='"
+                              << node.name << "' target=" << target_device.to_string()
+                              << " expected_rocm_ordinal=" << expected_ordinal);
+                    return false;
+                }
+            }
+        }
+#endif
+
         if (profiling)
             phase_start = std::chrono::high_resolution_clock::now();
 
+        ensureStageGPUStreamBound(node, ctx);
+
         bool success = node.stage->execute(ctx);
+
+#ifdef HAVE_ROCM
+        if (success && debugEnv().validation.sync_each_stage)
+        {
+            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
+            if (target_device.is_rocm())
+            {
+                HipDeviceGuard::forceSetDevice(target_device.rocm_ordinal());
+                hipError_t sync_err = hipDeviceSynchronize();
+                if (sync_err != hipSuccess)
+                {
+                    LOG_ERROR("[SYNC_EACH_STAGE] stage='" << node.name
+                                                          << "' device=" << target_device.to_string()
+                                                          << " hipDeviceSynchronize failed: "
+                                                          << hipGetErrorString(sync_err));
+                    ROCmBackend::dumpRecentPointerEvents(96);
+                    success = false;
+                }
+            }
+        }
+#endif
+
         if (profiling)
         {
             phase_end = std::chrono::high_resolution_clock::now();
@@ -1712,6 +1967,10 @@ namespace llaminar2
                     phase_end = std::chrono::high_resolution_clock::now();
                     mark_dirty_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
                 }
+
+#ifdef HAVE_ROCM
+                logWatchedPointerProducer(node.name, cached_dump_info);
+#endif
 
                 // Stage output printing (after coherence, so GPU→host sync has occurred)
                 printStageOutputs(node.name, cached_dump_info);

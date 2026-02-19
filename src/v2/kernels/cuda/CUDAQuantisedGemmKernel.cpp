@@ -151,10 +151,22 @@ namespace llaminar2
 
         CUDAPackedWeights::~CUDAPackedWeights()
         {
-            if (d_int8_data)
-                cudaQuantGemm_freeDevice(d_int8_data);
-            if (d_scales)
-                cudaQuantGemm_freeDevice(d_scales);
+            for (auto &[device_id, upload] : device_uploads)
+            {
+                (void)device_id;
+                if (upload.d_int8_data)
+                    cudaQuantGemm_freeDevice(upload.d_int8_data);
+                if (upload.d_scales)
+                    cudaQuantGemm_freeDevice(upload.d_scales);
+            }
+
+            if (device_uploads.empty())
+            {
+                if (d_int8_data)
+                    cudaQuantGemm_freeDevice(d_int8_data);
+                if (d_scales)
+                    cudaQuantGemm_freeDevice(d_scales);
+            }
         }
 
         // =====================================================================
@@ -363,47 +375,47 @@ namespace llaminar2
             // Pre-packed path: upload from CUDAPackedWeights
             if (packed_)
             {
-                // Check if already uploaded to this device
-                if (packed_->uploaded && packed_->cuda_device_id == cuda_device_id_)
+                std::lock_guard<std::mutex> lock(packed_->upload_mutex);
+
+                auto upload_it = packed_->device_uploads.find(cuda_device_id_);
+                if (upload_it == packed_->device_uploads.end())
                 {
-                    // Already uploaded - just reference the device pointers
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::ensureWeightsConverted] Reusing cached device pointers for K="
-                              << packed_->K << " N=" << packed_->N
-                              << ", d_scales=" << (void *)packed_->d_scales
-                              << ", host scales[0:4]: "
-                              << packed_->scales[0] << "," << (packed_->N > 1 ? packed_->scales[1] : 0.f) << ","
-                              << (packed_->N > 2 ? packed_->scales[2] : 0.f) << "," << (packed_->N > 3 ? packed_->scales[3] : 0.f));
-                    impl_->d_weights_int8 = packed_->d_int8_data;
-                    impl_->d_scales_B = packed_->d_scales;
-                    weights_converted_ = true;
-                    return;
+                    CUDAPackedWeights::DeviceUpload upload;
+
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::ensureWeightsConverted] Uploading packed weights to CUDA:"
+                              << cuda_device_id_ << " K=" << packed_->K << " N=" << packed_->N);
+                    if (!cudaQuantGemm_uploadWeights(
+                            packed_->int8_data.data(),
+                            packed_->scales.data(),
+                            &upload.d_int8_data,
+                            &upload.d_scales,
+                            packed_->K,
+                            packed_->N,
+                            cuda_device_id_))
+                    {
+                        if (upload.d_int8_data)
+                            cudaQuantGemm_freeDevice(upload.d_int8_data);
+                        if (upload.d_scales)
+                            cudaQuantGemm_freeDevice(upload.d_scales);
+                        throw std::runtime_error("[CUDAQuantisedGemmKernel] Failed to upload pre-packed weights");
+                    }
+
+                    auto emplaced = packed_->device_uploads.emplace(cuda_device_id_, upload);
+                    upload_it = emplaced.first;
                 }
 
-                // Upload to device and cache in packed_
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::ensureWeightsConverted] About to upload, host scales[0:4]: "
-                          << packed_->scales[0] << "," << (packed_->N > 1 ? packed_->scales[1] : 0.f) << ","
-                          << (packed_->N > 2 ? packed_->scales[2] : 0.f) << "," << (packed_->N > 3 ? packed_->scales[3] : 0.f));
-                if (!cudaQuantGemm_uploadWeights(
-                        packed_->int8_data.data(),
-                        packed_->scales.data(),
-                        &packed_->d_int8_data,
-                        &packed_->d_scales,
-                        packed_->K,
-                        packed_->N,
-                        cuda_device_id_))
-                {
-                    throw std::runtime_error("[CUDAQuantisedGemmKernel] Failed to upload pre-packed weights");
-                }
-
+                const auto &upload = upload_it->second;
+                packed_->d_int8_data = upload.d_int8_data;
+                packed_->d_scales = upload.d_scales;
                 packed_->cuda_device_id = cuda_device_id_;
                 packed_->uploaded = true;
 
                 // Reference device pointers from packed cache
-                impl_->d_weights_int8 = packed_->d_int8_data;
-                impl_->d_scales_B = packed_->d_scales;
+                impl_->d_weights_int8 = upload.d_int8_data;
+                impl_->d_scales_B = upload.d_scales;
                 weights_converted_ = true;
 
-                LOG_DEBUG("[CUDAQuantisedGemmKernel] Uploaded pre-packed weights to device " << cuda_device_id_);
+                LOG_DEBUG("[CUDAQuantisedGemmKernel] Using cached pre-packed weights on CUDA:" << cuda_device_id_);
                 return;
             }
 

@@ -39,7 +39,6 @@ namespace llaminar2::test
             return a;
         }
         std::shared_ptr<IModelLoader> loader() override { return nullptr; }
-        std::shared_ptr<TensorBase> getWeight(const std::string &, DeviceId) override { return nullptr; }
         std::shared_ptr<TensorBase> getWeightForDevice(const std::string &, DeviceId) override { return nullptr; }
         bool hasTensor(const std::string &) const override { return false; }
         std::shared_ptr<IWeightManager> weightManager() override { return nullptr; }

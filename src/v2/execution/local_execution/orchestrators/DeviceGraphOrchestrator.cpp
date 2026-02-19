@@ -576,50 +576,110 @@ namespace llaminar2
         // =====================================================================
 
         bool is_decode = (effective_input.seq_len == 1 && effective_input.batch_size <= 1);
+        bool has_unified_pp_path = (pipeline_config_ && pipeline_config_->hasPP());
         bool is_standard_path = !pipeline_config_ && !pp_stage_config_.has_value();
-        bool use_cached_forward = is_decode && is_standard_path && forward_cache_.valid && cache_config_.enabled;
+        bool is_partial_pp_path = !pipeline_config_ && pp_stage_config_.has_value();
+
+        ForwardGraphSignature forward_signature;
+        ForwardGraphCache *active_forward_cache = nullptr;
+        const bool has_stable_forward_inputs =
+            (effective_input.token_ids != nullptr) && (effective_input.position_ids != nullptr);
+        const bool forward_cache_eligible =
+            cache_config_.enabled &&
+            !has_unified_pp_path &&
+            has_stable_forward_inputs &&
+            (is_standard_path || is_partial_pp_path);
+        if (forward_cache_eligible)
+        {
+            int pp_first_layer = -1;
+            int pp_last_layer = -1;
+            bool pp_has_embedding = false;
+            bool pp_has_lm_head = false;
+            if (pp_stage_config_.has_value())
+            {
+                const auto &pp = pp_stage_config_.value();
+                pp_first_layer = pp.first_layer;
+                pp_last_layer = pp.last_layer;
+                pp_has_embedding = pp.has_embedding;
+                pp_has_lm_head = pp.has_lm_head;
+            }
+
+            forward_signature = ForwardGraphSignature{
+                effective_input.seq_len,
+                effective_input.batch_size,
+                input.device,
+                is_decode,
+                is_standard_path,
+                pp_stage_config_.has_value(),
+                pp_first_layer,
+                pp_last_layer,
+                pp_has_embedding,
+                pp_has_lm_head};
+
+            auto cache_it = forward_graph_cache_.find(forward_signature);
+            if (cache_it != forward_graph_cache_.end())
+            {
+                active_forward_cache = &cache_it->second;
+            }
+        }
+
+        bool use_cached_forward = forward_cache_eligible && active_forward_cache && active_forward_cache->valid;
 
         if (use_cached_forward)
         {
+            auto &forward_cache = *active_forward_cache;
             // ===== CACHE HIT: Reuse cached decode graph =====
 
             // Update stable buffers — stages hold pointers to these, so the
             // pointed-to values change but the pointers remain valid
-            forward_cache_.token_ids[0] = effective_input.token_ids[0];
-            forward_cache_.position_ids[0] = effective_input.position_ids[0];
+            int total_tokens = effective_input.batch_size * effective_input.seq_len;
+            if (static_cast<int>(forward_cache.token_ids.size()) == total_tokens)
+            {
+                std::memcpy(forward_cache.token_ids.data(), effective_input.token_ids,
+                            static_cast<size_t>(total_tokens) * sizeof(int));
+                std::memcpy(forward_cache.position_ids.data(), effective_input.position_ids,
+                            static_cast<size_t>(total_tokens) * sizeof(int));
+            }
+            else
+            {
+                forward_cache.token_ids.assign(effective_input.token_ids,
+                                               effective_input.token_ids + total_tokens);
+                forward_cache.position_ids.assign(effective_input.position_ids,
+                                                  effective_input.position_ids + total_tokens);
+            }
 
             // For GPU graph replay: set the capture stream on all stages ONCE.
             // The capture_stream never changes between decode steps, so after the
             // first pass we skip this 339-stage loop entirely.
-            void *replay_stream = forward_cache_.segment_cache.capture_stream;
-            if (replay_stream && !forward_cache_.gpu_stream_applied)
+            void *replay_stream = forward_cache.segment_cache.capture_stream;
+            if (replay_stream && !forward_cache.gpu_stream_applied)
             {
-                const auto &order = forward_cache_.graph->getExecutionOrder();
+                const auto &order = forward_cache.graph->getExecutionOrder();
                 for (const auto &node_name : order)
                 {
-                    ComputeNode *node = forward_cache_.graph->getNode(node_name);
+                    ComputeNode *node = forward_cache.graph->getNode(node_name);
                     if (node && node->stage)
                         node->stage->setGPUStream(replay_stream);
                 }
-                forward_cache_.gpu_stream_applied = true;
+                forward_cache.gpu_stream_applied = true;
             }
 
             // Update position-dependent params using cached stage pointers.
             // Only ~4 stages override updateDynamicParams() — avoids iterating
             // all ~339 stages with hash lookups on every decode step.
-            if (!forward_cache_.dynamic_param_stages_cached)
+            if (!forward_cache.dynamic_param_stages_cached)
             {
-                forward_cache_.dynamic_param_stages.clear();
-                const auto &order = forward_cache_.graph->getExecutionOrder();
+                forward_cache.dynamic_param_stages.clear();
+                const auto &order = forward_cache.graph->getExecutionOrder();
                 for (const auto &node_name : order)
                 {
-                    ComputeNode *node = forward_cache_.graph->getNode(node_name);
+                    ComputeNode *node = forward_cache.graph->getNode(node_name);
                     if (node && node->stage && node->stage->hasDynamicParams())
-                        forward_cache_.dynamic_param_stages.push_back(node->stage.get());
+                        forward_cache.dynamic_param_stages.push_back(node->stage.get());
                 }
-                forward_cache_.dynamic_param_stages_cached = true;
+                forward_cache.dynamic_param_stages_cached = true;
             }
-            for (auto *stage : forward_cache_.dynamic_param_stages)
+            for (auto *stage : forward_cache.dynamic_param_stages)
             {
                 stage->updateDynamicParams(effective_input.position_offset,
                                            effective_input.seq_len);
@@ -627,12 +687,12 @@ namespace llaminar2
 
             // Skip graph reset when Phase 3 replay is active — Phase 3 doesn't
             // call markCompleted(), so all flags are already false from last reset.
-            if (!forward_cache_.phase3_active)
+            if (!forward_cache.phase3_active)
             {
-                forward_cache_.graph->reset();
+                forward_cache.graph->reset();
             }
 
-            output = forward_cache_.output;
+            output = forward_cache.output;
 
             // Execute with single device context (standard path, no PP)
             IDeviceContext *ctx = getDeviceContext(input.device);
@@ -643,14 +703,17 @@ namespace llaminar2
             }
 
             bool success;
-            const bool has_collective_nodes = !forward_cache_.collective_nodes.empty();
-            const auto capture_policy = buildDecodeCapturePolicy(has_collective_nodes, ctx);
+            const bool has_collective_nodes = !forward_cache.collective_nodes.empty();
+            const auto capture_policy = buildDecodeCapturePolicy(
+                has_collective_nodes,
+                ctx,
+                forward_cache.segment_cache.consecutive_failures);
             if (capture_policy.collective_segmented_enabled)
             {
                 LOG_INFO("[DeviceGraphOrchestrator] Experimental collective segmented GPU-graph replay enabled");
             }
 
-            if (capture_policy.allow_segmented_capture && !forward_cache_.gpu_stream)
+            if (capture_policy.allow_segmented_capture && !forward_cache.gpu_stream)
             {
                 // Ensure backend factories are registered
                 DeviceId dev_id = ctx->deviceId();
@@ -675,33 +738,33 @@ namespace llaminar2
                 }
                 if (gpu_ctx)
                 {
-                    forward_cache_.gpu_stream = gpu_ctx->defaultStream();
-                    forward_cache_.gpu_ctx = gpu_ctx;
+                    forward_cache.gpu_stream = gpu_ctx->defaultStream();
+                    forward_cache.gpu_ctx = gpu_ctx;
                 }
             }
 
             bool used_segmented_capture = false;
             success = executor_.executeDecodeWithCapturePolicy(
-                *forward_cache_.graph,
+                *forward_cache.graph,
                 ctx,
-                &forward_cache_.segment_cache,
-                forward_cache_.gpu_stream,
-                forward_cache_.gpu_ctx,
-                &forward_cache_.collective_nodes,
+                &forward_cache.segment_cache,
+                forward_cache.gpu_stream,
+                forward_cache.gpu_ctx,
+                &forward_cache.collective_nodes,
                 capture_policy,
                 &used_segmented_capture);
 
             if (success && used_segmented_capture &&
-                forward_cache_.segment_cache.initialized &&
-                !forward_cache_.segment_cache.needs_capture)
+                forward_cache.segment_cache.initialized &&
+                !forward_cache.segment_cache.needs_capture)
             {
                 // Phase 3 replay doesn't call markCompleted(), so we can
                 // skip graph.reset() on subsequent steps.
-                forward_cache_.phase3_active = true;
+                forward_cache.phase3_active = true;
             }
             else
             {
-                forward_cache_.phase3_active = false;
+                forward_cache.phase3_active = false;
             }
 
             // Sync the stream at the forward pass boundary so logits are
@@ -725,31 +788,42 @@ namespace llaminar2
 
         // ===== CACHE MISS: Build new graph =====
 
-        // Invalidate decode cache on phase transition (e.g., prefill → decode → prefill)
-        if (forward_cache_.valid && (!is_decode || !is_standard_path))
+        // Unified PP path currently executes multi-device graphs and does not use
+        // this forward cache; clear entries to avoid stale memory growth.
+        if (has_unified_pp_path && !forward_graph_cache_.empty())
         {
-            LOG_DEBUG("[DeviceGraphOrchestrator] Invalidating forward graph cache "
-                      << "(seq_len=" << effective_input.seq_len
-                      << ", batch_size=" << effective_input.batch_size << ")");
-            forward_cache_.invalidate();
+            for (auto &[_, cache] : forward_graph_cache_)
+            {
+                cache.invalidate();
+            }
+            forward_graph_cache_.clear();
+            LOG_DEBUG("[DeviceGraphOrchestrator] Cleared forward graph cache for unified PP execution path");
         }
 
-        // For the first decode step on the standard path: redirect token_ids and
+        // For cache misses on standard path: redirect token_ids and
         // position_ids to stable buffers so that cached stages' pointers survive.
-        bool should_cache_after_build = is_decode && is_standard_path && cache_config_.enabled && !forward_cache_.valid;
+        ForwardGraphCache *build_cache = nullptr;
+        bool should_cache_after_build = false;
+        if (forward_cache_eligible)
+        {
+            auto [it, _inserted] = forward_graph_cache_.try_emplace(forward_signature);
+            build_cache = &it->second;
+            should_cache_after_build = !build_cache->valid;
+        }
+
         if (should_cache_after_build)
         {
             int total_tokens = effective_input.batch_size * effective_input.seq_len;
-            forward_cache_.token_ids.assign(
+            build_cache->token_ids.assign(
                 effective_input.token_ids,
                 effective_input.token_ids + total_tokens);
-            forward_cache_.position_ids.assign(
+            build_cache->position_ids.assign(
                 effective_input.position_ids,
                 effective_input.position_ids + total_tokens);
 
             // Redirect input to stable buffers before graph build
-            effective_input.token_ids = forward_cache_.token_ids.data();
-            effective_input.position_ids = forward_cache_.position_ids.data();
+            effective_input.token_ids = build_cache->token_ids.data();
+            effective_input.position_ids = build_cache->position_ids.data();
         }
 
         // Build forward graph via fluent builder API
@@ -887,16 +961,16 @@ namespace llaminar2
             }
         }
 
-        // Cache the graph for future decode steps (first decode step only)
+        // Cache the graph for future matching forward signatures
         if (should_cache_after_build && success)
         {
-            forward_cache_.graph = std::make_unique<ComputeGraph>(std::move(graph));
-            forward_cache_.output = output;
+            build_cache->graph = std::make_unique<ComputeGraph>(std::move(graph));
+            build_cache->output = output;
             // Pre-compute collective node set for fast decode intercept
-            forward_cache_.collective_nodes.clear();
-            for (const auto &n : forward_cache_.graph->getExecutionOrder())
+            build_cache->collective_nodes.clear();
+            for (const auto &n : build_cache->graph->getExecutionOrder())
             {
-                auto *nd = forward_cache_.graph->getNode(n);
+                auto *nd = build_cache->graph->getNode(n);
                 if (nd && nd->stage)
                 {
                     auto t = nd->stage->type();
@@ -904,14 +978,18 @@ namespace llaminar2
                         t == ComputeStageType::ALLGATHER ||
                         t == ComputeStageType::ALLGATHER_V)
                     {
-                        forward_cache_.collective_nodes.insert(n);
+                        build_cache->collective_nodes.insert(n);
                     }
                 }
             }
 
-            forward_cache_.valid = true;
-            LOG_INFO("[DeviceGraphOrchestrator] Cached forward graph for decode mode ("
-                     << forward_cache_.graph->size() << " stages)");
+            build_cache->valid = true;
+            LOG_INFO("[DeviceGraphOrchestrator] Cached forward graph for signature "
+                     << "[seq_len=" << forward_signature.seq_len
+                     << ", batch_size=" << forward_signature.batch_size
+                     << ", device=" << forward_signature.device.to_string()
+                     << ", decode=" << forward_signature.decode
+                     << "] (" << build_cache->graph->size() << " stages)");
         }
 
         auto end = std::chrono::high_resolution_clock::now();
@@ -944,7 +1022,8 @@ namespace llaminar2
 
     DeviceGraphExecutor::DecodeCapturePolicy DeviceGraphOrchestrator::buildDecodeCapturePolicy(
         bool has_collective_nodes,
-        IDeviceContext *ctx) const
+        IDeviceContext *ctx,
+        int segment_consecutive_failures) const
     {
         DeviceGraphExecutor::DecodeCapturePolicy policy;
 
@@ -979,7 +1058,7 @@ namespace llaminar2
             env.execution.gpu_graphs &&
             ctx && ctx->isGPU() &&
             can_use_segmented_graph &&
-            forward_cache_.segment_cache.consecutive_failures < DeviceGraphExecutor::GraphSegmentCache::kMaxFailures;
+            segment_consecutive_failures < DeviceGraphExecutor::GraphSegmentCache::kMaxFailures;
 
         policy.max_segment_failures = DeviceGraphExecutor::GraphSegmentCache::kMaxFailures;
         return policy;
@@ -1384,8 +1463,12 @@ namespace llaminar2
             cache.invalidate();
         }
 
-        // Clear forward graph cache
-        forward_cache_.invalidate();
+        // Clear forward graph caches
+        for (auto &[_, cache] : forward_graph_cache_)
+        {
+            cache.invalidate();
+        }
+        forward_graph_cache_.clear();
 
         // Clear device contexts
         device_contexts_.clear();
@@ -1508,8 +1591,12 @@ namespace llaminar2
             LOG_DEBUG("[DeviceGraphOrchestrator] Created default single-rank MPI context");
         }
 
-        // Create tensor factory
-        TensorFactory factory(*local_mpi_ctx);
+        // Create tensor factory and store it as owned member so it
+        // outlives initializeInferenceState() — DeviceGraphBufferManager
+        // and ensureDeviceWorkspaceAllocated() need it later.
+        owned_tensor_factory_ = std::make_unique<TensorFactory>(*local_mpi_ctx);
+        tensor_factory_ = owned_tensor_factory_.get();
+        auto &factory = *owned_tensor_factory_;
 
         // Enable mapped memory allocation for GPU tensors when requested
         // This enables zero-copy host access for all FP32 GPU tensors, avoiding slow memcpy syncs
@@ -1748,7 +1835,7 @@ namespace llaminar2
             // V is Q8_1 from GEMM, needs to match KV cache precision (FP32 for Hybrid, Q16_1 for HybridQ16)
             ActivationPrecision kv_cache_prec = resolveBufferPrecision(
                 act_prec, HybridBufferType::KV_Cache, nullptr);
-            kv_cache_prec = resolveKVCacheStoragePrecision(config.kv_cache_precision, kv_cache_prec);
+            kv_cache_prec = resolveKVCacheStoragePrecision(config.kv_cache_precision);
             state_.V_dequant = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
                 kv_cache_prec, head_dim, device);
@@ -1888,7 +1975,7 @@ namespace llaminar2
         // For Hybrid mode: KV cache uses BF16 (better than Q8_1, 2x compression)
         ActivationPrecision kv_cache_prec = resolveBufferPrecision(
             act_prec, HybridBufferType::KV_Cache, nullptr);
-        kv_cache_prec = resolveKVCacheStoragePrecision(config.kv_cache_precision, kv_cache_prec);
+        kv_cache_prec = resolveKVCacheStoragePrecision(config.kv_cache_precision);
         LOG_DEBUG("[DeviceGraphOrchestrator] KV cache precision: " << activationPrecisionToString(kv_cache_prec));
         LOG_DEBUG("[DeviceGraphOrchestrator] KV cache precision mode: "
                   << kvCachePrecisionToString(config.kv_cache_precision));
@@ -2057,6 +2144,48 @@ namespace llaminar2
         state_.d_model = d_model;
         state_.vocab_size = vocab_size;
         state_.device_id = device;
+
+        // =====================================================================
+        // POINTER DUMP: Log all allocated inference state buffer addresses
+        // for multi-GPU debugging (correlate crash addresses with known buffers)
+        // =====================================================================
+        auto logBuf = [&](const char *name, TensorBase *t)
+        {
+            if (!t)
+            {
+                LOG_DEBUG("[STATE_ALLOC] " << name << " = nullptr");
+                return;
+            }
+            LOG_DEBUG("[STATE_ALLOC] " << name
+                                       << " tensor_obj=" << static_cast<void *>(t)
+                                       << " host_ptr=" << t->raw_data()
+                                       << " gpu_ptr=" << t->gpu_data_ptr()
+                                       << " size_bytes=" << t->size_bytes()
+                                       << " device=" << device.toString());
+        };
+        logBuf("hidden", state_.hidden.get());
+        logBuf("logits", state_.logits.get());
+        if (state_.logits_local)
+            logBuf("logits_local", state_.logits_local.get());
+        logBuf("normalized", state_.normalized.get());
+        logBuf("residual", state_.residual.get());
+        logBuf("Q", state_.Q.get());
+        logBuf("K", state_.K.get());
+        logBuf("V", state_.V.get());
+        if (state_.Q_rope)
+            logBuf("Q_rope", state_.Q_rope.get());
+        if (state_.K_rope)
+            logBuf("K_rope", state_.K_rope.get());
+        if (state_.V_dequant)
+            logBuf("V_dequant", state_.V_dequant.get());
+        logBuf("attn_output", state_.attn_output.get());
+        logBuf("attn_proj", state_.attn_proj.get());
+        logBuf("gate", state_.gate.get());
+        logBuf("up", state_.up.get());
+        logBuf("ffn_output", state_.ffn_output.get());
+        logBuf("workspace_scores", state_.workspace_scores.get());
+        logBuf("workspace_context", state_.workspace_context.get());
+        logBuf("workspace_mask", state_.workspace_mask.get());
 
         LOG_DEBUG("[DeviceGraphOrchestrator] Inference state initialized successfully");
         return true;
@@ -2342,8 +2471,19 @@ namespace llaminar2
     void DeviceGraphOrchestrator::clearInferenceState()
     {
         state_.clear();
-        forward_cache_.invalidate();
-        LOG_DEBUG("[DeviceGraphOrchestrator] Inference state cleared");
+
+        // Forward graph cache is NOT cleared here. The cached graphs are
+        // structural — keyed by (seq_len, batch_size, device, decode) — and
+        // remain valid across sequences. On cache hit the token_ids,
+        // position_ids and dynamic params (pos_offset) are updated in-place
+        // before execution. KV cache is accessed through state_.kv_cache
+        // which clear() resets without deallocating, so stage pointers to
+        // the KV cache object remain valid.
+        //
+        // Use clearCache() for full teardown when the graph structure itself
+        // needs to change (e.g., device migration, PP reconfiguration).
+
+        LOG_DEBUG("[DeviceGraphOrchestrator] Inference state cleared (graph cache preserved)");
     }
 
     // =========================================================================
@@ -2598,11 +2738,21 @@ namespace llaminar2
             return nullptr;
         }
 
+        // CRITICAL: Use getWeightForDevice() instead of getWeight() to get
+        // device-isolated tensor instances. In multi-device (LOCAL TP) scenarios,
+        // getWeight() returns the SAME shared tensor to all devices, which causes
+        // a race condition: Device 0's ensureOnDevice(rocm:0) allocates GPU memory,
+        // then Device 1's ensureOnDevice(rocm:1) frees Device 0's allocation and
+        // reallocates on Device 1 — while Device 0's kernels are still using it.
+        // getWeightForDevice() returns clones for non-primary devices.
+        const DeviceId device = state_.device_id;
+
         // PREFILL phase: Always use full weight (GPU is primary, compute-bound)
         if (phase == InferencePhase::PREFILL)
         {
-            LOG_TRACE("[DeviceGraphOrchestrator::getPhaseAwareWeight] PREFILL phase - returning full weight for " << name);
-            auto weight = weight_manager_->getWeight(name);
+            LOG_TRACE("[DeviceGraphOrchestrator::getPhaseAwareWeight] PREFILL phase - returning full weight for " << name
+                                                                                                                  << " on " << device.to_string());
+            auto weight = weight_manager_->getWeightForDevice(name, device, layer_idx);
             if (!weight)
             {
                 LOG_ERROR("[DeviceGraphOrchestrator::getPhaseAwareWeight] Failed to load weight: " << name);
@@ -2614,8 +2764,9 @@ namespace llaminar2
         if (!shouldUseCPUDecodeWeight(name, layer_idx))
         {
             // No CPU participation - use full weight (GPU handles it)
-            LOG_TRACE("[DeviceGraphOrchestrator::getPhaseAwareWeight] DECODE phase, no CPU participation - returning full weight for " << name);
-            return weight_manager_->getWeight(name);
+            LOG_TRACE("[DeviceGraphOrchestrator::getPhaseAwareWeight] DECODE phase, no CPU participation - returning full weight for " << name
+                                                                                                                                       << " on " << device.to_string());
+            return weight_manager_->getWeightForDevice(name, device, layer_idx);
         }
 
         // CPU decode participation enabled - get decode shard
@@ -2623,7 +2774,7 @@ namespace llaminar2
         {
             // No placement map - fall back to full weight
             LOG_WARN("[DeviceGraphOrchestrator::getPhaseAwareWeight] CPU decode participation but no placement map - using full weight for " << name);
-            return weight_manager_->getWeight(name);
+            return weight_manager_->getWeightForDevice(name, device, layer_idx);
         }
 
         // Get device info from placement map
@@ -2633,7 +2784,7 @@ namespace llaminar2
         {
             // This weight doesn't have CPU decode participation
             LOG_TRACE("[DeviceGraphOrchestrator::getPhaseAwareWeight] DECODE phase, weight " << name << " has no CPU participation - returning full weight");
-            return weight_manager_->getWeight(name);
+            return weight_manager_->getWeightForDevice(name, device, layer_idx);
         }
 
         // Find the CPU device in decode_devices and get its fraction
@@ -2650,7 +2801,7 @@ namespace llaminar2
 
         // No CPU in decode devices - use full weight
         LOG_TRACE("[DeviceGraphOrchestrator::getPhaseAwareWeight] DECODE phase, CPU not in decode devices - returning full weight for " << name);
-        return weight_manager_->getWeight(name);
+        return weight_manager_->getWeightForDevice(name, device, layer_idx);
     }
 
     bool DeviceGraphOrchestrator::shouldUseCPUDecodeWeight(const std::string &name, int layer_idx) const

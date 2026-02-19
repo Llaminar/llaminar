@@ -416,9 +416,9 @@ protected:
 TEST_F(WeightManagerRealModelTest, LoadRealWeights)
 {
     // Load some real weights
-    auto embd = weight_manager_->getWeight("token_embd.weight");
-    auto q0 = weight_manager_->getWeight("blk.0.attn_q.weight");
-    auto norm0 = weight_manager_->getWeight("blk.0.attn_norm.weight");
+    auto embd = weight_manager_->getWeightForDevice("token_embd.weight");
+    auto q0 = weight_manager_->getWeightForDevice("blk.0.attn_q.weight");
+    auto norm0 = weight_manager_->getWeightForDevice("blk.0.attn_norm.weight");
 
     ASSERT_NE(embd, nullptr);
     ASSERT_NE(q0, nullptr);
@@ -467,12 +467,12 @@ TEST_F(WeightManagerRealModelTest, MultiDeviceWithRealWeights)
 TEST_F(WeightManagerRealModelTest, PackRealGemmWeights)
 {
     // Load multiple GEMM weights
-    weight_manager_->getWeight("blk.0.attn_q.weight");
-    weight_manager_->getWeight("blk.0.attn_k.weight");
-    weight_manager_->getWeight("blk.0.attn_v.weight");
-    weight_manager_->getWeight("blk.0.ffn_gate.weight");
-    weight_manager_->getWeight("blk.0.ffn_up.weight");
-    weight_manager_->getWeight("blk.0.ffn_down.weight");
+    weight_manager_->getWeightForDevice("blk.0.attn_q.weight");
+    weight_manager_->getWeightForDevice("blk.0.attn_k.weight");
+    weight_manager_->getWeightForDevice("blk.0.attn_v.weight");
+    weight_manager_->getWeightForDevice("blk.0.ffn_gate.weight");
+    weight_manager_->getWeightForDevice("blk.0.ffn_up.weight");
+    weight_manager_->getWeightForDevice("blk.0.ffn_down.weight");
 
     // Pack for CPU
     bool result = weight_manager_->packGemmWeights(DeviceId::cpu());

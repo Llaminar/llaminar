@@ -797,7 +797,7 @@ TEST_F(Test__Q8_1_LayerByLayer, EmbeddingComparison)
     }
 
     // Get embedding tensors from model context
-    auto embed_weight = model_ctx_->getWeight("token_embd.weight", -1);
+    auto embed_weight = model_ctx_->getWeightForDevice("token_embd.weight", -1);
     ASSERT_NE(embed_weight, nullptr) << "Embedding weight not found";
 
     int d_model = static_cast<int>(model_ctx_->model().embedding_length);

@@ -55,6 +55,7 @@ namespace llaminar2
             LOG_ERROR("[FusedQKVGEMMStage] Null input");
             return false;
         }
+
         if (!params_.wq || !params_.wk || !params_.wv)
         {
             LOG_ERROR("[FusedQKVGEMMStage] Null weight tensor(s)");
@@ -317,9 +318,12 @@ namespace llaminar2
         auto *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_q);
         auto *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_k);
         auto *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_v);
-        if (gemm_q) gemm_q->setGPUStream(gpuStream());
-        if (gemm_k) gemm_k->setGPUStream(gpuStream());
-        if (gemm_v) gemm_v->setGPUStream(gpuStream());
+        if (gemm_q)
+            gemm_q->setGPUStream(gpuStream());
+        if (gemm_k)
+            gemm_k->setGPUStream(gpuStream());
+        if (gemm_v)
+            gemm_v->setGPUStream(gpuStream());
         const bool gpu_execution = (target_dev_type == DeviceType::CUDA || target_dev_type == DeviceType::ROCm);
         LOG_DEBUG("[FusedQKVGEMMStage] device_id=" << params_.device_id.to_string()
                                                    << " is_gpu=" << gpu_execution);

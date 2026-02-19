@@ -20,12 +20,10 @@
 #include "../../../utils/ROCmKernelProfiler.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../ROCmKernelBase.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../kernels/rope/RoPEDeviceParams.h"
 #include <hip/hip_runtime.h>
-#include <cmath>
-#include <mutex>
-#include <map>
 
 // Forward declare extern "C" HIP wrappers (v2 - with inv_freq parameter)
 extern "C"
@@ -139,114 +137,6 @@ extern "C"
         int device_idx, void *stream);
 }
 
-// =========================================================================
-// Inverse Frequency Cache (shared across all RoPE kernel instances)
-// =========================================================================
-namespace
-{
-    struct InvFreqCacheKey
-    {
-        int head_dim;
-        float freq_base;
-        int device_idx;
-
-        bool operator<(const InvFreqCacheKey &other) const
-        {
-            if (head_dim != other.head_dim)
-                return head_dim < other.head_dim;
-            if (freq_base != other.freq_base)
-                return freq_base < other.freq_base;
-            return device_idx < other.device_idx;
-        }
-    };
-
-    struct InvFreqCacheEntry
-    {
-        float *d_inv_freq = nullptr;
-        int half_dim = 0;
-    };
-
-    std::map<InvFreqCacheKey, InvFreqCacheEntry> g_inv_freq_cache;
-    std::mutex g_inv_freq_mutex;
-
-    /**
-     * @brief Get or create inverse frequency table on device
-     *
-     * Caches the table per (head_dim, freq_base, device_idx) combination.
-     * Formula: inv_freq[i] = 1.0 / (freq_base^(2i/head_dim)) for i in [0, head_dim/2)
-     */
-    float *getOrCreateInvFreq(int head_dim, float freq_base, int device_idx)
-    {
-        InvFreqCacheKey key{head_dim, freq_base, device_idx};
-
-        std::lock_guard<std::mutex> lock(g_inv_freq_mutex);
-
-        auto it = g_inv_freq_cache.find(key);
-        if (it != g_inv_freq_cache.end())
-        {
-            return it->second.d_inv_freq;
-        }
-
-        // Compute on host
-        int half_dim = head_dim / 2;
-        std::vector<float> h_inv_freq(half_dim);
-        for (int i = 0; i < half_dim; ++i)
-        {
-            h_inv_freq[i] = 1.0f / std::pow(freq_base, 2.0f * i / head_dim);
-        }
-
-        // Allocate and copy to device
-        llaminar2::HipDeviceGuard::setDevice(device_idx);
-        float *d_inv_freq = nullptr;
-        hipError_t err = hipMalloc(&d_inv_freq, half_dim * sizeof(float));
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmRoPE] Failed to allocate inv_freq cache: " << hipGetErrorString(err));
-            return nullptr;
-        }
-
-        err = hipMemcpy(d_inv_freq, h_inv_freq.data(), half_dim * sizeof(float), hipMemcpyHostToDevice);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmRoPE] Failed to copy inv_freq to device: " << hipGetErrorString(err));
-            hipFree(d_inv_freq);
-            return nullptr;
-        }
-
-        LOG_DEBUG("[ROCmRoPE] Created inv_freq cache for head_dim=" << head_dim
-                                                                    << ", freq_base=" << freq_base
-                                                                    << ", device=" << device_idx);
-
-        g_inv_freq_cache[key] = {d_inv_freq, half_dim};
-        return d_inv_freq;
-    }
-
-    void clearInvFreqCacheInternal()
-    {
-        std::lock_guard<std::mutex> lock(g_inv_freq_mutex);
-        for (auto &[key, entry] : g_inv_freq_cache)
-        {
-            if (entry.d_inv_freq)
-            {
-                hipError_t set_err = static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(key.device_idx));
-                if (set_err == hipErrorDeinitialized || set_err == hipErrorNoDevice)
-                {
-                    // HIP runtime is shutting down, skip cleanup
-                    continue;
-                }
-                hipError_t err = hipFree(entry.d_inv_freq);
-                if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
-                {
-                    LOG_WARN("[ROCmRoPE] hipFree(inv_freq) failed: " << hipGetErrorString(err));
-                }
-            }
-        }
-        g_inv_freq_cache.clear();
-        LOG_DEBUG("[ROCmRoPE] Cleared inverse frequency cache");
-    }
-
-} // anonymous namespace
-
 namespace llaminar2
 {
     namespace rocm
@@ -332,16 +222,6 @@ namespace llaminar2
             return workspace_;
         }
 
-        float *ROCmRoPEKernelT<ActivationPrecision::FP32>::getOrCreateInvFreq(int head_dim, float freq_base, int device_idx)
-        {
-            return ::getOrCreateInvFreq(head_dim, freq_base, device_idx);
-        }
-
-        void ROCmRoPEKernelT<ActivationPrecision::FP32>::clearInvFreqCache()
-        {
-            ::clearInvFreqCacheInternal();
-        }
-
         bool ROCmRoPEKernelT<ActivationPrecision::FP32>::apply(
             float *data, float *output,
             const int *pos_ids,
@@ -356,10 +236,8 @@ namespace llaminar2
             (void)mpi_ctx;
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Require workspace to be bound
-            if (!workspace_)
+            if (!validateROCmWorkspaceBinding(workspace_, dev, "ROCmRoPEKernelT<FP32>"))
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP32>] Workspace not bound. Call bindWorkspace() first.");
                 return false;
             }
 
@@ -399,10 +277,8 @@ namespace llaminar2
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Require workspace to be bound
-            if (!workspace_)
+            if (!validateROCmWorkspaceBinding(workspace_, dev, "ROCmRoPEKernelT<FP32>"))
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP32>] Workspace not bound. Call bindWorkspace() first.");
                 return false;
             }
 
@@ -476,10 +352,8 @@ namespace llaminar2
                 return false;
             }
 
-            // Require workspace to be bound
-            if (!workspace_)
+            if (!validateROCmWorkspaceBinding(workspace_, dev, "ROCmRoPEKernelT<FP32>"))
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP32>] Workspace not bound. Call bindWorkspace() first.");
                 return false;
             }
 
@@ -652,16 +526,6 @@ namespace llaminar2
             return workspace_;
         }
 
-        float *ROCmRoPEKernelT<ActivationPrecision::BF16>::getOrCreateInvFreq(int head_dim, float freq_base, int device_idx)
-        {
-            return ::getOrCreateInvFreq(head_dim, freq_base, device_idx);
-        }
-
-        void ROCmRoPEKernelT<ActivationPrecision::BF16>::clearInvFreqCache()
-        {
-            ::clearInvFreqCacheInternal();
-        }
-
         bool ROCmRoPEKernelT<ActivationPrecision::BF16>::apply_bf16(
             uint16_t *data, uint16_t *output,
             const int *pos_ids,
@@ -672,10 +536,8 @@ namespace llaminar2
             (void)batch_size;
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Require workspace to be bound
-            if (!workspace_)
+            if (!validateROCmWorkspaceBinding(workspace_, dev, "ROCmRoPEKernelT<BF16>"))
             {
-                LOG_ERROR("[ROCmRoPEKernelT<BF16>] Workspace not bound. Call bindWorkspace() first.");
                 return false;
             }
 
@@ -715,10 +577,8 @@ namespace llaminar2
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Require workspace to be bound
-            if (!workspace_)
+            if (!validateROCmWorkspaceBinding(workspace_, dev, "ROCmRoPEKernelT<BF16>"))
             {
-                LOG_ERROR("[ROCmRoPEKernelT<BF16>] Workspace not bound. Call bindWorkspace() first.");
                 return false;
             }
 
@@ -793,10 +653,8 @@ namespace llaminar2
                 return false;
             }
 
-            // Require workspace to be bound
-            if (!workspace_)
+            if (!validateROCmWorkspaceBinding(workspace_, dev, "ROCmRoPEKernelT<BF16>"))
             {
-                LOG_ERROR("[ROCmRoPEKernelT<BF16>] Workspace not bound. Call bindWorkspace() first.");
                 return false;
             }
 
@@ -964,16 +822,6 @@ namespace llaminar2
             return workspace_;
         }
 
-        float *ROCmRoPEKernelT<ActivationPrecision::FP16>::getOrCreateInvFreq(int head_dim, float freq_base, int device_idx)
-        {
-            return ::getOrCreateInvFreq(head_dim, freq_base, device_idx);
-        }
-
-        void ROCmRoPEKernelT<ActivationPrecision::FP16>::clearInvFreqCache()
-        {
-            ::clearInvFreqCacheInternal();
-        }
-
         bool ROCmRoPEKernelT<ActivationPrecision::FP16>::apply_fp16(
             uint16_t *data, uint16_t *output,
             const int *pos_ids,
@@ -984,10 +832,8 @@ namespace llaminar2
             (void)batch_size;
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Require workspace to be bound
-            if (!workspace_)
+            if (!validateROCmWorkspaceBinding(workspace_, dev, "ROCmRoPEKernelT<FP16>"))
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP16>] Workspace not bound. Call bindWorkspace() first.");
                 return false;
             }
 
@@ -1027,10 +873,8 @@ namespace llaminar2
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Require workspace to be bound
-            if (!workspace_)
+            if (!validateROCmWorkspaceBinding(workspace_, dev, "ROCmRoPEKernelT<FP16>"))
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP16>] Workspace not bound. Call bindWorkspace() first.");
                 return false;
             }
 
@@ -1103,10 +947,8 @@ namespace llaminar2
                 return false;
             }
 
-            // Require workspace to be bound
-            if (!workspace_)
+            if (!validateROCmWorkspaceBinding(workspace_, dev, "ROCmRoPEKernelT<FP16>"))
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP16>] Workspace not bound. Call bindWorkspace() first.");
                 return false;
             }
 

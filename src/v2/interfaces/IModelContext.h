@@ -38,7 +38,7 @@ namespace llaminar2
      * @code
      * // Production code works with interface
      * void initializePipeline(IModelContext& ctx) {
-     *     auto embd = ctx.getWeight("token_embd.weight");
+     *     auto embd = ctx.getWeightForDevice("token_embd.weight");
      *     int num_layers = ctx.blockCount();
      *     auto& loader = ctx.loader();
      *     // ...
@@ -148,22 +148,6 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Get weight tensor by name (shared instance)
-         *
-         * Convenience method that delegates to weightManager()->getWeight().
-         *
-         * WARNING: For multi-device scenarios where each device needs independent
-         * coherence tracking, use getWeightForDevice() instead.
-         *
-         * @param name GGUF tensor name (e.g., "token_embd.weight", "blk.0.attn_q.weight")
-         * @param device Device for tensor placement (default: CPU)
-         * @return Shared pointer to tensor, or nullptr on error
-         */
-        virtual std::shared_ptr<TensorBase> getWeight(
-            const std::string &name,
-            DeviceId device = DeviceId::cpu()) = 0;
-
-        /**
          * @brief Get weight tensor for a specific device (device-isolated instance)
          *
          * For multi-device scenarios (LOCAL TP), each device needs its own tensor
@@ -171,13 +155,13 @@ namespace llaminar2
          *
          * Convenience method that delegates to weightManager()->getWeightForDevice().
          *
-         * @param name GGUF tensor name
-         * @param device Target device for this tensor instance
+         * @param name GGUF tensor name (e.g., "token_embd.weight", "blk.0.attn_q.weight")
+         * @param device Target device for this tensor instance (default: CPU)
          * @return Device-specific tensor instance, or nullptr on error
          */
         virtual std::shared_ptr<TensorBase> getWeightForDevice(
             const std::string &name,
-            DeviceId device) = 0;
+            DeviceId device = DeviceId::cpu()) = 0;
 
         // =========================================================================
         // Tensor Existence Check (Delegates to Loader)

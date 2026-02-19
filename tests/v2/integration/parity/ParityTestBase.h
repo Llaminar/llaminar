@@ -1349,9 +1349,6 @@ namespace llaminar2::test::parity
 #ifdef HAVE_CUDA
             llaminar2::CUDAEmbeddingKernelT::clearGlobalEmbeddingCache();
 #endif
-#ifdef HAVE_ROCM
-            llaminar2::ROCmEmbeddingKernelT::clearGlobalEmbeddingCache();
-#endif
 
             model_ctx_.reset();
             runner_.reset();

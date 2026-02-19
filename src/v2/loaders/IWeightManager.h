@@ -59,7 +59,7 @@ namespace llaminar2
      * @code
      * // Production code works with interface
      * void loadProjection(IWeightManager& weights) {
-     *     auto wq = weights.getWeight("blk.0.attn_q.weight");
+     *     auto wq = weights.getWeightForDevice("blk.0.attn_q.weight");
      *     if (weights.isWeightSharded("blk.0.attn_q.weight")) {
      *         // Need allreduce after matmul
      *     }
@@ -83,27 +83,9 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Get weight tensor by name (shared instance)
-         *
-         * Loads from storage if not cached, applies distribution strategy.
-         * Returns the SAME tensor instance for repeated calls with the same name.
-         *
-         * WARNING: For multi-device scenarios where each device needs independent
-         * coherence tracking, use getWeightForDevice() instead.
-         *
-         * @param name GGUF tensor name (e.g., "token_embd.weight", "blk.0.attn_q.weight")
-         * @param device Device for tensor placement (default: CPU)
-         * @param layer_idx Optional layer index for placement map lookup
-         * @return Shared pointer to tensor, or nullptr on error
-         */
-        virtual std::shared_ptr<TensorBase> getWeight(
-            const std::string &name,
-            DeviceId device = DeviceId::cpu(),
-            int layer_idx = -1) = 0;
-
-        /**
          * @brief Get weight tensor for a specific device (device-isolated instance)
          *
+         * Loads from storage if not cached, applies distribution strategy.
          * For multi-device scenarios (LOCAL TP), each device needs its own tensor
          * instance to track coherence state independently. This method:
          * - Returns the original tensor for the first device that requests it
@@ -113,14 +95,17 @@ namespace llaminar2
          * This solves the problem where multiple devices running forward() in parallel
          * would race to call ensureOnDevice() on a shared tensor.
          *
-         * @param name GGUF tensor name
-         * @param device Target device for this tensor instance
+         * For single-device scenarios, passing DeviceId::cpu() (the default) is safe
+         * and equivalent to the former getWeight() behavior.
+         *
+         * @param name GGUF tensor name (e.g., "token_embd.weight", "blk.0.attn_q.weight")
+         * @param device Target device for this tensor instance (default: CPU)
          * @param layer_idx Optional layer index for placement map lookup
          * @return Device-specific tensor instance, or nullptr on error
          */
         virtual std::shared_ptr<TensorBase> getWeightForDevice(
             const std::string &name,
-            DeviceId device,
+            DeviceId device = DeviceId::cpu(),
             int layer_idx = -1) = 0;
 
         // =========================================================================

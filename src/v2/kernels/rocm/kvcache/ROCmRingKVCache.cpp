@@ -17,6 +17,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../tensors/GpuTensorView.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../ROCmKernelBase.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
 
 #include "../../../utils/KVCacheProfiler.h"
@@ -1296,13 +1297,8 @@ namespace llaminar2
         int *d_tails = nullptr;
         int *d_counts = nullptr;
 
-        // Track whether we used workspace (to know if we need to free)
-        const bool use_workspace = hasWorkspace();
-
-        if (!use_workspace)
+        if (!validateROCmWorkspaceBinding(workspace_, device_id_, "ROCmRingKVCache"))
         {
-            LOG_ERROR("[ROCmRingKVCache] Workspace not bound - hot-path allocation disabled. "
-                      "Call bindWorkspace() before launch_gather_kernel()");
             return;
         }
 

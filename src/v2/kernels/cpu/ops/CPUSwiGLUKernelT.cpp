@@ -17,6 +17,7 @@
 #include "../primitives/SwiGLUPrimitives.h"
 #include "../../../tensors/Tensors.h" // For TensorBase
 #include "../../../utils/Logger.h"
+#include "../../../utils/KernelProfiler.h"
 
 namespace llaminar2
 {
@@ -186,6 +187,7 @@ namespace llaminar2
         const MPIContext *mpi_ctx,
         int device_idx)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
         if (!gate || !up || !output)
         {
             LOG_ERROR("CPUSwiGLUKernelT<FP32>::apply_tensor: null tensor");
@@ -254,6 +256,7 @@ namespace llaminar2
         const MPIContext *mpi_ctx,
         int device_idx)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
         if (!gate || !up || !output)
         {
             LOG_ERROR("CPUSwiGLUKernelT<BF16>::apply_tensor: null tensor");
@@ -332,6 +335,7 @@ namespace llaminar2
         const MPIContext *mpi_ctx,
         int device_idx)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
         if (!gate || !up || !output)
         {
             LOG_ERROR("CPUSwiGLUKernelT<FP16>::apply_tensor: null tensor");
@@ -414,6 +418,7 @@ namespace llaminar2
         const MPIContext *mpi_ctx,
         int device_idx)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
         if (!gate || !up || !output)
         {
             LOG_ERROR("CPUSwiGLUKernelT<Q8_1>::apply_tensor: null tensor");

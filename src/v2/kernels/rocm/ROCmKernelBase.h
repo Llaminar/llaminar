@@ -9,6 +9,43 @@
 namespace llaminar2
 {
 
+    inline bool validateROCmWorkspaceBinding(
+        DeviceWorkspaceManager *workspace,
+        int expected_rocm_device,
+        const char *kernel_name,
+        bool require_allocated = true)
+    {
+        if (!workspace)
+        {
+            LOG_ERROR("[" << kernel_name << "] Workspace not bound. Call bindWorkspace() first.");
+            return false;
+        }
+
+        if (require_allocated && !workspace->isAllocated())
+        {
+            LOG_ERROR("[" << kernel_name << "] Workspace is bound but not allocated");
+            return false;
+        }
+
+        if (expected_rocm_device < 0)
+        {
+            LOG_ERROR("[" << kernel_name << "] Invalid expected ROCm device index: "
+                          << expected_rocm_device);
+            return false;
+        }
+
+        const DeviceId workspace_device = workspace->device();
+        if (!workspace_device.is_rocm() || workspace_device.rocm_ordinal() != expected_rocm_device)
+        {
+            LOG_ERROR("[" << kernel_name << "] Workspace device mismatch: workspace="
+                          << workspace_device.to_string() << " expected=ROCm:" << expected_rocm_device
+                          << " workspace_ptr=" << static_cast<void *>(workspace));
+            return false;
+        }
+
+        return true;
+    }
+
     /**
      * @brief Base class for ROCm kernels with default IWorkspaceConsumer support.
      *

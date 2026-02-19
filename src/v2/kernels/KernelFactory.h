@@ -450,7 +450,7 @@ namespace llaminar
                  * @throws std::runtime_error if tensor type not supported on target device
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::TensorBase *tensor, DeviceType dev_type);
+                    const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for IQ4_NL tensor
@@ -459,7 +459,7 @@ namespace llaminar
                  * @return ITensorGemm implementation for the device
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::IQ4_NLTensor *tensor, DeviceType dev_type);
+                    const llaminar2::IQ4_NLTensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create raw GEMM kernel pointer for IQ4_NL tensor
@@ -468,145 +468,145 @@ namespace llaminar
                  * @return Raw pointer to ITensorGemm (caller owns)
                  */
                 static llaminar2::ITensorGemm *createGemmRaw(
-                    const llaminar2::IQ4_NLTensor *tensor, DeviceType dev_type);
+                    const llaminar2::IQ4_NLTensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for Q4_0 tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::Q4_0Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q4_0Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for Q4_1 tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::Q4_1Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q4_1Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for Q5_0 tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::Q5_0Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q5_0Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for Q5_1 tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::Q5_1Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q5_1Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for Q6_K tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::Q6_KTensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q6_KTensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for Q8_0 tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::Q8_0Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q8_0Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for Q8_1 tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for Q2_K tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::Q2_KTensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q2_KTensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for Q3_K tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::Q3_KTensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q3_KTensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for Q4_K tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::Q4_KTensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q4_KTensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for Q5_K tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::Q5_KTensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q5_KTensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for Q8_K tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::Q8_KTensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q8_KTensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for IQ1_M tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::IQ1_MTensor *tensor, DeviceType dev_type);
+                    const llaminar2::IQ1_MTensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for IQ1_S tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::IQ1_STensor *tensor, DeviceType dev_type);
+                    const llaminar2::IQ1_STensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for IQ2_S tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::IQ2_STensor *tensor, DeviceType dev_type);
+                    const llaminar2::IQ2_STensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for IQ2_XS tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::IQ2_XSTensor *tensor, DeviceType dev_type);
+                    const llaminar2::IQ2_XSTensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for IQ2_XXS tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::IQ2_XXSTensor *tensor, DeviceType dev_type);
+                    const llaminar2::IQ2_XXSTensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for IQ3_S tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::IQ3_STensor *tensor, DeviceType dev_type);
+                    const llaminar2::IQ3_STensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for IQ3_XXS tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::IQ3_XXSTensor *tensor, DeviceType dev_type);
+                    const llaminar2::IQ3_XXSTensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for IQ4_XS tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::IQ4_XSTensor *tensor, DeviceType dev_type);
+                    const llaminar2::IQ4_XSTensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for FP32 tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for FP16 tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for BF16 tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
-                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 // ==========================================================================
                 // Fused QKV GEMM Kernel Creation
@@ -769,25 +769,25 @@ namespace llaminar
                  * @return ITensorRoPE implementation for the device
                  */
                 static std::unique_ptr<llaminar2::ITensorRoPE> createRoPE(
-                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create RoPE kernel for BF16 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorRoPE> createRoPE(
-                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create RoPE kernel for FP16 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorRoPE> createRoPE(
-                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create RoPE kernel for Q8_1 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorRoPE> createRoPE(
-                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 // ==========================================================================
                 // SwiGLU Kernel Creation - Device-aware dispatch
@@ -797,25 +797,25 @@ namespace llaminar
                  * @brief Create SwiGLU kernel for FP32 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorSwiGLU> createSwiGLU(
-                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create SwiGLU kernel for BF16 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorSwiGLU> createSwiGLU(
-                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create SwiGLU kernel for FP16 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorSwiGLU> createSwiGLU(
-                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create SwiGLU kernel for Q8_1 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorSwiGLU> createSwiGLU(
-                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 // ==========================================================================
                 // Softmax Kernel Creation - Device-aware dispatch
@@ -825,25 +825,25 @@ namespace llaminar
                  * @brief Create Softmax kernel for FP32 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorSoftmax> createSoftmax(
-                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create Softmax kernel for BF16 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorSoftmax> createSoftmax(
-                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create Softmax kernel for FP16 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorSoftmax> createSoftmax(
-                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create Softmax kernel for Q8_1 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorSoftmax> createSoftmax(
-                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 // ==========================================================================
                 // RMSNorm Kernel Creation - Device-aware dispatch
@@ -853,25 +853,25 @@ namespace llaminar
                  * @brief Create RMSNorm kernel for FP32 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorRMSNorm> createRMSNorm(
-                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create RMSNorm kernel for BF16 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorRMSNorm> createRMSNorm(
-                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create RMSNorm kernel for FP16 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorRMSNorm> createRMSNorm(
-                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create RMSNorm kernel for Q8_1 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorRMSNorm> createRMSNorm(
-                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create RMSNorm kernel for Q16_1 activation tensor
@@ -880,7 +880,7 @@ namespace llaminar
                  * Used when residual is stored in high-precision Q16_1 format.
                  */
                 static std::unique_ptr<llaminar2::ITensorRMSNorm> createRMSNorm(
-                    const llaminar2::Q16_1Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q16_1Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 // ==========================================================================
                 // Attention Kernel Creation - Device-aware dispatch
@@ -890,25 +890,25 @@ namespace llaminar
                  * @brief Create Attention kernel for FP32 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorAttention> createAttention(
-                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create Attention kernel for BF16 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorAttention> createAttention(
-                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create Attention kernel for FP16 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorAttention> createAttention(
-                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create Attention kernel for Q8_1 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorAttention> createAttention(
-                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 // ==========================================================================
                 // Embedding Kernel Creation - Device-aware dispatch
@@ -918,25 +918,25 @@ namespace llaminar
                  * @brief Create Embedding kernel for FP32 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorEmbedding> createEmbedding(
-                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create Embedding kernel for BF16 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorEmbedding> createEmbedding(
-                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create Embedding kernel for FP16 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorEmbedding> createEmbedding(
-                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create Embedding kernel for Q8_1 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorEmbedding> createEmbedding(
-                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 // ==========================================================================
                 // ResidualAdd Kernel Creation - Device-aware dispatch
@@ -946,19 +946,19 @@ namespace llaminar
                  * @brief Create ResidualAdd kernel for FP32 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorResidualAdd> createResidualAdd(
-                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create ResidualAdd kernel for BF16 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorResidualAdd> createResidualAdd(
-                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create ResidualAdd kernel for FP16 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorResidualAdd> createResidualAdd(
-                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type);
+                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 // ==========================================================================
                 // Generic TensorBase* Factory Methods - Auto-dispatch by native_type()
@@ -977,7 +977,7 @@ namespace llaminar
                  * @throws std::runtime_error if tensor type is unsupported
                  */
                 static std::unique_ptr<llaminar2::ITensorRMSNorm> createRMSNorm(
-                    const llaminar2::TensorBase *tensor, DeviceType dev_type);
+                    const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 // ==========================================================================
                 // Device-scoped cached non-GEMM kernels
@@ -1065,7 +1065,7 @@ namespace llaminar
                  * @throws std::runtime_error if tensor type is unsupported
                  */
                 static std::unique_ptr<llaminar2::ITensorRoPE> createRoPE(
-                    const llaminar2::TensorBase *tensor, DeviceType dev_type);
+                    const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create SwiGLU kernel for any tensor type via dynamic dispatch
@@ -1079,7 +1079,7 @@ namespace llaminar
                  * @throws std::runtime_error if tensor type is unsupported
                  */
                 static std::unique_ptr<llaminar2::ITensorSwiGLU> createSwiGLU(
-                    const llaminar2::TensorBase *tensor, DeviceType dev_type);
+                    const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create Softmax kernel for any tensor type via dynamic dispatch
@@ -1093,7 +1093,7 @@ namespace llaminar
                  * @throws std::runtime_error if tensor type is unsupported
                  */
                 static std::unique_ptr<llaminar2::ITensorSoftmax> createSoftmax(
-                    const llaminar2::TensorBase *tensor, DeviceType dev_type);
+                    const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create ResidualAdd kernel for any tensor type via dynamic dispatch
@@ -1107,7 +1107,7 @@ namespace llaminar
                  * @throws std::runtime_error if tensor type is unsupported
                  */
                 static std::unique_ptr<llaminar2::ITensorResidualAdd> createResidualAdd(
-                    const llaminar2::TensorBase *tensor, DeviceType dev_type);
+                    const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create Attention kernel for any tensor type via dynamic dispatch
@@ -1121,7 +1121,7 @@ namespace llaminar
                  * @throws std::runtime_error if tensor type is unsupported
                  */
                 static std::unique_ptr<llaminar2::ITensorAttention> createAttention(
-                    const llaminar2::TensorBase *tensor, DeviceType dev_type);
+                    const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create Attention kernel for any ITensor via device-aware dispatch
@@ -1135,7 +1135,7 @@ namespace llaminar
                  * @throws std::runtime_error if tensor type is unsupported
                  */
                 static std::unique_ptr<llaminar2::ITensorAttention> createAttention(
-                    const llaminar2::ITensor *tensor, DeviceType dev_type);
+                    const llaminar2::ITensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 // ==========================================================================
                 // KVCache Factory Methods

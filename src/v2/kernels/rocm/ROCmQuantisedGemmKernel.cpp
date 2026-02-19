@@ -72,6 +72,7 @@
  */
 
 #include "ROCmQuantisedGemmKernel.h"
+#include "ROCmKernelBase.h"
 #include "backends/ComputeBackend.h" // DeviceManager
 #include "backends/DeviceId.h"       // DeviceId
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.
@@ -86,11 +87,13 @@
 #include "utils/Logger.h"
 #include "utils/ROCmKernelProfiler.h"
 #include "utils/DebugEnv.h"
+#include "utils/Assertions.h"
 
 #include <stdexcept>
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <mutex>
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -103,29 +106,16 @@ namespace llaminar2
     namespace rocm
     {
         // =====================================================================
-        // File-level helper: is the fused GEMV path enabled?
-        // Default OFF (performance regression on gfx906 due to FP32 atomicAdd).
-        // Set LLAMINAR_FUSED_GEMV=1 to enable for testing/development.
-        // =====================================================================
-        static bool isFusedGemvEnabled()
-        {
-            const bool enabled = debugEnv().rocm.fused_gemv;
-            static bool logged_enabled_once = false;
-            if (enabled && !logged_enabled_once)
-            {
-                LOG_INFO("[ROCmQuantisedGemmKernel] Fused GEMV enabled via DebugEnv (LLAMINAR_FUSED_GEMV=1)");
-                logged_enabled_once = true;
-            }
-            return enabled;
-        }
-
-        // =====================================================================
         // Forward declarations for HIP implementation (defined in .hip file)
         // =====================================================================
 
         // These functions are implemented in ROCmQuantisedGemmKernel_CK.hip
         extern "C"
         {
+            // Create/destroy per-instance CK kernel context (eliminates global/static cache state)
+            void *rocmQuantGemm_createKernelContext(int rocm_device_id);
+            void rocmQuantGemm_destroyKernelContext(void *kernel_ctx, int rocm_device_id);
+
             // Upload converted INT8 weights to device
             bool rocmQuantGemm_uploadWeights(
                 const int8_t *h_weights_int8, // [K x N] ColumnMajor
@@ -161,7 +151,8 @@ namespace llaminar2
                 const float *d_scale_A, // [M] per-row activation scales
                 const float *d_scale_B, // [N] per-column weight scales
                 int M, int N, int K,
-                int rocm_device_id, void *stream);
+                int rocm_device_id, void *stream,
+                void *kernel_ctx);
 
             // Execute INT8 GEMM without scaling (INT8→INT32 only)
             // Used when you want to apply custom scaling/bias separately.
@@ -170,7 +161,8 @@ namespace llaminar2
                 const int8_t *d_B_int8, // [K x N] RowMajor weights
                 int32_t *d_C_int32,     // [M x N] RowMajor INT32 output
                 int M, int N, int K,
-                int rocm_device_id, void *stream);
+                int rocm_device_id, void *stream,
+                void *kernel_ctx);
 
             // Execute INT8 GEMM using CK two-kernel with PRE-ALLOCATED buffer (allocation-free)
             // This is the preferred variant for hot-path execution.
@@ -182,7 +174,8 @@ namespace llaminar2
                 const float *d_scale_B, // [N] per-column weight scales
                 int32_t *d_C_int32,     // [M x N] Pre-allocated INT32 accumulator
                 int M, int N, int K,
-                int rocm_device_id, void *stream);
+                int rocm_device_id, void *stream,
+                void *kernel_ctx);
 
             // Execute INT8 GEMM using CK two-kernel with M-PADDING for decode (M < 8)
             // Pads activations to padded_m, runs CK, extracts first M rows of output.
@@ -197,7 +190,8 @@ namespace llaminar2
                 int M,                  // Actual M (output rows needed)
                 int padded_m,           // Padded M for CK
                 int N, int K,
-                int rocm_device_id, void *stream);
+                int rocm_device_id, void *stream,
+                void *kernel_ctx);
 
             // Execute INT8 GEMM using CK two-kernel with M-PADDING and PRE-ALLOCATED buffers (allocation-free)
             // This is the preferred variant for hot-path decode execution.
@@ -214,7 +208,8 @@ namespace llaminar2
                 int M,                   // Actual M (output rows needed)
                 int padded_m,            // Padded M for CK
                 int N, int K,
-                int rocm_device_id, void *stream);
+                int rocm_device_id, void *stream,
+                void *kernel_ctx);
 
             // Execute INT8 GEMM using CK two-kernel with HIP event timing (for benchmarking)
             // Same as _cached but returns kernel time via kernel_time_ms parameter.
@@ -227,7 +222,8 @@ namespace llaminar2
                 int32_t *d_C_int32,     // Pre-allocated [M × N] INT32 accumulator
                 int M, int N, int K,
                 int rocm_device_id,
-                float *kernel_time_ms, void *stream);
+                float *kernel_time_ms, void *stream,
+                void *kernel_ctx);
 
             // Allocate INT8 buffer
             bool rocmQuantGemm_allocInt8(int8_t **d_ptr, size_t count, int rocm_device_id);
@@ -399,6 +395,8 @@ namespace llaminar2
 
         struct ROCmQuantisedGemmKernel::Impl
         {
+            void *ck_kernel_context = nullptr;
+
             // Device memory for converted weights (only used when owns_weight_memory_ = true)
             // Option B: Only VNNI layout is persistent on device. Row-major is repacked
             // on-demand from VNNI into d_B_rowmajor_scratch (workspace buffer).
@@ -447,6 +445,10 @@ namespace llaminar2
             size_t d_scale_A_padded_capacity = 0;
             size_t d_E_padded_capacity = 0;
 
+            // Workspace validation cache: skip redundant hash map lookups when
+            // the same workspace is re-validated across GEMM calls.
+            const void *validated_workspace = nullptr;
+
             // Flag to track if we own weight memory
             bool owns_weight_memory = false;
 
@@ -455,6 +457,12 @@ namespace llaminar2
 
             ~Impl()
             {
+                if (ck_kernel_context)
+                {
+                    rocmQuantGemm_destroyKernelContext(ck_kernel_context, rocm_device_id);
+                    ck_kernel_context = nullptr;
+                }
+
                 // Only free weight memory if we own it (not from ROCmPackedWeights cache)
                 if (owns_weight_memory)
                 {
@@ -480,6 +488,7 @@ namespace llaminar2
                 const char *pointer_name,
                 const char *scope)
             {
+#if LLAMINAR_ASSERTIONS_ACTIVE
                 if (!ptr)
                 {
                     LOG_ERROR("[" << scope << "] " << pointer_name << " is null");
@@ -504,6 +513,13 @@ namespace llaminar2
                 LOG_WARN("[" << scope << "] hipPointerGetAttributes failed for " << pointer_name
                              << " ptr=" << ptr << ": " << hipGetErrorString(err));
                 return true;
+#else
+                // Release builds: skip HIP runtime validation for performance.
+                // Each hipPointerGetAttributes() call costs ~1-5μs, and with ~8 calls
+                // per GEMM × ~280 GEMMs per decode token, this adds ~2-10ms per token.
+                (void)ptr; (void)expected_device; (void)pointer_name; (void)scope;
+                return true;
+#endif
             }
 
             template <typename ImplT>
@@ -591,23 +607,31 @@ namespace llaminar2
 
         ROCmPackedWeights::~ROCmPackedWeights()
         {
-            if (d_int8_data_vnni || d_ratio_vnni_payload || d_ratio_vnni_ratio || d_scales)
+            if (!device_uploads.empty())
             {
-                LOG_TRACE("[ROCmPackedWeights::~] Freeing device memory: "
-                          << "d_int8_data_vnni=" << (void *)d_int8_data_vnni
-                          << " d_ratio_vnni_payload=" << (void *)d_ratio_vnni_payload
-                          << " d_ratio_vnni_ratio=" << (void *)d_ratio_vnni_ratio
-                          << " d_scales=" << (void *)d_scales
-                          << " rocm_device_id=" << rocm_device_id);
+                for (auto &[device_id, upload] : device_uploads)
+                {
+                    if (upload.d_int8_data_vnni)
+                        rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, device_id);
+                    if (upload.d_ratio_vnni_payload)
+                        rocmQuantGemm_freeDevice(upload.d_ratio_vnni_payload, device_id);
+                    if (upload.d_ratio_vnni_ratio)
+                        rocmQuantGemm_freeDevice(upload.d_ratio_vnni_ratio, device_id);
+                    if (upload.d_scales)
+                        rocmQuantGemm_freeDevice(upload.d_scales, device_id);
+                }
             }
-            if (d_int8_data_vnni)
-                rocmQuantGemm_freeDevice(d_int8_data_vnni, rocm_device_id);
-            if (d_ratio_vnni_payload)
-                rocmQuantGemm_freeDevice(d_ratio_vnni_payload, rocm_device_id);
-            if (d_ratio_vnni_ratio)
-                rocmQuantGemm_freeDevice(d_ratio_vnni_ratio, rocm_device_id);
-            if (d_scales)
-                rocmQuantGemm_freeDevice(d_scales, rocm_device_id);
+            else
+            {
+                if (d_int8_data_vnni)
+                    rocmQuantGemm_freeDevice(d_int8_data_vnni, rocm_device_id);
+                if (d_ratio_vnni_payload)
+                    rocmQuantGemm_freeDevice(d_ratio_vnni_payload, rocm_device_id);
+                if (d_ratio_vnni_ratio)
+                    rocmQuantGemm_freeDevice(d_ratio_vnni_ratio, rocm_device_id);
+                if (d_scales)
+                    rocmQuantGemm_freeDevice(d_scales, rocm_device_id);
+            }
         }
 
         // =====================================================================
@@ -859,6 +883,7 @@ namespace llaminar2
               K_(0),
               weights_converted_(false),
               owns_weight_memory_(true), // Legacy path owns weight memory
+              ck_dispatch_mutex_(std::make_unique<std::mutex>()),
               impl_(std::make_unique<Impl>())
         {
             if (!weights)
@@ -903,6 +928,11 @@ namespace llaminar2
 
             impl_->owns_weight_memory = true;        // Legacy constructor owns weight memory
             impl_->rocm_device_id = rocm_device_id_; // Store device ID for cleanup
+            impl_->ck_kernel_context = rocmQuantGemm_createKernelContext(rocm_device_id_);
+            if (!impl_->ck_kernel_context)
+            {
+                throw std::runtime_error("[ROCmQuantisedGemmKernel] Failed to create CK kernel context");
+            }
 
             LOG_DEBUG("[ROCmQuantisedGemmKernel] Created (legacy) for " << N_ << "x" << K_
                                                                         << " quantized weights (type=" << static_cast<int>(wt)
@@ -917,6 +947,7 @@ namespace llaminar2
               K_(0),
               weights_converted_(false),  // Not yet uploaded to device
               owns_weight_memory_(false), // ROCmPackedWeights owns the memory
+              ck_dispatch_mutex_(std::make_unique<std::mutex>()),
               impl_(std::make_unique<Impl>())
         {
             if (!packed)
@@ -929,6 +960,11 @@ namespace llaminar2
 
             impl_->owns_weight_memory = false;       // Pre-packed path doesn't own weight memory
             impl_->rocm_device_id = rocm_device_id_; // Store device ID for cleanup
+            impl_->ck_kernel_context = rocmQuantGemm_createKernelContext(rocm_device_id_);
+            if (!impl_->ck_kernel_context)
+            {
+                throw std::runtime_error("[ROCmQuantisedGemmKernel] Failed to create CK kernel context");
+            }
 
             LOG_DEBUG("[ROCmQuantisedGemmKernel] Created (pre-packed) for " << N_ << "x" << K_
                                                                             << " INT8 weights on ROCm device " << rocm_device_id_);
@@ -938,6 +974,21 @@ namespace llaminar2
 
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(ROCmQuantisedGemmKernel &&) noexcept = default;
         ROCmQuantisedGemmKernel &ROCmQuantisedGemmKernel::operator=(ROCmQuantisedGemmKernel &&) noexcept = default;
+
+        bool ROCmQuantisedGemmKernel::isFusedGemvEnabled()
+        {
+            const bool enabled = debugEnv().rocm.fused_gemv;
+            if (enabled && !fused_gemv_logged_enabled_once_)
+            {
+                std::lock_guard<std::mutex> lock(*ck_dispatch_mutex_);
+                if (!fused_gemv_logged_enabled_once_)
+                {
+                    LOG_INFO("[ROCmQuantisedGemmKernel] Fused GEMV enabled via DebugEnv (LLAMINAR_FUSED_GEMV=1)");
+                    fused_gemv_logged_enabled_once_ = true;
+                }
+            }
+            return enabled;
+        }
 
         // =====================================================================
         // ITensorGemm interface - Implementation
@@ -1014,18 +1065,8 @@ namespace llaminar2
                 return false;
             }
 
-            if (!ws)
+            if (!validateROCmWorkspaceBinding(ws, rocm_device_id_, "ROCmQuantisedGemmKernel::multiply_tensor"))
             {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Workspace not bound");
-                return false;
-            }
-
-            const DeviceId workspace_device = ws->device();
-            if (!workspace_device.is_rocm() || workspace_device.rocm_ordinal() != rocm_device_id_)
-            {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Workspace bound to wrong device: workspace="
-                          << workspace_device.to_string() << " kernel=ROCm:" << rocm_device_id_
-                          << " workspace_ptr=" << static_cast<void *>(ws));
                 return false;
             }
 
@@ -1530,6 +1571,34 @@ namespace llaminar2
             const int padded_m = getPaddedM(m);
             const bool needs_padding = needsMPadding(m);
             bool success = false;
+            const bool serialize_rocm_gemm = debugEnv().validation.serialize_rocm_gemm_stage;
+
+            auto runCKDispatch = [&](auto &&dispatch_fn, const char *op_name) -> bool
+            {
+                if (!serialize_rocm_gemm)
+                {
+                    return dispatch_fn();
+                }
+
+                std::lock_guard<std::mutex> lock(*ck_dispatch_mutex_);
+                bool dispatch_success = dispatch_fn();
+                if (!dispatch_success)
+                {
+                    return false;
+                }
+
+#ifdef HAVE_ROCM
+                const hipError_t sync_err = hipStreamSynchronize(reinterpret_cast<hipStream_t>(gpu_stream_));
+                if (sync_err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] " << op_name
+                                                                            << " stream sync failed during serialized CK dispatch: "
+                                                                            << hipGetErrorString(sync_err));
+                    return false;
+                }
+#endif
+                return true;
+            };
 
             if (needs_padding)
             {
@@ -1548,12 +1617,17 @@ namespace llaminar2
                 // Padding buffers come from workspace - no allocation needed
                 // Padded execution with cached buffers (no hot-path allocations!)
                 auto gemm_start = std::chrono::high_resolution_clock::now();
-                success = rocmQuantGemm_executeTwoKernel_padded_cached(
-                    d_A_int8, d_weights_int8, d_C_fp32_dst,
-                    d_scales_A, d_scales_B,
-                    impl_->d_CK_int32,
-                    impl_->d_A_padded, impl_->d_scale_A_padded, impl_->d_E_padded,
-                    m, padded_m, n, k, rocm_device_id_, gpu_stream_);
+                success = runCKDispatch(
+                    [&]()
+                    {
+                        return rocmQuantGemm_executeTwoKernel_padded_cached(
+                            d_A_int8, d_weights_int8, d_C_fp32_dst,
+                            d_scales_A, d_scales_B,
+                            impl_->d_CK_int32,
+                            impl_->d_A_padded, impl_->d_scale_A_padded, impl_->d_E_padded,
+                            m, padded_m, n, k, rocm_device_id_, gpu_stream_, impl_->ck_kernel_context);
+                    },
+                    "executeTwoKernel_padded_cached");
                 auto gemm_end = std::chrono::high_resolution_clock::now();
                 double gemm_ms = std::chrono::duration<double, std::milli>(gemm_end - gemm_start).count();
                 LOG_TRACE("[ROCmGEMM::TIMING] executeTwoKernel_padded_cached M=" << m << " N=" << n << " K=" << k << " took " << gemm_ms << "ms");
@@ -1562,11 +1636,16 @@ namespace llaminar2
             {
                 // Direct execution: no padding needed
                 auto gemm_start = std::chrono::high_resolution_clock::now();
-                success = rocmQuantGemm_executeTwoKernel_cached(
-                    d_A_int8, d_weights_int8, d_C_fp32_dst,
-                    d_scales_A, d_scales_B,
-                    impl_->d_CK_int32,
-                    m, n, k, rocm_device_id_, gpu_stream_);
+                success = runCKDispatch(
+                    [&]()
+                    {
+                        return rocmQuantGemm_executeTwoKernel_cached(
+                            d_A_int8, d_weights_int8, d_C_fp32_dst,
+                            d_scales_A, d_scales_B,
+                            impl_->d_CK_int32,
+                            m, n, k, rocm_device_id_, gpu_stream_, impl_->ck_kernel_context);
+                    },
+                    "executeTwoKernel_cached");
                 auto gemm_end = std::chrono::high_resolution_clock::now();
                 double gemm_ms = std::chrono::duration<double, std::milli>(gemm_end - gemm_start).count();
                 LOG_TRACE("[ROCmGEMM::TIMING] executeTwoKernel_cached M=" << m << " N=" << n << " K=" << k << " took " << gemm_ms << "ms");
@@ -1682,7 +1761,7 @@ namespace llaminar2
                     d_A_int8, d_weights_int8, d_C_fp32,
                     d_scales_A, d_scales_B,
                     impl_->d_CK_int32,
-                    m, padded_m, n, k, rocm_device_id_, gpu_stream_);
+                    m, padded_m, n, k, rocm_device_id_, gpu_stream_, impl_->ck_kernel_context);
                 // Can't get accurate timing for padded path without modifying it
                 if (kernel_time_ms)
                     *kernel_time_ms = -1.0f; // Indicate timing not available
@@ -1695,7 +1774,7 @@ namespace llaminar2
                     d_scales_A, d_scales_B,
                     impl_->d_CK_int32,
                     m, n, k, rocm_device_id_,
-                    kernel_time_ms, gpu_stream_);
+                    kernel_time_ms, gpu_stream_, impl_->ck_kernel_context);
             }
 
             if (!success)
@@ -1875,6 +1954,34 @@ namespace llaminar2
 
             // Step 4: Execute each projection using the SHARED quantized activations
             bool all_success = true;
+            const bool serialize_rocm_gemm = debugEnv().validation.serialize_rocm_gemm_stage;
+
+            auto runCKDispatch = [&](auto &&dispatch_fn, const char *op_name) -> bool
+            {
+                if (!serialize_rocm_gemm)
+                {
+                    return dispatch_fn();
+                }
+
+                std::lock_guard<std::mutex> lock(*ck_dispatch_mutex_);
+                bool dispatch_success = dispatch_fn();
+                if (!dispatch_success)
+                {
+                    return false;
+                }
+
+#ifdef HAVE_ROCM
+                const hipError_t sync_err = hipStreamSynchronize(reinterpret_cast<hipStream_t>(gpu_stream_));
+                if (sync_err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] " << op_name
+                                                                                  << " stream sync failed during serialized CK dispatch: "
+                                                                                  << hipGetErrorString(sync_err));
+                    return false;
+                }
+#endif
+                return true;
+            };
             for (size_t i = 0; i < projections.size() && all_success; ++i)
             {
                 const auto &proj = projections[i];
@@ -2225,15 +2332,20 @@ namespace llaminar2
                     {
                         // Padding buffers come from workspace - no allocation needed
                         // Use CACHED version to avoid hipMalloc/hipFree per call!
-                        success = rocmQuantGemm_executeTwoKernel_padded_cached(
-                            impl_->d_A_int8,
-                            d_weights_int8,
-                            d_output,
-                            impl_->d_scales_A,
-                            d_scales_B,
-                            rocm_kernel->impl_->d_CK_int32,
-                            impl_->d_A_padded, impl_->d_scale_A_padded, impl_->d_E_padded,
-                            m, padded_m, n, k, rocm_device_id_, gpu_stream_);
+                        success = runCKDispatch(
+                            [&]()
+                            {
+                                return rocmQuantGemm_executeTwoKernel_padded_cached(
+                                    impl_->d_A_int8,
+                                    d_weights_int8,
+                                    d_output,
+                                    impl_->d_scales_A,
+                                    d_scales_B,
+                                    rocm_kernel->impl_->d_CK_int32,
+                                    impl_->d_A_padded, impl_->d_scale_A_padded, impl_->d_E_padded,
+                                    m, padded_m, n, k, rocm_device_id_, gpu_stream_, rocm_kernel->impl_->ck_kernel_context);
+                            },
+                            "executeTwoKernel_padded_cached");
 
                         if (success)
                         {
@@ -2251,11 +2363,16 @@ namespace llaminar2
                         LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                                  << " BEFORE executeNoScale m=" << m << " n=" << n << " k=" << k
                                                                                                  << " device=" << rocm_device_id_);
-                        success = rocmQuantGemm_executeNoScale(
-                            impl_->d_A_int8,
-                            d_weights_int8,
-                            rocm_kernel->impl_->d_CK_int32,
-                            m, n, k, rocm_device_id_, gpu_stream_);
+                        success = runCKDispatch(
+                            [&]()
+                            {
+                                return rocmQuantGemm_executeNoScale(
+                                    impl_->d_A_int8,
+                                    d_weights_int8,
+                                    rocm_kernel->impl_->d_CK_int32,
+                                    m, n, k, rocm_device_id_, gpu_stream_, rocm_kernel->impl_->ck_kernel_context);
+                            },
+                            "executeNoScale");
                         LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                                  << " AFTER executeNoScale success=" << success);
 
@@ -2284,25 +2401,35 @@ namespace llaminar2
                     // No bias: use fast path
                     if (needs_padding)
                     {
-                        success = rocmQuantGemm_executeTwoKernel_padded(
-                            impl_->d_A_int8,
-                            d_weights_int8,
-                            d_output,
-                            impl_->d_scales_A,
-                            d_scales_B,
-                            rocm_kernel->impl_->d_CK_int32,
-                            m, padded_m, n, k, rocm_device_id_, gpu_stream_);
+                        success = runCKDispatch(
+                            [&]()
+                            {
+                                return rocmQuantGemm_executeTwoKernel_padded(
+                                    impl_->d_A_int8,
+                                    d_weights_int8,
+                                    d_output,
+                                    impl_->d_scales_A,
+                                    d_scales_B,
+                                    rocm_kernel->impl_->d_CK_int32,
+                                    m, padded_m, n, k, rocm_device_id_, gpu_stream_, rocm_kernel->impl_->ck_kernel_context);
+                            },
+                            "executeTwoKernel_padded");
                     }
                     else
                     {
-                        success = rocmQuantGemm_executeTwoKernel_cached(
-                            impl_->d_A_int8,
-                            d_weights_int8,
-                            d_output,
-                            impl_->d_scales_A,
-                            d_scales_B,
-                            rocm_kernel->impl_->d_CK_int32,
-                            m, n, k, rocm_device_id_, gpu_stream_);
+                        success = runCKDispatch(
+                            [&]()
+                            {
+                                return rocmQuantGemm_executeTwoKernel_cached(
+                                    impl_->d_A_int8,
+                                    d_weights_int8,
+                                    d_output,
+                                    impl_->d_scales_A,
+                                    d_scales_B,
+                                    rocm_kernel->impl_->d_CK_int32,
+                                    m, n, k, rocm_device_id_, gpu_stream_, rocm_kernel->impl_->ck_kernel_context);
+                            },
+                            "executeTwoKernel_cached");
                     }
                 }
 
@@ -2438,6 +2565,11 @@ namespace llaminar2
         void ROCmQuantisedGemmKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
         {
             workspace_ = workspace;
+            // Invalidate workspace validation cache so next validateWorkspace() re-populates
+            if (impl_)
+            {
+                impl_->validated_workspace = nullptr;
+            }
             if (workspace)
             {
                 LOG_DEBUG("[ROCmQuantisedGemmKernel] Bound workspace manager at " << (void *)workspace
@@ -2473,15 +2605,20 @@ namespace llaminar2
             // Path 1: Pre-packed weights (ROCmPackedWeights* passed to constructor)
             if (packed_)
             {
-                if (!packed_->uploaded)
+                std::lock_guard<std::mutex> lock(packed_->upload_mutex);
+                auto upload_it = packed_->device_uploads.find(rocm_device_id_);
+
+                if (upload_it == packed_->device_uploads.end())
                 {
+                    ROCmPackedWeights::DeviceUpload upload;
+
                     // Option B: Upload ONLY VNNI layout + scales to device.
                     // Row-major weights are repacked on-demand from VNNI into a
                     // shared workspace scratch buffer for CK GEMM prefill.
 
                     // Upload scales
                     rocmQuantGemm_setDevice(rocm_device_id_);
-                    if (!rocmQuantGemm_allocFloat(&packed_->d_scales,
+                    if (!rocmQuantGemm_allocFloat(&upload.d_scales,
                                                   static_cast<size_t>(packed_->N),
                                                   rocm_device_id_))
                     {
@@ -2489,12 +2626,14 @@ namespace llaminar2
                         return;
                     }
 
-                    hipError_t err = hipMemcpy(packed_->d_scales,
+                    hipError_t err = hipMemcpy(upload.d_scales,
                                                packed_->scales.data(),
                                                static_cast<size_t>(packed_->N) * sizeof(float),
                                                hipMemcpyHostToDevice);
                     if (err != hipSuccess)
                     {
+                        rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
+                        upload.d_scales = nullptr;
                         LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload scales: "
                                   << hipGetErrorString(err));
                         return;
@@ -2503,20 +2642,26 @@ namespace llaminar2
                     // Upload VNNI layout (sole weight copy on device)
                     if (!packed_->int8_data_vnni.empty())
                     {
-                        if (!rocmQuantGemm_allocInt8(&packed_->d_int8_data_vnni,
+                        if (!rocmQuantGemm_allocInt8(&upload.d_int8_data_vnni,
                                                      packed_->int8_data_vnni.size(),
                                                      rocm_device_id_))
                         {
+                            rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
+                            upload.d_scales = nullptr;
                             LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc VNNI weights");
                             return;
                         }
 
-                        err = hipMemcpy(packed_->d_int8_data_vnni,
+                        err = hipMemcpy(upload.d_int8_data_vnni,
                                         packed_->int8_data_vnni.data(),
                                         packed_->int8_data_vnni.size() * sizeof(int8_t),
                                         hipMemcpyHostToDevice);
                         if (err != hipSuccess)
                         {
+                            rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
+                            upload.d_int8_data_vnni = nullptr;
+                            rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
+                            upload.d_scales = nullptr;
                             LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload VNNI weights: "
                                       << hipGetErrorString(err));
                             return;
@@ -2529,38 +2674,68 @@ namespace llaminar2
                     // Upload Phase-1 ratio-VNNI compact buffers if available
                     if (!packed_->ratio_vnni_payload.empty() && !packed_->ratio_vnni_ratio.empty())
                     {
-                        if (!rocmQuantGemm_allocInt8(reinterpret_cast<int8_t **>(&packed_->d_ratio_vnni_payload),
+                        if (!rocmQuantGemm_allocInt8(reinterpret_cast<int8_t **>(&upload.d_ratio_vnni_payload),
                                                      packed_->ratio_vnni_payload.size(),
                                                      rocm_device_id_))
                         {
+                            if (upload.d_int8_data_vnni)
+                                rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
+                            rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
+                            upload.d_int8_data_vnni = nullptr;
+                            upload.d_scales = nullptr;
                             LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc ratio payload");
                             return;
                         }
-                        if (!rocmQuantGemm_allocInt8(&packed_->d_ratio_vnni_ratio,
+                        if (!rocmQuantGemm_allocInt8(&upload.d_ratio_vnni_ratio,
                                                      packed_->ratio_vnni_ratio.size(),
                                                      rocm_device_id_))
                         {
+                            rocmQuantGemm_freeDevice(upload.d_ratio_vnni_payload, rocm_device_id_);
+                            upload.d_ratio_vnni_payload = nullptr;
+                            if (upload.d_int8_data_vnni)
+                                rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
+                            rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
+                            upload.d_int8_data_vnni = nullptr;
+                            upload.d_scales = nullptr;
                             LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc ratio bytes");
                             return;
                         }
 
-                        err = hipMemcpy(packed_->d_ratio_vnni_payload,
+                        err = hipMemcpy(upload.d_ratio_vnni_payload,
                                         packed_->ratio_vnni_payload.data(),
                                         packed_->ratio_vnni_payload.size() * sizeof(uint8_t),
                                         hipMemcpyHostToDevice);
                         if (err != hipSuccess)
                         {
+                            rocmQuantGemm_freeDevice(upload.d_ratio_vnni_ratio, rocm_device_id_);
+                            rocmQuantGemm_freeDevice(upload.d_ratio_vnni_payload, rocm_device_id_);
+                            upload.d_ratio_vnni_ratio = nullptr;
+                            upload.d_ratio_vnni_payload = nullptr;
+                            if (upload.d_int8_data_vnni)
+                                rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
+                            rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
+                            upload.d_int8_data_vnni = nullptr;
+                            upload.d_scales = nullptr;
                             LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload ratio payload: "
                                       << hipGetErrorString(err));
                             return;
                         }
 
-                        err = hipMemcpy(packed_->d_ratio_vnni_ratio,
+                        err = hipMemcpy(upload.d_ratio_vnni_ratio,
                                         packed_->ratio_vnni_ratio.data(),
                                         packed_->ratio_vnni_ratio.size() * sizeof(int8_t),
                                         hipMemcpyHostToDevice);
                         if (err != hipSuccess)
                         {
+                            rocmQuantGemm_freeDevice(upload.d_ratio_vnni_ratio, rocm_device_id_);
+                            rocmQuantGemm_freeDevice(upload.d_ratio_vnni_payload, rocm_device_id_);
+                            upload.d_ratio_vnni_ratio = nullptr;
+                            upload.d_ratio_vnni_payload = nullptr;
+                            if (upload.d_int8_data_vnni)
+                                rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
+                            rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
+                            upload.d_int8_data_vnni = nullptr;
+                            upload.d_scales = nullptr;
                             LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload ratio bytes: "
                                       << hipGetErrorString(err));
                             return;
@@ -2577,19 +2752,28 @@ namespace llaminar2
                                  "ROCm GEMV/CK prefill paths may not work.");
                     }
 
-                    packed_->uploaded = true;
-                    packed_->rocm_device_id = rocm_device_id_;
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded pre-packed weights (Option B): "
-                              << packed_->N << "x" << packed_->K
-                              << " VRAM: " << (packed_->int8_data_vnni.size() / 1024) << " KB"
-                              << " (was " << (packed_->int8_data_vnni.size() * 2 / 1024) << " KB with row-major)");
+                    auto emplaced = packed_->device_uploads.emplace(rocm_device_id_, upload);
+                    upload_it = emplaced.first;
+
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded pre-packed weights (Option B) to ROCm:" << rocm_device_id_
+                                                                                                          << " " << packed_->N << "x" << packed_->K
+                                                                                                          << " VRAM: " << (packed_->int8_data_vnni.size() / 1024) << " KB"
+                                                                                                          << " (was " << (packed_->int8_data_vnni.size() * 2 / 1024) << " KB with row-major)");
                 }
 
+                const auto &upload = upload_it->second;
+                packed_->d_int8_data_vnni = upload.d_int8_data_vnni;
+                packed_->d_ratio_vnni_payload = upload.d_ratio_vnni_payload;
+                packed_->d_ratio_vnni_ratio = upload.d_ratio_vnni_ratio;
+                packed_->d_scales = upload.d_scales;
+                packed_->uploaded = true;
+                packed_->rocm_device_id = rocm_device_id_;
+
                 // Point impl_ to packed_ device pointers
-                impl_->d_weights_int8_vnni = packed_->d_int8_data_vnni;
-                impl_->d_weights_ratio_payload = packed_->d_ratio_vnni_payload;
-                impl_->d_weights_ratio = packed_->d_ratio_vnni_ratio;
-                impl_->d_scales_B = packed_->d_scales;
+                impl_->d_weights_int8_vnni = upload.d_int8_data_vnni;
+                impl_->d_weights_ratio_payload = upload.d_ratio_vnni_payload;
+                impl_->d_weights_ratio = upload.d_ratio_vnni_ratio;
+                impl_->d_scales_B = upload.d_scales;
                 impl_->ratio_vnni_bitwidth = packed_->ratio_vnni_bitwidth;
                 impl_->ratio_vnni_codebook_id = packed_->ratio_vnni_codebook_id;
                 impl_->ratio_vnni_has_min = packed_->ratio_vnni_has_min;
@@ -2716,13 +2900,23 @@ namespace llaminar2
         void ROCmQuantisedGemmKernel::validateWorkspace() const
         {
             // =========================================================================
+            // Fast path: skip re-validation if same workspace was already validated.
+            // During steady-state inference, the workspace pointer never changes,
+            // so this avoids ~20 unordered_map<string> lookups per GEMM call.
+            // (~2260 lookups/token × ~100ns each = ~0.2ms/token savings)
+            // =========================================================================
+            if (impl_->validated_workspace == workspace_)
+            {
+                return;
+            }
+
+            // =========================================================================
             // Workspace is REQUIRED - no fallback allocation
             // =========================================================================
-            if (!hasWorkspace())
+            if (!validateROCmWorkspaceBinding(workspace_, rocm_device_id_, "ROCmQuantisedGemmKernel"))
             {
                 throw std::runtime_error(
-                    "[ROCmQuantisedGemmKernel] Workspace not bound. Kernels require pre-allocated "
-                    "workspace buffers via bindWorkspace(). This is not optional.");
+                    "[ROCmQuantisedGemmKernel] Invalid workspace binding");
             }
 
             // Validate required buffers exist
@@ -2804,6 +2998,9 @@ namespace llaminar2
             impl_->d_A_padded_capacity = SIZE_MAX;
             impl_->d_scale_A_padded_capacity = SIZE_MAX;
             impl_->d_E_padded_capacity = SIZE_MAX;
+
+            // Mark workspace as validated to skip re-validation on next call
+            impl_->validated_workspace = workspace_;
 
             LOG_TRACE("[ROCmQuantisedGemmKernel::validateWorkspace] Workspace validated, pointers populated"
                       << " A_int8=" << (void *)impl_->d_A_int8
@@ -2969,7 +3166,7 @@ namespace llaminar2
                     d_C, // Output FP32
                     impl_->d_scales_A, impl_->d_scales_B,
                     impl_->d_C_int32, // Pre-allocated INT32 accumulator
-                    m, n, k, rocm_device_id_, gpu_stream_))
+                    m, n, k, rocm_device_id_, gpu_stream_, impl_->ck_kernel_context))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel] CK two-kernel GEMM failed");
                 return false;
@@ -3123,7 +3320,7 @@ namespace llaminar2
             // Step 2: Execute CK INT8 GEMM → INT32 (no scaling)
             if (!rocmQuantGemm_executeNoScale(
                     impl_->d_A_int8, impl_->d_B_rowmajor_scratch, impl_->d_C_int32,
-                    m, n, k, rocm_device_id_, gpu_stream_))
+                    m, n, k, rocm_device_id_, gpu_stream_, impl_->ck_kernel_context))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel] CK NoScale GEMM failed");
                 return false;

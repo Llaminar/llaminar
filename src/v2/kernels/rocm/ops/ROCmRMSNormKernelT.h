@@ -44,7 +44,7 @@ namespace llaminar2
         public:
             using StorageType = float;
 
-            explicit ROCmRMSNormKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+            explicit ROCmRMSNormKernelT(int device_idx = -1) : device_idx_(device_idx) {}
 
             /**
              * @brief Construct with device context (Phase 4 pattern)
@@ -124,7 +124,7 @@ namespace llaminar2
         public:
             using StorageType = uint16_t;
 
-            explicit ROCmRMSNormKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+            explicit ROCmRMSNormKernelT(int device_idx = -1) : device_idx_(device_idx) {}
 
             /**
              * @brief Construct with device context (Phase 4 pattern)
@@ -213,7 +213,7 @@ namespace llaminar2
         public:
             using StorageType = uint16_t;
 
-            explicit ROCmRMSNormKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+            explicit ROCmRMSNormKernelT(int device_idx = -1) : device_idx_(device_idx) {}
 
             /**
              * @brief Construct with device context (Phase 4 pattern)

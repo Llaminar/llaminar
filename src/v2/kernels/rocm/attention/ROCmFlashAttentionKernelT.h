@@ -122,7 +122,7 @@ namespace llaminar2
              * @brief Construct a ROCm Flash Attention kernel
              * @param device_idx ROCm device index (0-based)
              */
-            explicit ROCmFlashAttentionKernelT(int device_idx = 0);
+            explicit ROCmFlashAttentionKernelT(int device_idx = -1);
             ~ROCmFlashAttentionKernelT() override;
 
             // Non-copyable, moveable
@@ -310,7 +310,7 @@ namespace llaminar2
              * @brief Create ROCm Flash Attention kernel (legacy constructor)
              * @param device_idx ROCm device index (0-based)
              */
-            explicit ROCmFlashAttentionKernelT(int device_idx = 0);
+            explicit ROCmFlashAttentionKernelT(int device_idx = -1);
 
             /**
              * @brief Create ROCm Flash Attention kernel using device context
@@ -496,7 +496,7 @@ namespace llaminar2
              * @brief Create ROCm Flash Attention kernel (legacy constructor)
              * @param device_idx ROCm device index (0-based)
              */
-            explicit ROCmFlashAttentionKernelT(int device_idx = 0);
+            explicit ROCmFlashAttentionKernelT(int device_idx = -1);
 
             /**
              * @brief Create ROCm Flash Attention kernel using device context
@@ -632,7 +632,7 @@ namespace llaminar2
              * @brief Create ROCm Flash Attention kernel (legacy constructor)
              * @param device_idx ROCm device index (0-based)
              */
-            explicit ROCmFlashAttentionKernelT(int device_idx = 0);
+            explicit ROCmFlashAttentionKernelT(int device_idx = -1);
 
             /**
              * @brief Create ROCm Flash Attention kernel using device context

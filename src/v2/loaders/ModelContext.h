@@ -39,7 +39,7 @@ namespace llaminar2
      *   auto ctx = ModelContext::create("model.gguf", mpi_ctx);
      *   auto pipeline = PipelineFactory::create(ctx->architecture(), ctx, mpi_ctx, device_idx);
      *   // Pipeline reads hyperparameters from ctx->model()
-     *   // Pipeline loads weights via ctx->getWeight(name, device_idx)
+     *   // Pipeline loads weights via ctx->getWeightForDevice(name, device_idx)
      */
     class ModelContext : public IModelContext
     {
@@ -157,30 +157,16 @@ namespace llaminar2
         const ModelLoader &concreteLoader() const { return loader_; }
 
         /**
-         * @brief Get weight tensor by name (shared instance)
-         *
-         * Loads from GGUF with appropriate distribution strategy.
-         *
-         * @param name GGUF tensor name (e.g., "token_embd.weight", "blk.0.attn_q.weight")
-         * @param device Device for tensor placement (default: CPU)
-         * @return Shared pointer to tensor, or nullptr on error
-         */
-        std::shared_ptr<TensorBase> getWeight(const std::string &name, DeviceId device = DeviceId::cpu()) override
-        {
-            return weight_manager_->getWeight(name, device);
-        }
-
-        /**
          * @brief Get weight tensor for a specific device (device-isolated instance)
          *
-         * For multi-device scenarios (LOCAL TP), each device needs its own tensor
-         * instance to track coherence state independently.
+         * Loads from GGUF with appropriate distribution strategy.
+         * For multi-device scenarios, returns device-isolated clones.
          *
-         * @param name GGUF tensor name
-         * @param device Target device for this tensor instance
+         * @param name GGUF tensor name (e.g., "token_embd.weight", "blk.0.attn_q.weight")
+         * @param device Target device for this tensor instance (default: CPU)
          * @return Device-specific tensor instance, or nullptr on error
          */
-        std::shared_ptr<TensorBase> getWeightForDevice(const std::string &name, DeviceId device) override
+        std::shared_ptr<TensorBase> getWeightForDevice(const std::string &name, DeviceId device = DeviceId::cpu()) override
         {
             return weight_manager_->getWeightForDevice(name, device);
         }

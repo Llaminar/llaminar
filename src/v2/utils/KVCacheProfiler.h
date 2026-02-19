@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <limits>
+#include <print>
 #include <mutex>
 #include <sstream>
 
@@ -309,7 +310,7 @@ namespace llaminar2
             std::string summary = getSummary();
             if (!summary.empty())
             {
-                fprintf(stderr, "%s", summary.c_str());
+                std::print("{}", summary);
             }
         }
 

@@ -70,8 +70,8 @@ namespace llaminar2
      *
      * Usage:
      *   auto mgr = std::make_shared<WeightManager>(loader, mpi_ctx);
-     *   auto wq = mgr->getWeight("blk.0.attn_q.weight", device_idx);
-     *   auto wk = mgr->getWeight("blk.0.attn_k.weight", device_idx);
+     *   auto wq = mgr->getWeightForDevice("blk.0.attn_q.weight", device_idx);
+     *   auto wk = mgr->getWeightForDevice("blk.0.attn_k.weight", device_idx);
      */
     class WeightManager : public IWeightManager
     {
@@ -92,35 +92,21 @@ namespace llaminar2
                       WeightPrecision weight_precision = WeightPrecision::CONVERT_TO_FP32);
 
         /**
-         * @brief Get weight tensor by name (shared instance)
-         *
-         * Loads from GGUF if not cached, applies distribution strategy.
-         * Device placement is determined by placement_map if provided.
-         *
-         * WARNING: For multi-device scenarios, use getWeightForDevice() instead.
-         *
-         * @param name GGUF tensor name (e.g., "token_embd.weight", "blk.0.attn_q.weight")
-         * @param device Device for tensor placement (default: CPU)
-         * @param layer_idx Optional layer index for placement map lookup
-         * @return Shared pointer to tensor, or nullptr on error
-         */
-        std::shared_ptr<TensorBase> getWeight(const std::string &name, DeviceId device = DeviceId::cpu(), int layer_idx = -1) override;
-
-        /**
          * @brief Get weight tensor for a specific device (device-isolated instance)
          *
+         * Loads from GGUF if not cached, applies distribution strategy.
          * For multi-device scenarios (LOCAL TP), each device needs its own tensor
          * instance to track coherence state independently. This method:
          * - Returns the original tensor for the first device that requests it
          * - Creates and caches a clone for subsequent devices
          * - Clones are uploaded to GPU independently, avoiding race conditions
          *
-         * @param name GGUF tensor name
-         * @param device Target device for this tensor instance
+         * @param name GGUF tensor name (e.g., "token_embd.weight", "blk.0.attn_q.weight")
+         * @param device Target device for this tensor instance (default: CPU)
          * @param layer_idx Optional layer index for placement map lookup
          * @return Device-specific tensor instance, or nullptr on error
          */
-        std::shared_ptr<TensorBase> getWeightForDevice(const std::string &name, DeviceId device, int layer_idx = -1) override;
+        std::shared_ptr<TensorBase> getWeightForDevice(const std::string &name, DeviceId device = DeviceId::cpu(), int layer_idx = -1) override;
 
         /**
          * @brief Pre-load and upload weights for multiple devices
@@ -211,7 +197,7 @@ namespace llaminar2
          * @brief Set layer range for LAYER_PARTITIONED strategy
          *
          * For Pipeline Parallelism, restricts which layer weights are loaded.
-         * Weights outside this range will return nullptr from getWeight().
+         * Weights outside this range will return nullptr from getWeightForDevice().
          *
          * Layer range is [first, last) - first is inclusive, last is exclusive.
          *

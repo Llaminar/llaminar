@@ -136,7 +136,6 @@
 #include <iostream>
 #include <streambuf>
 #include <array>
-#include <mutex>
 #include <memory>
 
 #include "../../backends/rocm/HipDeviceGuard.h"
@@ -610,11 +609,11 @@ using DeviceGemmInt8_NoScale_128x128_MNPadding = ck::tensor_operation::device::D
 //     - GPU ISA compatibility checks
 //     - Internal buffer allocation
 //
-//   By using per-device static arrays, we:
-//     - Pay construction cost only on first call per device
-//     - Ensure thread-safe initialization (C++11 guarantees per element)
-//     - Avoid race conditions when multiple devices call concurrently
-//     - Zero overhead on subsequent calls
+//   By using per-instance kernel context, we:
+//     - Pay construction cost only on first use per kernel instance
+//     - Keep CK object lifetime bound to ROCmQuantisedGemmKernel lifetime
+//     - Avoid process-global mutable state across concurrent device execution
+//     - Keep repeated dispatch on the same instance allocation-free
 //
 // CRITICAL: CK kernel objects may have internal mutable state (cached streams,
 // workspace buffers) that is NOT thread-safe for concurrent use from different
@@ -640,59 +639,49 @@ using DeviceGemmInt8_NoScale_128x128_MNPadding = ck::tensor_operation::device::D
 //
 // ============================================================================
 
-// Maximum supported devices for per-device kernel caching
-constexpr int MAX_ROCM_DEVICES = 32;
+struct ROCmCKKernelContext
+{
+    int rocm_device_id = 0;
+    std::unique_ptr<DeviceGemmInt8_NoScale> kernel_128x128;
+    std::unique_ptr<DeviceGemmInt8_NoScale_128x128_MNPadding> kernel_128x128_mn_padding;
+    std::unique_ptr<DeviceGemmInt8_NoScale_64x64> kernel_64x64;
+    std::unique_ptr<DeviceGemmInt8_NoScale_32x32> kernel_32x32;
+};
 
-// Per-device kernel caches (each device gets its own CK kernel object)
-// We use lazy initialization with std::call_once for thread-safe construction
-// NOTE: No mutex needed - std::call_once provides all necessary thread safety
-
-// 128×128 kernel (for M >= 128, M % 128 == 0) - peak throughput, no padding
-static DeviceGemmInt8_NoScale& getCachedNoScaleKernel(int device_id = 0) {
-    static std::array<std::unique_ptr<DeviceGemmInt8_NoScale>, MAX_ROCM_DEVICES> devices;
-    static std::array<std::once_flag, MAX_ROCM_DEVICES> init_flags;
-    
-    int idx = std::min(std::max(device_id, 0), MAX_ROCM_DEVICES - 1);
-    std::call_once(init_flags[idx], [idx]() {
-        devices[idx] = std::make_unique<DeviceGemmInt8_NoScale>();
-    });
-    return *devices[idx];
+static DeviceGemmInt8_NoScale& getCachedNoScaleKernel(ROCmCKKernelContext& context)
+{
+    if (!context.kernel_128x128)
+    {
+        context.kernel_128x128 = std::make_unique<DeviceGemmInt8_NoScale>();
+    }
+    return *context.kernel_128x128;
 }
 
-// 128×128 kernel with MN-padding (for M >= 128, M % 128 != 0) - handles irregular M
-static DeviceGemmInt8_NoScale_128x128_MNPadding& getCachedNoScaleKernel128x128MNPadding(int device_id = 0) {
-    static std::array<std::unique_ptr<DeviceGemmInt8_NoScale_128x128_MNPadding>, MAX_ROCM_DEVICES> devices;
-    static std::array<std::once_flag, MAX_ROCM_DEVICES> init_flags;
-    
-    int idx = std::min(std::max(device_id, 0), MAX_ROCM_DEVICES - 1);
-    std::call_once(init_flags[idx], [idx]() {
-        devices[idx] = std::make_unique<DeviceGemmInt8_NoScale_128x128_MNPadding>();
-    });
-    return *devices[idx];
+static DeviceGemmInt8_NoScale_128x128_MNPadding& getCachedNoScaleKernel128x128MNPadding(ROCmCKKernelContext& context)
+{
+    if (!context.kernel_128x128_mn_padding)
+    {
+        context.kernel_128x128_mn_padding = std::make_unique<DeviceGemmInt8_NoScale_128x128_MNPadding>();
+    }
+    return *context.kernel_128x128_mn_padding;
 }
 
-// 64×64 kernel (for 32 < M < 128) - good balance
-static DeviceGemmInt8_NoScale_64x64& getCachedNoScaleKernel64x64(int device_id = 0) {
-    static std::array<std::unique_ptr<DeviceGemmInt8_NoScale_64x64>, MAX_ROCM_DEVICES> devices;
-    static std::array<std::once_flag, MAX_ROCM_DEVICES> init_flags;
-    
-    int idx = std::min(std::max(device_id, 0), MAX_ROCM_DEVICES - 1);
-    std::call_once(init_flags[idx], [idx]() {
-        devices[idx] = std::make_unique<DeviceGemmInt8_NoScale_64x64>();
-    });
-    return *devices[idx];
+static DeviceGemmInt8_NoScale_64x64& getCachedNoScaleKernel64x64(ROCmCKKernelContext& context)
+{
+    if (!context.kernel_64x64)
+    {
+        context.kernel_64x64 = std::make_unique<DeviceGemmInt8_NoScale_64x64>();
+    }
+    return *context.kernel_64x64;
 }
 
-// 32×32 kernel (for M <= 32) - optimal for decode
-static DeviceGemmInt8_NoScale_32x32& getCachedNoScaleKernel32x32(int device_id = 0) {
-    static std::array<std::unique_ptr<DeviceGemmInt8_NoScale_32x32>, MAX_ROCM_DEVICES> devices;
-    static std::array<std::once_flag, MAX_ROCM_DEVICES> init_flags;
-    
-    int idx = std::min(std::max(device_id, 0), MAX_ROCM_DEVICES - 1);
-    std::call_once(init_flags[idx], [idx]() {
-        devices[idx] = std::make_unique<DeviceGemmInt8_NoScale_32x32>();
-    });
-    return *devices[idx];
+static DeviceGemmInt8_NoScale_32x32& getCachedNoScaleKernel32x32(ROCmCKKernelContext& context)
+{
+    if (!context.kernel_32x32)
+    {
+        context.kernel_32x32 = std::make_unique<DeviceGemmInt8_NoScale_32x32>();
+    }
+    return *context.kernel_32x32;
 }
 
 enum class QuantShapeClass
@@ -1073,12 +1062,22 @@ __global__ void applyScaling_m1_vec4_kernel(
     }
 }
 
+__global__ void fillConstantFloat_kernel(float* __restrict__ dst, int count, float value)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count)
+    {
+        dst[idx] = value;
+    }
+}
+
 // ============================================================================
 // STUBS: Phase 4 functions return success but log "not yet implemented"
 // ============================================================================
 
 extern "C"
 {
+    bool rocmQuantGemm_setDevice(int rocm_device_id);
 
     // -------------------------------------------------------------------------
     // Dimension requirements (CK tile-based constraints)
@@ -1115,33 +1114,56 @@ extern "C"
     //
     // Call this from BackendManager::initROCmBackend() after device setup.
     
+    void *rocmQuantGemm_createKernelContext(int rocm_device_id)
+    {
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+            return nullptr;
+
+        auto *context = new (std::nothrow) ROCmCKKernelContext();
+        if (!context)
+            return nullptr;
+
+        context->rocm_device_id = rocm_device_id;
+        return context;
+    }
+
+    void rocmQuantGemm_destroyKernelContext(void *kernel_ctx, int rocm_device_id)
+    {
+        if (!kernel_ctx)
+            return;
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+            return;
+        auto *context = static_cast<ROCmCKKernelContext *>(kernel_ctx);
+        delete context;
+    }
+
     void rocmQuantGemm_warmupKernels()
     {
         fprintf(stderr, "[CK Warmup] Pre-initializing CK INT8 GEMM kernels...\n");
         
         auto start = std::chrono::high_resolution_clock::now();
         
-        // Force construction of all 3 kernel variants
-        // The static local initialization happens here
-        (void)getCachedNoScaleKernel32x32();  // 32x32 for decode (M <= 32)
+        // Force construction of all kernel variants for this warmup context
+        ROCmCKKernelContext context{};
+        (void)getCachedNoScaleKernel32x32(context);  // 32x32 for decode (M <= 32)
         
         auto t1 = std::chrono::high_resolution_clock::now();
         auto d1 = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - start).count();
         fprintf(stderr, "[CK Warmup]   32x32 kernel: %ld ms\n", d1);
         
-        (void)getCachedNoScaleKernel64x64();  // 64x64 for small batch (32 < M < 128)
+        (void)getCachedNoScaleKernel64x64(context);  // 64x64 for small batch (32 < M < 128)
         
         auto t2 = std::chrono::high_resolution_clock::now();
         auto d2 = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
         fprintf(stderr, "[CK Warmup]   64x64 kernel: %ld ms\n", d2);
         
-        (void)getCachedNoScaleKernel();       // 128x128 for prefill (M >= 128, M%128==0)
+        (void)getCachedNoScaleKernel(context);       // 128x128 for prefill (M >= 128, M%128==0)
         
         auto t3 = std::chrono::high_resolution_clock::now();
         auto d3 = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
         fprintf(stderr, "[CK Warmup]   128x128 kernel: %ld ms\n", d3);
         
-        (void)getCachedNoScaleKernel128x128MNPadding();  // 128x128 MNPadding for M%128!=0
+        (void)getCachedNoScaleKernel128x128MNPadding(context);  // 128x128 MNPadding for M%128!=0
         
         auto t4 = std::chrono::high_resolution_clock::now();
         auto d4 = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count();
@@ -1367,7 +1389,8 @@ extern "C"
         const int8_t *d_weights_int8,
         int32_t *d_C_int32,
         int M, int N, int K,
-        int rocm_device_id, void* stream)
+        int rocm_device_id, void* stream,
+        void* kernel_ctx)
     {
         if (!rocmQuantGemm_setDevice(rocm_device_id))
             return false;
@@ -1384,6 +1407,18 @@ extern "C"
         static constexpr bool debug_timing = false;
         auto t0 = std::chrono::high_resolution_clock::now();
 
+        ROCmCKKernelContext local_context;
+        local_context.rocm_device_id = rocm_device_id;
+        auto* context = kernel_ctx ? static_cast<ROCmCKKernelContext*>(kernel_ctx) : &local_context;
+
+        if (context->rocm_device_id != rocm_device_id)
+        {
+            fprintf(stderr,
+                "[rocmQuantGemm_executeNoScale] Context device mismatch: ctx=%d call=%d\n",
+                context->rocm_device_id, rocm_device_id);
+            return false;
+        }
+
         // =====================================================================
         // 4-WAY DISPATCH BASED ON M
         // =====================================================================
@@ -1399,7 +1434,7 @@ extern "C"
         if (M <= 32)
         {
             // Small M: Use 32×32 kernel (optimal for decode, M=1-32)
-            auto& device_gemm = getCachedNoScaleKernel32x32(rocm_device_id);
+            auto& device_gemm = getCachedNoScaleKernel32x32(*context);
             auto argument = device_gemm.MakeArgument(
                 d_A_int8, d_weights_int8, p_ds, d_C_int32,
                 M, N, K,
@@ -1420,7 +1455,7 @@ extern "C"
         else if (M < 128)
         {
             // Medium M: Use 64×64 kernel (optimal for M=33-127)
-            auto& device_gemm = getCachedNoScaleKernel64x64(rocm_device_id);
+            auto& device_gemm = getCachedNoScaleKernel64x64(*context);
             auto argument = device_gemm.MakeArgument(
                 d_A_int8, d_weights_int8, p_ds, d_C_int32,
                 M, N, K,
@@ -1441,7 +1476,7 @@ extern "C"
         else if (M % 128 == 0)
         {
             // Large M, multiple of 128: Use 128×128 kernel with GemmDefault (peak throughput)
-            auto& device_gemm = getCachedNoScaleKernel(rocm_device_id);
+            auto& device_gemm = getCachedNoScaleKernel(*context);
             auto argument = device_gemm.MakeArgument(
                 d_A_int8, d_weights_int8, p_ds, d_C_int32,
                 M, N, K,
@@ -1466,7 +1501,7 @@ extern "C"
 
             if (use_64)
             {
-                auto& device_gemm = getCachedNoScaleKernel64x64(rocm_device_id);
+                auto& device_gemm = getCachedNoScaleKernel64x64(*context);
                 auto argument = device_gemm.MakeArgument(
                     d_A_int8, d_weights_int8, p_ds, d_C_int32,
                     M, N, K,
@@ -1486,7 +1521,7 @@ extern "C"
             }
             else
             {
-                auto& device_gemm = getCachedNoScaleKernel128x128MNPadding(rocm_device_id);
+                auto& device_gemm = getCachedNoScaleKernel128x128MNPadding(*context);
                 auto argument = device_gemm.MakeArgument(
                     d_A_int8, d_weights_int8, p_ds, d_C_int32,
                     M, N, K,
@@ -1560,7 +1595,8 @@ extern "C"
         const float *d_scale_A,       // [M] per-row scales
         const float *d_scale_B,       // [N] per-column scales
         int M, int N, int K,
-        int rocm_device_id, void* stream)
+        int rocm_device_id, void* stream,
+        void* kernel_ctx)
     {
         if (M <= 0 || N <= 0 || K <= 0)
             return true;
@@ -1576,7 +1612,7 @@ extern "C"
         }
 
         // 2. Run CK INT8 GEMM: C_int32 = A_int8 × B_int8 (no scaling)
-        if (!rocmQuantGemm_executeNoScale(d_A_int8, d_B_int8, d_C_int32, M, N, K, rocm_device_id, stream))
+        if (!rocmQuantGemm_executeNoScale(d_A_int8, d_B_int8, d_C_int32, M, N, K, rocm_device_id, stream, kernel_ctx))
         {
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel] CK NoScale GEMM failed\n");
             hipFree(d_C_int32);
@@ -1631,7 +1667,8 @@ extern "C"
         const float *d_scale_B,       // [N] per-column scales
         int32_t *d_C_int32,           // Pre-allocated [M × N] INT32 accumulator
         int M, int N, int K,
-        int rocm_device_id, void* stream)
+        int rocm_device_id, void* stream,
+        void* kernel_ctx)
     {
         auto t_total_start = std::chrono::high_resolution_clock::now();
         auto t_step_start = t_total_start;
@@ -1656,7 +1693,7 @@ extern "C"
         }
 
         // 1. Run CK INT8 GEMM: C_int32 = A_int8 × B_int8 (no scaling)
-        if (!rocmQuantGemm_executeNoScale(d_A_int8, d_B_int8, d_C_int32, M, N, K, rocm_device_id, stream))
+        if (!rocmQuantGemm_executeNoScale(d_A_int8, d_B_int8, d_C_int32, M, N, K, rocm_device_id, stream, kernel_ctx))
         {
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_cached] CK NoScale GEMM failed\n");
             return false;
@@ -1728,7 +1765,8 @@ extern "C"
         int M,                        // Actual M (output rows needed)
         int padded_m,                 // Padded M for CK (>= CK_SMALL_MIN_M = 8)
         int N, int K,
-        int rocm_device_id, void* stream)
+        int rocm_device_id, void* stream,
+        void* kernel_ctx)
     {
         if (M <= 0 || N <= 0 || K <= 0)
             return true;
@@ -1802,9 +1840,14 @@ extern "C"
         // Fill padding scales with 1.0 (so padded rows have neutral scaling)
         if (padded_m > M)
         {
-            std::vector<float> padding_scales(padded_m - M, 1.0f);
-            err = hipMemcpy(d_scale_A_padded + M, padding_scales.data(),
-                           (padded_m - M) * sizeof(float), hipMemcpyHostToDevice);
+            const int padding_count = padded_m - M;
+            const int fill_block = 256;
+            const int fill_grid = (padding_count + fill_block - 1) / fill_block;
+            hipLaunchKernelGGL(
+                fillConstantFloat_kernel,
+                dim3(fill_grid), dim3(fill_block), 0, static_cast<hipStream_t>(stream),
+                d_scale_A_padded + M, padding_count, 1.0f);
+            err = hipGetLastError();
             if (err != hipSuccess)
             {
                 fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded] Failed to fill padding scales: %s\n",
@@ -1828,7 +1871,7 @@ extern "C"
         }
 
         // 4. Run CK INT8 GEMM on padded dimensions: C_int32 = A_padded × B (no scaling)
-        if (!rocmQuantGemm_executeNoScale(d_A_padded, d_B_int8, d_C_int32, padded_m, N, K, rocm_device_id, stream))
+        if (!rocmQuantGemm_executeNoScale(d_A_padded, d_B_int8, d_C_int32, padded_m, N, K, rocm_device_id, stream, kernel_ctx))
         {
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded] CK NoScale GEMM failed\n");
             hipFree(d_A_padded);
@@ -1907,7 +1950,8 @@ extern "C"
         int M,                        // Actual M (output rows needed)
         int padded_m,                 // Padded M for CK (>= CK_SMALL_MIN_M = 8)
         int N, int K,
-        int rocm_device_id, void* stream)
+        int rocm_device_id, void* stream,
+        void* kernel_ctx)
     {
         auto t_total_start = std::chrono::high_resolution_clock::now();
         auto t_step_start = t_total_start;
@@ -1972,25 +2016,17 @@ extern "C"
         }
         log_timing("hipMemcpyAsync_scales");
 
-        // Fill padding scales with 1.0 - use async copy to avoid blocking on previous work
+        // Fill padding scales with 1.0 (allocation-free, stream-ordered)
         if (padded_m > M)
         {
-            // Use a static buffer for the padding scales to avoid repeated allocation
-            static thread_local std::vector<float> padding_scales;
-            size_t padding_count = static_cast<size_t>(padded_m - M);
-            if (padding_scales.size() < padding_count)
-            {
-                padding_scales.resize(padding_count, 1.0f);
-            }
-            else
-            {
-                // Ensure all values are 1.0 (they should be from initial resize, but be safe)
-                std::fill(padding_scales.begin(), padding_scales.begin() + padding_count, 1.0f);
-            }
-            
-            // Use async copy to avoid blocking - small buffer (<1KB for padded_m=128)
-            err = hipMemcpyAsync(d_scale_A_padded + M, padding_scales.data(),
-                           padding_count * sizeof(float), hipMemcpyHostToDevice, static_cast<hipStream_t>(stream));
+            const int padding_count = padded_m - M;
+            const int fill_block = 256;
+            const int fill_grid = (padding_count + fill_block - 1) / fill_block;
+            hipLaunchKernelGGL(
+                fillConstantFloat_kernel,
+                dim3(fill_grid), dim3(fill_block), 0, static_cast<hipStream_t>(stream),
+                d_scale_A_padded + M, padding_count, 1.0f);
+            err = hipGetLastError();
             if (err != hipSuccess)
             {
                 fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] Failed to fill padding scales: %s\n",
@@ -2001,7 +2037,7 @@ extern "C"
         log_timing("fill_padding_scales");
 
         // 3. Run CK INT8 GEMM on padded dimensions: C_int32 = A_padded × B (no scaling)
-        if (!rocmQuantGemm_executeNoScale(d_A_padded, d_B_int8, d_C_int32, padded_m, N, K, rocm_device_id, stream))
+        if (!rocmQuantGemm_executeNoScale(d_A_padded, d_B_int8, d_C_int32, padded_m, N, K, rocm_device_id, stream, kernel_ctx))
         {
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] CK NoScale GEMM failed\n");
             return false;
@@ -2305,7 +2341,8 @@ extern "C"
         int32_t *d_C_int32,           // Pre-allocated [M × N] INT32 accumulator
         int M, int N, int K,
         int rocm_device_id,
-        float *kernel_time_ms, void* stream)        // OUTPUT: kernel execution time in ms
+        float *kernel_time_ms, void* stream,
+        void* kernel_ctx)        // OUTPUT: kernel execution time in ms
     {
         if (M <= 0 || N <= 0 || K <= 0)
         {
@@ -2352,7 +2389,7 @@ extern "C"
         }
 
         // 1. Run CK INT8 GEMM: C_int32 = A_int8 × B_int8 (no scaling)
-        if (!rocmQuantGemm_executeNoScale(d_A_int8, d_B_int8, d_C_int32, M, N, K, rocm_device_id, stream))
+        if (!rocmQuantGemm_executeNoScale(d_A_int8, d_B_int8, d_C_int32, M, N, K, rocm_device_id, stream, kernel_ctx))
         {
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_timed] CK NoScale GEMM failed\n");
             hipEventDestroy(start);

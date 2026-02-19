@@ -291,7 +291,7 @@ TEST_F(Test__MPI_E2E_TensorParallelInference, WeightShardingIsCorrect)
     ASSERT_NE(weight_mgr, nullptr);
 
     // Check column-parallel Q weight (first layer)
-    auto wq = weight_mgr->getWeight("blk.0.attn_q.weight");
+    auto wq = weight_mgr->getWeightForDevice("blk.0.attn_q.weight");
     ASSERT_NE(wq, nullptr);
 
     // Expected: [local_n_heads * head_dim, d_model]
@@ -301,7 +301,7 @@ TEST_F(Test__MPI_E2E_TensorParallelInference, WeightShardingIsCorrect)
         << "Q weight should be column-sharded";
 
     // Check column-parallel K weight
-    auto wk = weight_mgr->getWeight("blk.0.attn_k.weight");
+    auto wk = weight_mgr->getWeightForDevice("blk.0.attn_k.weight");
     ASSERT_NE(wk, nullptr);
     int local_n_kv_heads = n_kv_heads_ / world_size_;
     size_t expected_kv_rows = local_n_kv_heads * head_dim_;
@@ -309,21 +309,21 @@ TEST_F(Test__MPI_E2E_TensorParallelInference, WeightShardingIsCorrect)
         << "K weight should be column-sharded";
 
     // Check column-parallel Gate weight (FFN)
-    auto gate = weight_mgr->getWeight("blk.0.ffn_gate.weight");
+    auto gate = weight_mgr->getWeightForDevice("blk.0.ffn_gate.weight");
     ASSERT_NE(gate, nullptr);
     size_t expected_gate_rows = d_ff_ / world_size_;
     EXPECT_EQ(gate->shape()[0], expected_gate_rows)
         << "Gate weight should be column-sharded";
 
     // Check column-parallel LM head
-    auto lm_head = weight_mgr->getWeight("output.weight");
+    auto lm_head = weight_mgr->getWeightForDevice("output.weight");
     ASSERT_NE(lm_head, nullptr);
     size_t expected_vocab_local = vocab_size_ / world_size_;
     EXPECT_EQ(lm_head->shape()[0], expected_vocab_local)
         << "LM head should be column-sharded by vocab";
 
     // Verify token embeddings are NOT sharded (replicated)
-    auto emb = weight_mgr->getWeight("token_embd.weight");
+    auto emb = weight_mgr->getWeightForDevice("token_embd.weight");
     ASSERT_NE(emb, nullptr);
     EXPECT_EQ(emb->shape()[0], static_cast<size_t>(vocab_size_))
         << "Embeddings should be replicated (full vocab)";

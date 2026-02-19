@@ -51,7 +51,7 @@ namespace llaminar2
         class ROCmResidualAddKernelT<ActivationPrecision::FP32> : public ITensorResidualAdd
         {
         public:
-            explicit ROCmResidualAddKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+            explicit ROCmResidualAddKernelT(int device_idx = -1) : device_idx_(device_idx) {}
 
             /**
              * @brief Construct with device context (Phase 4 pattern)
@@ -134,7 +134,7 @@ namespace llaminar2
         class ROCmResidualAddKernelT<ActivationPrecision::BF16> : public ITensorResidualAdd
         {
         public:
-            explicit ROCmResidualAddKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+            explicit ROCmResidualAddKernelT(int device_idx = -1) : device_idx_(device_idx) {}
 
             /**
              * @brief Construct with device context (Phase 4 pattern)
@@ -228,7 +228,7 @@ namespace llaminar2
         class ROCmResidualAddKernelT<ActivationPrecision::FP16> : public ITensorResidualAdd
         {
         public:
-            explicit ROCmResidualAddKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+            explicit ROCmResidualAddKernelT(int device_idx = -1) : device_idx_(device_idx) {}
 
             /**
              * @brief Construct with device context (Phase 4 pattern)

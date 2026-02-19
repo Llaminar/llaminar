@@ -91,6 +91,132 @@ namespace
         return -1;
     }
 
+    /**
+     * @brief Resolve which NUMA nodes need MPI processes for inference.
+     *
+     * Examines the OrchestrationConfig against the full (NUMA-unfiltered)
+     * DeviceManager inventory and returns the set of NUMA nodes that will
+     * participate in inference.
+     *
+     * Rules:
+     *   - GPU devices requested via any CLI mode → NUMA nodes of those GPUs
+     *   - `-d cpu` (global)  → all NUMA nodes
+     *   - `-d cpu:N`         → NUMA node N
+     *   - simple `-tp N` (auto-pick)  → NUMA nodes of the first N GPUs
+     *   - default (no device flag)    → {0} (local NUMA)
+     */
+    std::set<int> resolveInferenceNUMANodes(
+        const OrchestrationConfig &config,
+        const DeviceManager &dm,
+        const CPUTopology &cpu_topology)
+    {
+        const auto &devices = dm.devices();
+        std::set<int> numa_nodes;
+
+        // Helper: look up NUMA node for a GlobalDeviceAddress from the
+        // already-enumerated DeviceManager inventory (avoids duplicate
+        // sysfs / NVML calls).
+        auto device_numa = [&](const GlobalDeviceAddress &addr) -> int
+        {
+            if (addr.isCPU())
+                return addr.numa_node;
+
+            ComputeBackendType bt = addr.isCUDA() ? ComputeBackendType::GPU_CUDA
+                                                  : ComputeBackendType::GPU_ROCM;
+            for (const auto &dev : devices)
+            {
+                if (dev.type == bt && dev.device_id == addr.device_ordinal)
+                    return dev.numa_node;
+            }
+            return -1; // unknown — will be caught at validation time
+        };
+
+        // ---- CPU modes ----
+        if (config.cpu_global_tp_all_local)
+        {
+            for (int n = 0; n < cpu_topology.numa_nodes; ++n)
+                numa_nodes.insert(n);
+            return numa_nodes;
+        }
+
+        if (config.device_for_this_rank.has_value() &&
+            config.device_for_this_rank->isCPU() &&
+            config.device_for_this_rank_numa_explicit)
+        {
+            numa_nodes.insert(config.device_for_this_rank->numa_node);
+            return numa_nodes;
+        }
+
+        // ---- Explicit GPU modes ----
+
+        // --device (single device)
+        if (config.device_for_this_rank.has_value() && config.device_for_this_rank->isGPU())
+        {
+            int n = device_numa(*config.device_for_this_rank);
+            if (n >= 0)
+                numa_nodes.insert(n);
+        }
+
+        // --device-map
+        for (const auto &[rank_id, addr] : config.device_map)
+        {
+            int n = device_numa(addr);
+            if (n >= 0)
+                numa_nodes.insert(n);
+        }
+
+        // --tp-devices
+        for (const auto &addr : config.tp_devices)
+        {
+            int n = device_numa(addr);
+            if (n >= 0)
+                numa_nodes.insert(n);
+        }
+
+        // --define-domain
+        for (const auto &dom : config.domain_definitions)
+        {
+            for (const auto &addr : dom.devices)
+            {
+                int n = device_numa(addr);
+                if (n >= 0)
+                    numa_nodes.insert(n);
+            }
+        }
+
+        // If any of the above populated the set, we're done.
+        if (!numa_nodes.empty())
+            return numa_nodes;
+
+        // ---- Simple TP (auto-pick GPUs) ----
+        if (config.tp_degree > 1)
+        {
+            // Collect all GPUs sorted by type then ordinal, pick first N.
+            // This mirrors what the TP auto-picker would choose.
+            std::vector<const ComputeDevice *> gpus;
+            for (const auto &dev : devices)
+            {
+                if (dev.type == ComputeBackendType::GPU_CUDA ||
+                    dev.type == ComputeBackendType::GPU_ROCM)
+                    gpus.push_back(&dev);
+            }
+
+            int count = std::min(static_cast<int>(gpus.size()), config.tp_degree);
+            for (int i = 0; i < count; ++i)
+            {
+                if (gpus[i]->numa_node >= 0)
+                    numa_nodes.insert(gpus[i]->numa_node);
+            }
+
+            if (!numa_nodes.empty())
+                return numa_nodes;
+        }
+
+        // ---- Default: NUMA 0 ----
+        numa_nodes.insert(0);
+        return numa_nodes;
+    }
+
     int physicalRepresentativeForCpu(int cpu)
     {
         std::ifstream siblings_file("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list");
@@ -292,12 +418,56 @@ int main(int argc, char *argv[])
     // If NOT running under MPI and bootstrap is not disabled, self-launch via mpirun
     if (!mpi_env.is_mpi_process && !config.mpi_no_bootstrap)
     {
-        // Build launch configuration from config and topology
+        // =================================================================
+        // Phase 1: Full device enumeration (no NUMA filtering)
+        //
+        // Before MPI bootstrap, initialise DeviceManager with no NUMA
+        // filter so we get a complete view of every device in the system.
+        // This lets us plan topology and decide which NUMA nodes need
+        // MPI processes.  The singleton is destroyed by execvp() when we
+        // self-launch, so child processes will re-initialise cleanly.
+        // =================================================================
+        auto &dm = DeviceManager::instance();
+        dm.initialize(-1); // full view — no NUMA filtering
+
+        // =================================================================
+        // Phase 2: Determine inference NUMA nodes
+        //
+        // Examine the user's config against the full device inventory to
+        // decide which NUMA nodes will participate in inference.
+        // =================================================================
+        const std::set<int> inference_numas =
+            resolveInferenceNUMANodes(config, dm, cpu_topology);
+
+        {
+            std::string nlist;
+            for (auto it = inference_numas.begin(); it != inference_numas.end(); ++it)
+            {
+                if (it != inference_numas.begin())
+                    nlist += ",";
+                nlist += std::to_string(*it);
+            }
+            LOG_INFO("[Main] Inference NUMA nodes: {" << nlist << "} ("
+                                                      << inference_numas.size() << " of "
+                                                      << cpu_topology.numa_nodes << " total)");
+        }
+
+        // =================================================================
+        // Phase 3: Build MPI launch configuration
+        //
+        // One MPI process per NUMA node that participates in inference.
+        // Each process is bound to its NUMA node's CPU cores.
+        // =================================================================
         MPILaunchConfig launch_config = MPIBootstrap::getDefaultConfig(cpu_topology);
 
         const bool cpu_intent_bootstrap =
             config.cpu_global_tp_all_local ||
             (config.device_for_this_rank.has_value() && config.device_for_this_rank->isCPU());
+
+        // Signal to child processes that they were self-bootstrapped.
+        // The child will skip redundant NUMA-filtered device enumeration
+        // because topology planning already happened here.
+        setenv("LLAMINAR_SELF_BOOTSTRAPPED", "1", 1);
 
         // For self-bootstrapped CPU-only runs, instruct child ranks to skip GPU
         // startup enumeration and factory registration. This avoids fixed startup
@@ -398,6 +568,65 @@ int main(int argc, char *argv[])
             {
                 LOG_WARN("[Main] Explicit CPU NUMA target " << config.device_for_this_rank->numa_node
                                                             << " requested, but cpu-set lookup failed; relying on launcher defaults");
+            }
+        }
+
+        // =================================================================
+        // GPU NUMA affinity: bind MPI process(es) to the NUMA node(s)
+        // where inference will run.  Uses the pre-bootstrap device
+        // inventory instead of raw sysfs probing.
+        //
+        // Only applies when the CPU-specific paths above haven't
+        // already configured a cpu-set.
+        // =================================================================
+        if (launch_config.cpu_set.empty() && !cpu_intent_bootstrap)
+        {
+            if (config.mpi_procs <= 0)
+            {
+                launch_config.num_procs = static_cast<int>(inference_numas.size());
+            }
+
+            if (inference_numas.size() == 1)
+            {
+                // All inference on a single NUMA node — pin to it.
+                const int target_numa = *inference_numas.begin();
+                std::string cpu_set = MPIBootstrap::getPhysicalCpuSetForNumaNode(target_numa);
+                if (cpu_set.empty())
+                    cpu_set = MPIBootstrap::getCpuSetForNumaNode(target_numa);
+
+                if (!cpu_set.empty())
+                {
+                    launch_config.bind_to_socket = false;
+                    launch_config.map_by_socket = false;
+                    launch_config.cpu_set = cpu_set;
+                    launch_config.omp_threads_per_rank = std::max(1, cpu_topology.cores_per_socket);
+                    launch_config.omp_places = "cores";
+                    launch_config.omp_proc_bind = "close";
+
+                    LOG_INFO("[Main] All target devices on NUMA node " << target_numa
+                                                                      << "; binding MPI process to cpu-set='" << cpu_set << "'");
+                }
+            }
+            else if (inference_numas.size() > 1)
+            {
+                // Inference spans multiple NUMA nodes.
+                // Use socket binding so mpirun naturally maps rank N → socket N.
+                launch_config.bind_to_socket = true;
+                launch_config.map_by_socket = true;
+                launch_config.omp_threads_per_rank = std::max(1, cpu_topology.cores_per_socket);
+                launch_config.omp_places = "cores";
+                launch_config.omp_proc_bind = "close";
+
+                std::string nodes_str;
+                for (auto it = inference_numas.begin(); it != inference_numas.end(); ++it)
+                {
+                    if (it != inference_numas.begin())
+                        nodes_str += ",";
+                    nodes_str += std::to_string(*it);
+                }
+                LOG_INFO("[Main] Inference spans NUMA nodes {" << nodes_str
+                                                               << "}; launching " << launch_config.num_procs
+                                                               << " process(es) with socket binding");
             }
         }
 
@@ -549,69 +778,63 @@ int main(int argc, char *argv[])
         LOG_WARN("NUMA detection failed, using fallback node 0. This may impact multi-socket performance.");
     }
 
-    // Initialize device manager with NUMA-aware filtering
-    // Exception: explicit/ambiguous GPU --device/--device-map should search all
-    // NUMA nodes so cross-NUMA GPU targets remain reachable.
-    int device_manager_numa_filter = numa_info.local_numa_node;
+    // ========================================================================
+    // Initialize Device Manager
+    //
+    // When self-bootstrapped (LLAMINAR_SELF_BOOTSTRAPPED=1), the parent
+    // process already did full topology planning and bound this MPI rank
+    // to the correct NUMA node.  We initialise without NUMA filtering so
+    // all devices remain reachable — the orchestrator picks the right ones.
+    //
+    // When externally launched (user ran mpirun), we fall back to NUMA
+    // filtering (if no GPU is explicitly requested) so each rank only
+    // sees devices on its own socket.
+    // ========================================================================
+    const bool self_bootstrapped = (std::getenv("LLAMINAR_SELF_BOOTSTRAPPED") != nullptr);
 
-    std::optional<GlobalDeviceAddress> mapped_device_for_rank;
-    bool mapped_device_numa_explicit = false;
-    for (const auto &[mapped_rank, mapped_addr] : config.device_map)
+    int device_manager_numa_filter;
+    if (self_bootstrapped)
     {
-        if (mapped_rank == mpi_ctx->rank())
-        {
-            mapped_device_for_rank = mapped_addr;
-            break;
-        }
+        // Parent already planned topology — no filtering needed.
+        device_manager_numa_filter = -1;
+        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Self-bootstrapped: initialising DeviceManager without NUMA filtering");
     }
-    if (mapped_device_for_rank.has_value())
+    else
     {
-        for (const auto &[mapped_rank, explicit_numa] : config.device_map_numa_explicit)
+        // External MPI launch — apply NUMA filtering by default, but
+        // disable it when any GPU is explicitly requested so cross-NUMA
+        // targets remain reachable.
+        device_manager_numa_filter = numa_info.local_numa_node;
+
+        std::optional<GlobalDeviceAddress> mapped_device_for_rank;
+        for (const auto &[mapped_rank, mapped_addr] : config.device_map)
         {
             if (mapped_rank == mpi_ctx->rank())
             {
-                mapped_device_numa_explicit = explicit_numa;
+                mapped_device_for_rank = mapped_addr;
                 break;
             }
         }
-    }
 
-    const bool has_gpu_device_request =
-        (config.device_for_this_rank.has_value() && config.device_for_this_rank->isGPU()) ||
-        (mapped_device_for_rank.has_value() && mapped_device_for_rank->isGPU());
+        const bool has_gpu_request =
+            (config.device_for_this_rank.has_value() && config.device_for_this_rank->isGPU()) ||
+            (mapped_device_for_rank.has_value() && mapped_device_for_rank->isGPU()) ||
+            std::any_of(config.tp_devices.begin(), config.tp_devices.end(),
+                        [](const GlobalDeviceAddress &d)
+                        { return d.isGPU(); }) ||
+            std::any_of(config.domain_definitions.begin(), config.domain_definitions.end(),
+                        [](const DomainDefinition &dom)
+                        {
+                            return std::any_of(dom.devices.begin(), dom.devices.end(),
+                                               [](const GlobalDeviceAddress &d)
+                                               { return d.isGPU(); });
+                        }) ||
+            (config.tp_degree > 1);
 
-    if (has_gpu_device_request)
-    {
-        device_manager_numa_filter = -1;
-
-        if (config.device_for_this_rank.has_value() && config.device_for_this_rank->isGPU())
+        if (has_gpu_request)
         {
-            if (config.device_for_this_rank_numa_explicit)
-            {
-                LOG_INFO("[Main] Explicit GPU --device " << config.device_for_this_rank->toString()
-                                                         << " detected; searching all NUMA nodes and enforcing explicit NUMA at validation");
-            }
-            else
-            {
-                LOG_INFO("[Main] Ambiguous --device " << config.device_for_this_rank->toShortString()
-                                                      << " detected (no explicit NUMA); searching all NUMA nodes");
-            }
-        }
-
-        if (mapped_device_for_rank.has_value() && mapped_device_for_rank->isGPU())
-        {
-            if (mapped_device_numa_explicit)
-            {
-                LOG_INFO("[Main] Explicit --device-map entry for rank " << mpi_ctx->rank()
-                                                                        << " -> " << mapped_device_for_rank->toString()
-                                                                        << "; searching all NUMA nodes and enforcing explicit NUMA at validation");
-            }
-            else
-            {
-                LOG_INFO("[Main] Ambiguous --device-map entry for rank " << mpi_ctx->rank()
-                                                                         << " -> " << mapped_device_for_rank->toShortString()
-                                                                         << " (no explicit NUMA); searching all NUMA nodes");
-            }
+            device_manager_numa_filter = -1;
+            LOG_INFO("[Main] GPU device(s) requested; initialising DeviceManager without NUMA filtering");
         }
     }
 

@@ -8,6 +8,7 @@
 #include "CPUEmbeddingKernelT.h"
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../../tensors/FP16Utils.h"
+#include "../../../utils/KernelProfiler.h"
 #include <cstring>
 #include <mutex>
 #include <type_traits>
@@ -265,6 +266,7 @@ namespace llaminar2
         const MPIContext *mpi_ctx,
         int device_idx)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::EMBEDDING);
         if (!embed_table || !token_ids || !output)
         {
             return false;

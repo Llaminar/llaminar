@@ -166,7 +166,7 @@ TEST_F(Test__MPI_ColumnParallelFFN, GateWeightLocalShape)
     int d_ff_local = D_FF / world_size;
 
     // Load gate weight (will be column-sliced)
-    auto gate_weight = weight_manager_->getWeight("blk.0.ffn_gate.weight", DeviceId::cpu());
+    auto gate_weight = weight_manager_->getWeightForDevice("blk.0.ffn_gate.weight", DeviceId::cpu());
     ASSERT_NE(gate_weight, nullptr) << "Failed to load gate weight";
 
     // Check shape: should be [d_ff_local, d_model]
@@ -198,7 +198,7 @@ TEST_F(Test__MPI_ColumnParallelFFN, UpWeightLocalShape)
     int d_ff_local = D_FF / world_size;
 
     // Load up weight (will be column-sliced)
-    auto up_weight = weight_manager_->getWeight("blk.0.ffn_up.weight", DeviceId::cpu());
+    auto up_weight = weight_manager_->getWeightForDevice("blk.0.ffn_up.weight", DeviceId::cpu());
     ASSERT_NE(up_weight, nullptr) << "Failed to load up weight";
 
     // Check shape: should be [d_ff_local, d_model]
@@ -230,7 +230,7 @@ TEST_F(Test__MPI_ColumnParallelFFN, DownWeightLocalShape)
     int d_ff_local = D_FF / world_size;
 
     // Load down weight (will be input-parallel sliced)
-    auto down_weight = weight_manager_->getWeight("blk.0.ffn_down.weight", DeviceId::cpu());
+    auto down_weight = weight_manager_->getWeightForDevice("blk.0.ffn_down.weight", DeviceId::cpu());
     ASSERT_NE(down_weight, nullptr) << "Failed to load down weight";
 
     // Check shape: should be [d_model, d_ff_local]
@@ -263,7 +263,7 @@ TEST_F(Test__MPI_ColumnParallelFFN, GateProjectionLocalOutput)
     int seq_len = 8;
 
     // Load gate weight
-    auto gate_weight = weight_manager_->getWeight("blk.0.ffn_gate.weight", DeviceId::cpu());
+    auto gate_weight = weight_manager_->getWeightForDevice("blk.0.ffn_gate.weight", DeviceId::cpu());
     ASSERT_NE(gate_weight, nullptr);
 
     // Create input tensor [seq_len, d_model]

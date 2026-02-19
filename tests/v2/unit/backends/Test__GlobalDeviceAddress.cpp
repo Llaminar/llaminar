@@ -32,11 +32,12 @@ TEST(Test__GlobalDeviceAddress, FactoryMethod_CPU)
     auto addr = GlobalDeviceAddress::cpu();
 
     EXPECT_EQ(addr.hostname, "localhost");
-    EXPECT_EQ(addr.numa_node, 0);
+    EXPECT_EQ(addr.numa_node, NUMA_NODE_UNKNOWN);
     EXPECT_EQ(addr.device_type, DeviceType::CPU);
     EXPECT_EQ(addr.device_ordinal, 0);
     EXPECT_TRUE(addr.isCPU());
     EXPECT_FALSE(addr.isGPU());
+    EXPECT_FALSE(addr.hasValidNuma());
 }
 
 TEST(Test__GlobalDeviceAddress, FactoryMethod_CPU_WithNuma)
@@ -63,12 +64,13 @@ TEST(Test__GlobalDeviceAddress, FactoryMethod_CUDA)
     auto addr = GlobalDeviceAddress::cuda(0);
 
     EXPECT_EQ(addr.hostname, "localhost");
-    EXPECT_EQ(addr.numa_node, 0);
+    EXPECT_EQ(addr.numa_node, NUMA_NODE_UNKNOWN);
     EXPECT_EQ(addr.device_type, DeviceType::CUDA);
     EXPECT_EQ(addr.device_ordinal, 0);
     EXPECT_TRUE(addr.isCUDA());
     EXPECT_TRUE(addr.isGPU());
     EXPECT_FALSE(addr.isCPU());
+    EXPECT_FALSE(addr.hasValidNuma());
 }
 
 TEST(Test__GlobalDeviceAddress, FactoryMethod_CUDA_WithOrdinal)
@@ -139,13 +141,25 @@ TEST(Test__GlobalDeviceAddress, Parse_FullForm_HIP_Alias)
 
 TEST(Test__GlobalDeviceAddress, Parse_ShortForm_TypeOrdinal)
 {
-    // "cuda:0" -> localhost:<current_numa>:cuda:0
+    // "cuda:0" -> localhost:NUMA_NODE_UNKNOWN:cuda:0 (NUMA unknown when not specified)
+    auto addr = GlobalDeviceAddress::parse("cuda:0");
+
+    EXPECT_EQ(addr.hostname, "localhost");
+    EXPECT_EQ(addr.numa_node, NUMA_NODE_UNKNOWN);
+    EXPECT_EQ(addr.device_type, DeviceType::CUDA);
+    EXPECT_EQ(addr.device_ordinal, 0);
+}
+
+TEST(Test__GlobalDeviceAddress, Parse_ShortForm_TypeOrdinal_WithExplicitNuma)
+{
+    // When current_numa is explicitly provided, use it
     auto addr = GlobalDeviceAddress::parse("cuda:0", 0);
 
     EXPECT_EQ(addr.hostname, "localhost");
     EXPECT_EQ(addr.numa_node, 0);
     EXPECT_EQ(addr.device_type, DeviceType::CUDA);
     EXPECT_EQ(addr.device_ordinal, 0);
+    EXPECT_TRUE(addr.hasValidNuma());
 }
 
 TEST(Test__GlobalDeviceAddress, Parse_ShortForm_TypeOrdinal_WithCurrentNuma)
@@ -219,10 +233,20 @@ TEST(Test__GlobalDeviceAddress, TryParse_NegativeOrdinal_ReturnsNullopt)
     EXPECT_FALSE(result.has_value());
 }
 
-TEST(Test__GlobalDeviceAddress, TryParse_NegativeNuma_ReturnsNullopt)
+TEST(Test__GlobalDeviceAddress, TryParse_NegativeNuma_MediumForm_ReturnsNullopt)
 {
-    auto result = GlobalDeviceAddress::tryParse("-1:cuda:0");
+    // Explicitly parsed NUMA < -1 is invalid
+    auto result = GlobalDeviceAddress::tryParse("-2:cuda:0");
     EXPECT_FALSE(result.has_value());
+}
+
+TEST(Test__GlobalDeviceAddress, TryParse_NegativeOneNuma_MediumForm_Succeeds)
+{
+    // NUMA_NODE_UNKNOWN (-1) is now a valid sentinel value
+    auto result = GlobalDeviceAddress::tryParse("-1:cuda:0");
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->numa_node, NUMA_NODE_UNKNOWN);
+    EXPECT_FALSE(result->hasValidNuma());
 }
 
 TEST(Test__GlobalDeviceAddress, TryParse_NonNumericOrdinal_ReturnsNullopt)
@@ -338,6 +362,21 @@ TEST(Test__GlobalDeviceAddress, SameNuma_DifferentHost_ReturnsFalse)
 {
     auto addr1 = GlobalDeviceAddress::cuda(0, 0, "node1");
     auto addr2 = GlobalDeviceAddress::cuda(0, 0, "node2");
+    EXPECT_FALSE(addr1.sameNuma(addr2));
+}
+
+TEST(Test__GlobalDeviceAddress, SameNuma_UnknownNuma_ReturnsFalse)
+{
+    // If either side has unknown NUMA, sameNuma should be conservative and return false
+    auto addr1 = GlobalDeviceAddress::cuda(0); // NUMA_NODE_UNKNOWN
+    auto addr2 = GlobalDeviceAddress::cuda(1); // NUMA_NODE_UNKNOWN
+    EXPECT_FALSE(addr1.sameNuma(addr2));
+}
+
+TEST(Test__GlobalDeviceAddress, SameNuma_OneUnknown_ReturnsFalse)
+{
+    auto addr1 = GlobalDeviceAddress::cuda(0, 0, "localhost"); // NUMA 0 (explicit)
+    auto addr2 = GlobalDeviceAddress::cuda(1);                  // NUMA_NODE_UNKNOWN
     EXPECT_FALSE(addr1.sameNuma(addr2));
 }
 
@@ -529,9 +568,10 @@ TEST(Test__GlobalDeviceAddress, FromLocalDeviceId_CUDA)
     auto addr = GlobalDeviceAddress::fromLocalDeviceId(device_id);
 
     EXPECT_EQ(addr.hostname, "localhost");
-    EXPECT_EQ(addr.numa_node, 0);
+    EXPECT_EQ(addr.numa_node, NUMA_NODE_UNKNOWN);
     EXPECT_EQ(addr.device_type, DeviceType::CUDA);
     EXPECT_EQ(addr.device_ordinal, 1);
+    EXPECT_FALSE(addr.hasValidNuma());
 }
 
 TEST(Test__GlobalDeviceAddress, RoundTrip_DeviceId)

@@ -49,7 +49,7 @@ namespace llaminar2::cuda
             const float *bias,
             int M,
             int N,
-            int device_idx = 0)
+            int device_idx = -1)
         {
             if (!output || !bias)
             {
@@ -83,7 +83,7 @@ namespace llaminar2::cuda
             float scale,
             int M,
             int N,
-            int device_idx = 0)
+            int device_idx = -1)
         {
             if (!output || !bias)
             {

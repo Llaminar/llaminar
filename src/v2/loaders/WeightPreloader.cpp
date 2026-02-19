@@ -66,7 +66,7 @@ namespace llaminar2
             current++;
 
             // Get the tensor from cache
-            auto tensor = weight_manager_->getWeight(name);
+            auto tensor = weight_manager_->getWeightForDevice(name);
             if (!tensor)
             {
                 LOG_WARN("[WeightPreloader] Weight not found: " << name);
@@ -122,7 +122,7 @@ namespace llaminar2
             current++;
 
             // Get the tensor from cache
-            auto tensor = weight_manager_->getWeight(name);
+            auto tensor = weight_manager_->getWeightForDevice(name);
             if (!tensor)
             {
                 LOG_WARN("[WeightPreloader] Weight not found: " << name);

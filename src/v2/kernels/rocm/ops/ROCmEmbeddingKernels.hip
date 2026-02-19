@@ -249,7 +249,9 @@ __global__ void rocm_embedding_q8_kernel(
     float *__restrict__ output,
     int num_tokens,
     int d_model,
-    int blocks_per_row)
+    int blocks_per_row,
+    int vocab_size,
+    int debug_probe)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_elements = num_tokens * d_model;
@@ -263,6 +265,9 @@ __global__ void rocm_embedding_q8_kernel(
         // Locate the EmbedQ8Block containing this element
         int block_idx = dim_idx / 32;
         int elem_in_block = dim_idx % 32;
+
+        (void)debug_probe;
+        (void)vocab_size;
 
         const EmbedQ8Block &block = embed_q8[token_id * blocks_per_row + block_idx];
 
@@ -409,6 +414,8 @@ extern "C"
         int num_tokens,
         int d_model,
         int blocks_per_row,
+        int vocab_size,
+        int debug_probe,
         hipStream_t stream)
     {
         (void)hipGetLastError();
@@ -419,7 +426,7 @@ extern "C"
 
         rocm_embedding_q8_kernel<<<grid_size, block_size, 0, stream>>>(
             reinterpret_cast<const EmbedQ8Block *>(embed_q8),
-            token_ids, output, num_tokens, d_model, blocks_per_row);
+            token_ids, output, num_tokens, d_model, blocks_per_row, vocab_size, debug_probe);
 
         return hipGetLastError();
     }

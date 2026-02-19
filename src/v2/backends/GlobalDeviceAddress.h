@@ -47,12 +47,18 @@ namespace llaminar2
      *
      * Thread safety: Immutable value type, safe to copy and share.
      */
+    /// Sentinel value indicating NUMA node has not been resolved from hardware.
+    static constexpr int NUMA_NODE_UNKNOWN = -1;
+
     struct GlobalDeviceAddress
     {
         std::string hostname = "localhost";
-        int numa_node = 0;
+        int numa_node = NUMA_NODE_UNKNOWN;
         DeviceType device_type = DeviceType::CPU;
         int device_ordinal = 0;
+
+        /// @brief Check whether numa_node has been explicitly set
+        bool hasValidNuma() const { return numa_node >= 0; }
 
         // =========================================================================
         // Factory Methods
@@ -60,29 +66,29 @@ namespace llaminar2
 
         /**
          * @brief Create a CPU device address
-         * @param numa NUMA node (default 0)
+         * @param numa NUMA node (NUMA_NODE_UNKNOWN if not known)
          * @param hostname Hostname (default "localhost")
          * @return GlobalDeviceAddress for CPU
          */
-        static GlobalDeviceAddress cpu(int numa = 0, const std::string &hostname = "localhost");
+        static GlobalDeviceAddress cpu(int numa = NUMA_NODE_UNKNOWN, const std::string &hostname = "localhost");
 
         /**
          * @brief Create a CUDA device address
          * @param ordinal GPU ordinal (0-indexed)
-         * @param numa NUMA node (default 0)
+         * @param numa NUMA node (NUMA_NODE_UNKNOWN if not known)
          * @param hostname Hostname (default "localhost")
          * @return GlobalDeviceAddress for CUDA GPU
          */
-        static GlobalDeviceAddress cuda(int ordinal, int numa = 0, const std::string &hostname = "localhost");
+        static GlobalDeviceAddress cuda(int ordinal, int numa = NUMA_NODE_UNKNOWN, const std::string &hostname = "localhost");
 
         /**
          * @brief Create a ROCm device address
          * @param ordinal GPU ordinal (0-indexed)
-         * @param numa NUMA node (default 0)
+         * @param numa NUMA node (NUMA_NODE_UNKNOWN if not known)
          * @param hostname Hostname (default "localhost")
          * @return GlobalDeviceAddress for ROCm GPU
          */
-        static GlobalDeviceAddress rocm(int ordinal, int numa = 0, const std::string &hostname = "localhost");
+        static GlobalDeviceAddress rocm(int ordinal, int numa = NUMA_NODE_UNKNOWN, const std::string &hostname = "localhost");
 
         // =========================================================================
         // Parsing
@@ -97,19 +103,19 @@ namespace llaminar2
          *   - Short: "type:ordinal" (e.g., "cuda:0" -> localhost:<current_numa>:cuda:0)
          *
          * @param spec String specification
-         * @param current_numa NUMA node to use for short form (default 0)
+         * @param current_numa NUMA node to use for short form (NUMA_NODE_UNKNOWN if not known)
          * @return Parsed GlobalDeviceAddress
          * @throws std::invalid_argument if parsing fails
          */
-        static GlobalDeviceAddress parse(const std::string &spec, int current_numa = 0);
+        static GlobalDeviceAddress parse(const std::string &spec, int current_numa = NUMA_NODE_UNKNOWN);
 
         /**
          * @brief Try to parse address from string (returns nullopt on error)
          * @param spec String specification
-         * @param current_numa NUMA node to use for short form (default 0)
+         * @param current_numa NUMA node to use for short form (NUMA_NODE_UNKNOWN if not known)
          * @return Parsed GlobalDeviceAddress or nullopt if invalid
          */
-        static std::optional<GlobalDeviceAddress> tryParse(const std::string &spec, int current_numa = 0);
+        static std::optional<GlobalDeviceAddress> tryParse(const std::string &spec, int current_numa = NUMA_NODE_UNKNOWN);
 
         // =========================================================================
         // Serialization
@@ -149,13 +155,13 @@ namespace llaminar2
          * @brief Create from local DeviceId with additional context
          * @param local_id Local DeviceId
          * @param hostname Hostname (default "localhost")
-         * @param numa_node NUMA node (default 0)
+         * @param numa_node NUMA node (NUMA_NODE_UNKNOWN if not known)
          * @return GlobalDeviceAddress
          */
         static GlobalDeviceAddress fromLocalDeviceId(
             const DeviceId &local_id,
             const std::string &hostname = "localhost",
-            int numa_node = 0);
+            int numa_node = NUMA_NODE_UNKNOWN);
 
         // =========================================================================
         // Predicates

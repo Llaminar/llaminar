@@ -20,9 +20,55 @@
 #include <dlfcn.h> // For HSA runtime loading
 #include <future>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <deque>
+#include <thread>
 
 namespace llaminar2
 {
+
+    namespace
+    {
+        struct PointerEvent
+        {
+            const char *kind = "?";
+            void *base_ptr = nullptr;
+            size_t size_bytes = 0;
+            int device_id = -1;
+            uint64_t sequence = 0;
+            uint64_t thread_hash = 0;
+            bool active = false;
+        };
+
+        std::mutex g_ptr_registry_mutex;
+        std::unordered_map<void *, ROCmPointerOwnerInfo> g_active_ptrs;
+        std::deque<PointerEvent> g_ptr_events;
+        uint64_t g_ptr_sequence = 0;
+        constexpr size_t kMaxPointerEvents = 512;
+
+        uint64_t currentThreadHash()
+        {
+            return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        }
+
+        void recordPointerEvent(const char *kind, void *ptr, size_t bytes, int device_id, bool active)
+        {
+            PointerEvent event;
+            event.kind = kind;
+            event.base_ptr = ptr;
+            event.size_bytes = bytes;
+            event.device_id = device_id;
+            event.active = active;
+            event.thread_hash = currentThreadHash();
+            event.sequence = ++g_ptr_sequence;
+            g_ptr_events.push_back(event);
+            if (g_ptr_events.size() > kMaxPointerEvents)
+            {
+                g_ptr_events.pop_front();
+            }
+        }
+    }
 
     // ====================================================================
     // Constructor / Destructor
@@ -61,6 +107,27 @@ namespace llaminar2
             return false;
         }
 
+        hipPointerAttribute_t src_attrs{};
+        hipError_t src_attr_err = hipPointerGetAttributes(&src_attrs, src);
+        if (src_attr_err != hipSuccess)
+        {
+            hipGetLastError();
+            LOG_ERROR("[ROCmBackend::deviceToHost] Invalid source device pointer: src=" << src
+                                                                                         << " bytes=" << bytes
+                                                                                         << " device_id=" << device_id
+                                                                                         << " hip_error=" << hipGetErrorString(src_attr_err));
+            return false;
+        }
+
+        if (src_attrs.device != device_id)
+        {
+            LOG_ERROR("[ROCmBackend::deviceToHost] Source pointer device mismatch: src=" << src
+                                                                                           << " ptr_device=" << src_attrs.device
+                                                                                           << " requested_device=" << device_id
+                                                                                           << " bytes=" << bytes);
+            return false;
+        }
+
         hipError_t err = hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost);
         return (err == hipSuccess);
     }
@@ -75,6 +142,27 @@ namespace llaminar2
         hipError_t err_set = hipSetDevice(device_id);
         if (err_set != hipSuccess)
         {
+            return false;
+        }
+
+        hipPointerAttribute_t dst_attrs{};
+        hipError_t dst_attr_err = hipPointerGetAttributes(&dst_attrs, dst);
+        if (dst_attr_err != hipSuccess)
+        {
+            hipGetLastError();
+            LOG_ERROR("[ROCmBackend::hostToDevice] Invalid destination device pointer: dst=" << dst
+                                                                                               << " bytes=" << bytes
+                                                                                               << " device_id=" << device_id
+                                                                                               << " hip_error=" << hipGetErrorString(dst_attr_err));
+            return false;
+        }
+
+        if (dst_attrs.device != device_id)
+        {
+            LOG_ERROR("[ROCmBackend::hostToDevice] Destination pointer device mismatch: dst=" << dst
+                                                                                                 << " ptr_device=" << dst_attrs.device
+                                                                                                 << " requested_device=" << device_id
+                                                                                                 << " bytes=" << bytes);
             return false;
         }
 
@@ -268,6 +356,23 @@ namespace llaminar2
         LOG_TRACE("[ROCmBackend::allocate] ALLOC ptr=" << ptr << " bytes=" << bytes
                                                        << " device_id=" << device_id << " (ROCm ordinal)");
 
+        {
+            std::lock_guard<std::mutex> lock(g_ptr_registry_mutex);
+            ROCmPointerOwnerInfo info;
+            info.base_ptr = ptr;
+            info.size_bytes = bytes;
+            info.device_id = device_id;
+            info.active = true;
+            info.thread_hash = currentThreadHash();
+            info.sequence = g_ptr_sequence + 1;
+            g_active_ptrs[ptr] = info;
+            recordPointerEvent("alloc", ptr, bytes, device_id, true);
+        }
+
+        LOG_DEBUG("[ROCM_PTR_ALLOC] ptr=" << ptr
+                                          << " bytes=" << bytes
+                                          << " device=" << device_id);
+
         // DIAGNOSTIC: Verify allocation ended up on the correct device
         {
             hipPointerAttribute_t attr = {};
@@ -388,6 +493,23 @@ namespace llaminar2
             return;
         }
 
+        size_t recorded_size = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_ptr_registry_mutex);
+            auto it = g_active_ptrs.find(ptr);
+            if (it != g_active_ptrs.end())
+            {
+                recorded_size = it->second.size_bytes;
+                it->second.active = false;
+                recordPointerEvent("free", ptr, it->second.size_bytes, device_id, false);
+                g_active_ptrs.erase(it);
+            }
+            else
+            {
+                recordPointerEvent("free-unknown", ptr, 0, device_id, false);
+            }
+        }
+
         err = hipFree(ptr);
         if (err != hipSuccess)
         {
@@ -403,6 +525,59 @@ namespace llaminar2
             {
                 LOG_ERROR("[ROCmBackend] hipFree failed: " << hipGetErrorString(err));
             }
+        }
+        else
+        {
+            LOG_DEBUG("[ROCM_PTR_FREE] ptr=" << ptr
+                                             << " bytes=" << recorded_size
+                                             << " device=" << device_id);
+        }
+    }
+
+    bool ROCmBackend::queryPointerOwner(const void *ptr, ROCmPointerOwnerInfo &info)
+    {
+        if (!ptr)
+        {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(g_ptr_registry_mutex);
+        uintptr_t target = reinterpret_cast<uintptr_t>(ptr);
+        for (const auto &[base, meta] : g_active_ptrs)
+        {
+            const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
+            const uintptr_t end = begin + meta.size_bytes;
+            if (target >= begin && target < end)
+            {
+                info = meta;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void ROCmBackend::dumpRecentPointerEvents(size_t max_events)
+    {
+        std::lock_guard<std::mutex> lock(g_ptr_registry_mutex);
+        if (g_ptr_events.empty())
+        {
+            LOG_WARN("[ROCM_PTR_EVENTS] no events recorded");
+            return;
+        }
+
+        const size_t total = g_ptr_events.size();
+        const size_t start = (total > max_events) ? (total - max_events) : 0;
+        LOG_WARN("[ROCM_PTR_EVENTS] dumping " << (total - start) << " of " << total << " recent events");
+        for (size_t i = start; i < total; ++i)
+        {
+            const auto &e = g_ptr_events[i];
+            LOG_WARN("[ROCM_PTR_EVENTS] #" << e.sequence
+                                            << " kind=" << e.kind
+                                            << " ptr=" << e.base_ptr
+                                            << " bytes=" << e.size_bytes
+                                            << " dev=" << e.device_id
+                                            << " active=" << (e.active ? 1 : 0)
+                                            << " thread=" << e.thread_hash);
         }
     }
 

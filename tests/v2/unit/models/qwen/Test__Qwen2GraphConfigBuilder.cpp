@@ -40,12 +40,6 @@ namespace
     class StubWeightManager : public IWeightManager
     {
     public:
-        std::shared_ptr<TensorBase> getWeight(const std::string & /*name*/,
-                                              DeviceId /*device*/, int /*layer_idx*/) override
-        {
-            return nullptr;
-        }
-
         std::shared_ptr<TensorBase> getWeightForDevice(const std::string & /*name*/,
                                                        DeviceId /*device*/, int /*layer_idx*/) override
         {

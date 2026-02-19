@@ -38,6 +38,8 @@
 #include <memory>
 #include <cstdint>
 #include <vector>
+#include <unordered_map>
+#include <mutex>
 
 namespace llaminar2
 {
@@ -67,12 +69,22 @@ namespace llaminar2
          */
         struct CUDAPackedWeights
         {
+            struct DeviceUpload
+            {
+                int8_t *d_int8_data = nullptr;
+                float *d_scales = nullptr;
+            };
+
             std::vector<int8_t> int8_data; ///< [K × N] ColumnMajor INT8 weights
             std::vector<float> scales;     ///< [N] per-column scale factors
             int K = 0;                     ///< Input features (rows in CUTLASS B matrix)
             int N = 0;                     ///< Output features (cols in CUTLASS B matrix)
 
+            mutable std::mutex upload_mutex;
+            std::unordered_map<int, DeviceUpload> device_uploads;
+
             // Device memory pointers (uploaded once, cached)
+            // Legacy compatibility fields, mirrored from the active device upload.
             int8_t *d_int8_data = nullptr; ///< Device pointer to INT8 weights
             float *d_scales = nullptr;     ///< Device pointer to scales
             int cuda_device_id = -1;       ///< Device where data is uploaded
@@ -82,6 +94,42 @@ namespace llaminar2
             // When weights are uploaded, we mark source_tensor_->device_valid_ = true
             // so StageCoherence doesn't try to re-upload the raw tensor data
             TensorBase *source_tensor_ = nullptr;
+
+            CUDAPackedWeights() = default;
+            CUDAPackedWeights(const CUDAPackedWeights &) = delete;
+            CUDAPackedWeights &operator=(const CUDAPackedWeights &) = delete;
+
+            CUDAPackedWeights(CUDAPackedWeights &&other) noexcept
+            {
+                *this = std::move(other);
+            }
+
+            CUDAPackedWeights &operator=(CUDAPackedWeights &&other) noexcept
+            {
+                if (this != &other)
+                {
+                    std::scoped_lock guard(upload_mutex, other.upload_mutex);
+                    int8_data = std::move(other.int8_data);
+                    scales = std::move(other.scales);
+                    K = other.K;
+                    N = other.N;
+                    device_uploads = std::move(other.device_uploads);
+                    d_int8_data = other.d_int8_data;
+                    d_scales = other.d_scales;
+                    cuda_device_id = other.cuda_device_id;
+                    uploaded = other.uploaded;
+                    source_tensor_ = other.source_tensor_;
+
+                    other.d_int8_data = nullptr;
+                    other.d_scales = nullptr;
+                    other.cuda_device_id = -1;
+                    other.uploaded = false;
+                    other.K = 0;
+                    other.N = 0;
+                    other.source_tensor_ = nullptr;
+                }
+                return *this;
+            }
 
             ~CUDAPackedWeights();
         };

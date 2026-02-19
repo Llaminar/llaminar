@@ -1938,7 +1938,8 @@ namespace llaminar2
          */
         DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
             bool has_collective_nodes,
-            IDeviceContext *ctx) const;
+            IDeviceContext *ctx,
+            int segment_consecutive_failures) const;
 
         /**
          * @brief Check whether collective segmented replay is backend-supported
@@ -1988,6 +1989,58 @@ namespace llaminar2
         // =========================================================================
         // Full Forward Graph Cache (Decode Optimization)
         // =========================================================================
+
+        /**
+         * @brief Signature for caching full forward graphs.
+         *
+         * Phase 1 goal: avoid rebuilding stage/kernel objects on repeated forwards
+         * with the same execution shape/path.
+         */
+        struct ForwardGraphSignature
+        {
+            int seq_len = 0;
+            int batch_size = 0;
+            DeviceId device = DeviceId::cpu();
+            bool decode = false;
+            bool standard_path = true;
+            bool pp_stage_enabled = false;
+            int pp_first_layer = -1;
+            int pp_last_layer = -1;
+            bool pp_has_embedding = false;
+            bool pp_has_lm_head = false;
+
+            bool operator==(const ForwardGraphSignature &other) const
+            {
+                return seq_len == other.seq_len &&
+                       batch_size == other.batch_size &&
+                       device == other.device &&
+                       decode == other.decode &&
+                       standard_path == other.standard_path &&
+                       pp_stage_enabled == other.pp_stage_enabled &&
+                       pp_first_layer == other.pp_first_layer &&
+                       pp_last_layer == other.pp_last_layer &&
+                       pp_has_embedding == other.pp_has_embedding &&
+                       pp_has_lm_head == other.pp_has_lm_head;
+            }
+        };
+
+        struct ForwardGraphSignatureHash
+        {
+            size_t operator()(const ForwardGraphSignature &sig) const
+            {
+                size_t h = std::hash<int>{}(sig.seq_len);
+                h ^= (std::hash<int>{}(sig.batch_size) + 0x9e3779b9 + (h << 6) + (h >> 2));
+                h ^= (std::hash<DeviceId>{}(sig.device) + 0x9e3779b9 + (h << 6) + (h >> 2));
+                h ^= (std::hash<bool>{}(sig.decode) + 0x9e3779b9 + (h << 6) + (h >> 2));
+                h ^= (std::hash<bool>{}(sig.standard_path) + 0x9e3779b9 + (h << 6) + (h >> 2));
+                h ^= (std::hash<bool>{}(sig.pp_stage_enabled) + 0x9e3779b9 + (h << 6) + (h >> 2));
+                h ^= (std::hash<int>{}(sig.pp_first_layer) + 0x9e3779b9 + (h << 6) + (h >> 2));
+                h ^= (std::hash<int>{}(sig.pp_last_layer) + 0x9e3779b9 + (h << 6) + (h >> 2));
+                h ^= (std::hash<bool>{}(sig.pp_has_embedding) + 0x9e3779b9 + (h << 6) + (h >> 2));
+                h ^= (std::hash<bool>{}(sig.pp_has_lm_head) + 0x9e3779b9 + (h << 6) + (h >> 2));
+                return h;
+            }
+        };
 
         /**
          * @brief Cached full forward graph for decode mode
@@ -2071,7 +2124,7 @@ namespace llaminar2
             }
         };
 
-        ForwardGraphCache forward_cache_;
+        std::unordered_map<ForwardGraphSignature, ForwardGraphCache, ForwardGraphSignatureHash> forward_graph_cache_;
 
         /// Padded sequence length from last forward_batch() call
         int padded_seq_len_ = 0;
@@ -2090,8 +2143,12 @@ namespace llaminar2
         // Graph Buffer Management Members (Phase 3 - moved from Qwen2Graph)
         // =========================================================================
 
-        /// TensorFactory for buffer allocation (not owned)
+        /// TensorFactory for buffer allocation (not owned, set via setTensorFactory())
         TensorFactory *tensor_factory_ = nullptr;
+
+        /// Owned TensorFactory, created during initializeInferenceState() when
+        /// no external factory is provided via setTensorFactory().
+        std::unique_ptr<TensorFactory> owned_tensor_factory_;
 
         /// Buffer manager for graph-managed allocation (nullptr if using manual buffers)
         std::unique_ptr<DeviceGraphBufferManager> buffer_manager_;

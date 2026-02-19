@@ -81,8 +81,8 @@ namespace llaminar2
             // Load a row-parallel weight (attn_output.weight)
             const std::string tensor_name = "blk.0.attn_output.weight";
 
-            auto weight0 = wm0.getWeight(tensor_name, DeviceId::cpu());
-            auto weight1 = wm1.getWeight(tensor_name, DeviceId::cpu());
+            auto weight0 = wm0.getWeightForDevice(tensor_name, DeviceId::cpu());
+            auto weight1 = wm1.getWeightForDevice(tensor_name, DeviceId::cpu());
 
             ASSERT_NE(weight0, nullptr) << "Rank 0 failed to load weight";
             ASSERT_NE(weight1, nullptr) << "Rank 1 failed to load weight";
@@ -128,7 +128,7 @@ namespace llaminar2
             // FFN Down is INPUT_PARALLEL (column-sliced) in Phase 4b-2
             // This means it splits the input dimension (columns) to match Gate/Up output
             const std::string tensor_name = "blk.0.ffn_down.weight";
-            auto weight = wm.getWeight(tensor_name, DeviceId::cpu());
+            auto weight = wm.getWeightForDevice(tensor_name, DeviceId::cpu());
             ASSERT_NE(weight, nullptr);
 
             auto *slice = dynamic_cast<TensorSlice *>(weight.get());
@@ -176,7 +176,7 @@ namespace llaminar2
             // Load COLUMN_PARALLEL weight (row-sliced)
             // ffn_gate.weight is [4864, 896] -> each rank gets [2432, 896] (rows sliced, K preserved)
             const std::string tensor_name = "blk.0.ffn_gate.weight";
-            auto weight = wm.getWeight(tensor_name, DeviceId::cpu());
+            auto weight = wm.getWeightForDevice(tensor_name, DeviceId::cpu());
             ASSERT_NE(weight, nullptr);
 
             auto *slice = dynamic_cast<TensorSlice *>(weight.get());
@@ -185,7 +185,7 @@ namespace llaminar2
 
             // Get cached GEMM engine (should work with pre-sliced data)
             // Note: prepared-weight path is required because raw data may have been released
-            // after the WeightManager packed the weights during getWeight()
+            // after the WeightManager packed the weights during getWeightForDevice()
             auto *gemm = getPreparedKernel(slice, DeviceId::cpu());
             ASSERT_NE(gemm, nullptr) << "Failed to get GEMM kernel from pre-sliced data";
 
@@ -236,7 +236,7 @@ namespace llaminar2
             wm_full.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
             const std::string tensor_name = "blk.0.ffn_gate.weight";
-            auto full_weight = wm_full.getWeight(tensor_name, DeviceId::cpu());
+            auto full_weight = wm_full.getWeightForDevice(tensor_name, DeviceId::cpu());
             ASSERT_NE(full_weight, nullptr);
 
             // Load sliced tensors (simulated 2-rank)
@@ -262,8 +262,8 @@ namespace llaminar2
             wm0.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
             wm1.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
-            auto weight0 = wm0.getWeight(tensor_name, DeviceId::cpu());
-            auto weight1 = wm1.getWeight(tensor_name, DeviceId::cpu());
+            auto weight0 = wm0.getWeightForDevice(tensor_name, DeviceId::cpu());
+            auto weight1 = wm1.getWeightForDevice(tensor_name, DeviceId::cpu());
 
             ASSERT_NE(weight0, nullptr);
             ASSERT_NE(weight1, nullptr);
@@ -359,7 +359,7 @@ namespace llaminar2
 
             // Load a replicated weight (attention norm)
             const std::string norm_name = "blk.0.attn_norm.weight";
-            auto norm_weight = wm.getWeight(norm_name, DeviceId::cpu());
+            auto norm_weight = wm.getWeightForDevice(norm_name, DeviceId::cpu());
             ASSERT_NE(norm_weight, nullptr);
 
             // Should NOT be a TensorSlice (replicated weights bypass slicing)

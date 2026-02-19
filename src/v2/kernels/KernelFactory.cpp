@@ -606,7 +606,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::TensorBase *tensor, DeviceType dev_type)
+                const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal)
             {
                 // Two-way dispatch based on interface:
                 // 1. IINT8Unpackable → QuantisedGemmKernel (quantized weights)
@@ -690,7 +690,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::IQ4_NLTensor *tensor, DeviceType dev_type)
+                const llaminar2::IQ4_NLTensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -725,7 +725,7 @@ namespace llaminar
             }
 
             llaminar2::ITensorGemm *KernelFactory::createGemmRaw(
-                const llaminar2::IQ4_NLTensor *tensor, DeviceType dev_type)
+                const llaminar2::IQ4_NLTensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -758,7 +758,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::Q4_0Tensor *tensor, DeviceType dev_type)
+                const llaminar2::Q4_0Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -803,7 +803,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::Q4_1Tensor *tensor, DeviceType dev_type)
+                const llaminar2::Q4_1Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -838,7 +838,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::Q5_0Tensor *tensor, DeviceType dev_type)
+                const llaminar2::Q5_0Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -873,7 +873,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::Q5_1Tensor *tensor, DeviceType dev_type)
+                const llaminar2::Q5_1Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -908,7 +908,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::Q6_KTensor *tensor, DeviceType dev_type)
+                const llaminar2::Q6_KTensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -943,7 +943,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::Q8_0Tensor *tensor, DeviceType dev_type)
+                const llaminar2::Q8_0Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -978,7 +978,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type)
+                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1013,7 +1013,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::Q2_KTensor *tensor, DeviceType dev_type)
+                const llaminar2::Q2_KTensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1048,7 +1048,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::Q3_KTensor *tensor, DeviceType dev_type)
+                const llaminar2::Q3_KTensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1083,7 +1083,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::Q4_KTensor *tensor, DeviceType dev_type)
+                const llaminar2::Q4_KTensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1118,7 +1118,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::Q5_KTensor *tensor, DeviceType dev_type)
+                const llaminar2::Q5_KTensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1153,7 +1153,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::Q8_KTensor *tensor, DeviceType dev_type)
+                const llaminar2::Q8_KTensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1188,7 +1188,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::IQ1_MTensor *tensor, DeviceType dev_type)
+                const llaminar2::IQ1_MTensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1223,7 +1223,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::IQ1_STensor *tensor, DeviceType dev_type)
+                const llaminar2::IQ1_STensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1258,7 +1258,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::IQ2_STensor *tensor, DeviceType dev_type)
+                const llaminar2::IQ2_STensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1293,7 +1293,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::IQ2_XSTensor *tensor, DeviceType dev_type)
+                const llaminar2::IQ2_XSTensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1328,7 +1328,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::IQ2_XXSTensor *tensor, DeviceType dev_type)
+                const llaminar2::IQ2_XXSTensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1363,7 +1363,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::IQ3_STensor *tensor, DeviceType dev_type)
+                const llaminar2::IQ3_STensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1398,7 +1398,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::IQ3_XXSTensor *tensor, DeviceType dev_type)
+                const llaminar2::IQ3_XXSTensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1433,7 +1433,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::IQ4_XSTensor *tensor, DeviceType dev_type)
+                const llaminar2::IQ4_XSTensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1468,7 +1468,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::FP32Tensor *tensor, DeviceType dev_type)
+                const llaminar2::FP32Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1510,7 +1510,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::FP16Tensor *tensor, DeviceType dev_type)
+                const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1542,7 +1542,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
-                const llaminar2::BF16Tensor *tensor, DeviceType dev_type)
+                const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 switch (dev_type)
                 {
@@ -1575,7 +1575,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorRoPE> KernelFactory::createRoPE(
-                const llaminar2::FP32Tensor *tensor, DeviceType dev_type)
+                const llaminar2::FP32Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor; // RoPE kernels don't need tensor state for creation
                 switch (dev_type)
@@ -1586,12 +1586,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return std::make_unique<llaminar2::cuda::CUDARoPEKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    return std::make_unique<llaminar2::cuda::CUDARoPEKernelT<llaminar2::ActivationPrecision::FP32>>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::rocm::ROCmRoPEKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    return std::make_unique<llaminar2::rocm::ROCmRoPEKernelT<llaminar2::ActivationPrecision::FP32>>(device_ordinal);
 #endif
 
                 default:
@@ -1600,7 +1600,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorRoPE> KernelFactory::createRoPE(
-                const llaminar2::BF16Tensor *tensor, DeviceType dev_type)
+                const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -1611,12 +1611,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return std::make_unique<llaminar2::cuda::CUDARoPEKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    return std::make_unique<llaminar2::cuda::CUDARoPEKernelT<llaminar2::ActivationPrecision::BF16>>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::rocm::ROCmRoPEKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    return std::make_unique<llaminar2::rocm::ROCmRoPEKernelT<llaminar2::ActivationPrecision::BF16>>(device_ordinal);
 #endif
 
                 default:
@@ -1625,7 +1625,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorRoPE> KernelFactory::createRoPE(
-                const llaminar2::FP16Tensor *tensor, DeviceType dev_type)
+                const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -1636,12 +1636,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return std::make_unique<llaminar2::cuda::CUDARoPEKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    return std::make_unique<llaminar2::cuda::CUDARoPEKernelT<llaminar2::ActivationPrecision::FP16>>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::rocm::ROCmRoPEKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    return std::make_unique<llaminar2::rocm::ROCmRoPEKernelT<llaminar2::ActivationPrecision::FP16>>(device_ordinal);
 #endif
 
                 default:
@@ -1650,7 +1650,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorRoPE> KernelFactory::createRoPE(
-                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type)
+                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -1680,7 +1680,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorSwiGLU> KernelFactory::createSwiGLU(
-                const llaminar2::FP32Tensor *tensor, DeviceType dev_type)
+                const llaminar2::FP32Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor; // SwiGLU kernels don't need tensor state for creation
                 switch (dev_type)
@@ -1690,12 +1690,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return std::make_unique<llaminar2::cuda::CUDASwiGLUKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    return std::make_unique<llaminar2::cuda::CUDASwiGLUKernelT<llaminar2::ActivationPrecision::FP32>>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::rocm::ROCmSwiGLUKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    return std::make_unique<llaminar2::rocm::ROCmSwiGLUKernelT<llaminar2::ActivationPrecision::FP32>>(device_ordinal);
 #endif
 
                 default:
@@ -1704,7 +1704,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorSwiGLU> KernelFactory::createSwiGLU(
-                const llaminar2::BF16Tensor *tensor, DeviceType dev_type)
+                const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -1714,12 +1714,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return std::make_unique<llaminar2::cuda::CUDASwiGLUKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    return std::make_unique<llaminar2::cuda::CUDASwiGLUKernelT<llaminar2::ActivationPrecision::BF16>>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::rocm::ROCmSwiGLUKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    return std::make_unique<llaminar2::rocm::ROCmSwiGLUKernelT<llaminar2::ActivationPrecision::BF16>>(device_ordinal);
 #endif
 
                 default:
@@ -1728,7 +1728,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorSwiGLU> KernelFactory::createSwiGLU(
-                const llaminar2::FP16Tensor *tensor, DeviceType dev_type)
+                const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -1738,12 +1738,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return std::make_unique<llaminar2::cuda::CUDASwiGLUKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    return std::make_unique<llaminar2::cuda::CUDASwiGLUKernelT<llaminar2::ActivationPrecision::FP16>>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::rocm::ROCmSwiGLUKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    return std::make_unique<llaminar2::rocm::ROCmSwiGLUKernelT<llaminar2::ActivationPrecision::FP16>>(device_ordinal);
 #endif
 
                 default:
@@ -1752,7 +1752,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorSwiGLU> KernelFactory::createSwiGLU(
-                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type)
+                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -1781,7 +1781,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorSoftmax> KernelFactory::createSoftmax(
-                const llaminar2::FP32Tensor *tensor, DeviceType dev_type)
+                const llaminar2::FP32Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -1805,7 +1805,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorSoftmax> KernelFactory::createSoftmax(
-                const llaminar2::BF16Tensor *tensor, DeviceType dev_type)
+                const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -1829,7 +1829,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorSoftmax> KernelFactory::createSoftmax(
-                const llaminar2::FP16Tensor *tensor, DeviceType dev_type)
+                const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -1853,7 +1853,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorSoftmax> KernelFactory::createSoftmax(
-                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type)
+                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -1881,7 +1881,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorResidualAdd> KernelFactory::createResidualAdd(
-                const llaminar2::FP32Tensor *tensor, DeviceType dev_type)
+                const llaminar2::FP32Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -1891,12 +1891,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return std::make_unique<llaminar2::cuda::CUDAResidualAddKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    return std::make_unique<llaminar2::cuda::CUDAResidualAddKernelT<llaminar2::ActivationPrecision::FP32>>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::rocm::ROCmResidualAddKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    return std::make_unique<llaminar2::rocm::ROCmResidualAddKernelT<llaminar2::ActivationPrecision::FP32>>(device_ordinal);
 #endif
 
                 default:
@@ -1905,7 +1905,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorResidualAdd> KernelFactory::createResidualAdd(
-                const llaminar2::BF16Tensor *tensor, DeviceType dev_type)
+                const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -1915,12 +1915,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return std::make_unique<llaminar2::cuda::CUDAResidualAddKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    return std::make_unique<llaminar2::cuda::CUDAResidualAddKernelT<llaminar2::ActivationPrecision::BF16>>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::rocm::ROCmResidualAddKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    return std::make_unique<llaminar2::rocm::ROCmResidualAddKernelT<llaminar2::ActivationPrecision::BF16>>(device_ordinal);
 #endif
 
                 default:
@@ -1929,7 +1929,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorResidualAdd> KernelFactory::createResidualAdd(
-                const llaminar2::FP16Tensor *tensor, DeviceType dev_type)
+                const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -1939,12 +1939,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return std::make_unique<llaminar2::cuda::CUDAResidualAddKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    return std::make_unique<llaminar2::cuda::CUDAResidualAddKernelT<llaminar2::ActivationPrecision::FP16>>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::rocm::ROCmResidualAddKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    return std::make_unique<llaminar2::rocm::ROCmResidualAddKernelT<llaminar2::ActivationPrecision::FP16>>(device_ordinal);
 #endif
 
                 default:
@@ -1958,7 +1958,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorRMSNorm> KernelFactory::createRMSNorm(
-                const llaminar2::FP32Tensor *tensor, DeviceType dev_type)
+                const llaminar2::FP32Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -1968,12 +1968,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return std::make_unique<llaminar2::cuda::CUDARMSNormKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    return std::make_unique<llaminar2::cuda::CUDARMSNormKernelT<llaminar2::ActivationPrecision::FP32>>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::rocm::ROCmRMSNormKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    return std::make_unique<llaminar2::rocm::ROCmRMSNormKernelT<llaminar2::ActivationPrecision::FP32>>(device_ordinal);
 #endif
 
                 default:
@@ -1982,7 +1982,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorRMSNorm> KernelFactory::createRMSNorm(
-                const llaminar2::BF16Tensor *tensor, DeviceType dev_type)
+                const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -1992,12 +1992,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return std::make_unique<llaminar2::cuda::CUDARMSNormKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    return std::make_unique<llaminar2::cuda::CUDARMSNormKernelT<llaminar2::ActivationPrecision::BF16>>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::rocm::ROCmRMSNormKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    return std::make_unique<llaminar2::rocm::ROCmRMSNormKernelT<llaminar2::ActivationPrecision::BF16>>(device_ordinal);
 #endif
 
                 default:
@@ -2006,7 +2006,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorRMSNorm> KernelFactory::createRMSNorm(
-                const llaminar2::FP16Tensor *tensor, DeviceType dev_type)
+                const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -2016,12 +2016,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return std::make_unique<llaminar2::cuda::CUDARMSNormKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    return std::make_unique<llaminar2::cuda::CUDARMSNormKernelT<llaminar2::ActivationPrecision::FP16>>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::rocm::ROCmRMSNormKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    return std::make_unique<llaminar2::rocm::ROCmRMSNormKernelT<llaminar2::ActivationPrecision::FP16>>(device_ordinal);
 #endif
 
                 default:
@@ -2030,7 +2030,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorRMSNorm> KernelFactory::createRMSNorm(
-                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type)
+                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -2054,7 +2054,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorRMSNorm> KernelFactory::createRMSNorm(
-                const llaminar2::Q16_1Tensor *tensor, DeviceType dev_type)
+                const llaminar2::Q16_1Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -2082,7 +2082,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorSoftmax> KernelFactory::createSoftmax(
-                const llaminar2::TensorBase *tensor, DeviceType dev_type)
+                const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal)
             {
                 if (!tensor)
                 {
@@ -2092,13 +2092,13 @@ namespace llaminar
                 switch (tensor->native_type())
                 {
                 case llaminar2::TensorType::FP32:
-                    return createSoftmax(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type);
+                    return createSoftmax(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::BF16:
-                    return createSoftmax(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type);
+                    return createSoftmax(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::FP16:
-                    return createSoftmax(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type);
+                    return createSoftmax(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::Q8_1:
-                    return createSoftmax(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type);
+                    return createSoftmax(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type, device_ordinal);
                 default:
                     throw std::runtime_error(
                         "KernelFactory::createSoftmax: unsupported tensor type " +
@@ -2107,7 +2107,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorRMSNorm> KernelFactory::createRMSNorm(
-                const llaminar2::TensorBase *tensor, DeviceType dev_type)
+                const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal)
             {
                 if (!tensor)
                 {
@@ -2117,15 +2117,15 @@ namespace llaminar
                 switch (tensor->native_type())
                 {
                 case llaminar2::TensorType::FP32:
-                    return createRMSNorm(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type);
+                    return createRMSNorm(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::BF16:
-                    return createRMSNorm(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type);
+                    return createRMSNorm(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::FP16:
-                    return createRMSNorm(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type);
+                    return createRMSNorm(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::Q8_1:
-                    return createRMSNorm(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type);
+                    return createRMSNorm(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::Q16_1:
-                    return createRMSNorm(static_cast<const llaminar2::Q16_1Tensor *>(tensor), dev_type);
+                    return createRMSNorm(static_cast<const llaminar2::Q16_1Tensor *>(tensor), dev_type, device_ordinal);
                 default:
                     throw std::runtime_error(
                         "KernelFactory::createRMSNorm: unsupported tensor type " +
@@ -2156,9 +2156,9 @@ namespace llaminar
                 if (reg_it != device_kernel_registry_.end())
                 {
                     LOG_DEBUG("[KernelFactory][Registry] hit kind=ROPE dev=" << static_cast<int>(target_device.type)
-                                                                               << ":" << target_device.ordinal
-                                                                               << " variant=" << static_cast<int>(tensor->native_type())
-                                                                               << " ptr=" << reg_it->second.get());
+                                                                             << ":" << target_device.ordinal
+                                                                             << " variant=" << static_cast<int>(tensor->native_type())
+                                                                             << " ptr=" << reg_it->second.get());
                     return static_cast<llaminar2::ITensorRoPE *>(reg_it->second.get());
                 }
 
@@ -2168,20 +2168,20 @@ namespace llaminar
                     auto *raw_ptr = it->second.get();
                     device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
                     LOG_DEBUG("[KernelFactory][Registry] backfill kind=ROPE dev=" << static_cast<int>(target_device.type)
-                                                                                    << ":" << target_device.ordinal
-                                                                                    << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                    << " ptr=" << raw_ptr);
+                                                                                  << ":" << target_device.ordinal
+                                                                                  << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                  << " ptr=" << raw_ptr);
                     return raw_ptr;
                 }
 
-                auto kernel = createRoPE(tensor, getDeviceType(target_device));
+                auto kernel = createRoPE(tensor, getDeviceType(target_device), target_device.ordinal);
                 auto *raw_ptr = kernel.get();
                 rope_cache_[key] = std::move(kernel);
                 device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
                 LOG_DEBUG("[KernelFactory][Registry] create kind=ROPE dev=" << static_cast<int>(target_device.type)
-                                                                              << ":" << target_device.ordinal
-                                                                              << " variant=" << static_cast<int>(tensor->native_type())
-                                                                              << " ptr=" << raw_ptr);
+                                                                            << ":" << target_device.ordinal
+                                                                            << " variant=" << static_cast<int>(tensor->native_type())
+                                                                            << " ptr=" << raw_ptr);
                 return raw_ptr;
             }
 
@@ -2206,10 +2206,10 @@ namespace llaminar
                 auto reg_it = device_kernel_registry_.find(registry_key);
                 if (reg_it != device_kernel_registry_.end())
                 {
-                    LOG_DEBUG("[KernelFactory][Registry] hit kind=RMSNORM dev=" << static_cast<int>(target_device.type)
-                                                                                  << ":" << target_device.ordinal
-                                                                                  << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                  << " ptr=" << reg_it->second.get());
+                    LOG_DEBUG("[KernelFactory][RMSNORM] registry hit dev=" << static_cast<int>(target_device.type)
+                                                                          << ":" << target_device.ordinal
+                                                                          << " tensor_type=" << static_cast<int>(tensor->native_type())
+                                                                          << " kernel=" << reg_it->second.get());
                     return static_cast<llaminar2::ITensorRMSNorm *>(reg_it->second.get());
                 }
 
@@ -2218,21 +2218,25 @@ namespace llaminar
                 {
                     auto *raw_ptr = it->second.get();
                     device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
-                    LOG_DEBUG("[KernelFactory][Registry] backfill kind=RMSNORM dev=" << static_cast<int>(target_device.type)
-                                                                                       << ":" << target_device.ordinal
-                                                                                       << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                       << " ptr=" << raw_ptr);
+                    LOG_DEBUG("[KernelFactory][RMSNORM] cache hit dev=" << static_cast<int>(target_device.type)
+                                                                       << ":" << target_device.ordinal
+                                                                       << " tensor_type=" << static_cast<int>(tensor->native_type())
+                                                                       << " kernel=" << static_cast<const void *>(raw_ptr));
                     return raw_ptr;
                 }
 
-                auto kernel = createRMSNorm(tensor, getDeviceType(target_device));
+                auto kernel = createRMSNorm(tensor, getDeviceType(target_device), target_device.ordinal);
                 auto *raw_ptr = kernel.get();
                 rmsnorm_cache_[key] = std::move(kernel);
                 device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                LOG_INFO("[KernelFactory][RMSNORM] create dev=" << static_cast<int>(target_device.type)
+                                                                << ":" << target_device.ordinal
+                                                                << " tensor_type=" << static_cast<int>(tensor->native_type())
+                                                                << " kernel=" << static_cast<const void *>(raw_ptr));
                 LOG_DEBUG("[KernelFactory][Registry] create kind=RMSNORM dev=" << static_cast<int>(target_device.type)
-                                                                                 << ":" << target_device.ordinal
-                                                                                 << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                 << " ptr=" << raw_ptr);
+                                                                               << ":" << target_device.ordinal
+                                                                               << " variant=" << static_cast<int>(tensor->native_type())
+                                                                               << " ptr=" << raw_ptr);
                 return raw_ptr;
             }
 
@@ -2258,9 +2262,9 @@ namespace llaminar
                 if (reg_it != device_kernel_registry_.end())
                 {
                     LOG_DEBUG("[KernelFactory][Registry] hit kind=SWIGLU dev=" << static_cast<int>(target_device.type)
-                                                                                 << ":" << target_device.ordinal
-                                                                                 << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                 << " ptr=" << reg_it->second.get());
+                                                                               << ":" << target_device.ordinal
+                                                                               << " variant=" << static_cast<int>(tensor->native_type())
+                                                                               << " ptr=" << reg_it->second.get());
                     return static_cast<llaminar2::ITensorSwiGLU *>(reg_it->second.get());
                 }
 
@@ -2270,20 +2274,20 @@ namespace llaminar
                     auto *raw_ptr = it->second.get();
                     device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
                     LOG_DEBUG("[KernelFactory][Registry] backfill kind=SWIGLU dev=" << static_cast<int>(target_device.type)
-                                                                                      << ":" << target_device.ordinal
-                                                                                      << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                      << " ptr=" << raw_ptr);
+                                                                                    << ":" << target_device.ordinal
+                                                                                    << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                    << " ptr=" << raw_ptr);
                     return raw_ptr;
                 }
 
-                auto kernel = createSwiGLU(tensor, getDeviceType(target_device));
+                auto kernel = createSwiGLU(tensor, getDeviceType(target_device), target_device.ordinal);
                 auto *raw_ptr = kernel.get();
                 swiglu_cache_[key] = std::move(kernel);
                 device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
                 LOG_DEBUG("[KernelFactory][Registry] create kind=SWIGLU dev=" << static_cast<int>(target_device.type)
-                                                                                << ":" << target_device.ordinal
-                                                                                << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                << " ptr=" << raw_ptr);
+                                                                              << ":" << target_device.ordinal
+                                                                              << " variant=" << static_cast<int>(tensor->native_type())
+                                                                              << " ptr=" << raw_ptr);
                 return raw_ptr;
             }
 
@@ -2309,9 +2313,9 @@ namespace llaminar
                 if (reg_it != device_kernel_registry_.end())
                 {
                     LOG_DEBUG("[KernelFactory][Registry] hit kind=SOFTMAX dev=" << static_cast<int>(target_device.type)
-                                                                                  << ":" << target_device.ordinal
-                                                                                  << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                  << " ptr=" << reg_it->second.get());
+                                                                                << ":" << target_device.ordinal
+                                                                                << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                << " ptr=" << reg_it->second.get());
                     return static_cast<llaminar2::ITensorSoftmax *>(reg_it->second.get());
                 }
 
@@ -2321,20 +2325,20 @@ namespace llaminar
                     auto *raw_ptr = it->second.get();
                     device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
                     LOG_DEBUG("[KernelFactory][Registry] backfill kind=SOFTMAX dev=" << static_cast<int>(target_device.type)
-                                                                                       << ":" << target_device.ordinal
-                                                                                       << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                       << " ptr=" << raw_ptr);
+                                                                                     << ":" << target_device.ordinal
+                                                                                     << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                     << " ptr=" << raw_ptr);
                     return raw_ptr;
                 }
 
-                auto kernel = createSoftmax(tensor, getDeviceType(target_device));
+                auto kernel = createSoftmax(tensor, getDeviceType(target_device), target_device.ordinal);
                 auto *raw_ptr = kernel.get();
                 softmax_cache_[key] = std::move(kernel);
                 device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
                 LOG_DEBUG("[KernelFactory][Registry] create kind=SOFTMAX dev=" << static_cast<int>(target_device.type)
-                                                                                 << ":" << target_device.ordinal
-                                                                                 << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                 << " ptr=" << raw_ptr);
+                                                                               << ":" << target_device.ordinal
+                                                                               << " variant=" << static_cast<int>(tensor->native_type())
+                                                                               << " ptr=" << raw_ptr);
                 return raw_ptr;
             }
 
@@ -2360,9 +2364,9 @@ namespace llaminar
                 if (reg_it != device_kernel_registry_.end())
                 {
                     LOG_DEBUG("[KernelFactory][Registry] hit kind=RESIDUAL_ADD dev=" << static_cast<int>(target_device.type)
-                                                                                       << ":" << target_device.ordinal
-                                                                                       << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                       << " ptr=" << reg_it->second.get());
+                                                                                     << ":" << target_device.ordinal
+                                                                                     << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                     << " ptr=" << reg_it->second.get());
                     return static_cast<llaminar2::ITensorResidualAdd *>(reg_it->second.get());
                 }
 
@@ -2372,20 +2376,20 @@ namespace llaminar
                     auto *raw_ptr = it->second.get();
                     device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
                     LOG_DEBUG("[KernelFactory][Registry] backfill kind=RESIDUAL_ADD dev=" << static_cast<int>(target_device.type)
-                                                                                            << ":" << target_device.ordinal
-                                                                                            << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                            << " ptr=" << raw_ptr);
+                                                                                          << ":" << target_device.ordinal
+                                                                                          << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                          << " ptr=" << raw_ptr);
                     return raw_ptr;
                 }
 
-                auto kernel = createResidualAdd(tensor, getDeviceType(target_device));
+                auto kernel = createResidualAdd(tensor, getDeviceType(target_device), target_device.ordinal);
                 auto *raw_ptr = kernel.get();
                 residual_add_cache_[key] = std::move(kernel);
                 device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
                 LOG_DEBUG("[KernelFactory][Registry] create kind=RESIDUAL_ADD dev=" << static_cast<int>(target_device.type)
-                                                                                      << ":" << target_device.ordinal
-                                                                                      << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                      << " ptr=" << raw_ptr);
+                                                                                    << ":" << target_device.ordinal
+                                                                                    << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                    << " ptr=" << raw_ptr);
                 return raw_ptr;
             }
 
@@ -2411,9 +2415,9 @@ namespace llaminar
                 if (reg_it != device_kernel_registry_.end())
                 {
                     LOG_DEBUG("[KernelFactory][Registry] hit kind=ATTENTION dev=" << static_cast<int>(target_device.type)
-                                                                                    << ":" << target_device.ordinal
-                                                                                    << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                    << " ptr=" << reg_it->second.get());
+                                                                                  << ":" << target_device.ordinal
+                                                                                  << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                  << " ptr=" << reg_it->second.get());
                     return static_cast<llaminar2::ITensorAttention *>(reg_it->second.get());
                 }
 
@@ -2423,20 +2427,20 @@ namespace llaminar
                     auto *raw_ptr = it->second.get();
                     device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
                     LOG_DEBUG("[KernelFactory][Registry] backfill kind=ATTENTION dev=" << static_cast<int>(target_device.type)
-                                                                                         << ":" << target_device.ordinal
-                                                                                         << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                         << " ptr=" << raw_ptr);
+                                                                                       << ":" << target_device.ordinal
+                                                                                       << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                       << " ptr=" << raw_ptr);
                     return raw_ptr;
                 }
 
-                auto kernel = createAttention(tensor, getDeviceType(target_device));
+                auto kernel = createAttention(tensor, getDeviceType(target_device), target_device.ordinal);
                 auto *raw_ptr = kernel.get();
                 attention_cache_[key] = std::move(kernel);
                 device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
                 LOG_DEBUG("[KernelFactory][Registry] create kind=ATTENTION dev=" << static_cast<int>(target_device.type)
-                                                                                   << ":" << target_device.ordinal
-                                                                                   << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                   << " ptr=" << raw_ptr);
+                                                                                 << ":" << target_device.ordinal
+                                                                                 << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                 << " ptr=" << raw_ptr);
                 return raw_ptr;
             }
 
@@ -2462,9 +2466,9 @@ namespace llaminar
                 if (reg_it != device_kernel_registry_.end())
                 {
                     LOG_DEBUG("[KernelFactory][Registry] hit kind=EMBEDDING dev=" << static_cast<int>(target_device.type)
-                                                                                    << ":" << target_device.ordinal
-                                                                                    << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                    << " ptr=" << reg_it->second.get());
+                                                                                  << ":" << target_device.ordinal
+                                                                                  << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                  << " ptr=" << reg_it->second.get());
                     return static_cast<llaminar2::ITensorEmbedding *>(reg_it->second.get());
                 }
 
@@ -2474,9 +2478,9 @@ namespace llaminar
                     auto *raw_ptr = it->second.get();
                     device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
                     LOG_DEBUG("[KernelFactory][Registry] backfill kind=EMBEDDING dev=" << static_cast<int>(target_device.type)
-                                                                                         << ":" << target_device.ordinal
-                                                                                         << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                         << " ptr=" << raw_ptr);
+                                                                                       << ":" << target_device.ordinal
+                                                                                       << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                       << " ptr=" << raw_ptr);
                     return raw_ptr;
                 }
 
@@ -2486,16 +2490,16 @@ namespace llaminar
                 switch (tensor->native_type())
                 {
                 case llaminar2::TensorType::FP32:
-                    kernel = createEmbedding(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type);
+                    kernel = createEmbedding(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type, target_device.ordinal);
                     break;
                 case llaminar2::TensorType::BF16:
-                    kernel = createEmbedding(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type);
+                    kernel = createEmbedding(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type, target_device.ordinal);
                     break;
                 case llaminar2::TensorType::FP16:
-                    kernel = createEmbedding(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type);
+                    kernel = createEmbedding(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type, target_device.ordinal);
                     break;
                 case llaminar2::TensorType::Q8_1:
-                    kernel = createEmbedding(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type);
+                    kernel = createEmbedding(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type, target_device.ordinal);
                     break;
                 default:
                     throw std::runtime_error(
@@ -2507,14 +2511,14 @@ namespace llaminar
                 embedding_cache_[key] = std::move(kernel);
                 device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
                 LOG_DEBUG("[KernelFactory][Registry] create kind=EMBEDDING dev=" << static_cast<int>(target_device.type)
-                                                                                   << ":" << target_device.ordinal
-                                                                                   << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                   << " ptr=" << raw_ptr);
+                                                                                 << ":" << target_device.ordinal
+                                                                                 << " variant=" << static_cast<int>(tensor->native_type())
+                                                                                 << " ptr=" << raw_ptr);
                 return raw_ptr;
             }
 
             std::unique_ptr<llaminar2::ITensorRoPE> KernelFactory::createRoPE(
-                const llaminar2::TensorBase *tensor, DeviceType dev_type)
+                const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal)
             {
                 if (!tensor)
                 {
@@ -2524,13 +2528,13 @@ namespace llaminar
                 switch (tensor->native_type())
                 {
                 case llaminar2::TensorType::FP32:
-                    return createRoPE(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type);
+                    return createRoPE(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::BF16:
-                    return createRoPE(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type);
+                    return createRoPE(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::FP16:
-                    return createRoPE(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type);
+                    return createRoPE(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::Q8_1:
-                    return createRoPE(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type);
+                    return createRoPE(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type, device_ordinal);
                 default:
                     throw std::runtime_error(
                         "KernelFactory::createRoPE: unsupported tensor type " +
@@ -2539,7 +2543,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorSwiGLU> KernelFactory::createSwiGLU(
-                const llaminar2::TensorBase *tensor, DeviceType dev_type)
+                const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal)
             {
                 if (!tensor)
                 {
@@ -2549,13 +2553,13 @@ namespace llaminar
                 switch (tensor->native_type())
                 {
                 case llaminar2::TensorType::FP32:
-                    return createSwiGLU(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type);
+                    return createSwiGLU(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::BF16:
-                    return createSwiGLU(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type);
+                    return createSwiGLU(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::FP16:
-                    return createSwiGLU(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type);
+                    return createSwiGLU(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::Q8_1:
-                    return createSwiGLU(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type);
+                    return createSwiGLU(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type, device_ordinal);
                 default:
                     throw std::runtime_error(
                         "KernelFactory::createSwiGLU: unsupported tensor type " +
@@ -2564,7 +2568,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorResidualAdd> KernelFactory::createResidualAdd(
-                const llaminar2::TensorBase *tensor, DeviceType dev_type)
+                const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal)
             {
                 if (!tensor)
                 {
@@ -2574,11 +2578,11 @@ namespace llaminar
                 switch (tensor->native_type())
                 {
                 case llaminar2::TensorType::FP32:
-                    return createResidualAdd(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type);
+                    return createResidualAdd(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::BF16:
-                    return createResidualAdd(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type);
+                    return createResidualAdd(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::FP16:
-                    return createResidualAdd(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type);
+                    return createResidualAdd(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type, device_ordinal);
                 default:
                     throw std::runtime_error(
                         "KernelFactory::createResidualAdd: unsupported tensor type " +
@@ -2587,7 +2591,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorAttention> KernelFactory::createAttention(
-                const llaminar2::TensorBase *tensor, DeviceType dev_type)
+                const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal)
             {
                 if (!tensor)
                 {
@@ -2597,13 +2601,13 @@ namespace llaminar
                 switch (tensor->native_type())
                 {
                 case llaminar2::TensorType::FP32:
-                    return createAttention(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type);
+                    return createAttention(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::BF16:
-                    return createAttention(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type);
+                    return createAttention(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::FP16:
-                    return createAttention(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type);
+                    return createAttention(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::Q8_1:
-                    return createAttention(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type);
+                    return createAttention(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type, device_ordinal);
                 default:
                     throw std::runtime_error(
                         "KernelFactory::createAttention: unsupported tensor type " +
@@ -2612,7 +2616,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorAttention> KernelFactory::createAttention(
-                const llaminar2::ITensor *tensor, DeviceType dev_type)
+                const llaminar2::ITensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 if (!tensor)
                 {
@@ -2632,7 +2636,7 @@ namespace llaminar
                     {
                         throw std::runtime_error("KernelFactory::createAttention: ITensor for CPU must be TensorBase");
                     }
-                    return createAttention(cpu_tensor, dev_type);
+                    return createAttention(cpu_tensor, dev_type, device_ordinal);
                 }
 
 #ifdef HAVE_CUDA
@@ -2640,11 +2644,11 @@ namespace llaminar
                     switch (tensor->native_type())
                     {
                     case llaminar2::TensorType::FP32:
-                        return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
+                        return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>(device_ordinal);
                     case llaminar2::TensorType::FP16:
-                        return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
+                        return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>(device_ordinal);
                     case llaminar2::TensorType::BF16:
-                        return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
+                        return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>(device_ordinal);
                     default:
                         throw std::runtime_error(
                             "KernelFactory::createAttention: unsupported CUDA tensor type " +
@@ -2657,11 +2661,11 @@ namespace llaminar
                     switch (tensor->native_type())
                     {
                     case llaminar2::TensorType::FP32:
-                        return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
+                        return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>(device_ordinal);
                     case llaminar2::TensorType::FP16:
-                        return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
+                        return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>(device_ordinal);
                     case llaminar2::TensorType::BF16:
-                        return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
+                        return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>(device_ordinal);
                     default:
                         throw std::runtime_error(
                             "KernelFactory::createAttention: unsupported ROCm tensor type " +
@@ -2681,7 +2685,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorAttention> KernelFactory::createAttention(
-                const llaminar2::FP32Tensor *tensor, DeviceType dev_type)
+                const llaminar2::FP32Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -2691,12 +2695,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>(device_ordinal);
 #endif
 
                 default:
@@ -2705,7 +2709,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorAttention> KernelFactory::createAttention(
-                const llaminar2::BF16Tensor *tensor, DeviceType dev_type)
+                const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -2715,12 +2719,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>(device_ordinal);
 #endif
 
                 default:
@@ -2729,7 +2733,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorAttention> KernelFactory::createAttention(
-                const llaminar2::FP16Tensor *tensor, DeviceType dev_type)
+                const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -2739,12 +2743,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    return std::make_unique<llaminar2::rocm::ROCmFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>(device_ordinal);
 #endif
 
                 default:
@@ -2753,7 +2757,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorAttention> KernelFactory::createAttention(
-                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type)
+                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -2782,7 +2786,7 @@ namespace llaminar
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorEmbedding> KernelFactory::createEmbedding(
-                const llaminar2::FP32Tensor *tensor, DeviceType dev_type)
+                const llaminar2::FP32Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -2792,12 +2796,12 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return std::make_unique<llaminar2::CUDAEmbeddingKernelT>();
+                    return std::make_unique<llaminar2::CUDAEmbeddingKernelT>(device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::ROCmEmbeddingKernelT>();
+                    return std::make_unique<llaminar2::ROCmEmbeddingKernelT>(device_ordinal);
 #endif
 
                 default:
@@ -2806,7 +2810,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorEmbedding> KernelFactory::createEmbedding(
-                const llaminar2::BF16Tensor *tensor, DeviceType dev_type)
+                const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -2821,7 +2825,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::ROCmEmbeddingKernelT>();
+                    return std::make_unique<llaminar2::ROCmEmbeddingKernelT>(device_ordinal);
 #endif
 
                 default:
@@ -2830,7 +2834,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorEmbedding> KernelFactory::createEmbedding(
-                const llaminar2::FP16Tensor *tensor, DeviceType dev_type)
+                const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -2845,7 +2849,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::ROCmEmbeddingKernelT>();
+                    return std::make_unique<llaminar2::ROCmEmbeddingKernelT>(device_ordinal);
 #endif
 
                 default:
@@ -2854,7 +2858,7 @@ namespace llaminar
             }
 
             std::unique_ptr<llaminar2::ITensorEmbedding> KernelFactory::createEmbedding(
-                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type)
+                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type, int device_ordinal)
             {
                 (void)tensor;
                 switch (dev_type)
@@ -2869,7 +2873,7 @@ namespace llaminar
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
-                    return std::make_unique<llaminar2::ROCmEmbeddingKernelT>();
+                    return std::make_unique<llaminar2::ROCmEmbeddingKernelT>(device_ordinal);
 #endif
 
                 default:
@@ -2930,6 +2934,8 @@ namespace llaminar
             const llaminar2::gemm_v4::QuantisedPackedWeights *
             KernelFactory::ensurePackedWeightsInTensorCache(const llaminar2::TensorBase *tensor)
             {
+                std::lock_guard<std::mutex> tensor_lock(tensor->packed_cache_mutex_);
+
                 // Check if tensor already has packed weights cached
                 TensorPackedWeightsCache *packed_cache = nullptr;
                 if (tensor->cache_.has_value())
@@ -2982,6 +2988,8 @@ namespace llaminar
             llaminar2::cuda::CUDAPackedWeights *
             KernelFactory::ensureCUDAPackedWeightsInTensorCache(const llaminar2::TensorBase *tensor)
             {
+                std::lock_guard<std::mutex> tensor_lock(tensor->packed_cache_mutex_);
+
                 // Check if tensor already has CUDA packed weights cached
                 TensorCUDAPackedWeightsCache *packed_cache = nullptr;
                 if (tensor->cuda_cache_.has_value())
@@ -3042,6 +3050,8 @@ namespace llaminar
             llaminar2::rocm::ROCmPackedWeights *
             KernelFactory::ensureROCmPackedWeightsInTensorCache(const llaminar2::TensorBase *tensor)
             {
+                std::lock_guard<std::mutex> tensor_lock(tensor->packed_cache_mutex_);
+
                 // Check if tensor already has ROCm packed weights cached
                 TensorROCmPackedWeightsCache *packed_cache = nullptr;
                 if (tensor->rocm_cache_.has_value())
@@ -3170,62 +3180,65 @@ namespace llaminar
                 }
 
                 // Also clean up tensor's packed weights cache if present (CPU VNNI)
-                if (tensor->cache_.has_value())
                 {
-                    try
+                    std::lock_guard<std::mutex> tensor_lock(tensor->packed_cache_mutex_);
+                    if (tensor->cache_.has_value())
                     {
-                        auto *packed_cache = std::any_cast<TensorPackedWeightsCache *>(tensor->cache_);
-                        if (packed_cache)
+                        try
                         {
-                            delete packed_cache;
-                            tensor->cache_.reset();
+                            auto *packed_cache = std::any_cast<TensorPackedWeightsCache *>(tensor->cache_);
+                            if (packed_cache)
+                            {
+                                delete packed_cache;
+                                tensor->cache_.reset();
+                            }
+                        }
+                        catch (const std::bad_any_cast &)
+                        {
+                            // cache_ contains something else - leave it alone
                         }
                     }
-                    catch (const std::bad_any_cast &)
-                    {
-                        // cache_ contains something else - leave it alone
-                    }
-                }
 
 #ifdef HAVE_CUDA
-                // Also clean up tensor's CUDA packed weights cache if present
-                if (tensor->cuda_cache_.has_value())
-                {
-                    try
+                    // Also clean up tensor's CUDA packed weights cache if present
+                    if (tensor->cuda_cache_.has_value())
                     {
-                        auto *cuda_packed_cache = std::any_cast<TensorCUDAPackedWeightsCache *>(tensor->cuda_cache_);
-                        if (cuda_packed_cache)
+                        try
                         {
-                            delete cuda_packed_cache; // ~CUDAPackedWeights frees device memory
-                            tensor->cuda_cache_.reset();
+                            auto *cuda_packed_cache = std::any_cast<TensorCUDAPackedWeightsCache *>(tensor->cuda_cache_);
+                            if (cuda_packed_cache)
+                            {
+                                delete cuda_packed_cache; // ~CUDAPackedWeights frees device memory
+                                tensor->cuda_cache_.reset();
+                            }
+                        }
+                        catch (const std::bad_any_cast &)
+                        {
+                            // cuda_cache_ contains something else - leave it alone
                         }
                     }
-                    catch (const std::bad_any_cast &)
-                    {
-                        // cuda_cache_ contains something else - leave it alone
-                    }
-                }
 #endif
 
 #ifdef HAVE_ROCM
-                // Also clean up tensor's ROCm packed weights cache if present
-                if (tensor->rocm_cache_.has_value())
-                {
-                    try
+                    // Also clean up tensor's ROCm packed weights cache if present
+                    if (tensor->rocm_cache_.has_value())
                     {
-                        auto *rocm_packed_cache = std::any_cast<TensorROCmPackedWeightsCache *>(tensor->rocm_cache_);
-                        if (rocm_packed_cache)
+                        try
                         {
-                            delete rocm_packed_cache; // ~ROCmPackedWeights frees device memory
-                            tensor->rocm_cache_.reset();
+                            auto *rocm_packed_cache = std::any_cast<TensorROCmPackedWeightsCache *>(tensor->rocm_cache_);
+                            if (rocm_packed_cache)
+                            {
+                                delete rocm_packed_cache; // ~ROCmPackedWeights frees device memory
+                                tensor->rocm_cache_.reset();
+                            }
+                        }
+                        catch (const std::bad_any_cast &)
+                        {
+                            // rocm_cache_ contains something else - leave it alone
                         }
                     }
-                    catch (const std::bad_any_cast &)
-                    {
-                        // rocm_cache_ contains something else - leave it alone
-                    }
-                }
 #endif
+                }
 
                 // Clear any fused QKV kernels that reference this tensor
                 for (auto it = fused_qkv_cache_.begin(); it != fused_qkv_cache_.end();)
@@ -3335,6 +3348,8 @@ namespace llaminar
                     {
                         continue;
                     }
+
+                    std::lock_guard<std::mutex> tensor_lock(tensor->packed_cache_mutex_);
 
                     // Clean up CPU packed weights
                     if (tensor->cache_.has_value())
@@ -3554,25 +3569,25 @@ namespace llaminar
                         device_engine = std::make_shared<PhaseCGemmDeviceEngine>(prepared->device_id, prepared->variant);
                         device_gemm_engine_registry_[device_engine_key] = device_engine;
                         LOG_DEBUG("[KernelFactory][PhaseC] device GEMM engine create dev=" << static_cast<int>(prepared->device_id.type)
-                                                                                            << ":" << prepared->device_id.ordinal
-                                                                                            << " variant=" << prepared->variant);
+                                                                                           << ":" << prepared->device_id.ordinal
+                                                                                           << " variant=" << prepared->variant);
                     }
                     else
                     {
                         device_engine = dev_it->second;
                         LOG_DEBUG("[KernelFactory][PhaseC] device GEMM engine hit dev=" << static_cast<int>(prepared->device_id.type)
-                                                                                          << ":" << prepared->device_id.ordinal
-                                                                                          << " variant=" << prepared->variant);
+                                                                                        << ":" << prepared->device_id.ordinal
+                                                                                        << " variant=" << prepared->variant);
                     }
                 }
 
                 auto *kernel = device_engine->resolveKernel(prepared);
                 LOG_DEBUG("[KernelFactory][PhaseC] GEMM kernel via device engine dev=" << static_cast<int>(prepared->device_id.type)
-                                                                                        << ":" << prepared->device_id.ordinal
-                                                                                        << " prepared=" << prepared
-                                                                                        << " tensor=" << prepared->tensor
-                                                                                        << " variant=" << prepared->variant
-                                                                                        << " ptr=" << kernel);
+                                                                                       << ":" << prepared->device_id.ordinal
+                                                                                       << " prepared=" << prepared
+                                                                                       << " tensor=" << prepared->tensor
+                                                                                       << " variant=" << prepared->variant
+                                                                                       << " ptr=" << kernel);
                 return kernel;
             }
 
@@ -3626,9 +3641,9 @@ namespace llaminar
                     if (it != prepared_gemm_registry_.end())
                     {
                         LOG_DEBUG("[KernelFactory][PhaseC] prepared weights hit dev=" << static_cast<int>(target_device.type)
-                                                                                        << ":" << target_device.ordinal
-                                                                                        << " kind=" << static_cast<int>(resolved_kind)
-                                                                                        << " tensor=" << tensor);
+                                                                                      << ":" << target_device.ordinal
+                                                                                      << " kind=" << static_cast<int>(resolved_kind)
+                                                                                      << " tensor=" << tensor);
                         return it->second.get();
                     }
                 }
@@ -3677,10 +3692,10 @@ namespace llaminar
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 auto [it, inserted] = prepared_gemm_registry_.emplace(key, std::move(handle));
                 LOG_DEBUG("[KernelFactory][PhaseC] prepared weights " << (inserted ? "create" : "race-hit")
-                                                                        << " dev=" << static_cast<int>(target_device.type)
-                                                                        << ":" << target_device.ordinal
-                                                                        << " kind=" << static_cast<int>(resolved_kind)
-                                                                        << " tensor=" << tensor);
+                                                                      << " dev=" << static_cast<int>(target_device.type)
+                                                                      << ":" << target_device.ordinal
+                                                                      << " kind=" << static_cast<int>(resolved_kind)
+                                                                      << " tensor=" << tensor);
                 return it->second.get();
             }
 

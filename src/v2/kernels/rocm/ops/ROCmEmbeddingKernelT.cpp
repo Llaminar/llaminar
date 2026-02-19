@@ -6,12 +6,17 @@
 #include "ROCmEmbeddingKernelT.h"
 #include "utils/Logger.h"
 #include "utils/ROCmKernelProfiler.h"
-#include "../../../tensors/TensorClasses.h"
+#include "utils/DebugEnv.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../common/EmbedQ8Repack.h"
+#include "../ROCmKernelBase.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../backends/rocm/ROCmBackend.h"
 
 #include <hip/hip_runtime.h>
+#include <algorithm>
+#include <mutex>
+#include <vector>
 
 // Forward declarations for HIP kernels (defined in ROCmEmbeddingKernels.hip)
 extern "C"
@@ -55,11 +60,164 @@ extern "C"
         int num_tokens,
         int d_model,
         int blocks_per_row,
+        int vocab_size,
+        int debug_probe,
         hipStream_t stream);
 }
 
 namespace llaminar2
 {
+
+    ROCmEmbeddingKernelT::~ROCmEmbeddingKernelT()
+    {
+        std::lock_guard<std::mutex> lock(canary_mutex_);
+        for (auto &entry : canary_by_device_)
+        {
+            auto &buf = entry.second;
+            if (!buf.base)
+            {
+                continue;
+            }
+
+            try
+            {
+                (void)HipDeviceGuard::setDevice(entry.first);
+                (void)hipFree(buf.base);
+            }
+            catch (...)
+            {
+                // Best-effort cleanup in destructor.
+            }
+
+            buf = DebugCanaryBuffer{};
+        }
+    }
+
+    void ROCmEmbeddingKernelT::setGPUStream(void *stream)
+    {
+        gpu_stream_ = stream;
+
+        int current_device = -1;
+        if (hipGetDevice(&current_device) == hipSuccess && current_device >= 0)
+        {
+            std::lock_guard<std::mutex> lock(stream_mutex_);
+            stream_by_device_[current_device] = stream;
+        }
+    }
+
+    void *ROCmEmbeddingKernelT::getStream() const
+    {
+        int current_device = -1;
+        if (hipGetDevice(&current_device) == hipSuccess && current_device >= 0)
+        {
+            std::lock_guard<std::mutex> lock(stream_mutex_);
+            auto it = stream_by_device_.find(current_device);
+            if (it != stream_by_device_.end())
+            {
+                return it->second;
+            }
+        }
+
+        return gpu_stream_ ? gpu_stream_ : (device_ctx_ ? device_ctx_->defaultStream() : nullptr);
+    }
+
+    namespace
+    {
+        bool validatePointerForDevice(const void *ptr,
+                                      int expected_device,
+                                      const char *ptr_name,
+                                      bool fail_on_query_error)
+        {
+            if (!ptr)
+            {
+                LOG_ERROR("[ROCmEmbeddingKernelT] " << ptr_name << " is null");
+                return false;
+            }
+
+            hipPointerAttribute_t attr{};
+            hipError_t attr_err = hipPointerGetAttributes(&attr, ptr);
+            if (attr_err != hipSuccess)
+            {
+                if (fail_on_query_error)
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to query pointer attributes for " << ptr_name
+                                                                                               << " ptr=" << ptr << " err=" << hipGetErrorString(attr_err)
+                                                                                               << " expected_device=" << expected_device);
+                    ROCmBackend::dumpRecentPointerEvents(32);
+                    return false;
+                }
+                return true;
+            }
+
+            if (attr.device != expected_device)
+            {
+                LOG_ERROR("[ROCmEmbeddingKernelT] " << ptr_name << " buffer on wrong device: ptr=" << ptr
+                                                    << " attr.device=" << attr.device << " expected=" << expected_device);
+                ROCmBackend::dumpRecentPointerEvents(32);
+                return false;
+            }
+
+            ROCmPointerOwnerInfo owner_info{};
+            if (ROCmBackend::queryPointerOwner(ptr, owner_info) && owner_info.active && owner_info.device_id != expected_device)
+            {
+                LOG_ERROR("[ROCmEmbeddingKernelT] " << ptr_name << " owner mismatch: ptr=" << ptr
+                                                    << " owner.device=" << owner_info.device_id << " expected=" << expected_device
+                                                    << " owner.base=" << owner_info.base_ptr << " owner.bytes=" << owner_info.size_bytes
+                                                    << " owner.seq=" << owner_info.sequence);
+                ROCmBackend::dumpRecentPointerEvents(32);
+                return false;
+            }
+
+            return true;
+        }
+
+        bool validateTokenIdsHost(const int *token_ids,
+                                  int num_tokens,
+                                  int vocab_size,
+                                  bool fail_on_invalid)
+        {
+            if (!token_ids || num_tokens <= 0)
+            {
+                LOG_ERROR("[ROCmEmbeddingKernelT] Invalid token buffer on host: token_ids=" << token_ids
+                                                                                            << " num_tokens=" << num_tokens);
+                return false;
+            }
+
+            int min_id = token_ids[0];
+            int max_id = token_ids[0];
+            int first_invalid_pos = -1;
+            int first_invalid_id = -1;
+
+            for (int i = 0; i < num_tokens; ++i)
+            {
+                int value = token_ids[i];
+                min_id = std::min(min_id, value);
+                max_id = std::max(max_id, value);
+                if ((value < 0 || value >= vocab_size) && first_invalid_pos < 0)
+                {
+                    first_invalid_pos = i;
+                    first_invalid_id = value;
+                }
+            }
+
+            LOG_INFO("[ROCmEmbeddingKernelT] Host token stats: num_tokens=" << num_tokens
+                                                                            << " vocab_size=" << vocab_size
+                                                                            << " min_id=" << min_id
+                                                                            << " max_id=" << max_id
+                                                                            << " first_id=" << token_ids[0]
+                                                                            << " last_id=" << token_ids[num_tokens - 1]);
+
+            if (first_invalid_pos >= 0)
+            {
+                LOG_ERROR("[ROCmEmbeddingKernelT] Host token out of range at pos=" << first_invalid_pos
+                                                                                   << " id=" << first_invalid_id
+                                                                                   << " vocab_size=" << vocab_size);
+                return !fail_on_invalid;
+            }
+
+            return true;
+        }
+    }
 
     bool ROCmEmbeddingKernelT::apply(
         const float *embed_data,
@@ -195,6 +353,14 @@ namespace llaminar2
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::EMBEDDING_LOOKUP, static_cast<hipStream_t>(getStream()));
         (void)mpi_ctx;
 
+        const bool serialize_embedding_stage = debugEnv().validation.serialize_embedding_stage;
+        static std::mutex global_serialize_embedding_mutex;
+        std::unique_lock<std::mutex> serialize_lock(global_serialize_embedding_mutex, std::defer_lock);
+        if (serialize_embedding_stage)
+        {
+            serialize_lock.lock();
+        }
+
         if (!embed_table || !output)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] apply_tensor: null tensor pointer");
@@ -224,29 +390,46 @@ namespace llaminar2
             return false;
         }
 
+        DeviceWorkspaceManager *workspace = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(workspace_mutex_);
+            auto it = workspace_by_device_.find(dev);
+            if (it != workspace_by_device_.end())
+            {
+                workspace = it->second;
+            }
+            else
+            {
+                workspace = workspace_;
+            }
+        }
+
         // =====================================================================
         // Step 1: Get token_ids buffer from workspace and copy data
         // =====================================================================
-        if (!hasWorkspace())
+        if (!validateROCmWorkspaceBinding(workspace, dev, "ROCmEmbeddingKernelT"))
         {
-            LOG_ERROR("[ROCmEmbeddingKernelT] Workspace not bound - call bindWorkspace() before apply_tensor()");
             return false;
         }
 
-        int *d_token_ids = static_cast<int *>(workspace_->getBuffer(EmbeddingWorkspaceBuffers::TOKEN_IDS));
+        int *d_token_ids = static_cast<int *>(workspace->getBuffer(EmbeddingWorkspaceBuffers::TOKEN_IDS));
         if (!d_token_ids)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] Workspace buffer '" << EmbeddingWorkspaceBuffers::TOKEN_IDS << "' not found");
             return false;
         }
 
-        // Workspace must belong to the active device in LocalTP execution.
-        const DeviceId workspace_device = workspace_->device();
-        if (!workspace_device.is_rocm() || workspace_device.rocm_ordinal() != dev)
+        const DeviceId workspace_device = workspace->device();
+
+        const bool validate_gpu_ptrs = debugEnv().validation.validate_gpu_ptrs;
+        if (validate_gpu_ptrs && !validateTokenIdsHost(token_ids, num_tokens, static_cast<int>(embed_table->rows()), /*fail_on_invalid=*/true))
         {
-            LOG_ERROR("[ROCmEmbeddingKernelT] Workspace device mismatch: workspace="
-                      << workspace_device.to_string() << " active=ROCm:" << dev
-                      << " workspace_ptr=" << static_cast<void *>(workspace_));
+            return false;
+        }
+
+        if (validate_gpu_ptrs &&
+            !validatePointerForDevice(d_token_ids, dev, "TOKEN_IDS", /*fail_on_query_error=*/true))
+        {
             return false;
         }
 
@@ -272,6 +455,15 @@ namespace llaminar2
             LOG_ERROR("[ROCmEmbeddingKernelT] Output GPU pointer is null");
             return false;
         }
+        if (validate_gpu_ptrs &&
+            !validatePointerForDevice(d_output, dev, "OUTPUT", /*fail_on_query_error=*/true))
+        {
+            return false;
+        }
+
+        const bool sync_embedding_stage =
+            debugEnv().validation.sync_each_stage ||
+            debugEnv().validation.sync_after_embedding_stage;
 
         // =====================================================================
         // Step 3: Route by embedding table format
@@ -282,6 +474,11 @@ namespace llaminar2
         if (embed_fp32 && embed_fp32->isOnGPU())
         {
             float *d_embed = const_cast<float *>(static_cast<const float *>(embed_fp32->gpu_data_ptr()));
+            if (validate_gpu_ptrs &&
+                !validatePointerForDevice(d_embed, dev, "EMBED_FP32", /*fail_on_query_error=*/true))
+            {
+                return false;
+            }
             LOG_DEBUG("[ROCmEmbeddingKernelT] FP32 fast path: d_embed=" << static_cast<void *>(d_embed)
                                                                         << " num_tokens=" << num_tokens << " d_model=" << d_model);
             err = hipOps_embedding_fp32(d_embed, d_token_ids, d_output, num_tokens, d_model, stream);
@@ -290,6 +487,18 @@ namespace llaminar2
                 LOG_ERROR("[ROCmEmbeddingKernelT] FP32 kernel failed: " << hipGetErrorString(err));
                 return false;
             }
+
+            if (sync_embedding_stage)
+            {
+                hipError_t sync_err = hipStreamSynchronize(stream);
+                if (sync_err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] FP32 embedding stream sync failed: "
+                              << hipGetErrorString(sync_err));
+                    ROCmBackend::dumpRecentPointerEvents(64);
+                    return false;
+                }
+            }
             return true;
         }
 
@@ -297,7 +506,11 @@ namespace llaminar2
         const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(embed_table);
         if (unpackable)
         {
-            void *d_embed_q8 = workspace_->getBuffer(EmbeddingWorkspaceBuffers::EMBED_TABLE);
+            constexpr size_t kCanaryGuardBytes = 64 * 1024;
+            constexpr unsigned char kCanaryPrePattern = 0xA5;
+            constexpr unsigned char kCanaryPostPattern = 0x5A;
+
+            void *d_embed_q8 = workspace->getBuffer(EmbeddingWorkspaceBuffers::EMBED_TABLE);
             if (!d_embed_q8)
             {
                 LOG_ERROR("[ROCmEmbeddingKernelT] Workspace buffer '" << EmbeddingWorkspaceBuffers::EMBED_TABLE << "' not found");
@@ -305,46 +518,29 @@ namespace llaminar2
             }
 
             // Validate device ownership of workspace pointers (critical for no-P2P systems).
+            if (validate_gpu_ptrs)
             {
-                hipPointerAttribute_t token_attr{};
-                hipError_t token_err = hipPointerGetAttributes(&token_attr, d_token_ids);
-                if (token_err == hipSuccess && token_attr.device != dev)
+                if (!validatePointerForDevice(d_token_ids, dev, "TOKEN_IDS", /*fail_on_query_error=*/true) ||
+                    !validatePointerForDevice(d_embed_q8, dev, "EMBED_TABLE", /*fail_on_query_error=*/true) ||
+                    !validatePointerForDevice(d_output, dev, "OUTPUT", /*fail_on_query_error=*/true))
                 {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] TOKEN_IDS buffer on wrong device: ptr=" << static_cast<void *>(d_token_ids)
-                                                                                              << " attr.device=" << token_attr.device << " expected=" << dev);
-                    return false;
-                }
-
-                hipPointerAttribute_t embed_attr{};
-                hipError_t embed_err = hipPointerGetAttributes(&embed_attr, d_embed_q8);
-                if (embed_err == hipSuccess && embed_attr.device != dev)
-                {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] EMBED_TABLE buffer on wrong device: ptr=" << d_embed_q8
-                                                                                                << " attr.device=" << embed_attr.device << " expected=" << dev);
-                    return false;
-                }
-
-                hipPointerAttribute_t out_attr{};
-                hipError_t out_err = hipPointerGetAttributes(&out_attr, d_output);
-                if (out_err == hipSuccess && out_attr.device != dev)
-                {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] output buffer on wrong device: ptr=" << static_cast<void *>(d_output)
-                                                                                           << " attr.device=" << out_attr.device << " expected=" << dev);
                     return false;
                 }
             }
 
             bool needs_upload = false;
             {
-                std::lock_guard<std::mutex> lock(s_embed_cache_mutex_);
-                auto it = s_workspace_embed_cache_.find(workspace_);
-                needs_upload = (it == s_workspace_embed_cache_.end()) || (it->second != embed_table);
+                std::lock_guard<std::mutex> lock(embed_cache_mutex_);
+                auto it = cached_embed_table_by_device_.find(dev);
+                const TensorBase *cached_for_device =
+                    (it != cached_embed_table_by_device_.end()) ? it->second : cached_embed_table_;
+                needs_upload = (cached_for_device != embed_table);
             }
             if (needs_upload)
             {
                 auto repacked = repackEmbeddingToQ8(embed_table, d_model);
 
-                const size_t embed_buf_size = workspace_->getBufferSize(EmbeddingWorkspaceBuffers::EMBED_TABLE);
+                const size_t embed_buf_size = workspace->getBufferSize(EmbeddingWorkspaceBuffers::EMBED_TABLE);
                 if (embed_buf_size < repacked.byte_size)
                 {
                     LOG_ERROR("[ROCmEmbeddingKernelT] EMBED_TABLE workspace too small: have=" << embed_buf_size
@@ -352,7 +548,7 @@ namespace llaminar2
                                                                                               << " vocab=" << repacked.vocab_size
                                                                                               << " d_model=" << d_model
                                                                                               << " blocks_per_row=" << repacked.blocks_per_row
-                                                                                              << " workspace=" << static_cast<void *>(workspace_)
+                                                                                              << " workspace=" << static_cast<void *>(workspace)
                                                                                               << " device=" << workspace_device.to_string());
                     return false;
                 }
@@ -369,8 +565,9 @@ namespace llaminar2
                 }
 
                 {
-                    std::lock_guard<std::mutex> lock(s_embed_cache_mutex_);
-                    s_workspace_embed_cache_[workspace_] = embed_table;
+                    std::lock_guard<std::mutex> lock(embed_cache_mutex_);
+                    cached_embed_table_ = embed_table;
+                    cached_embed_table_by_device_[dev] = embed_table;
                 }
                 LOG_INFO("[ROCmEmbeddingKernelT] Uploaded EmbedQ8 embedding: "
                          << tensorTypeName(embed_table->native_type()) << " "
@@ -381,13 +578,172 @@ namespace llaminar2
             }
 
             size_t blocks_per_row = (static_cast<size_t>(d_model) + 31) / 32;
-            err = hipOps_embedding_q8(d_embed_q8, d_token_ids, d_output,
+            const size_t output_bytes = static_cast<size_t>(num_tokens) * static_cast<size_t>(d_model) * sizeof(float);
+            const bool use_dev0_canary = validate_gpu_ptrs && (dev == 0);
+            float *kernel_output = d_output;
+            void *canary_base = nullptr;
+
+            if (use_dev0_canary)
+            {
+                std::lock_guard<std::mutex> lock(canary_mutex_);
+                auto &canary = canary_by_device_[dev];
+                const size_t required_total = output_bytes + (2 * kCanaryGuardBytes);
+
+                if (!canary.base || canary.total_bytes < required_total || canary.payload_bytes < output_bytes)
+                {
+                    if (canary.base)
+                    {
+                        (void)hipFree(canary.base);
+                        canary = DebugCanaryBuffer{};
+                    }
+
+                    void *new_base = nullptr;
+                    err = hipMalloc(&new_base, required_total);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmEmbeddingKernelT] Failed to allocate EmbedQ8 canary buffer: "
+                                  << hipGetErrorString(err) << " bytes=" << required_total << " dev=" << dev);
+                        return false;
+                    }
+
+                    canary.base = new_base;
+                    canary.guard_bytes = kCanaryGuardBytes;
+                    canary.payload_bytes = output_bytes;
+                    canary.total_bytes = required_total;
+                    canary.payload = reinterpret_cast<float *>(static_cast<unsigned char *>(new_base) + kCanaryGuardBytes);
+                }
+
+                canary_base = canary.base;
+                kernel_output = canary.payload;
+
+                err = hipMemsetAsync(canary_base, kCanaryPrePattern, kCanaryGuardBytes, stream);
+                if (err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to init pre-guard: " << hipGetErrorString(err));
+                    return false;
+                }
+                err = hipMemsetAsync(static_cast<unsigned char *>(canary_base) + kCanaryGuardBytes + output_bytes,
+                                     kCanaryPostPattern,
+                                     kCanaryGuardBytes,
+                                     stream);
+                if (err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to init post-guard: " << hipGetErrorString(err));
+                    return false;
+                }
+            }
+
+            err = hipOps_embedding_q8(d_embed_q8, d_token_ids, kernel_output,
                                       num_tokens, d_model,
-                                      static_cast<int>(blocks_per_row), stream);
+                                      static_cast<int>(blocks_per_row),
+                                      static_cast<int>(embed_table->rows()),
+                                      (validate_gpu_ptrs && dev == 0) ? 1 : 0,
+                                      stream);
+            if (validate_gpu_ptrs)
+            {
+                hipError_t launch_err = hipPeekAtLastError();
+                if (launch_err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] EmbedQ8 post-launch error: " << hipGetErrorString(launch_err)
+                                                                                   << " dev=" << dev
+                                                                                   << " stream=" << static_cast<void *>(stream)
+                                                                                   << " d_embed_q8=" << d_embed_q8
+                                                                                   << " d_token_ids=" << static_cast<void *>(d_token_ids)
+                                                                                   << " d_output=" << static_cast<void *>(d_output));
+                    ROCmBackend::dumpRecentPointerEvents(64);
+                    return false;
+                }
+            }
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmEmbeddingKernelT] EmbedQ8 kernel failed: " << hipGetErrorString(err));
                 return false;
+            }
+
+            if (use_dev0_canary)
+            {
+                hipError_t sync_err = hipStreamSynchronize(stream);
+                if (sync_err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] EmbedQ8 canary sync failed: "
+                              << hipGetErrorString(sync_err));
+                    ROCmBackend::dumpRecentPointerEvents(64);
+                    return false;
+                }
+
+                std::vector<unsigned char> pre(kCanaryGuardBytes);
+                std::vector<unsigned char> post(kCanaryGuardBytes);
+
+                err = hipMemcpy(pre.data(), canary_base, kCanaryGuardBytes, hipMemcpyDeviceToHost);
+                if (err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to read pre-guard: " << hipGetErrorString(err));
+                    return false;
+                }
+                err = hipMemcpy(post.data(), static_cast<unsigned char *>(canary_base) + kCanaryGuardBytes + output_bytes,
+                                kCanaryGuardBytes, hipMemcpyDeviceToHost);
+                if (err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to read post-guard: " << hipGetErrorString(err));
+                    return false;
+                }
+
+                auto find_mismatch = [](const std::vector<unsigned char> &buf, unsigned char expected) -> size_t
+                {
+                    for (size_t i = 0; i < buf.size(); ++i)
+                    {
+                        if (buf[i] != expected)
+                        {
+                            return i;
+                        }
+                    }
+                    return static_cast<size_t>(-1);
+                };
+
+                const size_t pre_bad = find_mismatch(pre, kCanaryPrePattern);
+                const size_t post_bad = find_mismatch(post, kCanaryPostPattern);
+                if (pre_bad != static_cast<size_t>(-1) || post_bad != static_cast<size_t>(-1))
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] EmbedQ8 canary corruption detected"
+                              << " dev=" << dev
+                              << " pre_bad=" << ((pre_bad == static_cast<size_t>(-1)) ? -1 : static_cast<int>(pre_bad))
+                              << " post_bad=" << ((post_bad == static_cast<size_t>(-1)) ? -1 : static_cast<int>(post_bad))
+                              << " d_output=" << static_cast<void *>(d_output)
+                              << " kernel_output=" << static_cast<void *>(kernel_output));
+                    ROCmBackend::dumpRecentPointerEvents(64);
+                    return false;
+                }
+
+                err = hipMemcpyAsync(d_output, kernel_output, output_bytes, hipMemcpyDeviceToDevice, stream);
+                if (err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to copy canary payload to output: "
+                              << hipGetErrorString(err));
+                    return false;
+                }
+            }
+
+            if (sync_embedding_stage)
+            {
+                hipError_t sync_err = hipStreamSynchronize(stream);
+                if (sync_err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] EmbedQ8 stream sync failed: "
+                              << hipGetErrorString(sync_err));
+                    ROCmBackend::dumpRecentPointerEvents(64);
+                    return false;
+                }
+            }
+            else if (use_dev0_canary)
+            {
+                hipError_t sync_err = hipStreamSynchronize(stream);
+                if (sync_err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] EmbedQ8 post-copy sync failed: "
+                              << hipGetErrorString(sync_err));
+                    ROCmBackend::dumpRecentPointerEvents(64);
+                    return false;
+                }
             }
             return true;
         }
@@ -441,16 +797,69 @@ namespace llaminar2
 
     void ROCmEmbeddingKernelT::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
-        workspace_ = workspace;
+        int dev_key = device_idx_;
+        if (workspace)
+        {
+            const DeviceId ws_device = workspace->device();
+            dev_key = ws_device.toKernelDeviceIndex();
+        }
+
+        bool workspace_changed = false;
+        {
+            std::lock_guard<std::mutex> lock(workspace_mutex_);
+            auto it = workspace_by_device_.find(dev_key);
+            workspace_changed = (it == workspace_by_device_.end()) || (it->second != workspace);
+            workspace_ = workspace;
+            workspace_by_device_[dev_key] = workspace;
+        }
+
+        // Only invalidate embed cache when the workspace actually changes.
+        // Re-binding the same workspace (e.g. on graph rebuild with cached buffers)
+        // should not force a ~300ms embedding repack + upload.
+        if (workspace_changed)
+        {
+            std::lock_guard<std::mutex> lock(embed_cache_mutex_);
+            cached_embed_table_ = nullptr;
+            cached_embed_table_by_device_[dev_key] = nullptr;
+        }
     }
 
     bool ROCmEmbeddingKernelT::hasWorkspace() const
     {
-        return workspace_ != nullptr && workspace_->isAllocated();
+        int current_device = -1;
+        DeviceWorkspaceManager *workspace = nullptr;
+
+        if (hipGetDevice(&current_device) == hipSuccess && current_device >= 0)
+        {
+            std::lock_guard<std::mutex> lock(workspace_mutex_);
+            auto it = workspace_by_device_.find(current_device);
+            if (it != workspace_by_device_.end())
+            {
+                workspace = it->second;
+            }
+        }
+
+        if (!workspace)
+        {
+            workspace = workspace_;
+        }
+
+        return workspace != nullptr && workspace->isAllocated();
     }
 
     DeviceWorkspaceManager *ROCmEmbeddingKernelT::getWorkspace() const
     {
+        int current_device = -1;
+        if (hipGetDevice(&current_device) == hipSuccess && current_device >= 0)
+        {
+            std::lock_guard<std::mutex> lock(workspace_mutex_);
+            auto it = workspace_by_device_.find(current_device);
+            if (it != workspace_by_device_.end())
+            {
+                return it->second;
+            }
+        }
+
         return workspace_;
     }
 

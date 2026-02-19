@@ -7,7 +7,6 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
-#include "../../../utils/KernelProfiler.h"
 #include "../../../kernels/KernelFactory.h"
 
 namespace llaminar2
@@ -24,8 +23,6 @@ namespace llaminar2
 
     bool SwiGLUStage::execute(IDeviceContext *ctx)
     {
-        KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
-
         if (!ensureContext(ctx, "SwiGLUStage"))
         {
             return false;

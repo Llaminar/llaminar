@@ -191,10 +191,12 @@ namespace llaminar2
             return nullptr;
         }
 
-        LOG_DEBUG("DeviceGraphBufferManager: Allocated BAR buffer '" << node_name << "." << desc.name
-                                                                     << "' for collective '" << desc.collective_id
-                                                                     << "' at offset " << offset
-                                                                     << " (" << size_bytes << " bytes)");
+        LOG_DEBUG("[BAR_ALLOC] '" << node_name << "." << desc.name
+                  << "' collective='" << desc.collective_id
+                  << "' bar_ptr=" << ptr
+                  << " offset=" << offset
+                  << " bytes=" << size_bytes
+                  << " device=" << desc.device.toString());
 
         // Create a tensor wrapping the external BAR memory
         // Note: For now, we use the standard factory and rely on the caller
@@ -358,14 +360,19 @@ namespace llaminar2
         size_t allocated_bytes = tensor->size_bytes();
         updateStats(desc, allocated_bytes);
 
+        // Log pointer addresses for multi-GPU debugging
+        LOG_DEBUG("[BUFFER_ALLOC] '" << node_name << "." << desc.name << "'"
+                  << " role=" << bufferRoleName(desc.role)
+                  << " host_ptr=" << static_cast<const void*>(tensor->raw_data())
+                  << " gpu_ptr=" << tensor->gpu_data_ptr()
+                  << " device=" << desc.device.toString()
+                  << " bytes=" << allocated_bytes
+                  << " tensor_obj=" << static_cast<void*>(tensor.get())
+                  << (desc.isCollectiveBuffer() ? " [COLLECTIVE]" : ""));
+
         // Store buffer and descriptor
         descriptors_[key] = desc;
         buffers_[key] = std::move(tensor);
-
-        LOG_TRACE("DeviceGraphBufferManager: Allocated " << bufferRoleName(desc.role) << " buffer '"
-                                                         << node_name << "." << desc.name << "' ("
-                                                         << allocated_bytes << " bytes)"
-                                                         << (desc.isCollectiveBuffer() ? " [COLLECTIVE]" : ""));
 
         return true;
     }

@@ -61,7 +61,7 @@ namespace llaminar2
                 int layer_idx = extractLayerIndex(name);
 
                 // Load weight via weight manager (handles caching, sharding, device placement)
-                auto weight = weight_manager.getWeight(name, DeviceId::cpu(), layer_idx);
+                auto weight = weight_manager.getWeightForDevice(name, DeviceId::cpu(), layer_idx);
                 if (weight)
                 {
                     loaded.push_back(name);

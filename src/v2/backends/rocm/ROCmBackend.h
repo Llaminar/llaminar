@@ -13,9 +13,20 @@
 #include "../IBackend.h"
 #include <future>
 #include <memory>
+#include <cstdint>
 
 namespace llaminar2
 {
+
+    struct ROCmPointerOwnerInfo
+    {
+        void *base_ptr = nullptr;
+        size_t size_bytes = 0;
+        int device_id = -1;
+        uint64_t sequence = 0;
+        uint64_t thread_hash = 0;
+        bool active = false;
+    };
 
     /**
      * @class ROCmBackend
@@ -202,6 +213,25 @@ namespace llaminar2
          * @return true if query succeeded
          */
         bool getHsaAgent(int device_id, uint64_t *agent);
+
+        /**
+         * @brief Query recorded allocation ownership for a pointer address
+         *
+         * Checks whether @p ptr falls inside any active or recently-freed ROCm
+         * allocation tracked by ROCmBackend::allocate()/free(). This is useful
+         * for diagnosing cross-device pointer usage bugs.
+         *
+         * @param ptr Pointer address to inspect
+         * @param info Output ownership metadata
+         * @return true if matching allocation range was found
+         */
+        static bool queryPointerOwner(const void *ptr, ROCmPointerOwnerInfo &info);
+
+        /**
+         * @brief Dump recently tracked allocation events to logs
+         * @param max_events Maximum recent events to print
+         */
+        static void dumpRecentPointerEvents(size_t max_events = 64);
 
     private:
         int device_count_;

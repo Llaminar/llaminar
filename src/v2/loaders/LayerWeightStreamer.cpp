@@ -409,7 +409,7 @@ namespace llaminar2
         for (const auto &name : weight_names)
         {
             // Get the CPU weight to check its size
-            auto weight = weight_manager_->getWeight(name, DeviceId::cpu(), layer_idx);
+            auto weight = weight_manager_->getWeightForDevice(name, DeviceId::cpu(), layer_idx);
             if (weight)
             {
                 total += weight->size_bytes();
@@ -469,7 +469,7 @@ namespace llaminar2
         {
             // Request weight on the target device
             // WeightManager will handle the CPU->GPU transfer
-            auto weight = weight_manager_->getWeight(name, device, layer_idx);
+            auto weight = weight_manager_->getWeightForDevice(name, device, layer_idx);
             if (!weight)
             {
                 LOG_WARN("[LayerWeightStreamer] Failed to load weight: " << name);

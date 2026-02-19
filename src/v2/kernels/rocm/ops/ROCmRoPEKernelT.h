@@ -64,7 +64,7 @@ namespace llaminar2
             /// Maximum head_dim/2 for worst-case workspace allocation (covers head_dim up to 256)
             static constexpr int MAX_HALF_DIM = 128;
 
-            explicit ROCmRoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
+            explicit ROCmRoPEKernelT(int device_idx = -1, float rope_theta = 10000.0f)
                 : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
                   inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
 
@@ -220,12 +220,6 @@ namespace llaminar2
              */
             DeviceWorkspaceManager *getWorkspace() const override;
 
-            /**
-             * @brief Clear cached inverse frequency table
-             * Call this when model is unloaded or head_dim/rope_theta changes
-             */
-            static void clearInvFreqCache();
-
         private:
             int device_idx_;
             float rope_theta_;
@@ -239,10 +233,6 @@ namespace llaminar2
             mutable bool inv_freq_initialized_ = false;
             mutable int inv_freq_head_dim_ = 0;
             mutable float inv_freq_theta_ = 0.0f;
-
-            // Legacy inverse frequency cache (shared across all instances for same config)
-            // Key: (head_dim << 32) | device_idx, Value: device pointer
-            static float *getOrCreateInvFreq(int head_dim, float rope_theta, int device_idx);
 
             /// Pinned host memory for graph-captured H2D copy of device params
             rope::RoPEDeviceParams *h_device_params_ = nullptr;
@@ -261,7 +251,7 @@ namespace llaminar2
             /// Maximum head_dim/2 for worst-case workspace allocation (covers head_dim up to 256)
             static constexpr int MAX_HALF_DIM = 128;
 
-            explicit ROCmRoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
+            explicit ROCmRoPEKernelT(int device_idx = -1, float rope_theta = 10000.0f)
                 : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
                   inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
 
@@ -397,8 +387,6 @@ namespace llaminar2
             bool hasWorkspace() const override;
             DeviceWorkspaceManager *getWorkspace() const override;
 
-            static void clearInvFreqCache();
-
         private:
             int device_idx_;
             float rope_theta_;
@@ -410,8 +398,6 @@ namespace llaminar2
             mutable bool inv_freq_initialized_ = false;
             mutable int inv_freq_head_dim_ = 0;
             mutable float inv_freq_theta_ = 0.0f;
-
-            static float *getOrCreateInvFreq(int head_dim, float rope_theta, int device_idx);
 
             /// Pinned host memory for graph-captured H2D copy of device params
             rope::RoPEDeviceParams *h_device_params_ = nullptr;
@@ -430,7 +416,7 @@ namespace llaminar2
             /// Maximum head_dim/2 for worst-case workspace allocation (covers head_dim up to 256)
             static constexpr int MAX_HALF_DIM = 128;
 
-            explicit ROCmRoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
+            explicit ROCmRoPEKernelT(int device_idx = -1, float rope_theta = 10000.0f)
                 : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
                   inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
 
@@ -566,8 +552,6 @@ namespace llaminar2
             bool hasWorkspace() const override;
             DeviceWorkspaceManager *getWorkspace() const override;
 
-            static void clearInvFreqCache();
-
         private:
             int device_idx_;
             float rope_theta_;
@@ -579,8 +563,6 @@ namespace llaminar2
             mutable bool inv_freq_initialized_ = false;
             mutable int inv_freq_head_dim_ = 0;
             mutable float inv_freq_theta_ = 0.0f;
-
-            static float *getOrCreateInvFreq(int head_dim, float rope_theta, int device_idx);
 
             /// Pinned host memory for graph-captured H2D copy of device params
             rope::RoPEDeviceParams *h_device_params_ = nullptr;

@@ -178,8 +178,9 @@ namespace llaminar2
                 return std::nullopt;
             }
 
-            // Validate NUMA node is non-negative
-            if (addr.numa_node < 0)
+            // Validate NUMA node: reject truly invalid negatives
+            // (NUMA_NODE_UNKNOWN/-1 is allowed as sentinel value)
+            if (addr.numa_node < -1)
             {
                 return std::nullopt;
             }
@@ -210,7 +211,7 @@ namespace llaminar2
         std::ostringstream oss;
 
         // Omit localhost and numa_node 0 for brevity
-        if (hostname == "localhost" && numa_node == 0)
+        if (hostname == "localhost" && (numa_node == 0 || numa_node < 0))
         {
             oss << deviceTypeToString(device_type) << ":" << device_ordinal;
         }
@@ -273,6 +274,9 @@ namespace llaminar2
 
     bool GlobalDeviceAddress::sameNuma(const GlobalDeviceAddress &other) const
     {
+        // If either side has unknown NUMA, we cannot confirm same-NUMA
+        if (numa_node < 0 || other.numa_node < 0)
+            return false;
         return hostname == other.hostname && numa_node == other.numa_node;
     }
 

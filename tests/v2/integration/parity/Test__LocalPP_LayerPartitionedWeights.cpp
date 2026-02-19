@@ -54,7 +54,7 @@ protected:
         for (int layer = 0; layer < num_layers; ++layer)
         {
             std::string name = "blk." + std::to_string(layer) + ".attn_q.weight";
-            if (ctx->getWeight(name) != nullptr)
+            if (ctx->getWeightForDevice(name) != nullptr)
             {
                 count++;
             }
@@ -72,7 +72,7 @@ protected:
         std::set<std::string> loadable;
         for (const auto& name : weight_names)
         {
-            if (ctx->getWeight(name) != nullptr)
+            if (ctx->getWeightForDevice(name) != nullptr)
             {
                 loadable.insert(name);
             }
@@ -118,17 +118,17 @@ TEST_F(Test__LocalPP_LayerPartitionedWeights, TwoStage_LayerPartitioning)
     for (int layer = 0; layer < 12; ++layer)
     {
         std::string name = "blk." + std::to_string(layer) + ".attn_q.weight";
-        EXPECT_NE(stage0_ctx->getWeight(name), nullptr)
+        EXPECT_NE(stage0_ctx->getWeightForDevice(name), nullptr)
             << "Stage 0 should have layer " << layer;
-        EXPECT_EQ(stage1_ctx->getWeight(name), nullptr)
+        EXPECT_EQ(stage1_ctx->getWeightForDevice(name), nullptr)
             << "Stage 1 should NOT have layer " << layer;
     }
     for (int layer = 12; layer < 24; ++layer)
     {
         std::string name = "blk." + std::to_string(layer) + ".attn_q.weight";
-        EXPECT_EQ(stage0_ctx->getWeight(name), nullptr)
+        EXPECT_EQ(stage0_ctx->getWeightForDevice(name), nullptr)
             << "Stage 0 should NOT have layer " << layer;
-        EXPECT_NE(stage1_ctx->getWeight(name), nullptr)
+        EXPECT_NE(stage1_ctx->getWeightForDevice(name), nullptr)
             << "Stage 1 should have layer " << layer;
     }
 }
@@ -149,21 +149,21 @@ TEST_F(Test__LocalPP_LayerPartitionedWeights, TwoStage_SpecialWeights)
     ASSERT_NE(stage1_ctx, nullptr);
 
     // Embedding
-    EXPECT_NE(stage0_ctx->getWeight("token_embd.weight"), nullptr)
+    EXPECT_NE(stage0_ctx->getWeightForDevice("token_embd.weight"), nullptr)
         << "Stage 0 should have embedding";
-    EXPECT_EQ(stage1_ctx->getWeight("token_embd.weight"), nullptr)
+    EXPECT_EQ(stage1_ctx->getWeightForDevice("token_embd.weight"), nullptr)
         << "Stage 1 should NOT have embedding";
 
     // Output norm
-    EXPECT_EQ(stage0_ctx->getWeight("output_norm.weight"), nullptr)
+    EXPECT_EQ(stage0_ctx->getWeightForDevice("output_norm.weight"), nullptr)
         << "Stage 0 should NOT have output_norm";
-    EXPECT_NE(stage1_ctx->getWeight("output_norm.weight"), nullptr)
+    EXPECT_NE(stage1_ctx->getWeightForDevice("output_norm.weight"), nullptr)
         << "Stage 1 should have output_norm";
 
     // LM head
-    EXPECT_EQ(stage0_ctx->getWeight("output.weight"), nullptr)
+    EXPECT_EQ(stage0_ctx->getWeightForDevice("output.weight"), nullptr)
         << "Stage 0 should NOT have LM head";
-    EXPECT_NE(stage1_ctx->getWeight("output.weight"), nullptr)
+    EXPECT_NE(stage1_ctx->getWeightForDevice("output.weight"), nullptr)
         << "Stage 1 should have LM head";
 }
 
@@ -254,13 +254,13 @@ TEST_F(Test__LocalPP_LayerPartitionedWeights, ThreeStage_LayerPartitioning)
     EXPECT_EQ(stage2_layers, 8) << "Stage 2: layers 16-23";
 
     // Verify special weights
-    EXPECT_NE(stage0_ctx->getWeight("token_embd.weight"), nullptr);
-    EXPECT_EQ(stage1_ctx->getWeight("token_embd.weight"), nullptr);
-    EXPECT_EQ(stage2_ctx->getWeight("token_embd.weight"), nullptr);
+    EXPECT_NE(stage0_ctx->getWeightForDevice("token_embd.weight"), nullptr);
+    EXPECT_EQ(stage1_ctx->getWeightForDevice("token_embd.weight"), nullptr);
+    EXPECT_EQ(stage2_ctx->getWeightForDevice("token_embd.weight"), nullptr);
 
-    EXPECT_EQ(stage0_ctx->getWeight("output.weight"), nullptr);
-    EXPECT_EQ(stage1_ctx->getWeight("output.weight"), nullptr);
-    EXPECT_NE(stage2_ctx->getWeight("output.weight"), nullptr);
+    EXPECT_EQ(stage0_ctx->getWeightForDevice("output.weight"), nullptr);
+    EXPECT_EQ(stage1_ctx->getWeightForDevice("output.weight"), nullptr);
+    EXPECT_NE(stage2_ctx->getWeightForDevice("output.weight"), nullptr);
 }
 
 // =============================================================================

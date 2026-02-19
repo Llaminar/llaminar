@@ -369,7 +369,7 @@ namespace llaminar2::test
         auto mgr = createWeightManager(loader, mpi_ctx, WeightDistributionStrategy::REPLICATED);
 
         // Load a weight to populate cache
-        auto w1 = mgr->getWeight("blk.0.attn_norm.weight");
+        auto w1 = mgr->getWeightForDevice("blk.0.attn_norm.weight");
         ASSERT_NE(w1, nullptr);
         EXPECT_EQ(mgr->cacheSize(), 1);
 
@@ -417,8 +417,8 @@ namespace llaminar2::test
 
         // Load FFN gate weight (column-parallel)
         const std::string weight_name = "blk.0.ffn_gate.weight";
-        auto w0 = mgr0->getWeight(weight_name, DeviceId::cpu());
-        auto w1 = mgr1->getWeight(weight_name, DeviceId::cpu());
+        auto w0 = mgr0->getWeightForDevice(weight_name, DeviceId::cpu());
+        auto w1 = mgr1->getWeightForDevice(weight_name, DeviceId::cpu());
 
         ASSERT_NE(w0, nullptr) << "Rank 0 failed to load weight";
         ASSERT_NE(w1, nullptr) << "Rank 1 failed to load weight";

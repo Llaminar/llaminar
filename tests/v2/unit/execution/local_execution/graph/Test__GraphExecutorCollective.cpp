@@ -21,11 +21,66 @@
 #include "collective/test/CollectiveTestMocks.h"
 #include "tensors/TensorClasses.h"
 #include "backends/DeviceId.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "backends/IWorkerGPUContext.h"
 #include "mocks/MockCollectiveContext.h"
+#include "mocks/MockComputeStage.h"
 #include "config/TPDomain.h"
+#include <future>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
+
+namespace
+{
+    class MockWorkerGPUContext final : public IWorkerGPUContext
+    {
+    public:
+        explicit MockWorkerGPUContext(int device_ordinal, void *default_stream)
+            : device_ordinal_(device_ordinal), default_stream_(default_stream) {}
+
+        int deviceOrdinal() const override { return device_ordinal_; }
+        std::string deviceName() const override { return "MockWorkerGPU-" + std::to_string(device_ordinal_); }
+        bool isInitialized() const override { return true; }
+
+        void submitAndWait(std::function<void()> work) override { work(); }
+        std::future<void> submitAsync(std::function<void()> work) override
+        {
+            work();
+            std::promise<void> done;
+            done.set_value();
+            return done.get_future();
+        }
+
+        void *defaultStream() override { return default_stream_; }
+        void *createStream() override { return default_stream_; }
+        void destroyStream(void * /*stream*/) override {}
+
+        void *createEvent() override { return reinterpret_cast<void *>(0xCAFEBABE); }
+        void destroyEvent(void * /*event*/) override {}
+        void recordEvent(void * /*event*/, void * /*stream*/) override {}
+        void waitEvent(void * /*event*/, void * /*stream*/) override {}
+        void synchronizeEvent(void * /*event*/) override {}
+
+        void *blasHandle() override { return reinterpret_cast<void *>(0x11111111); }
+        void *blasLtHandle() override { return reinterpret_cast<void *>(0x22222222); }
+
+        void setCollectiveComm(void *comm) override { collective_comm_ = comm; }
+        void *collectiveComm() const override { return collective_comm_; }
+
+        void synchronize() override {}
+        void synchronizeStream(void * /*stream*/) override {}
+        void insertStreamDependency(void * /*dependent_stream*/, void * /*dependency_stream*/) override {}
+
+        std::unique_ptr<IGPUGraphCapture> createGraphCapture() override { return nullptr; }
+        std::unique_ptr<IGPUGraphCapture> createGraphCapture(void * /*stream*/) override { return nullptr; }
+
+    private:
+        int device_ordinal_ = -1;
+        void *default_stream_ = nullptr;
+        void *collective_comm_ = nullptr;
+    };
+} // namespace
 
 // =============================================================================
 // Test Fixture
@@ -555,4 +610,131 @@ TEST_F(Test__GraphExecutorCollective, AllgatherWithNullDomain_NotIntercepted_Exe
     // Verify CollectiveContext methods were NOT called
     EXPECT_EQ(mock_ctx->allgather_call_count(), 0);
     EXPECT_EQ(mock_ctx->allgather_in_domain_call_count(), 0);
+}
+
+// =============================================================================
+// Stage Stream Binding Tests
+// =============================================================================
+
+class Test__GraphExecutorStreamBinding : public ::testing::Test
+{
+protected:
+    void SetUp() override
+    {
+        GPUDeviceContextPool::instance().shutdown();
+
+        cuda_default_stream_ = reinterpret_cast<void *>(0xC0FFEE00);
+        rocm_default_stream_ = reinterpret_cast<void *>(0xBADC0DE0);
+
+        GPUDeviceContextPool::instance().registerNvidiaFactory(
+            [this](int ordinal)
+            {
+                return std::make_unique<MockWorkerGPUContext>(ordinal, cuda_default_stream_);
+            },
+            1);
+
+        GPUDeviceContextPool::instance().registerAMDFactory(
+            [this](int ordinal)
+            {
+                return std::make_unique<MockWorkerGPUContext>(ordinal, rocm_default_stream_);
+            },
+            1);
+    }
+
+    void TearDown() override
+    {
+        GPUDeviceContextPool::instance().shutdown();
+    }
+
+    void *cuda_default_stream_ = nullptr;
+    void *rocm_default_stream_ = nullptr;
+};
+
+TEST_F(Test__GraphExecutorStreamBinding, NullStageStream_BindsToNodeDeviceDefaultStream)
+{
+    GraphExecutorConfig config;
+    DeviceGraphExecutor executor(config);
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
+        ComputeStageType::GEMM,
+        "stream_bind_stage",
+        DeviceId::cuda(0));
+    auto *stage_raw = stage.get();
+
+    ASSERT_EQ(stage_raw->gpuStream(), nullptr);
+
+    ComputeGraph graph;
+    graph.addNode("stream_bind_stage", std::move(stage), DeviceId::cuda(0));
+
+    ASSERT_TRUE(executor.execute(graph, &ctx));
+    EXPECT_EQ(stage_raw->gpuStream(), cuda_default_stream_);
+}
+
+TEST_F(Test__GraphExecutorStreamBinding, PreBoundStageStream_IsNotOverwritten)
+{
+    GraphExecutorConfig config;
+    DeviceGraphExecutor executor(config);
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    void *prebound = reinterpret_cast<void *>(0x1234ABCD);
+
+    auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
+        ComputeStageType::GEMM,
+        "prebound_stage",
+        DeviceId::cuda(0));
+    auto *stage_raw = stage.get();
+    stage_raw->setGPUStream(prebound);
+
+    ComputeGraph graph;
+    graph.addNode("prebound_stage", std::move(stage), DeviceId::cuda(0));
+
+    ASSERT_TRUE(executor.execute(graph, &ctx));
+    EXPECT_EQ(stage_raw->gpuStream(), prebound);
+}
+
+TEST_F(Test__GraphExecutorStreamBinding, NodeDeviceOverridesStageDeviceWhenResolvingStream)
+{
+    GraphExecutorConfig config;
+    DeviceGraphExecutor executor(config);
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+
+    auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
+        ComputeStageType::GEMM,
+        "node_device_precedence",
+        DeviceId::rocm(0));
+    auto *stage_raw = stage.get();
+
+    ASSERT_EQ(stage_raw->gpuStream(), nullptr);
+
+    ComputeGraph graph;
+    graph.addNode("node_device_precedence", std::move(stage), DeviceId::cuda(0));
+
+    ASSERT_TRUE(executor.execute(graph, &ctx));
+    EXPECT_EQ(stage_raw->gpuStream(), cuda_default_stream_);
+    EXPECT_NE(stage_raw->gpuStream(), rocm_default_stream_);
+}
+
+TEST_F(Test__GraphExecutorStreamBinding, CudaContextUsedWhenNodeAndStageDevicesAreInvalid)
+{
+    GraphExecutorConfig config;
+    DeviceGraphExecutor executor(config);
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
+        ComputeStageType::GEMM,
+        "ctx_fallback_cuda",
+        DeviceId::invalid());
+    auto *stage_raw = stage.get();
+
+    ASSERT_EQ(stage_raw->gpuStream(), nullptr);
+
+    ComputeGraph graph;
+    graph.addNode("ctx_fallback_cuda", std::move(stage), DeviceId::invalid());
+
+    ASSERT_TRUE(executor.execute(graph, &ctx));
+    EXPECT_EQ(stage_raw->gpuStream(), cuda_default_stream_);
 }

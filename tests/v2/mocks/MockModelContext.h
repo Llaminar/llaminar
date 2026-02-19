@@ -54,7 +54,7 @@ namespace llaminar2::test
      * // Simple usage with presets
      * auto ctx = MockModelContext::createQwen2_05B();
      * int num_layers = ctx->blockCount();
-     * auto embd = ctx->getWeight("token_embd.weight");
+     * auto embd = ctx->getWeightForDevice("token_embd.weight");
      *
      * // Custom model with builder
      * auto ctx = MockModelContextBuilder()
@@ -133,13 +133,9 @@ namespace llaminar2::test
         int contextLength() const override;
         int feedForwardLength() const override;
 
-        std::shared_ptr<TensorBase> getWeight(
-            const std::string &name,
-            DeviceId device = DeviceId::cpu()) override;
-
         std::shared_ptr<TensorBase> getWeightForDevice(
             const std::string &name,
-            DeviceId device) override;
+            DeviceId device = DeviceId::cpu()) override;
 
         bool hasTensor(const std::string &name) const override;
 
@@ -463,13 +459,6 @@ namespace llaminar2::test
     inline int MockModelContext::feedForwardLength() const
     {
         return static_cast<int>(mock_loader_->feedForwardLength());
-    }
-
-    inline std::shared_ptr<TensorBase> MockModelContext::getWeight(
-        const std::string &name,
-        DeviceId device)
-    {
-        return mock_weight_manager_->getWeight(name, device);
     }
 
     inline std::shared_ptr<TensorBase> MockModelContext::getWeightForDevice(

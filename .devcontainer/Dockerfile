@@ -33,11 +33,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     passwd \
     xterm \
-    # Build essentials
+    # Build essentials (GCC 14 for full C++23 support including <print>)
     build-essential \
-    gcc \
-    g++ \
-    gfortran \
+    gcc-14 \
+    g++-14 \
+    gfortran-14 \
     gdb \
     cmake \
     make \
@@ -93,6 +93,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libeigen3-dev \
     # Node.js for MCP servers (will be installed via features)
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Set GCC 14 as default compiler (for full C++23 support including std::print)
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
+        --slave /usr/bin/g++ g++ /usr/bin/g++-14 \
+        --slave /usr/bin/gfortran gfortran /usr/bin/gfortran-14 \
+        --slave /usr/bin/gcov gcov /usr/bin/gcov-14
 
 # Fix perf symlink for Ubuntu 24.04 bug
 # Detect installed linux-tools version and create proper symlink

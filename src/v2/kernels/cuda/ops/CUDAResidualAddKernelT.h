@@ -38,7 +38,7 @@ namespace llaminar2::cuda
     class CUDAResidualAddKernelT<ActivationPrecision::FP32> : public ITensorResidualAdd
     {
     public:
-        explicit CUDAResidualAddKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+        explicit CUDAResidualAddKernelT(int device_idx = -1) : device_idx_(device_idx) {}
 
         /**
          * @brief Construct with device context (Phase 4 pattern)
@@ -120,7 +120,7 @@ namespace llaminar2::cuda
     class CUDAResidualAddKernelT<ActivationPrecision::BF16> : public ITensorResidualAdd
     {
     public:
-        explicit CUDAResidualAddKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+        explicit CUDAResidualAddKernelT(int device_idx = -1) : device_idx_(device_idx) {}
 
         explicit CUDAResidualAddKernelT(IWorkerGPUContext *ctx)
         {
@@ -212,7 +212,7 @@ namespace llaminar2::cuda
     class CUDAResidualAddKernelT<ActivationPrecision::FP16> : public ITensorResidualAdd
     {
     public:
-        explicit CUDAResidualAddKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+        explicit CUDAResidualAddKernelT(int device_idx = -1) : device_idx_(device_idx) {}
 
         explicit CUDAResidualAddKernelT(IWorkerGPUContext *ctx)
         {

@@ -9,12 +9,16 @@
 #include "backends/HostBackend.h"
 #include "../tensors/TensorClasses.h"
 #include "../backends/BackendManager.h" // For getCUDABackend, getROCmBackend
+#include "../backends/ComputeBackend.h" // For DeviceManager (NUMA lookup)
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
+#include <array>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cstdint>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
 
@@ -153,6 +157,194 @@ namespace llaminar2
         LOG_ERROR("[LocalTPContext] Unknown device type: " << device.toString());
         return nullptr;
     }
+
+#ifdef HAVE_ROCM
+    static uint64_t fnv1a64(const uint8_t *data, size_t length)
+    {
+        constexpr uint64_t FNV_OFFSET_BASIS = 1469598103934665603ull;
+        constexpr uint64_t FNV_PRIME = 1099511628211ull;
+        uint64_t hash = FNV_OFFSET_BASIS;
+        for (size_t i = 0; i < length; ++i)
+        {
+            hash ^= static_cast<uint64_t>(data[i]);
+            hash *= FNV_PRIME;
+        }
+        return hash;
+    }
+
+    static bool validateRocmAllreducePointerForSlot(const std::string &stage_name,
+                                                    const char *phase,
+                                                    int slot,
+                                                    DeviceId expected_device,
+                                                    TensorBase *tensor,
+                                                    void *ptr,
+                                                    uint64_t *watch_checksum_out = nullptr,
+                                                    size_t *watch_sample_bytes_out = nullptr,
+                                                    size_t *watch_sample_offset_out = nullptr)
+    {
+        if (watch_checksum_out)
+            *watch_checksum_out = 0;
+        if (watch_sample_bytes_out)
+            *watch_sample_bytes_out = 0;
+        if (watch_sample_offset_out)
+            *watch_sample_offset_out = 0;
+
+        if (!expected_device.is_rocm())
+        {
+            return true;
+        }
+
+        auto *backend = dynamic_cast<ROCmBackend *>(getBackendForDevice(expected_device));
+        if (!backend)
+        {
+            LOG_ERROR("[LOCALTP_ROCM_PTR_VALIDATE_FAIL] missing ROCm backend for slot=" << slot
+                                                                                        << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                                                                                        << " expected_device=" << expected_device.toString());
+            return false;
+        }
+
+        const int expected_ordinal = expected_device.rocm_ordinal();
+        backend->setDevice(expected_ordinal);
+
+        bool is_device_ptr = false;
+        bool is_host_ptr = false;
+        bool is_managed = false;
+        int attr_device = -1;
+        if (!backend->queryPointerAttributes(ptr, is_device_ptr, is_host_ptr, is_managed, attr_device))
+        {
+            LOG_ERROR("[LOCALTP_ROCM_PTR_VALIDATE_FAIL] hip attribute query failed"
+                      << " slot=" << slot
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " ptr=" << ptr
+                      << " expected_device=" << expected_ordinal
+                      << " tensor=" << static_cast<void *>(tensor)
+                      << " tensor_device="
+                      << (tensor && tensor->current_device().has_value() ? tensor->current_device()->toString() : "none"));
+            ROCmBackend::dumpRecentPointerEvents(128);
+            return false;
+        }
+
+        if (!is_device_ptr || attr_device != expected_ordinal)
+        {
+            LOG_ERROR("[LOCALTP_ROCM_PTR_VALIDATE_FAIL] hip attribute mismatch"
+                      << " slot=" << slot
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " ptr=" << ptr
+                      << " expected_device=" << expected_ordinal
+                      << " attr_device=" << attr_device
+                      << " is_device_ptr=" << (is_device_ptr ? 1 : 0)
+                      << " is_host_ptr=" << (is_host_ptr ? 1 : 0)
+                      << " is_managed=" << (is_managed ? 1 : 0)
+                      << " tensor=" << static_cast<void *>(tensor)
+                      << " tensor_device="
+                      << (tensor && tensor->current_device().has_value() ? tensor->current_device()->toString() : "none"));
+            ROCmBackend::dumpRecentPointerEvents(128);
+            return false;
+        }
+
+        ROCmPointerOwnerInfo owner;
+        if (!ROCmBackend::queryPointerOwner(ptr, owner))
+        {
+            LOG_ERROR("[LOCALTP_ROCM_PTR_VALIDATE_FAIL] owner lookup failed"
+                      << " slot=" << slot
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " ptr=" << ptr
+                      << " expected_device=" << expected_ordinal
+                      << " tensor=" << static_cast<void *>(tensor));
+            ROCmBackend::dumpRecentPointerEvents(128);
+            return false;
+        }
+
+        if (owner.device_id != expected_ordinal)
+        {
+            LOG_ERROR("[LOCALTP_ROCM_PTR_VALIDATE_FAIL] owner mismatch"
+                      << " slot=" << slot
+                      << " phase=" << (phase ? phase : "(unknown)")
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " ptr=" << ptr
+                      << " expected_device=" << expected_ordinal
+                      << " owner_device=" << owner.device_id
+                      << " owner_base=" << owner.base_ptr
+                      << " owner_bytes=" << owner.size_bytes
+                      << " owner_seq=" << owner.sequence
+                      << " owner_thread=" << owner.thread_hash
+                      << " tensor=" << static_cast<void *>(tensor)
+                      << " tensor_device="
+                      << (tensor && tensor->current_device().has_value() ? tensor->current_device()->toString() : "none"));
+            ROCmBackend::dumpRecentPointerEvents(128);
+            return false;
+        }
+
+        const auto &validation = debugEnv().validation;
+        if (validation.trace_local_tp_pointer)
+        {
+            const uintptr_t watch = static_cast<uintptr_t>(validation.trace_local_tp_pointer_address);
+            const uintptr_t begin = reinterpret_cast<uintptr_t>(owner.base_ptr);
+            const uintptr_t end = begin + owner.size_bytes;
+            if (watch >= begin && watch < end)
+            {
+                const size_t offset = static_cast<size_t>(watch - begin);
+                constexpr size_t WATCH_SAMPLE_MAX_BYTES = 256;
+                const size_t available = owner.size_bytes > offset ? (owner.size_bytes - offset) : 0;
+                const size_t sample_bytes = std::min(WATCH_SAMPLE_MAX_BYTES, available);
+
+                uint64_t checksum = 0;
+                bool checksum_ready = false;
+                if (sample_bytes > 0)
+                {
+                    std::array<uint8_t, WATCH_SAMPLE_MAX_BYTES> sample{};
+                    const uint8_t *sample_src = reinterpret_cast<const uint8_t *>(owner.base_ptr) + offset;
+                    if (backend->deviceToHost(sample.data(), const_cast<uint8_t *>(sample_src), sample_bytes, expected_ordinal))
+                    {
+                        checksum = fnv1a64(sample.data(), sample_bytes);
+                        checksum_ready = true;
+                    }
+                    else
+                    {
+                        LOG_WARN("[LOCALTP_PTR_WATCH_COPY_FAIL]"
+                                 << " phase=" << (phase ? phase : "(unknown)")
+                                 << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                                 << " slot=" << slot
+                                 << " watch=" << reinterpret_cast<const void *>(watch)
+                                 << " owner_base=" << owner.base_ptr
+                                 << " sample_offset=" << offset
+                                 << " sample_bytes=" << sample_bytes
+                                 << " copy_error=deviceToHost_failed");
+                    }
+                }
+
+                if (checksum_ready)
+                {
+                    if (watch_checksum_out)
+                        *watch_checksum_out = checksum;
+                    if (watch_sample_bytes_out)
+                        *watch_sample_bytes_out = sample_bytes;
+                    if (watch_sample_offset_out)
+                        *watch_sample_offset_out = offset;
+                }
+
+                LOG_WARN("[LOCALTP_PTR_WATCH_HIT]"
+                         << " phase=" << (phase ? phase : "(unknown)")
+                         << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                         << " slot=" << slot
+                         << " watch=" << reinterpret_cast<const void *>(watch)
+                         << " buffer_ptr=" << ptr
+                         << " expected_device=" << expected_device.toString()
+                         << " owner_device=" << owner.device_id
+                         << " owner_base=" << owner.base_ptr
+                         << " owner_bytes=" << owner.size_bytes
+                         << " owner_seq=" << owner.sequence
+                         << " offset=" << offset
+                         << " sample_bytes=" << sample_bytes
+                         << " checksum=" << (checksum_ready ? std::to_string(checksum) : std::string("n/a"))
+                         << " tensor=" << static_cast<void *>(tensor)
+                         << " tensor_name=" << (tensor && !tensor->debugName().empty() ? tensor->debugName() : "(unnamed)"));
+            }
+        }
+
+        return true;
+    }
+#endif
 
     // =========================================================================
     // Construction
@@ -679,6 +871,7 @@ namespace llaminar2
     bool LocalTPContext::allreduceWithBarrierMultiGpu(TensorBase *tensor, const std::string &stage_name, size_t count)
     {
         const int num_participants = degree();
+        const bool strict_stage_barrier = debugEnv().validation.strict_local_tp_stage_barrier;
 
         // Determine which device index this tensor belongs to BEFORE taking the lock
         // This is critical: buffers must be ordered by device index, NOT arrival order
@@ -712,21 +905,188 @@ namespace llaminar2
         // Increment arrival count
         int arrival_order = barrier_count_.fetch_add(1);
 
+        if (arrival_order >= num_participants)
+        {
+            LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: barrier overflow detected "
+                      << "arrival_order=" << arrival_order << " participants=" << num_participants
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " generation=" << my_generation << " - resetting barrier state");
+
+            barrier_count_.store(0);
+            barrier_generation_.fetch_add(1);
+            barrier_tensors_.clear();
+            barrier_stage_name_.clear();
+            barrier_element_count_ = 0;
+            barrier_result_ = false;
+
+            lock.unlock();
+            barrier_cv_.notify_all();
+            return false;
+        }
+
         if (arrival_order == 0)
         {
             // First arrival: initialize tensor collection vector and store count
             barrier_tensors_.clear();
             barrier_tensors_.resize(num_participants, nullptr);
+            barrier_watch_checksums_.assign(num_participants, 0);
+            barrier_watch_sample_bytes_.assign(num_participants, 0);
+            barrier_watch_sample_offsets_.assign(num_participants, 0);
+            barrier_watch_checksum_valid_.assign(num_participants, false);
             barrier_element_count_ = count;
+            barrier_stage_name_ = stage_name;
             LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: First arrival (device thread), "
                       << "stage=" << (stage_name.empty() ? "(none)" : stage_name)
                       << ", count=" << count << " (0=use numel)"
                       << ", waiting for " << (num_participants - 1) << " more devices");
         }
+        else if (strict_stage_barrier && barrier_stage_name_ != stage_name)
+        {
+            LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: mixed stage names in the same barrier generation "
+                      << "expected='" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_)
+                      << "' got='" << (stage_name.empty() ? "(none)" : stage_name)
+                      << "' arrival_order=" << arrival_order
+                      << " participants=" << num_participants
+                      << " generation=" << my_generation);
+
+            barrier_count_.store(0);
+            barrier_generation_.fetch_add(1);
+            barrier_tensors_.clear();
+            barrier_stage_name_.clear();
+            barrier_watch_checksums_.clear();
+            barrier_watch_sample_bytes_.clear();
+            barrier_watch_sample_offsets_.clear();
+            barrier_watch_checksum_valid_.clear();
+            barrier_element_count_ = 0;
+            barrier_result_ = false;
+
+            lock.unlock();
+            barrier_cv_.notify_all();
+            return false;
+        }
 
         // Store this device's tensor at its DEVICE INDEX slot (not arrival order!)
         // This ensures buffers[i] corresponds to device_ordinals_[i] in RCCL
         barrier_tensors_[device_index] = tensor;
+
+        DeviceId expected_device_for_slot = devices_[device_index].toLocalDeviceId();
+        if (!tensor->ensureOnDevice(expected_device_for_slot))
+        {
+            LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: failed ensureOnDevice at arrival for slot "
+                      << device_index << " expected_device=" << expected_device_for_slot.toString());
+            barrier_count_.store(0);
+            barrier_generation_.fetch_add(1);
+            barrier_tensors_.clear();
+            barrier_stage_name_.clear();
+            barrier_watch_checksums_.clear();
+            barrier_watch_sample_bytes_.clear();
+            barrier_watch_sample_offsets_.clear();
+            barrier_watch_checksum_valid_.clear();
+            barrier_element_count_ = 0;
+            barrier_result_ = false;
+
+            lock.unlock();
+            barrier_cv_.notify_all();
+            return false;
+        }
+
+        void *arrival_ptr = tensor->gpu_data_ptr();
+        if (!arrival_ptr)
+        {
+            LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: missing GPU buffer at arrival for slot "
+                      << device_index << " expected_device=" << expected_device_for_slot.toString());
+            barrier_count_.store(0);
+            barrier_generation_.fetch_add(1);
+            barrier_tensors_.clear();
+            barrier_stage_name_.clear();
+            barrier_element_count_ = 0;
+            barrier_result_ = false;
+
+            lock.unlock();
+            barrier_cv_.notify_all();
+            return false;
+        }
+
+        const auto arrival_current_device = tensor->current_device();
+        LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: arrival tensor diagnostics"
+                  << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                  << " slot=" << device_index
+                  << " expected_device=" << expected_device_for_slot.toString()
+                  << " tensor=" << static_cast<void *>(tensor)
+                  << " tensor_name=" << (tensor->debugName().empty() ? "(unnamed)" : tensor->debugName())
+                  << " home_device=" << tensor->home_device().toString()
+                  << " current_device=" << (arrival_current_device.has_value() ? arrival_current_device->toString() : "none")
+                  << " gpu_ptr=" << arrival_ptr
+                  << " requested_count=" << count
+                  << " tensor_numel=" << tensor->numel());
+
+#ifdef HAVE_ROCM
+        uint64_t arrival_watch_checksum = 0;
+        size_t arrival_watch_sample_bytes = 0;
+        size_t arrival_watch_sample_offset = 0;
+        if (expected_device_for_slot.is_rocm() &&
+            !validateRocmAllreducePointerForSlot(barrier_stage_name_, "arrival", device_index, expected_device_for_slot, tensor, arrival_ptr,
+                                                 &arrival_watch_checksum, &arrival_watch_sample_bytes, &arrival_watch_sample_offset))
+        {
+            barrier_count_.store(0);
+            barrier_generation_.fetch_add(1);
+            barrier_tensors_.clear();
+            barrier_stage_name_.clear();
+            barrier_watch_checksums_.clear();
+            barrier_watch_sample_bytes_.clear();
+            barrier_watch_sample_offsets_.clear();
+            barrier_watch_checksum_valid_.clear();
+            barrier_element_count_ = 0;
+            barrier_result_ = false;
+
+            lock.unlock();
+            barrier_cv_.notify_all();
+            return false;
+        }
+
+        if (arrival_watch_sample_bytes > 0)
+        {
+            barrier_watch_checksums_[device_index] = arrival_watch_checksum;
+            barrier_watch_sample_bytes_[device_index] = arrival_watch_sample_bytes;
+            barrier_watch_sample_offsets_[device_index] = arrival_watch_sample_offset;
+            barrier_watch_checksum_valid_[device_index] = true;
+        }
+
+        if (debugEnv().validation.validate_gpu_ptrs && expected_device_for_slot.is_rocm())
+        {
+            auto *rocm_backend = dynamic_cast<ROCmBackend *>(getBackendForDevice(expected_device_for_slot));
+            if (rocm_backend)
+            {
+                rocm_backend->setDevice(expected_device_for_slot.toKernelDeviceIndex());
+                bool is_device_ptr = false;
+                bool is_host_ptr = false;
+                bool is_managed = false;
+                int attr_device = -1;
+                (void)rocm_backend->queryPointerAttributes(arrival_ptr, is_device_ptr, is_host_ptr, is_managed, attr_device);
+
+                ROCmPointerOwnerInfo owner;
+                if (ROCmBackend::queryPointerOwner(arrival_ptr, owner))
+                {
+                    LOG_DEBUG("[LOCALTP_PTR_OWNER] phase=arrival"
+                              << " stage=" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_)
+                              << " slot=" << device_index
+                              << " expected_device=" << expected_device_for_slot.toString()
+                              << " ptr=" << arrival_ptr
+                              << " attr_device=" << attr_device
+                              << " is_device_ptr=" << (is_device_ptr ? 1 : 0)
+                              << " is_host_ptr=" << (is_host_ptr ? 1 : 0)
+                              << " is_managed=" << (is_managed ? 1 : 0)
+                              << " owner_device=" << owner.device_id
+                              << " owner_base=" << owner.base_ptr
+                              << " owner_bytes=" << owner.size_bytes
+                              << " owner_seq=" << owner.sequence
+                              << " owner_thread=" << owner.thread_hash
+                              << " tensor=" << static_cast<void *>(tensor)
+                              << " tensor_name=" << (tensor->debugName().empty() ? "(unnamed)" : tensor->debugName()));
+                }
+            }
+        }
+#endif
 
         LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: Device arrival #" << (arrival_order + 1)
                                                                                    << " of " << num_participants
@@ -803,6 +1163,15 @@ namespace llaminar2
                 goto cleanup;
             }
 
+            DeviceId expected_device = devices_[i].toLocalDeviceId();
+            if (!t->ensureOnDevice(expected_device))
+            {
+                LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: failed ensureOnDevice for slot "
+                          << i << " expected_device=" << expected_device.toString());
+                barrier_result_ = false;
+                goto cleanup;
+            }
+
             void *ptr = t->gpu_data_ptr();
             if (!ptr)
             {
@@ -811,6 +1180,113 @@ namespace llaminar2
                 barrier_result_ = false;
                 goto cleanup;
             }
+
+            const auto prelaunch_current_device = t->current_device();
+            LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: prelaunch slot diagnostics"
+                      << " stage=" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_)
+                      << " slot=" << i
+                      << " expected_device=" << expected_device.toString()
+                      << " tensor=" << static_cast<void *>(t)
+                      << " tensor_name=" << (t->debugName().empty() ? "(unnamed)" : t->debugName())
+                      << " home_device=" << t->home_device().toString()
+                      << " current_device=" << (prelaunch_current_device.has_value() ? prelaunch_current_device->toString() : "none")
+                      << " gpu_ptr=" << ptr
+                      << " effective_count=" << effective_count
+                      << " tensor_numel=" << t->numel());
+
+#ifdef HAVE_ROCM
+            uint64_t prelaunch_watch_checksum = 0;
+            size_t prelaunch_watch_sample_bytes = 0;
+            size_t prelaunch_watch_sample_offset = 0;
+            if (expected_device.is_rocm() &&
+                !validateRocmAllreducePointerForSlot(barrier_stage_name_, "prelaunch", i, expected_device, t, ptr,
+                                                     &prelaunch_watch_checksum, &prelaunch_watch_sample_bytes, &prelaunch_watch_sample_offset))
+            {
+                barrier_result_ = false;
+                goto cleanup;
+            }
+
+            if (prelaunch_watch_sample_bytes > 0)
+            {
+                const bool had_arrival_checksum = (i < static_cast<int>(barrier_watch_checksum_valid_.size()))
+                                                      ? barrier_watch_checksum_valid_[i]
+                                                      : false;
+                if (had_arrival_checksum &&
+                    barrier_watch_sample_bytes_[i] == prelaunch_watch_sample_bytes &&
+                    barrier_watch_sample_offsets_[i] == prelaunch_watch_sample_offset &&
+                    barrier_watch_checksums_[i] != prelaunch_watch_checksum)
+                {
+                    LOG_ERROR("[LOCALTP_PTR_WATCH_CHECKSUM_MISMATCH]"
+                              << " stage=" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_)
+                              << " slot=" << i
+                              << " generation=" << my_generation
+                              << " arrival_checksum=" << barrier_watch_checksums_[i]
+                              << " prelaunch_checksum=" << prelaunch_watch_checksum
+                              << " sample_bytes=" << prelaunch_watch_sample_bytes
+                              << " sample_offset=" << prelaunch_watch_sample_offset
+                              << " expected_device=" << expected_device.toString()
+                              << " tensor=" << static_cast<void *>(t)
+                              << " tensor_name=" << (t->debugName().empty() ? "(unnamed)" : t->debugName()));
+                    ROCmBackend::dumpRecentPointerEvents(128);
+                    barrier_result_ = false;
+                    goto cleanup;
+                }
+            }
+
+            if (debugEnv().validation.validate_gpu_ptrs && expected_device.is_rocm())
+            {
+                ROCmPointerOwnerInfo owner;
+                if (ROCmBackend::queryPointerOwner(ptr, owner))
+                {
+                    auto *rocm_backend = dynamic_cast<ROCmBackend *>(getBackendForDevice(expected_device));
+                    bool is_device_ptr = false;
+                    bool is_host_ptr = false;
+                    bool is_managed = false;
+                    int attr_device = -1;
+                    if (rocm_backend)
+                    {
+                        rocm_backend->setDevice(expected_device.toKernelDeviceIndex());
+                        (void)rocm_backend->queryPointerAttributes(ptr, is_device_ptr, is_host_ptr, is_managed, attr_device);
+                    }
+
+                    LOG_DEBUG("[LOCALTP_PTR_OWNER] phase=prelaunch"
+                              << " stage=" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_)
+                              << " slot=" << i
+                              << " expected_device=" << expected_device.toString()
+                              << " ptr=" << ptr
+                              << " attr_device=" << attr_device
+                              << " is_device_ptr=" << (is_device_ptr ? 1 : 0)
+                              << " is_host_ptr=" << (is_host_ptr ? 1 : 0)
+                              << " is_managed=" << (is_managed ? 1 : 0)
+                              << " owner_device=" << owner.device_id
+                              << " owner_base=" << owner.base_ptr
+                              << " owner_bytes=" << owner.size_bytes
+                              << " owner_seq=" << owner.sequence
+                              << " owner_thread=" << owner.thread_hash
+                              << " tensor=" << static_cast<void *>(t)
+                              << " tensor_name=" << (t->debugName().empty() ? "(unnamed)" : t->debugName()));
+
+                    const int expected_ordinal = expected_device.rocm_ordinal();
+                    if (owner.device_id != expected_ordinal)
+                    {
+                        LOG_ERROR("[LOCALTP_GPU_PTR_MISMATCH] slot=" << i
+                                                                     << " ptr=" << ptr
+                                                                     << " owner.dev=" << owner.device_id
+                                                                     << " expected.dev=" << expected_ordinal
+                                                                     << " owner.base=" << owner.base_ptr
+                                                                     << " owner.bytes=" << owner.size_bytes
+                                                                     << " owner.seq=" << owner.sequence
+                                                                     << " owner.thread=" << owner.thread_hash
+                                                                     << " tensor=" << static_cast<void *>(t)
+                                                                     << " tensor_device="
+                                                                     << (t->current_device().has_value() ? t->current_device()->toString() : "none"));
+                        ROCmBackend::dumpRecentPointerEvents(128);
+                        barrier_result_ = false;
+                        goto cleanup;
+                    }
+                }
+            }
+#endif
 
             // TRACE: Log detailed buffer info including device for debugging memory faults
             LOG_TRACE("LocalTPContext::allreduceWithBarrierMultiGpu: BUFFER[" << i << "] "
@@ -828,6 +1304,17 @@ namespace llaminar2
         {
             // Execute the multi-GPU allreduce
             CollectiveDataType dtype = tensorDTypeToCollective(barrier_tensors_[0]);
+            const bool serialize_local_tp_launch = debugEnv().validation.serialize_local_tp_allreduce_launch;
+            static std::mutex local_tp_launch_mutex;
+            std::unique_lock<std::mutex> launch_lock(local_tp_launch_mutex, std::defer_lock);
+            if (serialize_local_tp_launch)
+            {
+                launch_lock.lock();
+                LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: serialized allreduce launch lock acquired "
+                          << "stage=" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_)
+                          << " participants=" << num_participants
+                          << " count=" << effective_count);
+            }
 
             // Phase 3 runtime policy: make graph-capture support explicit.
             // If users enable global GPU graph mode without segmented-collective
@@ -876,6 +1363,38 @@ namespace llaminar2
             LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: Calling allreduceMulti with "
                       << buffers.size() << " buffers, " << effective_count << " elements");
 
+            if (debugEnv().validation.sync_local_tp_allreduce)
+            {
+#ifdef HAVE_ROCM
+                for (int i = 0; i < num_participants; ++i)
+                {
+                    DeviceId sync_device = devices_[i].toLocalDeviceId();
+                    if (!sync_device.is_rocm())
+                    {
+                        continue;
+                    }
+
+                    auto *rocm_backend = dynamic_cast<ROCmBackend *>(getBackendForDevice(sync_device));
+                    if (!rocm_backend)
+                    {
+                        LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: missing ROCm backend for pre-allreduce sync "
+                                  << sync_device.toString());
+                        barrier_result_ = false;
+                        goto cleanup;
+                    }
+
+                    rocm_backend->setDevice(sync_device.toKernelDeviceIndex());
+                    if (!rocm_backend->synchronize(sync_device.toKernelDeviceIndex()))
+                    {
+                        LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: pre-allreduce synchronize failed for "
+                                  << sync_device.toString());
+                        barrier_result_ = false;
+                        goto cleanup;
+                    }
+                }
+#endif
+            }
+
             bool success = backend_impl_->allreduceMultiAndSynchronize(
                 buffers, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM);
 
@@ -903,6 +1422,100 @@ namespace llaminar2
             // TRACE: Log after allreduce+sync completes
             LOG_TRACE("LocalTPContext::allreduceWithBarrierMultiGpu: ALLREDUCE+SYNC COMPLETE");
 
+            if (debugEnv().validation.sync_local_tp_allreduce)
+            {
+#ifdef HAVE_ROCM
+                for (int i = 0; i < num_participants; ++i)
+                {
+                    DeviceId sync_device = devices_[i].toLocalDeviceId();
+                    if (!sync_device.is_rocm())
+                    {
+                        continue;
+                    }
+
+                    auto *rocm_backend = dynamic_cast<ROCmBackend *>(getBackendForDevice(sync_device));
+                    if (!rocm_backend)
+                    {
+                        LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: missing ROCm backend for post-allreduce sync "
+                                  << sync_device.toString());
+                        barrier_result_ = false;
+                        goto cleanup;
+                    }
+
+                    rocm_backend->setDevice(sync_device.toKernelDeviceIndex());
+                    if (!rocm_backend->synchronize(sync_device.toKernelDeviceIndex()))
+                    {
+                        LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: post-allreduce synchronize failed for "
+                                  << sync_device.toString());
+                        barrier_result_ = false;
+                        goto cleanup;
+                    }
+                }
+#endif
+            }
+
+#ifdef HAVE_ROCM
+            if (debugEnv().validation.validate_gpu_ptrs)
+            {
+                for (int i = 0; i < num_participants; ++i)
+                {
+                    TensorBase *t = barrier_tensors_[i];
+                    if (!t)
+                    {
+                        continue;
+                    }
+
+                    DeviceId expected_device = devices_[i].toLocalDeviceId();
+                    if (!expected_device.is_rocm())
+                    {
+                        continue;
+                    }
+
+                    void *ptr = t->gpu_data_ptr();
+                    if (!ptr)
+                    {
+                        LOG_ERROR("[LOCALTP_PTR_OWNER] phase=postallreduce slot=" << i
+                                                                                  << " stage=" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_)
+                                                                                  << " expected_device=" << expected_device.toString()
+                                                                                  << " ptr=null");
+                        continue;
+                    }
+
+                    auto *rocm_backend = dynamic_cast<ROCmBackend *>(getBackendForDevice(expected_device));
+                    bool is_device_ptr = false;
+                    bool is_host_ptr = false;
+                    bool is_managed = false;
+                    int attr_device = -1;
+                    if (rocm_backend)
+                    {
+                        rocm_backend->setDevice(expected_device.toKernelDeviceIndex());
+                        (void)rocm_backend->queryPointerAttributes(ptr, is_device_ptr, is_host_ptr, is_managed, attr_device);
+                    }
+
+                    ROCmPointerOwnerInfo owner;
+                    if (ROCmBackend::queryPointerOwner(ptr, owner))
+                    {
+                        LOG_DEBUG("[LOCALTP_PTR_OWNER] phase=postallreduce"
+                                  << " stage=" << (barrier_stage_name_.empty() ? "(none)" : barrier_stage_name_)
+                                  << " slot=" << i
+                                  << " expected_device=" << expected_device.toString()
+                                  << " ptr=" << ptr
+                                  << " attr_device=" << attr_device
+                                  << " is_device_ptr=" << (is_device_ptr ? 1 : 0)
+                                  << " is_host_ptr=" << (is_host_ptr ? 1 : 0)
+                                  << " is_managed=" << (is_managed ? 1 : 0)
+                                  << " owner_device=" << owner.device_id
+                                  << " owner_base=" << owner.base_ptr
+                                  << " owner_bytes=" << owner.size_bytes
+                                  << " owner_seq=" << owner.sequence
+                                  << " owner_thread=" << owner.thread_hash
+                                  << " tensor=" << static_cast<void *>(t)
+                                  << " tensor_name=" << (t->debugName().empty() ? "(unnamed)" : t->debugName()));
+                    }
+                }
+            }
+#endif
+
             // Mark all tensors as device-dirty (data was modified on GPU)
             for (int i = 0; i < num_participants; ++i)
             {
@@ -928,6 +1541,11 @@ namespace llaminar2
     cleanup:
         // Clear barrier state and signal completion
         barrier_tensors_.clear();
+        barrier_stage_name_.clear();
+        barrier_watch_checksums_.clear();
+        barrier_watch_sample_bytes_.clear();
+        barrier_watch_sample_offsets_.clear();
+        barrier_watch_checksum_valid_.clear();
         barrier_element_count_ = 0;
         barrier_count_.store(0);
         barrier_generation_.fetch_add(1);
@@ -1053,12 +1671,27 @@ namespace llaminar2
                 //   - This is the ONLY way for ROCm data to reach BAR
                 // ===========================================================================
                 const float *hip_staging_ptr = static_cast<const float *>(rocm_tensor->rocm_data_ptr());
+                if (!hip_staging_ptr)
+                {
+                    hip_staging_ptr = static_cast<const float *>(rocm_tensor->gpu_data_ptr());
+                    LOG_DEBUG("LocalTPContext::executePCIeBarAllreduce: rocm_data_ptr() is null; "
+                              << "falling back to gpu_data_ptr()=" << hip_staging_ptr);
+                }
                 float *bar_ptr = static_cast<float *>(rocm_tensor->bar_address());
 
                 if (!cuda_output || !hip_staging_ptr)
                 {
                     LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: Invalid pointers "
                               << "(cuda=" << cuda_output << ", hip_staging=" << hip_staging_ptr << ")");
+                    if (debugEnv().validation.validate_gpu_ptrs)
+                    {
+                        LOG_ERROR("LocalTPContext::executePCIeBarAllreduce: FAIL-FAST due to invalid GPU pointers "
+                                  << "with LLAMINAR_VALIDATE_GPU_PTRS=1");
+#ifdef HAVE_ROCM
+                        ROCmBackend::dumpRecentPointerEvents(128);
+#endif
+                        throw std::runtime_error("LocalTPContext PCIeBAR allreduce invalid pointers (hip_staging null)");
+                    }
                     return false;
                 }
 
@@ -1999,10 +2632,45 @@ namespace llaminar2
                     num_rocm++;
             }
 
-            // Use simple PCIeBAR for exactly 1+1 case (2 devices total)
+            // Use simple PCIeBAR for exactly 1+1 case if on the same NUMA node
             if (num_cuda == 1 && num_rocm == 1)
             {
-                return CollectiveBackendType::PCIE_BAR;
+                // Check NUMA affinity via DeviceManager — PCIeBAR requires same-NUMA
+                bool same_numa = true;
+                int first_numa = -1;
+                const auto &dm = DeviceManager::instance();
+                for (const auto &dev : devices)
+                {
+                    if (!dev.isGPU())
+                        continue;
+                    // Look up real NUMA from hardware inventory
+                    int dev_numa = -1;
+                    for (const auto &cd : dm.devices())
+                    {
+                        bool type_match = (dev.isCUDA() && cd.type == ComputeBackendType::GPU_CUDA) ||
+                                          (dev.isROCm() && cd.type == ComputeBackendType::GPU_ROCM);
+                        if (type_match && cd.device_id == dev.device_ordinal)
+                        {
+                            dev_numa = cd.numa_node;
+                            break;
+                        }
+                    }
+                    if (dev_numa < 0)
+                        continue; // Unknown — don't block
+                    if (first_numa < 0)
+                        first_numa = dev_numa;
+                    else if (dev_numa != first_numa)
+                        same_numa = false;
+                }
+                if (same_numa)
+                {
+                    return CollectiveBackendType::PCIE_BAR;
+                }
+                LOG_WARN("Cross-NUMA heterogeneous GPU collective: HOST backend selected "
+                         "instead of PCIeBAR — this will be slow! "
+                         "For best performance, use GPUs on the same NUMA node "
+                         "so PCIeBAR peer-to-peer transfers can be used.");
+                return CollectiveBackendType::HOST;
             }
 
             // Use hierarchical backend for N+M case (>2 devices)

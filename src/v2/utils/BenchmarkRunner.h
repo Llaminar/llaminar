@@ -129,6 +129,7 @@ namespace llaminar2
          * @return Tuple of (success, time_ms, tokens_generated, generated_text)
          */
         std::tuple<bool, double, int, std::string> runDecode(int n_tokens, int eos_token_id);
+
     };
 
 } // namespace llaminar2

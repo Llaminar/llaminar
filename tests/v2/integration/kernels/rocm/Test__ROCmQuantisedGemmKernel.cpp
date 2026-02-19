@@ -65,7 +65,9 @@ extern "C"
         const int8_t *d_weights_int8,
         int32_t *d_C_int32,
         int M, int N, int K,
-        int rocm_device_id);
+        int rocm_device_id,
+        void *stream,
+        void *kernel_ctx);
 
     // Two-kernel path: INT8×INT8→INT32 GEMM + separate scale application
     bool rocmQuantGemm_executeTwoKernel(
@@ -75,7 +77,9 @@ extern "C"
         const float *d_scales_A,
         const float *d_scales_B,
         int M, int N, int K,
-        int rocm_device_id);
+        int rocm_device_id,
+        void *stream,
+        void *kernel_ctx);
 
     // Memory management
     void rocmQuantGemm_freeDevice(void *d_ptr, int rocm_device_id);
@@ -616,7 +620,11 @@ namespace llaminar2
                 ASSERT_EQ(hipMemcpy(d_A, h_A.data(), static_cast<size_t>(M) * K * sizeof(int8_t), hipMemcpyHostToDevice), hipSuccess);
                 ASSERT_EQ(hipMemcpy(d_B, h_B.data(), static_cast<size_t>(K) * N * sizeof(int8_t), hipMemcpyHostToDevice), hipSuccess);
 
-                ASSERT_TRUE(rocmQuantGemm_executeNoScale(d_A, d_B, d_C, M, N, K, /*rocm_device_id=*/0));
+                ASSERT_TRUE(rocmQuantGemm_executeNoScale(
+                    d_A, d_B, d_C, M, N, K,
+                    /*rocm_device_id=*/0,
+                    /*stream=*/nullptr,
+                    /*kernel_ctx=*/nullptr));
 
                 std::vector<int32_t> h_C(static_cast<size_t>(M) * N);
                 ASSERT_EQ(hipMemcpy(h_C.data(), d_C, static_cast<size_t>(M) * N * sizeof(int32_t), hipMemcpyDeviceToHost), hipSuccess);
@@ -743,7 +751,9 @@ namespace llaminar2
                     d_A, d_B, d_E,
                     d_scaleA, d_scaleB,
                     M, N, K,
-                    /*rocm_device_id=*/0));
+                    /*rocm_device_id=*/0,
+                    /*stream=*/nullptr,
+                    /*kernel_ctx=*/nullptr));
 
                 std::vector<float> h_E(static_cast<size_t>(M) * N);
                 ASSERT_EQ(hipMemcpy(h_E.data(), d_E, static_cast<size_t>(M) * N * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);

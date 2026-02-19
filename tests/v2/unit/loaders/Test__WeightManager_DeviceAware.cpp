@@ -392,7 +392,7 @@ TEST_F(WeightManagerDeviceAwareTest, ClearCache_RemovesAllWeights)
     EXPECT_EQ(mock_->cacheSize(), 0u);
 
     // After clearing, weights should return nullptr
-    auto weight = mock_->getWeight("blk.0.attn_q.weight");
+    auto weight = mock_->getWeightForDevice("blk.0.attn_q.weight");
     EXPECT_EQ(weight, nullptr);
 }
 
@@ -415,7 +415,7 @@ TEST_F(WeightManagerDeviceAwareTest, GetDecodeWeight_FallsBackToMainWeight)
 {
     // Without explicit decode weight, falls back to main weight
     auto decode = mock_->getDecodeWeight("blk.0.attn_q.weight", DeviceId::cpu(), 0.5f);
-    auto main = mock_->getWeight("blk.0.attn_q.weight");
+    auto main = mock_->getWeightForDevice("blk.0.attn_q.weight");
 
     ASSERT_NE(decode, nullptr);
     EXPECT_EQ(decode.get(), main.get());
@@ -431,10 +431,10 @@ TEST_F(WeightManagerDeviceAwareTest, Builder_AddAttentionLayer)
                     .addAttentionLayer(0, 64, 16, 4, 2) // layer 0, hidden=64, head_dim=16, 4 heads, 2 KV heads
                     .build();
 
-    EXPECT_NE(mock->getWeight("blk.0.attn_q.weight"), nullptr);
-    EXPECT_NE(mock->getWeight("blk.0.attn_k.weight"), nullptr);
-    EXPECT_NE(mock->getWeight("blk.0.attn_v.weight"), nullptr);
-    EXPECT_NE(mock->getWeight("blk.0.attn_output.weight"), nullptr);
+    EXPECT_NE(mock->getWeightForDevice("blk.0.attn_q.weight"), nullptr);
+    EXPECT_NE(mock->getWeightForDevice("blk.0.attn_k.weight"), nullptr);
+    EXPECT_NE(mock->getWeightForDevice("blk.0.attn_v.weight"), nullptr);
+    EXPECT_NE(mock->getWeightForDevice("blk.0.attn_output.weight"), nullptr);
 }
 
 TEST_F(WeightManagerDeviceAwareTest, Builder_AddFFNLayer)
@@ -443,9 +443,9 @@ TEST_F(WeightManagerDeviceAwareTest, Builder_AddFFNLayer)
                     .addFFNLayer(0, 64, 256) // layer 0, hidden=64, ffn_dim=256
                     .build();
 
-    EXPECT_NE(mock->getWeight("blk.0.ffn_gate.weight"), nullptr);
-    EXPECT_NE(mock->getWeight("blk.0.ffn_up.weight"), nullptr);
-    EXPECT_NE(mock->getWeight("blk.0.ffn_down.weight"), nullptr);
+    EXPECT_NE(mock->getWeightForDevice("blk.0.ffn_gate.weight"), nullptr);
+    EXPECT_NE(mock->getWeightForDevice("blk.0.ffn_up.weight"), nullptr);
+    EXPECT_NE(mock->getWeightForDevice("blk.0.ffn_down.weight"), nullptr);
 }
 
 TEST_F(WeightManagerDeviceAwareTest, Builder_AddNormWeights)
@@ -454,8 +454,8 @@ TEST_F(WeightManagerDeviceAwareTest, Builder_AddNormWeights)
                     .addNormWeights(0, 64) // layer 0, hidden=64
                     .build();
 
-    EXPECT_NE(mock->getWeight("blk.0.attn_norm.weight"), nullptr);
-    EXPECT_NE(mock->getWeight("blk.0.ffn_norm.weight"), nullptr);
+    EXPECT_NE(mock->getWeightForDevice("blk.0.attn_norm.weight"), nullptr);
+    EXPECT_NE(mock->getWeightForDevice("blk.0.ffn_norm.weight"), nullptr);
 }
 
 TEST_F(WeightManagerDeviceAwareTest, Builder_AddEmbedding)
@@ -464,7 +464,7 @@ TEST_F(WeightManagerDeviceAwareTest, Builder_AddEmbedding)
                     .addEmbedding(1000, 64) // vocab=1000, hidden=64
                     .build();
 
-    auto embd = mock->getWeight("token_embd.weight");
+    auto embd = mock->getWeightForDevice("token_embd.weight");
     ASSERT_NE(embd, nullptr);
     EXPECT_EQ(embd->shape()[0], 1000u);
     EXPECT_EQ(embd->shape()[1], 64u);
@@ -476,7 +476,7 @@ TEST_F(WeightManagerDeviceAwareTest, Builder_AddLMHead)
                     .addLMHead(1000, 64) // vocab=1000, hidden=64
                     .build();
 
-    auto head = mock->getWeight("output.weight");
+    auto head = mock->getWeightForDevice("output.weight");
     ASSERT_NE(head, nullptr);
     EXPECT_EQ(head->shape()[0], 1000u);
     EXPECT_EQ(head->shape()[1], 64u);
@@ -488,8 +488,8 @@ TEST_F(WeightManagerDeviceAwareTest, Builder_AddLMHead)
 
 TEST_F(WeightManagerDeviceAwareTest, ResetCounters_ClearsTracking)
 {
-    mock_->getWeight("blk.0.attn_q.weight");
-    mock_->getWeight("nonexistent.weight");
+    mock_->getWeightForDevice("blk.0.attn_q.weight");
+    mock_->getWeightForDevice("nonexistent.weight");
 
     EXPECT_EQ(mock_->getWeightCallCount(), 2u);
     EXPECT_EQ(mock_->missingWeightRequests().size(), 1u);
@@ -507,8 +507,8 @@ TEST_F(WeightManagerDeviceAwareTest, ResetCounters_ClearsTracking)
 TEST_F(WeightManagerDeviceAwareTest, MultipleLayerWeights)
 {
     // Test handling of multiple layers
-    auto q0 = mock_->getWeight("blk.0.attn_q.weight");
-    auto q1 = mock_->getWeight("blk.1.attn_q.weight");
+    auto q0 = mock_->getWeightForDevice("blk.0.attn_q.weight");
+    auto q1 = mock_->getWeightForDevice("blk.1.attn_q.weight");
 
     ASSERT_NE(q0, nullptr);
     ASSERT_NE(q1, nullptr);

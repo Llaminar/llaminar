@@ -1685,6 +1685,16 @@ namespace llaminar2
     {
         bool validate_buffers = false; ///< Enable buffer validation after stage execution
         bool validate_inputs = false;  ///< Enable input validation BEFORE stage execution (Phase 1)
+        bool validate_gpu_ptrs = false; ///< Validate GPU pointer device ownership before stage execution
+        bool sync_each_stage = false; ///< Force hipDeviceSynchronize after each stage (ROCm debug)
+        bool sync_after_embedding_stage = false; ///< Force stream sync only after embedding kernel launch (targeted race debug)
+        bool sync_local_tp_allreduce = false; ///< Force device sync before/after LOCAL TP allreduce (targeted debug)
+        bool serialize_embedding_stage = false; ///< Serialize embedding stage execution across LOCAL TP device threads (targeted race debug)
+        bool serialize_rocm_gemm_stage = false; ///< Serialize ROCm CK GEMM dispatch across LOCAL TP device threads (targeted race debug)
+        bool strict_local_tp_stage_barrier = false; ///< Fail fast when LOCAL TP barrier receives mixed stage names in one generation
+        bool serialize_local_tp_allreduce_launch = false; ///< Serialize LOCAL TP collective launch section across threads (targeted race debug)
+        bool trace_local_tp_pointer = false; ///< Enable targeted pointer watch for LOCAL TP allreduce buffers
+        uint64_t trace_local_tp_pointer_address = 0; ///< Watched address for LOCAL TP pointer tracing (env accepts hex/decimal)
         bool fail_on_zero = false;     ///< Fail immediately when all-zero OUTPUT tensor detected (auto-enabled in Debug)
         bool fail_on_nan = false;      ///< Fail immediately when NaN/Inf detected
         bool dump_on_failure = true;   ///< Dump all buffers to disk when verification fails
@@ -1743,6 +1753,66 @@ namespace llaminar2
                 sample_rows = std::atoi(sample_rows_env);
                 if (sample_rows < 1)
                     sample_rows = 1;
+            }
+
+            const char *gpu_ptrs_env = std::getenv("LLAMINAR_VALIDATE_GPU_PTRS");
+            if (gpu_ptrs_env)
+            {
+                validate_gpu_ptrs = (std::atoi(gpu_ptrs_env) != 0);
+            }
+
+            const char *sync_stage_env = std::getenv("LLAMINAR_SYNC_EACH_STAGE");
+            if (sync_stage_env)
+            {
+                sync_each_stage = (std::atoi(sync_stage_env) != 0);
+            }
+
+            const char *sync_embed_env = std::getenv("LLAMINAR_SYNC_AFTER_EMBEDDING_STAGE");
+            if (sync_embed_env)
+            {
+                sync_after_embedding_stage = (std::atoi(sync_embed_env) != 0);
+            }
+
+            const char *sync_local_tp_env = std::getenv("LLAMINAR_SYNC_LOCAL_TP_ALLREDUCE");
+            if (sync_local_tp_env)
+            {
+                sync_local_tp_allreduce = (std::atoi(sync_local_tp_env) != 0);
+            }
+
+            const char *serialize_embed_env = std::getenv("LLAMINAR_SERIALIZE_EMBEDDING_STAGE");
+            if (serialize_embed_env)
+            {
+                serialize_embedding_stage = (std::atoi(serialize_embed_env) != 0);
+            }
+
+            const char *serialize_rocm_gemm_env = std::getenv("LLAMINAR_SERIALIZE_ROCM_GEMM_STAGE");
+            if (serialize_rocm_gemm_env)
+            {
+                serialize_rocm_gemm_stage = (std::atoi(serialize_rocm_gemm_env) != 0);
+            }
+
+            const char *strict_local_tp_stage_env = std::getenv("LLAMINAR_STRICT_LOCAL_TP_STAGE_BARRIER");
+            if (strict_local_tp_stage_env)
+            {
+                strict_local_tp_stage_barrier = (std::atoi(strict_local_tp_stage_env) != 0);
+            }
+
+            const char *serialize_local_tp_launch_env = std::getenv("LLAMINAR_SERIALIZE_LOCAL_TP_ALLREDUCE_LAUNCH");
+            if (serialize_local_tp_launch_env)
+            {
+                serialize_local_tp_allreduce_launch = (std::atoi(serialize_local_tp_launch_env) != 0);
+            }
+
+            const char *trace_local_tp_ptr_env = std::getenv("LLAMINAR_TRACE_LOCAL_TP_PTR");
+            if (trace_local_tp_ptr_env && trace_local_tp_ptr_env[0] != '\0')
+            {
+                char *end_ptr = nullptr;
+                const unsigned long long parsed = std::strtoull(trace_local_tp_ptr_env, &end_ptr, 0);
+                if (end_ptr != trace_local_tp_ptr_env)
+                {
+                    trace_local_tp_pointer = true;
+                    trace_local_tp_pointer_address = static_cast<uint64_t>(parsed);
+                }
             }
         }
     };

@@ -23,6 +23,7 @@
 #include "../../utils/Logger.h"
 #include "../../utils/MPITopology.h"
 #include "../../utils/NUMATopology.h"
+#include "../../utils/WeightLoadingProfiler.h"
 
 #include <algorithm>
 #include <cctype>
@@ -918,7 +919,10 @@ namespace llaminar2
         // Create ModelContext using the unified config-based factory method
         // Use NATIVE weight precision to preserve quantization (Q4_0, Q8_0, etc.)
         // for efficient GPU kernels rather than dequantizing to FP32
-        model_ctx_ = ModelContext::create(model_path, weight_config);
+        {
+            ScopedWeightLoadTimer timer(WeightLoadPhase::GGUF_PARSE);
+            model_ctx_ = ModelContext::create(model_path, weight_config);
+        }
 
         if (!model_ctx_)
         {
@@ -975,6 +979,8 @@ namespace llaminar2
 
     bool OrchestrationRunner::buildComputeGraph()
     {
+        ScopedWeightLoadTimer timer(WeightLoadPhase::GRAPH_BUILD);
+
         // Check if LOCAL TP is configured (multiple devices within this rank)
         if (hasLocalTP())
         {
