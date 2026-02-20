@@ -57,12 +57,14 @@ namespace
          */
         static std::vector<std::string> buildScenario7Args()
         {
+            // Use hostname-qualified addresses so findRankForDevice can
+            // disambiguate ranks that live on different nodes.
             return {
                 "llaminar2",
                 "-m", "models/test.gguf",
-                "--define-domain", "gpu0=0:cuda:0,0:cuda:1",
-                "--define-domain", "gpu1=1:rocm:0,1:rocm:1",
-                "--define-domain", "cpu=cpu:0,cpu:1",
+                "--define-domain", "gpu0=node0:0:cuda:0,node0:0:cuda:1",
+                "--define-domain", "gpu1=node1:0:rocm:0,node1:0:rocm:1",
+                "--define-domain", "cpu=node2:0:cpu:0,node2:0:cpu:1",
                 "--pp-stage", "0=gpu0:0-7",
                 "--pp-stage", "1=gpu1:8-15",
                 "--pp-stage", "2=cpu:16-23"};
@@ -142,34 +144,34 @@ namespace
                 return info;
             };
 
-            // GPU0 domain (NUMA 0, 2 CUDA GPUs)
+            // GPU0 domain (node0, 2 CUDA GPUs)
             RankInventory gpu0_inv;
             gpu0_inv.rank = 0;
             gpu0_inv.node_id = 0;
             gpu0_inv.local_rank = 0;
-            gpu0_inv.hostname = "localhost";
+            gpu0_inv.hostname = "node0";
             gpu0_inv.numa_nodes = 1; // Single NUMA node
             gpu0_inv.gpus.push_back(makeGpuDevice(DeviceType::CUDA, 0));
             gpu0_inv.gpus.push_back(makeGpuDevice(DeviceType::CUDA, 1));
             inventory.ranks.push_back(gpu0_inv);
 
-            // GPU1 domain (NUMA 1, 2 ROCm GPUs)
+            // GPU1 domain (node1, 2 ROCm GPUs)
             RankInventory gpu1_inv;
             gpu1_inv.rank = 1;
-            gpu1_inv.node_id = 0;
-            gpu1_inv.local_rank = 1;
-            gpu1_inv.hostname = "localhost";
+            gpu1_inv.node_id = 1;
+            gpu1_inv.local_rank = 0;
+            gpu1_inv.hostname = "node1";
             gpu1_inv.numa_nodes = 1; // Single NUMA node
             gpu1_inv.gpus.push_back(makeGpuDevice(DeviceType::ROCm, 0));
             gpu1_inv.gpus.push_back(makeGpuDevice(DeviceType::ROCm, 1));
             inventory.ranks.push_back(gpu1_inv);
 
-            // CPU domain (NUMA 0 and 1, 2 CPUs)
+            // CPU domain (node2, 2 CPU sockets)
             RankInventory cpu_inv;
             cpu_inv.rank = 2;
-            cpu_inv.node_id = 0;
-            cpu_inv.local_rank = 2;
-            cpu_inv.hostname = "localhost";
+            cpu_inv.node_id = 2;
+            cpu_inv.local_rank = 0;
+            cpu_inv.hostname = "node2";
             cpu_inv.numa_nodes = 2; // Two NUMA nodes
             cpu_inv.cpu.type = DeviceType::CPU;
             cpu_inv.cpu.local_device_id = 0;
@@ -180,7 +182,7 @@ namespace
 
             // Set cluster-level metadata
             inventory.world_size = 3;
-            inventory.node_count = 1;
+            inventory.node_count = 3;
             inventory.total_gpus = 4; // 2 CUDA + 2 ROCm
             inventory.total_gpu_memory = 4 * 8ULL * 1024 * 1024 * 1024;
             inventory.total_cpu_memory = 256ULL * 1024 * 1024 * 1024;

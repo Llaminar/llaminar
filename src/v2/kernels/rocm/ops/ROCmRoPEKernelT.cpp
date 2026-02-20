@@ -302,7 +302,24 @@ namespace llaminar2
                 inv_freq_theta_ = rope_theta;
             }
 
-            return hipOps_rope_fp32_v2(Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
+            // Copy position_ids from host to device workspace buffer
+            // (position_ids is a host pointer; HIP kernel expects device pointer)
+            int *d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
+            if (!d_position_ids)
+            {
+                LOG_ERROR("[ROCmRoPEKernelT<FP32>] POSITION_IDS buffer not allocated in workspace");
+                return false;
+            }
+
+            size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
+            hipError_t err = hipMemcpy(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));
+                return false;
+            }
+
+            return hipOps_rope_fp32_v2(Q, K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
         }
 
         bool ROCmRoPEKernelT<ActivationPrecision::FP32>::apply_tensor(
@@ -602,9 +619,24 @@ namespace llaminar2
                 inv_freq_theta_ = rope_theta;
             }
 
-            return hipOps_rope_bf16_v2(Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
+            // Copy position_ids from host to device workspace buffer
+            // (position_ids is a host pointer; HIP kernel expects device pointer)
+            int *d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
+            if (!d_position_ids)
+            {
+                LOG_ERROR("[ROCmRoPEKernelT<BF16>] POSITION_IDS buffer not allocated in workspace");
+                return false;
+            }
 
-            return hipOps_rope_bf16_v2(Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
+            size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
+            hipError_t err = hipMemcpy(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));
+                return false;
+            }
+
+            return hipOps_rope_bf16_v2(Q, K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
         }
 
         bool ROCmRoPEKernelT<ActivationPrecision::BF16>::apply_tensor(
@@ -898,7 +930,24 @@ namespace llaminar2
                 inv_freq_theta_ = rope_theta;
             }
 
-            return hipOps_rope_fp16_v2(Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
+            // Copy position_ids from host to device workspace buffer
+            // (position_ids is a host pointer; HIP kernel expects device pointer)
+            int *d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
+            if (!d_position_ids)
+            {
+                LOG_ERROR("[ROCmRoPEKernelT<FP16>] POSITION_IDS buffer not allocated in workspace");
+                return false;
+            }
+
+            size_t pos_bytes = static_cast<size_t>(seq_len) * sizeof(int);
+            hipError_t err = hipMemcpy(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));
+                return false;
+            }
+
+            return hipOps_rope_fp16_v2(Q, K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
         }
 
         bool ROCmRoPEKernelT<ActivationPrecision::FP16>::apply_tensor(

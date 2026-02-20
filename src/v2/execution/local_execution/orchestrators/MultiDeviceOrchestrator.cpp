@@ -1150,7 +1150,7 @@ namespace llaminar2
         // DIAGNOSTIC: Run forward passes SEQUENTIALLY to test if concurrency causes crash.
         // If sequential execution works but parallel crashes, it's a concurrent HIP issue.
         const bool serialize_devices = (std::getenv("LLAMINAR_SERIALIZE_TP_FORWARD") != nullptr);
-        
+
         // Launch parallel forward passes on all devices
         std::vector<std::future<bool>> futures;
         futures.reserve(device_runners_.size());
@@ -1164,13 +1164,14 @@ namespace llaminar2
                 // DeviceGraphOrchestrator has both forward(tokens, seq_len) -> bool
                 // and forward(tokens, seq_len, batch_size=1) -> const float*
                 IInferenceRunner *runner_iface = runner.get();
-                
+
                 if (serialize_devices)
                 {
                     // SERIAL mode: run each device's forward completely before starting the next
                     LOG_WARN("MultiDeviceOrchestrator::forwardTP: SERIAL mode - device " << i << " running synchronously");
                     bool ok = runner_iface->forward(tokens, seq_len);
-                    futures.push_back(std::async(std::launch::deferred, [ok]() { return ok; }));
+                    futures.push_back(std::async(std::launch::deferred, [ok]()
+                                                 { return ok; }));
                 }
                 else
                 {
@@ -1874,12 +1875,29 @@ namespace llaminar2
         // logits_local buffers allocated but never computes LM_HEAD would return stale data.
         if (key == "LM_HEAD" && device_runners_.size() > 1 && combined_logits_ && tp_ctx_)
         {
-            // First, verify this stage actually owns the LM_HEAD
-            auto wm = model_ctx_->weightManager();
-            if (!wm || !wm->hasLMHead())
+            // First, verify this stage actually owns the LM_HEAD.
+            // Check nested_pp_stage_config first — when this MDO is a TP stage inside PP,
+            // the config accurately reflects whether this stage has the LM head.
+            // The weight manager check is a fallback for standalone TP (non-PP) usage
+            // where the full model context is shared and wm->hasLMHead() may be true
+            // even for stages that don't compute the LM head.
+            bool owns_lm_head = true;
+            if (config_.nested_pp_stage_config.has_value())
+            {
+                owns_lm_head = config_.nested_pp_stage_config->has_lm_head;
+            }
+            else
+            {
+                auto wm = model_ctx_->weightManager();
+                owns_lm_head = wm && wm->hasLMHead();
+            }
+
+            if (!owns_lm_head)
             {
                 LOG_DEBUG("MultiDeviceOrchestrator::getSnapshot LM_HEAD: this stage doesn't own LM_HEAD, "
-                          << "falling through to PP stage search (hasLMHead=" << (wm ? wm->hasLMHead() : false) << ")");
+                          << "falling through to PP stage search"
+                          << " (nested_pp_config=" << config_.nested_pp_stage_config.has_value()
+                          << " has_lm_head=" << (config_.nested_pp_stage_config.has_value() ? config_.nested_pp_stage_config->has_lm_head : false) << ")");
                 // Fall through to PP stage search or return nullptr
             }
             else

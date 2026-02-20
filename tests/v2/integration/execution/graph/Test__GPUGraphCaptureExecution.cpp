@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 #include <memory>
+#include <optional>
 #include <vector>
 #include <unordered_set>
 #include <string>
@@ -131,13 +132,26 @@ protected:
      * @param[out] norm_input  Raw pointer to the RMSNorm input tensor
      * @param[out] residual    Raw pointer to the residual tensor
      * @param[out] result_output Raw pointer to the final output tensor
+     * @param stage_device  Device ID for stage params (kernel dispatch).
+     *                      Default: CPU — the stages create CPU kernels.
+     * @param node_device   Device ID for graph nodes (coherence target).
+     *                      Default: device_ctx_->deviceId() (GPU).
+     *                      IMPORTANT: When executeNode() is used (e.g. collective-
+     *                      graph fallback), node_device MUST match stage_device.
+     *                      Otherwise coherence marks outputs as GPU-dirty while the
+     *                      CPU kernel writes to host, causing verification to read
+     *                      uninitialized GPU zeros.
      * @return Populated ComputeGraph
      */
     ComputeGraph buildNormResidualGraph(size_t seq_len, size_t d_model,
                                         FP32Tensor *&norm_input,
                                         FP32Tensor *&residual,
-                                        FP32Tensor *&result_output)
+                                        FP32Tensor *&result_output,
+                                        DeviceId stage_device = DeviceId::cpu(),
+                                        std::optional<DeviceId> node_device = std::nullopt)
     {
+        const DeviceId graph_device = node_device.value_or(device_ctx_->deviceId());
+
         norm_input = createFP32Tensor({seq_len, d_model});
         auto *norm_output = createFP32Tensor({seq_len, d_model});
         auto *gamma = createFP32Tensor({d_model});
@@ -165,17 +179,19 @@ protected:
         norm_params.gamma = gamma;
         norm_params.eps = 1e-5f;
         norm_params.seq_len = static_cast<int>(seq_len);
+        norm_params.device_id = stage_device;
 
         ResidualAddStage::Params res_params;
         res_params.input = norm_output;
         res_params.residual = residual;
         res_params.output = result_output;
         res_params.num_elements = num_elements;
+        res_params.device_id = stage_device;
 
         // Assemble graph with dependency
         ComputeGraph graph;
-        graph.addNode("rmsnorm", ComputeStageFactory::createRMSNorm(norm_params), device_ctx_->deviceId());
-        graph.addNode("residual_add", ComputeStageFactory::createResidualAdd(res_params), device_ctx_->deviceId());
+        graph.addNode("rmsnorm", ComputeStageFactory::createRMSNorm(norm_params), graph_device);
+        graph.addNode("residual_add", ComputeStageFactory::createResidualAdd(res_params), graph_device);
         graph.addDependency("residual_add", "rmsnorm");
 
         return graph;
@@ -384,7 +400,25 @@ TEST_F(GPUGraphCaptureExecutionTest, CollectiveNodesPresent_FallsBackToFastDecod
     FP32Tensor *norm_input = nullptr;
     FP32Tensor *residual = nullptr;
     FP32Tensor *result = nullptr;
-    auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
+
+    // Build graph with CPU device for BOTH stage params and graph nodes.
+    //
+    // This test exercises the collective-fallback path in executeFastDecode,
+    // which routes ALL nodes (not just collectives) through executeNode().
+    // executeNode() does full coherence management based on node.device:
+    //   - Uploads inputs to target device
+    //   - Allocates output buffers on target device
+    //   - After stage->execute(), marks outputs as device-dirty
+    //
+    // If node.device is GPU but stage device_id is CPU, the CPU kernel
+    // writes to host memory while coherence marks outputs as GPU-dirty.
+    // When verification later calls data(), it syncs from GPU (which has
+    // uninitialized zeros) back to host, overwriting the correct CPU output.
+    //
+    // Fix: Use CPU device for graph nodes so that executeNode()'s coherence
+    // targets CPU (effectively a no-op), matching the CPU kernel dispatch.
+    auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result,
+                                        DeviceId::cpu(), DeviceId::cpu());
 
     GraphExecutorConfig config;
     DeviceGraphExecutor executor(config);

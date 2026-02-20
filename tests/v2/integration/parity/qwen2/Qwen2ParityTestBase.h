@@ -428,11 +428,225 @@ namespace llaminar2::test::parity::qwen2
             };
         }
 
+        // =============================================================================
+        // LocalPPTestRunner — test-only PP wrapper using pre-compiled child runners
+        // =============================================================================
+
         /**
-         * @brief Factory that creates a MultiDeviceOrchestrator(PP) from a PP node
+         * @brief Test-only IInferenceRunner wrapper for local Pipeline Parallelism
          *
-         * Builds PP stage configs from the tree node's children and creates
-         * a MultiDeviceOrchestrator in PP mode (or TP_PP for hybrid).
+         * Wraps pre-compiled child runners (from TreeToRunnerCompiler) with
+         * PP forward sequencing: runs stages sequentially, transferring the
+         * hidden state between them via a LocalPPContext.
+         *
+         * This avoids creating a MultiDeviceOrchestrator(TP_PP) from scratch,
+         * which fails for hybrid PP+TP because the MDO's internal
+         * initializePPDeviceRunners() creates PP-stage-filtered model contexts
+         * that lack global weights (output_norm, output/lm_head) needed by
+         * createTestableInferenceRunner() in the nested TP MDO.
+         *
+         * Instead, the tree compiler creates child runners correctly:
+         *   - TP stage: MDO(TP) from FULL model context with nested_pp_stage_config
+         *   - Device stage: DGO from createPPStageRunner with partial weights
+         *
+         * This wrapper sequences those pre-built runners with PP semantics.
+         */
+        class LocalPPTestRunner : public IInferenceRunner
+        {
+        public:
+            LocalPPTestRunner(
+                std::vector<std::unique_ptr<IInferenceRunner>> stage_runners,
+                std::unique_ptr<ILocalPPContext> pp_ctx)
+                : stage_runners_(std::move(stage_runners)),
+                  pp_ctx_(std::move(pp_ctx))
+            {
+                if (stage_runners_.empty())
+                {
+                    throw std::invalid_argument("LocalPPTestRunner: no stage runners provided");
+                }
+                LOG_INFO("[LocalPPTestRunner] Created with " << stage_runners_.size()
+                                                             << " PP stages");
+            }
+
+            // ================================================================
+            // Core Inference API
+            // ================================================================
+
+            bool forward(const int *tokens, int seq_len) override
+            {
+                // Stage 0: run with tokens (has embedding)
+                if (!stage_runners_[0]->forward(tokens, seq_len))
+                {
+                    LOG_ERROR("[LocalPPTestRunner] Stage 0 forward failed");
+                    return false;
+                }
+
+                // Subsequent stages: transfer hidden state, then run
+                for (size_t i = 1; i < stage_runners_.size(); ++i)
+                {
+                    TensorBase *hidden = stage_runners_[i - 1]->getHiddenState();
+                    if (!hidden)
+                    {
+                        LOG_ERROR("[LocalPPTestRunner] Stage " << (i - 1)
+                                                               << " has no hidden state to transfer");
+                        return false;
+                    }
+
+                    // Transfer hidden state between devices
+                    if (pp_ctx_)
+                    {
+                        if (!pp_ctx_->transfer(hidden, static_cast<int>(i - 1),
+                                               static_cast<int>(i)))
+                        {
+                            LOG_ERROR("[LocalPPTestRunner] Transfer from stage "
+                                      << (i - 1) << " to stage " << i << " failed");
+                            return false;
+                        }
+                    }
+
+                    stage_runners_[i]->setHiddenState(hidden);
+
+                    // Forward with nullptr tokens — stage uses hidden state input
+                    if (!stage_runners_[i]->forward(nullptr, seq_len))
+                    {
+                        LOG_ERROR("[LocalPPTestRunner] Stage " << i << " forward failed");
+                        return false;
+                    }
+
+                    stage_runners_[i]->clearHiddenStateInput();
+                }
+
+                current_position_ += seq_len;
+                return true;
+            }
+
+            const float *logits() const override
+            {
+                return stage_runners_.back()->logits();
+            }
+
+            int vocab_size() const override
+            {
+                return stage_runners_.back()->vocab_size();
+            }
+
+            void clear_cache() override
+            {
+                for (auto &runner : stage_runners_)
+                    runner->clear_cache();
+                current_position_ = 0;
+            }
+
+            int get_position() const override
+            {
+                return current_position_;
+            }
+
+            ExecutionPath executionPath() const override
+            {
+                return ExecutionPath::GRAPH;
+            }
+
+            const char *architecture() const override
+            {
+                return stage_runners_.front()->architecture();
+            }
+
+            // ================================================================
+            // Snapshot API — aggregate from all stages
+            // ================================================================
+
+            void enableSnapshotCapture(const std::string &output_dir = "") override
+            {
+                for (auto &runner : stage_runners_)
+                    runner->enableSnapshotCapture(output_dir);
+            }
+
+            void disableSnapshotCapture() override
+            {
+                for (auto &runner : stage_runners_)
+                    runner->disableSnapshotCapture();
+            }
+
+            void clearSnapshots() override
+            {
+                for (auto &runner : stage_runners_)
+                    runner->clearSnapshots();
+            }
+
+            const float *getSnapshot(const std::string &key, size_t &out_size) const override
+            {
+                // Search all stages for the snapshot key
+                for (const auto &runner : stage_runners_)
+                {
+                    const float *data = runner->getSnapshot(key, out_size);
+                    if (data)
+                        return data;
+                }
+                out_size = 0;
+                return nullptr;
+            }
+
+            std::vector<std::string> getSnapshotKeys() const override
+            {
+                std::vector<std::string> all_keys;
+                for (const auto &runner : stage_runners_)
+                {
+                    auto keys = runner->getSnapshotKeys();
+                    all_keys.insert(all_keys.end(), keys.begin(), keys.end());
+                }
+                return all_keys;
+            }
+
+            // ================================================================
+            // Hidden State API — delegate to first/last stage
+            // ================================================================
+
+            TensorBase *getHiddenState() override
+            {
+                return stage_runners_.back()->getHiddenState();
+            }
+
+            const TensorBase *getHiddenState() const override
+            {
+                return stage_runners_.back()->getHiddenState();
+            }
+
+            void setHiddenState(TensorBase *hidden_state) override
+            {
+                stage_runners_.front()->setHiddenState(hidden_state);
+            }
+
+            bool hasHiddenStateInput() const override
+            {
+                return stage_runners_.front()->hasHiddenStateInput();
+            }
+
+            void clearHiddenStateInput() override
+            {
+                for (auto &runner : stage_runners_)
+                    runner->clearHiddenStateInput();
+            }
+
+        private:
+            std::vector<std::unique_ptr<IInferenceRunner>> stage_runners_;
+            std::unique_ptr<ILocalPPContext> pp_ctx_;
+            int current_position_ = 0;
+        };
+
+        /**
+         * @brief Factory that creates a PP runner from a PP node
+         *
+         * For pure PP (all stages are single devices): creates a
+         * MultiDeviceOrchestrator(PP) from scratch (works correctly because
+         * MDO(PP) uses createPPStageRunner for each stage, handling partial
+         * weights properly).
+         *
+         * For hybrid PP+TP: uses LocalPPTestRunner to wrap the pre-compiled
+         * child runners. This avoids creating MDO(TP_PP) from scratch, which
+         * would fail because the MDO's internal initializePPDeviceRunners()
+         * creates stage-filtered model contexts that lack global weights
+         * needed by the nested TP MDO's createTestableInferenceRunner().
          */
         inline TreeToRunnerCompiler::LocalPPRunnerFactory makeLocalPPFactory()
         {
@@ -440,56 +654,113 @@ namespace llaminar2::test::parity::qwen2
                       std::vector<std::unique_ptr<IInferenceRunner>> child_runners,
                       const std::shared_ptr<IModelContext> &model_ctx) -> std::unique_ptr<IInferenceRunner>
             {
-                // Build PP stage configs from tree children
+                // Check if any stage is a TP domain
                 bool has_tp_stages = false;
-                MultiDeviceOrchestrator::Config mdo_config;
-                mdo_config.max_seq_len = 4096;
-                mdo_config.batch_size = 1;
-
                 for (const auto &child : node.children)
                 {
-                    // Tree uses inclusive last_layer, PPStageConfig uses exclusive
-                    MultiDeviceOrchestrator::PPStageConfig stage_cfg;
-                    stage_cfg.first_layer = child.first_layer;
-                    stage_cfg.last_layer = child.last_layer + 1;
-                    stage_cfg.has_embedding = child.has_embedding;
-                    stage_cfg.has_lm_head = child.has_lm_head;
-
-                    // Collect devices for this stage
-                    auto leaves = child.leafDevices();
-                    for (const auto *leaf : leaves)
-                    {
-                        stage_cfg.stage_devices.push_back(leaf->device);
-                    }
-
-                    // If child is a TP node, configure TP within this PP stage
                     if (child.type == ParallelismNodeType::TENSOR_PARALLEL)
                     {
                         has_tp_stages = true;
-                        stage_cfg.tp_backend = child.backend;
-                        float w = 1.0f / static_cast<float>(stage_cfg.stage_devices.size());
-                        for (size_t d = 0; d < stage_cfg.stage_devices.size(); ++d)
-                        {
-                            stage_cfg.tp_weights.push_back(
-                                child.tp_weights.empty() ? w : child.tp_weights[d]);
-                        }
+                        break;
+                    }
+                }
+
+                if (has_tp_stages)
+                {
+                    // =========================================================
+                    // Hybrid PP+TP: Use LocalPPTestRunner with pre-compiled
+                    // child runners. The tree compiler already created:
+                    //   - MDO(TP) for TP stages (from full model_ctx)
+                    //   - DGO for single-device stages (from createPPStageRunner)
+                    // We just need to sequence them with PP semantics.
+                    // =========================================================
+
+                    if (child_runners.size() != node.children.size())
+                    {
+                        LOG_ERROR("[TreeFactory] Hybrid PP+TP: expected " << node.children.size()
+                                                                          << " child runners, got " << child_runners.size());
+                        return nullptr;
                     }
 
-                    mdo_config.pp_stages.push_back(std::move(stage_cfg));
+                    // Build LocalPPConfig for activation transfers
+                    LocalPPConfig pp_config;
+                    pp_config.layer_boundaries.push_back(node.children[0].first_layer);
+
+                    for (const auto &child : node.children)
+                    {
+                        // Use first leaf device as representative for each stage
+                        auto leaves = child.leafDevices();
+                        if (leaves.empty())
+                        {
+                            LOG_ERROR("[TreeFactory] PP child has no leaf devices");
+                            return nullptr;
+                        }
+                        pp_config.stage_devices.push_back(leaves[0]->device);
+                        // Tree uses inclusive last_layer, boundaries are exclusive
+                        pp_config.layer_boundaries.push_back(child.last_layer + 1);
+                    }
+
+                    if (!pp_config.isValid())
+                    {
+                        LOG_ERROR("[TreeFactory] Invalid LocalPPConfig for hybrid PP+TP");
+                        return nullptr;
+                    }
+
+                    // Create PP context for inter-stage hidden state transfers
+                    std::unique_ptr<ILocalPPContext> pp_ctx;
+                    try
+                    {
+                        pp_ctx = createLocalPPContext(pp_config);
+                    }
+                    catch (const std::exception &e)
+                    {
+                        LOG_WARN("[TreeFactory] Failed to create LocalPPContext: " << e.what()
+                                                                                   << " — will attempt transfers without PP context");
+                    }
+
+                    return std::make_unique<LocalPPTestRunner>(
+                        std::move(child_runners), std::move(pp_ctx));
                 }
-
-                mdo_config.mode = has_tp_stages
-                                      ? MultiDeviceOrchestrator::ParallelismMode::TP_PP
-                                      : MultiDeviceOrchestrator::ParallelismMode::PP;
-
-                if (!mdo_config.validate())
+                else
                 {
-                    LOG_ERROR("[TreeFactory] Invalid PP config from tree");
-                    return nullptr;
-                }
+                    // =========================================================
+                    // Pure PP: Create MDO(PP) from scratch.
+                    // This works correctly because MDO(PP) uses
+                    // createPPStageRunner for each stage, which handles
+                    // partial weights properly.
+                    // =========================================================
+                    MultiDeviceOrchestrator::Config mdo_config;
+                    mdo_config.max_seq_len = 4096;
+                    mdo_config.batch_size = 1;
 
-                auto orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, mdo_config);
-                return orch;
+                    for (const auto &child : node.children)
+                    {
+                        MultiDeviceOrchestrator::PPStageConfig stage_cfg;
+                        stage_cfg.first_layer = child.first_layer;
+                        stage_cfg.last_layer = child.last_layer + 1;
+                        stage_cfg.has_embedding = child.has_embedding;
+                        stage_cfg.has_lm_head = child.has_lm_head;
+
+                        auto leaves = child.leafDevices();
+                        for (const auto *leaf : leaves)
+                        {
+                            stage_cfg.stage_devices.push_back(leaf->device);
+                        }
+
+                        mdo_config.pp_stages.push_back(std::move(stage_cfg));
+                    }
+
+                    mdo_config.mode = MultiDeviceOrchestrator::ParallelismMode::PP;
+
+                    if (!mdo_config.validate())
+                    {
+                        LOG_ERROR("[TreeFactory] Invalid PP config from tree");
+                        return nullptr;
+                    }
+
+                    auto orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, mdo_config);
+                    return orch;
+                }
             };
         }
 

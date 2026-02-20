@@ -336,7 +336,45 @@ namespace llaminar2
             activations->mark_device_dirty();
         }
 
-        // Use direct GPU-to-GPU transfer
+        // Cross-vendor GPU transfer (CUDA↔ROCm): use host bounce if tensor
+        // is not BAR-backed. PCIeBAR requires allocateInBarRegion(); normal
+        // device memory won't work for cross-vendor direct copies.
+        const bool is_cross_vendor =
+            (src_device.is_cuda() && dst_device.is_rocm()) ||
+            (src_device.is_rocm() && dst_device.is_cuda());
+
+        if (is_cross_vendor && !activations->isBARBacked())
+        {
+            // GPU → host: use ensureOnHost() for proper D2H coherence sync.
+            // NOTE: Do NOT use data() here — for quantized tensors (Q4_0, Q8_0, etc.),
+            // data() returns a dequantized float view without touching coherence flags,
+            // leaving host_valid_ = false and causing a COHERENCE ERROR downstream.
+            if (!activations->ensureOnHost())
+            {
+                LOG_ERROR("LocalPPContext::transfer: Failed to sync to host from "
+                          << src_device.toString() << " for cross-vendor bounce");
+                return false;
+            }
+
+            // Invalidate old GPU data — host is now authoritative
+            activations->invalidateGpuData();
+
+            // Host → destination GPU
+            if (!activations->ensureOnDevice(dst_device))
+            {
+                LOG_ERROR("LocalPPContext::transfer: Failed to upload to "
+                          << dst_device.toString() << " after cross-vendor host bounce");
+                return false;
+            }
+            activations->mark_device_dirty();
+
+            LOG_DEBUG("LocalPPContext::transfer: Cross-vendor host bounce "
+                      << src_device.toString() << " → CPU → " << dst_device.toString()
+                      << " (" << activations->numel() << " elements)");
+            return true;
+        }
+
+        // Same-vendor GPU-to-GPU or BAR-backed cross-vendor: direct transfer
         if (!activations->transferTo(dst_device))
         {
             LOG_ERROR("LocalPPContext::transfer: transferTo() failed "
@@ -1333,7 +1371,48 @@ namespace llaminar2
             activations->mark_device_dirty();
         }
 
-        // Use TensorBase::transferTo() which uses GlobalBackendRouter
+        // Cross-vendor GPU transfer (CUDA↔ROCm): use host bounce if tensor
+        // is not BAR-backed. PCIeBAR requires allocateInBarRegion(); normal
+        // device memory won't work for cross-vendor direct copies.
+        const bool is_cross_vendor =
+            (src_device.is_cuda() && dst_device.is_rocm()) ||
+            (src_device.is_rocm() && dst_device.is_cuda());
+
+        if (is_cross_vendor && !activations->isBARBacked())
+        {
+            // GPU → host (data() triggers D2H sync for device-dirty tensors)
+            const void *host_ptr = activations->data();
+            if (!host_ptr)
+            {
+                LOG_ERROR("HierarchicalPPContext::transferSingleToSingle: "
+                          "Failed to sync to host from "
+                          << src_device.toString()
+                          << " for cross-vendor bounce");
+                return false;
+            }
+
+            // Invalidate old GPU data — host is now authoritative
+            activations->invalidateGpuData();
+
+            // Host → destination GPU
+            if (!activations->ensureOnDevice(dst_device))
+            {
+                LOG_ERROR("HierarchicalPPContext::transferSingleToSingle: "
+                          "Failed to upload to "
+                          << dst_device.toString()
+                          << " after cross-vendor host bounce");
+                return false;
+            }
+            activations->mark_device_dirty();
+
+            LOG_DEBUG("HierarchicalPPContext::transferSingleToSingle: "
+                      "Cross-vendor host bounce "
+                      << src_device.toString() << " → CPU → " << dst_device.toString()
+                      << " (" << activations->numel() << " elements)");
+            return true;
+        }
+
+        // Same-vendor GPU-to-GPU or BAR-backed cross-vendor: use direct transfer
         if (!activations->transferTo(dst_device))
         {
             LOG_ERROR("HierarchicalPPContext::transferSingleToSingle: transferTo() failed "

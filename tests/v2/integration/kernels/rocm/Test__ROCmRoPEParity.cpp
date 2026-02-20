@@ -289,16 +289,15 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_Small)
     rocm_kernel.bindWorkspace(&workspace);
 
     float *d_q, *d_k;
-    int *d_pos_ids;
     hipMalloc(&d_q, total * sizeof(float));
     hipMalloc(&d_k, total_k * sizeof(float));
-    hipMalloc(&d_pos_ids, seq_len * sizeof(int));
 
     hipMemcpy(d_q, rocm_q.data(), total * sizeof(float), hipMemcpyHostToDevice);
     hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_pos_ids, position_ids.data(), seq_len * sizeof(int), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, d_pos_ids, seq_len, n_heads, n_kv_heads,
+    // position_ids must be a HOST pointer - apply_typed handles H2D copy internally
+    // via the workspace POSITION_IDS buffer
+    ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_kv_heads,
                                         head_dim, rope_theta, 0));
     hipDeviceSynchronize();
 
@@ -307,7 +306,6 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_Small)
 
     hipFree(d_q);
     hipFree(d_k);
-    hipFree(d_pos_ids);
 
     // Validate Q
     ASSERT_FALSE(hasNaNOrInf(rocm_q.data(), total)) << "ROCm Q output contains NaN/Inf";
@@ -363,16 +361,15 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_Large)
     rocm_kernel.bindWorkspace(&workspace);
 
     float *d_q, *d_k;
-    int *d_pos_ids;
     hipMalloc(&d_q, total_q * sizeof(float));
     hipMalloc(&d_k, total_k * sizeof(float));
-    hipMalloc(&d_pos_ids, seq_len * sizeof(int));
 
     hipMemcpy(d_q, rocm_q.data(), total_q * sizeof(float), hipMemcpyHostToDevice);
     hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_pos_ids, position_ids.data(), seq_len * sizeof(int), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, d_pos_ids, seq_len, n_heads, n_kv_heads,
+    // position_ids must be a HOST pointer - apply_typed handles H2D copy internally
+    // via the workspace POSITION_IDS buffer
+    ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_kv_heads,
                                         head_dim, rope_theta, 0));
     hipDeviceSynchronize();
 
@@ -381,7 +378,6 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_Large)
 
     hipFree(d_q);
     hipFree(d_k);
-    hipFree(d_pos_ids);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_q.data(), total_q)) << "ROCm Q output contains NaN/Inf";
     double cosine_q = cosineSimilarity(rocm_q.data(), cpu_q.data(), total_q);
@@ -446,16 +442,15 @@ TEST_F(Test__ROCmRoPEParity, RoPE_BF16_Small)
     rocm_kernel.bindWorkspace(&workspace);
 
     uint16_t *d_q, *d_k;
-    int *d_pos_ids;
     hipMalloc(&d_q, total * sizeof(uint16_t));
     hipMalloc(&d_k, total_k * sizeof(uint16_t));
-    hipMalloc(&d_pos_ids, seq_len * sizeof(int));
 
     hipMemcpy(d_q, rocm_q.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
     hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(uint16_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_pos_ids, position_ids.data(), seq_len * sizeof(int), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, d_pos_ids, seq_len, n_heads, n_kv_heads,
+    // position_ids must be a HOST pointer - apply_typed handles H2D copy internally
+    // via the workspace POSITION_IDS buffer
+    ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_kv_heads,
                                         head_dim, rope_theta, 0));
     hipDeviceSynchronize();
 
@@ -464,7 +459,6 @@ TEST_F(Test__ROCmRoPEParity, RoPE_BF16_Small)
 
     hipFree(d_q);
     hipFree(d_k);
-    hipFree(d_pos_ids);
 
     // Dequantize for comparison
     std::vector<float> cpu_q_fp32(total), rocm_q_fp32(total);
@@ -531,16 +525,15 @@ TEST_F(Test__ROCmRoPEParity, RoPE_BF16_Large)
     rocm_kernel.bindWorkspace(&workspace);
 
     uint16_t *d_q, *d_k;
-    int *d_pos_ids;
     hipMalloc(&d_q, total_q * sizeof(uint16_t));
     hipMalloc(&d_k, total_k * sizeof(uint16_t));
-    hipMalloc(&d_pos_ids, seq_len * sizeof(int));
 
     hipMemcpy(d_q, rocm_q.data(), total_q * sizeof(uint16_t), hipMemcpyHostToDevice);
     hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(uint16_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_pos_ids, position_ids.data(), seq_len * sizeof(int), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, d_pos_ids, seq_len, n_heads, n_kv_heads,
+    // position_ids must be a HOST pointer - apply_typed handles H2D copy internally
+    // via the workspace POSITION_IDS buffer
+    ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_kv_heads,
                                         head_dim, rope_theta, 0));
     hipDeviceSynchronize();
 
@@ -549,7 +542,6 @@ TEST_F(Test__ROCmRoPEParity, RoPE_BF16_Large)
 
     hipFree(d_q);
     hipFree(d_k);
-    hipFree(d_pos_ids);
 
     std::vector<float> cpu_q_fp32(total_q), rocm_q_fp32(total_q);
     std::vector<float> cpu_k_fp32(total_k), rocm_k_fp32(total_k);
@@ -618,16 +610,15 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP16_Small)
     rocm_kernel.bindWorkspace(&workspace);
 
     uint16_t *d_q, *d_k;
-    int *d_pos_ids;
     hipMalloc(&d_q, total * sizeof(uint16_t));
     hipMalloc(&d_k, total_k * sizeof(uint16_t));
-    hipMalloc(&d_pos_ids, seq_len * sizeof(int));
 
     hipMemcpy(d_q, rocm_q.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
     hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(uint16_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_pos_ids, position_ids.data(), seq_len * sizeof(int), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, d_pos_ids, seq_len, n_heads, n_kv_heads,
+    // position_ids must be a HOST pointer - apply_typed handles H2D copy internally
+    // via the workspace POSITION_IDS buffer
+    ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_kv_heads,
                                         head_dim, rope_theta, 0));
     hipDeviceSynchronize();
 
@@ -636,7 +627,6 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP16_Small)
 
     hipFree(d_q);
     hipFree(d_k);
-    hipFree(d_pos_ids);
 
     std::vector<float> cpu_q_fp32(total), rocm_q_fp32(total);
     std::vector<float> cpu_k_fp32(total_k), rocm_k_fp32(total_k);
@@ -701,16 +691,15 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP16_Large)
     rocm_kernel.bindWorkspace(&workspace);
 
     uint16_t *d_q, *d_k;
-    int *d_pos_ids;
     hipMalloc(&d_q, total_q * sizeof(uint16_t));
     hipMalloc(&d_k, total_k * sizeof(uint16_t));
-    hipMalloc(&d_pos_ids, seq_len * sizeof(int));
 
     hipMemcpy(d_q, rocm_q.data(), total_q * sizeof(uint16_t), hipMemcpyHostToDevice);
     hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(uint16_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_pos_ids, position_ids.data(), seq_len * sizeof(int), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, d_pos_ids, seq_len, n_heads, n_kv_heads,
+    // position_ids must be a HOST pointer - apply_typed handles H2D copy internally
+    // via the workspace POSITION_IDS buffer
+    ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_kv_heads,
                                         head_dim, rope_theta, 0));
     hipDeviceSynchronize();
 
@@ -719,7 +708,6 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP16_Large)
 
     hipFree(d_q);
     hipFree(d_k);
-    hipFree(d_pos_ids);
 
     std::vector<float> cpu_q_fp32(total_q), rocm_q_fp32(total_q);
     std::vector<float> cpu_k_fp32(total_k), rocm_k_fp32(total_k);

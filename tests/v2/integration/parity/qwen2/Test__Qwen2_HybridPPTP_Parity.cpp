@@ -112,17 +112,22 @@ public:
 
 TEST_P(Qwen2HybridPPTPParityTest, PrefillParity)
 {
-    // Hybrid PP+TP: setup PP pipeline with nested TP domains, use TP parity comparison
+    // Hybrid PP+TP: pipeline uses LocalPPTestRunner wrapping pre-compiled
+    // TP MDO + single-device DGO. Use non-TP parity comparison since the
+    // outer runner is not a MultiDeviceOrchestrator (TP-specific snapshot
+    // access requires MDO cast). The combined output is still compared
+    // against PyTorch reference for correctness.
     ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    auto summary = runTPPrefillParity();
-    assertTPParity(summary);
+    auto summary = runPrefillParity();
+    assertParity(summary);
 }
 
 TEST_P(Qwen2HybridPPTPParityTest, DecodeParity)
 {
-    // Hybrid PP+TP: setup PP pipeline with nested TP domains, use TP decode parity comparison
+    // Hybrid PP+TP: use non-TP decode parity comparison for the same reason
+    // as PrefillParity — the outer runner is a LocalPPTestRunner, not MDO.
     ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    auto summary = runTPDecodeParity();
+    auto summary = runDecodeParity();
     assertDecodeParity(summary);
 }
 

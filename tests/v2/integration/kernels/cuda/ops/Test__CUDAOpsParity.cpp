@@ -722,16 +722,15 @@ TEST_F(Test__CUDAOpsParity, RoPE_FP32_Small)
     cuda_kernel.bindWorkspace(&workspace);
 
     float *d_q, *d_k;
-    int *d_pos_ids;
     cudaMalloc(&d_q, total * sizeof(float));
     cudaMalloc(&d_k, total * sizeof(float));
-    cudaMalloc(&d_pos_ids, seq_len * sizeof(int));
 
     cudaMemcpy(d_q, cuda_q.data(), total * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_k, cuda_k.data(), total * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_pos_ids, position_ids.data(), seq_len * sizeof(int), cudaMemcpyHostToDevice);
 
-    ASSERT_TRUE(cuda_kernel.apply_typed(d_q, d_k, d_pos_ids, seq_len, n_heads, n_heads,
+    // position_ids must be a HOST pointer - apply_typed handles H2D copy internally
+    // via the workspace POSITION_IDS buffer
+    ASSERT_TRUE(cuda_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_heads,
                                         head_dim, rope_theta, 0));
     cudaDeviceSynchronize();
 
@@ -740,7 +739,6 @@ TEST_F(Test__CUDAOpsParity, RoPE_FP32_Small)
 
     cudaFree(d_q);
     cudaFree(d_k);
-    cudaFree(d_pos_ids);
 
     // Validate Q
     ASSERT_FALSE(hasNaNOrInf(cuda_q.data(), total)) << "CUDA Q output contains NaN/Inf";
@@ -802,16 +800,15 @@ TEST_F(Test__CUDAOpsParity, RoPE_FP32_Large)
     cuda_kernel.bindWorkspace(&workspace);
 
     float *d_q, *d_k;
-    int *d_pos_ids;
     cudaMalloc(&d_q, q_total * sizeof(float));
     cudaMalloc(&d_k, k_total * sizeof(float));
-    cudaMalloc(&d_pos_ids, seq_len * sizeof(int));
 
     cudaMemcpy(d_q, cuda_q.data(), q_total * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_k, cuda_k.data(), k_total * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_pos_ids, position_ids.data(), seq_len * sizeof(int), cudaMemcpyHostToDevice);
 
-    ASSERT_TRUE(cuda_kernel.apply_typed(d_q, d_k, d_pos_ids, seq_len, n_heads, n_kv_heads,
+    // position_ids must be a HOST pointer - apply_typed handles H2D copy internally
+    // via the workspace POSITION_IDS buffer
+    ASSERT_TRUE(cuda_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_kv_heads,
                                         head_dim, rope_theta, 0));
     cudaDeviceSynchronize();
 
@@ -820,7 +817,6 @@ TEST_F(Test__CUDAOpsParity, RoPE_FP32_Large)
 
     cudaFree(d_q);
     cudaFree(d_k);
-    cudaFree(d_pos_ids);
 
     ASSERT_FALSE(hasNaNOrInf(cuda_q.data(), q_total));
     ASSERT_FALSE(hasNaNOrInf(cuda_k.data(), k_total));

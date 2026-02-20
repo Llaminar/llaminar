@@ -37,6 +37,7 @@
 #include "kernels/cpu/CPURingKVCache.h"
 #endif
 
+#include <algorithm>
 #include <vector>
 #include <cmath>
 #include <random>
@@ -221,10 +222,16 @@ protected:
         int batch_size, int n_heads, int head_dim)
     {
         auto reqs = kernel.getWorkspaceRequirements(batch_size, n_heads, head_dim);
-        workspace_ = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
+
+        // Compute actual budget from requirements (with alignment padding) + 1MB margin
+        const size_t required_bytes = reqs.total_bytes_with_alignment();
+        const size_t budget = std::max(required_bytes + 1024 * 1024, static_cast<size_t>(16 * 1024 * 1024));
+        workspace_ = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), budget);
         if (!workspace_->allocate(reqs))
         {
-            LOG_ERROR("Failed to allocate workspace for FlashDecode");
+            LOG_ERROR("Failed to allocate workspace for FlashDecode (required="
+                      << (required_bytes / (1024 * 1024)) << "MB, budget="
+                      << (budget / (1024 * 1024)) << "MB)");
             return false;
         }
         kernel.bindWorkspace(workspace_.get());

@@ -48,7 +48,7 @@ extern "C"
         int8_t *d_A_int8,
         float *d_scales_A,
         int M, int K,
-        int rocm_device_id);
+        int rocm_device_id, void *stream);
 
     // Work buffer management
     bool rocmQuantGemm_ensureWorkBuffers(
@@ -98,7 +98,7 @@ extern "C"
         float alpha, float beta,
         const float *d_C_existing, // For beta != 0 (nullable)
         const float *d_bias,       // [N] optional bias (nullable)
-        int rocm_device_id);
+        int rocm_device_id, void *stream);
 }
 #endif
 
@@ -544,7 +544,7 @@ namespace llaminar2
 
                 // Upload and quantize
                 ASSERT_TRUE(rocmQuantGemm_copyHostToDevice(d_activations, h_activations.data(), M * K, 0));
-                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(d_activations, d_A_int8, d_scales_A, M, K, 0));
+                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(d_activations, d_A_int8, d_scales_A, M, K, 0, nullptr));
 
                 // Download results
                 std::vector<int8_t> h_A_int8(M * K);
@@ -808,7 +808,7 @@ namespace llaminar2
 
                 // Upload and quantize
                 ASSERT_TRUE(rocmQuantGemm_copyHostToDevice(d_activations, h_activations.data(), M * K, 0));
-                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(d_activations, d_A_int8, d_scales_A, M, K, 0));
+                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(d_activations, d_A_int8, d_scales_A, M, K, 0, nullptr));
 
                 // Download results
                 std::vector<int8_t> h_A_int8(M * K);
@@ -873,7 +873,7 @@ namespace llaminar2
                     M, K, N, 0));
 
                 ASSERT_TRUE(rocmQuantGemm_copyHostToDevice(d_activations, h_activations.data(), M * K, 0));
-                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(d_activations, d_A_int8, d_scales_A, M, K, 0));
+                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(d_activations, d_A_int8, d_scales_A, M, K, 0, nullptr));
 
                 // Download scales
                 std::vector<float> h_scales_A(M);
@@ -925,7 +925,7 @@ namespace llaminar2
                     M, K, N, 0));
 
                 ASSERT_TRUE(rocmQuantGemm_copyHostToDevice(d_activations, h_activations.data(), M * K, 0));
-                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(d_activations, d_A_int8, d_scales_A, M, K, 0));
+                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(d_activations, d_A_int8, d_scales_A, M, K, 0, nullptr));
 
                 // Download results
                 std::vector<int8_t> h_A_int8(M * K);
@@ -1483,7 +1483,7 @@ namespace llaminar2
 
                 // Step 5: Quantize activations on device
                 ASSERT_TRUE(rocmQuantGemm_quantizeActivations(
-                    d_activations, d_A_int8, d_scales_A, M, K, 0));
+                    d_activations, d_A_int8, d_scales_A, M, K, 0, nullptr));
 
                 // Step 6: Verify quantized activations
                 std::vector<int8_t> h_A_int8(M * K);
@@ -1594,7 +1594,7 @@ namespace llaminar2
                         &d_A_int8, &d_scales_A, &d_C_int32, &work_buffer_M,
                         tc.M, tc.K, tc.N, 0));
                     ASSERT_TRUE(rocmQuantGemm_quantizeActivations(
-                        d_activations, d_A_int8, d_scales_A, tc.M, tc.K, 0))
+                        d_activations, d_A_int8, d_scales_A, tc.M, tc.K, 0, nullptr))
                         << "Failed to quantize activations for " << tc.name;
 
                     // Cleanup
@@ -1648,7 +1648,7 @@ namespace llaminar2
                     EXPECT_GE(work_buffer_M, M) << "Work buffer too small for M=" << M;
 
                     ASSERT_TRUE(rocmQuantGemm_quantizeActivations(
-                        d_activations, d_A_int8, d_scales_A, M, K, 0))
+                        d_activations, d_A_int8, d_scales_A, M, K, 0, nullptr))
                         << "Failed to quantize for M=" << M;
 
                     rocmQuantGemm_freeDevice(d_activations, 0);
@@ -1718,12 +1718,12 @@ namespace llaminar2
                 // Apply scaling without bias
                 ASSERT_TRUE(rocmQuantGemm_applyScaling(
                     d_C_int32, d_C_fp32_no_bias, d_scales_A, d_scales_B,
-                    M, N, 1.0f, 0.0f, nullptr, nullptr, 0));
+                    M, N, 1.0f, 0.0f, nullptr, nullptr, 0, nullptr));
 
                 // Apply scaling with bias
                 ASSERT_TRUE(rocmQuantGemm_applyScaling(
                     d_C_int32, d_C_fp32_with_bias, d_scales_A, d_scales_B,
-                    M, N, 1.0f, 0.0f, nullptr, d_bias, 0));
+                    M, N, 1.0f, 0.0f, nullptr, d_bias, 0, nullptr));
 
                 // Download results
                 std::vector<float> h_C_fp32_no_bias(M * N);
@@ -1794,7 +1794,7 @@ namespace llaminar2
 
                 ASSERT_TRUE(rocmQuantGemm_applyScaling(
                     d_C_int32, d_C_fp32, d_scales_A, d_scales_B,
-                    M, N, alpha, 0.0f, nullptr, nullptr, 0));
+                    M, N, alpha, 0.0f, nullptr, nullptr, 0, nullptr));
 
                 std::vector<float> h_C_fp32(M * N);
                 hipMemcpy(h_C_fp32.data(), d_C_fp32, M * N * sizeof(float), hipMemcpyDeviceToHost);

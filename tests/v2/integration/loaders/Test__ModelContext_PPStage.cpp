@@ -13,9 +13,9 @@
  * - Multi-stage PP (3+ stages) divides layers correctly
  * - Explicit config (custom layer ranges) works correctly
  *
- * NOTE: The API uses INCLUSIVE last_layer in ModelContextConfig, but WeightManager
- * uses EXCLUSIVE internally. This mismatch is a known issue (see ModelContext.cpp
- * line 207). Tests verify the ACTUAL behavior to catch any regressions.
+ * NOTE: ModelContextConfig uses INCLUSIVE last_layer. ModelContext::create()
+ * converts to exclusive via `last_layer + 1` before passing to WeightManager.
+ * The conversion is correct: config.last_layer=11 → setLayerRange(0, 12) → layers 0-11 loaded.
  */
 
 #include <gtest/gtest.h>
@@ -48,13 +48,12 @@ TEST_F(Test__ModelContext_PPStage, FirstStage_LoadsEmbedding_NotLmHead)
     // Create config for first PP stage (2 stages total)
     // Qwen2.5-0.5b has 24 layers, so stage 0 gets layers 0-11 (inclusive)
     // forPPStage calculates: first=0, last=11 (inclusive)
-    // But WeightManager uses exclusive last_layer, so layers 0-10 are loaded
-    // This is a known API mismatch - test verifies actual behavior
+    // ModelContext::create converts to exclusive: setLayerRange(0, 12) → layers 0-11 loaded
     auto config = ModelContextConfig::forPPStage(0, 2, 24);
 
     // Verify the config values
     EXPECT_EQ(config.first_layer, 0);
-    EXPECT_EQ(config.last_layer, 11);  // Inclusive in config
+    EXPECT_EQ(config.last_layer, 11); // Inclusive in config
     EXPECT_TRUE(config.has_embedding);
     EXPECT_FALSE(config.has_lm_head);
 
@@ -80,14 +79,13 @@ TEST_F(Test__ModelContext_PPStage, FirstStage_LoadsEmbedding_NotLmHead)
     auto layer0_q = weight_mgr->getWeightForDevice("blk.0.attn_q.weight");
     EXPECT_NE(layer0_q, nullptr) << "Stage 0 should have layer 0";
 
-    // Layer 10 (second to last in actual loaded range) should be available
+    // Layer 10 should be available
     auto layer10_q = weight_mgr->getWeightForDevice("blk.10.attn_q.weight");
     EXPECT_NE(layer10_q, nullptr) << "Stage 0 should have layer 10";
 
-    // Layer 11 should NOT be available (due to exclusive interpretation)
-    // NOTE: This is the actual behavior - last_layer is exclusive in WeightManager
+    // Layer 11 should be available (last_layer=11 is inclusive)
     auto layer11_q = weight_mgr->getWeightForDevice("blk.11.attn_q.weight");
-    EXPECT_EQ(layer11_q, nullptr) << "Stage 0 should NOT have layer 11 (exclusive boundary)";
+    EXPECT_NE(layer11_q, nullptr) << "Stage 0 should have layer 11 (inclusive boundary)";
 
     // Layer 12 should NOT be available (outside range)
     auto layer12_q = weight_mgr->getWeightForDevice("blk.12.attn_q.weight");
@@ -99,12 +97,12 @@ TEST_F(Test__ModelContext_PPStage, LastStage_LoadsLmHead_NotEmbedding)
 {
     // Create config for last PP stage (2 stages total)
     // Stage 1 gets layers 12-23 (inclusive in config)
-    // Due to exclusive interpretation in WeightManager: layers 12-22 loaded
+    // ModelContext::create converts to exclusive: setLayerRange(12, 24) → layers 12-23 loaded
     auto config = ModelContextConfig::forPPStage(1, 2, 24);
 
     // Verify the config values
     EXPECT_EQ(config.first_layer, 12);
-    EXPECT_EQ(config.last_layer, 23);  // Inclusive in config
+    EXPECT_EQ(config.last_layer, 23); // Inclusive in config
     EXPECT_FALSE(config.has_embedding);
     EXPECT_TRUE(config.has_lm_head);
 
@@ -128,13 +126,13 @@ TEST_F(Test__ModelContext_PPStage, LastStage_LoadsLmHead_NotEmbedding)
     auto layer12_q = weight_mgr->getWeightForDevice("blk.12.attn_q.weight");
     EXPECT_NE(layer12_q, nullptr) << "Stage 1 should have layer 12";
 
-    // Layer 22 (second to last in actual loaded range) should be available
+    // Layer 22 should be available
     auto layer22_q = weight_mgr->getWeightForDevice("blk.22.attn_q.weight");
     EXPECT_NE(layer22_q, nullptr) << "Stage 1 should have layer 22";
 
-    // Layer 23 should NOT be available (due to exclusive interpretation)
+    // Layer 23 should be available (last_layer=23 is inclusive)
     auto layer23_q = weight_mgr->getWeightForDevice("blk.23.attn_q.weight");
-    EXPECT_EQ(layer23_q, nullptr) << "Stage 1 should NOT have layer 23 (exclusive boundary)";
+    EXPECT_NE(layer23_q, nullptr) << "Stage 1 should have layer 23 (inclusive boundary)";
 
     // Layer 11 should NOT be available
     auto layer11_q = weight_mgr->getWeightForDevice("blk.11.attn_q.weight");
@@ -169,9 +167,9 @@ TEST_F(Test__ModelContext_PPStage, FullModel_LoadsEverything)
 TEST_F(Test__ModelContext_PPStage, ThreeStages_DividesCorrectly)
 {
     // 24 layers / 3 stages = 8 layers each
-    // Due to exclusive interpretation, each stage loads (layers_per_stage - 1) layers
+    // Each stage loads all assigned layers (inclusive boundary)
 
-    // Stage 0: layers 0-7 (inclusive), actual: 0-6 (exclusive)
+    // Stage 0: layers 0-7 (inclusive)
     auto config0 = ModelContextConfig::forPPStage(0, 3, 24);
     EXPECT_EQ(config0.first_layer, 0);
     EXPECT_EQ(config0.last_layer, 7);
@@ -184,10 +182,10 @@ TEST_F(Test__ModelContext_PPStage, ThreeStages_DividesCorrectly)
     EXPECT_EQ(wm0->getWeightForDevice("output.weight"), nullptr) << "Stage 0 no lm_head";
     EXPECT_NE(wm0->getWeightForDevice("blk.0.attn_q.weight"), nullptr);
     EXPECT_NE(wm0->getWeightForDevice("blk.6.attn_q.weight"), nullptr);
-    EXPECT_EQ(wm0->getWeightForDevice("blk.7.attn_q.weight"), nullptr) << "Exclusive boundary";
+    EXPECT_NE(wm0->getWeightForDevice("blk.7.attn_q.weight"), nullptr) << "Inclusive boundary";
     EXPECT_EQ(wm0->getWeightForDevice("blk.8.attn_q.weight"), nullptr);
 
-    // Stage 1: layers 8-15 (inclusive), actual: 8-14 (exclusive)
+    // Stage 1: layers 8-15 (inclusive)
     auto config1 = ModelContextConfig::forPPStage(1, 3, 24);
     EXPECT_EQ(config1.first_layer, 8);
     EXPECT_EQ(config1.last_layer, 15);
@@ -201,10 +199,10 @@ TEST_F(Test__ModelContext_PPStage, ThreeStages_DividesCorrectly)
     EXPECT_EQ(wm1->getWeightForDevice("blk.7.attn_q.weight"), nullptr);
     EXPECT_NE(wm1->getWeightForDevice("blk.8.attn_q.weight"), nullptr);
     EXPECT_NE(wm1->getWeightForDevice("blk.14.attn_q.weight"), nullptr);
-    EXPECT_EQ(wm1->getWeightForDevice("blk.15.attn_q.weight"), nullptr) << "Exclusive boundary";
+    EXPECT_NE(wm1->getWeightForDevice("blk.15.attn_q.weight"), nullptr) << "Inclusive boundary";
     EXPECT_EQ(wm1->getWeightForDevice("blk.16.attn_q.weight"), nullptr);
 
-    // Stage 2: layers 16-23 (inclusive), actual: 16-22 (exclusive)
+    // Stage 2: layers 16-23 (inclusive)
     auto config2 = ModelContextConfig::forPPStage(2, 3, 24);
     EXPECT_EQ(config2.first_layer, 16);
     EXPECT_EQ(config2.last_layer, 23);
@@ -218,7 +216,7 @@ TEST_F(Test__ModelContext_PPStage, ThreeStages_DividesCorrectly)
     EXPECT_EQ(wm2->getWeightForDevice("blk.15.attn_q.weight"), nullptr);
     EXPECT_NE(wm2->getWeightForDevice("blk.16.attn_q.weight"), nullptr);
     EXPECT_NE(wm2->getWeightForDevice("blk.22.attn_q.weight"), nullptr);
-    EXPECT_EQ(wm2->getWeightForDevice("blk.23.attn_q.weight"), nullptr) << "Exclusive boundary";
+    EXPECT_NE(wm2->getWeightForDevice("blk.23.attn_q.weight"), nullptr) << "Inclusive boundary";
 }
 
 // Test 5: Explicit config (not using forPPStage helper)
@@ -240,11 +238,11 @@ TEST_F(Test__ModelContext_PPStage, ExplicitConfig_WorksCorrectly)
     EXPECT_EQ(wm->getWeightForDevice("token_embd.weight"), nullptr);
     EXPECT_EQ(wm->getWeightForDevice("output.weight"), nullptr);
 
-    // Only layers 5-9 (exclusive boundary at 10)
+    // Layers 5-10 (inclusive boundary)
     EXPECT_EQ(wm->getWeightForDevice("blk.4.attn_q.weight"), nullptr);
     EXPECT_NE(wm->getWeightForDevice("blk.5.attn_q.weight"), nullptr);
     EXPECT_NE(wm->getWeightForDevice("blk.9.attn_q.weight"), nullptr);
-    EXPECT_EQ(wm->getWeightForDevice("blk.10.attn_q.weight"), nullptr) << "Exclusive boundary";
+    EXPECT_NE(wm->getWeightForDevice("blk.10.attn_q.weight"), nullptr) << "Inclusive boundary";
     EXPECT_EQ(wm->getWeightForDevice("blk.11.attn_q.weight"), nullptr);
 }
 
@@ -321,38 +319,32 @@ TEST_F(Test__ModelContext_PPStage, PPStage_ReducesLoadedWeightCount)
     }
 
     EXPECT_EQ(full_layer_count, 24) << "Full model should have all 24 layers";
-    // Due to exclusive boundary interpretation, stage 0 gets 11 layers (0-10) instead of 12
-    EXPECT_EQ(stage0_layer_count, 11) << "Stage 0 should have 11 layers (exclusive boundary)";
+    // Stage 0 gets 12 layers (0-11 inclusive)
+    EXPECT_EQ(stage0_layer_count, 12) << "Stage 0 should have 12 layers (inclusive boundary)";
     EXPECT_LT(stage0_layer_count, full_layer_count) << "PP stage should load fewer layers";
 }
 
-// Test 10: Documents the inclusive/exclusive API mismatch (known issue)
-// This test will FAIL if the mismatch is fixed, alerting us to update tests
-TEST_F(Test__ModelContext_PPStage, DocumentsInclusiveExclusiveMismatch)
+// Test 10: Verifies inclusive last_layer semantics work correctly
+// ModelContextConfig.last_layer is inclusive; ModelContext::create() converts to
+// exclusive via +1 before passing to WeightManager::setLayerRange().
+TEST_F(Test__ModelContext_PPStage, InclusiveLastLayerSemanticsAreCorrect)
 {
-    // ModelContextConfig documents last_layer as INCLUSIVE
-    // WeightManager interprets it as EXCLUSIVE
-    // This test documents the current behavior
-    
     auto config = ModelContextConfig::forPPStage(0, 2, 24);
-    
+
     // forPPStage sets last_layer = 11 (meaning layers 0-11 inclusive, 12 layers)
     EXPECT_EQ(config.last_layer, 11) << "Config says last_layer=11 (inclusive)";
-    
+
     auto ctx = ModelContext::create(TEST_MODEL_PATH, config);
     ASSERT_NE(ctx, nullptr);
     auto wm = ctx->concreteWeightManager();
-    
-    // But WeightManager treats it as exclusive, so layer 11 is NOT loaded
-    // This is the CURRENT (potentially buggy) behavior
+
+    // ModelContext::create converts inclusive→exclusive: setLayerRange(0, 12)
+    // So layers 0-11 are all loaded correctly
     auto layer10 = wm->getWeightForDevice("blk.10.attn_q.weight");
     auto layer11 = wm->getWeightForDevice("blk.11.attn_q.weight");
-    
+    auto layer12 = wm->getWeightForDevice("blk.12.attn_q.weight");
+
     EXPECT_NE(layer10, nullptr) << "Layer 10 should be loaded";
-    
-    // IMPORTANT: If this expectation fails, the mismatch has been fixed!
-    // Update all PP stage tests to use inclusive semantics when that happens.
-    EXPECT_EQ(layer11, nullptr) 
-        << "KNOWN ISSUE: layer 11 not loaded due to exclusive interpretation. "
-        << "If this fails, the API mismatch may have been fixed - update tests!";
+    EXPECT_NE(layer11, nullptr) << "Layer 11 should be loaded (inclusive boundary)";
+    EXPECT_EQ(layer12, nullptr) << "Layer 12 should NOT be loaded (outside range)";
 }
