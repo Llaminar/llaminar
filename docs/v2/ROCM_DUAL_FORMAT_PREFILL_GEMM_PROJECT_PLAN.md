@@ -21,6 +21,163 @@ That fallback is safe, but it does not complete the intended dual-format story f
 4. Keep deterministic, low-risk fallback to CK path for unsupported shapes.
 5. Roll out behind feature flags with tight correctness and performance gates.
 
+## Explicit Optimization Goals (Current Priority)
+These goals define the current tuning phase and should drive all Phase-4 decisions:
+
+1. **Find optimal strategy by shape type / aspect ratio (not single fixed dimensions).**
+    - Target inference shape families: `Attention`, `FFN_Up`, `FFN_Down`, `FFN_Gate`, `LM_HEAD`.
+    - Optimize for ratio classes first, then validate representative concrete sizes.
+
+2. **Tune kernels in playground to approach or beat CK.**
+    - Use CK as performance reference and guardrail while iterating custom HIP strategies.
+    - Keep only variants that show repeatable wins or acceptable tradeoffs.
+
+3. **Implement ratio-aware dispatch in HIP prefill entrypoint.**
+    - Add a dispatcher pattern in the ratio-VNNI prefill HIP path that detects shape type/aspect ratio and routes to the corresponding tuned strategy kernel.
+    - Keep explicit CK fallback for unsupported/unsafe cases.
+
+## Current Focus: VNNI-Native LM_HEAD Designs (Feb 2026)
+
+We are explicitly prioritizing **VNNI-native** prefill kernels that leverage our existing `B_vnni[K/4, N, 4]` layout, rather than forcing CK-like movement patterns.
+
+### Design 1 (Start Here): `MR4_CPT8_VNNI_Stream`
+- Intent: evolve current strong `mr4` path (best custom baseline so far) with wider N-side vectorization.
+- Tile sketch:
+   - `M_TILE=32` via `BY=8, MR=4`
+   - `N_TILE=512` via `64 lanes * CPT=8`
+   - `K_STEP=4` (native VNNI pack)
+- Vectorization requirements:
+   - Vectorized B global loads (paired `int4`/`int2` fragments per lane for CPT8)
+   - Vectorized A pack loads (packed 4x int8 in `int32`, optionally prefetching as `int4` over kg)
+   - Vectorized C stores (two contiguous `store_i32x4` stores per row-group)
+- Rationale:
+   - Preserves no-heavy-LDS/barrier strength of current MR4 kernel.
+   - Increases useful work per lane on extreme-wide `N` while staying VNNI-native.
+
+### Design 2: `MR4_CPT4_VNNI_LDS_B_DoubleBuffer`
+- Intent: add controlled LDS staging only where reuse/latency hiding pays off.
+- Tile sketch:
+   - `M_TILE=32`, `N_TILE=256`, `KG_TILE in {8,16}`
+   - 256-thread block
+- Vectorization requirements:
+   - Vectorized global→LDS B copies (`b128` style transfers where possible)
+   - Vectorized LDS reads for A/B fragments into VGPRs
+   - Vectorized C stores (`store_i32x4`)
+- Rationale:
+   - Keep VNNI indexing semantics but reduce global latency pressure versus pure streaming.
+
+### Design 3: `Persistent_SplitK_VNNI_MR4` (LM_HEAD-specialized)
+- Intent: improve wide-shape scheduling and cache locality for very large `N`.
+- Execution sketch:
+   - Persistent CTAs own fixed N-stripes.
+   - Split-K stage-1 emits vectorized int32 partials.
+   - Stage-2 performs vectorized reduction and final stores.
+- Vectorization requirements:
+   - Vectorized partial writes/reads (`int4`-style where legal)
+   - Vectorized final C stores
+- Rationale:
+   - Targets LM_HEAD extreme-wide workload specifically.
+
+### Implementation Order
+1. **Design 1 first** (lowest risk, closest to proven winner path).
+2. Design 2 second (if bandwidth/latency still dominates).
+3. Design 3 third (LM_HEAD-specific specialization pass).
+
+### Immediate Bench Targets (Design 1)
+- Shapes: `(M,N,K)=(128,151936,896)` and `(128,151936,2048)`.
+- Gate metrics:
+   - correctness parity vs CK (max abs diff 0 in lab correctness mode)
+   - kernel-ms and e2e-ms vs `ck_baseline`
+   - compare directly against `lmhead_vec_mr4_pad_cpt4` as the custom baseline-to-beat.
+
+## Shape-Type Taxonomy (Aspect-Ratio Driven)
+
+Primary ratio signal for prefill GEMM selection (for GEMM `C[M,N] = A[M,K] * B[K,N]`):
+- `r = N / K` (output width vs reduction depth)
+
+Initial shape classes for policy development:
+- **Attention-like (square-ish):** `0.75 <= r <= 1.33`
+   - Typical: projection layers where hidden->hidden dominates.
+- **FFN-Up / FFN-Gate (wide):** `r > 1.33`
+   - Typical: expansion projections (`N >> K`).
+- **FFN-Down (tall/reduction-heavy):** `r < 0.75`
+   - Typical: contraction projections (`N << K`).
+- **LM_HEAD (extreme wide):** very large `N` (vocab-sized output), usually a strict subset of wide with dedicated policy checks.
+
+Notes:
+- `M` remains a secondary policy axis (`small/medium/large batch-token count`) once ratio class is chosen.
+- Thresholds above are initial and should be adjusted based on measured winner boundaries.
+
+## Current Benchmark Shape Set (Qwen2.5)
+
+To speed up iteration while preserving representative aspect-ratio classes, the strategy lab now uses Qwen2.5 0.5B and 3B defaults:
+
+- **Qwen2.5-0.5B** (`hidden=896`, `ffn=4864`, `vocab=151936`)
+   - `AttnOut`: `(M,N,K)=(128,896,896)`
+   - `FFN_Up/Gate`: `(128,4864,896)`
+   - `FFN_Down`: `(128,896,4864)`
+   - `LM_Head`: `(128,151936,896)`
+- **Qwen2.5-3B** (`hidden=2048`, `ffn=11008`, `vocab=151936`)
+   - `AttnOut`: `(128,2048,2048)`
+   - `FFN_Up/Gate`: `(128,11008,2048)`
+   - `FFN_Down`: `(128,2048,11008)`
+   - `LM_Head`: `(128,151936,2048)`
+
+Source of model dimensions: Hugging Face config files for `Qwen/Qwen2.5-0.5B-Instruct` and `Qwen/Qwen2.5-3B-Instruct`.
+
+## Latest Quick Sweep (all GPUs, shortlist)
+
+Run mode:
+- `--all-devices --warmup=1 --iters=2 --no-check`
+- shortlist strategies plus split-k variants
+- LM head uses fast subset by default (override: `--full-lm-head`)
+
+Observed winners vs CK (`vsCK > 1.0` means faster than CK):
+- `Qwen2.5-0.5B_AttnOut`: `wave64_cpt4_splitk_by8(s=4)` at **1.492x**
+- `Qwen2.5-3B_AttnOut`: `wave64_cpt4_splitk_by8(s=4)` at **1.084x**
+- `Qwen2.5-0.5B_FFN_Down`: `wave64_cpt4_splitk_by8(s=4)` at **2.360x**
+- `Qwen2.5-3B_FFN_Down`: `wave64_cpt4_splitk_by8(s=4)` at **1.115x**
+- `FFN_Up/Gate` and both `LM_Head` shapes: CK baseline remains best in this shortlist run.
+
+## Gap Closure Policy (Winner-Map v1)
+
+Based on exhaustive/targeted sweeps on Qwen2.5 0.5B and 3B shapes, the current policy to close parity gaps is:
+
+- **Wide / Extreme-Wide (`N/K >= 2.0`)**
+   - Prefer CK baseline by default.
+   - Includes `FFN_Up`, `FFN_Gate`, and `LM_Head` classes in current shapes.
+- **Attention-like / Down-projection classes (`N/K < 2.0`)**
+   - Keep custom candidates active.
+   - Current winner is typically `wave64_cpt4_splitk_by8` (often `splitk=4`).
+
+This policy is now implemented in the strategy lab as a default dispatch preference for wide/extrawide classes, with an override flag:
+- `--no-prefer-ck-wide` to force benchmarking custom variants on wide shapes.
+
+### Closure Validation Snapshot
+
+Re-run with policy enabled (`--all-devices`, Qwen2.5 shape set):
+- `FFN_Up`, `FFN_Gate`, `LM_Head` -> CK selected (parity closed by dispatch choice).
+- `AttnOut`, `FFN_Down` -> custom split-k variants remain faster than CK in tested slices.
+
+Representative winners:
+- `Qwen2.5-0.5B_AttnOut`: `wave64_cpt4_splitk_by8` (vsCK ~1.51)
+- `Qwen2.5-3B_AttnOut`: `wave64_cpt4_splitk_by8` (vsCK ~1.13)
+- `Qwen2.5-0.5B_FFN_Down`: `wave64_cpt4_splitk_by8` (vsCK ~2.31)
+- `Qwen2.5-3B_FFN_Down`: `wave64_cpt4_splitk_by8` (vsCK ~1.09)
+- `Qwen2.5-{0.5B,3B}_{FFN_Up,FFN_Gate,LM_Head}`: `ck_baseline` (vsCK = 1.00)
+
+## Dispatch Cleanup (Row-Count Hardcoding)
+
+To reduce overfitting to fixed row counts, `rocmQuantGemm_executeNoScale` in `ROCmQuantisedGemmKernel_CK.hip` now uses an **aspect-aware policy** (primarily `N/K`, then `M`) instead of purely `M` buckets.
+
+Policy summary:
+- Keep `128x128` default for `M % 128 == 0`.
+- Prefer `32x32` only for small + not-too-wide shapes.
+- Prefer `64x64` for sub-128 and moderate `N/K`.
+- Route wide/irregular cases to `128x128 MNPadding`.
+
+This keeps compatibility while moving dispatch toward ratio-driven behavior.
+
 ## Non-Goals (Initial Implementation)
 - No decode-path redesign (M=1 GEMV path remains authoritative).
 - No change to model semantics, TP/PP placement rules, or tensor ownership model.
@@ -118,9 +275,10 @@ Kernel Plan:
 1. Add entrypoint family (suggested naming):
    - rocmGemm_int8_int8_int32_vnni_prefill
    - rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar (optional if needed)
-2. Initial tile strategy:
-   - Start with fixed tile (example: M_tile=8, N_tile=64, K_step=128).
-   - Use sdot4-compatible K iteration and int32 accumulators.
+2. Initial tile strategy (**active now**):
+   - Start with **Design 1: `MR4_CPT8_VNNI_Stream`**.
+   - Preserve VNNI-native `K/4` iteration (`sdot4`-compatible) and fully vectorized load/store path.
+   - Keep register pressure bounded enough to avoid occupancy collapse (Design 1 constraint).
 3. Keep scaling/epilogue external in phase 1.
 
 Integration Tasks:
@@ -179,6 +337,32 @@ Tasks:
 2. Tune tile shapes for representative M/N/K buckets.
 3. Consider fused epilogue path (alpha/beta/bias) after baseline stability.
 4. Optimize shared-memory staging and vectorized loads.
+
+### Phase 4A - Aspect-Ratio Strategy Discovery (Step 1)
+Objective: identify the best-performing strategy per shape class before broad auto-heuristics.
+
+Tasks:
+1. Define benchmark buckets by shape class (`Attention`, `FFN_Up`, `FFN_Down`, `FFN_Gate`, `LM_HEAD`) with at least one small/medium/large `M` representative each where practical.
+2. Run shortlisted strategies against each bucket and record winner map by class.
+3. Use CK instance patterns (tile families, rectangular variants, regular vs irregular handling) as guidance for new candidates.
+4. Promote only strategies that are stable and win by class, not only by one exact shape.
+
+Exit Criteria:
+- Per-class winner map exists and is reproducible.
+- No selected strategy introduces unacceptable regressions in another class.
+
+### Phase 4B - Dispatcher Integration (Step 3)
+Objective: encode class-based strategy routing in the ratio-VNNI prefill HIP entrypoint.
+
+Tasks:
+1. Add shape classifier (`r = N/K`, plus optional `M` bucket) inside ratio-VNNI prefill dispatch path.
+2. Route each class to its selected strategy kernel from Phase 4A.
+3. Preserve explicit fallback path and one-time reason logging.
+4. Add focused integration/perf checks to verify classifier boundaries and dispatch correctness.
+
+Exit Criteria:
+- Ratio-VNNI prefill path dispatches by shape class with deterministic behavior.
+- CK fallback remains intact and observable.
 
 Exit Criteria:
 - Measurable prefill latency improvement for targeted workloads.
@@ -468,10 +652,109 @@ Add counters/logging for:
 - Rationale: host sweep data shows `CPT>1` is uniformly worse across tested real-model prefill shapes, so continuing to sweep those modes adds time without actionable upside.
 - Sweep coverage now explicitly includes Qwen `7B` and `14B` prefill projection families: `AttnOut`, `FFN_Up`, `FFN_Down`, and `FFN_Gate`, so `KB` tuning decisions are validated across both square (attention) and tall/wide (FFN) shapes.
 
+#### Latest Validation (2026-02-21, Slice 25 - CK MI50 strategy review + playground synthesis)
+- Reviewed local CK source under `external/composable_kernel` for MI50/gfx906 int8 GEMM behavior and aligned findings with current ROCm prefill playground experiments.
+- Key CK (MI50/gfx906) observations:
+   - `dot4` is the core int8 primitive (`__builtin_amdgcn_sdot4` / `v_dot4_i32_i8`), with effective `K1=4` packing semantics.
+   - int8 prefill on gfx906 is driven by `DeviceGemmDl` instance families (not XDL int8 path), with broad tile catalogs and per-shape instance selection.
+   - CK carries regular (`GemmDefault`) and irregular (`MNPadding`) instance tables separately for edge-shape robustness.
+   - Parallelization is block-tiled over `(M,N)` with `K0PerBlock` loop pipelining, plus multiple thread-cluster permutations for the same tile shape.
+   - Common DL int8 shape families include `256x128`, `128x128`, `64x64`, `32x32`, and skinny/wide variants (`64x16`, `16x64`, `64x8`, `8x64`).
+- Current playground synthesis:
+   - Effective: aligned fastpath + unroll2 + launch-bounds path, and split/grid-cap tuning (best observed around `~0.887x` CK on `M=128,N=3584,K=3584`).
+   - Neutral/minor: vectorized stores improve code quality/coalescing hygiene but are not primary wins alone.
+   - Regressive in current form: dual-acc interleave and heavier unroll/shared-B variants.
+   - Current auto heuristic underperforms fixed/manual picks on tested attention/FFN-like shapes.
+
+#### Latest Validation (2026-02-21, Slice 26 - repack-inclusive strategy accounting + wide-shape win plan)
+- Updated `Microbench__ROCmPrefillStrategyLab.hip` to report both kernel-only and repack-inclusive metrics:
+   - `KernelMS`, `RepackMS`, `E2EMS` (`KernelMS + RepackMS`)
+   - `vsCK(K)` and `vsCK(E2E)`
+- CK-vs-custom comparisons are now explicit about host-side prep cost, preventing kernel-only false positives.
+- Current conclusion remains unchanged for dispatch safety:
+   - `FFN_Up`, `FFN_Gate`, and `LM_Head` stay CK-preferred in the default policy until a custom path wins on `vsCK(E2E)`.
+
+#### Wide/Extreme-Wide Gap Closure Tactics (FFN_Up, FFN_Gate, LM_Head)
+
+Primary objective for these classes: improve end-to-end throughput, not only kernel throughput.
+
+1. **Persistent B-pack reuse (highest leverage for repeated prefill calls)**
+   - Idea: cache and reuse pre-packed/transpose-ready B buffers per `(device, weight_ptr, K, N, variant)` instead of repacking each invocation.
+   - Why: wide and extreme-wide shapes amplify repack bytes; reducing `RepackMS` can flip `vsCK(E2E)` even when `KernelMS` is similar.
+   - Hook points:
+      - `ROCmQuantisedGemmKernel.cpp` prefill dispatch/repack cache path.
+      - strategy lab `runTimedHostPrepLoop` for A/B validation with and without persistent pack reuse.
+
+2. **CK-style skinny/wide tile family promotion for custom kernels**
+   - Idea: add/benchmark more rectangular tile variants for wide outputs (e.g., `32x8`, `64x8`, `16x64` style mapping analogs) and lock per-bucket winners.
+   - Why: CK catalogs separate regular and irregular (`MNPadding`) families and keep skinny/wide options that map better to FFN/LM aspect ratios.
+   - Hook points:
+      - existing variant controls (`LLAMINAR_ROCM_VNNI_PREFILL_VARIANT`, `..._GRID_VARIANT`).
+      - shortlist track `S5_wave64_ck_style_skinny_wide` promoted from experiment to required bucket gate.
+
+3. **Two-level LM-head policy (chunked-N custom path vs CK full-N)**
+   - Idea: for very large `N` (vocab-sized), evaluate chunked-N execution where custom kernels process vocabulary tiles with bounded workspace, then merge.
+   - Why: LM-head is often repack/bandwidth-limited; chunking can improve cache behavior and reduce one-shot staging pressure.
+   - Guardrail: only adopt if total `E2EMS` beats CK and numerical parity remains exact.
+
+4. **Grid-kpar only under reduction-pressure gates**
+   - Idea: keep split-K/grid-kpar for wide classes only when `K` is large enough and atomic/reduction overhead is amortized.
+   - Why: prior sweeps show shape-dependent gains; unconditional split-K can regress.
+   - Policy: gate by `(K, M)` bucket and retain CK fallback for low-benefit regions.
+
+5. **Repack-aware dispatch thresholding (policy hard requirement)**
+   - Idea: dispatch winner map for wide classes must be decided by `vsCK(E2E)`, with kernel-only used as secondary signal.
+   - Why: this aligns policy with production full-path cost model.
+
+### Phase 4 Concrete Shortlist (CK-Informed + Playground-Validated)
+
+Objective: turn the current tuning space into a small, stable candidate set for policy convergence.
+
+#### Candidate variants to keep active
+1. `S0_ck_baseline`
+   - Reference only (`rocmQuantGemm_executeNoScale` / current CK path).
+2. `S1_wave64_grid_by8_cap128`
+   - Current top manual playground candidate for attention-like square buckets.
+3. `S2_wave64_aligned_unroll2_lb_cap128`
+   - Best aligned/unroll family candidate; generally second-best in recent runs.
+4. `S3_wave64_aligned_unroll2_cap128`
+   - Control variant to isolate launch-bounds impact.
+5. `S4_wave64_splitk_cap_family`
+   - Split-K candidate set with bounded cap (`split ∈ {2,4,8}` where shape supports).
+6. `S5_wave64_ck_style_skinny_wide`
+   - CK-inspired rectangular variants for `MxN` aspect extremes (FFN-up / FFN-down).
+
+#### De-prioritized variants (do not include in routine sweeps)
+- dual-acc interleave family
+- heavy unroll/shared-B family
+- broad auto-heuristic switching policy (until per-bucket winners are revalidated)
+
+#### Benchmark buckets (minimum required for shortlist decisions)
+- `B1 Attention-like`: `(M,N,K) = (128,3584,3584)`
+- `B2 FFN-up-like`: `(128,18944,3584)`
+- `B3 FFN-down-like`: `(128,3584,18944)`
+- `B4 Medium M`: one representative medium-M production shape (`M=32/64`) from real-model sweep set
+
+#### Selection gate for default policy candidacy
+- Correctness: `MaxAbsDiff=0` vs CK reference on harnessed compare path.
+- Performance: candidate must beat current policy baseline by `>=2%` on at least one primary bucket without regressing another primary bucket by `>1%`.
+- Stability: repeated run variance acceptable (`<=2%` spread over repeated samples on same host/config).
+
+#### Shortlist execution order
+1. Re-run `S1/S2/S3` on `B1/B2/B3` to lock manual winner map.
+2. Add `S4` only on buckets where `K` is sufficiently large and atomics do not dominate.
+3. Add `S5` for skinny/wide buckets and compare against locked winner map.
+4. Encode a minimal shape-bucket dispatch policy from winners (manual map before auto heuristic).
+
 ### Phase 4
 - [ ] Add split-K/grid_kpar prefill variants as needed.
 - [ ] Tune tile parameters and dispatch thresholds.
 - [ ] Evaluate optional fused epilogue.
+
+### Explicit Goal Tracking (Current Tuning Cycle)
+- [ ] Goal 1: Aspect-ratio winner map completed for `Attention`, `FFN_Up`, `FFN_Down`, `FFN_Gate`, `LM_HEAD`.
+- [ ] Goal 2: Playground kernels reach near-CK or better per class with reproducible runs.
+- [ ] Goal 3: Ratio-aware dispatcher landed in ratio-VNNI prefill HIP entrypoint with fallback-safe behavior.
 
 ### Phase 5
 - [ ] Run burn-in and stress validation.
@@ -493,4 +776,143 @@ This project is complete when:
 4. ✅ Completed: auto split tuning and focused baseline-vs-grid perf smoke.
 5. ✅ Completed: added production-path full prefill sweep harness (`PrefillFullPath_GridKParSweep`) with baseline vs grid (`auto/s4/s8`) comparisons.
 6. In progress: broadened sweep buckets to real model projection shapes + aspect ratios and added micro-variant forcing controls.
-7. Next: ingest sweep results and codify final shape-threshold rules (baseline vs grid-kpar and tile variant) into stable default dispatch policy.
+7. ✅ Completed: documented CK MI50 int8 strategy findings and merged with playground synthesis into a tracked shortlist.
+8. In progress: execute shortlist (`S1..S5`) by shape class and codify initial winner map per aspect-ratio family.
+9. Next: iterate Step 1 until per-class winners stabilize, then implement ratio-aware HIP dispatcher for ratio-VNNI prefill entrypoint.
+10. Next: run wide-class closure sweeps (`FFN_Up`, `FFN_Gate`, `LM_Head`) under repack-inclusive gates and promote only variants that improve `vsCK(E2E)`.
+
+## Next Pass Implementation TODO (Execution Checklist)
+
+This checklist is the next implementation pass for closing wide/extrawide gaps while preserving fallback safety.
+
+### 1) Persistent B-pack reuse to reduce `RepackMS`
+- Scope:
+   - Add/extend persistent packed-B cache for prefill where shapes repeat.
+   - Reuse cache by `(device, weight identity, K, N, strategy/variant)`.
+- Primary touchpoints:
+   - `src/v2/kernels/rocm/ROCmQuantisedGemmKernel.cpp`
+   - `tests/v2/performance/kernels/rocm/Microbench__ROCmPrefillStrategyLab.hip`
+- Acceptance:
+   - `RepackMS` reduced on repeated calls for target wide buckets.
+   - No correctness drift vs CK.
+
+### 2) Promote CK-style skinny/wide tile families (`S5`) and validate by aspect bucket
+- Scope:
+   - Keep `S5` as first-class candidate in wide/extrawide sweeps.
+   - Add/retain rectangular variant coverage (skinny/wide-focused).
+- Primary touchpoints:
+   - `tests/v2/performance/kernels/rocm/Microbench__ROCmPrefillStrategyLab.hip`
+   - prefill variant dispatch controls in ROCm kernel path.
+- Acceptance:
+   - Stable winner map by class (`Attention`, `FFN_Up`, `FFN_Down`, `FFN_Gate`, `LM_Head`).
+   - No promoted variant regresses another primary bucket by more than policy threshold.
+
+### 3) LM-head two-level policy (chunked-N custom path vs CK full-N)
+- Scope:
+   - Add optional chunked-N evaluation mode for extreme-wide `LM_Head`.
+   - Compare against CK full-N baseline using end-to-end timing.
+- Primary touchpoints:
+   - ROCm prefill dispatch path in `ROCmQuantisedGemmKernel.cpp`
+   - strategy/perf harness for LM-head shape buckets.
+- Acceptance:
+   - Promote only if `vsCK(E2E) > 1.0` with parity intact.
+   - Keep deterministic CK fallback as default when chunked mode does not win.
+
+### 4) Grid-kpar only under reduction-pressure gates
+- Scope:
+   - Restrict split-K/grid-kpar use to gated `(K, M)` regions where it is beneficial.
+   - Keep baseline native prefill and CK fallback contracts unchanged.
+- Primary touchpoints:
+   - `tryExperimentalPrefillNativeGemm` policy logic in ROCm prefill dispatch.
+   - Existing env controls for split count/auto mode.
+- Acceptance:
+   - Fewer regressions in low-benefit wide buckets.
+   - Grid-kpar remains available and selected in known high-pressure regions.
+
+### 5) Make repack-aware gating mandatory for wide classes
+- Scope:
+   - For `FFN_Up`, `FFN_Gate`, `LM_Head`, require dispatch decisions to use E2E criteria (`KernelMS + RepackMS`) rather than kernel-only.
+   - Keep kernel-only metrics as diagnostic secondary signal.
+- Primary touchpoints:
+   - strategy-lab winner selection policy and wide-class promotion logic.
+   - production policy docs and dispatch comments.
+- Acceptance:
+   - Wide-class promotions blocked unless `vsCK(E2E)` gate passes.
+   - Documentation and harness outputs clearly distinguish kernel vs E2E winner decisions.
+
+### Run-order for next pass
+1. Implement persistent B-pack reuse and verify repeated-call `RepackMS` delta.
+2. Re-run wide/extrawide shortlist with `S5` promoted and collect winner map.
+3. Prototype LM-head chunked-N mode and evaluate strict E2E gate.
+4. Tighten grid-kpar gates with updated winner map.
+5. Enforce mandatory wide-class repack-aware gating and lock policy.
+
+#### Latest Validation (2026-02-21, Slice 27 - next-pass kickoff implementation)
+- Implemented persistent row-major upload reuse in `ROCmQuantisedGemmKernel::ensureWeightsConverted()`:
+   - when host row-major pack is available, upload and retain `d_int8_data_rowmajor` as persistent CK prefill B buffer.
+   - CK prefill paths can now bypass runtime VNNI/ratio→row-major repack in repeated calls for this class.
+- Updated strategy lab wide-shape policy in `Microbench__ROCmPrefillStrategyLab.hip`:
+   - promoted S5 skinny/wide shortlist for `N/K >= 2.0` when `--no-prefer-ck-wide` is used.
+   - wide/extrawide winner logging now uses repack-aware metric (`vsCK(E2E)`), while non-wide retains `vsCK(K)`.
+- Tightened runtime split-K/grid-kpar gate in `tryExperimentalPrefillNativeGemm()`:
+   - grid-kpar now requires reduction-pressure gates based on `(K, M)` and minimum shape constraints, reducing low-benefit split-K attempts.
+- Focused validation:
+   - build: `llaminar2_core` and `v2_perf_rocm_prefill_strategy_lab` targets compile/link.
+   - integration parity: `*PrefillNativeInt8VNNI_MatchesCKFallback*` passed.
+   - strategy lab sanity run confirms S5 shortlist activation and wide-shape `vsCK(E2E)` winner reporting.
+
+#### Latest Validation (2026-02-21, Slice 28 - LM-head chunked-N prototype in strategy lab)
+- Added LM-head chunked policy prototype to `Microbench__ROCmPrefillStrategyLab.hip`:
+   - new options: `--lm-head-chunk-n=<cols>` and `--no-lm-head-chunked`.
+   - for LM-head shapes under custom-wide benchmarking (`--no-prefer-ck-wide`), lab now evaluates a chunked custom path and emits a dedicated row:
+      - `<base_strategy>_chunked_n<chunk_n>`.
+- Current prototype behavior:
+   - splits extreme-wide `N` into fixed `chunk_n` slices,
+   - runs the selected custom kernel per chunk,
+   - aggregates `KernelMS`, `RepackMS`, `E2EMS`, and compares against CK full-N baseline with `vsCK(E2E)`.
+- Focused run example:
+   - `--m=128 --n=151936 --k=896 --no-prefer-ck-wide --full-lm-head --lm-head-chunk-n=16384 --strategies=wave64_cpt4_grid_by8_cap64`
+   - observed row: `wave64_cpt4_grid_by8_cap64_chunked_n16384` with `vsCK(E2E)=0.719` on this host/config.
+- Outcome:
+   - prototype is integrated and measurable; CK remains default winner under strict E2E gate for this tested LM-head case.
+
+#### Latest Validation (2026-02-21, Slice 29 - GEMV INT8-VNNI LM-head mining for GEMM closure)
+- Refocus applied: objective is CK-closure for all shape classes, with LM_HEAD improvements guided by production GEMV INT8-VNNI behavior rather than isolated chunking heuristics.
+- Source path reviewed: `rocmGemv_int8_int8_int32_vnni` / scaled variant in `src/v2/kernels/rocm/ROCmGemvKernel.hip` and decode dispatch wiring in `src/v2/kernels/rocm/ROCmQuantisedGemmKernel.cpp`.
+- Extracted production heuristics/techniques to port into LM_HEAD prefill GEMM tuning:
+   1. **Aspect-ratio regime split (hard gate first, then tune):**
+      - GEMV uses a strict wide gate (`N >= 8*K`) and falls back to grid-kpar / square / base.
+      - Action for GEMM: keep LM_HEAD in a dedicated extreme-wide bucket (not generic wide), with independent tile family and thresholds.
+   2. **Occupancy + inner-loop co-optimization (not occupancy-only):**
+      - GEMV grid-kpar selects `kb` to preserve minimum k-groups per block while maintaining minimum waves/CU.
+      - Action for GEMM: tune split-K by jointly constraining `(k_groups_per_block, waves_per_cu)` and reject settings that shorten inner loops below a floor.
+   3. **Template-specialized tile ladders with light runtime selection:**
+      - GEMV launches pre-instantiated variants (`TN ∈ {128,256,512}`, `CPT ∈ {2,4}`, vec-load on/off) via simple gates.
+      - Action for GEMM: keep shortlist-driven static kernels (`S1..S5`) and avoid broad auto switching until per-bucket winners are stable.
+   4. **Shape-aware override hooks for controlled sweeps:**
+      - GEMV already has tuning overrides (`tn/kb/cpt/vec-load`) for deterministic A/B exploration.
+      - Action for GEMM: mirror this discipline in prefill policy experiments (forceable variant/split thresholds per bucket), then lock defaults only after stability checks.
+   5. **Reduction-pressure gating before enabling split-K:**
+      - GEMV avoids K-splitting in wide_vec4 regime and uses explicit gates for kpar paths.
+      - Action for GEMM: preserve current reduction-pressure gate tightening and treat split-K as opt-in for proven `(K,M,N)` regions only.
+   6. **Repack cost as first-class signal for wide classes:**
+      - GEMV path rationale plus prior slices reinforce that kernel-only gains are insufficient for LM_HEAD.
+      - Action for GEMM policy: keep `vsCK(E2E)` mandatory for LM_HEAD promotions; kernel-only remains diagnostic.
+- Immediate implementation priorities (LM_HEAD closure track):
+   - P1: lock an LM_HEAD-specific winner map over `S2/S4/S5` using repack-inclusive gates.
+   - P2: add split-K floor checks derived from `k_groups_per_block` and measured occupancy (strategy-lab report columns).
+   - P3: keep chunked-N mode experimental only until it wins `vsCK(E2E)` on repeated runs; CK remains default fallback.
+
+#### Latest Validation (2026-02-21, Slice 30 - full no-prefer-ck-wide challenger sweep + persistent leaderboard)
+- Added on-disk leaderboard persistence in strategy lab with latest snapshots + append-only history CSV outputs.
+- Executed full default-shape sweep with wide-challenger mode enabled:
+   - `v2_perf_rocm_prefill_strategy_lab --no-check --no-prefer-ck-wide --leaderboard-dir=artifacts/rocm_prefill_strategy_lab/no_prefer_ck_wide`
+- Outcome on this host/config:
+   - No INT8 VNNI GEMM subtype currently exceeds CK on end-to-end metric (`vsCK(E2E) > 1.0`) across the default sweep set.
+   - Wide and extreme-wide classes (`FFN_Up`, `FFN_Gate`, `LM_Head`) remain CK-best under E2E accounting.
+   - Kernel-only winners persist in non-wide buckets (notably split-K variants for `AttnOut` / `FFN_Down`), but they do not convert into E2E wins once repack cost is included.
+- Persisted artifacts (challenger run):
+   - `artifacts/rocm_prefill_strategy_lab/no_prefer_ck_wide/int8_vnni_gemm_winners_latest.csv`
+   - `artifacts/rocm_prefill_strategy_lab/no_prefer_ck_wide/int8_vnni_gemm_leaderboard_latest.csv`
+   - `artifacts/rocm_prefill_strategy_lab/no_prefer_ck_wide/int8_vnni_gemm_winners_history.csv`
+   - `artifacts/rocm_prefill_strategy_lab/no_prefer_ck_wide/int8_vnni_gemm_leaderboard_history.csv`

@@ -873,3 +873,77 @@ TEST_F(ROCmQuantisedGemmPerf, PrefillFullPath_CptAndKbSweep)
         }
     }
 }
+
+/**
+ * @test Harvest canonical CK full-path prefill baselines for strategy-lab shapes
+ *
+ * This test emits parseable lines for the exact shape set used by
+ * Microbench__ROCmPrefillStrategyLab.hip (Qwen2.5 0.5B and 3B projections).
+ *
+ * Output format:
+ *   CANONICAL_CK_PREFILL,<shape_name>,M,N,K,mean_ms,mean_tflops,cosine
+ */
+TEST_F(ROCmQuantisedGemmPerf, PrefillFullPath_CKCanonicalHarvest_Qwen0_5B_3B)
+{
+    if (!has_rocm_device_)
+    {
+        GTEST_SKIP() << "No ROCm device available";
+    }
+
+    struct ShapeCfg
+    {
+        std::string name;
+        int M;
+        int N;
+        int K;
+    };
+
+    const std::vector<ShapeCfg> shapes = {
+        {"Qwen2.5-0.5B_AttnOut", 128, 896, 896},
+        {"Qwen2.5-0.5B_FFN_Up", 128, 4864, 896},
+        {"Qwen2.5-0.5B_FFN_Gate", 128, 4864, 896},
+        {"Qwen2.5-0.5B_FFN_Down", 128, 896, 4864},
+        {"Qwen2.5-0.5B_LM_Head", 128, 151936, 896},
+        {"Qwen2.5-3B_AttnOut", 128, 2048, 2048},
+        {"Qwen2.5-3B_FFN_Up", 128, 11008, 2048},
+        {"Qwen2.5-3B_FFN_Gate", 128, 11008, 2048},
+        {"Qwen2.5-3B_FFN_Down", 128, 2048, 11008},
+        {"Qwen2.5-3B_LM_Head", 128, 151936, 2048},
+    };
+
+    // Force baseline CK full-path behavior for canonical harvesting.
+    ScopedEnvOverride prefill_experimental("LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL", "0");
+    ScopedEnvOverride grid_kpar("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR", "0");
+    ScopedEnvOverride grid_splits("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR_SPLITS", "0");
+
+    std::cout << "\n[Perf] Canonical CK full-path harvest (Qwen2.5 0.5B / 3B strategy-lab shapes)\n";
+    std::cout << "[Perf] Emitting parseable lines prefixed with CANONICAL_CK_PREFILL\n";
+
+    for (const auto &shape : shapes)
+    {
+        ROCmBenchConfig cfg{
+            .name = shape.name,
+            .M = shape.M,
+            .N = shape.N,
+            .K = shape.K,
+            .warmup_iters = 2,
+            .bench_iters = 4,
+            .num_trials = 2,
+            .end_to_end_timing = true,
+        };
+
+        const auto stats = runBenchmark(cfg);
+
+        std::cout << "CANONICAL_CK_PREFILL,"
+                  << shape.name << ","
+                  << shape.M << ","
+                  << shape.N << ","
+                  << shape.K << ","
+                  << std::fixed << std::setprecision(6) << stats.mean_ms << ","
+                  << std::fixed << std::setprecision(6) << stats.mean_tflops << ","
+                  << std::fixed << std::setprecision(6) << stats.cosine_sim
+                  << std::endl;
+
+        EXPECT_GT(stats.cosine_sim, 0.99);
+    }
+}

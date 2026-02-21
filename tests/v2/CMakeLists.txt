@@ -7970,6 +7970,28 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm IQ4 decode microbenchmark")
 
+    set_source_files_properties(
+        performance/kernels/rocm/Microbench__ROCmPrefillStrategyLab.hip
+        PROPERTIES LANGUAGE HIP
+    )
+    add_executable(v2_perf_rocm_prefill_strategy_lab
+        performance/kernels/rocm/Microbench__ROCmPrefillStrategyLab.hip
+    )
+    target_link_libraries(v2_perf_rocm_prefill_strategy_lab
+        hip::host
+        hip::device
+        llaminar2_core
+        OpenMP::OpenMP_CXX
+    )
+    target_compile_options(v2_perf_rocm_prefill_strategy_lab PRIVATE -fopenmp)
+    target_link_options(v2_perf_rocm_prefill_strategy_lab PRIVATE -fopenmp)
+    add_v2_test(V2_Perf_ROCmPrefillStrategyLab
+        COMMAND $<TARGET_FILE:v2_perf_rocm_prefill_strategy_lab>
+        LABELS "V2;Performance;ROCm;GEMM;Prefill;Microbenchmark;StrategyLab;gfx906;Experiment"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added standalone ROCm prefill strategy lab microbenchmark")
+
     # NOTE: FP16 vs INT8 benchmark removed (January 2026) - INT8 proven faster for all sizes.
     # Results documented in changelog/2026-01-10-rocm-int8-gemm-optimization.md
 

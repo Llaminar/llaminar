@@ -757,6 +757,37 @@ static int chooseQuantThreadsFromShape(int M, int K)
     return 256;
 }
 
+enum class NoScaleKernelClass
+{
+    K32x32,
+    K64x64,
+    K128x128Default,
+    K128x128MNPadding,
+};
+
+static NoScaleKernelClass chooseNoScaleKernelClass(int M, int N, int K)
+{
+    if ((M % 128) == 0)
+    {
+        return NoScaleKernelClass::K128x128Default;
+    }
+
+    const double safe_k = static_cast<double>(std::max(K, 1));
+    const double aspect_n_over_k = static_cast<double>(N) / safe_k;
+
+    if (M <= 32 && aspect_n_over_k < 8.0)
+    {
+        return NoScaleKernelClass::K32x32;
+    }
+
+    if (M < 128 && aspect_n_over_k < 4.0)
+    {
+        return NoScaleKernelClass::K64x64;
+    }
+
+    return NoScaleKernelClass::K128x128MNPadding;
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -1397,18 +1428,21 @@ extern "C"
         }
 
         // =====================================================================
-        // 4-WAY DISPATCH BASED ON M
+        // 4-WAY DISPATCH (ASPECT-RATIO AWARE)
         // =====================================================================
-        // The 32×32 and 64×64 kernels use GemmMNPadding to handle irregular M.
-        // The 128×128 kernel uses GemmDefault for M % 128 == 0 (peak throughput).
-        // The 128×128 MNPadding kernel handles M >= 128 with irregular M.
+        // Prefer selecting kernels by output/input aspect (N/K) first, then M.
+        // This avoids overfitting to fixed row counts and generalizes across
+        // smaller/larger prefill batches while retaining 128x128 fastpath on
+        // exact multiples of 128.
         // =====================================================================
 
         // NOTE: ScopedCoutSilence removed - was silencing cout during CK execution
         // which could cause issues if kernel hangs (destructor never runs, cout stays silenced)
         // CK debug output like "arg.e_grid_desc_m_n_" will now be visible.
         
-        if (M <= 32)
+        const NoScaleKernelClass kernel_class = chooseNoScaleKernelClass(M, N, K);
+
+        if (kernel_class == NoScaleKernelClass::K32x32)
         {
             // Small M: Use 32×32 kernel (optimal for decode, M=1-32)
             auto& device_gemm = getCachedNoScaleKernel32x32(*context);
@@ -1429,7 +1463,7 @@ extern "C"
             auto invoker = device_gemm.MakeInvoker();
             invoker.Run(argument, StreamConfig{static_cast<hipStream_t>(stream), false});
         }
-        else if (M < 128)
+        else if (kernel_class == NoScaleKernelClass::K64x64)
         {
             // Medium M: Use 64×64 kernel (optimal for M=33-127)
             auto& device_gemm = getCachedNoScaleKernel64x64(*context);
@@ -1450,7 +1484,7 @@ extern "C"
             auto invoker = device_gemm.MakeInvoker();
             invoker.Run(argument, StreamConfig{static_cast<hipStream_t>(stream), false});
         }
-        else if (M % 128 == 0)
+        else if (kernel_class == NoScaleKernelClass::K128x128Default)
         {
             // Large M, multiple of 128: Use 128×128 kernel with GemmDefault (peak throughput)
             auto& device_gemm = getCachedNoScaleKernel(*context);
@@ -1473,49 +1507,23 @@ extern "C"
         }
         else
         {
-            // Large M, irregular: keep 128×128(MNPadding) default on gfx906.
-            bool use_64 = false;
+            auto& device_gemm = getCachedNoScaleKernel128x128MNPadding(*context);
+            auto argument = device_gemm.MakeArgument(
+                d_A_int8, d_weights_int8, p_ds, d_C_int32,
+                M, N, K,
+                K, K, strides_ds, N,
+                AElementOp{}, BElementOp{}, CDEElementOp_None{}
+            );
 
-            if (use_64)
+            if (!device_gemm.IsSupportedArgument(argument))
             {
-                auto& device_gemm = getCachedNoScaleKernel64x64(*context);
-                auto argument = device_gemm.MakeArgument(
-                    d_A_int8, d_weights_int8, p_ds, d_C_int32,
-                    M, N, K,
-                    K, K, strides_ds, N,
-                    AElementOp{}, BElementOp{}, CDEElementOp_None{}
-                );
-
-                if (!device_gemm.IsSupportedArgument(argument))
-                {
-                    fprintf(stderr, "[rocmQuantGemm_executeNoScale] 64×64 irregular kernel doesn't support M=%d N=%d K=%d\n",
-                            M, N, K);
-                    return false;
-                }
-
-                auto invoker = device_gemm.MakeInvoker();
-                invoker.Run(argument, StreamConfig{static_cast<hipStream_t>(stream), false});
+                fprintf(stderr, "[rocmQuantGemm_executeNoScale] 128×128 MNPadding kernel doesn't support M=%d N=%d K=%d\n",
+                        M, N, K);
+                return false;
             }
-            else
-            {
-                auto& device_gemm = getCachedNoScaleKernel128x128MNPadding(*context);
-                auto argument = device_gemm.MakeArgument(
-                    d_A_int8, d_weights_int8, p_ds, d_C_int32,
-                    M, N, K,
-                    K, K, strides_ds, N,
-                    AElementOp{}, BElementOp{}, CDEElementOp_None{}
-                );
 
-                if (!device_gemm.IsSupportedArgument(argument))
-                {
-                    fprintf(stderr, "[rocmQuantGemm_executeNoScale] 128×128 MNPadding kernel doesn't support M=%d N=%d K=%d\n",
-                            M, N, K);
-                    return false;
-                }
-
-                auto invoker = device_gemm.MakeInvoker();
-                invoker.Run(argument, StreamConfig{static_cast<hipStream_t>(stream), false});
-            }
+            auto invoker = device_gemm.MakeInvoker();
+            invoker.Run(argument, StreamConfig{static_cast<hipStream_t>(stream), false});
         }
         
         // DEBUG: If timing enabled, sync and report actual GEMM execution time

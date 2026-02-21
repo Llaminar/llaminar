@@ -1080,6 +1080,95 @@ __global__ void gemm_payload_v2_i8_prefill_kernel(
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
     const int m = blockIdx.y * blockDim.y + threadIdx.y;
+    const bool valid_n = (n < N);
+    const bool valid_m = (m < M);
+
+    const int blocks_per_row = K / 32;
+    const int kb = max(1, kblocks);
+    const int b_per = (blocks_per_row + kb - 1) / kb;
+    const int b0 = min(blocks_per_row, static_cast<int>(blockIdx.z) * b_per);
+    const int b1 = min(blocks_per_row, b0 + b_per);
+
+    if (b0 >= b1)
+    {
+        return;
+    }
+
+    int32_t acc = 0;
+    extern __shared__ int32_t shared_payload[]; // [blockDim.x * 8]
+
+    for (int b = b0; b < b1; ++b)
+    {
+        if (threadIdx.y == 0)
+        {
+            int32_t* payload_dst = shared_payload + static_cast<int>(threadIdx.x) * 8;
+            if (valid_n)
+            {
+                const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
+                const uint4 packed0 = *reinterpret_cast<const uint4*>(d_payload + linear * 32u);
+                const uint4 packed1 = *reinterpret_cast<const uint4*>(d_payload + linear * 32u + 16u);
+                payload_dst[0] = static_cast<int32_t>(packed0.x);
+                payload_dst[1] = static_cast<int32_t>(packed0.y);
+                payload_dst[2] = static_cast<int32_t>(packed0.z);
+                payload_dst[3] = static_cast<int32_t>(packed0.w);
+                payload_dst[4] = static_cast<int32_t>(packed1.x);
+                payload_dst[5] = static_cast<int32_t>(packed1.y);
+                payload_dst[6] = static_cast<int32_t>(packed1.z);
+                payload_dst[7] = static_cast<int32_t>(packed1.w);
+            }
+            else
+            {
+                #pragma unroll
+                for (int g = 0; g < 8; ++g)
+                {
+                    payload_dst[g] = 0;
+                }
+            }
+        }
+
+        __syncthreads();
+
+        if (valid_m && valid_n)
+        {
+            const int32_t* a4 = reinterpret_cast<const int32_t*>(
+                d_A_int8 + static_cast<int64_t>(m) * K + b * 32);
+            const int32_t* payload_i32 = shared_payload + static_cast<int>(threadIdx.x) * 8;
+
+            #pragma unroll
+            for (int g = 0; g < 8; ++g)
+            {
+                acc = __builtin_amdgcn_sdot4(a4[g], payload_i32[g], acc, false);
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (valid_m && valid_n)
+    {
+        const int64_t out_idx = static_cast<int64_t>(m) * N + n;
+        if (kb == 1)
+        {
+            d_C_int32[out_idx] = acc;
+        }
+        else
+        {
+            atomicAdd(&d_C_int32[out_idx], acc);
+        }
+    }
+}
+
+__global__ void gemm_payload_v2_i8_prefill_kernel_direct(
+    const int8_t* __restrict__ d_A_int8,
+    const uint8_t* __restrict__ d_payload,
+    int32_t* __restrict__ d_C_int32,
+    int M,
+    int N,
+    int K,
+    int kblocks)
+{
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m = blockIdx.y * blockDim.y + threadIdx.y;
     if (m >= M || n >= N)
     {
         return;
@@ -1104,13 +1193,17 @@ __global__ void gemm_payload_v2_i8_prefill_kernel(
             d_A_int8 + static_cast<int64_t>(m) * K + b * 32);
 
         const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
-        const int32_t* payload_i32 = reinterpret_cast<const int32_t*>(d_payload + linear * 32u);
+        const uint4 packed0 = *reinterpret_cast<const uint4*>(d_payload + linear * 32u);
+        const uint4 packed1 = *reinterpret_cast<const uint4*>(d_payload + linear * 32u + 16u);
 
-        #pragma unroll
-        for (int g = 0; g < 8; ++g)
-        {
-            acc = __builtin_amdgcn_sdot4(a4[g], payload_i32[g], acc, false);
-        }
+        acc = __builtin_amdgcn_sdot4(a4[0], static_cast<int32_t>(packed0.x), acc, false);
+        acc = __builtin_amdgcn_sdot4(a4[1], static_cast<int32_t>(packed0.y), acc, false);
+        acc = __builtin_amdgcn_sdot4(a4[2], static_cast<int32_t>(packed0.z), acc, false);
+        acc = __builtin_amdgcn_sdot4(a4[3], static_cast<int32_t>(packed0.w), acc, false);
+        acc = __builtin_amdgcn_sdot4(a4[4], static_cast<int32_t>(packed1.x), acc, false);
+        acc = __builtin_amdgcn_sdot4(a4[5], static_cast<int32_t>(packed1.y), acc, false);
+        acc = __builtin_amdgcn_sdot4(a4[6], static_cast<int32_t>(packed1.z), acc, false);
+        acc = __builtin_amdgcn_sdot4(a4[7], static_cast<int32_t>(packed1.w), acc, false);
     }
 
     const int64_t out_idx = static_cast<int64_t>(m) * N + n;
@@ -1121,6 +1214,190 @@ __global__ void gemm_payload_v2_i8_prefill_kernel(
     else
     {
         atomicAdd(&d_C_int32[out_idx], acc);
+    }
+}
+
+template <int BLOCK_X, int BLOCK_Y, int CPT>
+__global__ void gemm_payload_v2_i8_prefill_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const uint8_t* __restrict__ d_payload,
+    int32_t* __restrict__ d_C_int32,
+    int M,
+    int N,
+    int K,
+    int kblocks)
+{
+    const int n_base = blockIdx.x * (BLOCK_X * CPT) + threadIdx.x * CPT;
+    const int m = blockIdx.y * BLOCK_Y + threadIdx.y;
+    if (m >= M || n_base >= N)
+    {
+        return;
+    }
+
+    const int blocks_per_row = K / 32;
+    const int kb = max(1, kblocks);
+    const int b_per = (blocks_per_row + kb - 1) / kb;
+    const int b0 = min(blocks_per_row, static_cast<int>(blockIdx.z) * b_per);
+    const int b1 = min(blocks_per_row, b0 + b_per);
+
+    if (b0 >= b1)
+    {
+        return;
+    }
+
+    int32_t acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        acc[c] = 0;
+    }
+
+    for (int b = b0; b < b1; ++b)
+    {
+        const int32_t* a4 = reinterpret_cast<const int32_t*>(
+            d_A_int8 + static_cast<int64_t>(m) * K + b * 32);
+
+        const size_t linear0 = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n_base);
+        const int32_t* payload_i32_0 = reinterpret_cast<const int32_t*>(d_payload + linear0 * 32u);
+
+        if constexpr (CPT == 4)
+        {
+            if ((n_base + 3) < N)
+            {
+                const int32_t* payload_i32_1 = payload_i32_0 + 8;
+                const int32_t* payload_i32_2 = payload_i32_1 + 8;
+                const int32_t* payload_i32_3 = payload_i32_2 + 8;
+
+                #pragma unroll
+                for (int g = 0; g < 8; ++g)
+                {
+                    const int32_t a = a4[g];
+                    acc[0] = __builtin_amdgcn_sdot4(a, payload_i32_0[g], acc[0], false);
+                    acc[1] = __builtin_amdgcn_sdot4(a, payload_i32_1[g], acc[1], false);
+                    acc[2] = __builtin_amdgcn_sdot4(a, payload_i32_2[g], acc[2], false);
+                    acc[3] = __builtin_amdgcn_sdot4(a, payload_i32_3[g], acc[3], false);
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    const int n = n_base + c;
+                    if (n < N)
+                    {
+                        const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
+                        const int32_t* payload_i32 = reinterpret_cast<const int32_t*>(d_payload + linear * 32u);
+                        #pragma unroll
+                        for (int g = 0; g < 8; ++g)
+                        {
+                            acc[c] = __builtin_amdgcn_sdot4(a4[g], payload_i32[g], acc[c], false);
+                        }
+                    }
+                }
+            }
+        }
+        else if constexpr (CPT == 2)
+        {
+            if ((n_base + 1) < N)
+            {
+                const int32_t* payload_i32_1 = payload_i32_0 + 8;
+                #pragma unroll
+                for (int g = 0; g < 8; ++g)
+                {
+                    const int32_t a = a4[g];
+                    acc[0] = __builtin_amdgcn_sdot4(a, payload_i32_0[g], acc[0], false);
+                    acc[1] = __builtin_amdgcn_sdot4(a, payload_i32_1[g], acc[1], false);
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    const int n = n_base + c;
+                    if (n < N)
+                    {
+                        const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
+                        const int32_t* payload_i32 = reinterpret_cast<const int32_t*>(d_payload + linear * 32u);
+                        #pragma unroll
+                        for (int g = 0; g < 8; ++g)
+                        {
+                            acc[c] = __builtin_amdgcn_sdot4(a4[g], payload_i32[g], acc[c], false);
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            #pragma unroll
+            for (int g = 0; g < 8; ++g)
+            {
+                acc[0] = __builtin_amdgcn_sdot4(a4[g], payload_i32_0[g], acc[0], false);
+            }
+        }
+    }
+
+    const int64_t out_base = static_cast<int64_t>(m) * N + n_base;
+    if (kb == 1)
+    {
+        if constexpr (CPT == 4)
+        {
+            if ((n_base + 3) < N)
+            {
+                *reinterpret_cast<uint4*>(d_C_int32 + out_base) = make_uint4(
+                    static_cast<uint32_t>(acc[0]),
+                    static_cast<uint32_t>(acc[1]),
+                    static_cast<uint32_t>(acc[2]),
+                    static_cast<uint32_t>(acc[3]));
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    const int n = n_base + c;
+                    if (n < N)
+                    {
+                        d_C_int32[out_base + c] = acc[c];
+                    }
+                }
+            }
+        }
+        else if constexpr (CPT == 2)
+        {
+            if ((n_base + 1) < N)
+            {
+                *reinterpret_cast<uint2*>(d_C_int32 + out_base) = make_uint2(
+                    static_cast<uint32_t>(acc[0]),
+                    static_cast<uint32_t>(acc[1]));
+            }
+            else
+            {
+                d_C_int32[out_base] = acc[0];
+                if ((n_base + 1) < N)
+                {
+                    d_C_int32[out_base + 1] = acc[1];
+                }
+            }
+        }
+        else
+        {
+            d_C_int32[out_base] = acc[0];
+        }
+    }
+    else
+    {
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            const int n = n_base + c;
+            if (n < N)
+            {
+                atomicAdd(&d_C_int32[out_base + c], acc[c]);
+            }
+        }
     }
 }
 
@@ -1596,7 +1873,7 @@ __global__ void gemv_ratio_vnni_grid_kpar_kernel_t(
     int N, int K, int kblocks,
     uint8_t)
 {
-    static_assert(CPT == 1, "Canonical ratio-VNNI path requires CPT==1");
+    static_assert(CPT == 1 || CPT == 2, "ratio-VNNI grid-kpar supports CPT in {1,2}");
 
     const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
     const bool active = (n_base < N);
@@ -1694,6 +1971,38 @@ __global__ void gemv_ratio_vnni_grid_kpar_kernel_t(
                     acc1 = __builtin_amdgcn_sdot4(a7, w1_high, acc1, false);
 
                     acc[0] = acc0 + acc1;
+                }
+            }
+            else if constexpr (CPT == 2)
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    const int n = n_base + c;
+                    if (n < N)
+                    {
+                        const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
+                        const uint8_t* payload16 = d_payload + linear * 16;
+                        const int8_t ratio = d_ratio[linear];
+
+                        int32_t packed_groups[8];
+                        if constexpr (IQ4)
+                        {
+                            decode_q4_block8_to_packed_i8<true>(payload16, ratio, packed_groups);
+                        }
+                        else
+                        {
+                            decode_q4_block8_to_packed_i8<false>(payload16, ratio, packed_groups);
+                        }
+
+                        int32_t lane_acc = acc[c];
+                        #pragma unroll
+                        for (int g = 0; g < 8; ++g)
+                        {
+                            lane_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], lane_acc, false);
+                        }
+                        acc[c] = lane_acc;
+                    }
                 }
             }
         }
@@ -2510,6 +2819,7 @@ bool rocmGemv_ratio_vnni_int8_int32(
 
     constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;  // 128
     constexpr int TN_IQ4_WIDE = 256;
+    constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;    // 2
     const int linear_tn_override = g_ratio_linear_tn_override.load(std::memory_order_relaxed);
     const int linear_kb_override = g_ratio_linear_kb_override.load(std::memory_order_relaxed);
     const int iq4_tn_override = g_ratio_iq4_tn_override.load(std::memory_order_relaxed);
@@ -2554,7 +2864,9 @@ bool rocmGemv_ratio_vnni_int8_int32(
             iq4_use_wide_tile = true;
         }
         const int tn_iq4 = iq4_use_wide_tile ? TN_IQ4_WIDE : TN;
-        const int grid_n_iq4 = (N + tn_iq4 - 1) / tn_iq4;
+        const bool iq4_use_cpt2 = (CPT == 2) && (N >= (tn_iq4 * CPT));
+        const int logical_tn_iq4 = tn_iq4 * (iq4_use_cpt2 ? CPT : 1);
+        const int grid_n_iq4 = (N + logical_tn_iq4 - 1) / logical_tn_iq4;
 
         if (!ensure_ratio_iq4_perm_lut_table_on_device(device_id))
         {
@@ -2563,19 +2875,41 @@ bool rocmGemv_ratio_vnni_int8_int32(
 
         if (iq4_use_wide_tile)
         {
-            hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true>),
-                dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
-                d_A_int8, d_payload, d_ratio, d_C_int32,
-                N, K, kb, codebook_id);
+            if (iq4_use_cpt2)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE * CPT, CPT, true>),
+                    dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
+                    d_A_int8, d_payload, d_ratio, d_C_int32,
+                    N, K, kb, codebook_id);
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true>),
+                    dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
+                    d_A_int8, d_payload, d_ratio, d_C_int32,
+                    N, K, kb, codebook_id);
+            }
         }
         else
         {
-            hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true>),
-                dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
-                d_A_int8, d_payload, d_ratio, d_C_int32,
-                N, K, kb, codebook_id);
+            if (iq4_use_cpt2)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN * CPT, CPT, true>),
+                    dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
+                    d_A_int8, d_payload, d_ratio, d_C_int32,
+                    N, K, kb, codebook_id);
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true>),
+                    dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
+                    d_A_int8, d_payload, d_ratio, d_C_int32,
+                    N, K, kb, codebook_id);
+            }
         }
     }
     else
@@ -2611,7 +2945,9 @@ bool rocmGemv_ratio_vnni_int8_int32(
             linear_use_wide_tile = true;
         }
         const int tn_linear = linear_use_wide_tile ? TN_IQ4_WIDE : TN;
-        const int grid_n_linear = (N + tn_linear - 1) / tn_linear;
+        const bool linear_use_cpt2 = (CPT == 2) && (N >= (tn_linear * CPT));
+        const int logical_tn_linear = tn_linear * (linear_use_cpt2 ? CPT : 1);
+        const int grid_n_linear = (N + logical_tn_linear - 1) / logical_tn_linear;
 
         if (!ensure_ratio_linear_perm_lut_table_on_device(device_id))
         {
@@ -2620,19 +2956,41 @@ bool rocmGemv_ratio_vnni_int8_int32(
 
         if (linear_use_wide_tile)
         {
-            hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, false>),
-                dim3(grid_n_linear, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
-                d_A_int8, d_payload, d_ratio, d_C_int32,
-                N, K, kb, codebook_id);
+            if (linear_use_cpt2)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE * CPT, CPT, false>),
+                    dim3(grid_n_linear, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
+                    d_A_int8, d_payload, d_ratio, d_C_int32,
+                    N, K, kb, codebook_id);
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, false>),
+                    dim3(grid_n_linear, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
+                    d_A_int8, d_payload, d_ratio, d_C_int32,
+                    N, K, kb, codebook_id);
+            }
         }
         else
         {
-            hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, false>),
-                dim3(grid_n_linear, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
-                d_A_int8, d_payload, d_ratio, d_C_int32,
-                N, K, kb, codebook_id);
+            if (linear_use_cpt2)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN * CPT, CPT, false>),
+                    dim3(grid_n_linear, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
+                    d_A_int8, d_payload, d_ratio, d_C_int32,
+                    N, K, kb, codebook_id);
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, false>),
+                    dim3(grid_n_linear, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
+                    d_A_int8, d_payload, d_ratio, d_C_int32,
+                    N, K, kb, codebook_id);
+            }
         }
     }
     hipError_t err = hipGetLastError();
@@ -3462,7 +3820,14 @@ bool rocmGemm_ratio_vnni_int8_int32_prefill_v2(
     }
     else
     {
-        if (N >= 12288 && M <= 256)
+        if (is_i8_payload_family)
+        {
+            // Auto-tuned default for payload-v2 bitwidth-8 families (Q*_K / IQ*).
+            // Wider Y tile improves reuse of B payload rows across output rows.
+            block_x = 8;
+            block_y = 32;
+        }
+        else if (N >= 12288 && M <= 256)
         {
             block_x = 32;
             block_y = 8;
@@ -3477,7 +3842,12 @@ bool rocmGemm_ratio_vnni_int8_int32_prefill_v2(
     int kb = prefill_kb;
     if (kb <= 0)
     {
-        if (K >= 16384)
+        if (is_i8_payload_family)
+        {
+            // Auto-tuned split-K for payload-v2 bitwidth=8 route.
+            kb = 2;
+        }
+        else if (K >= 16384)
         {
             kb = 8;
         }
@@ -3511,9 +3881,12 @@ bool rocmGemm_ratio_vnni_int8_int32_prefill_v2(
         }
     }
 
+    const int payload_cpt = 1;
+
     const dim3 block(static_cast<unsigned>(block_x), static_cast<unsigned>(block_y), 1);
+    const int logical_tile_n = block_x * payload_cpt;
     const dim3 grid(
-        static_cast<unsigned>((N + block_x - 1) / block_x),
+        static_cast<unsigned>((N + logical_tile_n - 1) / logical_tile_n),
         static_cast<unsigned>((M + block_y - 1) / block_y),
         static_cast<unsigned>(kb));
 
@@ -3576,19 +3949,144 @@ bool rocmGemm_ratio_vnni_int8_int32_prefill_v2(
     }
     else
     {
-        hipLaunchKernelGGL(
-            gemm_payload_v2_i8_prefill_kernel,
-            grid,
-            block,
-            0,
-            static_cast<hipStream_t>(stream),
-            d_A_int8,
-            d_payload,
-            d_C_int32,
-            M,
-            N,
-            K,
-            kb);
+        if (payload_cpt >= 4)
+        {
+            if (block_x == 32 && block_y == 8)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemm_payload_v2_i8_prefill_kernel_t<32, 8, 4>),
+                    grid,
+                    block,
+                    0,
+                    static_cast<hipStream_t>(stream),
+                    d_A_int8,
+                    d_payload,
+                    d_C_int32,
+                    M,
+                    N,
+                    K,
+                    kb);
+            }
+            else if (block_x == 8 && block_y == 32)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemm_payload_v2_i8_prefill_kernel_t<8, 32, 4>),
+                    grid,
+                    block,
+                    0,
+                    static_cast<hipStream_t>(stream),
+                    d_A_int8,
+                    d_payload,
+                    d_C_int32,
+                    M,
+                    N,
+                    K,
+                    kb);
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemm_payload_v2_i8_prefill_kernel_t<16, 16, 4>),
+                    grid,
+                    block,
+                    0,
+                    static_cast<hipStream_t>(stream),
+                    d_A_int8,
+                    d_payload,
+                    d_C_int32,
+                    M,
+                    N,
+                    K,
+                    kb);
+            }
+        }
+        else if (payload_cpt == 2)
+        {
+            if (block_x == 32 && block_y == 8)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemm_payload_v2_i8_prefill_kernel_t<32, 8, 2>),
+                    grid,
+                    block,
+                    0,
+                    static_cast<hipStream_t>(stream),
+                    d_A_int8,
+                    d_payload,
+                    d_C_int32,
+                    M,
+                    N,
+                    K,
+                    kb);
+            }
+            else if (block_x == 8 && block_y == 32)
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemm_payload_v2_i8_prefill_kernel_t<8, 32, 2>),
+                    grid,
+                    block,
+                    0,
+                    static_cast<hipStream_t>(stream),
+                    d_A_int8,
+                    d_payload,
+                    d_C_int32,
+                    M,
+                    N,
+                    K,
+                    kb);
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemm_payload_v2_i8_prefill_kernel_t<16, 16, 2>),
+                    grid,
+                    block,
+                    0,
+                    static_cast<hipStream_t>(stream),
+                    d_A_int8,
+                    d_payload,
+                    d_C_int32,
+                    M,
+                    N,
+                    K,
+                    kb);
+            }
+        }
+        else
+        {
+            const bool use_shared_payload = (N <= 8192);
+            if (use_shared_payload)
+            {
+                hipLaunchKernelGGL(
+                    gemm_payload_v2_i8_prefill_kernel,
+                    grid,
+                    block,
+                    static_cast<size_t>(block_x) * 8u * sizeof(int32_t),
+                    static_cast<hipStream_t>(stream),
+                    d_A_int8,
+                    d_payload,
+                    d_C_int32,
+                    M,
+                    N,
+                    K,
+                    kb);
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    gemm_payload_v2_i8_prefill_kernel_direct,
+                    grid,
+                    block,
+                    0,
+                    static_cast<hipStream_t>(stream),
+                    d_A_int8,
+                    d_payload,
+                    d_C_int32,
+                    M,
+                    N,
+                    K,
+                    kb);
+            }
+        }
     }
 
     const hipError_t err = hipGetLastError();

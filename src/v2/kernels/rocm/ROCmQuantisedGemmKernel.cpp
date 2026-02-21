@@ -2077,7 +2077,24 @@ namespace llaminar2
             {
                 LOG_TRACE("[" << callsite << "] Trying INT8 VNNI native prefill scaffold (M=" << m
                               << " N=" << n << " K=" << k << ")");
-                const bool try_grid_kpar = debugEnv().rocm.vnni_prefill_grid_kpar && k >= 256 && n >= 128;
+                const double k_over_m = static_cast<double>(k) / static_cast<double>(std::max(m, 1));
+                const bool reduction_pressure =
+                    (k >= 1024) ||
+                    ((k >= 512) && (k_over_m >= 16.0));
+                const bool try_grid_kpar =
+                    debugEnv().rocm.vnni_prefill_grid_kpar &&
+                    n >= 128 &&
+                    m >= 8 &&
+                    reduction_pressure;
+
+                if (debugEnv().rocm.vnni_prefill_grid_kpar && !try_grid_kpar)
+                {
+                    static std::once_flag grid_kpar_gate_once;
+                    std::call_once(grid_kpar_gate_once, [&]()
+                                   { LOG_INFO("[" << callsite << "] INT8 prefill grid-kpar gated off for low reduction-pressure shapes"
+                                                 << " (M=" << m << ", N=" << n << ", K=" << k
+                                                 << ", K/M=" << std::fixed << std::setprecision(2) << k_over_m << ")"); });
+                }
                 if (try_grid_kpar)
                 {
                     const int requested_slices_env = debugEnv().rocm.vnni_prefill_grid_kpar_splits;
@@ -4117,6 +4134,73 @@ namespace llaminar2
                                       << (packed_->int8_data_vnni.size() / 1024) << " KB");
                         }
 
+                        // Optional persistent row-major upload for CK prefill reuse.
+                        // When host row-major pack is available, keep a device copy so
+                        // repeated prefill calls can bypass VNNI/ratio->row-major repack.
+                        if (!packed_->int8_data.empty())
+                        {
+                            if (!rocmQuantGemm_allocInt8(&upload.d_int8_data_rowmajor,
+                                                         packed_->int8_data.size(),
+                                                         rocm_device_id_))
+                            {
+                                if (upload.d_ratio_vnni_min)
+                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_min, rocm_device_id_);
+                                if (upload.d_ratio_vnni_ratio)
+                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_ratio, rocm_device_id_);
+                                if (upload.d_ratio_vnni_payload)
+                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_payload, rocm_device_id_);
+                                if (upload.d_int8_data_vnni)
+                                    rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
+                                if (upload.d_scales)
+                                    rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
+                                upload.d_ratio_vnni_min = nullptr;
+                                upload.d_ratio_vnni_ratio = nullptr;
+                                upload.d_ratio_vnni_payload = nullptr;
+                                upload.d_int8_data_vnni = nullptr;
+                                upload.d_scales = nullptr;
+                                cleanup_startup_async_resources();
+                                LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc row-major weights");
+                                return;
+                            }
+
+                            err = startupMemcpyAsyncOrSync(
+                                upload.d_int8_data_rowmajor,
+                                packed_->int8_data.data(),
+                                packed_->int8_data.size() * sizeof(int8_t),
+                                async_upload_enabled,
+                                upload.startup_h2d_stream,
+                                nullptr,
+                                "ROCmQuantisedGemmKernel::ensureWeightsConverted",
+                                "rowmajor");
+                            if (err != hipSuccess)
+                            {
+                                rocmQuantGemm_freeDevice(upload.d_int8_data_rowmajor, rocm_device_id_);
+                                upload.d_int8_data_rowmajor = nullptr;
+                                if (upload.d_ratio_vnni_min)
+                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_min, rocm_device_id_);
+                                if (upload.d_ratio_vnni_ratio)
+                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_ratio, rocm_device_id_);
+                                if (upload.d_ratio_vnni_payload)
+                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_payload, rocm_device_id_);
+                                if (upload.d_int8_data_vnni)
+                                    rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
+                                if (upload.d_scales)
+                                    rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
+                                upload.d_ratio_vnni_min = nullptr;
+                                upload.d_ratio_vnni_ratio = nullptr;
+                                upload.d_ratio_vnni_payload = nullptr;
+                                upload.d_int8_data_vnni = nullptr;
+                                upload.d_scales = nullptr;
+                                cleanup_startup_async_resources();
+                                LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload row-major weights: "
+                                          << hipGetErrorString(err));
+                                return;
+                            }
+
+                            LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded persistent row-major weights for CK prefill reuse: "
+                                      << (packed_->int8_data.size() / 1024) << " KB");
+                        }
+
                         // Upload ratio-VNNI compact buffers if available
                         if (!packed_->ratio_vnni_payload.empty() && !packed_->ratio_vnni_ratio.empty())
                         {
@@ -4332,10 +4416,10 @@ namespace llaminar2
                         upload_it = emplaced.first;
                     }
 
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded pre-packed weights (Option B) to ROCm:" << rocm_device_id_
-                                                                                                          << " " << packed_->N << "x" << packed_->K
-                                                                                                          << " VRAM: " << (packed_->int8_data_vnni.size() / 1024) << " KB"
-                                                                                                          << " (was " << (packed_->int8_data_vnni.size() * 2 / 1024) << " KB with row-major)");
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded pre-packed weights to ROCm:" << rocm_device_id_
+                                                                                                 << " " << packed_->N << "x" << packed_->K
+                                                                                                 << " vnni=" << (packed_->int8_data_vnni.size() / 1024) << " KB"
+                                                                                                 << " rowmajor=" << (packed_->int8_data.size() / 1024) << " KB");
                 }
 
                 {
