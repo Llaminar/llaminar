@@ -2181,6 +2181,11 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR_KB=<n>` - Grid-kpar K-block count override (`0` = auto policy)
      * - `LLAMINAR_ROCM_VNNI_PREFILL_VARIANT=<id>` - Force baseline INT8 prefill tile variant (`-1` auto, `0` 16x16, `1` 32x8, `2` 8x32, `3` 8x8)
      * - `LLAMINAR_ROCM_VNNI_PREFILL_GRID_VARIANT=<id>` - Force grid-kpar INT8 prefill tile variant (`-1` auto, `0` 16x16, `1` 32x8, `2` 8x32, `3` 8x8)
+    * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE=1` - Enable FFN-wide policy override for production dispatch path
+    * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_GRID_KPAR=<n>` - FFN override grid-kpar mode (`-1` policy default, `0` baseline, `1` grid-kpar)
+    * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_SPLITS=<n>` - FFN override split-K slices (`0` policy default)
+    * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_CPT=<n>` - FFN override outputs-per-thread (`0` policy default, `1`,`2`,`4` valid)
+    * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_VARIANT=<id>` - FFN override tile variant (`-1` policy default, `0` 16x16, `1` 32x8, `2` 8x32, `3` 8x8)
      * - `LLAMINAR_ROCM_RATIO_PREFILL_VARIANT=<id>` - Force ratio-prefill tile variant (`-1` auto, `0` 16x16, `1` 32x8, `2` 8x32, `3` 8x8)
      * - `LLAMINAR_ROCM_RATIO_PREFILL_KB=<n>` - Ratio-prefill split-K blocks (`0` = auto)
      * - `LLAMINAR_ROCM_RATIO_PREFILL_LINEAR_VARIANT=<id>` - Force linear-codebook ratio prefill tile variant (`-1`=use global/auto)
@@ -2213,6 +2218,11 @@ namespace llaminar2
         int vnni_prefill_grid_kpar_kb = 0;      ///< Grid-kpar K-block count override (0=auto)
         int vnni_prefill_variant = -1;          ///< Baseline prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
         int vnni_prefill_grid_variant = -1;     ///< Grid-kpar prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
+        bool vnni_prefill_ffn_override = false; ///< Enable FFN-wide policy override for INT8 prefill
+        int vnni_prefill_ffn_override_grid_kpar = -1;
+        int vnni_prefill_ffn_override_splits = 0;
+        int vnni_prefill_ffn_override_cpt = 0;
+        int vnni_prefill_ffn_override_variant = -1;
         int ratio_prefill_variant = -1;         ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
         int ratio_prefill_kb = 0;               ///< Ratio prefill split-K blocks override (0=auto)
         int ratio_prefill_linear_variant = -1;  ///< Linear codebook ratio prefill tile override (-1=use global/auto)
@@ -2245,6 +2255,11 @@ namespace llaminar2
             vnni_prefill_grid_kpar_kb = 0;
             vnni_prefill_variant = -1;
             vnni_prefill_grid_variant = -1;
+            vnni_prefill_ffn_override = false;
+            vnni_prefill_ffn_override_grid_kpar = -1;
+            vnni_prefill_ffn_override_splits = 0;
+            vnni_prefill_ffn_override_cpt = 0;
+            vnni_prefill_ffn_override_variant = -1;
             ratio_prefill_variant = -1;
             ratio_prefill_kb = 0;
             ratio_prefill_linear_variant = -1;
@@ -2348,6 +2363,40 @@ namespace llaminar2
             if (vnni_prefill_grid_variant_env)
             {
                 vnni_prefill_grid_variant = std::clamp(std::atoi(vnni_prefill_grid_variant_env), -1, 3);
+            }
+
+            const char *vnni_prefill_ffn_override_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE");
+            if (vnni_prefill_ffn_override_env)
+            {
+                vnni_prefill_ffn_override = (std::atoi(vnni_prefill_ffn_override_env) != 0);
+            }
+
+            const char *vnni_prefill_ffn_override_grid_kpar_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_GRID_KPAR");
+            if (vnni_prefill_ffn_override_grid_kpar_env)
+            {
+                vnni_prefill_ffn_override_grid_kpar = std::clamp(std::atoi(vnni_prefill_ffn_override_grid_kpar_env), -1, 1);
+            }
+
+            const char *vnni_prefill_ffn_override_splits_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_SPLITS");
+            if (vnni_prefill_ffn_override_splits_env)
+            {
+                vnni_prefill_ffn_override_splits = std::clamp(std::atoi(vnni_prefill_ffn_override_splits_env), 0, 32);
+            }
+
+            const char *vnni_prefill_ffn_override_cpt_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_CPT");
+            if (vnni_prefill_ffn_override_cpt_env)
+            {
+                const int requested_cpt = std::atoi(vnni_prefill_ffn_override_cpt_env);
+                if (requested_cpt == 0 || requested_cpt == 1 || requested_cpt == 2 || requested_cpt == 4)
+                {
+                    vnni_prefill_ffn_override_cpt = requested_cpt;
+                }
+            }
+
+            const char *vnni_prefill_ffn_override_variant_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_VARIANT");
+            if (vnni_prefill_ffn_override_variant_env)
+            {
+                vnni_prefill_ffn_override_variant = std::clamp(std::atoi(vnni_prefill_ffn_override_variant_env), -1, 3);
             }
 
             const char *ratio_prefill_variant_env = std::getenv("LLAMINAR_ROCM_RATIO_PREFILL_VARIANT");

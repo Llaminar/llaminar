@@ -1175,6 +1175,233 @@ Next action from this slice:
    2. Add FFN-focused fast path for persistent packed-B reuse to suppress non-math overhead.
    3. Re-run `V2_Perf_ROCmPrefillDispatchComparison` plus focused strategy-lab A/B to verify production-path gains persist.
 
+#### Latest Validation (2026-02-23, Slice 36 - FFN guardrails + persistent row-major reuse implementation)
+- Implemented code-level tuning deltas in `src/v2/kernels/rocm/ROCmQuantisedGemmKernel.cpp`:
+   1. **FFN launch-geometry guardrails (native INT8 prefill policy)**
+      - Added auto-policy guardrails to disable `grid-kpar` for low-parallelism FFN conditions (`M < 16`, low K-group count, or insufficient logical tile count).
+      - Added guardrail telemetry counter: `prefill_gemm.int8_policy.guardrail_disable_grid_kpar`.
+   2. **FFN persistent packed-B reuse fast path (CK fallback path)**
+      - Added one-time materialization of a persistent row-major B buffer for FFN-like prefill shapes when startup row-major upload is unavailable.
+      - Reuses the persistent buffer on subsequent calls, reducing repeated VNNI/ratio→row-major repack overhead.
+      - Added reuse telemetry counters:
+         - `prefill_gemm.ck_rowmajor_persistent.materialized`
+         - `prefill_gemm.ck_rowmajor_persistent.reuse`
+
+- Build/validation status:
+   - `cmake --build build_v2_release --target v2_perf_rocm_prefill_strategy_lab --parallel` ✅
+   - `cmake --build build_v2_release --target v2_perf_rocm_prefill_dispatch_comparison --parallel` ✅
+   - `ctest --test-dir build_v2_release -R '^V2_Perf_ROCmPrefillDispatchComparison$' --output-on-failure` ✅
+
+- Focused post-change FFN A/B rerun (strategy-lab, `iters=6`):
+   - `0.5B FFN (128,4864,896)`: CK `1.068 ms` vs `lmhead_vec_mr4_pad_cpt4` `0.117 ms` (`vsCK(E2E)=9.107`, previously `8.889`).
+   - `3B FFN (128,11008,2048)`: CK `3.354 ms` vs `wave64_cpt4_aligned_unroll2_lb_cap128` `0.707 ms` (`vsCK(E2E)=4.747`, previously `5.370`; run-to-run drift noted).
+
+- Full production-style perf suite (post-change) still passes and remains parity-clean:
+   - `V2_Perf_ROCmPrefillDispatchComparison`: PASSED.
+   - Class summary remains directionally unchanged (Attention/FFN_Down favor new path; FFN_Up/FFN_Gate/LM_Head favor legacy CK in this harness).
+
+Next action from this slice:
+- Run a short repeatability batch (`iters=16`) on the two FFN shapes and use the new telemetry counters to confirm persistent row-major reuse hit-rate before further policy promotion.
+
+#### Latest Validation (2026-02-23, Slice 37 - FFN env override knobs + production sweep parse fix)
+- Implemented FFN override controls in `src/v2/utils/DebugEnv.h` + `src/v2/kernels/rocm/ROCmQuantisedGemmKernel.cpp`:
+   - New env knobs:
+      - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE=1`
+      - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_GRID_KPAR` (`-1` policy default, `0` baseline, `1` grid-kpar)
+      - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_SPLITS` (`0` policy default)
+      - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_CPT` (`0` policy default, `1/2/4` valid)
+      - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_VARIANT` (`-1` policy default, `0..3` tile id)
+   - Policy now consumes the above knobs for FFN-like shapes (`N/K in [2,16), M>=64`) and emits profile tags:
+      - `prefill_gemm.int8_policy.ffn_override_env_gridkpar`
+      - `prefill_gemm.int8_policy.ffn_override_env_baseline`
+
+- Build + validation status:
+   - `cmake --build build_v2_release --target v2_perf_rocm_prefill_dispatch_comparison --parallel` ✅
+   - Production harness sweep completed with parser fixed for libfort box-drawing separators (`║` + `│`).
+
+- Production-path FFN override sweep (12 configs, benchmark: `build_v2_release/tests/v2/v2_perf_rocm_prefill_dispatch_comparison`):
+   - **Best in this batch:** `grid=1, variant=1, cpt=4, splits=4`
+      - `Qwen2.5-0.5B_FFN_Up`: `0.938x`
+      - `Qwen2.5-0.5B_FFN_Gate`: `0.940x`
+      - `Qwen2.5-3B_FFN_Up`: `0.890x`
+      - `Qwen2.5-3B_FFN_Gate`: `0.890x`
+      - Aggregate FFN score (mean of four rows): `0.9145x`
+   - Top-5 ranking by aggregate score:
+      1. `grid1_v1_c4_s4` (`avg=0.9145`, `min=0.890`)
+      2. `grid1_v1_c4_s6` (`avg=0.9118`, `min=0.879`)
+      3. `grid1_v1_c4_s2` (`avg=0.9118`, `min=0.875`)
+      4. `grid1_v3_c4_s2` (`avg=0.9038`, `min=0.875`)
+      5. `base_v3_c4` (`avg=0.9020`, `min=0.875`)
+
+- Interpretation:
+   - `PARSE_FAIL` issue was parser-side (column indexing with mixed box separators), not benchmark instability.
+   - With parser corrected, FFN-only production ranking is stable, but all tested FFN overrides remain CK-favored (< `1.0x`) in this harness.
+
+Next action from this slice:
+- Use the new env knobs to run repeatability (`iters=16`, multi-run) for the top 2-3 configs and validate whether `grid1_v1_c4_s4` remains best under variance; only then consider policy promotion.
+
+#### Latest Validation (2026-02-23, Slice 38 - FFN HIP kernel-body tuning, not dispatch-only)
+- Implemented direct HIP kernel tuning in `src/v2/kernels/rocm/ROCmQuantisedGemmKernel_CK.hip`:
+   - Updated both INT8 prefill kernels:
+      - `qgemm_int8_int8_vnni_prefill_kernel_t`
+      - `qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t`
+   - Core changes:
+      1. Hoisted full-tile boundary checks (`full_tile`) outside inner `kg` loops.
+      2. Replaced repeated `(kg * N + n)` address recomputation with pointer-increment traversal (`a_ptr += 4`, `b_ptr += N*4`).
+      3. Kept tail paths explicit but moved validity checks to lightweight per-iteration pointer paths.
+
+- Build + run status:
+   - `cmake --build build_v2_release --target v2_perf_rocm_prefill_dispatch_comparison --parallel` ✅
+   - Benchmark run with best-known FFN override knobs from Slice 37:
+      - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE=1`
+      - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_GRID_KPAR=1`
+      - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_SPLITS=4`
+      - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_CPT=4`
+      - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_VARIANT=1`
+
+- Measured FFN results vs CK (production dispatch harness):
+   - `Qwen2.5-0.5B_FFN_Up`: `0.955x`
+   - `Qwen2.5-0.5B_FFN_Gate`: `0.949x`
+   - `Qwen2.5-3B_FFN_Up`: `0.899x`
+   - `Qwen2.5-3B_FFN_Gate`: `0.904x`
+   - Aggregate FFN mean: `0.9268x` (min: `0.899x`)
+
+- Interpretation:
+   - This slice confirms a **real kernel-body gain** over the prior dispatch-only best (`~0.9145x` aggregate in Slice 37), while still remaining CK-favored overall.
+   - The largest remaining gap is concentrated in 3B FFN Up/Gate, suggesting the next round should target high-N/high-K memory throughput and split-K reduction overhead specifically.
+
+Next action from this slice:
+- Add a second kernel-level experiment focused on 3B FFN shapes: staged B-vector load path (or LDS-assisted B tile for grid-kpar) with minimal register growth, then re-run the same four-row FFN scorecard.
+
+#### Latest Validation (2026-02-23, Slice 39 - 3B-focused grid-kpar kernel experiments)
+- Ran two follow-up kernel-body experiments in `src/v2/kernels/rocm/ROCmQuantisedGemmKernel_CK.hip` for FFN Up/Gate:
+
+1. **Experiment A (LDS-staged B broadcast across Y dimension, grid-kpar 32x8/CPT4 path)**
+   - Added optional staged mode in `qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t` and enabled it for the hot launch path.
+   - Result: major regression in production FFN scorecard (`avg=0.817x`, `min=0.752x`), likely barrier/synchronization overhead dominating expected global-load savings.
+   - Action: rolled back active launch to non-staged path.
+
+2. **Experiment B (atomic accumulation branch removal)**
+   - Removed `acc[c] != 0` guard before `atomicAdd` in grid-kpar output accumulation.
+   - Rationale: reduce control-flow/divergence overhead in a path where accumulators are rarely zero for FFN workloads.
+
+- Measured FFN scorecard (same production harness + same override knobs):
+   - `Qwen2.5-0.5B_FFN_Up`: `0.953x`
+   - `Qwen2.5-0.5B_FFN_Gate`: `0.959x`
+   - `Qwen2.5-3B_FFN_Up`: `0.901x`
+   - `Qwen2.5-3B_FFN_Gate`: `0.902x`
+   - Aggregate FFN mean: `0.9288x` (min: `0.901x`)
+
+- Interpretation:
+   - Best kernel-body result so far improved from Slice 38 (`0.9268x`) to `0.9288x`, but CK remains ahead overall.
+   - Synchronization-heavy LDS staging is not a good fit for current grid-kpar mapping on these FFN shapes; low-overhead instruction/control-path cleanup produced a safer gain.
+
+Next action from this slice:
+- Focus next kernel work on reducing global atomic pressure for 3B FFN (e.g., warp-local partial reduction before atomics, or split-K slice tuning tied to atomic contention) while preserving the no-regression 0.5B behavior.
+
+#### Latest Validation (2026-02-23, Slice 40 - two-phase first-slice accumulation experiment)
+- Implemented and tested a kernel-level two-phase accumulation variant for hot grid-kpar prefill (`32x8`, `CPT=4`):
+   1. First launch writes slice-0 partials directly (non-atomic).
+   2. Second launch accumulates remaining slices via `atomicAdd`.
+- Goal: reduce global atomic traffic by one slice worth of atomics in FFN Up/Gate.
+
+- Result in production FFN scorecard:
+   - `Qwen2.5-0.5B_FFN_Up`: `0.957x`
+   - `Qwen2.5-0.5B_FFN_Gate`: `0.948x`
+   - `Qwen2.5-3B_FFN_Up`: `0.888x`
+   - `Qwen2.5-3B_FFN_Gate`: `0.891x`
+   - Aggregate: `0.9210x` (regression vs Slice 39 best `0.9288x`).
+
+- Decision:
+   - Do **not** promote two-phase accumulation path.
+   - Keep active direction anchored on the lower-risk branch-removal improvement from Slice 39.
+
+- Additional note:
+   - This slice suggests that extra launch/control complexity can offset any saved atomic operations for current FFN shapes on MI60; contention mitigation should next focus on in-kernel reduction patterns with minimal launch/synchronization overhead.
+
+Next action from this slice:
+- Prototype a warp-cooperative accumulation path that reduces per-element atomics without introducing an extra kernel launch, then re-run the same four-row FFN scorecard.
+
+#### Latest Validation (2026-02-23, Slice 41 - grid-kpar int32-pointer B traversal)
+- Implemented a focused hot-loop tuning in `src/v2/kernels/rocm/ROCmQuantisedGemmKernel_CK.hip` for `qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t`:
+   - Switched full-tile and tail `CPT=4`/`CPT=2` B-side traversal from byte-pointer + vector reinterpret casts to direct `int32_t*` row-stride traversal (`stride_i32 = N`).
+   - Kept arithmetic and launch policy unchanged (same split-k/grid-kpar FFN override settings), isolating the loop-load addressing effect.
+
+- Build + validation status:
+   - `cmake --build build_v2_release --target v2_perf_rocm_prefill_dispatch_comparison --parallel` ✅
+   - Pinned production benchmark config:
+      - `LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL=1`
+      - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE=1`
+      - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_GRID_KPAR=1`
+      - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_SPLITS=4`
+      - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_CPT=4`
+      - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_VARIANT=1`
+
+- Repeat measurements (4-row FFN scorecard):
+   1. `avg=0.9285`, `min=0.898`
+   2. `avg=0.9268`, `min=0.901`
+   3. `avg=0.9245`, `min=0.902`
+   - Representative row values stayed in the same band as Slice 39 but with slightly improved central tendency vs the immediate post-rollback baseline (~`0.920-0.924` range).
+
+- Interpretation:
+   - This is a small, low-risk kernel-body improvement (address-generation/typed-load cleanup) with no evidence of regression across the four FFN rows.
+   - CK remains ahead overall (`< 1.0x`), and the primary remaining deficit is still 3B FFN Up/Gate.
+
+Next action from this slice:
+- Continue with a no-extra-launch atomic-pressure reduction experiment (warp-cooperative accumulation) on the same grid-kpar path, validated against the identical four-row FFN scorecard.
+
+#### Latest Validation (2026-02-23, Slice 42 - in-kernel pair-slice accumulation experiment, rolled back)
+- Implemented and tested a targeted split-K atomic-pressure experiment in `src/v2/kernels/rocm/ROCmQuantisedGemmKernel_CK.hip`:
+   - Added a specialized `32x8/CPT4` grid-kpar kernel that accumulates **two split-K slices per thread** before issuing atomics (single launch, no extra reduction kernel).
+   - Launch policy used paired `grid.z` for this hot path while keeping the same FFN override benchmark knobs.
+
+- Measurement outcome (pinned production FFN scorecard):
+   - Representative first run: `avg=0.9233`, `min=0.892`
+   - Repeat set:
+      1. `avg=0.9160`, `min=0.891`
+      2. `avg=0.9233`, `min=0.893`
+      3. `avg=0.9153`, `min=0.887`
+   - Regression concentrated in 3B FFN Up/Gate minima compared with the active baseline band.
+
+- Decision:
+   - **Do not promote** this pair-slice path.
+   - Rolled back the specialized kernel and launch branch; restored prior baseline implementation.
+
+- Post-rollback sanity check (same pinned benchmark settings):
+   - `Qwen2.5-0.5B_FFN_Up`: `0.959x`
+   - `Qwen2.5-0.5B_FFN_Gate`: `0.944x`
+   - `Qwen2.5-3B_FFN_Up`: `0.904x`
+   - `Qwen2.5-3B_FFN_Gate`: `0.904x`
+   - Aggregate: `0.9278x` (min: `0.904x`), consistent with restored pre-experiment baseline band.
+
+Next action from this slice:
+- Try a lower-risk in-kernel contention tactic that keeps launch topology unchanged (e.g., selective atomic path tuning by tile occupancy), and re-evaluate on the same four-row FFN scorecard.
+
+#### Latest Validation (2026-02-23, Slice 43 - high-contention 32x4 launch-shape variant, rolled back)
+- Implemented a launch-shape contention experiment in `src/v2/kernels/rocm/ROCmQuantisedGemmKernel_CK.hip` for grid-kpar `PREFILL_TILE_32x8`, `CPT=4`:
+   - For high-contention large FFN conditions (`slices>=4`, `N>=8192`, `K>=2048`), temporarily switched block shape from `32x8` to `32x4` while keeping kernel math unchanged.
+   - Goal: test whether lower Y-lane concurrency improves atomic contention behavior on 3B FFN Up/Gate.
+
+- Measurement outcome (pinned production FFN scorecard, 3 repeats):
+   1. `avg=0.9123`, `min=0.878`
+   2. `avg=0.9155`, `min=0.879`
+   3. `avg=0.9138`, `min=0.880`
+   - 3B FFN rows dropped into `~0.878–0.882` band, materially below active baseline.
+
+- Decision:
+   - **Do not promote** this launch-shape variant.
+   - Rolled back to the original `32x8` launch path.
+
+- Post-rollback sanity run (same pinned settings):
+   - `Qwen2.5-0.5B_FFN_Up`: `0.949x`
+   - `Qwen2.5-0.5B_FFN_Gate`: `0.951x`
+   - `Qwen2.5-3B_FFN_Up`: `0.902x`
+   - `Qwen2.5-3B_FFN_Gate`: `0.902x`
+   - Aggregate: `0.9260x`, min `0.902x` (baseline band restored).
+
+Next action from this slice:
+- Continue with low-risk math-path micro-tuning inside the existing `32x8/CPT4` kernel body (no launch-shape changes), and validate on the same four-row FFN scorecard.
+
 ## Appendix A - On-demand ROCm Strategy-Lab Profiling Reports
 
 Use `scripts/rocm_strategy_lab_rocprof_reports.py` to generate profiling reports quickly while iterating on new strategies.

@@ -1163,6 +1163,11 @@ __global__ void qgemm_int8_int8_vnni_prefill_kernel_t(
     }
 
     const int k_groups = K / 4;
+    const bool full_tile = (n_base + CPT - 1) < N;
+    const int64_t b_row_stride_bytes = static_cast<int64_t>(N) * 4;
+    const int8_t* a_ptr0 = d_A_int8 + static_cast<int64_t>(m) * K;
+    const int8_t* b_ptr0 = d_B_int8_vnni + static_cast<int64_t>(n_base) * 4;
+
     int32_t acc[CPT];
     #pragma unroll
     for (int c = 0; c < CPT; ++c)
@@ -1170,66 +1175,109 @@ __global__ void qgemm_int8_int8_vnni_prefill_kernel_t(
         acc[c] = 0;
     }
 
-    for (int kg = 0; kg < k_groups; ++kg)
+    if constexpr (CPT == 4)
     {
-        const int32_t a_packed = *reinterpret_cast<const int32_t*>(
-            d_A_int8 + static_cast<int64_t>(m) * K + kg * 4);
-
-        if constexpr (CPT == 4)
+        if (full_tile)
         {
-            if ((n_base + 3) < N)
+            const int8_t* a_ptr = a_ptr0;
+            const int8_t* b_ptr = b_ptr0;
+            for (int kg = 0; kg < k_groups; ++kg)
             {
-                const uint4 b_pack4 = *reinterpret_cast<const uint4*>(
-                    d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
+                const uint4 b_pack4 = *reinterpret_cast<const uint4*>(b_ptr);
                 acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.x), acc[0], false);
                 acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.y), acc[1], false);
                 acc[2] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.z), acc[2], false);
                 acc[3] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.w), acc[3], false);
-            }
-            else
-            {
-                #pragma unroll
-                for (int c = 0; c < CPT; ++c)
-                {
-                    const int n = n_base + c;
-                    if (n < N)
-                    {
-                        const int32_t b_packed = *reinterpret_cast<const int32_t*>(
-                            d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n) * 4);
-                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
-                    }
-                }
-            }
-        }
-        else if constexpr (CPT == 2)
-        {
-            if ((n_base + 1) < N)
-            {
-                const uint2 b_pack2 = *reinterpret_cast<const uint2*>(
-                    d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.x), acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.y), acc[1], false);
-            }
-            else
-            {
-                #pragma unroll
-                for (int c = 0; c < CPT; ++c)
-                {
-                    const int n = n_base + c;
-                    if (n < N)
-                    {
-                        const int32_t b_packed = *reinterpret_cast<const int32_t*>(
-                            d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n) * 4);
-                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
-                    }
-                }
+                a_ptr += 4;
+                b_ptr += b_row_stride_bytes;
             }
         }
         else
         {
-            const int32_t b_packed = *reinterpret_cast<const int32_t*>(
-                d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
+            const int valid = max(0, N - n_base);
+            const int8_t* a_ptr = a_ptr0;
+            const int8_t* b0 = b_ptr0;
+            const int8_t* b1 = b_ptr0 + 4;
+            const int8_t* b2 = b_ptr0 + 8;
+            const int8_t* b3 = b_ptr0 + 12;
+            for (int kg = 0; kg < k_groups; ++kg)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
+                if (valid > 0)
+                {
+                    acc[0] = __builtin_amdgcn_sdot4(a_packed, *reinterpret_cast<const int32_t*>(b0), acc[0], false);
+                }
+                if (valid > 1)
+                {
+                    acc[1] = __builtin_amdgcn_sdot4(a_packed, *reinterpret_cast<const int32_t*>(b1), acc[1], false);
+                }
+                if (valid > 2)
+                {
+                    acc[2] = __builtin_amdgcn_sdot4(a_packed, *reinterpret_cast<const int32_t*>(b2), acc[2], false);
+                }
+                if (valid > 3)
+                {
+                    acc[3] = __builtin_amdgcn_sdot4(a_packed, *reinterpret_cast<const int32_t*>(b3), acc[3], false);
+                }
+                a_ptr += 4;
+                b0 += b_row_stride_bytes;
+                b1 += b_row_stride_bytes;
+                b2 += b_row_stride_bytes;
+                b3 += b_row_stride_bytes;
+            }
+        }
+    }
+    else if constexpr (CPT == 2)
+    {
+        if (full_tile)
+        {
+            const int8_t* a_ptr = a_ptr0;
+            const int8_t* b_ptr = b_ptr0;
+            for (int kg = 0; kg < k_groups; ++kg)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
+                const uint2 b_pack2 = *reinterpret_cast<const uint2*>(b_ptr);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.x), acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.y), acc[1], false);
+                a_ptr += 4;
+                b_ptr += b_row_stride_bytes;
+            }
+        }
+        else
+        {
+            const int valid = max(0, N - n_base);
+            const int8_t* a_ptr = a_ptr0;
+            const int8_t* b0 = b_ptr0;
+            const int8_t* b1 = b_ptr0 + 4;
+            for (int kg = 0; kg < k_groups; ++kg)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
+                if (valid > 0)
+                {
+                    acc[0] = __builtin_amdgcn_sdot4(a_packed, *reinterpret_cast<const int32_t*>(b0), acc[0], false);
+                }
+                if (valid > 1)
+                {
+                    acc[1] = __builtin_amdgcn_sdot4(a_packed, *reinterpret_cast<const int32_t*>(b1), acc[1], false);
+                }
+                a_ptr += 4;
+                b0 += b_row_stride_bytes;
+                b1 += b_row_stride_bytes;
+            }
+        }
+    }
+    else
+    {
+        const int8_t* a_ptr = a_ptr0;
+        const int8_t* b_ptr = b_ptr0;
+        for (int kg = 0; kg < k_groups; ++kg)
+        {
+            const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
+            const int32_t b_packed = *reinterpret_cast<const int32_t*>(b_ptr);
             acc[0] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[0], false);
+            a_ptr += 4;
+            b_ptr += b_row_stride_bytes;
         }
     }
 
@@ -1279,7 +1327,7 @@ __global__ void qgemm_int8_int8_vnni_prefill_kernel_t(
     }
 }
 
-template <int BLOCK_X, int BLOCK_Y, int CPT>
+template <int BLOCK_X, int BLOCK_Y, int CPT, bool STAGE_B = false, bool ATOMIC_ACCUM = true>
 __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
     const int8_t* __restrict__ d_A_int8,
     const int8_t* __restrict__ d_B_int8_vnni,
@@ -1287,7 +1335,8 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
     int M,
     int N,
     int K,
-    int k_groups_per_slice)
+    int k_groups_per_slice,
+    int slice_index_base)
 {
     const int n_base = blockIdx.x * (BLOCK_X * CPT) + threadIdx.x * CPT;
     const int m = blockIdx.y * BLOCK_Y + threadIdx.y;
@@ -1299,13 +1348,18 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
     }
 
     const int total_k_groups = K / 4;
-    const int k_begin = split_idx * k_groups_per_slice;
+    const int k_begin = (split_idx + slice_index_base) * k_groups_per_slice;
     if (k_begin >= total_k_groups)
     {
         return;
     }
 
     const int k_end = min(total_k_groups, k_begin + k_groups_per_slice);
+    const bool full_tile = (n_base + CPT - 1) < N;
+    const int64_t b_row_stride_bytes = static_cast<int64_t>(N) * 4;
+    const int8_t* a_ptr0 = d_A_int8 + static_cast<int64_t>(m) * K + static_cast<int64_t>(k_begin) * 4;
+    const int8_t* b_ptr0 = d_B_int8_vnni + (static_cast<int64_t>(k_begin) * N + n_base) * 4;
+
     int32_t acc[CPT];
     #pragma unroll
     for (int c = 0; c < CPT; ++c)
@@ -1313,66 +1367,194 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
         acc[c] = 0;
     }
 
-    for (int kg = k_begin; kg < k_end; ++kg)
+    if constexpr (STAGE_B)
     {
-        const int32_t a_packed = *reinterpret_cast<const int32_t*>(
-            d_A_int8 + static_cast<int64_t>(m) * K + kg * 4);
+        __shared__ int32_t s_b_local[CPT][BLOCK_X];
+        const int valid = max(0, N - n_base);
+        const int lane_x = threadIdx.x;
+        const int8_t* a_ptr = a_ptr0;
 
         if constexpr (CPT == 4)
         {
-            if ((n_base + 3) < N)
+            const int8_t* b0 = b_ptr0;
+            const int8_t* b1 = b_ptr0 + 4;
+            const int8_t* b2 = b_ptr0 + 8;
+            const int8_t* b3 = b_ptr0 + 12;
+
+            for (int kg = k_begin; kg < k_end; ++kg)
             {
-                const uint4 b_pack4 = *reinterpret_cast<const uint4*>(
-                    d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.x), acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.y), acc[1], false);
-                acc[2] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.z), acc[2], false);
-                acc[3] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.w), acc[3], false);
-            }
-            else
-            {
-                #pragma unroll
-                for (int c = 0; c < CPT; ++c)
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
+                if (threadIdx.y == 0)
                 {
-                    const int n = n_base + c;
-                    if (n < N)
-                    {
-                        const int32_t b_packed = *reinterpret_cast<const int32_t*>(
-                            d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n) * 4);
-                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
-                    }
+                    s_b_local[0][lane_x] = (valid > 0) ? *reinterpret_cast<const int32_t*>(b0) : 0;
+                    s_b_local[1][lane_x] = (valid > 1) ? *reinterpret_cast<const int32_t*>(b1) : 0;
+                    s_b_local[2][lane_x] = (valid > 2) ? *reinterpret_cast<const int32_t*>(b2) : 0;
+                    s_b_local[3][lane_x] = (valid > 3) ? *reinterpret_cast<const int32_t*>(b3) : 0;
+                    b0 += b_row_stride_bytes;
+                    b1 += b_row_stride_bytes;
+                    b2 += b_row_stride_bytes;
+                    b3 += b_row_stride_bytes;
                 }
+                __syncthreads();
+
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, s_b_local[0][lane_x], acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, s_b_local[1][lane_x], acc[1], false);
+                acc[2] = __builtin_amdgcn_sdot4(a_packed, s_b_local[2][lane_x], acc[2], false);
+                acc[3] = __builtin_amdgcn_sdot4(a_packed, s_b_local[3][lane_x], acc[3], false);
+
+                __syncthreads();
+                a_ptr += 4;
             }
         }
         else if constexpr (CPT == 2)
         {
-            if ((n_base + 1) < N)
+            const int8_t* b0 = b_ptr0;
+            const int8_t* b1 = b_ptr0 + 4;
+
+            for (int kg = k_begin; kg < k_end; ++kg)
             {
-                const uint2 b_pack2 = *reinterpret_cast<const uint2*>(
-                    d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.x), acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.y), acc[1], false);
-            }
-            else
-            {
-                #pragma unroll
-                for (int c = 0; c < CPT; ++c)
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
+                if (threadIdx.y == 0)
                 {
-                    const int n = n_base + c;
-                    if (n < N)
-                    {
-                        const int32_t b_packed = *reinterpret_cast<const int32_t*>(
-                            d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n) * 4);
-                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
-                    }
+                    s_b_local[0][lane_x] = (valid > 0) ? *reinterpret_cast<const int32_t*>(b0) : 0;
+                    s_b_local[1][lane_x] = (valid > 1) ? *reinterpret_cast<const int32_t*>(b1) : 0;
+                    b0 += b_row_stride_bytes;
+                    b1 += b_row_stride_bytes;
                 }
+                __syncthreads();
+
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, s_b_local[0][lane_x], acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, s_b_local[1][lane_x], acc[1], false);
+
+                __syncthreads();
+                a_ptr += 4;
             }
         }
         else
         {
-            const int32_t b_packed = *reinterpret_cast<const int32_t*>(
-                d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
+            const int8_t* b0 = b_ptr0;
+            for (int kg = k_begin; kg < k_end; ++kg)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
+                if (threadIdx.y == 0)
+                {
+                    s_b_local[0][lane_x] = (valid > 0) ? *reinterpret_cast<const int32_t*>(b0) : 0;
+                    b0 += b_row_stride_bytes;
+                }
+                __syncthreads();
+
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, s_b_local[0][lane_x], acc[0], false);
+
+                __syncthreads();
+                a_ptr += 4;
+            }
+        }
+    }
+    else if constexpr (CPT == 4)
+    {
+        if (full_tile)
+        {
+            const int8_t* a_ptr = a_ptr0;
+            const int32_t* b_ptr = reinterpret_cast<const int32_t*>(b_ptr0);
+            const int b_row_stride_i32 = N;
+            for (int kg = k_begin; kg < k_end; ++kg)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_ptr[0], acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_ptr[1], acc[1], false);
+                acc[2] = __builtin_amdgcn_sdot4(a_packed, b_ptr[2], acc[2], false);
+                acc[3] = __builtin_amdgcn_sdot4(a_packed, b_ptr[3], acc[3], false);
+                a_ptr += 4;
+                b_ptr += b_row_stride_i32;
+            }
+        }
+        else
+        {
+            const int valid = max(0, N - n_base);
+            const int8_t* a_ptr = a_ptr0;
+            const int32_t* b0 = reinterpret_cast<const int32_t*>(b_ptr0);
+            const int32_t* b1 = b0 + 1;
+            const int32_t* b2 = b0 + 2;
+            const int32_t* b3 = b0 + 3;
+            const int b_row_stride_i32 = N;
+            for (int kg = k_begin; kg < k_end; ++kg)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
+                if (valid > 0)
+                {
+                    acc[0] = __builtin_amdgcn_sdot4(a_packed, *b0, acc[0], false);
+                }
+                if (valid > 1)
+                {
+                    acc[1] = __builtin_amdgcn_sdot4(a_packed, *b1, acc[1], false);
+                }
+                if (valid > 2)
+                {
+                    acc[2] = __builtin_amdgcn_sdot4(a_packed, *b2, acc[2], false);
+                }
+                if (valid > 3)
+                {
+                    acc[3] = __builtin_amdgcn_sdot4(a_packed, *b3, acc[3], false);
+                }
+                a_ptr += 4;
+                b0 += b_row_stride_i32;
+                b1 += b_row_stride_i32;
+                b2 += b_row_stride_i32;
+                b3 += b_row_stride_i32;
+            }
+        }
+    }
+    else if constexpr (CPT == 2)
+    {
+        if (full_tile)
+        {
+            const int8_t* a_ptr = a_ptr0;
+            const int32_t* b_ptr = reinterpret_cast<const int32_t*>(b_ptr0);
+            const int b_row_stride_i32 = N;
+            for (int kg = k_begin; kg < k_end; ++kg)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_ptr[0], acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_ptr[1], acc[1], false);
+                a_ptr += 4;
+                b_ptr += b_row_stride_i32;
+            }
+        }
+        else
+        {
+            const int valid = max(0, N - n_base);
+            const int8_t* a_ptr = a_ptr0;
+            const int32_t* b0 = reinterpret_cast<const int32_t*>(b_ptr0);
+            const int32_t* b1 = b0 + 1;
+            const int b_row_stride_i32 = N;
+            for (int kg = k_begin; kg < k_end; ++kg)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
+                if (valid > 0)
+                {
+                    acc[0] = __builtin_amdgcn_sdot4(a_packed, *b0, acc[0], false);
+                }
+                if (valid > 1)
+                {
+                    acc[1] = __builtin_amdgcn_sdot4(a_packed, *b1, acc[1], false);
+                }
+                a_ptr += 4;
+                b0 += b_row_stride_i32;
+                b1 += b_row_stride_i32;
+            }
+        }
+    }
+    else
+    {
+        const int8_t* a_ptr = a_ptr0;
+        const int8_t* b_ptr = b_ptr0;
+        for (int kg = k_begin; kg < k_end; ++kg)
+        {
+            const int32_t a_packed = *reinterpret_cast<const int32_t*>(a_ptr);
+            const int32_t b_packed = *reinterpret_cast<const int32_t*>(b_ptr);
             acc[0] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[0], false);
+            a_ptr += 4;
+            b_ptr += b_row_stride_bytes;
         }
     }
 
@@ -1380,9 +1562,16 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
     for (int c = 0; c < CPT; ++c)
     {
         const int n = n_base + c;
-        if (n < N && acc[c] != 0)
+        if (n < N)
         {
-            atomicAdd(&d_C_int32[static_cast<int64_t>(m) * N + n], acc[c]);
+            if constexpr (ATOMIC_ACCUM)
+            {
+                atomicAdd(&d_C_int32[static_cast<int64_t>(m) * N + n], acc[c]);
+            }
+            else
+            {
+                d_C_int32[static_cast<int64_t>(m) * N + n] = acc[c];
+            }
         }
     }
 }
@@ -2898,16 +3087,18 @@ extern "C"
             return false;
         }
 
-        const size_t c_bytes = static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(int32_t);
-        hipError_t memset_err = hipMemsetAsync(d_C_int32, 0, c_bytes, static_cast<hipStream_t>(stream));
-        if (memset_err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_int8_int8_int32_vnni_prefill_grid_kpar] hipMemsetAsync failed: %s\n", hipGetErrorString(memset_err));
-            return false;
-        }
-
         const int variant = resolve_prefill_int8_tile_variant(tile_variant, M, N, K, true);
         const int cpt_v = (cpt == 2 || cpt == 4) ? cpt : 1;
+
+        {
+            const size_t c_bytes = static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(int32_t);
+            hipError_t memset_err = hipMemsetAsync(d_C_int32, 0, c_bytes, static_cast<hipStream_t>(stream));
+            if (memset_err != hipSuccess)
+            {
+                fprintf(stderr, "[rocmQuantGemm_int8_int8_int32_vnni_prefill_grid_kpar] hipMemsetAsync failed: %s\n", hipGetErrorString(memset_err));
+                return false;
+            }
+        }
 
         if (variant == PREFILL_TILE_32x8)
         {
@@ -2916,21 +3107,21 @@ extern "C"
             const dim3 block(BX, BY, 1);
             if (cpt_v == 4)
             {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4>),
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4, false, true>),
                                    dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
             }
             else if (cpt_v == 2)
             {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2>),
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2, false, true>),
                                    dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
             }
             else
             {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1>),
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1, false, true>),
                                    dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
             }
         }
         else if (variant == PREFILL_TILE_8x32)
@@ -2940,21 +3131,21 @@ extern "C"
             const dim3 block(BX, BY, 1);
             if (cpt_v == 4)
             {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4>),
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4, false, true>),
                                    dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
             }
             else if (cpt_v == 2)
             {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2>),
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2, false, true>),
                                    dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
             }
             else
             {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1>),
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1, false, true>),
                                    dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
             }
         }
         else if (variant == PREFILL_TILE_8x8)
@@ -2964,21 +3155,21 @@ extern "C"
             const dim3 block(BX, BY, 1);
             if (cpt_v == 4)
             {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4>),
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4, false, true>),
                                    dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
             }
             else if (cpt_v == 2)
             {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2>),
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2, false, true>),
                                    dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
             }
             else
             {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1>),
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1, false, true>),
                                    dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
             }
         }
         else
@@ -2988,21 +3179,21 @@ extern "C"
             const dim3 block(BX, BY, 1);
             if (cpt_v == 4)
             {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4>),
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4, false, true>),
                                    dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
             }
             else if (cpt_v == 2)
             {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2>),
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2, false, true>),
                                    dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
             }
             else
             {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1>),
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1, false, true>),
                                    dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
             }
         }
 

@@ -2087,13 +2087,39 @@ namespace llaminar2
                     const char *profile = "default";
                 };
 
-                auto select_vnni_prefill_launch = [](int M, int N, int K) -> VnniPrefillLaunchConfig
+                const auto &rocm_env = debugEnv().rocm;
+                auto select_vnni_prefill_launch = [&rocm_env](int M, int N, int K) -> VnniPrefillLaunchConfig
                 {
                     const double safe_k = static_cast<double>(std::max(K, 1));
                     const double aspect_n_over_k = static_cast<double>(N) / safe_k;
                     const int64_t work = static_cast<int64_t>(M) * static_cast<int64_t>(N) * static_cast<int64_t>(K);
+                    const int k_groups = std::max(1, K / 4);
 
                     constexpr int64_t kSmallWorkThreshold = 1200000000LL; // 0.5B-like vs 3B-like split
+                    constexpr int64_t kGridKparMinWork = 300000000LL;
+
+                    const bool is_ffn_up_like = (aspect_n_over_k >= 2.0 && aspect_n_over_k < 16.0);
+                    if (is_ffn_up_like && M >= 64 && rocm_env.vnni_prefill_ffn_override)
+                    {
+                        const bool use_grid_kpar = (rocm_env.vnni_prefill_ffn_override_grid_kpar < 0)
+                                                       ? true
+                                                       : (rocm_env.vnni_prefill_ffn_override_grid_kpar != 0);
+                        const int split_k_slices = (rocm_env.vnni_prefill_ffn_override_splits > 0)
+                                                       ? rocm_env.vnni_prefill_ffn_override_splits
+                                                       : 2;
+                        const int tile_variant = (rocm_env.vnni_prefill_ffn_override_variant >= 0)
+                                                     ? rocm_env.vnni_prefill_ffn_override_variant
+                                                     : 1;
+                        const int cpt = (rocm_env.vnni_prefill_ffn_override_cpt > 0)
+                                            ? rocm_env.vnni_prefill_ffn_override_cpt
+                                            : 4;
+
+                        if (use_grid_kpar)
+                        {
+                            return VnniPrefillLaunchConfig{true, split_k_slices, tile_variant, cpt, "ffn_override_env_gridkpar"};
+                        }
+                        return VnniPrefillLaunchConfig{false, split_k_slices, tile_variant, cpt, "ffn_override_env_baseline"};
+                    }
 
                     // Shape classes (ratio-first, then work-size split).
                     if (aspect_n_over_k >= 32.0)
@@ -2105,6 +2131,11 @@ namespace llaminar2
                     if (aspect_n_over_k >= 2.0)
                     {
                         // FFN up/gate (wide): strategy-lab favored split-k style behavior.
+                        if (work < kGridKparMinWork || M < 16 || k_groups < 64)
+                        {
+                            return VnniPrefillLaunchConfig{false, 1, 1, 1, "wide_guardrail_baseline_32x8_cpt1"};
+                        }
+
                         const int slices = (work <= kSmallWorkThreshold) ? 4 : 6;
                         return VnniPrefillLaunchConfig{true, slices, 1, 4, "wide_gridkpar_32x8_cpt4"};
                     }
@@ -2112,6 +2143,11 @@ namespace llaminar2
                     if (aspect_n_over_k < 0.75)
                     {
                         // FFN down (tall): keep grid-kpar with moderate split count.
+                        if (work < kGridKparMinWork || M < 16 || k_groups < 64)
+                        {
+                            return VnniPrefillLaunchConfig{false, 1, 1, 1, "tall_guardrail_baseline_32x8_cpt1"};
+                        }
+
                         const int slices = (work <= kSmallWorkThreshold) ? 4 : 6;
                         return VnniPrefillLaunchConfig{true, slices, 1, 4, "tall_gridkpar_32x8_cpt4"};
                     }
@@ -2123,11 +2159,14 @@ namespace llaminar2
                     }
                 };
 
-                const auto &rocm_env = debugEnv().rocm;
                 const VnniPrefillLaunchConfig policy_cfg = select_vnni_prefill_launch(m, n, k);
                 WeightLoadingProfiler::addDetail(
                     std::string("prefill_gemm.int8_policy.") + policy_cfg.profile,
                     1.0);
+                if (std::strncmp(policy_cfg.profile, "ffn_override_env_", 17) == 0)
+                {
+                    WeightLoadingProfiler::addDetail("prefill_gemm.int8_policy.ffn_up_override_applied", 1.0);
+                }
 
                 const bool has_manual_override =
                     (rocm_env.vnni_prefill_variant >= 0) ||
@@ -2145,6 +2184,40 @@ namespace llaminar2
                 const int grid_variant = has_manual_override ? rocm_env.vnni_prefill_grid_variant : policy_cfg.tile_variant;
                 const int cpt = has_manual_override ? rocm_env.vnni_prefill_cpt : policy_cfg.cpt;
 
+                const int resolved_variant = [&]()
+                {
+                    if (try_grid_kpar)
+                    {
+                        return grid_variant;
+                    }
+                    return baseline_variant;
+                }();
+
+                const int tile_x = [&]()
+                {
+                    if (resolved_variant == 1)
+                        return 32;
+                    if (resolved_variant == 2 || resolved_variant == 3)
+                        return 8;
+                    return 16;
+                }();
+
+                const int logical_tile_n = std::max(1, tile_x * std::max(1, cpt));
+                const int grid_n = std::max(1, (n + logical_tile_n - 1) / logical_tile_n);
+                const int64_t logical_tiles = static_cast<int64_t>(m) * static_cast<int64_t>(grid_n);
+                const int k_groups = std::max(1, k / 4);
+                const bool low_parallelism_guardrail = (!has_manual_override) && try_grid_kpar &&
+                                                       (logical_tiles < 512 || m < 16 || k_groups < 64);
+
+                const bool use_grid_kpar = low_parallelism_guardrail ? false : try_grid_kpar;
+
+                if (low_parallelism_guardrail)
+                {
+                    WeightLoadingProfiler::addDetail(
+                        "prefill_gemm.int8_policy.guardrail_disable_grid_kpar",
+                        1.0);
+                }
+
                 if (!has_manual_override)
                 {
                     static std::once_flag vnni_prefill_policy_once;
@@ -2157,7 +2230,7 @@ namespace llaminar2
                                                   << ")"); });
                 }
 
-                if (try_grid_kpar)
+                if (use_grid_kpar)
                 {
                     const int requested_slices_env = rocm_env.vnni_prefill_grid_kpar_splits;
                     const int requested_slices = [&]()
@@ -2749,6 +2822,122 @@ namespace llaminar2
 
             // Option B: Repack VNNI→row-major into workspace scratch for CK GEMM
             int8_t *d_weights_int8 = nullptr;
+
+            const auto should_materialize_persistent_rowmajor = [&](int mm, int nn, int kk) -> bool
+            {
+                if (mm <= 1 || nn <= 0 || kk <= 0)
+                {
+                    return false;
+                }
+
+                const double n_over_k = static_cast<double>(nn) / static_cast<double>(std::max(1, kk));
+                const bool ffn_like = (n_over_k >= 1.5) || (n_over_k <= 0.75);
+                if (!ffn_like)
+                {
+                    return false;
+                }
+
+                const int64_t work = static_cast<int64_t>(mm) * static_cast<int64_t>(nn) * static_cast<int64_t>(kk);
+                return work >= 300000000LL;
+            };
+
+            const auto try_materialize_persistent_rowmajor = [&](int nn, int kk) -> bool
+            {
+                if (!impl_ || impl_->d_weights_int8_rowmajor)
+                {
+                    return true;
+                }
+
+                if (!should_materialize_persistent_rowmajor(m, nn, kk))
+                {
+                    return false;
+                }
+
+                if (!impl_->d_weights_int8_vnni && !(impl_->d_weights_ratio_payload && impl_->d_weights_ratio))
+                {
+                    return false;
+                }
+
+                int8_t **rowmajor_target = nullptr;
+                if (packed_)
+                {
+                    auto upload_it = packed_->device_uploads.find(rocm_device_id_);
+                    if (upload_it != packed_->device_uploads.end())
+                    {
+                        rowmajor_target = &upload_it->second.d_int8_data_rowmajor;
+                    }
+                }
+
+                if (!rowmajor_target)
+                {
+                    rowmajor_target = &impl_->d_weights_int8_rowmajor;
+                }
+
+                const bool had_existing_rowmajor = (*rowmajor_target != nullptr);
+                if (!(*rowmajor_target))
+                {
+                    const size_t rowmajor_elems = static_cast<size_t>(nn) * static_cast<size_t>(kk);
+                    if (!rocmQuantGemm_allocInt8(rowmajor_target, rowmajor_elems, rocm_device_id_))
+                    {
+                        return false;
+                    }
+                }
+                const bool allocated_now = (!had_existing_rowmajor && *rowmajor_target != nullptr);
+
+                bool repack_ok = false;
+                const bool descriptor_supported =
+                    ((impl_->ratio_vnni_bitwidth == 4 && impl_->ratio_vnni_payload_bytes == 16) ||
+                     (impl_->ratio_vnni_bitwidth == 5 && impl_->ratio_vnni_payload_bytes == 20));
+                if (impl_->d_weights_ratio_payload && impl_->d_weights_ratio && descriptor_supported &&
+                    impl_->ratio_vnni_block_size == 32 && impl_->ratio_vnni_ratio_bytes == 1 &&
+                    impl_->ratio_vnni_payload_stride_bytes == impl_->ratio_vnni_payload_bytes &&
+                    impl_->ratio_vnni_ratio_stride_bytes == 1 &&
+                    (impl_->ratio_vnni_has_min == 0 ||
+                     (impl_->ratio_vnni_has_min != 0 && impl_->d_weights_ratio_min &&
+                      impl_->ratio_vnni_min_bytes == 1 && impl_->ratio_vnni_min_stride_bytes == 1)))
+                {
+                    repack_ok = rocmGemv_expandRatioVNNI_to_rowmajor(
+                        impl_->d_weights_ratio_payload,
+                        impl_->d_weights_ratio,
+                        impl_->d_weights_ratio_min,
+                        *rowmajor_target,
+                        nn, kk,
+                        impl_->ratio_vnni_bitwidth,
+                        impl_->ratio_vnni_codebook_id,
+                        impl_->ratio_vnni_has_min,
+                        impl_->ratio_vnni_block_size,
+                        impl_->ratio_vnni_payload_bytes,
+                        rocm_device_id_, gpu_stream_);
+                }
+                else if (impl_->d_weights_int8_vnni)
+                {
+                    repack_ok = rocmGemv_repackVNNI_to_rowmajor(
+                        impl_->d_weights_int8_vnni,
+                        *rowmajor_target,
+                        nn, kk,
+                        rocm_device_id_, gpu_stream_);
+                }
+
+                if (!repack_ok)
+                {
+                    if (allocated_now && rowmajor_target && *rowmajor_target)
+                    {
+                        rocmQuantGemm_freeDevice(*rowmajor_target, rocm_device_id_);
+                        *rowmajor_target = nullptr;
+                    }
+                    return false;
+                }
+
+                impl_->d_weights_int8_rowmajor = *rowmajor_target;
+                if (packed_)
+                {
+                    packed_->d_int8_data_rowmajor = *rowmajor_target;
+                }
+
+                WeightLoadingProfiler::addDetail("prefill_gemm.ck_rowmajor_persistent.materialized", 1.0);
+                return true;
+            };
+
             if (impl_->d_weights_int8_rowmajor)
             {
                 if (!waitForStartupRepackIfNeeded(
@@ -2760,6 +2949,16 @@ namespace llaminar2
                     return false;
                 }
                 d_weights_int8 = impl_->d_weights_int8_rowmajor;
+            }
+
+            if (!d_weights_int8)
+            {
+                (void)try_materialize_persistent_rowmajor(n, k);
+                if (impl_->d_weights_int8_rowmajor)
+                {
+                    d_weights_int8 = impl_->d_weights_int8_rowmajor;
+                    WeightLoadingProfiler::addDetail("prefill_gemm.ck_rowmajor_persistent.reuse", 1.0);
+                }
             }
 
             if (!d_weights_int8 && impl_->d_B_rowmajor_scratch)

@@ -7992,6 +7992,28 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added standalone ROCm prefill strategy lab microbenchmark")
 
+    set_source_files_properties(
+        performance/kernels/rocm/Microbench__GeminiFFNKernelPlayground.hip
+        PROPERTIES LANGUAGE HIP
+    )
+    add_executable(v2_perf_rocm_gemini_ffn_kernel_playground
+        performance/kernels/rocm/Microbench__GeminiFFNKernelPlayground.hip
+    )
+    target_link_libraries(v2_perf_rocm_gemini_ffn_kernel_playground
+        hip::host
+        hip::device
+        llaminar2_core
+        OpenMP::OpenMP_CXX
+    )
+    target_compile_options(v2_perf_rocm_gemini_ffn_kernel_playground PRIVATE -fopenmp)
+    target_link_options(v2_perf_rocm_gemini_ffn_kernel_playground PRIVATE -fopenmp)
+    add_v2_test(V2_Perf_ROCmGeminiFFNKernelPlayground
+        COMMAND $<TARGET_FILE:v2_perf_rocm_gemini_ffn_kernel_playground>
+        LABELS "V2;Performance;ROCm;GEMM;Prefill;Microbenchmark;Gemini;FFN;gfx906;Experiment"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added Gemini FFN kernel playground microbenchmark")
+
     add_executable(v2_perf_rocm_prefill_dispatch_comparison
         performance/kernels/rocm/Perf__ROCmPrefillDispatchComparison.cpp
     )
