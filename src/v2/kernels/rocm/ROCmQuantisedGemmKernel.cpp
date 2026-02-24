@@ -386,6 +386,25 @@ namespace llaminar2
                 int M, int N, int K,
                 int device_id, void *stream);
 
+            // INT8 VNNI wide-tile prefill GEMM with N-tile selection (64 or 128).
+            bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_ntile(
+                const int8_t *d_A_int8,
+                const int8_t *d_B_int8_vnni,
+                int32_t *d_C_int32,
+                int M, int N, int K,
+                int n_tile_select,
+                int device_id, void *stream);
+
+            // INT8 VNNI wide-tile V2 prefill GEMM (A from L2, only B in LDS).
+            // kt_select: 8 or 16.
+            bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v2(
+                const int8_t *d_A_int8,
+                const int8_t *d_B_int8_vnni,
+                int32_t *d_C_int32,
+                int M, int N, int K,
+                int kt_select,
+                int device_id, void *stream);
+
             // ratio-VNNI native prefill GEMM scaffold: payload + ratio side-channel
             bool rocmGemm_ratio_vnni_int8_int32_prefill(
                 const int8_t *d_A_int8,   // [M x K] row-major INT8 activations
@@ -2139,6 +2158,18 @@ namespace llaminar2
                     }
 
                     // Shape classes (ratio-first, then work-size split).
+
+                    // ── Wide-tile kernel for ALL prefill shapes with M ≤ 128 ──
+                    // Covers all M-rows in a single block (M_TILE=128, N_TILE=64, KT=8).
+                    // Key advantage: B matrix read exactly once from HBM (no M-tile re-read
+                    // amplification). Grid = ceil(N/64) blocks — sufficient for shapes with
+                    // N ≥ ~8K to saturate 60 CUs × 3 wg/CU.
+                    // Also avoids hipMemsetAsync + atomicAdd overhead of grid-kpar.
+                    if (M <= 128)
+                    {
+                        return VnniPrefillLaunchConfig{false, 1, 1, 1, 0, 0, "wide_tile_128", true};
+                    }
+
                     if (aspect_n_over_k >= 32.0)
                     {
                         // LM-head/extreme-wide: Wide-tile kernel covers ALL M-rows (up to 128)
@@ -2264,12 +2295,26 @@ namespace llaminar2
                 // Wide-tile path: covers all M-rows in one block (extreme-wide shapes)
                 if (!has_manual_override && policy_cfg.use_wide_tile)
                 {
-                    native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile(
-                        d_A_int8,
-                        impl_->d_weights_int8_vnni,
-                        impl_->d_C_int32,
-                        m, n, k,
-                        rocm_device_id_, gpu_stream_);
+                    if (rocm_env.wide_tile_v2)
+                    {
+                        native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v2(
+                            d_A_int8,
+                            impl_->d_weights_int8_vnni,
+                            impl_->d_C_int32,
+                            m, n, k,
+                            rocm_env.wide_tile_kt,
+                            rocm_device_id_, gpu_stream_);
+                    }
+                    else
+                    {
+                        native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_ntile(
+                            d_A_int8,
+                            impl_->d_weights_int8_vnni,
+                            impl_->d_C_int32,
+                            m, n, k,
+                            rocm_env.wide_tile_ntile,
+                            rocm_device_id_, gpu_stream_);
+                    }
                     if (!native_ok)
                     {
                         static std::once_flag wide_tile_fallback_once;

@@ -142,6 +142,13 @@ namespace
 
         PathBenchStats runPathBenchmark(const ShapeCase &shape, bool use_new_dispatch)
         {
+            return runPathBenchmarkVariant(shape, use_new_dispatch, false, 8);
+        }
+
+        // Extended variant: control wide-tile V2 and KT selection
+        PathBenchStats runPathBenchmarkVariant(const ShapeCase &shape, bool use_new_dispatch,
+                                               bool use_v2, int kt, int ntile = 64)
+        {
             PathBenchStats stats;
 
             auto weights = TestTensorFactory::createQ8_0Random({static_cast<size_t>(shape.N), static_cast<size_t>(shape.K)});
@@ -165,6 +172,9 @@ namespace
             ScopedEnvOverride prefill_cpt("LLAMINAR_ROCM_VNNI_PREFILL_CPT", "1");
             ScopedEnvOverride prefill_variant("LLAMINAR_ROCM_VNNI_PREFILL_VARIANT", "-1");
             ScopedEnvOverride prefill_grid_variant("LLAMINAR_ROCM_VNNI_PREFILL_GRID_VARIANT", "-1");
+            ScopedEnvOverride wide_v2("LLAMINAR_ROCM_WIDE_TILE_V2", use_v2 ? "1" : "0");
+            ScopedEnvOverride wide_kt("LLAMINAR_ROCM_WIDE_TILE_KT", std::to_string(kt));
+            ScopedEnvOverride wide_ntile("LLAMINAR_ROCM_WIDE_TILE_NTILE", std::to_string(ntile));
 
             for (int i = 0; i < shape.warmup_iters; ++i)
             {
@@ -221,6 +231,12 @@ namespace
             {"FFN_Gate", "Qwen2.5-3B_FFN_Gate", 128, 11008, 2048, 1, 2},
             {"FFN_Down", "Qwen2.5-3B_FFN_Down", 128, 2048, 11008, 1, 2},
             {"LM_Head", "Qwen2.5-3B_LM_Head", 128, 151936, 2048, 1, 1},
+
+            {"Attention", "Qwen2.5-7B_AttnOut", 128, 3584, 3584, 1, 2},
+            {"FFN_Up", "Qwen2.5-7B_FFN_Up", 128, 18944, 3584, 1, 2},
+            {"FFN_Gate", "Qwen2.5-7B_FFN_Gate", 128, 18944, 3584, 1, 2},
+            {"FFN_Down", "Qwen2.5-7B_FFN_Down", 128, 3584, 18944, 1, 2},
+            {"LM_Head", "Qwen2.5-7B_LM_Head", 128, 151936, 3584, 1, 1},
         };
 
         fort::utf8_table table;
@@ -287,5 +303,109 @@ namespace
 
         std::cout << "\n"
                   << summary.to_string() << std::endl;
+    }
+
+    // =========================================================================
+    // Wide-tile variant comparison: V1/KT8 vs V2/KT8 vs V2/KT16
+    // Tests all shapes to find per-shape-class optimal variant.
+    // =========================================================================
+    TEST_F(ROCmPrefillDispatchComparisonPerf, WideTileVariantComparison)
+    {
+        if (!has_rocm_device_)
+        {
+            GTEST_SKIP() << "No ROCm device available";
+        }
+
+        std::cout << "\n[Perf] Wide-tile variant comparison: V1/N64 vs V1/N128 vs V2/KT8 vs V2/KT16\n";
+        std::cout << "[Perf] Device: " << device_name_ << "\n\n";
+
+        struct VariantConfig
+        {
+            const char *name;
+            bool v2;
+            int kt;
+            int ntile;
+        };
+
+        const std::vector<VariantConfig> variants = {
+            {"V1/N64", false, 8, 64},
+            {"V1/N128", false, 8, 128},
+            {"V2/KT8", true, 8, 64},
+            {"V2/KT16", true, 16, 64},
+        };
+
+        const std::vector<ShapeCase> shapes = {
+            {"Attention", "Qwen2.5-0.5B_AttnOut", 128, 896, 896, 1, 2},
+            {"FFN_Up", "Qwen2.5-0.5B_FFN_Up", 128, 4864, 896, 1, 2},
+            {"FFN_Down", "Qwen2.5-0.5B_FFN_Down", 128, 896, 4864, 1, 2},
+            {"LM_Head", "Qwen2.5-0.5B_LM_Head", 128, 151936, 896, 1, 1},
+
+            {"Attention", "Qwen2.5-3B_AttnOut", 128, 2048, 2048, 1, 2},
+            {"FFN_Up", "Qwen2.5-3B_FFN_Up", 128, 11008, 2048, 1, 2},
+            {"FFN_Down", "Qwen2.5-3B_FFN_Down", 128, 2048, 11008, 1, 2},
+            {"LM_Head", "Qwen2.5-3B_LM_Head", 128, 151936, 2048, 1, 1},
+
+            {"Attention", "Qwen2.5-7B_AttnOut", 128, 3584, 3584, 1, 2},
+            {"FFN_Up", "Qwen2.5-7B_FFN_Up", 128, 18944, 3584, 1, 2},
+            {"FFN_Down", "Qwen2.5-7B_FFN_Down", 128, 3584, 18944, 1, 2},
+            {"LM_Head", "Qwen2.5-7B_LM_Head", 128, 151936, 3584, 1, 1},
+        };
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header << "Shape" << "N" << "K" << "CK(ms)" << "V1/N64(ms)" << "V1/N128(ms)" << "V2/KT8(ms)" << "V2/KT16(ms)" << "Best" << "vs CK" << fort::endr;
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        for (int c = 1; c <= 9; ++c)
+        {
+            table.column(static_cast<unsigned>(c)).set_cell_text_align(fort::text_align::right);
+        }
+
+        for (const auto &shape : shapes)
+        {
+            // CK baseline
+            const auto ck = runPathBenchmarkVariant(shape, false, false, 8);
+
+            // Native variants
+            std::vector<PathBenchStats> variant_stats;
+            for (const auto &v : variants)
+            {
+                variant_stats.push_back(runPathBenchmarkVariant(shape, true, v.v2, v.kt, v.ntile));
+            }
+
+            // Find best variant
+            int best_idx = 0;
+            for (size_t i = 1; i < variant_stats.size(); ++i)
+            {
+                if (variant_stats[i].mean_ms < variant_stats[static_cast<size_t>(best_idx)].mean_ms)
+                {
+                    best_idx = static_cast<int>(i);
+                }
+            }
+
+            const double vs_ck = (variant_stats[static_cast<size_t>(best_idx)].mean_ms > 0.0)
+                                     ? ck.mean_ms / variant_stats[static_cast<size_t>(best_idx)].mean_ms
+                                     : 0.0;
+
+            table << shape.name
+                  << shape.N
+                  << shape.K
+                  << std::fixed << std::setprecision(3) << ck.mean_ms
+                  << std::fixed << std::setprecision(3) << variant_stats[0].mean_ms
+                  << std::fixed << std::setprecision(3) << variant_stats[1].mean_ms
+                  << std::fixed << std::setprecision(3) << variant_stats[2].mean_ms
+                  << std::fixed << std::setprecision(3) << variant_stats[3].mean_ms
+                  << variants[static_cast<size_t>(best_idx)].name
+                  << std::fixed << std::setprecision(3) << vs_ck
+                  << fort::endr;
+
+            // Verify all variants produce correct output
+            for (size_t i = 0; i < variant_stats.size(); ++i)
+            {
+                const double cos = cosineSimilarity(ck.output, variant_stats[i].output);
+                EXPECT_GT(cos, 0.99) << "Output mismatch for " << shape.name << " variant " << variants[i].name;
+            }
+        }
+
+        std::cout << table.to_string() << std::endl;
     }
 }

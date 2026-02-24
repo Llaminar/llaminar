@@ -2229,6 +2229,9 @@ namespace llaminar2
         int vnni_prefill_ffn_override_kernel_body = 2;
         int vnni_prefill_grid_swizzle = -1;
         int vnni_prefill_ffn_override_grid_swizzle = 1;
+        bool wide_tile_v2 = false;             ///< Use V2 wide-tile kernel (A from L2) instead of V1 (LLAMINAR_ROCM_WIDE_TILE_V2)
+        int wide_tile_kt = 8;                  ///< KT parameter for wide-tile kernels (8 or 16) (LLAMINAR_ROCM_WIDE_TILE_KT)
+        int wide_tile_ntile = 64;              ///< N-tile for wide-tile V1 kernel (64 or 128) (LLAMINAR_ROCM_WIDE_TILE_NTILE)
         int ratio_prefill_variant = -1;        ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
         int ratio_prefill_kb = 0;              ///< Ratio prefill split-K blocks override (0=auto)
         int ratio_prefill_linear_variant = -1; ///< Linear codebook ratio prefill tile override (-1=use global/auto)
@@ -2269,6 +2272,9 @@ namespace llaminar2
             vnni_prefill_ffn_override_kernel_body = 2;
             vnni_prefill_grid_swizzle = -1;
             vnni_prefill_ffn_override_grid_swizzle = 1;
+            wide_tile_v2 = false;
+            wide_tile_kt = 8;
+            wide_tile_ntile = 64;
             ratio_prefill_variant = -1;
             ratio_prefill_kb = 0;
             ratio_prefill_linear_variant = -1;
@@ -2424,6 +2430,32 @@ namespace llaminar2
             if (vnni_prefill_ffn_override_grid_swizzle_env)
             {
                 vnni_prefill_ffn_override_grid_swizzle = std::clamp(std::atoi(vnni_prefill_ffn_override_grid_swizzle_env), -1, 1);
+            }
+
+            const char *wide_tile_v2_env = std::getenv("LLAMINAR_ROCM_WIDE_TILE_V2");
+            if (wide_tile_v2_env)
+            {
+                wide_tile_v2 = (std::atoi(wide_tile_v2_env) != 0);
+            }
+
+            const char *wide_tile_kt_env = std::getenv("LLAMINAR_ROCM_WIDE_TILE_KT");
+            if (wide_tile_kt_env)
+            {
+                const int kt = std::atoi(wide_tile_kt_env);
+                if (kt == 8 || kt == 16)
+                {
+                    wide_tile_kt = kt;
+                }
+            }
+
+            const char *wide_tile_ntile_env = std::getenv("LLAMINAR_ROCM_WIDE_TILE_NTILE");
+            if (wide_tile_ntile_env)
+            {
+                const int nt = std::atoi(wide_tile_ntile_env);
+                if (nt == 64 || nt == 128)
+                {
+                    wide_tile_ntile = nt;
+                }
             }
 
             const char *ratio_prefill_variant_env = std::getenv("LLAMINAR_ROCM_RATIO_PREFILL_VARIANT");

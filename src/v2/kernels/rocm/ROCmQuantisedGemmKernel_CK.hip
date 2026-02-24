@@ -1758,8 +1758,8 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
 //   Total: 6 KB — leaves room for 3+ waves
 //
 // Register budget:
-//   32 accumulators + 4 A-regs + 8 B-regs + 8 prefetch VGPRs + ~20 addr/temp
-//   ≈ 72-80 VGPRs → floor(256/80) = 3 waves/SIMD
+//   32 accumulators + 4 A-regs + 8 B-regs + ~20 addr/temp
+//   ≈ 66 VGPRs → floor(256/66) = 3 waves/SIMD
 //
 // ============================================================================
 
@@ -3867,6 +3867,15 @@ extern "C"
     // WIDE-TILE PREFILL DISPATCH
     // =========================================================================
     //
+    // Forward declaration for parameterized N-tile dispatch.
+    bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_ntile(
+        const int8_t* d_A_int8,
+        const int8_t* d_B_int8_vnni,
+        int32_t* d_C_int32,
+        int M, int N, int K,
+        int n_tile_select,
+        int rocm_device_id, void* stream);
+
     // For extreme-wide shapes (N >> K, M ≤ 128: LM_Head vocab projection).
     // Launches qgemm_int8_vnni_wide_tile_kernel<64, 8> which covers all M-rows
     // in a single block, eliminating B re-reads from HBM.
@@ -3877,6 +3886,20 @@ extern "C"
         const int8_t* d_B_int8_vnni,
         int32_t* d_C_int32,
         int M, int N, int K,
+        int rocm_device_id, void* stream)
+    {
+        return rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_ntile(
+            d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, 64, rocm_device_id, stream);
+    }
+
+    // Parameterized N-tile dispatch for wide-tile V1 kernel.
+    // n_tile_select: 64 (default) or 128 (wider tile, higher compute density, fewer blocks).
+    bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_ntile(
+        const int8_t* d_A_int8,
+        const int8_t* d_B_int8_vnni,
+        int32_t* d_C_int32,
+        int M, int N, int K,
+        int n_tile_select,
         int rocm_device_id, void* stream)
     {
         if (!d_A_int8 || !d_B_int8_vnni || !d_C_int32 || M <= 0 || N <= 0 || K <= 0)
@@ -3902,25 +3925,119 @@ extern "C"
             return false;
         }
 
-        constexpr int N_TILE = 64;
         constexpr int KT = 8;
+        constexpr int BLOCK_SIZE = 256;
+
+        if (n_tile_select == 128)
+        {
+            constexpr int N_TILE = 128;
+            const unsigned n_tiles = static_cast<unsigned>((N + N_TILE - 1) / N_TILE);
+            const dim3 grid(n_tiles, 1, 1);
+            const dim3 block(BLOCK_SIZE, 1, 1);
+            // N_TILE=128: 64 accumulators/thread, ~92 VGPRs → 2 waves/SIMD.
+            // Benefit: half the grid blocks, 89% compute density (vs 84% for N=64).
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_kernel<N_TILE, KT, 0>),
+                               grid, block, 0, static_cast<hipStream_t>(stream),
+                               d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+        else
+        {
+            constexpr int N_TILE = 64;
+            const unsigned n_tiles = static_cast<unsigned>((N + N_TILE - 1) / N_TILE);
+            const dim3 grid(n_tiles, 1, 1);
+            const dim3 block(BLOCK_SIZE, 1, 1);
+            // N_TILE=64: 32 accumulators/thread, 66 VGPRs → 3 waves/SIMD.
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_kernel<N_TILE, KT, 0>),
+                               grid, block, 0, static_cast<hipStream_t>(stream),
+                               d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile] Kernel launch failed: %s (M=%d N=%d K=%d ntile=%d)\n",
+                    hipGetErrorString(err), M, N, K, n_tile_select);
+            return false;
+        }
+
+        return true;
+    }
+
+    // =========================================================================
+    // WIDE-TILE V2 DISPATCH (A from L2, B in LDS)
+    // =========================================================================
+    //
+    // V2 variant reads A directly from L2 cache instead of cooperatively loading
+    // to LDS.  Benefits:
+    //   - Eliminates A LDS bank conflicts (4-way conflict in V1 stride-4 access)
+    //   - Removes A cooperative load phase → faster per-iteration setup
+    //   - Only 2 KB LDS (B tile only) vs 6 KB (V1 with A+B)
+    //   - L1 handles broadcast for threads sharing same m_base
+    //   - Naturally supports any KT (no multi-pass A loading needed)
+    //
+    // Best for shapes where A fits in L2 (A ≤ 4 MB → M*K ≤ 4M bytes → always
+    // true for M=128, K up to 32K).
+    //
+    // kt_select: 8 → KT=8 (default), 16 → KT=16 (fewer sync barriers, more
+    //            compute per tile, better for large K).
+    //
+    // =========================================================================
+    bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v2(
+        const int8_t* d_A_int8,
+        const int8_t* d_B_int8_vnni,
+        int32_t* d_C_int32,
+        int M, int N, int K,
+        int kt_select,
+        int rocm_device_id, void* stream)
+    {
+        if (!d_A_int8 || !d_B_int8_vnni || !d_C_int32 || M <= 0 || N <= 0 || K <= 0)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v2] Invalid arguments (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if ((K % 4) != 0)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v2] K must be multiple of 4 (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if (M > 128)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v2] M must be ≤ 128 (got M=%d)\n", M);
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+        {
+            return false;
+        }
+
+        constexpr int N_TILE = 64;
         constexpr int BLOCK_SIZE = 256;
 
         const unsigned n_tiles = static_cast<unsigned>((N + N_TILE - 1) / N_TILE);
         const dim3 grid(n_tiles, 1, 1);
         const dim3 block(BLOCK_SIZE, 1, 1);
 
-        // MIN_BLOCKS=2 → compiler targets ≤128 VGPRs; actual: 66 VGPRs, 0 scratch,
-        // 3 waves/SIMD, batched global loads (A+B overlap in memory pipeline)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_kernel<N_TILE, KT, 2>),
-                           grid, block, 0, static_cast<hipStream_t>(stream),
-                           d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        if (kt_select == 16)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v2_kernel<N_TILE, 16>),
+                               grid, block, 0, static_cast<hipStream_t>(stream),
+                               d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+        else
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v2_kernel<N_TILE, 8>),
+                               grid, block, 0, static_cast<hipStream_t>(stream),
+                               d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
 
         const hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
-            fprintf(stderr, "[rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile] Kernel launch failed: %s (M=%d N=%d K=%d)\n",
-                    hipGetErrorString(err), M, N, K);
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v2] Kernel launch failed: %s (M=%d N=%d K=%d kt=%d)\n",
+                    hipGetErrorString(err), M, N, K, kt_select);
             return false;
         }
 
