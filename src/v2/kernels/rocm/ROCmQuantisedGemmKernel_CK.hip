@@ -2127,6 +2127,1885 @@ __global__ void qgemm_int8_vnni_wide_tile_v2_kernel(
 }
 
 // ============================================================================
+// WIDE-TILE V3: LDS Double-Buffered Pipeline
+// ============================================================================
+//
+// Key improvements over V1 (based on CK ISA analysis — see
+// changelog/2025-07-24-ck-vs-v1-isa-analysis.md):
+//
+//   1. LDS double-buffering: overlap global→LDS loads of tile N+1 with
+//      compute on tile N.  CK ISA shows this is the primary technique
+//      behind its 14% advantage.  Expected gain: ~5-8%.
+//
+//   2. KT=16 support with multi-pass A cooperative load: V1's single-pass
+//      A load (256 threads / (KT/4) chunks) only covers 128 M-rows when
+//      KT=8.  With KT=16, A_K_CHUNKS=4 → 256/4=64 rows/pass → need 2
+//      passes.  Halves loop iterations vs KT=8.  Expected gain: ~2-3%.
+//
+//   3. Software-pipelined main loop:
+//        preload tile 0 → buf[0]
+//        for tile 1..N-1:
+//            issue global loads for tile t      (async, into staging regs)
+//            compute tile t-1 from buf[(t-1)%2] (overlaps with loads!)
+//            __syncthreads()
+//            write staging → buf[t%2]            (vmcnt(0) ensures loads done)
+//            __syncthreads()
+//        compute last tile
+//
+// LDS Budget (KT=16, N_TILE=64):
+//   a_lds[2][16 × 128] × 4 bytes = 16 KB
+//   b_lds[2][16 × 64]  × 4 bytes =  8 KB
+//   Total: 24 KB → 2 workgroups/CU (48 KB < 64 KB LDS)
+//
+// LDS Budget (KT=8, N_TILE=64):
+//   a_lds[2][8 × 128] × 4 bytes = 8 KB
+//   b_lds[2][8 × 64]  × 4 bytes = 4 KB
+//   Total: 12 KB → 5 workgroups/CU
+//
+// Register Budget (~66 VGPRs for KT=16):
+//   32 accumulators + 8 a_staging (2 × uint4) + 4 b_staging (1 × uint4)
+//   + 12 operands (transient) + ~10 misc = ~66 VGPRs → 3 waves/SIMD
+//
+// ============================================================================
+
+template <int N_TILE, int KT>
+__global__ __launch_bounds__(256, 0)
+void qgemm_int8_vnni_wide_tile_v3_kernel(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    int32_t* __restrict__ d_C_int32,
+    int M,
+    int N,
+    int K)
+{
+    // Thread layout: 256 threads = 32 (M-dim) × 8 (N-dim)
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int THREADS_M = 32;
+    constexpr int THREADS_N = BLOCK_SIZE / THREADS_M; // 8
+    constexpr int M_PER_THREAD = 4;                   // 32 × 4 = 128 M-rows
+    constexpr int N_PER_THREAD = N_TILE / THREADS_N;  // 64 / 8 = 8 N-cols
+    constexpr int M_TILE = THREADS_M * M_PER_THREAD;  // 128
+
+    static_assert(THREADS_M * THREADS_N == BLOCK_SIZE);
+    static_assert(N_TILE % THREADS_N == 0);
+    static_assert(KT % 4 == 0, "KT must be multiple of 4 for vectorized A loads");
+    static_assert(N_TILE % 4 == 0, "N_TILE must be multiple of 4 for vectorized B loads");
+
+    const int n_block = blockIdx.x * N_TILE;
+    const int t_m = threadIdx.x % THREADS_M; // 0..31
+    const int t_n = threadIdx.x / THREADS_M; // 0..7
+
+    const int m_base = t_m * M_PER_THREAD;
+    const int n_base = n_block + t_n * N_PER_THREAD;
+
+    // =========================================================================
+    // LDS: Double-buffered (ping-pong between buf[0] and buf[1])
+    // =========================================================================
+    __shared__ int32_t a_lds[2][KT * M_TILE];
+    __shared__ int32_t b_lds[2][KT * N_TILE];
+
+    // Accumulators: 4 × 8 = 32 per thread
+    int32_t acc[M_PER_THREAD][N_PER_THREAD];
+    #pragma unroll
+    for (int mm = 0; mm < M_PER_THREAD; ++mm)
+        #pragma unroll
+        for (int nn = 0; nn < N_PER_THREAD; ++nn)
+            acc[mm][nn] = 0;
+
+    const int total_k_groups = K / 4;
+
+    // Reinterpret pointers for int32 (packed 4×int8) access
+    const int32_t* a_global = reinterpret_cast<const int32_t*>(d_A_int8);
+    const int32_t* b_global = reinterpret_cast<const int32_t*>(d_B_int8_vnni);
+    const int a_row_stride = K / 4; // k-groups per A row
+
+    // =========================================================================
+    // A cooperative load geometry — multi-pass for KT ≥ 16
+    //
+    // With 256 threads and A_K_CHUNKS = KT/4 vec4-groups per row:
+    //   KT=8  → A_K_CHUNKS=2, 256/2=128 rows/pass → 1 pass  (covers all 128)
+    //   KT=16 → A_K_CHUNKS=4, 256/4=64  rows/pass → 2 passes (64+64=128)
+    // =========================================================================
+    constexpr int A_K_CHUNKS = KT / 4;
+    constexpr int A_ROWS_PER_PASS = BLOCK_SIZE / A_K_CHUNKS;
+    constexpr int A_NUM_PASSES = (M_TILE + A_ROWS_PER_PASS - 1) / A_ROWS_PER_PASS;
+
+    // Per-thread A load coordinates (loop-invariant)
+    const int a_kg = (threadIdx.x % A_K_CHUNKS) * 4;
+    const int a_thread_mi_base = threadIdx.x / A_K_CHUNKS;
+
+    // Pre-compute M-row index for each A pass
+    int a_mi[A_NUM_PASSES];
+    #pragma unroll
+    for (int p = 0; p < A_NUM_PASSES; ++p)
+        a_mi[p] = a_thread_mi_base + p * A_ROWS_PER_PASS;
+
+    // =========================================================================
+    // B cooperative load geometry
+    //   KT=8,  N_TILE=64 → B_ACTIVE_THREADS=128 (first half of block)
+    //   KT=16, N_TILE=64 → B_ACTIVE_THREADS=256 (all threads participate)
+    // =========================================================================
+    constexpr int B_N_CHUNKS = N_TILE / 4;
+    constexpr int B_ACTIVE_THREADS = KT * B_N_CHUNKS;
+    static_assert(B_ACTIVE_THREADS <= BLOCK_SIZE,
+                  "B tile too large for single-pass cooperative load");
+
+    const int b_kk_local = threadIdx.x / B_N_CHUNKS;
+    const int b_nl = (threadIdx.x % B_N_CHUNKS) * 4;
+    const int b_gn = n_block + b_nl;
+    const int b_lds_off = b_kk_local * N_TILE + b_nl;
+
+    const int num_tiles = (total_k_groups + KT - 1) / KT;
+    if (num_tiles == 0) return;
+
+    // Staging registers for double-buffered pipeline
+    uint4 a_staging[A_NUM_PASSES];
+    uint4 b_staging;
+
+    // =========================================================================
+    // PRELOAD: Load first tile (tile 0) into buf[0]
+    // =========================================================================
+
+    // A loads — multi-pass
+    #pragma unroll
+    for (int p = 0; p < A_NUM_PASSES; ++p)
+    {
+        const int mi = a_mi[p];
+        const int gkg = a_kg; // kt_base = 0
+        if (__builtin_expect(mi < M && gkg + 3 < total_k_groups, 1))
+        {
+            a_staging[p] = *reinterpret_cast<const uint4*>(
+                a_global + static_cast<int64_t>(mi) * a_row_stride + gkg);
+        }
+        else
+        {
+            a_staging[p].x = (mi < M && gkg + 0 < total_k_groups)
+                ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 0] : 0;
+            a_staging[p].y = (mi < M && gkg + 1 < total_k_groups)
+                ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 1] : 0;
+            a_staging[p].z = (mi < M && gkg + 2 < total_k_groups)
+                ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 2] : 0;
+            a_staging[p].w = (mi < M && gkg + 3 < total_k_groups)
+                ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 3] : 0;
+        }
+    }
+
+    // B load
+    b_staging = make_uint4(0, 0, 0, 0);
+    if (threadIdx.x < B_ACTIVE_THREADS)
+    {
+        const int gkk = b_kk_local; // kt_base = 0
+        if (__builtin_expect(b_gn + 3 < N && gkk < total_k_groups, 1))
+        {
+            b_staging = *reinterpret_cast<const uint4*>(
+                b_global + static_cast<int64_t>(gkk) * N + b_gn);
+        }
+        else
+        {
+            b_staging.x = (b_gn + 0 < N && gkk < total_k_groups)
+                ? b_global[static_cast<int64_t>(gkk) * N + b_gn + 0] : 0;
+            b_staging.y = (b_gn + 1 < N && gkk < total_k_groups)
+                ? b_global[static_cast<int64_t>(gkk) * N + b_gn + 1] : 0;
+            b_staging.z = (b_gn + 2 < N && gkk < total_k_groups)
+                ? b_global[static_cast<int64_t>(gkk) * N + b_gn + 2] : 0;
+            b_staging.w = (b_gn + 3 < N && gkk < total_k_groups)
+                ? b_global[static_cast<int64_t>(gkk) * N + b_gn + 3] : 0;
+        }
+    }
+
+    // Write staged data to buf[0]
+    #pragma unroll
+    for (int p = 0; p < A_NUM_PASSES; ++p)
+    {
+        const int mi = a_mi[p];
+        a_lds[0][(a_kg + 0) * M_TILE + mi] = a_staging[p].x;
+        a_lds[0][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
+        a_lds[0][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
+        a_lds[0][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
+    }
+    if (threadIdx.x < B_ACTIVE_THREADS)
+    {
+        *reinterpret_cast<uint4*>(&b_lds[0][b_lds_off]) = b_staging;
+    }
+
+    __syncthreads(); // buf[0] ready for compute
+
+    // =========================================================================
+    // MAIN LOOP: Double-buffered pipeline
+    //
+    // For each tile t (1 .. num_tiles-1):
+    //   1. Issue global loads for tile t      → staging regs  (async)
+    //   2. Compute tile (t-1) from buf[(t-1)%2]               (overlaps!)
+    //   3. __syncthreads()                    (all reads from cur_buf done)
+    //   4. Write staging → buf[t%2]           (vmcnt(0) ensures loads done)
+    //   5. __syncthreads()                    (LDS writes visible)
+    // =========================================================================
+    for (int tile = 1; tile < num_tiles; ++tile)
+    {
+        const int cur_buf = (tile - 1) & 1; // buffer to compute from
+        const int nxt_buf = tile & 1;       // buffer to load into
+        const int kt_base = tile * KT;
+
+        // --- 1. Issue ALL global loads for next tile (async) ---
+
+        // A loads — multi-pass
+        #pragma unroll
+        for (int p = 0; p < A_NUM_PASSES; ++p)
+        {
+            const int mi = a_mi[p];
+            const int gkg = kt_base + a_kg;
+            if (__builtin_expect(mi < M && gkg + 3 < total_k_groups, 1))
+            {
+                a_staging[p] = *reinterpret_cast<const uint4*>(
+                    a_global + static_cast<int64_t>(mi) * a_row_stride + gkg);
+            }
+            else
+            {
+                a_staging[p].x = (mi < M && gkg + 0 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 0] : 0;
+                a_staging[p].y = (mi < M && gkg + 1 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 1] : 0;
+                a_staging[p].z = (mi < M && gkg + 2 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 2] : 0;
+                a_staging[p].w = (mi < M && gkg + 3 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 3] : 0;
+            }
+        }
+
+        // B load
+        if (threadIdx.x < B_ACTIVE_THREADS)
+        {
+            const int gkk = kt_base + b_kk_local;
+            if (__builtin_expect(b_gn + 3 < N && gkk < total_k_groups, 1))
+            {
+                b_staging = *reinterpret_cast<const uint4*>(
+                    b_global + static_cast<int64_t>(gkk) * N + b_gn);
+            }
+            else
+            {
+                b_staging = make_uint4(0, 0, 0, 0);
+                b_staging.x = (b_gn + 0 < N && gkk < total_k_groups)
+                    ? b_global[static_cast<int64_t>(gkk) * N + b_gn + 0] : 0;
+                b_staging.y = (b_gn + 1 < N && gkk < total_k_groups)
+                    ? b_global[static_cast<int64_t>(gkk) * N + b_gn + 1] : 0;
+                b_staging.z = (b_gn + 2 < N && gkk < total_k_groups)
+                    ? b_global[static_cast<int64_t>(gkk) * N + b_gn + 2] : 0;
+                b_staging.w = (b_gn + 3 < N && gkk < total_k_groups)
+                    ? b_global[static_cast<int64_t>(gkk) * N + b_gn + 3] : 0;
+            }
+        }
+
+        // --- 2. Compute on CURRENT buffer (overlaps with global loads!) ---
+        #pragma unroll
+        for (int kk = 0; kk < KT; ++kk)
+        {
+            int32_t a_reg[M_PER_THREAD];
+            #pragma unroll
+            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                a_reg[mm] = a_lds[cur_buf][kk * M_TILE + m_base + mm];
+
+            int32_t b_reg[N_PER_THREAD];
+            #pragma unroll
+            for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                b_reg[nn] = b_lds[cur_buf][kk * N_TILE + t_n * N_PER_THREAD + nn];
+
+            #pragma unroll
+            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                    acc[mm][nn] = __builtin_amdgcn_sdot4(
+                        a_reg[mm], b_reg[nn], acc[mm][nn], false);
+        }
+
+        // --- 3. Barrier: all threads done reading cur_buf ---
+        __syncthreads();
+
+        // --- 4. Write staged data to NEXT buffer ---
+        // (compiler inserts s_waitcnt vmcnt(0) here for the global loads)
+        #pragma unroll
+        for (int p = 0; p < A_NUM_PASSES; ++p)
+        {
+            const int mi = a_mi[p];
+            a_lds[nxt_buf][(a_kg + 0) * M_TILE + mi] = a_staging[p].x;
+            a_lds[nxt_buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
+            a_lds[nxt_buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
+            a_lds[nxt_buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
+        }
+        if (threadIdx.x < B_ACTIVE_THREADS)
+        {
+            *reinterpret_cast<uint4*>(&b_lds[nxt_buf][b_lds_off]) = b_staging;
+        }
+
+        // --- 5. Barrier: LDS writes visible before next iteration ---
+        __syncthreads();
+    }
+
+    // =========================================================================
+    // FINAL TILE: Compute the last tile (already loaded into LDS)
+    // =========================================================================
+    {
+        const int last_buf = (num_tiles - 1) & 1;
+
+        #pragma unroll
+        for (int kk = 0; kk < KT; ++kk)
+        {
+            int32_t a_reg[M_PER_THREAD];
+            #pragma unroll
+            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                a_reg[mm] = a_lds[last_buf][kk * M_TILE + m_base + mm];
+
+            int32_t b_reg[N_PER_THREAD];
+            #pragma unroll
+            for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                b_reg[nn] = b_lds[last_buf][kk * N_TILE + t_n * N_PER_THREAD + nn];
+
+            #pragma unroll
+            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                    acc[mm][nn] = __builtin_amdgcn_sdot4(
+                        a_reg[mm], b_reg[nn], acc[mm][nn], false);
+        }
+    }
+
+    // =========================================================================
+    // STORE RESULTS (same vectorized store as V1)
+    // =========================================================================
+    #pragma unroll
+    for (int mm = 0; mm < M_PER_THREAD; ++mm)
+    {
+        const int m_idx = m_base + mm;
+        if (m_idx < M)
+        {
+            if (n_base + N_PER_THREAD - 1 < N)
+            {
+                // All N_PER_THREAD columns are valid — vectorized uint4 stores
+                const int64_t row_off = static_cast<int64_t>(m_idx) * N + n_base;
+                #pragma unroll
+                for (int chunk = 0; chunk < N_PER_THREAD; chunk += 4)
+                {
+                    *reinterpret_cast<uint4*>(d_C_int32 + row_off + chunk) =
+                        make_uint4(static_cast<uint32_t>(acc[mm][chunk + 0]),
+                                   static_cast<uint32_t>(acc[mm][chunk + 1]),
+                                   static_cast<uint32_t>(acc[mm][chunk + 2]),
+                                   static_cast<uint32_t>(acc[mm][chunk + 3]));
+                }
+            }
+            else
+            {
+                // Tail N-block: scalar stores with bounds checking
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                {
+                    const int n_idx = n_base + nn;
+                    if (n_idx < N)
+                    {
+                        d_C_int32[static_cast<int64_t>(m_idx) * N + n_idx] = acc[mm][nn];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// WIDE-TILE V4: N128 Double-Buffered Pipeline (CK-parity target)
+// ============================================================================
+//
+// V4 targets the FFN_Up/Gate 0.84× CK gap by matching CK's tile geometry:
+//   - M128 × N128 × K16  (same as CK's 128x128 kernel)
+//   - LDS double-buffering (from V3)
+//   - Multi-pass B cooperative loading (new — handles KT×N_CHUNKS > 256)
+//
+// Why N128 matters for FFN_Up/Gate:
+//   V1/N64 achieves only 84% compute density on N=18944 (partial tail block).
+//   N128 raises this to 89%.  More importantly, N128 halves the grid block
+//   count (148 vs 296), doubling the K-work per block and cutting overhead.
+//
+// Why V1/N128 failed but V4/N128 should work:
+//   V1/N128 had no latency hiding — the wider tile increased VGPR pressure
+//   (→ 2 waves/SIMD) without compensating.  V4 adds double-buffering to
+//   overlap loads with compute, which the ISA analysis showed is CK's
+//   primary technique for sustaining throughput at 2 waves/SIMD.
+//
+// LDS Budget (KT=16, N_TILE=128):
+//   a_lds[2][16 × 128] × 4 bytes = 16 KB
+//   b_lds[2][16 × 128] × 4 bytes = 16 KB
+//   Total: 32 KB → 2 workgroups/CU (max 64 KB)
+//
+// LDS Budget (KT=8, N_TILE=128):
+//   a_lds[2][8 × 128] × 4 bytes = 8 KB
+//   b_lds[2][8 × 128] × 4 bytes = 8 KB
+//   Total: 16 KB → 4 workgroups/CU
+//
+// Register Budget (N128):
+//   64 accumulators (4M × 16N) + staging + operands ≈ 92 VGPRs → 2 waves/SIMD
+//
+// B Multi-Pass Loading:
+//   KT=16, N=128 → B_TOTAL_ELEMENTS = 16 × 32 = 512 vec4-groups.
+//   256 threads → 2 passes (256 elements each).
+//   KT=8,  N=128 → B_TOTAL_ELEMENTS = 8 × 32 = 256 → 1 pass.
+//
+// ============================================================================
+
+template <int N_TILE, int KT>
+__global__ __launch_bounds__(256, 0)
+void qgemm_int8_vnni_wide_tile_v4_kernel(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    int32_t* __restrict__ d_C_int32,
+    int M,
+    int N,
+    int K)
+{
+    // Thread layout: 256 threads = 32 (M-dim) × 8 (N-dim)
+    // With N128: each thread covers 4M × 16N = 64 accumulators
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int THREADS_M = 32;
+    constexpr int THREADS_N = BLOCK_SIZE / THREADS_M; // 8
+    constexpr int M_PER_THREAD = 4;                   // 32 × 4 = 128 M-rows
+    constexpr int N_PER_THREAD = N_TILE / THREADS_N;  // 128 / 8 = 16 N-cols
+    constexpr int M_TILE = THREADS_M * M_PER_THREAD;  // 128
+
+    static_assert(THREADS_M * THREADS_N == BLOCK_SIZE);
+    static_assert(N_TILE % THREADS_N == 0);
+    static_assert(KT % 4 == 0, "KT must be multiple of 4 for vectorized A loads");
+    static_assert(N_TILE % 4 == 0, "N_TILE must be multiple of 4 for vectorized B loads");
+
+    const int n_block = blockIdx.x * N_TILE;
+    const int t_m = threadIdx.x % THREADS_M; // 0..31
+    const int t_n = threadIdx.x / THREADS_M; // 0..7
+
+    const int m_base = t_m * M_PER_THREAD;
+    const int n_base = n_block + t_n * N_PER_THREAD;
+
+    // =========================================================================
+    // LDS: Double-buffered (ping-pong between buf[0] and buf[1])
+    // =========================================================================
+    __shared__ int32_t a_lds[2][KT * M_TILE];
+    __shared__ int32_t b_lds[2][KT * N_TILE];
+
+    // Accumulators: 4 × 16 = 64 per thread (N128) or 4 × 8 = 32 (N64)
+    int32_t acc[M_PER_THREAD][N_PER_THREAD];
+    #pragma unroll
+    for (int mm = 0; mm < M_PER_THREAD; ++mm)
+        #pragma unroll
+        for (int nn = 0; nn < N_PER_THREAD; ++nn)
+            acc[mm][nn] = 0;
+
+    const int total_k_groups = K / 4;
+
+    const int32_t* a_global = reinterpret_cast<const int32_t*>(d_A_int8);
+    const int32_t* b_global = reinterpret_cast<const int32_t*>(d_B_int8_vnni);
+    const int a_row_stride = K / 4;
+
+    // =========================================================================
+    // A cooperative load geometry — multi-pass (same as V3)
+    // =========================================================================
+    constexpr int A_K_CHUNKS = KT / 4;
+    constexpr int A_ROWS_PER_PASS = BLOCK_SIZE / A_K_CHUNKS;
+    constexpr int A_NUM_PASSES = (M_TILE + A_ROWS_PER_PASS - 1) / A_ROWS_PER_PASS;
+
+    const int a_kg = (threadIdx.x % A_K_CHUNKS) * 4;
+    const int a_thread_mi_base = threadIdx.x / A_K_CHUNKS;
+
+    int a_mi[A_NUM_PASSES];
+    #pragma unroll
+    for (int p = 0; p < A_NUM_PASSES; ++p)
+        a_mi[p] = a_thread_mi_base + p * A_ROWS_PER_PASS;
+
+    // =========================================================================
+    // B cooperative load geometry — multi-pass for large tiles
+    //
+    // B tile = KT × N_TILE int32 elements.  Each thread loads a uint4 (4 ints).
+    // Total vec4-groups = KT × (N_TILE/4).
+    //   KT=8,  N=64  → 128  groups → 1 pass (128 threads active)
+    //   KT=8,  N=128 → 256  groups → 1 pass (256 threads active)
+    //   KT=16, N=64  → 256  groups → 1 pass (256 threads active)
+    //   KT=16, N=128 → 512  groups → 2 passes (256 threads × 2)
+    //
+    // Each thread is assigned a (kk, n_local) coordinate per pass.
+    // =========================================================================
+    constexpr int B_N_CHUNKS = N_TILE / 4;
+    constexpr int B_TOTAL_GROUPS = KT * B_N_CHUNKS;
+    constexpr int B_NUM_PASSES = (B_TOTAL_GROUPS + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // Pre-compute B load coordinates for each pass (loop-invariant)
+    struct BLoadCoord {
+        int kk_local;
+        int nl;
+        int gn;
+        int lds_off;
+        bool active;
+    };
+    BLoadCoord b_coords[B_NUM_PASSES];
+    #pragma unroll
+    for (int p = 0; p < B_NUM_PASSES; ++p)
+    {
+        const int flat = p * BLOCK_SIZE + threadIdx.x;
+        if (flat < B_TOTAL_GROUPS)
+        {
+            b_coords[p].kk_local = flat / B_N_CHUNKS;
+            b_coords[p].nl = (flat % B_N_CHUNKS) * 4;
+            b_coords[p].gn = n_block + b_coords[p].nl;
+            b_coords[p].lds_off = b_coords[p].kk_local * N_TILE + b_coords[p].nl;
+            b_coords[p].active = true;
+        }
+        else
+        {
+            b_coords[p] = {0, 0, 0, 0, false};
+        }
+    }
+
+    const int num_tiles = (total_k_groups + KT - 1) / KT;
+    if (num_tiles == 0) return;
+
+    // Staging registers for double-buffered pipeline
+    uint4 a_staging[A_NUM_PASSES];
+    uint4 b_staging[B_NUM_PASSES];
+
+    // =========================================================================
+    // Helper lambdas (device-code inlined by compiler)
+    // =========================================================================
+
+    // Issue all A global loads into staging registers
+    auto issue_a_loads = [&](int kt_base) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < A_NUM_PASSES; ++p)
+        {
+            const int mi = a_mi[p];
+            const int gkg = kt_base + a_kg;
+            if (__builtin_expect(mi < M && gkg + 3 < total_k_groups, 1))
+            {
+                a_staging[p] = *reinterpret_cast<const uint4*>(
+                    a_global + static_cast<int64_t>(mi) * a_row_stride + gkg);
+            }
+            else
+            {
+                a_staging[p].x = (mi < M && gkg + 0 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 0] : 0;
+                a_staging[p].y = (mi < M && gkg + 1 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 1] : 0;
+                a_staging[p].z = (mi < M && gkg + 2 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 2] : 0;
+                a_staging[p].w = (mi < M && gkg + 3 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 3] : 0;
+            }
+        }
+    };
+
+    // Issue all B global loads into staging registers
+    auto issue_b_loads = [&](int kt_base) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < B_NUM_PASSES; ++p)
+        {
+            if (b_coords[p].active)
+            {
+                const int gkk = kt_base + b_coords[p].kk_local;
+                const int gn = b_coords[p].gn;
+                if (__builtin_expect(gn + 3 < N && gkk < total_k_groups, 1))
+                {
+                    b_staging[p] = *reinterpret_cast<const uint4*>(
+                        b_global + static_cast<int64_t>(gkk) * N + gn);
+                }
+                else
+                {
+                    b_staging[p] = make_uint4(0, 0, 0, 0);
+                    b_staging[p].x = (gn + 0 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 0] : 0;
+                    b_staging[p].y = (gn + 1 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 1] : 0;
+                    b_staging[p].z = (gn + 2 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 2] : 0;
+                    b_staging[p].w = (gn + 3 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 3] : 0;
+                }
+            }
+        }
+    };
+
+    // Write staged A data to LDS buffer
+    auto write_a_to_lds = [&](int buf) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < A_NUM_PASSES; ++p)
+        {
+            const int mi = a_mi[p];
+            a_lds[buf][(a_kg + 0) * M_TILE + mi] = a_staging[p].x;
+            a_lds[buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
+            a_lds[buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
+            a_lds[buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
+        }
+    };
+
+    // Write staged B data to LDS buffer
+    auto write_b_to_lds = [&](int buf) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < B_NUM_PASSES; ++p)
+        {
+            if (b_coords[p].active)
+            {
+                *reinterpret_cast<uint4*>(&b_lds[buf][b_coords[p].lds_off]) = b_staging[p];
+            }
+        }
+    };
+
+    // Compute GEMM tile from LDS buffer into accumulators
+    auto compute_tile = [&](int buf) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int kk = 0; kk < KT; ++kk)
+        {
+            int32_t a_reg[M_PER_THREAD];
+            #pragma unroll
+            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                a_reg[mm] = a_lds[buf][kk * M_TILE + m_base + mm];
+
+            int32_t b_reg[N_PER_THREAD];
+            #pragma unroll
+            for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                b_reg[nn] = b_lds[buf][kk * N_TILE + t_n * N_PER_THREAD + nn];
+
+            #pragma unroll
+            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                    acc[mm][nn] = __builtin_amdgcn_sdot4(
+                        a_reg[mm], b_reg[nn], acc[mm][nn], false);
+        }
+    };
+
+    // =========================================================================
+    // PRELOAD: Load first tile (tile 0) into buf[0]
+    // =========================================================================
+    issue_a_loads(0);
+    issue_b_loads(0);
+    write_a_to_lds(0);
+    write_b_to_lds(0);
+    __syncthreads();
+
+    // =========================================================================
+    // MAIN LOOP: Double-buffered pipeline
+    // =========================================================================
+    for (int tile = 1; tile < num_tiles; ++tile)
+    {
+        const int cur_buf = (tile - 1) & 1;
+        const int nxt_buf = tile & 1;
+        const int kt_base = tile * KT;
+
+        // 1. Issue global loads for next tile (async)
+        issue_a_loads(kt_base);
+        issue_b_loads(kt_base);
+
+        // 2. Compute on current buffer (overlaps with global loads)
+        compute_tile(cur_buf);
+
+        // 3. Barrier: all threads done reading cur_buf
+        __syncthreads();
+
+        // 4. Write staged data to next buffer
+        write_a_to_lds(nxt_buf);
+        write_b_to_lds(nxt_buf);
+
+        // 5. Barrier: LDS writes visible
+        __syncthreads();
+    }
+
+    // =========================================================================
+    // FINAL TILE
+    // =========================================================================
+    compute_tile((num_tiles - 1) & 1);
+
+    // =========================================================================
+    // STORE RESULTS (vectorized uint4 stores with tail N handling)
+    // =========================================================================
+    #pragma unroll
+    for (int mm = 0; mm < M_PER_THREAD; ++mm)
+    {
+        const int m_idx = m_base + mm;
+        if (m_idx < M)
+        {
+            if (n_base + N_PER_THREAD - 1 < N)
+            {
+                const int64_t row_off = static_cast<int64_t>(m_idx) * N + n_base;
+                #pragma unroll
+                for (int chunk = 0; chunk < N_PER_THREAD; chunk += 4)
+                {
+                    *reinterpret_cast<uint4*>(d_C_int32 + row_off + chunk) =
+                        make_uint4(static_cast<uint32_t>(acc[mm][chunk + 0]),
+                                   static_cast<uint32_t>(acc[mm][chunk + 1]),
+                                   static_cast<uint32_t>(acc[mm][chunk + 2]),
+                                   static_cast<uint32_t>(acc[mm][chunk + 3]));
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                {
+                    const int n_idx = n_base + nn;
+                    if (n_idx < N)
+                    {
+                        d_C_int32[static_cast<int64_t>(m_idx) * N + n_idx] = acc[mm][nn];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// WIDE-TILE V5: N128 Double-Buffered + ABBA Software-Pipelined Inner Loop
+// ============================================================================
+//
+// V5 addresses V4's fatal flaw: 256 VGPR / 118 spills → 1 wave/SIMD.
+// The root cause was `#pragma unroll` on the KT loop with 64 accumulators,
+// causing the compiler to keep all KT × 20 operand VGPRs live simultaneously.
+//
+// V5 fixes this with three changes:
+//
+// 1. `__launch_bounds__(256, 2)` — forces 128 VGPR budget (2 waves/SIMD)
+//
+// 2. ABBA dual-register software pipeline for the KT loop:
+//    - Two operand register sets: set[0] and set[1], 20 VGPRs each
+//    - Load kk=0 into set[0], kk=1 into set[1], compute set[0],
+//      load kk=2 into set[0] (reuse), compute set[1], etc.
+//    - Peak live VGPRs: 64 (acc) + 2×20 (operands) + ~10 (misc) = ~114
+//
+// 3. Inline asm `s_waitcnt lgkmcnt(N)` for explicit partial waits:
+//    - After loading set[next], wait with lgkmcnt = 5 (one set in-flight)
+//    - Allows compute on set[cur] while set[next]'s reads complete
+//
+// Resource Budget (N128, KT=8):
+//   Target: ~108 VGPRs → 2 waves/SIMD (vs V4's 256 + 118 spills = 1 wave)
+//   Single-buffered inner loop: 20 operand VGPRs (a_reg[4] + b_reg[16])
+//   kk loop NOT unrolled — prevents VGPR explosion, 2-wave hides LDS latency
+//   LDS: same as V4 — a[2][KT×128] + b[2][KT×128] = 16/32 KB
+//   Matches CK's occupancy profile: 128 VGPRs, 2 waves/SIMD, 0 spills
+//
+// ============================================================================
+
+template <int N_TILE, int KT>
+__global__ __launch_bounds__(256, 2)
+void qgemm_int8_vnni_wide_tile_v5_kernel(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    int32_t* __restrict__ d_C_int32,
+    int M,
+    int N,
+    int K)
+{
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int THREADS_M = 32;
+    constexpr int THREADS_N = BLOCK_SIZE / THREADS_M; // 8
+    constexpr int M_PER_THREAD = 4;
+    constexpr int N_PER_THREAD = N_TILE / THREADS_N;  // 128/8 = 16
+    constexpr int M_TILE = THREADS_M * M_PER_THREAD;  // 128
+
+    static_assert(THREADS_M * THREADS_N == BLOCK_SIZE);
+    static_assert(N_TILE % THREADS_N == 0);
+    static_assert(KT % 4 == 0);
+    static_assert(N_TILE % 4 == 0);
+    static_assert(M_PER_THREAD == 4, "Vectorized A load requires M_PER_THREAD == 4");
+
+    const int n_block = blockIdx.x * N_TILE;
+    const int t_m = threadIdx.x % THREADS_M;
+    const int t_n = threadIdx.x / THREADS_M;
+    const int m_base = t_m * M_PER_THREAD;
+    const int n_base = n_block + t_n * N_PER_THREAD;
+
+    // =========================================================================
+    // LDS: Double-buffered (same as V4)
+    // =========================================================================
+    __shared__ int32_t a_lds[2][KT * M_TILE];
+    __shared__ int32_t b_lds[2][KT * N_TILE];
+
+    // 64 accumulators — always live across the KT loop
+    int32_t acc[M_PER_THREAD][N_PER_THREAD];
+    #pragma unroll
+    for (int mm = 0; mm < M_PER_THREAD; ++mm)
+        #pragma unroll
+        for (int nn = 0; nn < N_PER_THREAD; ++nn)
+            acc[mm][nn] = 0;
+
+    const int total_k_groups = K / 4;
+    const int32_t* a_global = reinterpret_cast<const int32_t*>(d_A_int8);
+    const int32_t* b_global = reinterpret_cast<const int32_t*>(d_B_int8_vnni);
+    const int a_row_stride = K / 4;
+
+    // =========================================================================
+    // A cooperative load geometry (same as V4)
+    // =========================================================================
+    constexpr int A_K_CHUNKS = KT / 4;
+    constexpr int A_ROWS_PER_PASS = BLOCK_SIZE / A_K_CHUNKS;
+    constexpr int A_NUM_PASSES = (M_TILE + A_ROWS_PER_PASS - 1) / A_ROWS_PER_PASS;
+
+    const int a_kg = (threadIdx.x % A_K_CHUNKS) * 4;
+    const int a_thread_mi_base = threadIdx.x / A_K_CHUNKS;
+
+    int a_mi[A_NUM_PASSES];
+    #pragma unroll
+    for (int p = 0; p < A_NUM_PASSES; ++p)
+        a_mi[p] = a_thread_mi_base + p * A_ROWS_PER_PASS;
+
+    // =========================================================================
+    // B cooperative load geometry (same as V4)
+    // =========================================================================
+    constexpr int B_N_CHUNKS = N_TILE / 4;
+    constexpr int B_TOTAL_GROUPS = KT * B_N_CHUNKS;
+    constexpr int B_NUM_PASSES = (B_TOTAL_GROUPS + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    struct BLoadCoord {
+        int kk_local;
+        int nl;
+        int gn;
+        int lds_off;
+        bool active;
+    };
+    BLoadCoord b_coords[B_NUM_PASSES];
+    #pragma unroll
+    for (int p = 0; p < B_NUM_PASSES; ++p)
+    {
+        const int flat = p * BLOCK_SIZE + threadIdx.x;
+        if (flat < B_TOTAL_GROUPS)
+        {
+            b_coords[p].kk_local = flat / B_N_CHUNKS;
+            b_coords[p].nl = (flat % B_N_CHUNKS) * 4;
+            b_coords[p].gn = n_block + b_coords[p].nl;
+            b_coords[p].lds_off = b_coords[p].kk_local * N_TILE + b_coords[p].nl;
+            b_coords[p].active = true;
+        }
+        else
+        {
+            b_coords[p] = {0, 0, 0, 0, false};
+        }
+    }
+
+    const int num_tiles = (total_k_groups + KT - 1) / KT;
+    if (num_tiles == 0) return;
+
+    uint4 a_staging[A_NUM_PASSES];
+    uint4 b_staging[B_NUM_PASSES];
+
+    // =========================================================================
+    // Global→LDS transfer lambdas (same as V4)
+    // =========================================================================
+    auto issue_a_loads = [&](int kt_base) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < A_NUM_PASSES; ++p)
+        {
+            const int mi = a_mi[p];
+            const int gkg = kt_base + a_kg;
+            if (__builtin_expect(mi < M && gkg + 3 < total_k_groups, 1))
+            {
+                a_staging[p] = *reinterpret_cast<const uint4*>(
+                    a_global + static_cast<int64_t>(mi) * a_row_stride + gkg);
+            }
+            else
+            {
+                a_staging[p].x = (mi < M && gkg + 0 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 0] : 0;
+                a_staging[p].y = (mi < M && gkg + 1 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 1] : 0;
+                a_staging[p].z = (mi < M && gkg + 2 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 2] : 0;
+                a_staging[p].w = (mi < M && gkg + 3 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 3] : 0;
+            }
+        }
+    };
+
+    auto issue_b_loads = [&](int kt_base) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < B_NUM_PASSES; ++p)
+        {
+            if (b_coords[p].active)
+            {
+                const int gkk = kt_base + b_coords[p].kk_local;
+                const int gn = b_coords[p].gn;
+                if (__builtin_expect(gn + 3 < N && gkk < total_k_groups, 1))
+                {
+                    b_staging[p] = *reinterpret_cast<const uint4*>(
+                        b_global + static_cast<int64_t>(gkk) * N + gn);
+                }
+                else
+                {
+                    b_staging[p] = make_uint4(0, 0, 0, 0);
+                    b_staging[p].x = (gn + 0 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 0] : 0;
+                    b_staging[p].y = (gn + 1 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 1] : 0;
+                    b_staging[p].z = (gn + 2 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 2] : 0;
+                    b_staging[p].w = (gn + 3 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 3] : 0;
+                }
+            }
+        }
+    };
+
+    auto write_a_to_lds = [&](int buf) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < A_NUM_PASSES; ++p)
+        {
+            const int mi = a_mi[p];
+            a_lds[buf][(a_kg + 0) * M_TILE + mi] = a_staging[p].x;
+            a_lds[buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
+            a_lds[buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
+            a_lds[buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
+        }
+    };
+
+    auto write_b_to_lds = [&](int buf) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < B_NUM_PASSES; ++p)
+        {
+            if (b_coords[p].active)
+            {
+                *reinterpret_cast<uint4*>(&b_lds[buf][b_coords[p].lds_off]) = b_staging[p];
+            }
+        }
+    };
+
+    // =========================================================================
+    // CHANGED: ABBA software-pipelined GEMM tile computation
+    //
+    // Instead of V4's `#pragma unroll for (kk=0..KT)` which explodes VGPRs:
+    // - Two operand register sets: set[0] and set[1], 20 VGPRs each
+    // - Runtime loop alternates: load→compute→load→compute (ABBA)
+    // - Compute on set[cur] while set[nxt]'s reads are in-flight
+    //
+    // Register budget:
+    //   64 (acc) + 2×4 (a_set) + 2×16 (b_set) + ~10 (addr/misc) = ~114
+    //   With __launch_bounds__(256, 2) → compiler targets ≤128 VGPRs
+    //
+    // V5 rev2: Single-buffered inner loop (no ABBA).
+    //   - 20 operand VGPRs (one set: a_reg[4] + b_reg[16]) instead of 40 (dual)
+    //   - #pragma clang loop unroll(disable) prevents kk loop unroll explosion
+    //   - 2-wave occupancy hides LDS read latency via wavefront switching
+    //   - Target: 64 acc + 20 operand + ~24 outer = ~108 VGPRs → 0 spills
+    // =========================================================================
+    auto compute_tile = [&](int buf) __attribute__((always_inline))
+    {
+        const int32_t* __restrict__ a_ptr = &a_lds[buf][m_base];
+        const int32_t* __restrict__ b_ptr = &b_lds[buf][t_n * N_PER_THREAD];
+
+        // Single-buffered: load + compute each kk step.
+        // No prefetching — 2 waves/SIMD handles latency hiding.
+        #pragma clang loop unroll(disable)
+        for (int kk = 0; kk < KT; ++kk)
+        {
+            // Operand registers: a_reg[4] + b_reg[16] = 20 VGPRs
+            // Declared inside loop body → reused each iteration, never stacked
+            int32_t a_reg[M_PER_THREAD];
+            int32_t b_reg[N_PER_THREAD];
+
+            // Vectorized LDS reads: 1 ds_read_b128 for A + 4 for B = 5 total
+            *reinterpret_cast<uint4*>(&a_reg[0]) =
+                *reinterpret_cast<const uint4*>(&a_ptr[kk * M_TILE]);
+
+            #pragma unroll
+            for (int c = 0; c < N_PER_THREAD; c += 4)
+                *reinterpret_cast<uint4*>(&b_reg[c]) =
+                    *reinterpret_cast<const uint4*>(&b_ptr[kk * N_TILE + c]);
+
+            // 64 v_dot4 — fully unrolled for ALU throughput
+            #pragma unroll
+            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                    acc[mm][nn] = __builtin_amdgcn_sdot4(
+                        a_reg[mm], b_reg[nn], acc[mm][nn], false);
+        }
+    };
+
+    // =========================================================================
+    // PRELOAD: Load first tile (tile 0) into buf[0]
+    // =========================================================================
+    issue_a_loads(0);
+    issue_b_loads(0);
+    write_a_to_lds(0);
+    write_b_to_lds(0);
+    __syncthreads();
+
+    // =========================================================================
+    // MAIN LOOP: Double-buffered pipeline (same as V4)
+    // =========================================================================
+    for (int tile = 1; tile < num_tiles; ++tile)
+    {
+        const int cur_buf = (tile - 1) & 1;
+        const int nxt_buf = tile & 1;
+        const int kt_base = tile * KT;
+
+        issue_a_loads(kt_base);
+        issue_b_loads(kt_base);
+
+        compute_tile(cur_buf);
+
+        __syncthreads();
+
+        write_a_to_lds(nxt_buf);
+        write_b_to_lds(nxt_buf);
+
+        __syncthreads();
+    }
+
+    // =========================================================================
+    // FINAL TILE
+    // =========================================================================
+    compute_tile((num_tiles - 1) & 1);
+
+    // =========================================================================
+    // STORE RESULTS (vectorized uint4 stores)
+    // =========================================================================
+    #pragma unroll
+    for (int mm = 0; mm < M_PER_THREAD; ++mm)
+    {
+        const int m_idx = m_base + mm;
+        if (m_idx < M)
+        {
+            if (n_base + N_PER_THREAD - 1 < N)
+            {
+                const int64_t row_off = static_cast<int64_t>(m_idx) * N + n_base;
+                #pragma unroll
+                for (int chunk = 0; chunk < N_PER_THREAD; chunk += 4)
+                {
+                    *reinterpret_cast<uint4*>(d_C_int32 + row_off + chunk) =
+                        make_uint4(static_cast<uint32_t>(acc[mm][chunk + 0]),
+                                   static_cast<uint32_t>(acc[mm][chunk + 1]),
+                                   static_cast<uint32_t>(acc[mm][chunk + 2]),
+                                   static_cast<uint32_t>(acc[mm][chunk + 3]));
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                {
+                    const int n_idx = n_base + nn;
+                    if (n_idx < N)
+                    {
+                        d_C_int32[static_cast<int64_t>(m_idx) * N + n_idx] = acc[mm][nn];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// WIDE-TILE V6: Cross-Iteration Read-Compute Overlap via Partial Unroll
+// ============================================================================
+//
+// V6 addresses V5's remaining scheduling inefficiency.
+//
+// ISA Analysis (V5 vs CK inner loop):
+//
+//   V5 (per kk step): 5 ds_read_b128 → lgkmcnt(3→2→1→0) → 64 v_dot4
+//     - First 16 v_dot4 overlap with 3 outstanding reads (good)
+//     - Remaining 48 v_dot4 have ZERO reads in-flight (wasted overlap)
+//     - `#pragma clang loop unroll(disable)` prevents cross-step visibility
+//
+//   CK (fully unrolled): 128 ds_read_b128 interleaved with 2048 v_dot4
+//     - 32 v_dot4 per compute block, 1-2 ds_read_b128 issued between blocks
+//     - Always 5-6 LDS reads in-flight → constant latency hiding
+//     - s_waitcnt lgkmcnt(5) → wait for oldest 1, keep 5 in pipeline
+//
+// V6 strategy: `#pragma clang loop unroll_count(2)` on the kk loop.
+//
+//   - Compiler sees 2 consecutive kk iterations (10 reads + 128 v_dot4)
+//   - Can schedule kk+1's reads DURING kk's compute (CK's pattern)
+//   - `__launch_bounds__(256, 2)` keeps 128 VGPR target
+//   - Unlike V5r1 (ABBA), the compiler CHOOSES overlap degree — no forced
+//     dual register sets. If overlap fits in 128 VGPRs, great; if not,
+//     it serializes gracefully (degrading to V5 performance, not worse).
+//
+// Register Budget (N128, KT=8, unroll_count=2):
+//   Peak live (with overlap): 64 acc + 20 (kk=0 operands) + 20 (kk=1 reads)
+//                            + ~24 overhead = ~128 VGPRs
+//   Peak live (no overlap):   64 acc + 20 operand + ~24 = ~108 VGPRs
+//   Either way: ≤128 VGPRs target, 0 spills, 2 waves/SIMD
+//
+// ============================================================================
+
+template <int N_TILE, int KT>
+__global__ __launch_bounds__(256, 2)
+void qgemm_int8_vnni_wide_tile_v6_kernel(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    int32_t* __restrict__ d_C_int32,
+    int M,
+    int N,
+    int K)
+{
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int THREADS_M = 32;
+    constexpr int THREADS_N = BLOCK_SIZE / THREADS_M; // 8
+    constexpr int M_PER_THREAD = 4;
+    constexpr int N_PER_THREAD = N_TILE / THREADS_N;  // 128/8 = 16
+    constexpr int M_TILE = THREADS_M * M_PER_THREAD;  // 128
+
+    static_assert(THREADS_M * THREADS_N == BLOCK_SIZE);
+    static_assert(N_TILE % THREADS_N == 0);
+    static_assert(KT % 4 == 0);
+    static_assert(N_TILE % 4 == 0);
+    static_assert(M_PER_THREAD == 4, "Vectorized A load requires M_PER_THREAD == 4");
+
+    const int n_block = blockIdx.x * N_TILE;
+    const int t_m = threadIdx.x % THREADS_M;
+    const int t_n = threadIdx.x / THREADS_M;
+    const int m_base = t_m * M_PER_THREAD;
+    const int n_base = n_block + t_n * N_PER_THREAD;
+
+    // =========================================================================
+    // LDS: Double-buffered (same as V5)
+    // =========================================================================
+    __shared__ int32_t a_lds[2][KT * M_TILE];
+    __shared__ int32_t b_lds[2][KT * N_TILE];
+
+    // 64 accumulators — always live across the KT loop
+    int32_t acc[M_PER_THREAD][N_PER_THREAD];
+    #pragma unroll
+    for (int mm = 0; mm < M_PER_THREAD; ++mm)
+        #pragma unroll
+        for (int nn = 0; nn < N_PER_THREAD; ++nn)
+            acc[mm][nn] = 0;
+
+    const int total_k_groups = K / 4;
+    const int32_t* a_global = reinterpret_cast<const int32_t*>(d_A_int8);
+    const int32_t* b_global = reinterpret_cast<const int32_t*>(d_B_int8_vnni);
+    const int a_row_stride = K / 4;
+
+    // =========================================================================
+    // A cooperative load geometry (same as V5)
+    // =========================================================================
+    constexpr int A_K_CHUNKS = KT / 4;
+    constexpr int A_ROWS_PER_PASS = BLOCK_SIZE / A_K_CHUNKS;
+    constexpr int A_NUM_PASSES = (M_TILE + A_ROWS_PER_PASS - 1) / A_ROWS_PER_PASS;
+
+    const int a_kg = (threadIdx.x % A_K_CHUNKS) * 4;
+    const int a_thread_mi_base = threadIdx.x / A_K_CHUNKS;
+
+    int a_mi[A_NUM_PASSES];
+    #pragma unroll
+    for (int p = 0; p < A_NUM_PASSES; ++p)
+        a_mi[p] = a_thread_mi_base + p * A_ROWS_PER_PASS;
+
+    // =========================================================================
+    // B cooperative load geometry (same as V5)
+    // =========================================================================
+    constexpr int B_N_CHUNKS = N_TILE / 4;
+    constexpr int B_TOTAL_GROUPS = KT * B_N_CHUNKS;
+    constexpr int B_NUM_PASSES = (B_TOTAL_GROUPS + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    struct BLoadCoord {
+        int kk_local;
+        int nl;
+        int gn;
+        int lds_off;
+        bool active;
+    };
+    BLoadCoord b_coords[B_NUM_PASSES];
+    #pragma unroll
+    for (int p = 0; p < B_NUM_PASSES; ++p)
+    {
+        const int flat = p * BLOCK_SIZE + threadIdx.x;
+        if (flat < B_TOTAL_GROUPS)
+        {
+            b_coords[p].kk_local = flat / B_N_CHUNKS;
+            b_coords[p].nl = (flat % B_N_CHUNKS) * 4;
+            b_coords[p].gn = n_block + b_coords[p].nl;
+            b_coords[p].lds_off = b_coords[p].kk_local * N_TILE + b_coords[p].nl;
+            b_coords[p].active = true;
+        }
+        else
+        {
+            b_coords[p] = {0, 0, 0, 0, false};
+        }
+    }
+
+    const int num_tiles = (total_k_groups + KT - 1) / KT;
+    if (num_tiles == 0) return;
+
+    uint4 a_staging[A_NUM_PASSES];
+    uint4 b_staging[B_NUM_PASSES];
+
+    // =========================================================================
+    // Global→LDS transfer lambdas (same as V5)
+    // =========================================================================
+    auto issue_a_loads = [&](int kt_base) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < A_NUM_PASSES; ++p)
+        {
+            const int mi = a_mi[p];
+            const int gkg = kt_base + a_kg;
+            if (__builtin_expect(mi < M && gkg + 3 < total_k_groups, 1))
+            {
+                a_staging[p] = *reinterpret_cast<const uint4*>(
+                    a_global + static_cast<int64_t>(mi) * a_row_stride + gkg);
+            }
+            else
+            {
+                a_staging[p].x = (mi < M && gkg + 0 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 0] : 0;
+                a_staging[p].y = (mi < M && gkg + 1 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 1] : 0;
+                a_staging[p].z = (mi < M && gkg + 2 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 2] : 0;
+                a_staging[p].w = (mi < M && gkg + 3 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 3] : 0;
+            }
+        }
+    };
+
+    auto issue_b_loads = [&](int kt_base) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < B_NUM_PASSES; ++p)
+        {
+            if (b_coords[p].active)
+            {
+                const int gkk = kt_base + b_coords[p].kk_local;
+                const int gn = b_coords[p].gn;
+                if (__builtin_expect(gn + 3 < N && gkk < total_k_groups, 1))
+                {
+                    b_staging[p] = *reinterpret_cast<const uint4*>(
+                        b_global + static_cast<int64_t>(gkk) * N + gn);
+                }
+                else
+                {
+                    b_staging[p] = make_uint4(0, 0, 0, 0);
+                    b_staging[p].x = (gn + 0 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 0] : 0;
+                    b_staging[p].y = (gn + 1 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 1] : 0;
+                    b_staging[p].z = (gn + 2 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 2] : 0;
+                    b_staging[p].w = (gn + 3 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 3] : 0;
+                }
+            }
+        }
+    };
+
+    auto write_a_to_lds = [&](int buf) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < A_NUM_PASSES; ++p)
+        {
+            const int mi = a_mi[p];
+            a_lds[buf][(a_kg + 0) * M_TILE + mi] = a_staging[p].x;
+            a_lds[buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
+            a_lds[buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
+            a_lds[buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
+        }
+    };
+
+    auto write_b_to_lds = [&](int buf) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < B_NUM_PASSES; ++p)
+        {
+            if (b_coords[p].active)
+            {
+                *reinterpret_cast<uint4*>(&b_lds[buf][b_coords[p].lds_off]) = b_staging[p];
+            }
+        }
+    };
+
+    // =========================================================================
+    // V6: SOFTWARE-PIPELINED INNER LOOP (non-unrolled pairs)
+    //
+    // Process kk steps in pairs with double-buffered operands. The pair
+    // loop is NOT unrolled to stay within 128 VGPR budget:
+    //   - Fully unrolled: 4 copies × 40 operands → 379 VGPR spills
+    //   - Non-unrolled:   1 body  × 40 operands → fits ~118 VGPRs
+    //
+    // For each (kk, kk+1) pair:
+    //   1) Load set 0 (5 ds_read) ─── sched_barrier ───
+    //   2) Load set 1 (5 ds_read) ─── sched_barrier ───
+    //   3) Compute kk   (64 v_dot4, compiler inserts lgkmcnt(5))
+    //            ── sched_barrier ───
+    //   4) Compute kk+1 (64 v_dot4, set 1 data ready)
+    //            ── sched_barrier ───
+    //
+    // The ~8% loop overhead (address compute + branch) is more than
+    // recovered by hiding ~30 cycles of LDS latency per pair.
+    //
+    // Register budget: 64 acc + 40 operands + 8 staging + ~6 misc = ~118
+    // =========================================================================
+    auto compute_tile = [&](int buf) __attribute__((always_inline))
+    {
+        const int32_t* __restrict__ a_ptr = &a_lds[buf][m_base];
+        const int32_t* __restrict__ b_ptr = &b_lds[buf][t_n * N_PER_THREAD];
+
+        static_assert(KT % 2 == 0, "KT must be even for paired processing");
+
+        #pragma clang loop unroll(disable)
+        for (int kk = 0; kk < KT; kk += 2)
+        {
+            int32_t a0[M_PER_THREAD], a1[M_PER_THREAD];
+            int32_t b0[N_PER_THREAD], b1[N_PER_THREAD];
+
+            // ═══ LOAD SET 0: kk operands (5 ds_read_b128) ═══════
+            *reinterpret_cast<uint4*>(&a0[0]) =
+                *reinterpret_cast<const uint4*>(&a_ptr[kk * M_TILE]);
+            #pragma unroll
+            for (int c = 0; c < N_PER_THREAD; c += 4)
+                *reinterpret_cast<uint4*>(&b0[c]) =
+                    *reinterpret_cast<const uint4*>(&b_ptr[kk * N_TILE + c]);
+
+            // fence: set 0 reads issued before set 1 reads
+            __builtin_amdgcn_sched_barrier(0);
+
+            // ═══ LOAD SET 1: kk+1 operands (5 ds_read_b128) ═════
+            *reinterpret_cast<uint4*>(&a1[0]) =
+                *reinterpret_cast<const uint4*>(&a_ptr[(kk + 1) * M_TILE]);
+            #pragma unroll
+            for (int c = 0; c < N_PER_THREAD; c += 4)
+                *reinterpret_cast<uint4*>(&b1[c]) =
+                    *reinterpret_cast<const uint4*>(&b_ptr[(kk + 1) * N_TILE + c]);
+
+            // fence: all 10 reads must be issued before compute
+            __builtin_amdgcn_sched_barrier(0);
+
+            // ═══ COMPUTE kk: 64 v_dot4 from set 0 ═══════════════
+            // Compiler inserts lgkmcnt(5): set 0 ready, set 1 in-flight
+            #pragma unroll
+            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                    acc[mm][nn] = __builtin_amdgcn_sdot4(
+                        a0[mm], b0[nn], acc[mm][nn], false);
+
+            // fence: kk compute complete before kk+1 compute
+            __builtin_amdgcn_sched_barrier(0);
+
+            // ═══ COMPUTE kk+1: 64 v_dot4 from set 1 ═════════════
+            // Set 1 data ready (64 ALU cycles >> 30 LDS latency)
+            #pragma unroll
+            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                    acc[mm][nn] = __builtin_amdgcn_sdot4(
+                        a1[mm], b1[nn], acc[mm][nn], false);
+
+            // fence: pair complete before next pair's reads
+            __builtin_amdgcn_sched_barrier(0);
+        }
+    };
+
+    // =========================================================================
+    // PRELOAD: Load first tile (tile 0) into buf[0]
+    // =========================================================================
+    issue_a_loads(0);
+    issue_b_loads(0);
+    write_a_to_lds(0);
+    write_b_to_lds(0);
+    __syncthreads();
+
+    // =========================================================================
+    // MAIN LOOP: Double-buffered pipeline (same as V5)
+    // =========================================================================
+    for (int tile = 1; tile < num_tiles; ++tile)
+    {
+        const int cur_buf = (tile - 1) & 1;
+        const int nxt_buf = tile & 1;
+        const int kt_base = tile * KT;
+
+        issue_a_loads(kt_base);
+        issue_b_loads(kt_base);
+
+        compute_tile(cur_buf);
+
+        __syncthreads();
+
+        write_a_to_lds(nxt_buf);
+        write_b_to_lds(nxt_buf);
+
+        __syncthreads();
+    }
+
+    // =========================================================================
+    // FINAL TILE
+    // =========================================================================
+    compute_tile((num_tiles - 1) & 1);
+
+    // =========================================================================
+    // STORE RESULTS (vectorized uint4 stores)
+    // =========================================================================
+    #pragma unroll
+    for (int mm = 0; mm < M_PER_THREAD; ++mm)
+    {
+        const int m_idx = m_base + mm;
+        if (m_idx < M)
+        {
+            if (n_base + N_PER_THREAD - 1 < N)
+            {
+                const int64_t row_off = static_cast<int64_t>(m_idx) * N + n_base;
+                #pragma unroll
+                for (int chunk = 0; chunk < N_PER_THREAD; chunk += 4)
+                {
+                    *reinterpret_cast<uint4*>(d_C_int32 + row_off + chunk) =
+                        make_uint4(static_cast<uint32_t>(acc[mm][chunk + 0]),
+                                   static_cast<uint32_t>(acc[mm][chunk + 1]),
+                                   static_cast<uint32_t>(acc[mm][chunk + 2]),
+                                   static_cast<uint32_t>(acc[mm][chunk + 3]));
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                {
+                    const int n_idx = n_base + nn;
+                    if (n_idx < N)
+                    {
+                        d_C_int32[static_cast<int64_t>(m_idx) * N + n_idx] = acc[mm][nn];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// WIDE-TILE V7: Safe-Tile Split with Branchless Interior Loop
+// ============================================================================
+//
+// V7 addresses the outer-pipeline overhead identified by rocprof profiling.
+//
+// rocprof per-dispatch analysis (7B FFN_Up, M=128 N=18944 K=3584):
+//   V5 GPU kernel: 0.771ms   CK GPU kernel: 0.723ms   Gap: 6.6%
+//
+// V5 ISA analysis shows the compiler emits both fast and slow (boundary-
+// checked) code paths within a single loop body: 15 branches in the fast
+// path + 84 branches in the boundary path = 99 loop branches total.
+// Even though branches are well-predicted, the duplicated boundary code:
+//   1. Wastes icache: ~800 extra instructions in the loop function
+//   2. Pollutes the L1I$ (16 KB/CU on gfx906), potentially evicting
+//      hot compute code on larger loop bodies
+//   3. Prevents optimal instruction scheduling — the compiler must
+//      generate branch-safe code even in the fast path
+//
+// V7 strategy: Split the outer loop into TWO separate loops:
+//
+//   SAFE LOOP:     tiles 1..num_safe_tiles-1
+//     - ALL loads are unconditional vectorized (global_load_dwordx4)
+//     - ZERO boundary checks, ZERO branches in load path
+//     - Compiler can generate maximally tight ISA
+//
+//   BOUNDARY LOOP: tiles num_safe_tiles..num_tiles-1
+//     - Full boundary checks (same as V5)
+//     - Only runs for the last 0-2 tiles (or never for aligned shapes)
+//
+// Safe tile computation:
+//   A loads safe when: a_mi[p] < M && kt_base + a_kg + 3 < total_k_groups
+//     → M >= M_TILE && (tile+1)*KT <= total_k_groups
+//   B loads safe when: gn + 3 < N && gkk < total_k_groups
+//     → n_block + N_TILE <= N && (tile+1)*KT <= total_k_groups
+//   Combined: safe for tiles 0..floor(total_k_groups/KT)-1 when M==M_TILE
+//             and this is an interior N-block.
+//
+// For 7B FFN_Up (M=128, N=18944, K=3584):
+//   total_k_groups=896, KT=8 → 896/8=112 = num_tiles → ALL tiles safe
+//   18944/128=148, 18944%128=0 → ALL N-blocks are interior
+//   → Boundary loop NEVER executes. Safe loop covers everything.
+//
+// Register budget: identical to V5 (64 acc + 20 staging + 20 operand + ~13)
+//   → 117 VGPRs, 0 spills, 2 waves/SIMD
+//
+// ============================================================================
+
+template <int N_TILE, int KT>
+__global__ __launch_bounds__(256, 2)
+void qgemm_int8_vnni_wide_tile_v7_kernel(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    int32_t* __restrict__ d_C_int32,
+    int M,
+    int N,
+    int K)
+{
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int THREADS_M = 32;
+    constexpr int THREADS_N = BLOCK_SIZE / THREADS_M; // 8
+    constexpr int M_PER_THREAD = 4;
+    constexpr int N_PER_THREAD = N_TILE / THREADS_N;  // 128/8 = 16
+    constexpr int M_TILE = THREADS_M * M_PER_THREAD;  // 128
+
+    static_assert(THREADS_M * THREADS_N == BLOCK_SIZE);
+    static_assert(N_TILE % THREADS_N == 0);
+    static_assert(KT % 4 == 0);
+    static_assert(N_TILE % 4 == 0);
+    static_assert(M_PER_THREAD == 4, "Vectorized A load requires M_PER_THREAD == 4");
+
+    const int n_block = blockIdx.x * N_TILE;
+    const int t_m = threadIdx.x % THREADS_M;
+    const int t_n = threadIdx.x / THREADS_M;
+    const int m_base = t_m * M_PER_THREAD;
+    const int n_base = n_block + t_n * N_PER_THREAD;
+
+    // =========================================================================
+    // LDS: Double-buffered
+    // =========================================================================
+    __shared__ int32_t a_lds[2][KT * M_TILE];
+    __shared__ int32_t b_lds[2][KT * N_TILE];
+
+    // 64 accumulators — always live across the KT loop
+    int32_t acc[M_PER_THREAD][N_PER_THREAD];
+    #pragma unroll
+    for (int mm = 0; mm < M_PER_THREAD; ++mm)
+        #pragma unroll
+        for (int nn = 0; nn < N_PER_THREAD; ++nn)
+            acc[mm][nn] = 0;
+
+    const int total_k_groups = K / 4;
+    const int32_t* a_global = reinterpret_cast<const int32_t*>(d_A_int8);
+    const int32_t* b_global = reinterpret_cast<const int32_t*>(d_B_int8_vnni);
+    const int a_row_stride = K / 4;
+
+    // =========================================================================
+    // A cooperative load geometry
+    // =========================================================================
+    constexpr int A_K_CHUNKS = KT / 4;
+    constexpr int A_ROWS_PER_PASS = BLOCK_SIZE / A_K_CHUNKS;
+    constexpr int A_NUM_PASSES = (M_TILE + A_ROWS_PER_PASS - 1) / A_ROWS_PER_PASS;
+
+    const int a_kg = (threadIdx.x % A_K_CHUNKS) * 4;
+    const int a_thread_mi_base = threadIdx.x / A_K_CHUNKS;
+
+    int a_mi[A_NUM_PASSES];
+    #pragma unroll
+    for (int p = 0; p < A_NUM_PASSES; ++p)
+        a_mi[p] = a_thread_mi_base + p * A_ROWS_PER_PASS;
+
+    // =========================================================================
+    // B cooperative load geometry
+    // =========================================================================
+    constexpr int B_N_CHUNKS = N_TILE / 4;
+    constexpr int B_TOTAL_GROUPS = KT * B_N_CHUNKS;
+    constexpr int B_NUM_PASSES = (B_TOTAL_GROUPS + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    struct BLoadCoord {
+        int kk_local;
+        int nl;
+        int gn;
+        int lds_off;
+        bool active;
+    };
+    BLoadCoord b_coords[B_NUM_PASSES];
+    #pragma unroll
+    for (int p = 0; p < B_NUM_PASSES; ++p)
+    {
+        const int flat = p * BLOCK_SIZE + threadIdx.x;
+        if (flat < B_TOTAL_GROUPS)
+        {
+            b_coords[p].kk_local = flat / B_N_CHUNKS;
+            b_coords[p].nl = (flat % B_N_CHUNKS) * 4;
+            b_coords[p].gn = n_block + b_coords[p].nl;
+            b_coords[p].lds_off = b_coords[p].kk_local * N_TILE + b_coords[p].nl;
+            b_coords[p].active = true;
+        }
+        else
+        {
+            b_coords[p] = {0, 0, 0, 0, false};
+        }
+    }
+
+    const int num_tiles = (total_k_groups + KT - 1) / KT;
+    if (num_tiles == 0) return;
+
+    uint4 a_staging[A_NUM_PASSES];
+    uint4 b_staging[B_NUM_PASSES];
+
+    // =========================================================================
+    // V7 CHANGE: Pre-compute safe tile count
+    //
+    // Safe tiles are those where ALL loads (A and B) are guaranteed in-bounds
+    // for ALL threads. This allows the safe loop to use unconditional
+    // vectorized loads with zero boundary checks.
+    //
+    // Safe conditions (all must hold):
+    //   1. M >= M_TILE (all a_mi[p] < M)
+    //   2. n_block + N_TILE <= N (all B column accesses within bounds)
+    //   3. (tile+1)*KT <= total_k_groups (all K-group accesses within bounds)
+    //
+    // num_safe_tiles = number of tiles satisfying condition 3 (0-indexed).
+    // If conditions 1 or 2 fail, num_safe_tiles = 0 (all tiles boundary-checked).
+    // =========================================================================
+    const bool a_m_safe  = (M >= M_TILE);
+    const bool b_n_safe  = (n_block + N_TILE <= N);
+    const int  safe_k    = total_k_groups / KT;  // floor: tiles with full K coverage
+    const int  num_safe  = (a_m_safe && b_n_safe) ? (safe_k < num_tiles ? safe_k : num_tiles) : 0;
+
+    // =========================================================================
+    // SAFE load lambdas: unconditional vectorized loads (no boundary checks)
+    // =========================================================================
+    auto safe_issue_a_loads = [&](int kt_base) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < A_NUM_PASSES; ++p)
+        {
+            a_staging[p] = *reinterpret_cast<const uint4*>(
+                a_global + static_cast<int64_t>(a_mi[p]) * a_row_stride + kt_base + a_kg);
+        }
+    };
+
+    auto safe_issue_b_loads = [&](int kt_base) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < B_NUM_PASSES; ++p)
+        {
+            if (b_coords[p].active)
+            {
+                b_staging[p] = *reinterpret_cast<const uint4*>(
+                    b_global + static_cast<int64_t>(kt_base + b_coords[p].kk_local) * N + b_coords[p].gn);
+            }
+        }
+    };
+
+    // =========================================================================
+    // BOUNDARY load lambdas: with boundary checks (same as V5)
+    // =========================================================================
+    auto boundary_issue_a_loads = [&](int kt_base) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < A_NUM_PASSES; ++p)
+        {
+            const int mi = a_mi[p];
+            const int gkg = kt_base + a_kg;
+            if (__builtin_expect(mi < M && gkg + 3 < total_k_groups, 1))
+            {
+                a_staging[p] = *reinterpret_cast<const uint4*>(
+                    a_global + static_cast<int64_t>(mi) * a_row_stride + gkg);
+            }
+            else
+            {
+                a_staging[p].x = (mi < M && gkg + 0 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 0] : 0;
+                a_staging[p].y = (mi < M && gkg + 1 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 1] : 0;
+                a_staging[p].z = (mi < M && gkg + 2 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 2] : 0;
+                a_staging[p].w = (mi < M && gkg + 3 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(mi) * a_row_stride + gkg + 3] : 0;
+            }
+        }
+    };
+
+    auto boundary_issue_b_loads = [&](int kt_base) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < B_NUM_PASSES; ++p)
+        {
+            if (b_coords[p].active)
+            {
+                const int gkk = kt_base + b_coords[p].kk_local;
+                const int gn = b_coords[p].gn;
+                if (__builtin_expect(gn + 3 < N && gkk < total_k_groups, 1))
+                {
+                    b_staging[p] = *reinterpret_cast<const uint4*>(
+                        b_global + static_cast<int64_t>(gkk) * N + gn);
+                }
+                else
+                {
+                    b_staging[p] = make_uint4(0, 0, 0, 0);
+                    b_staging[p].x = (gn + 0 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 0] : 0;
+                    b_staging[p].y = (gn + 1 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 1] : 0;
+                    b_staging[p].z = (gn + 2 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 2] : 0;
+                    b_staging[p].w = (gn + 3 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 3] : 0;
+                }
+            }
+        }
+    };
+
+    // =========================================================================
+    // LDS write lambdas (same as V5)
+    // =========================================================================
+    auto write_a_to_lds = [&](int buf) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < A_NUM_PASSES; ++p)
+        {
+            const int mi = a_mi[p];
+            a_lds[buf][(a_kg + 0) * M_TILE + mi] = a_staging[p].x;
+            a_lds[buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
+            a_lds[buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
+            a_lds[buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
+        }
+    };
+
+    auto write_b_to_lds = [&](int buf) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < B_NUM_PASSES; ++p)
+        {
+            if (b_coords[p].active)
+            {
+                *reinterpret_cast<uint4*>(&b_lds[buf][b_coords[p].lds_off]) = b_staging[p];
+            }
+        }
+    };
+
+    // =========================================================================
+    // Compute tile (same as V5: single-buffered inner loop)
+    // =========================================================================
+    auto compute_tile = [&](int buf) __attribute__((always_inline))
+    {
+        const int32_t* __restrict__ a_ptr = &a_lds[buf][m_base];
+        const int32_t* __restrict__ b_ptr = &b_lds[buf][t_n * N_PER_THREAD];
+
+        #pragma clang loop unroll(disable)
+        for (int kk = 0; kk < KT; ++kk)
+        {
+            int32_t a_reg[M_PER_THREAD];
+            int32_t b_reg[N_PER_THREAD];
+
+            *reinterpret_cast<uint4*>(&a_reg[0]) =
+                *reinterpret_cast<const uint4*>(&a_ptr[kk * M_TILE]);
+
+            #pragma unroll
+            for (int c = 0; c < N_PER_THREAD; c += 4)
+                *reinterpret_cast<uint4*>(&b_reg[c]) =
+                    *reinterpret_cast<const uint4*>(&b_ptr[kk * N_TILE + c]);
+
+            #pragma unroll
+            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                    acc[mm][nn] = __builtin_amdgcn_sdot4(
+                        a_reg[mm], b_reg[nn], acc[mm][nn], false);
+        }
+    };
+
+    // =========================================================================
+    // PRELOAD: tile 0 (safe or boundary)
+    // =========================================================================
+    if (num_safe > 0)
+    {
+        safe_issue_a_loads(0);
+        safe_issue_b_loads(0);
+    }
+    else
+    {
+        boundary_issue_a_loads(0);
+        boundary_issue_b_loads(0);
+    }
+    write_a_to_lds(0);
+    write_b_to_lds(0);
+    __syncthreads();
+
+    // =========================================================================
+    // SAFE LOOP: tiles 1..num_safe-1 (zero boundary checks)
+    //
+    // This is the hot path for aligned shapes. The compiler generates a
+    // tight loop body without any boundary-checking branches or fallback
+    // scalar load code, resulting in smaller ISA and better icache utilization.
+    // =========================================================================
+    for (int tile = 1; tile < num_safe; ++tile)
+    {
+        const int cur_buf = (tile - 1) & 1;
+        const int nxt_buf = tile & 1;
+        const int kt_base = tile * KT;
+
+        safe_issue_a_loads(kt_base);
+        safe_issue_b_loads(kt_base);
+
+        compute_tile(cur_buf);
+
+        __syncthreads();
+
+        write_a_to_lds(nxt_buf);
+        write_b_to_lds(nxt_buf);
+
+        __syncthreads();
+    }
+
+    // =========================================================================
+    // BOUNDARY LOOP: tiles max(1, num_safe)..num_tiles-1 (with boundary checks)
+    //
+    // Handles the last 0-2 tiles where K or N boundary checks are needed.
+    // For aligned shapes (M=128, N%128==0, K%32==0), this loop never executes.
+    // =========================================================================
+    {
+        const int boundary_start = (num_safe > 0) ? num_safe : 1;
+        for (int tile = boundary_start; tile < num_tiles; ++tile)
+        {
+            const int cur_buf = (tile - 1) & 1;
+            const int nxt_buf = tile & 1;
+            const int kt_base = tile * KT;
+
+            boundary_issue_a_loads(kt_base);
+            boundary_issue_b_loads(kt_base);
+
+            compute_tile(cur_buf);
+
+            __syncthreads();
+
+            write_a_to_lds(nxt_buf);
+            write_b_to_lds(nxt_buf);
+
+            __syncthreads();
+        }
+    }
+
+    // =========================================================================
+    // FINAL TILE
+    // =========================================================================
+    compute_tile((num_tiles - 1) & 1);
+
+    // =========================================================================
+    // STORE RESULTS (vectorized uint4 stores)
+    // =========================================================================
+    #pragma unroll
+    for (int mm = 0; mm < M_PER_THREAD; ++mm)
+    {
+        const int m_idx = m_base + mm;
+        if (m_idx < M)
+        {
+            if (n_base + N_PER_THREAD - 1 < N)
+            {
+                const int64_t row_off = static_cast<int64_t>(m_idx) * N + n_base;
+                #pragma unroll
+                for (int chunk = 0; chunk < N_PER_THREAD; chunk += 4)
+                {
+                    *reinterpret_cast<uint4*>(d_C_int32 + row_off + chunk) =
+                        make_uint4(static_cast<uint32_t>(acc[mm][chunk + 0]),
+                                   static_cast<uint32_t>(acc[mm][chunk + 1]),
+                                   static_cast<uint32_t>(acc[mm][chunk + 2]),
+                                   static_cast<uint32_t>(acc[mm][chunk + 3]));
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                {
+                    const int n_idx = n_base + nn;
+                    if (n_idx < N)
+                    {
+                        d_C_int32[static_cast<int64_t>(m_idx) * N + n_idx] = acc[mm][nn];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
 // STUBS: Phase 4 functions return success but log "not yet implemented"
 // ============================================================================
 
@@ -4037,6 +5916,378 @@ extern "C"
         if (err != hipSuccess)
         {
             fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v2] Kernel launch failed: %s (M=%d N=%d K=%d kt=%d)\n",
+                    hipGetErrorString(err), M, N, K, kt_select);
+            return false;
+        }
+
+        return true;
+    }
+
+    // =========================================================================
+    // WIDE-TILE V3 DISPATCH (LDS Double-Buffered Pipeline)
+    // =========================================================================
+    //
+    // V3 variant uses LDS double-buffering to overlap global→LDS loads for
+    // tile N+1 with compute on tile N.  Based on CK ISA analysis showing
+    // this is the primary technique behind CK's 14% advantage over V1.
+    //
+    // Also fixes multi-pass A cooperative load for KT=16 (V1 only covers
+    // 64 of 128 M-rows when KT=16).
+    //
+    // kt_select: 8 → KT=8 (3 waves/SIMD, 12 KB LDS),
+    //           16 → KT=16 (2 workgroups/CU, 24 KB LDS, fewer iterations).
+    //
+    // =========================================================================
+    bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v3(
+        const int8_t* d_A_int8,
+        const int8_t* d_B_int8_vnni,
+        int32_t* d_C_int32,
+        int M, int N, int K,
+        int kt_select,
+        int rocm_device_id, void* stream)
+    {
+        if (!d_A_int8 || !d_B_int8_vnni || !d_C_int32 || M <= 0 || N <= 0 || K <= 0)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v3] Invalid arguments (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if ((K % 4) != 0)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v3] K must be multiple of 4 (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if (M > 128)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v3] M must be ≤ 128 (got M=%d)\n", M);
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+        {
+            return false;
+        }
+
+        constexpr int N_TILE = 64;
+        constexpr int BLOCK_SIZE = 256;
+
+        const unsigned n_tiles = static_cast<unsigned>((N + N_TILE - 1) / N_TILE);
+        const dim3 grid(n_tiles, 1, 1);
+        const dim3 block(BLOCK_SIZE, 1, 1);
+
+        if (kt_select == 16)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v3_kernel<N_TILE, 16>),
+                               grid, block, 0, static_cast<hipStream_t>(stream),
+                               d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+        else
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v3_kernel<N_TILE, 8>),
+                               grid, block, 0, static_cast<hipStream_t>(stream),
+                               d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v3] Kernel launch failed: %s (M=%d N=%d K=%d kt=%d)\n",
+                    hipGetErrorString(err), M, N, K, kt_select);
+            return false;
+        }
+
+        return true;
+    }
+
+    // =========================================================================
+    // WIDE-TILE V4 DISPATCH (N128 Double-Buffered Pipeline)
+    // =========================================================================
+    //
+    // V4 targets FFN_Up/Gate shapes by matching CK's N128 tile geometry:
+    //   - N_TILE = 128 (vs V1/V3's N_TILE = 64)
+    //   - LDS double-buffering (same as V3)
+    //   - Multi-pass B cooperative loading (new for N128)
+    //
+    // kt_select: 8  → KT=8  (16 KB LDS, 4 workgroups/CU, 2 waves/SIMD)
+    //           16  → KT=16 (32 KB LDS, 2 workgroups/CU, 2 waves/SIMD)
+    //
+    // =========================================================================
+    bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v4(
+        const int8_t* d_A_int8,
+        const int8_t* d_B_int8_vnni,
+        int32_t* d_C_int32,
+        int M, int N, int K,
+        int kt_select,
+        int rocm_device_id, void* stream)
+    {
+        if (!d_A_int8 || !d_B_int8_vnni || !d_C_int32 || M <= 0 || N <= 0 || K <= 0)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v4] Invalid arguments (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if ((K % 4) != 0)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v4] K must be multiple of 4 (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if (M > 128)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v4] M must be ≤ 128 (got M=%d)\n", M);
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+        {
+            return false;
+        }
+
+        constexpr int N_TILE = 128;
+        constexpr int BLOCK_SIZE = 256;
+
+        const unsigned n_tiles = static_cast<unsigned>((N + N_TILE - 1) / N_TILE);
+        const dim3 grid(n_tiles, 1, 1);
+        const dim3 block(BLOCK_SIZE, 1, 1);
+
+        if (kt_select == 16)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v4_kernel<N_TILE, 16>),
+                               grid, block, 0, static_cast<hipStream_t>(stream),
+                               d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+        else
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v4_kernel<N_TILE, 8>),
+                               grid, block, 0, static_cast<hipStream_t>(stream),
+                               d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v4] Kernel launch failed: %s (M=%d N=%d K=%d kt=%d)\n",
+                    hipGetErrorString(err), M, N, K, kt_select);
+            return false;
+        }
+
+        return true;
+    }
+
+    // =========================================================================
+    // WIDE-TILE V5 DISPATCH (N128 ABBA Software-Pipelined)
+    // =========================================================================
+    //
+    // V5 = V4 outer structure + ABBA inner loop + __launch_bounds__(256,2).
+    // Targets 2 waves/SIMD (≤128 VGPRs) vs V4's 1 wave (256 VGPRs + spills).
+    //
+    // kt_select: 8  → KT=8  (16 KB LDS, 4 workgroups/CU, 2 waves/SIMD)
+    //           16  → KT=16 (32 KB LDS, 2 workgroups/CU, 2 waves/SIMD)
+    //
+    // =========================================================================
+    bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v5(
+        const int8_t* d_A_int8,
+        const int8_t* d_B_int8_vnni,
+        int32_t* d_C_int32,
+        int M, int N, int K,
+        int kt_select,
+        int rocm_device_id, void* stream)
+    {
+        if (!d_A_int8 || !d_B_int8_vnni || !d_C_int32 || M <= 0 || N <= 0 || K <= 0)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v5] Invalid arguments (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if ((K % 4) != 0)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v5] K must be multiple of 4 (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if (M > 128)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v5] M must be ≤ 128 (got M=%d)\n", M);
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+        {
+            return false;
+        }
+
+        constexpr int N_TILE = 128;
+        constexpr int BLOCK_SIZE = 256;
+
+        const unsigned n_tiles = static_cast<unsigned>((N + N_TILE - 1) / N_TILE);
+        const dim3 grid(n_tiles, 1, 1);
+        const dim3 block(BLOCK_SIZE, 1, 1);
+
+        if (kt_select == 16)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v5_kernel<N_TILE, 16>),
+                               grid, block, 0, static_cast<hipStream_t>(stream),
+                               d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+        else
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v5_kernel<N_TILE, 8>),
+                               grid, block, 0, static_cast<hipStream_t>(stream),
+                               d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v5] Kernel launch failed: %s (M=%d N=%d K=%d kt=%d)\n",
+                    hipGetErrorString(err), M, N, K, kt_select);
+            return false;
+        }
+
+        return true;
+    }
+
+    // =========================================================================
+    // WIDE-TILE V6 DISPATCH (N128 Cross-Iteration Read-Compute Overlap)
+    // =========================================================================
+    //
+    // V6 = V5 + #pragma clang loop unroll_count(2) on inner kk loop.
+    // Targets CK-style ds_read/v_dot4 interleaving across kk steps.
+    //
+    // kt_select: 8  → KT=8  (16 KB LDS, 4 workgroups/CU, 2 waves/SIMD)
+    //           16  → KT=16 (32 KB LDS, 2 workgroups/CU, 2 waves/SIMD)
+    //
+    // =========================================================================
+    bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v6(
+        const int8_t* d_A_int8,
+        const int8_t* d_B_int8_vnni,
+        int32_t* d_C_int32,
+        int M, int N, int K,
+        int kt_select,
+        int rocm_device_id, void* stream)
+    {
+        if (!d_A_int8 || !d_B_int8_vnni || !d_C_int32 || M <= 0 || N <= 0 || K <= 0)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v6] Invalid arguments (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if ((K % 4) != 0)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v6] K must be multiple of 4 (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if (M > 128)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v6] M must be ≤ 128 (got M=%d)\n", M);
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+        {
+            return false;
+        }
+
+        constexpr int N_TILE = 128;
+        constexpr int BLOCK_SIZE = 256;
+
+        const unsigned n_tiles = static_cast<unsigned>((N + N_TILE - 1) / N_TILE);
+        const dim3 grid(n_tiles, 1, 1);
+        const dim3 block(BLOCK_SIZE, 1, 1);
+
+        if (kt_select == 16)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v6_kernel<N_TILE, 16>),
+                               grid, block, 0, static_cast<hipStream_t>(stream),
+                               d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+        else
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v6_kernel<N_TILE, 8>),
+                               grid, block, 0, static_cast<hipStream_t>(stream),
+                               d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v6] Kernel launch failed: %s (M=%d N=%d K=%d kt=%d)\n",
+                    hipGetErrorString(err), M, N, K, kt_select);
+            return false;
+        }
+
+        return true;
+    }
+
+    // =========================================================================
+    // WIDE-TILE V7 DISPATCH (N128 Safe-Tile Split with Branchless Interior)
+    // =========================================================================
+    //
+    // V7 = V5 outer structure + safe/boundary tile split.
+    // Safe loop uses unconditional vectorized loads (zero boundary branches).
+    // Boundary loop handles last 0-2 edge tiles with full checking.
+    //
+    // kt_select: 8  → KT=8  (16 KB LDS, 4 workgroups/CU, 2 waves/SIMD)
+    //           16  → KT=16 (32 KB LDS, 2 workgroups/CU, 2 waves/SIMD)
+    //
+    // =========================================================================
+    bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v7(
+        const int8_t* d_A_int8,
+        const int8_t* d_B_int8_vnni,
+        int32_t* d_C_int32,
+        int M, int N, int K,
+        int kt_select,
+        int rocm_device_id, void* stream)
+    {
+        if (!d_A_int8 || !d_B_int8_vnni || !d_C_int32 || M <= 0 || N <= 0 || K <= 0)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v7] Invalid arguments (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if ((K % 4) != 0)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v7] K must be multiple of 4 (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if (M > 128)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v7] M must be ≤ 128 (got M=%d)\n", M);
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+        {
+            return false;
+        }
+
+        constexpr int N_TILE = 128;
+        constexpr int BLOCK_SIZE = 256;
+
+        const unsigned n_tiles = static_cast<unsigned>((N + N_TILE - 1) / N_TILE);
+        const dim3 grid(n_tiles, 1, 1);
+        const dim3 block(BLOCK_SIZE, 1, 1);
+
+        if (kt_select == 16)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v7_kernel<N_TILE, 16>),
+                               grid, block, 0, static_cast<hipStream_t>(stream),
+                               d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+        else
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v7_kernel<N_TILE, 8>),
+                               grid, block, 0, static_cast<hipStream_t>(stream),
+                               d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_vnni_prefill_wide_tile_v7] Kernel launch failed: %s (M=%d N=%d K=%d kt=%d)\n",
                     hipGetErrorString(err), M, N, K, kt_select);
             return false;
         }

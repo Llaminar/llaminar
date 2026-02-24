@@ -405,6 +405,56 @@ namespace llaminar2
                 int kt_select,
                 int device_id, void *stream);
 
+            // INT8 VNNI wide-tile V3 prefill GEMM (LDS double-buffered pipeline).
+            // kt_select: 8 or 16.
+            bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v3(
+                const int8_t *d_A_int8,
+                const int8_t *d_B_int8_vnni,
+                int32_t *d_C_int32,
+                int M, int N, int K,
+                int kt_select,
+                int device_id, void *stream);
+
+            // INT8 VNNI wide-tile V4 prefill GEMM (N128 double-buffered pipeline).
+            // kt_select: 8 or 16.
+            bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v4(
+                const int8_t *d_A_int8,
+                const int8_t *d_B_int8_vnni,
+                int32_t *d_C_int32,
+                int M, int N, int K,
+                int kt_select,
+                int device_id, void *stream);
+
+            // INT8 VNNI wide-tile V5 prefill GEMM (N128 ABBA software-pipelined, 2 waves/SIMD).
+            // kt_select: 8 or 16.
+            bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v5(
+                const int8_t *d_A_int8,
+                const int8_t *d_B_int8_vnni,
+                int32_t *d_C_int32,
+                int M, int N, int K,
+                int kt_select,
+                int device_id, void *stream);
+
+            // INT8 VNNI wide-tile V6 prefill GEMM (N128 cross-iteration overlap, 2 waves/SIMD).
+            // kt_select: 8 or 16.
+            bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v6(
+                const int8_t *d_A_int8,
+                const int8_t *d_B_int8_vnni,
+                int32_t *d_C_int32,
+                int M, int N, int K,
+                int kt_select,
+                int device_id, void *stream);
+
+            // INT8 VNNI wide-tile V7 prefill GEMM (N128 safe-tile split, branchless interior).
+            // kt_select: 8 or 16.
+            bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v7(
+                const int8_t *d_A_int8,
+                const int8_t *d_B_int8_vnni,
+                int32_t *d_C_int32,
+                int M, int N, int K,
+                int kt_select,
+                int device_id, void *stream);
+
             // ratio-VNNI native prefill GEMM scaffold: payload + ratio side-channel
             bool rocmGemm_ratio_vnni_int8_int32_prefill(
                 const int8_t *d_A_int8,   // [M x K] row-major INT8 activations
@@ -2295,8 +2345,64 @@ namespace llaminar2
                 // Wide-tile path: covers all M-rows in one block (extreme-wide shapes)
                 if (!has_manual_override && policy_cfg.use_wide_tile)
                 {
-                    if (rocm_env.wide_tile_v2)
+                    if (rocm_env.wide_tile_v7)
                     {
+                        // V7 forced via env var: safe-tile split, branchless interior loop
+                        native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v7(
+                            d_A_int8,
+                            impl_->d_weights_int8_vnni,
+                            impl_->d_C_int32,
+                            m, n, k,
+                            rocm_env.wide_tile_kt,
+                            rocm_device_id_, gpu_stream_);
+                    }
+                    else if (rocm_env.wide_tile_v6)
+                    {
+                        // V6 forced via env var: partial-unroll cross-iteration read-compute overlap
+                        native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v6(
+                            d_A_int8,
+                            impl_->d_weights_int8_vnni,
+                            impl_->d_C_int32,
+                            m, n, k,
+                            rocm_env.wide_tile_kt,
+                            rocm_device_id_, gpu_stream_);
+                    }
+                    else if (rocm_env.wide_tile_v5)
+                    {
+                        // V5 forced via env var: N128 ABBA software-pipelined, 2 waves/SIMD
+                        native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v5(
+                            d_A_int8,
+                            impl_->d_weights_int8_vnni,
+                            impl_->d_C_int32,
+                            m, n, k,
+                            rocm_env.wide_tile_kt,
+                            rocm_device_id_, gpu_stream_);
+                    }
+                    else if (rocm_env.wide_tile_v4)
+                    {
+                        // V4 forced via env var: N128 double-buffered pipeline
+                        native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v4(
+                            d_A_int8,
+                            impl_->d_weights_int8_vnni,
+                            impl_->d_C_int32,
+                            m, n, k,
+                            rocm_env.wide_tile_kt,
+                            rocm_device_id_, gpu_stream_);
+                    }
+                    else if (rocm_env.wide_tile_v3)
+                    {
+                        // V3 forced via env var for all wide-tile shapes
+                        native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v3(
+                            d_A_int8,
+                            impl_->d_weights_int8_vnni,
+                            impl_->d_C_int32,
+                            m, n, k,
+                            rocm_env.wide_tile_kt,
+                            rocm_device_id_, gpu_stream_);
+                    }
+                    else if (rocm_env.wide_tile_v2)
+                    {
+                        // V2 forced via env var for all wide-tile shapes
                         native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v2(
                             d_A_int8,
                             impl_->d_weights_int8_vnni,
@@ -2305,14 +2411,35 @@ namespace llaminar2
                             rocm_env.wide_tile_kt,
                             rocm_device_id_, gpu_stream_);
                     }
-                    else
+                    else if (k >= n)
                     {
-                        native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_ntile(
+                        // Auto V3 for K-heavy shapes (Attention: K==N, FFN_Down: K>>N).
+                        // V3's LDS double-buffering hides global load latency in the long
+                        // K-loop, giving +2-5% over V1 on these shapes.
+                        // N-heavy shapes (FFN_Up/Gate, LM_Head: N > K) use V5 below.
+                        native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v3(
                             d_A_int8,
                             impl_->d_weights_int8_vnni,
                             impl_->d_C_int32,
                             m, n, k,
-                            rocm_env.wide_tile_ntile,
+                            8, // KT=8: best occupancy for V3 auto-dispatch
+                            rocm_device_id_, gpu_stream_);
+                    }
+                    else
+                    {
+                        // Auto V7/KT16 for N-heavy shapes (FFN_Up/Gate, LM_Head: N > K).
+                        // V7's safe-tile split eliminates boundary branches from the hot
+                        // loop — for aligned shapes (M=128, N%128==0, K%32==0) the boundary
+                        // loop never executes, producing maximally tight ISA.
+                        // Benchmark results (wallclock, 7B FFN_Up M=128 N=18944 K=3584):
+                        //   V7/KT16: 7.300ms  V5/KT8: 7.397ms  CK: 7.323ms
+                        // V7/KT16 matches or beats CK on all FFN_Up and LM_Head shapes.
+                        native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v7(
+                            d_A_int8,
+                            impl_->d_weights_int8_vnni,
+                            impl_->d_C_int32,
+                            m, n, k,
+                            16, // KT=16: best for V7 (safe-tile split, 2 waves/SIMD)
                             rocm_device_id_, gpu_stream_);
                     }
                     if (!native_ok)

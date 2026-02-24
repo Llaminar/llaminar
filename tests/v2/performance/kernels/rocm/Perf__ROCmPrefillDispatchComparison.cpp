@@ -145,9 +145,12 @@ namespace
             return runPathBenchmarkVariant(shape, use_new_dispatch, false, 8);
         }
 
-        // Extended variant: control wide-tile V2 and KT selection
+        // Extended variant: control wide-tile V2/V3/V4 and KT selection
         PathBenchStats runPathBenchmarkVariant(const ShapeCase &shape, bool use_new_dispatch,
-                                               bool use_v2, int kt, int ntile = 64)
+                                               bool use_v2, int kt, int ntile = 64,
+                                               bool use_v3 = false, bool use_v4 = false,
+                                               bool use_v5 = false, bool use_v6 = false,
+                                               bool use_v7 = false)
         {
             PathBenchStats stats;
 
@@ -173,6 +176,11 @@ namespace
             ScopedEnvOverride prefill_variant("LLAMINAR_ROCM_VNNI_PREFILL_VARIANT", "-1");
             ScopedEnvOverride prefill_grid_variant("LLAMINAR_ROCM_VNNI_PREFILL_GRID_VARIANT", "-1");
             ScopedEnvOverride wide_v2("LLAMINAR_ROCM_WIDE_TILE_V2", use_v2 ? "1" : "0");
+            ScopedEnvOverride wide_v3("LLAMINAR_ROCM_WIDE_TILE_V3", use_v3 ? "1" : "0");
+            ScopedEnvOverride wide_v4("LLAMINAR_ROCM_WIDE_TILE_V4", use_v4 ? "1" : "0");
+            ScopedEnvOverride wide_v5("LLAMINAR_ROCM_WIDE_TILE_V5", use_v5 ? "1" : "0");
+            ScopedEnvOverride wide_v6("LLAMINAR_ROCM_WIDE_TILE_V6", use_v6 ? "1" : "0");
+            ScopedEnvOverride wide_v7("LLAMINAR_ROCM_WIDE_TILE_V7", use_v7 ? "1" : "0");
             ScopedEnvOverride wide_kt("LLAMINAR_ROCM_WIDE_TILE_KT", std::to_string(kt));
             ScopedEnvOverride wide_ntile("LLAMINAR_ROCM_WIDE_TILE_NTILE", std::to_string(ntile));
 
@@ -316,22 +324,37 @@ namespace
             GTEST_SKIP() << "No ROCm device available";
         }
 
-        std::cout << "\n[Perf] Wide-tile variant comparison: V1/N64 vs V1/N128 vs V2/KT8 vs V2/KT16\n";
+        std::cout << "\n[Perf] Wide-tile variant comparison: V1/N64 vs V1/N128 vs V2/KT8 vs V2/KT16 vs V3/KT8 vs V3/KT16\n";
         std::cout << "[Perf] Device: " << device_name_ << "\n\n";
 
         struct VariantConfig
         {
             const char *name;
             bool v2;
+            bool v3;
+            bool v4;
+            bool v5;
+            bool v6;
+            bool v7;
             int kt;
             int ntile;
         };
 
         const std::vector<VariantConfig> variants = {
-            {"V1/N64", false, 8, 64},
-            {"V1/N128", false, 8, 128},
-            {"V2/KT8", true, 8, 64},
-            {"V2/KT16", true, 16, 64},
+            {"V1/N64", false, false, false, false, false, false, 8, 64},
+            {"V1/N128", false, false, false, false, false, false, 8, 128},
+            {"V2/KT8", true, false, false, false, false, false, 8, 64},
+            {"V2/KT16", true, false, false, false, false, false, 16, 64},
+            {"V3/KT8", false, true, false, false, false, false, 8, 64},
+            {"V3/KT16", false, true, false, false, false, false, 16, 64},
+            {"V4/KT8", false, false, true, false, false, false, 8, 128},
+            {"V4/KT16", false, false, true, false, false, false, 16, 128},
+            {"V5/KT8", false, false, false, true, false, false, 8, 128},
+            {"V5/KT16", false, false, false, true, false, false, 16, 128},
+            {"V6/KT8", false, false, false, false, true, false, 8, 128},
+            {"V6/KT16", false, false, false, false, true, false, 16, 128},
+            {"V7/KT8", false, false, false, false, false, true, 8, 128},
+            {"V7/KT16", false, false, false, false, false, true, 16, 128},
         };
 
         const std::vector<ShapeCase> shapes = {
@@ -353,9 +376,15 @@ namespace
 
         fort::utf8_table table;
         table.set_border_style(FT_DOUBLE2_STYLE);
-        table << fort::header << "Shape" << "N" << "K" << "CK(ms)" << "V1/N64(ms)" << "V1/N128(ms)" << "V2/KT8(ms)" << "V2/KT16(ms)" << "Best" << "vs CK" << fort::endr;
+        table << fort::header << "Shape" << "N" << "K" << "CK(ms)";
+        for (const auto &v : variants)
+        {
+            table << (std::string(v.name) + "(ms)");
+        }
+        table << "Best" << "vs CK" << fort::endr;
         table.column(0).set_cell_text_align(fort::text_align::left);
-        for (int c = 1; c <= 9; ++c)
+        const int num_cols = 3 + static_cast<int>(variants.size()) + 2; // Shape+N+K + variants + Best+vsCK
+        for (int c = 1; c < num_cols; ++c)
         {
             table.column(static_cast<unsigned>(c)).set_cell_text_align(fort::text_align::right);
         }
@@ -369,7 +398,7 @@ namespace
             std::vector<PathBenchStats> variant_stats;
             for (const auto &v : variants)
             {
-                variant_stats.push_back(runPathBenchmarkVariant(shape, true, v.v2, v.kt, v.ntile));
+                variant_stats.push_back(runPathBenchmarkVariant(shape, true, v.v2, v.kt, v.ntile, v.v3, v.v4, v.v5, v.v6, v.v7));
             }
 
             // Find best variant
@@ -389,12 +418,12 @@ namespace
             table << shape.name
                   << shape.N
                   << shape.K
-                  << std::fixed << std::setprecision(3) << ck.mean_ms
-                  << std::fixed << std::setprecision(3) << variant_stats[0].mean_ms
-                  << std::fixed << std::setprecision(3) << variant_stats[1].mean_ms
-                  << std::fixed << std::setprecision(3) << variant_stats[2].mean_ms
-                  << std::fixed << std::setprecision(3) << variant_stats[3].mean_ms
-                  << variants[static_cast<size_t>(best_idx)].name
+                  << std::fixed << std::setprecision(3) << ck.mean_ms;
+            for (const auto &vs : variant_stats)
+            {
+                table << std::fixed << std::setprecision(3) << vs.mean_ms;
+            }
+            table << variants[static_cast<size_t>(best_idx)].name
                   << std::fixed << std::setprecision(3) << vs_ck
                   << fort::endr;
 
