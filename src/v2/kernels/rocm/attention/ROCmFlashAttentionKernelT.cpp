@@ -35,9 +35,49 @@ extern "C"
         const float *mask,
         void *stream);
 
+    // Flash Attention 2 prefill with native FP16 KV cache (avoids FP32 conversion)
+    int hipFlashAttn_prefill_fa2_fp16(
+        const float *Q, const void *K, const void *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        void *stream);
+
+    // Flash Attention 2 prefill with native Q8_1 KV cache (inline dequant)
+    int hipFlashAttn_prefill_fa2_q8_1(
+        const float *Q, const void *K, const void *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        void *stream);
+
     // Flash Decoding for single-token decode with split-K parallelism
     int hipFlashAttn_decode_fp32(
         const float *Q, const float *K_cache, const float *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream);
+
+    // Flash Decoding with native FP16 KV cache (avoids FP32 conversion)
+    int hipFlashAttn_decode_fp16(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream);
+
+    // Flash Decoding with native Q8_1 KV cache (inline dequant)
+    int hipFlashAttn_decode_q8_1(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
         float *O_partial, float *m_partial, float *l_partial,
         int batch_size, int kv_len,
         int n_heads, int n_kv_heads, int head_dim,
@@ -469,6 +509,10 @@ namespace llaminar2
             const float *V_ptr = static_cast<const float *>(V->gpu_data_ptr());
             float *O_ptr = static_cast<float *>(output->gpu_data_ptr());
 
+            // Track whether native KV dispatch is possible (FP16/Q8_1 → no conversion)
+            bool use_native_kv = false;
+            TensorType kv_native_type = TensorType::FP32;
+
             if (K->native_type() != TensorType::FP32 || V->native_type() != TensorType::FP32)
             {
                 if (K->native_type() != V->native_type())
@@ -478,49 +522,62 @@ namespace llaminar2
                     return false;
                 }
 
-                if (!workspace_)
+                kv_native_type = K->native_type();
+
+                // For prefill (head_dim >= 64) or decode, dispatch to
+                // native FP16/Q8_1 kernel — eliminates FP32 conversion pipeline entirely
+                if (head_dim >= 64 &&
+                    (kv_native_type == TensorType::FP16 ||
+                     (kv_native_type == TensorType::Q8_1 && head_dim % 32 == 0)))
                 {
-                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Mixed-precision KV requires workspace-bound conversion buffers");
-                    return false;
+                    use_native_kv = true;
+                    LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Native "
+                              << K->dtype_name() << " KV path — skipping FP32 conversion");
                 }
-
-                const size_t rows = static_cast<size_t>(batch_size) * static_cast<size_t>(kv_len);
-                const size_t logical_cols = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
-                const size_t logical_elements = rows * logical_cols;
-
-                float *d_k_tmp = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::K_TMP_FP32));
-                float *d_v_tmp = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::V_TMP_FP32));
-                if (!d_k_tmp || !d_v_tmp)
+                else
                 {
-                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Missing workspace conversion buffers: "
-                              << AttentionWorkspaceBuffers::K_TMP_FP32 << " / "
-                              << AttentionWorkspaceBuffers::V_TMP_FP32);
-                    return false;
-                }
+                    // Fallback: FP32 workspace conversion (decode path, or head_dim < 64)
+                    if (!workspace_)
+                    {
+                        LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Mixed-precision KV requires workspace-bound conversion buffers");
+                        return false;
+                    }
 
-                // GPU-side conversion: launch async kernels instead of the catastrophic
-                // D2H → CPU convert → H2D round-trip that caused 112 synchronous hipMemcpy
-                // calls per decode token (4 per layer × 28 layers).
-                const auto hip_stream = static_cast<hipStream_t>(stream_);
-                const bool k_ok = hip_convert_tensor_to_fp32(
-                    K->gpu_data_ptr(), K->native_type(), d_k_tmp,
-                    static_cast<int>(logical_elements),
-                    static_cast<int>(rows), static_cast<int>(logical_cols),
-                    hip_stream);
-                const bool v_ok = hip_convert_tensor_to_fp32(
-                    V->gpu_data_ptr(), V->native_type(), d_v_tmp,
-                    static_cast<int>(logical_elements),
-                    static_cast<int>(rows), static_cast<int>(logical_cols),
-                    hip_stream);
-                if (!k_ok || !v_ok)
-                {
-                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] GPU-side KV conversion failed for type "
-                              << K->dtype_name());
-                    return false;
-                }
+                    const size_t rows = static_cast<size_t>(batch_size) * static_cast<size_t>(kv_len);
+                    const size_t logical_cols = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
+                    const size_t logical_elements = rows * logical_cols;
 
-                K_ptr = d_k_tmp;
-                V_ptr = d_v_tmp;
+                    float *d_k_tmp = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::K_TMP_FP32));
+                    float *d_v_tmp = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::V_TMP_FP32));
+                    if (!d_k_tmp || !d_v_tmp)
+                    {
+                        LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Missing workspace conversion buffers: "
+                                  << AttentionWorkspaceBuffers::K_TMP_FP32 << " / "
+                                  << AttentionWorkspaceBuffers::V_TMP_FP32);
+                        return false;
+                    }
+
+                    const auto hip_stream = static_cast<hipStream_t>(stream_);
+                    const bool k_ok = hip_convert_tensor_to_fp32(
+                        K->gpu_data_ptr(), K->native_type(), d_k_tmp,
+                        static_cast<int>(logical_elements),
+                        static_cast<int>(rows), static_cast<int>(logical_cols),
+                        hip_stream);
+                    const bool v_ok = hip_convert_tensor_to_fp32(
+                        V->gpu_data_ptr(), V->native_type(), d_v_tmp,
+                        static_cast<int>(logical_elements),
+                        static_cast<int>(rows), static_cast<int>(logical_cols),
+                        hip_stream);
+                    if (!k_ok || !v_ok)
+                    {
+                        LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] GPU-side KV conversion failed for type "
+                                  << K->dtype_name());
+                        return false;
+                    }
+
+                    K_ptr = d_k_tmp;
+                    V_ptr = d_v_tmp;
+                }
             }
 
             if (!Q_ptr || !K_ptr || !V_ptr || !O_ptr)
@@ -579,6 +636,89 @@ namespace llaminar2
             if (workspace_mask)
             {
                 mask_ptr = static_cast<const float *>(workspace_mask->gpu_data_ptr());
+            }
+
+            // Native KV dispatch: call typed kernel directly, skip FP32 conversion
+            if (use_native_kv)
+            {
+                int result;
+                if (seq_len == 1)
+                {
+                    // Flash Decoding with native KV cache
+                    int num_splits = DEFAULT_NUM_SPLITS;
+                    if (kv_len <= 64)
+                        num_splits = 1;
+                    else if (kv_len < 128)
+                        num_splits = 2;
+                    else if (kv_len < 256)
+                        num_splits = 4;
+
+                    allocateWorkspace(n_heads, head_dim, num_splits);
+
+                    if (!partial_output_buf_ || !partial_m_buf_ || !partial_l_buf_)
+                    {
+                        LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Workspace allocation failed for native decode");
+                        return false;
+                    }
+
+                    {
+                        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::FLASH_ATTN_DECODE,
+                                                         static_cast<hipStream_t>(stream_));
+                        if (kv_native_type == TensorType::FP16)
+                        {
+                            result = hipFlashAttn_decode_fp16(
+                                Q_ptr, K->gpu_data_ptr(), V->gpu_data_ptr(), O_ptr,
+                                static_cast<float *>(partial_output_buf_),
+                                static_cast<float *>(partial_m_buf_),
+                                static_cast<float *>(partial_l_buf_),
+                                batch_size, kv_len,
+                                n_heads, n_kv_heads, head_dim,
+                                num_splits, d_attn_params, stream_);
+                        }
+                        else
+                        {
+                            result = hipFlashAttn_decode_q8_1(
+                                Q_ptr, K->gpu_data_ptr(), V->gpu_data_ptr(), O_ptr,
+                                static_cast<float *>(partial_output_buf_),
+                                static_cast<float *>(partial_m_buf_),
+                                static_cast<float *>(partial_l_buf_),
+                                batch_size, kv_len,
+                                n_heads, n_kv_heads, head_dim,
+                                num_splits, d_attn_params, stream_);
+                        }
+                    }
+                }
+                else
+                {
+                    // Prefill with native KV
+                    ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::FLASH_ATTN_PREFILL,
+                                                     static_cast<hipStream_t>(stream_));
+                    if (kv_native_type == TensorType::FP16)
+                    {
+                        result = hipFlashAttn_prefill_fa2_fp16(
+                            Q_ptr, K->gpu_data_ptr(), V->gpu_data_ptr(), O_ptr,
+                            batch_size, seq_len, kv_len,
+                            n_heads, n_kv_heads, head_dim,
+                            causal, window_size, 0,
+                            d_attn_params, mask_ptr, stream_);
+                    }
+                    else
+                    {
+                        result = hipFlashAttn_prefill_fa2_q8_1(
+                            Q_ptr, K->gpu_data_ptr(), V->gpu_data_ptr(), O_ptr,
+                            batch_size, seq_len, kv_len,
+                            n_heads, n_kv_heads, head_dim,
+                            causal, window_size, 0,
+                            d_attn_params, mask_ptr, stream_);
+                    }
+                }
+                if (result != 0)
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Native "
+                              << K->dtype_name() << " KV kernel failed: " << result);
+                    return false;
+                }
+                return true;
             }
 
             return apply_typed(Q_ptr, K_ptr, V_ptr, O_ptr,

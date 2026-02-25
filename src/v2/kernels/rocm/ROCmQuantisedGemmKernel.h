@@ -95,7 +95,6 @@
 #include "../../tensors/TensorKernels.h"
 #include "../../tensors/BlockStructures.h"
 #include "../../interfaces/IWorkspaceConsumer.h"
-#include "ROCmRatioVNNIAbi.h"
 #include <memory>
 #include <cstdint>
 #include <vector>
@@ -178,15 +177,13 @@ namespace llaminar2
             {
                 int8_t *d_int8_data_vnni = nullptr;
                 int8_t *d_int8_data_rowmajor = nullptr;
-                uint8_t *d_ratio_vnni_payload = nullptr;
-                int8_t *d_ratio_vnni_ratio = nullptr;
-                int8_t *d_ratio_vnni_min = nullptr;
                 float *d_scales = nullptr;
                 void *startup_h2d_pinned_scales = nullptr;
                 void *startup_h2d_pinned_vnni = nullptr;
-                void *startup_h2d_pinned_ratio_payload = nullptr;
-                void *startup_h2d_pinned_ratio = nullptr;
-                void *startup_h2d_pinned_ratio_min = nullptr;
+                uint8_t *d_native_vnni_payload = nullptr;
+                void *d_native_vnni_scales = nullptr; // __half* on device; void* for header compatibility
+                void *startup_h2d_pinned_native_payload = nullptr;
+                void *startup_h2d_pinned_native_scales = nullptr;
                 void *startup_h2d_stream = nullptr;
                 void *startup_repack_stream = nullptr;
                 void *startup_commit_stream = nullptr;
@@ -202,24 +199,12 @@ namespace llaminar2
             std::vector<int8_t> int8_data_vnni; ///< [K/4 × N × 4] VNNI layout (the sole device layout)
             std::vector<float> scales;          ///< [N] per-column (per-output-feature) scale factors
 
-            // Phase-1 ratio-VNNI compact container (IQ4_NL, Q4_0, optional Q4_1 min side-channel)
-            std::vector<uint8_t> ratio_vnni_payload;                          ///< [blocks × N × payload_bytes] compact nibble payload
-            std::vector<int8_t> ratio_vnni_ratio;                             ///< [blocks × N] per-block int8 ratio
-            std::vector<int8_t> ratio_vnni_min;                               ///< [blocks × N] optional per-block int8 min side-channel
-            uint16_t ratio_vnni_abi_version = ROCM_RATIO_VNNI_PREFILL_ABI_V2; ///< Metadata descriptor version
-            uint8_t ratio_vnni_bitwidth = 0;                                  ///< 4 for Phase-1
-            uint8_t ratio_vnni_codebook_id = 0;                               ///< 0=linear(Q4_0), 4=IQ4(IQ4_NL)
-            uint8_t ratio_vnni_has_min = 0;                                   ///< 0 in Phase-1
-            uint8_t ratio_vnni_block_size = 0;                                ///< 32 in Phase-1
-            uint16_t ratio_vnni_payload_bytes = 0;                            ///< 16 in Phase-1
-            uint8_t ratio_vnni_ratio_bytes = 1;                               ///< Side-channel ratio bytes per record (int8 today)
-            uint8_t ratio_vnni_min_bytes = 0;                                 ///< Side-channel min bytes per record (0=no min, int8=1)
-            uint8_t ratio_vnni_reserved0 = 0;                                 ///< Reserved for future metadata
-            uint32_t ratio_vnni_flags = 0;                                    ///< Reserved metadata flags
-            uint32_t ratio_vnni_blocks_per_row = 0;                           ///< K / block_size when block_size > 0
-            uint32_t ratio_vnni_payload_stride_bytes = 0;                     ///< Byte stride between payload records
-            uint32_t ratio_vnni_ratio_stride_bytes = 1;                       ///< Byte stride between ratio records
-            uint32_t ratio_vnni_min_stride_bytes = 0;                         ///< Byte stride between min records
+            // Native-VNNI compact container (Q4_0, IQ4_NL)
+            // Achieves lossless weight reconstruction by keeping per-block FP16 scales separate.
+            std::vector<uint8_t> native_vnni_payload; ///< [blocks_per_row × N × 16] nibble payload interleaved by N
+            std::vector<uint16_t> native_vnni_scales; ///< [blocks_per_row × N] FP16 per-block scales (raw uint16_t bits)
+            uint8_t native_vnni_codebook_id = 0;      ///< 0=linear (Q4_0), 4=IQ4 (IQ4_NL)
+            uint32_t native_vnni_blocks_per_row = 0;  ///< K / 32
 
             int K = 0; ///< Input features (rows in CK B matrix)
             int N = 0; ///< Output features (cols in CK B matrix)
@@ -234,10 +219,9 @@ namespace llaminar2
             // Phase 4 pilot: optional persistent row-major buffer precomputed on GPU at startup.
             int8_t *d_int8_data_vnni = nullptr;         ///< Device pointer to VNNI-packed weights (sole device copy)
             int8_t *d_int8_data_rowmajor = nullptr;     ///< Optional persistent row-major CK buffer (startup GPU repack)
-            uint8_t *d_ratio_vnni_payload = nullptr;    ///< Device pointer to compact ratio-VNNI payload
-            int8_t *d_ratio_vnni_ratio = nullptr;       ///< Device pointer to ratio-VNNI per-block ratios
-            int8_t *d_ratio_vnni_min = nullptr;         ///< Device pointer to ratio-VNNI per-block mins
             float *d_scales = nullptr;                  ///< Device pointer to scales
+            uint8_t *d_native_vnni_payload = nullptr;   ///< Device pointer to native-VNNI payload
+            void *d_native_vnni_scales = nullptr;       ///< Device pointer to native-VNNI FP16 scales (__half*)
             void *startup_repack_ready_event = nullptr; ///< Optional startup repack completion event (hipEvent_t*)
             bool startup_repack_event_pending = false;  ///< True until startup repack event is consumed by CK stream wait
             void *startup_commit_ready_event = nullptr; ///< Optional startup commit completion event (hipEvent_t*)
@@ -262,32 +246,18 @@ namespace llaminar2
                     int8_data = std::move(other.int8_data);
                     int8_data_vnni = std::move(other.int8_data_vnni);
                     scales = std::move(other.scales);
-                    ratio_vnni_payload = std::move(other.ratio_vnni_payload);
-                    ratio_vnni_ratio = std::move(other.ratio_vnni_ratio);
-                    ratio_vnni_min = std::move(other.ratio_vnni_min);
-                    ratio_vnni_abi_version = other.ratio_vnni_abi_version;
-                    ratio_vnni_bitwidth = other.ratio_vnni_bitwidth;
-                    ratio_vnni_codebook_id = other.ratio_vnni_codebook_id;
-                    ratio_vnni_has_min = other.ratio_vnni_has_min;
-                    ratio_vnni_block_size = other.ratio_vnni_block_size;
-                    ratio_vnni_payload_bytes = other.ratio_vnni_payload_bytes;
-                    ratio_vnni_ratio_bytes = other.ratio_vnni_ratio_bytes;
-                    ratio_vnni_min_bytes = other.ratio_vnni_min_bytes;
-                    ratio_vnni_reserved0 = other.ratio_vnni_reserved0;
-                    ratio_vnni_flags = other.ratio_vnni_flags;
-                    ratio_vnni_blocks_per_row = other.ratio_vnni_blocks_per_row;
-                    ratio_vnni_payload_stride_bytes = other.ratio_vnni_payload_stride_bytes;
-                    ratio_vnni_ratio_stride_bytes = other.ratio_vnni_ratio_stride_bytes;
-                    ratio_vnni_min_stride_bytes = other.ratio_vnni_min_stride_bytes;
+                    native_vnni_payload = std::move(other.native_vnni_payload);
+                    native_vnni_scales = std::move(other.native_vnni_scales);
+                    native_vnni_codebook_id = other.native_vnni_codebook_id;
+                    native_vnni_blocks_per_row = other.native_vnni_blocks_per_row;
                     K = other.K;
                     N = other.N;
                     device_uploads = std::move(other.device_uploads);
                     d_int8_data_vnni = other.d_int8_data_vnni;
                     d_int8_data_rowmajor = other.d_int8_data_rowmajor;
-                    d_ratio_vnni_payload = other.d_ratio_vnni_payload;
-                    d_ratio_vnni_ratio = other.d_ratio_vnni_ratio;
-                    d_ratio_vnni_min = other.d_ratio_vnni_min;
                     d_scales = other.d_scales;
+                    d_native_vnni_payload = other.d_native_vnni_payload;
+                    d_native_vnni_scales = other.d_native_vnni_scales;
                     startup_repack_ready_event = other.startup_repack_ready_event;
                     startup_repack_event_pending = other.startup_repack_event_pending;
                     startup_commit_ready_event = other.startup_commit_ready_event;
@@ -297,28 +267,15 @@ namespace llaminar2
 
                     other.d_int8_data_vnni = nullptr;
                     other.d_int8_data_rowmajor = nullptr;
-                    other.d_ratio_vnni_payload = nullptr;
-                    other.d_ratio_vnni_ratio = nullptr;
-                    other.d_ratio_vnni_min = nullptr;
                     other.d_scales = nullptr;
+                    other.d_native_vnni_payload = nullptr;
+                    other.d_native_vnni_scales = nullptr;
+                    other.native_vnni_codebook_id = 0;
+                    other.native_vnni_blocks_per_row = 0;
                     other.startup_repack_ready_event = nullptr;
                     other.startup_repack_event_pending = false;
                     other.startup_commit_ready_event = nullptr;
                     other.startup_commit_event_pending = false;
-                    other.ratio_vnni_abi_version = ROCM_RATIO_VNNI_PREFILL_ABI_V2;
-                    other.ratio_vnni_bitwidth = 0;
-                    other.ratio_vnni_codebook_id = 0;
-                    other.ratio_vnni_has_min = 0;
-                    other.ratio_vnni_block_size = 0;
-                    other.ratio_vnni_payload_bytes = 0;
-                    other.ratio_vnni_ratio_bytes = 1;
-                    other.ratio_vnni_min_bytes = 0;
-                    other.ratio_vnni_reserved0 = 0;
-                    other.ratio_vnni_flags = 0;
-                    other.ratio_vnni_blocks_per_row = 0;
-                    other.ratio_vnni_payload_stride_bytes = 0;
-                    other.ratio_vnni_ratio_stride_bytes = 1;
-                    other.ratio_vnni_min_stride_bytes = 0;
                     other.rocm_device_id = -1;
                     other.uploaded = false;
                     other.K = 0;
@@ -694,7 +651,6 @@ namespace llaminar2
             enum class PrefillDispatchPath
             {
                 INT8_VNNI_NATIVE,
-                RATIO_VNNI_NATIVE,
                 CK_FALLBACK
             };
 

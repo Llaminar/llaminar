@@ -7913,40 +7913,6 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm GEMV kernel performance benchmarks")
 
-    # Performance Test: ROCm Ratio-VNNI Decode Kernel (Phase-1 Q4_0/IQ4_NL)
-    # Compares compact ratio-VNNI decode GEMV kernel against existing INT8 VNNI decode path
-    add_executable(v2_perf_rocm_ratio_vnni_decode_kernel
-        performance/kernels/rocm/Perf__ROCmRatioVNNIDecodeKernel.cpp
-    )
-    target_link_libraries(v2_perf_rocm_ratio_vnni_decode_kernel
-        llaminar2_core
-        GTest::gtest
-        GTest::gtest_main
-    )
-    add_v2_test(V2_Perf_ROCmRatioVNNIDecodeKernel
-        COMMAND $<TARGET_FILE:v2_perf_rocm_ratio_vnni_decode_kernel>
-        LABELS "V2;Performance;ROCm;GEMV;RatioVNNI;Q4_0;IQ4_NL;Decode;gfx906;Benchmark"
-        MPI_PROCS 1
-    )
-    message(STATUS "V2 Tests: Added ROCm ratio-VNNI decode performance benchmark")
-
-    # Performance Test: ROCm Ratio-VNNI Prefill Kernel
-    # Measures full-path prefill (M>1) ratio-native GEMM across Qwen 7B/14B Attn/FFN shapes
-    add_executable(v2_perf_rocm_ratio_vnni_prefill_kernel
-        performance/kernels/rocm/Perf__ROCmRatioVNNIPrefillKernel.cpp
-    )
-    target_link_libraries(v2_perf_rocm_ratio_vnni_prefill_kernel
-        llaminar2_core
-        GTest::gtest
-        GTest::gtest_main
-    )
-    add_v2_test(V2_Perf_ROCmRatioVNNIPrefillKernel
-        COMMAND $<TARGET_FILE:v2_perf_rocm_ratio_vnni_prefill_kernel>
-        LABELS "V2;Performance;ROCm;GEMM;RatioVNNI;Prefill;Q4_0;IQ4_NL;gfx906;Benchmark"
-        MPI_PROCS 1
-    )
-    message(STATUS "V2 Tests: Added ROCm ratio-VNNI prefill performance benchmark")
-
     # Performance Test: ROCm IQ4_NL Decode Microbenchmark
     # Isolates IQ4_NL decode+dot strategy costs to compare kernel approach variants.
     set_source_files_properties(

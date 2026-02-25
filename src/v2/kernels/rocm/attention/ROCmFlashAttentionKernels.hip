@@ -29,6 +29,7 @@
 #include <hip/hip_fp16.h>
 #include <cstdint>
 #include "../../attention/AttentionDeviceParams.h"
+#include "../../../tensors/BlockStructures.h"
 #include <cmath>
 #include <cfloat>
 #include <cstdio>
@@ -55,6 +56,18 @@ namespace
 
     // Maximum VGPRs per wavefront (for occupancy tuning)
     constexpr int MAX_VGPRS_PER_WAVEFRONT = 256;
+
+    // =========================================================================
+    // KV Cache Type Tags for Template Dispatch
+    // =========================================================================
+    //
+    // The cooperative prefill kernel is templated on KV_TYPE so it can read K/V
+    // directly in their native storage format, eliminating the FP32 conversion
+    // kernel and halving HBM bandwidth for FP16.
+    //   FP32: K/V are float*    (4 bytes/element) — baseline
+    //   FP16: K/V are __half*   (2 bytes/element) — 2× BW savings + fdot2
+    //   Q8_1: K/V are Q8_1Block* (36 bytes/32 elements) — ~3.5× BW savings
+    enum class KVTypeTag { FP32, FP16, Q8_1 };
 
     // =========================================================================
     // Flash Attention 2 Configuration for MI50
@@ -1074,12 +1087,12 @@ namespace
     //
     // =========================================================================
 
-    template <int Q_PER_WAVE, int DIMS_PER_LANE>
+    template <int Q_PER_WAVE, int DIMS_PER_LANE, KVTypeTag KV_TYPE = KVTypeTag::FP32>
     __global__ __launch_bounds__(256, 3)
     void flash_attention_2_cooperative_mi50_kernel(
         const float *__restrict__ Q,
-        const float *__restrict__ K,
-        const float *__restrict__ V,
+        const void *__restrict__ K,
+        const void *__restrict__ V,
         float *__restrict__ O,
         int batch_size,
         int seq_len,
@@ -1188,19 +1201,43 @@ namespace
         }
 
         // =================================================================
-        // 7. Batch/Head Pointers for K/V
+        // 7. Batch/Head Pointers for K/V (type-aware)
         // =================================================================
-        const float *K_batch = K + batch_idx * kv_stride_global * n_kv_heads * head_dim;
-        const float *V_batch = V + batch_idx * kv_stride_global * n_kv_heads * head_dim;
-        const int kv_head_offset = kv_head_idx * head_dim;
-        const int kv_row_stride = n_kv_heads * head_dim;
+        // Compute byte-level base pointers so the batch+head offset is hoisted
+        // out of the main KV loop. KV_TYPE determines element size and layout.
+        const int kv_head_offset_elems = kv_head_idx * head_dim;
+        const int kv_row_stride_elems = n_kv_heads * head_dim;
+
+        // Q8_1 block layout (compiled out for non-Q8_1 via if constexpr)
+        [[maybe_unused]] constexpr int Q8_BS = 32;
+        [[maybe_unused]] const int q8_bph = head_dim / Q8_BS;    // blocks per head
+        [[maybe_unused]] const int q8_bpr = n_kv_heads * q8_bph; // blocks per KV row
+
+        // Byte-level base pointers: batch + head absorbed, only kv_pos varies in loop
+        size_t row_byte_stride;
+        size_t base_byte_off;
+        if constexpr (KV_TYPE == KVTypeTag::Q8_1) {
+            row_byte_stride = static_cast<size_t>(q8_bpr) * sizeof(llaminar2::Q8_1Block);
+            base_byte_off = static_cast<size_t>(batch_idx) * kv_stride_global * row_byte_stride
+                          + static_cast<size_t>(kv_head_idx) * q8_bph * sizeof(llaminar2::Q8_1Block);
+        } else if constexpr (KV_TYPE == KVTypeTag::FP16) {
+            row_byte_stride = static_cast<size_t>(kv_row_stride_elems) * sizeof(__half);
+            base_byte_off = static_cast<size_t>(batch_idx) * kv_stride_global * row_byte_stride
+                          + static_cast<size_t>(kv_head_offset_elems) * sizeof(__half);
+        } else {
+            row_byte_stride = static_cast<size_t>(kv_row_stride_elems) * sizeof(float);
+            base_byte_off = static_cast<size_t>(batch_idx) * kv_stride_global * row_byte_stride
+                          + static_cast<size_t>(kv_head_offset_elems) * sizeof(float);
+        }
+        const char *K_base = reinterpret_cast<const char*>(K) + base_byte_off;
+        const char *V_base = reinterpret_cast<const char*>(V) + base_byte_off;
 
         // =================================================================
         // 8. Main Loop: Wavefront-Cooperative KV Processing
         // =================================================================
         // Each wavefront iterates over ALL KV positions. For each position,
         // all 64 lanes cooperate on dot products and V accumulation.
-        // K and V are in FP32 global memory; Q is in FP16 in LDS.
+        // KV_TYPE determines load format: FP32/FP16 element loads or Q8_1 dequant.
         // All inner loops use #pragma unroll with compile-time template bounds
         // to ensure register promotion of O_lane/m_i/l_i arrays.
 
@@ -1212,17 +1249,61 @@ namespace
                 if (kv_pos > max_q_pos + position_offset_runtime) break;
             }
 
-            const float *K_ptr = K_batch + kv_pos * kv_row_stride + kv_head_offset;
-            const float *V_ptr = V_batch + kv_pos * kv_row_stride + kv_head_offset;
+            // Type-dispatched K/V load. Only the active KV_TYPE path survives
+            // compilation (if constexpr eliminates dead branches → zero VGPR cost
+            // for inactive paths).
+            float k_vals[DIMS_PER_LANE] = {};   // FP32/Q8_1/FP16+DPL1
+            float v_vals[DIMS_PER_LANE] = {};   // Always float for O accumulation
+            [[maybe_unused]] __half2 k_h2;      // FP16+DPL>=2 fdot2 path only
 
-            // Cooperative K/V load: each lane loads its output dims (coalesced!)
-            float k_vals[DIMS_PER_LANE];
-            float v_vals[DIMS_PER_LANE];
-            #pragma unroll
-            for (int di = 0; di < DIMS_PER_LANE; di++) {
-                int d = lane_id + di * WAVEFRONT_SIZE;
-                k_vals[di] = (d < head_dim) ? K_ptr[d] : 0.0f;
-                v_vals[di] = (d < head_dim) ? V_ptr[d] : 0.0f;
+            const char *K_pos = K_base + kv_pos * row_byte_stride;
+            const char *V_pos = V_base + kv_pos * row_byte_stride;
+
+            if constexpr (KV_TYPE == KVTypeTag::FP16) {
+                // ---- FP16 KV: half bandwidth, fdot2 for dot product ----
+                const __half *Kh = reinterpret_cast<const __half*>(K_pos);
+                const __half *Vh = reinterpret_cast<const __half*>(V_pos);
+                if constexpr (DIMS_PER_LANE >= 2) {
+                    // Pack K into half2 for fdot2 (shared across all Q rows)
+                    __half k0 = (lane_id < head_dim) ? Kh[lane_id] : __float2half(0.0f);
+                    __half k1 = (lane_id + WAVEFRONT_SIZE < head_dim)
+                                    ? Kh[lane_id + WAVEFRONT_SIZE] : __float2half(0.0f);
+                    k_h2 = __halves2half2(k0, k1);
+                } else {
+                    // DPL=1: scalar convert, no fdot2
+                    k_vals[0] = (lane_id < head_dim) ? __half2float(Kh[lane_id]) : 0.0f;
+                }
+                #pragma unroll
+                for (int di = 0; di < DIMS_PER_LANE; di++) {
+                    int d = lane_id + di * WAVEFRONT_SIZE;
+                    v_vals[di] = (d < head_dim) ? __half2float(Vh[d]) : 0.0f;
+                }
+            } else if constexpr (KV_TYPE == KVTypeTag::Q8_1) {
+                // ---- Q8_1 KV: inline dequant, ~3.5× BW savings ----
+                const llaminar2::Q8_1Block *Kq = reinterpret_cast<const llaminar2::Q8_1Block*>(K_pos);
+                const llaminar2::Q8_1Block *Vq = reinterpret_cast<const llaminar2::Q8_1Block*>(V_pos);
+                #pragma unroll
+                for (int di = 0; di < DIMS_PER_LANE; di++) {
+                    int d = lane_id + di * WAVEFRONT_SIZE;
+                    if (d < head_dim) {
+                        int bi = d / Q8_BS;
+                        int bo = d % Q8_BS;
+                        float ks = __half2float(*reinterpret_cast<const __half*>(&Kq[bi].d));
+                        k_vals[di] = static_cast<float>(Kq[bi].qs[bo]) * ks;
+                        float vs = __half2float(*reinterpret_cast<const __half*>(&Vq[bi].d));
+                        v_vals[di] = static_cast<float>(Vq[bi].qs[bo]) * vs;
+                    }
+                }
+            } else {
+                // ---- FP32 KV: original path ----
+                const float *Kf = reinterpret_cast<const float*>(K_pos);
+                const float *Vf = reinterpret_cast<const float*>(V_pos);
+                #pragma unroll
+                for (int di = 0; di < DIMS_PER_LANE; di++) {
+                    int d = lane_id + di * WAVEFRONT_SIZE;
+                    k_vals[di] = (d < head_dim) ? Kf[d] : 0.0f;
+                    v_vals[di] = (d < head_dim) ? Vf[d] : 0.0f;
+                }
             }
 
             // Process each Q row owned by this wavefront.
@@ -1236,14 +1317,27 @@ namespace
                 int local_q = q_wave_start + qi;
                 int global_q = q_block_start + local_q;
 
-                // Cooperative dot product: Q (FP16 from LDS) * K (FP32 from HBM)
+                // Cooperative dot product: type-dispatched
+                // FP16+DPL>=2: single v_dot2_f32_f16 instruction (2 FP16 muls + FP32 acc)
+                // All other paths: scalar FP32 multiply-add
                 float partial_dot = 0.0f;
-                #pragma unroll
-                for (int di = 0; di < DIMS_PER_LANE; di++) {
-                    int d = lane_id + di * WAVEFRONT_SIZE;
-                    if (d < head_dim) {
-                        float q_val = half_to_float(Q_tile[local_q * q_stride + d]);
-                        partial_dot += q_val * k_vals[di];
+                if constexpr (KV_TYPE == KVTypeTag::FP16 && DIMS_PER_LANE >= 2) {
+                    // fdot2: pack Q from LDS (already FP16), dot with pre-packed K half2
+                    __half q0 = Q_tile[local_q * q_stride + lane_id];
+                    __half q1 = (lane_id + WAVEFRONT_SIZE < head_dim)
+                                    ? Q_tile[local_q * q_stride + lane_id + WAVEFRONT_SIZE]
+                                    : __float2half(0.0f);
+                    __half2 q_h2 = __halves2half2(q0, q1);
+                    partial_dot = __builtin_amdgcn_fdot2(q_h2, k_h2, 0.0f, false);
+                } else {
+                    // Scalar path: FP32, Q8_1 (dequantized), or FP16+DPL=1
+                    #pragma unroll
+                    for (int di = 0; di < DIMS_PER_LANE; di++) {
+                        int d = lane_id + di * WAVEFRONT_SIZE;
+                        if (d < head_dim) {
+                            float q_val = half_to_float(Q_tile[local_q * q_stride + d]);
+                            partial_dot += q_val * k_vals[di];
+                        }
                     }
                 }
 
@@ -1360,11 +1454,12 @@ namespace
      * @brief Flash Decoding kernel for single-query decode on MI50
      *        v3: wavefront-cooperative KV processing + exp2f intrinsic
      */
+    template <KVTypeTag KV_TYPE = KVTypeTag::FP32>
     __global__ __launch_bounds__(256, 4)
     void flash_decoding_mi50_kernel(
         const float *__restrict__ Q,
-        const float *__restrict__ K_cache,
-        const float *__restrict__ V_cache,
+        const void *__restrict__ K_cache,
+        const void *__restrict__ V_cache,
         float *__restrict__ O_partial,
         float *__restrict__ m_partial,
         float *__restrict__ l_partial,
@@ -1456,11 +1551,33 @@ namespace
         float m_local = -FLT_MAX;
         float l_local = 0.0f;
 
-        const float *K_batch = K_cache + batch_idx * kv_batch_stride * n_kv_heads * head_dim;
-        const float *V_batch = V_cache + batch_idx * kv_batch_stride * n_kv_heads * head_dim;
+        // Byte-level base pointers for type-dispatched K/V access (KV_TYPE)
+        // Batch + head offsets hoisted out of the main KV loop.
+        const int kv_head_offset_elems = kv_head_idx * head_dim;
+        const int kv_row_stride_elems = n_kv_heads * head_dim;
 
-        const int kv_head_offset = kv_head_idx * head_dim;
-        const int kv_stride = n_kv_heads * head_dim;
+        // Q8_1 block layout (compiled out for non-Q8_1 via if constexpr)
+        [[maybe_unused]] constexpr int Q8_BS = 32;
+        [[maybe_unused]] const int q8_bph = head_dim / Q8_BS;    // blocks per head
+        [[maybe_unused]] const int q8_bpr = n_kv_heads * q8_bph; // blocks per KV row
+
+        size_t row_byte_stride;
+        size_t base_byte_off;
+        if constexpr (KV_TYPE == KVTypeTag::Q8_1) {
+            row_byte_stride = static_cast<size_t>(q8_bpr) * sizeof(llaminar2::Q8_1Block);
+            base_byte_off = static_cast<size_t>(batch_idx) * kv_batch_stride * row_byte_stride
+                          + static_cast<size_t>(kv_head_idx) * q8_bph * sizeof(llaminar2::Q8_1Block);
+        } else if constexpr (KV_TYPE == KVTypeTag::FP16) {
+            row_byte_stride = static_cast<size_t>(kv_row_stride_elems) * sizeof(__half);
+            base_byte_off = static_cast<size_t>(batch_idx) * kv_batch_stride * row_byte_stride
+                          + static_cast<size_t>(kv_head_offset_elems) * sizeof(__half);
+        } else {
+            row_byte_stride = static_cast<size_t>(kv_row_stride_elems) * sizeof(float);
+            base_byte_off = static_cast<size_t>(batch_idx) * kv_batch_stride * row_byte_stride
+                          + static_cast<size_t>(kv_head_offset_elems) * sizeof(float);
+        }
+        const char *K_base = reinterpret_cast<const char*>(K_cache) + base_byte_off;
+        const char *V_base = reinterpret_cast<const char*>(V_cache) + base_byte_off;
 
         // =====================================================================
         // Main loop: wavefront-cooperative KV processing
@@ -1471,29 +1588,70 @@ namespace
         // =====================================================================
         for (int kv_pos = kv_start + wavefront_id; kv_pos < kv_end; kv_pos += num_wavefronts)
         {
-            const float *K_ptr = K_batch + kv_pos * kv_stride + kv_head_offset;
+            const char *K_pos = K_base + kv_pos * row_byte_stride;
 
-            // Cooperative dot product: each lane loads its dims of Q and K
-            // Lane i loads Q[i], Q[i+64], ... and K[i], K[i+64], ...
-            // This is fully coalesced — adjacent lanes access adjacent floats
+            // Type-dispatched K load + dot product
+            // FP16: half bandwidth, fdot2 for vectorized path (Q→FP16 on the fly)
+            // Q8_1: inline dequant, ~3.5× BW savings
+            // FP32: original vectorized path (float2)
             float partial_dot = 0.0f;
-            if ((head_dim & 1) == 0)
+            if constexpr (KV_TYPE == KVTypeTag::FP16)
             {
-                const int head_dim_vec2 = head_dim / 2;
-                const float2 *Q_ptr2 = reinterpret_cast<const float2 *>(Q_shared);
-                const float2 *K_ptr2 = reinterpret_cast<const float2 *>(K_ptr);
-                for (int d2 = lane_id; d2 < head_dim_vec2; d2 += WAVEFRONT_SIZE)
+                const __half *Kh = reinterpret_cast<const __half*>(K_pos);
+                if ((head_dim & 1) == 0)
                 {
-                    const float2 qv = Q_ptr2[d2];
-                    const float2 kv = K_ptr2[d2];
-                    partial_dot += qv.x * kv.x + qv.y * kv.y;
+                    const int head_dim_vec2 = head_dim / 2;
+                    const float2 *Q_ptr2 = reinterpret_cast<const float2 *>(Q_shared);
+                    const __half2 *K_ptr2 = reinterpret_cast<const __half2 *>(Kh);
+                    for (int d2 = lane_id; d2 < head_dim_vec2; d2 += WAVEFRONT_SIZE)
+                    {
+                        const float2 qv = Q_ptr2[d2];
+                        const __half2 kh2 = K_ptr2[d2];
+                        // fdot2: convert Q→FP16, then v_dot2_f32_f16 on gfx906
+                        __half2 qh2 = __float22half2_rn(qv);
+                        partial_dot = __builtin_amdgcn_fdot2(qh2, kh2, partial_dot, false);
+                    }
+                }
+                else
+                {
+                    for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE)
+                    {
+                        partial_dot += Q_shared[d] * __half2float(Kh[d]);
+                    }
+                }
+            }
+            else if constexpr (KV_TYPE == KVTypeTag::Q8_1)
+            {
+                const llaminar2::Q8_1Block *Kq = reinterpret_cast<const llaminar2::Q8_1Block*>(K_pos);
+                for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE)
+                {
+                    const int bi = d / Q8_BS;
+                    const int bo = d % Q8_BS;
+                    const float ks = __half2float(*reinterpret_cast<const __half*>(&Kq[bi].d));
+                    partial_dot += Q_shared[d] * (static_cast<float>(Kq[bi].qs[bo]) * ks);
                 }
             }
             else
             {
-                for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE)
+                const float *K_ptr = reinterpret_cast<const float*>(K_pos);
+                if ((head_dim & 1) == 0)
                 {
-                    partial_dot += Q_shared[d] * K_ptr[d];
+                    const int head_dim_vec2 = head_dim / 2;
+                    const float2 *Q_ptr2 = reinterpret_cast<const float2 *>(Q_shared);
+                    const float2 *K_ptr2 = reinterpret_cast<const float2 *>(K_ptr);
+                    for (int d2 = lane_id; d2 < head_dim_vec2; d2 += WAVEFRONT_SIZE)
+                    {
+                        const float2 qv = Q_ptr2[d2];
+                        const float2 kv = K_ptr2[d2];
+                        partial_dot += qv.x * kv.x + qv.y * kv.y;
+                    }
+                }
+                else
+                {
+                    for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE)
+                    {
+                        partial_dot += Q_shared[d] * K_ptr[d];
+                    }
                 }
             }
 
@@ -1510,13 +1668,36 @@ namespace
 
             l_local = l_local * scale_old + p;
 
-            // Cooperative V load + O accumulation
+            // Type-dispatched V load + O accumulation
             // Each lane updates only its own output dims (2 for head_dim=128)
-            const float *V_ptr = V_batch + kv_pos * kv_stride + kv_head_offset;
+            const char *V_pos = V_base + kv_pos * row_byte_stride;
             int o_idx = 0;
-            for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE, o_idx++)
+            if constexpr (KV_TYPE == KVTypeTag::FP16)
             {
-                O_lane[o_idx] = O_lane[o_idx] * scale_old + p * V_ptr[d];
+                const __half *Vh = reinterpret_cast<const __half*>(V_pos);
+                for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE, o_idx++)
+                {
+                    O_lane[o_idx] = O_lane[o_idx] * scale_old + p * __half2float(Vh[d]);
+                }
+            }
+            else if constexpr (KV_TYPE == KVTypeTag::Q8_1)
+            {
+                const llaminar2::Q8_1Block *Vq = reinterpret_cast<const llaminar2::Q8_1Block*>(V_pos);
+                for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE, o_idx++)
+                {
+                    const int bi = d / Q8_BS;
+                    const int bo = d % Q8_BS;
+                    const float vs = __half2float(*reinterpret_cast<const __half*>(&Vq[bi].d));
+                    O_lane[o_idx] = O_lane[o_idx] * scale_old + p * (static_cast<float>(Vq[bi].qs[bo]) * vs);
+                }
+            }
+            else
+            {
+                const float *V_ptr = reinterpret_cast<const float*>(V_pos);
+                for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE, o_idx++)
+                {
+                    O_lane[o_idx] = O_lane[o_idx] * scale_old + p * V_ptr[d];
+                }
             }
 
             m_local = m_new;
@@ -1719,7 +1900,185 @@ namespace
         }
     }
 
+    // =========================================================================
+    // Cooperative Prefill Launch Dispatcher (KV-type templated)
+    // =========================================================================
+    //
+    // Factored out of extern "C" to allow template instantiation per KV_TYPE.
+    // Each instantiation generates {4,8,16} × {1,2} kernel variants (6 total).
+    // With 3 KV types → 18 kernel instantiations. Binary size ~3× but no
+    // runtime cost (only one variant executes per call).
+    //
+    template <KVTypeTag KV_TYPE>
+    int launch_cooperative_prefill(
+        const float *Q, const void *K, const void *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        float softmax_scale, bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        hipStream_t hip_stream)
+    {
+        int tile_q = 32;  // Optimal for head_dim=128
+
+        // Allow override via environment
+        const char *tq_env = getenv("LLAMINAR_FA2_COOPERATIVE_TILE_Q");
+        if (tq_env) {
+            int tq_override = atoi(tq_env);
+            if (tq_override == 16 || tq_override == 32 || tq_override == 64)
+                tile_q = tq_override;
+        }
+
+        const int q_stride = head_dim + FA2_LDS_PAD_FP16;
+        const int lds_size = tile_q * q_stride * static_cast<int>(sizeof(__half));
+
+        const int num_q_tiles = (seq_len + tile_q - 1) / tile_q;
+        dim3 grid(n_heads, num_q_tiles, batch_size);
+        dim3 block(FA2_THREADS_PER_BLOCK);
+
+        constexpr int WAVES_PER_BLOCK = 4;
+        const int q_per_wave = tile_q / WAVES_PER_BLOCK;
+        const int dims_per_lane = (head_dim + WAVEFRONT_SIZE - 1) / WAVEFRONT_SIZE;
+
+        // Template dispatch — covers all valid (q_per_wave, dims_per_lane) combos
+        #define LAUNCH_COOP_KV(QPW, DPL) \
+            hipLaunchKernelGGL( \
+                (flash_attention_2_cooperative_mi50_kernel<QPW, DPL, KV_TYPE>), \
+                grid, block, lds_size, hip_stream, \
+                Q, K, V, O, \
+                batch_size, seq_len, kv_len, \
+                n_heads, n_kv_heads, head_dim, \
+                softmax_scale, causal, window_size, position_offset, \
+                device_params, mask, \
+                tile_q)
+
+        bool dispatched = false;
+        if (dims_per_lane == 2) {
+            // head_dim 65-128 (most common: 128)
+            if (q_per_wave == 8) { LAUNCH_COOP_KV(8, 2); dispatched = true; }
+            else if (q_per_wave == 4) { LAUNCH_COOP_KV(4, 2); dispatched = true; }
+            else if (q_per_wave == 16) { LAUNCH_COOP_KV(16, 2); dispatched = true; }
+        } else if (dims_per_lane == 1) {
+            // head_dim 1-64
+            if (q_per_wave == 8) { LAUNCH_COOP_KV(8, 1); dispatched = true; }
+            else if (q_per_wave == 4) { LAUNCH_COOP_KV(4, 1); dispatched = true; }
+            else if (q_per_wave == 16) { LAUNCH_COOP_KV(16, 1); dispatched = true; }
+        }
+        #undef LAUNCH_COOP_KV
+
+        if (!dispatched) {
+            printf("[hipFlashAttn_prefill] Unsupported config: q_per_wave=%d, dims_per_lane=%d\n",
+                   q_per_wave, dims_per_lane);
+            return -1;
+        }
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) {
+            printf("[hipFlashAttn_prefill] Cooperative kernel launch failed: %s\n", hipGetErrorString(err));
+            return -1;
+        }
+        return 0;
+    }
+
 } // anonymous namespace
+
+// =============================================================================
+// Flash Decoding launch template (outside extern "C" — templates need C++ linkage)
+// KV_TYPE selects native K/V format:
+//   FP16: half bandwidth, fdot2 dot product on gfx906
+//   Q8_1: inline dequant, ~3.5× BW savings
+//   FP32: original path (backward-compatible)
+// =============================================================================
+template <KVTypeTag KV_TYPE>
+static int launch_decode(
+    const float *Q, const void *K_cache, const void *V_cache, float *O,
+    float *O_partial, float *m_partial, float *l_partial,
+    int batch_size, int kv_len,
+    int n_heads, int n_kv_heads, int head_dim,
+    int num_splits,
+    const llaminar2::attention::AttentionDeviceParams *device_params,
+    hipStream_t hip_stream)
+{
+    if (head_dim <= 0 || head_dim > 128)
+    {
+        printf("[launch_decode] Error: head_dim=%d must be in [1, 128]\n", head_dim);
+        return -1;
+    }
+
+    float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+    const DecodeAutotuneSelection tuned = chooseDecodeLaunchConfig(kv_len, head_dim, num_splits);
+    const int effective_num_splits = tuned.config.splits;
+    const int decode_threads_per_block = tuned.config.tpb;
+
+    hipEvent_t tune_start = nullptr;
+    hipEvent_t tune_stop = nullptr;
+    const bool measure_tuning = tuned.should_time;
+    if (measure_tuning)
+    {
+        if (hipEventCreate(&tune_start) == hipSuccess && hipEventCreate(&tune_stop) == hipSuccess)
+        {
+            hipEventRecord(tune_start, hip_stream);
+        }
+        else
+        {
+            if (tune_start)
+                hipEventDestroy(tune_start);
+            if (tune_stop)
+                hipEventDestroy(tune_stop);
+            tune_start = nullptr;
+            tune_stop = nullptr;
+        }
+    }
+
+    // Split-K kernel (type-dispatched via template)
+    size_t smem_size = head_dim * sizeof(float); // Q in shared memory
+    dim3 grid_split(n_heads, effective_num_splits, batch_size);
+    dim3 block_split(decode_threads_per_block);
+
+    hipLaunchKernelGGL(
+        (flash_decoding_mi50_kernel<KV_TYPE>),
+        grid_split, block_split, smem_size, hip_stream,
+        Q, K_cache, V_cache,
+        O_partial, m_partial, l_partial,
+        kv_len, n_heads, n_kv_heads, head_dim,
+        effective_num_splits, softmax_scale, device_params);
+
+    // Reduction kernel (unchanged — operates on FP32 partials only)
+    dim3 grid_reduce(n_heads, batch_size);
+    dim3 block_reduce(256);
+
+    hipLaunchKernelGGL(
+        flash_decoding_reduce_mi50_kernel,
+        grid_reduce, block_reduce, 0, hip_stream,
+        O_partial, m_partial, l_partial, O,
+        n_heads, head_dim, effective_num_splits);
+
+    if (tune_start && tune_stop)
+    {
+        hipEventRecord(tune_stop, hip_stream);
+        if (hipEventSynchronize(tune_stop) == hipSuccess)
+        {
+            float elapsed_ms = 0.0f;
+            if (hipEventElapsedTime(&elapsed_ms, tune_start, tune_stop) == hipSuccess)
+            {
+                recordDecodeAutotuneResult(tuned.key, tuned.candidate_index, elapsed_ms);
+            }
+        }
+        hipEventDestroy(tune_start);
+        hipEventDestroy(tune_stop);
+    }
+
+    (void)hipGetLastError();  // Clear stale errors
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        printf("[launch_decode] Kernel launch failed: %s\n", hipGetErrorString(err));
+        return -1;
+    }
+
+    return 0;
+}
 
 // =============================================================================
 // Extern "C" Wrapper Functions
@@ -1728,7 +2087,7 @@ namespace
 extern "C"
 {
     /**
-     * @brief Launch Flash Attention 2 kernel for MI50
+     * @brief Launch Flash Attention 2 prefill kernel for MI50 (FP32 KV)
      *
      * @return 0 on success, -1 on invalid input, -2 on unsupported arch
      */
@@ -1758,70 +2117,12 @@ extern "C"
         float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
         if (head_dim >= 64) {
-            // Cooperative kernel — dramatic LDS reduction, 5× higher occupancy
-            // Template parameters ensure register promotion (no scratch spills).
-            int tile_q = 32;  // Optimal for head_dim=128 (44 VGPRs, 5 waves/SIMD)
-
-            // Allow override via environment
-            const char *tq_env = getenv("LLAMINAR_FA2_COOPERATIVE_TILE_Q");
-            if (tq_env) {
-                int tq_override = atoi(tq_env);
-                if (tq_override == 16 || tq_override == 32 || tq_override == 64)
-                    tile_q = tq_override;
-            }
-
-            const int q_stride = head_dim + FA2_LDS_PAD_FP16;
-            const int lds_size = tile_q * q_stride * static_cast<int>(sizeof(__half));
-
-            const int num_q_tiles = (seq_len + tile_q - 1) / tile_q;
-            dim3 grid(n_heads, num_q_tiles, batch_size);
-            dim3 block(FA2_THREADS_PER_BLOCK);
-
-            // Dispatch template instantiation based on (tile_q, head_dim).
-            // Q_PER_WAVE = tile_q / 4 (4 wavefronts per block)
-            // DIMS_PER_LANE = ceil(head_dim / 64) (64 lanes per wavefront)
-            constexpr int WAVES_PER_BLOCK = 4;
-            const int q_per_wave = tile_q / WAVES_PER_BLOCK;
-            const int dims_per_lane = (head_dim + WAVEFRONT_SIZE - 1) / WAVEFRONT_SIZE;
-
-            // Template dispatch — must cover all valid (q_per_wave, dims_per_lane) combos
-            #define LAUNCH_COOP_KERNEL(QPW, DPL) \
-                hipLaunchKernelGGL( \
-                    (flash_attention_2_cooperative_mi50_kernel<QPW, DPL>), \
-                    grid, block, lds_size, hip_stream, \
-                    Q, K, V, O, \
-                    batch_size, seq_len, kv_len, \
-                    n_heads, n_kv_heads, head_dim, \
-                    softmax_scale, causal, window_size, position_offset, \
-                    device_params, mask, \
-                    tile_q)
-
-            bool dispatched = false;
-            if (dims_per_lane == 2) {
-                // head_dim 65-128 (most common: 128)
-                if (q_per_wave == 8) { LAUNCH_COOP_KERNEL(8, 2); dispatched = true; }
-                else if (q_per_wave == 4) { LAUNCH_COOP_KERNEL(4, 2); dispatched = true; }
-                else if (q_per_wave == 16) { LAUNCH_COOP_KERNEL(16, 2); dispatched = true; }
-            } else if (dims_per_lane == 1) {
-                // head_dim 1-64
-                if (q_per_wave == 8) { LAUNCH_COOP_KERNEL(8, 1); dispatched = true; }
-                else if (q_per_wave == 4) { LAUNCH_COOP_KERNEL(4, 1); dispatched = true; }
-                else if (q_per_wave == 16) { LAUNCH_COOP_KERNEL(16, 1); dispatched = true; }
-            }
-            #undef LAUNCH_COOP_KERNEL
-
-            if (!dispatched) {
-                printf("[hipFlashAttn_prefill_fa2] Unsupported config: q_per_wave=%d, dims_per_lane=%d\n",
-                       q_per_wave, dims_per_lane);
-                return -1;
-            }
-
-            hipError_t err = hipGetLastError();
-            if (err != hipSuccess) {
-                printf("[hipFlashAttn_prefill_fa2] Cooperative kernel launch failed: %s\n", hipGetErrorString(err));
-                return -1;
-            }
-            return 0;
+            return launch_cooperative_prefill<KVTypeTag::FP32>(
+                Q, K, V, O,
+                batch_size, seq_len, kv_len,
+                n_heads, n_kv_heads, head_dim,
+                softmax_scale, causal, window_size, position_offset,
+                device_params, mask, hip_stream);
         }
 
         // Fall through to existing tiled kernel for head_dim < 64
@@ -1914,9 +2215,103 @@ extern "C"
     }
 
     /**
-     * @brief Launch Flash Decoding kernel for MI50
+     * @brief Launch Flash Attention 2 prefill kernel with FP16 KV cache
+     *
+     * Reads K/V directly as FP16 from device memory, eliminating the
+     * FP32 conversion kernel. For head_dim >= 64 (DIMS_PER_LANE=2), uses
+     * v_dot2_f32_f16 for 2× ALU throughput on the Q@K^T dot product.
+     * Halves HBM bandwidth for K/V reads vs FP32.
      *
      * @return 0 on success, -1 on error
+     */
+    int hipFlashAttn_prefill_fa2_fp16(
+        const float *Q, const void *K, const void *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        void *stream)
+    {
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+
+        if (head_dim <= 0 || head_dim > 128)
+        {
+            printf("[hipFlashAttn_prefill_fa2_fp16] Error: head_dim=%d must be in [1, 128]\n", head_dim);
+            return -1;
+        }
+        if (n_heads % n_kv_heads != 0)
+        {
+            printf("[hipFlashAttn_prefill_fa2_fp16] Error: n_heads must be divisible by n_kv_heads\n");
+            return -1;
+        }
+        if (head_dim < 64)
+        {
+            printf("[hipFlashAttn_prefill_fa2_fp16] Error: FP16 KV requires head_dim >= 64 (got %d)\n", head_dim);
+            return -1;
+        }
+
+        float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+        return launch_cooperative_prefill<KVTypeTag::FP16>(
+            Q, K, V, O,
+            batch_size, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            softmax_scale, causal, window_size, position_offset,
+            device_params, mask, hip_stream);
+    }
+
+    /**
+     * @brief Launch Flash Attention 2 prefill kernel with Q8_1 KV cache
+     *
+     * Reads K/V directly as Q8_1Block from device memory, performing inline
+     * dequantization (scale × int8 → float) per element. Eliminates the
+     * FP32 conversion kernel and reduces HBM bandwidth ~3.5× vs FP32.
+     *
+     * @return 0 on success, -1 on error
+     */
+    int hipFlashAttn_prefill_fa2_q8_1(
+        const float *Q, const void *K, const void *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        void *stream)
+    {
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+
+        if (head_dim <= 0 || head_dim > 128)
+        {
+            printf("[hipFlashAttn_prefill_fa2_q8_1] Error: head_dim=%d must be in [1, 128]\n", head_dim);
+            return -1;
+        }
+        if (n_heads % n_kv_heads != 0)
+        {
+            printf("[hipFlashAttn_prefill_fa2_q8_1] Error: n_heads must be divisible by n_kv_heads\n");
+            return -1;
+        }
+        if (head_dim < 64)
+        {
+            printf("[hipFlashAttn_prefill_fa2_q8_1] Error: Q8_1 KV requires head_dim >= 64 (got %d)\n", head_dim);
+            return -1;
+        }
+        if (head_dim % 32 != 0)
+        {
+            printf("[hipFlashAttn_prefill_fa2_q8_1] Error: head_dim must be multiple of 32 for Q8_1 (got %d)\n", head_dim);
+            return -1;
+        }
+
+        float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+        return launch_cooperative_prefill<KVTypeTag::Q8_1>(
+            Q, K, V, O,
+            batch_size, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            softmax_scale, causal, window_size, position_offset,
+            device_params, mask, hip_stream);
+    }
+
+    /**
+     * @brief Launch Flash Decoding kernel for MI50 (FP32 KV cache)
      */
     int hipFlashAttn_decode_fp32(
         const float *Q, const float *K_cache, const float *V_cache, float *O,
@@ -1927,87 +2322,60 @@ extern "C"
         const llaminar2::attention::AttentionDeviceParams *device_params,
         void *stream)
     {
-        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-
-        if (head_dim <= 0 || head_dim > 128)
-        {
-            printf("[hipFlashAttn_decode_fp32] Error: head_dim=%d must be in [1, 128]\n", head_dim);
-            return -1;
-        }
-
-        float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-
-        const DecodeAutotuneSelection tuned = chooseDecodeLaunchConfig(kv_len, head_dim, num_splits);
-        const int effective_num_splits = tuned.config.splits;
-        const int decode_threads_per_block = tuned.config.tpb;
-
-        hipEvent_t tune_start = nullptr;
-        hipEvent_t tune_stop = nullptr;
-        const bool measure_tuning = tuned.should_time;
-        if (measure_tuning)
-        {
-            if (hipEventCreate(&tune_start) == hipSuccess && hipEventCreate(&tune_stop) == hipSuccess)
-            {
-                hipEventRecord(tune_start, hip_stream);
-            }
-            else
-            {
-                if (tune_start)
-                    hipEventDestroy(tune_start);
-                if (tune_stop)
-                    hipEventDestroy(tune_stop);
-                tune_start = nullptr;
-                tune_stop = nullptr;
-            }
-        }
-
-        // Split-K kernel
-        size_t smem_size = head_dim * sizeof(float); // Q in shared memory
-        dim3 grid_split(n_heads, effective_num_splits, batch_size);
-        dim3 block_split(decode_threads_per_block);
-
-        hipLaunchKernelGGL(
-            flash_decoding_mi50_kernel,
-            grid_split, block_split, smem_size, hip_stream,
-            Q, K_cache, V_cache,
+        return launch_decode<KVTypeTag::FP32>(
+            Q, K_cache, V_cache, O,
             O_partial, m_partial, l_partial,
-            kv_len, n_heads, n_kv_heads, head_dim,
-            effective_num_splits, softmax_scale, device_params);
+            batch_size, kv_len, n_heads, n_kv_heads, head_dim,
+            num_splits, device_params, static_cast<hipStream_t>(stream));
+    }
 
-        // Reduction kernel
-        dim3 grid_reduce(n_heads, batch_size);
-        dim3 block_reduce(256);
+    /**
+     * @brief Launch Flash Decoding kernel for MI50 (FP16 KV cache — native half reads)
+     *
+     * K_cache/V_cache point to __half data in the same logical layout as FP32.
+     * Halves KV read bandwidth; uses fdot2 (v_dot2_f32_f16) for K·Q dot product.
+     */
+    int hipFlashAttn_decode_fp16(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream)
+    {
+        return launch_decode<KVTypeTag::FP16>(
+            Q, K_cache, V_cache, O,
+            O_partial, m_partial, l_partial,
+            batch_size, kv_len, n_heads, n_kv_heads, head_dim,
+            num_splits, device_params, static_cast<hipStream_t>(stream));
+    }
 
-        hipLaunchKernelGGL(
-            flash_decoding_reduce_mi50_kernel,
-            grid_reduce, block_reduce, 0, hip_stream,
-            O_partial, m_partial, l_partial, O,
-            n_heads, head_dim, effective_num_splits);
-
-        if (tune_start && tune_stop)
+    /**
+     * @brief Launch Flash Decoding kernel for MI50 (Q8_1 KV cache — inline dequant)
+     *
+     * K_cache/V_cache point to Q8_1Block data. Each block covers 32 elements.
+     * ~3.5× bandwidth savings vs FP32. head_dim must be multiple of 32.
+     */
+    int hipFlashAttn_decode_q8_1(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream)
+    {
+        if (head_dim % 32 != 0)
         {
-            hipEventRecord(tune_stop, hip_stream);
-            if (hipEventSynchronize(tune_stop) == hipSuccess)
-            {
-                float elapsed_ms = 0.0f;
-                if (hipEventElapsedTime(&elapsed_ms, tune_start, tune_stop) == hipSuccess)
-                {
-                    recordDecodeAutotuneResult(tuned.key, tuned.candidate_index, elapsed_ms);
-                }
-            }
-            hipEventDestroy(tune_start);
-            hipEventDestroy(tune_stop);
-        }
-
-        (void)hipGetLastError();  // Clear stale errors
-        hipError_t err = hipGetLastError();
-        if (err != hipSuccess)
-        {
-            printf("[hipFlashAttn_decode_fp32] Kernel launch failed: %s\n", hipGetErrorString(err));
+            printf("[hipFlashAttn_decode_q8_1] Error: head_dim must be multiple of 32 for Q8_1 (got %d)\n", head_dim);
             return -1;
         }
-
-        return 0;
+        return launch_decode<KVTypeTag::Q8_1>(
+            Q, K_cache, V_cache, O,
+            O_partial, m_partial, l_partial,
+            batch_size, kv_len, n_heads, n_kv_heads, head_dim,
+            num_splits, device_params, static_cast<hipStream_t>(stream));
     }
 
     /**

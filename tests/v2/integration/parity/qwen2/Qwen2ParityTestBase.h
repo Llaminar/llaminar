@@ -789,6 +789,14 @@ namespace llaminar2::test::parity::qwen2
          */
         virtual BackendThresholds getBackendThresholds() = 0;
 
+        /**
+         * @brief Apply model path/snapshot dir overrides from TestConfig
+         *
+         * Override in subclasses that have access to TestConfig (e.g., ConfigDrivenParityTest).
+         * Default implementation does nothing (preserves ParityConfig defaults).
+         */
+        virtual void applyModelOverrides() {}
+
         void SetUp() override
         {
             // Apply backend-specific thresholds
@@ -800,6 +808,12 @@ namespace llaminar2::test::parity::qwen2
             config_.min_early_layers_passed = thresholds.min_early_layers_passed;
             config_.kl_threshold = thresholds.kl_threshold;
             config_.excluded_stages = thresholds.excluded_stages;
+            config_.min_top1_accuracy = thresholds.min_top1_accuracy;
+            config_.min_top5_accuracy = thresholds.min_top5_accuracy;
+            config_.min_decode_pass_rate = thresholds.min_decode_pass_rate;
+
+            // Apply model path/snapshot dir overrides from TestConfig if available
+            applyModelOverrides();
 
             ParityTestBase::SetUp();
         }
@@ -833,6 +847,14 @@ namespace llaminar2::test::parity::qwen2
         BackendThresholds getBackendThresholds() override
         {
             return cfg().thresholds;
+        }
+
+        void applyModelOverrides() override
+        {
+            if (!cfg().model_path.empty())
+                config_.model_path = cfg().model_path;
+            if (!cfg().snapshot_dir.empty())
+                config_.snapshot_dir = cfg().snapshot_dir;
         }
 
         std::string getBackendName() override
@@ -926,6 +948,8 @@ namespace llaminar2::test::parity::qwen2
             LOG_INFO("║  Devices: " << cfg().device_count() << "x " << deviceTypeName(cfg().primary_device()));
             LOG_INFO("║  Parallelism: " << parallelismName(cfg().parallelism));
             LOG_INFO("║  Collective: " << collectiveName(cfg().collective));
+            if (!cfg().model_path.empty())
+                LOG_INFO("║  Model: " << cfg().model_path);
             LOG_INFO("╚══════════════════════════════════════════════════════════════════╝");
 
             Qwen2ParityTestBase::SetUp();

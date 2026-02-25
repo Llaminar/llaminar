@@ -72,7 +72,6 @@
  */
 
 #include "ROCmQuantisedGemmKernel.h"
-#include "ROCmRatioVNNIAbi.h"
 #include "ROCmKernelBase.h"
 #include "backends/ComputeBackend.h" // DeviceManager
 #include "backends/DeviceId.h"       // DeviceId
@@ -265,6 +264,18 @@ namespace llaminar2
                 const float *d_bias,       // [N] optional bias (nullable)
                 int rocm_device_id, void *stream);
 
+            // Apply scale-A only (for grouped ratio-VNNI path where B-scales
+            // are already applied per-group in the GEMV kernel).
+            bool rocmQuantGemm_applyScaleA_fp32(
+                const float *d_C_fp32_grouped, // [M×N] FP32 with B-scales applied
+                float *d_output,               // [M×N] FP32 output
+                const float *d_scales_A,       // [M] per-row activation scales
+                int M, int N,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                int rocm_device_id, void *stream);
+
             // In-place bias addition: output[m,n] += bias[n] (common .hip)
             bool rocmQuantGemm_biasAdd(
                 float *d_output,     // [M × N] FP32 output (modified in-place)
@@ -307,32 +318,16 @@ namespace llaminar2
                 int N, int K,
                 int device_id, void *stream);
 
-            // Ratio-VNNI decode GEMV (Phase-1: IQ4_NL + Q4_0, 4-bit)
-            bool rocmGemv_ratio_vnni_int8_int32(
-                const int8_t *d_A_int8,   // [K]
-                const uint8_t *d_payload, // [blocks × N × payload_bytes]
-                const int8_t *d_ratio,    // [blocks × N]
-                int32_t *d_C_int32,       // [N]
-                int N, int K,
-                uint8_t bitwidth,
-                uint8_t codebook_id,
-                uint8_t has_min,
-                uint8_t block_size,
-                uint16_t payload_bytes,
-                int device_id, void *stream);
-
-            // Ratio-VNNI -> row-major INT8 expansion for CK prefill (Phase-1)
-            bool rocmGemv_expandRatioVNNI_to_rowmajor(
+            // Native-VNNI GEMV: lossless Q4/IQ4 decode with FP16 per-block scales.
+            // Output is FP32 with scale_A applied inline — no epilogue kernel needed.
+            bool rocmGemv_native_vnni_fp32(
+                const int8_t *d_A_int8,
                 const uint8_t *d_payload,
-                const int8_t *d_ratio,
-                const int8_t *d_min,
-                int8_t *d_B_rowmajor,
+                const void *d_block_scales, // __half* (FP16)
+                float *d_C_fp32,
+                const float *d_scale_A,
                 int N, int K,
-                uint8_t bitwidth,
                 uint8_t codebook_id,
-                uint8_t has_min,
-                uint8_t block_size,
-                uint16_t payload_bytes,
                 int device_id, void *stream);
 
             // =========================================================================
@@ -406,36 +401,6 @@ namespace llaminar2
                 int M, int N, int K,
                 int kt_select,
                 int device_id, void *stream);
-
-            // ratio-VNNI native prefill GEMM scaffold: payload + ratio side-channel
-            bool rocmGemm_ratio_vnni_int8_int32_prefill(
-                const int8_t *d_A_int8,   // [M x K] row-major INT8 activations
-                const uint8_t *d_payload, // [blocks x N x payload_bytes]
-                const int8_t *d_ratio,    // [blocks x N]
-                const int8_t *d_min,      // [blocks x N] optional min side-channel
-                int32_t *d_C_int32,       // [M x N] row-major INT32 accumulators
-                int M, int N, int K,
-                uint8_t bitwidth,
-                uint8_t codebook_id,
-                uint8_t has_min,
-                uint8_t block_size,
-                uint16_t payload_bytes,
-                int prefill_variant,
-                int prefill_kb,
-                int device_id, void *stream);
-
-            // ratio-VNNI native prefill GEMM (ABI v2 descriptor)
-            bool rocmGemm_ratio_vnni_int8_int32_prefill_v2(
-                const int8_t *d_A_int8,
-                const uint8_t *d_payload,
-                const int8_t *d_ratio,
-                const int8_t *d_min,
-                int32_t *d_C_int32,
-                int M, int N, int K,
-                const ROCmRatioVNNIPrefillAbiV2Desc *abi,
-                int prefill_variant,
-                int prefill_kb,
-                int device_id, void *stream);
         }
 
         // =====================================================================
@@ -495,35 +460,22 @@ namespace llaminar2
             // Device memory for converted weights (only used when owns_weight_memory_ = true)
             // Option B: Only VNNI layout is persistent on device. Row-major is repacked
             // on-demand from VNNI into d_B_rowmajor_scratch (workspace buffer).
-            int8_t *d_weights_int8_vnni = nullptr;      // [K/4 x N x 4] VNNI layout (sole device copy)
-            int8_t *d_weights_int8_rowmajor = nullptr;  // [N x K] optional persistent CK row-major buffer (startup repack)
-            uint8_t *d_weights_ratio_payload = nullptr; // [blocks × N × payload_bytes]
-            int8_t *d_weights_ratio = nullptr;          // [blocks × N]
-            int8_t *d_weights_ratio_min = nullptr;      // [blocks × N], optional
-            float *d_scales_B = nullptr;                // [N] per-column scales
+            int8_t *d_weights_int8_vnni = nullptr;       // [K/4 x N x 4] VNNI layout (sole device copy)
+            int8_t *d_weights_int8_rowmajor = nullptr;   // [N x K] optional persistent CK row-major buffer (startup repack)
+            float *d_scales_B = nullptr;                 // [N] per-column scales
+            uint8_t *d_weights_native_payload = nullptr; // [blocks_per_row × N × 16]
+            void *d_weights_native_scales = nullptr;     // [blocks_per_row × N] __half*
+            uint8_t native_vnni_codebook_id = 0;
+            uint32_t native_vnni_blocks_per_row = 0;
+            bool has_native_vnni = false;
             void *startup_repack_ready_event = nullptr; // hipEvent_t* as opaque pointer
             bool startup_repack_event_pending = false;
             void *startup_commit_ready_event = nullptr; // hipEvent_t* as opaque pointer
             bool startup_commit_event_pending = false;
             void *startup_h2d_pinned_scales = nullptr;
             void *startup_h2d_pinned_vnni = nullptr;
-            void *startup_h2d_pinned_ratio_payload = nullptr;
-            void *startup_h2d_pinned_ratio = nullptr;
-            void *startup_h2d_pinned_ratio_min = nullptr;
-
-            uint8_t ratio_vnni_bitwidth = 0;
-            uint8_t ratio_vnni_codebook_id = 0;
-            uint8_t ratio_vnni_has_min = 0;
-            uint8_t ratio_vnni_block_size = 0;
-            uint16_t ratio_vnni_payload_bytes = 0;
-            uint16_t ratio_vnni_abi_version = ROCM_RATIO_VNNI_PREFILL_ABI_V2;
-            uint8_t ratio_vnni_ratio_bytes = 1;
-            uint8_t ratio_vnni_min_bytes = 0;
-            uint32_t ratio_vnni_flags = 0;
-            uint32_t ratio_vnni_blocks_per_row = 0;
-            uint32_t ratio_vnni_payload_stride_bytes = 0;
-            uint32_t ratio_vnni_ratio_stride_bytes = 1;
-            uint32_t ratio_vnni_min_stride_bytes = 0;
+            void *startup_h2d_pinned_native_payload = nullptr;
+            void *startup_h2d_pinned_native_scales = nullptr;
 
             // Work buffer pointers - obtained from workspace at execution time
             // These are NOT owned by the kernel - they point into workspace-managed memory
@@ -547,9 +499,6 @@ namespace llaminar2
             int repack_cached_n = 0;
             int repack_cached_k = 0;
             int8_t *repack_cached_src_vnni = nullptr;
-            uint8_t *repack_cached_src_ratio_payload = nullptr;
-            int8_t *repack_cached_src_ratio = nullptr;
-            int8_t *repack_cached_src_ratio_min = nullptr;
             int8_t *repack_cached_dst = nullptr;
 
             // Capacity tracking for workspace buffers (set during validateWorkspace)
@@ -585,14 +534,12 @@ namespace llaminar2
                         rocmQuantGemm_freeDevice(d_weights_int8_vnni, rocm_device_id);
                     if (d_weights_int8_rowmajor)
                         rocmQuantGemm_freeDevice(d_weights_int8_rowmajor, rocm_device_id);
-                    if (d_weights_ratio_payload)
-                        rocmQuantGemm_freeDevice(d_weights_ratio_payload, rocm_device_id);
-                    if (d_weights_ratio)
-                        rocmQuantGemm_freeDevice(d_weights_ratio, rocm_device_id);
-                    if (d_weights_ratio_min)
-                        rocmQuantGemm_freeDevice(d_weights_ratio_min, rocm_device_id);
                     if (d_scales_B)
                         rocmQuantGemm_freeDevice(d_scales_B, rocm_device_id);
+                    if (d_weights_native_payload)
+                        rocmQuantGemm_freeDevice(d_weights_native_payload, rocm_device_id);
+                    if (d_weights_native_scales)
+                        rocmQuantGemm_freeDevice(d_weights_native_scales, rocm_device_id);
 #ifdef HAVE_ROCM
                     if (startup_repack_ready_event)
                     {
@@ -614,9 +561,8 @@ namespace llaminar2
                     };
                     free_pinned(startup_h2d_pinned_scales);
                     free_pinned(startup_h2d_pinned_vnni);
-                    free_pinned(startup_h2d_pinned_ratio_payload);
-                    free_pinned(startup_h2d_pinned_ratio);
-                    free_pinned(startup_h2d_pinned_ratio_min);
+                    free_pinned(startup_h2d_pinned_native_payload);
+                    free_pinned(startup_h2d_pinned_native_scales);
 #endif
                 }
                 // Work buffers (including d_B_rowmajor_scratch) are NOT freed -
@@ -683,9 +629,9 @@ namespace llaminar2
                     return false;
                 }
 
-                if (!impl->d_weights_int8_vnni && !(impl->d_weights_ratio_payload && impl->d_weights_ratio))
+                if (!impl->d_weights_int8_vnni)
                 {
-                    LOG_ERROR("[" << log_scope << "] Missing VNNI/ratio source weights");
+                    LOG_ERROR("[" << log_scope << "] Missing VNNI source weights");
                     return false;
                 }
 
@@ -693,9 +639,6 @@ namespace llaminar2
                                        impl->repack_cached_n == n &&
                                        impl->repack_cached_k == k &&
                                        impl->repack_cached_src_vnni == impl->d_weights_int8_vnni &&
-                                       impl->repack_cached_src_ratio_payload == impl->d_weights_ratio_payload &&
-                                       impl->repack_cached_src_ratio == impl->d_weights_ratio &&
-                                       impl->repack_cached_src_ratio_min == impl->d_weights_ratio_min &&
                                        impl->repack_cached_dst == impl->d_B_rowmajor_scratch;
 
                 if (cache_hit)
@@ -705,35 +648,7 @@ namespace llaminar2
                 }
 
                 bool repack_ok = false;
-                const bool descriptor_supported =
-                    ((impl->ratio_vnni_bitwidth == 4 && impl->ratio_vnni_payload_bytes == 16) ||
-                     (impl->ratio_vnni_bitwidth == 5 && impl->ratio_vnni_payload_bytes == 20));
-                if (impl->d_weights_ratio_payload && impl->d_weights_ratio &&
-                    descriptor_supported &&
-                    impl->ratio_vnni_block_size == 32 &&
-                    impl->ratio_vnni_ratio_bytes == 1 &&
-                    impl->ratio_vnni_payload_stride_bytes == impl->ratio_vnni_payload_bytes &&
-                    impl->ratio_vnni_ratio_stride_bytes == 1 &&
-                    (impl->ratio_vnni_has_min == 0 ||
-                     (impl->ratio_vnni_has_min != 0 &&
-                      impl->d_weights_ratio_min &&
-                      impl->ratio_vnni_min_bytes == 1 &&
-                      impl->ratio_vnni_min_stride_bytes == 1)))
-                {
-                    repack_ok = rocmGemv_expandRatioVNNI_to_rowmajor(
-                        impl->d_weights_ratio_payload,
-                        impl->d_weights_ratio,
-                        impl->d_weights_ratio_min,
-                        impl->d_B_rowmajor_scratch,
-                        n, k,
-                        impl->ratio_vnni_bitwidth,
-                        impl->ratio_vnni_codebook_id,
-                        impl->ratio_vnni_has_min,
-                        impl->ratio_vnni_block_size,
-                        impl->ratio_vnni_payload_bytes,
-                        rocm_device_id, gpu_stream);
-                }
-                else if (impl->d_weights_int8_vnni)
+                if (impl->d_weights_int8_vnni)
                 {
                     repack_ok = rocmGemv_repackVNNI_to_rowmajor(
                         impl->d_weights_int8_vnni,
@@ -744,7 +659,7 @@ namespace llaminar2
 
                 if (!repack_ok)
                 {
-                    LOG_ERROR("[" << log_scope << "] ratio/VNNI→row-major repack failed");
+                    LOG_ERROR("[" << log_scope << "] VNNI→row-major repack failed");
                     impl->repack_cache_valid = false;
                     return false;
                 }
@@ -753,9 +668,6 @@ namespace llaminar2
                 impl->repack_cached_n = n;
                 impl->repack_cached_k = k;
                 impl->repack_cached_src_vnni = impl->d_weights_int8_vnni;
-                impl->repack_cached_src_ratio_payload = impl->d_weights_ratio_payload;
-                impl->repack_cached_src_ratio = impl->d_weights_ratio;
-                impl->repack_cached_src_ratio_min = impl->d_weights_ratio_min;
                 impl->repack_cached_dst = impl->d_B_rowmajor_scratch;
                 return true;
             }
@@ -827,9 +739,6 @@ namespace llaminar2
                 };
                 free_pinned(impl->startup_h2d_pinned_scales);
                 free_pinned(impl->startup_h2d_pinned_vnni);
-                free_pinned(impl->startup_h2d_pinned_ratio_payload);
-                free_pinned(impl->startup_h2d_pinned_ratio);
-                free_pinned(impl->startup_h2d_pinned_ratio_min);
                 return true;
 #else
                 (void)impl;
@@ -973,9 +882,6 @@ namespace llaminar2
 
                 free_if_set(upload.startup_h2d_pinned_scales);
                 free_if_set(upload.startup_h2d_pinned_vnni);
-                free_if_set(upload.startup_h2d_pinned_ratio_payload);
-                free_if_set(upload.startup_h2d_pinned_ratio);
-                free_if_set(upload.startup_h2d_pinned_ratio_min);
 #else
                 (void)upload;
 #endif
@@ -1058,7 +964,7 @@ namespace llaminar2
                     return true;
                 }
 
-                if (!upload.d_int8_data_vnni && !(upload.d_ratio_vnni_payload && upload.d_ratio_vnni_ratio))
+                if (!upload.d_int8_data_vnni)
                 {
                     return true;
                 }
@@ -1112,23 +1018,7 @@ namespace llaminar2
                 }
 
                 bool repack_ok = false;
-                if (upload.d_ratio_vnni_payload && upload.d_ratio_vnni_ratio)
-                {
-                    repack_ok = rocmGemv_expandRatioVNNI_to_rowmajor(
-                        upload.d_ratio_vnni_payload,
-                        upload.d_ratio_vnni_ratio,
-                        upload.d_ratio_vnni_min,
-                        upload.d_int8_data_rowmajor,
-                        N, K,
-                        4,
-                        0,
-                        0,
-                        32,
-                        16,
-                        rocm_device_id,
-                        reinterpret_cast<void *>(repack_stream));
-                }
-                else if (upload.d_int8_data_vnni)
+                if (upload.d_int8_data_vnni)
                 {
                     repack_ok = rocmGemv_repackVNNI_to_rowmajor(
                         upload.d_int8_data_vnni,
@@ -1257,12 +1147,6 @@ namespace llaminar2
                         rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, device_id);
                     if (upload.d_int8_data_rowmajor)
                         rocmQuantGemm_freeDevice(upload.d_int8_data_rowmajor, device_id);
-                    if (upload.d_ratio_vnni_payload)
-                        rocmQuantGemm_freeDevice(upload.d_ratio_vnni_payload, device_id);
-                    if (upload.d_ratio_vnni_ratio)
-                        rocmQuantGemm_freeDevice(upload.d_ratio_vnni_ratio, device_id);
-                    if (upload.d_ratio_vnni_min)
-                        rocmQuantGemm_freeDevice(upload.d_ratio_vnni_min, device_id);
                     if (upload.d_scales)
                         rocmQuantGemm_freeDevice(upload.d_scales, device_id);
 #ifdef HAVE_ROCM
@@ -1288,12 +1172,6 @@ namespace llaminar2
                     rocmQuantGemm_freeDevice(d_int8_data_vnni, rocm_device_id);
                 if (d_int8_data_rowmajor)
                     rocmQuantGemm_freeDevice(d_int8_data_rowmajor, rocm_device_id);
-                if (d_ratio_vnni_payload)
-                    rocmQuantGemm_freeDevice(d_ratio_vnni_payload, rocm_device_id);
-                if (d_ratio_vnni_ratio)
-                    rocmQuantGemm_freeDevice(d_ratio_vnni_ratio, rocm_device_id);
-                if (d_ratio_vnni_min)
-                    rocmQuantGemm_freeDevice(d_ratio_vnni_min, rocm_device_id);
                 if (d_scales)
                     rocmQuantGemm_freeDevice(d_scales, rocm_device_id);
 #ifdef HAVE_ROCM
@@ -1309,315 +1187,93 @@ namespace llaminar2
         // packWeightsToROCm: Convert any quantized tensor to INT8 + scales
         // =====================================================================
 
-        namespace
+        bool packNativeVNNI(const TensorBase *tensor, ROCmPackedWeights &out)
         {
-            constexpr uint8_t RATIO_VNNI_CODEBOOK_LINEAR = 0;
-            constexpr uint8_t RATIO_VNNI_CODEBOOK_IQ4 = 4;
+            if (!tensor)
+                return false;
 
-            bool buildBitwidth8PayloadV2FromVNNI(
-                const std::vector<int8_t> &int8_vnni,
-                int N,
-                int K,
-                ROCmPackedWeights &out)
+            const TensorType wt = tensor->native_type();
+            if (wt != TensorType::Q4_0 && wt != TensorType::IQ4_NL)
+                return false;
+
+            auto *raw_accessor = dynamic_cast<const ITensorGemmTileDataProvider *>(tensor);
+            auto *quant_accessor = dynamic_cast<const IINT8Unpackable *>(tensor);
+            if (!raw_accessor || !quant_accessor)
+                return false;
+
+            const int N = static_cast<int>(tensor->rows());
+            const int K = static_cast<int>(tensor->cols());
+            if ((K % 32) != 0 || raw_accessor->block_size() != 32)
+                return false;
+
+            const int blocks_per_row = K / 32;
+            const int payload_bytes = 16; // 32 nibbles = 16 bytes
+
+            out.native_vnni_payload.resize(static_cast<size_t>(blocks_per_row) * N * payload_bytes);
+            out.native_vnni_scales.resize(static_cast<size_t>(blocks_per_row) * N);
+            out.native_vnni_codebook_id = (wt == TensorType::IQ4_NL) ? 4 : 0;
+            out.native_vnni_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
+
+            // Also need per-row scales for the INT8 activation scaling (used by CK expand and activation quant).
+            // For native-VNNI we set per-row scale = 1.0 (scale is per-block, not per-row),
+            // but we still need the scales array for activation quantization compatibility.
+            // We compute per-row max-abs from dequantized weights for CK prefill compat.
+            out.scales.resize(N);
+            for (int n = 0; n < N; ++n)
             {
-                if (N <= 0 || K <= 0 || (K % 32) != 0 || int8_vnni.empty())
+                float max_abs = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b)
                 {
-                    return false;
+                    const float scale_b = std::abs(quant_accessor->get_block_scale(
+                        static_cast<size_t>(n), static_cast<size_t>(b)));
+                    // Conservative: scale * 8 covers full Q4_0 range
+                    max_abs = std::max(max_abs, scale_b * 8.0f);
                 }
-
-                const size_t k_groups = static_cast<size_t>(K) / 4;
-                const size_t expected_vnni_bytes = k_groups * static_cast<size_t>(N) * 4;
-                if (int8_vnni.size() != expected_vnni_bytes)
-                {
-                    LOG_WARN("[buildBitwidth8PayloadV2FromVNNI] Unexpected VNNI buffer size: got=" << int8_vnni.size()
-                                                                                                   << " expected=" << expected_vnni_bytes);
-                    return false;
-                }
-
-                const int blocks_per_row = K / 32;
-                constexpr int payload_bytes = 32;
-
-                out.ratio_vnni_payload.assign(static_cast<size_t>(blocks_per_row) * static_cast<size_t>(N) * payload_bytes, 0u);
-                out.ratio_vnni_ratio.assign(static_cast<size_t>(blocks_per_row) * static_cast<size_t>(N), static_cast<int8_t>(127));
-                out.ratio_vnni_min.clear();
-
-                for (int n = 0; n < N; ++n)
-                {
-                    for (int b = 0; b < blocks_per_row; ++b)
-                    {
-                        const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
-                        uint8_t *payload_dst = out.ratio_vnni_payload.data() + linear * payload_bytes;
-
-                        for (int g = 0; g < 8; ++g)
-                        {
-                            const size_t kg = static_cast<size_t>(b) * 8u + static_cast<size_t>(g);
-                            const size_t vnni_base = (kg * static_cast<size_t>(N) + static_cast<size_t>(n)) * 4u;
-                            payload_dst[g * 4 + 0] = static_cast<uint8_t>(int8_vnni[vnni_base + 0]);
-                            payload_dst[g * 4 + 1] = static_cast<uint8_t>(int8_vnni[vnni_base + 1]);
-                            payload_dst[g * 4 + 2] = static_cast<uint8_t>(int8_vnni[vnni_base + 2]);
-                            payload_dst[g * 4 + 3] = static_cast<uint8_t>(int8_vnni[vnni_base + 3]);
-                        }
-                    }
-                }
-
-                out.ratio_vnni_abi_version = ROCM_RATIO_VNNI_PREFILL_ABI_V2;
-                out.ratio_vnni_bitwidth = 8;
-                out.ratio_vnni_codebook_id = RATIO_VNNI_CODEBOOK_LINEAR;
-                out.ratio_vnni_has_min = 0;
-                out.ratio_vnni_block_size = 32;
-                out.ratio_vnni_payload_bytes = payload_bytes;
-                out.ratio_vnni_ratio_bytes = 1;
-                out.ratio_vnni_min_bytes = 0;
-                out.ratio_vnni_flags = 0;
-                out.ratio_vnni_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
-                out.ratio_vnni_payload_stride_bytes = payload_bytes;
-                out.ratio_vnni_ratio_stride_bytes = 1;
-                out.ratio_vnni_min_stride_bytes = 0;
-
-                LOG_DEBUG("[buildBitwidth8PayloadV2FromVNNI] Built bitwidth-8 payload-v2 container for "
-                          << N << "x" << K
-                          << " payload=" << (out.ratio_vnni_payload.size() / 1024) << " KB");
-                return true;
+                out.scales[n] = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
             }
 
-            bool packRatioVNNIPhase1(const TensorBase *tensor, ROCmPackedWeights &out)
+            // Interleave payload and scales by N for coalesced GPU access
+            for (int n = 0; n < N; ++n)
             {
-                if (!tensor)
+                for (int b = 0; b < blocks_per_row; ++b)
                 {
-                    return false;
-                }
+                    const void *raw_block = raw_accessor->get_raw_block_at(
+                        static_cast<size_t>(n), static_cast<size_t>(b));
+                    if (!raw_block)
+                    {
+                        LOG_ERROR("[packNativeVNNI] get_raw_block returned null at n=" << n << " b=" << b);
+                        return false;
+                    }
 
-                const TensorType wt = tensor->native_type();
-                if (wt != TensorType::Q4_0 && wt != TensorType::IQ4_NL && wt != TensorType::IQ4_XS && wt != TensorType::Q4_1 &&
-                    wt != TensorType::Q5_0 && wt != TensorType::Q5_1)
-                {
-                    return false;
-                }
+                    const uint8_t *payload_src = nullptr;
+                    uint16_t scale_fp16 = 0;
 
-                auto *raw_accessor = dynamic_cast<const ITensorGemmTileDataProvider *>(tensor);
-                auto *quant_accessor = dynamic_cast<const IINT8Unpackable *>(tensor);
-                if (!raw_accessor || !quant_accessor)
-                {
-                    LOG_DEBUG("[packRatioVNNIPhase1] Tensor lacks required raw/quant accessor interfaces");
-                    return false;
-                }
-
-                const int N = static_cast<int>(tensor->rows());
-                const int K = static_cast<int>(tensor->cols());
-                if ((K % 32) != 0)
-                {
-                    return false;
-                }
-                if (raw_accessor->block_size() != 32)
-                {
-                    return false;
-                }
-
-                const int blocks_per_row = K / 32;
-                const bool is_q5_family = (wt == TensorType::Q5_0 || wt == TensorType::Q5_1);
-                const int payload_bytes = is_q5_family ? 20 : 16;
-                const bool has_min = (wt == TensorType::Q4_1 || wt == TensorType::Q5_1);
-
-                out.ratio_vnni_payload.resize(static_cast<size_t>(blocks_per_row) * N * payload_bytes);
-                out.ratio_vnni_ratio.resize(static_cast<size_t>(blocks_per_row) * N);
-                if (has_min)
-                {
-                    out.ratio_vnni_min.resize(static_cast<size_t>(blocks_per_row) * N);
-                }
-                else
-                {
-                    out.ratio_vnni_min.clear();
-                }
-                out.ratio_vnni_abi_version = ROCM_RATIO_VNNI_PREFILL_ABI_V2;
-                out.ratio_vnni_bitwidth = is_q5_family ? 5 : 4;
-                out.ratio_vnni_codebook_id =
-                    (wt == TensorType::IQ4_NL || wt == TensorType::IQ4_XS) ? RATIO_VNNI_CODEBOOK_IQ4 : RATIO_VNNI_CODEBOOK_LINEAR;
-                out.ratio_vnni_has_min = has_min ? 1 : 0;
-                out.ratio_vnni_block_size = 32;
-                out.ratio_vnni_payload_bytes = payload_bytes;
-                out.ratio_vnni_ratio_bytes = 1;
-                out.ratio_vnni_min_bytes = has_min ? 1 : 0;
-                out.ratio_vnni_flags = 0;
-                out.ratio_vnni_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
-                out.ratio_vnni_payload_stride_bytes = payload_bytes;
-                out.ratio_vnni_ratio_stride_bytes = out.ratio_vnni_ratio_bytes;
-                out.ratio_vnni_min_stride_bytes = has_min ? 1 : 0;
-
-                // Pass 1: choose per-column scaling domain for ratio/min side channels.
-                //
-                // For ratio-VNNI we must satisfy two constraints simultaneously:
-                //   1) ratio int8 must not clip badly: ratio ~= scale_b * 128 / scale_col
-                //   2) (for *_1) min side-channel must retain precision: min_q ~= min_b / scale_col
-                //
-                // We therefore anchor scale_col to the maximum block slope, then apply
-                // endpoint guards to keep reconstructed int8 endpoints within range.
-                for (int n = 0; n < N; ++n)
-                {
-                    float max_scale = 0.0f;
-                    float max_pos_endpoint = 0.0f;
-                    float max_neg_endpoint = 0.0f;
-                    std::vector<float> q4_0_abs_scales;
                     if (wt == TensorType::Q4_0)
                     {
-                        q4_0_abs_scales.reserve(static_cast<size_t>(blocks_per_row));
+                        const auto *blk = static_cast<const Q4_0Block *>(raw_block);
+                        payload_src = blk->qs;
+                        scale_fp16 = blk->d;
                     }
-                    for (int b = 0; b < blocks_per_row; ++b)
+                    else // IQ4_NL
                     {
-                        const float scale_b = quant_accessor->get_block_scale(static_cast<size_t>(n), static_cast<size_t>(b));
-                        const float abs_scale_b = std::abs(scale_b);
-                        max_scale = std::max(max_scale, abs_scale_b);
-
-                        if (wt == TensorType::Q4_0)
-                        {
-                            q4_0_abs_scales.push_back(abs_scale_b);
-                        }
-
-                        if (has_min)
-                        {
-                            const void *raw_block = raw_accessor->get_raw_block_at(static_cast<size_t>(n), static_cast<size_t>(b));
-                            if (!raw_block)
-                            {
-                                LOG_ERROR("[packRatioVNNIPhase1] get_raw_block returned null at n=" << n << " b=" << b);
-                                return false;
-                            }
-                            float min_b = 0.0f;
-                            if (wt == TensorType::Q4_1)
-                            {
-                                const auto *blk = static_cast<const Q4_1Block *>(raw_block);
-                                min_b = fp16_to_fp32(blk->m);
-                            }
-                            else
-                            {
-                                const auto *blk = static_cast<const Q5_1Block *>(raw_block);
-                                min_b = fp16_to_fp32(blk->m);
-                            }
-
-                            const float qmax = is_q5_family ? 31.0f : 15.0f;
-                            const float max_b = min_b + scale_b * qmax;
-                            max_pos_endpoint = std::max(max_pos_endpoint, max_b);
-                            max_neg_endpoint = std::max(max_neg_endpoint, -min_b);
-                        }
+                        const auto *blk = static_cast<const IQ4_NLBlock *>(raw_block);
+                        payload_src = blk->qs;
+                        scale_fp16 = blk->d;
                     }
 
-                    float scale_col = (max_scale > 0.0f) ? (max_scale * (128.0f / 127.0f)) : 1.0f;
-
-                    // Q4_0-only robust scaling domain:
-                    // use a high-percentile block scale to reduce quantization noise in
-                    // ratio side-channel, while keeping a max-scale guard to limit clip.
-                    if (wt == TensorType::Q4_0 && !q4_0_abs_scales.empty())
-                    {
-                        constexpr size_t q4_0_scale_percentile = 80;
-                        const size_t rank98 = (q4_0_abs_scales.size() * q4_0_scale_percentile) / 100;
-                        std::nth_element(q4_0_abs_scales.begin(),
-                                         q4_0_abs_scales.begin() + std::min(rank98, q4_0_abs_scales.size() - 1),
-                                         q4_0_abs_scales.end());
-                        const float p98_scale = q4_0_abs_scales[std::min(rank98, q4_0_abs_scales.size() - 1)];
-
-                        const float scale_from_p98 = (p98_scale > 0.0f) ? (p98_scale * (128.0f / 127.0f)) : scale_col;
-                        constexpr float q4_0_clip_guard = 0.10f;
-                        const float scale_from_max_guard = max_scale * q4_0_clip_guard;
-                        scale_col = std::max(scale_from_p98, scale_from_max_guard);
-                    }
-
-                    if (has_min)
-                    {
-                        constexpr float endpoint_guard = 120.0f;
-                        if (max_pos_endpoint > 0.0f)
-                        {
-                            scale_col = std::max(scale_col, max_pos_endpoint / endpoint_guard);
-                        }
-                        if (max_neg_endpoint > 0.0f)
-                        {
-                            scale_col = std::max(scale_col, max_neg_endpoint / endpoint_guard);
-                        }
-                    }
-
-                    out.scales[n] = scale_col;
+                    // Interleave by N: block (b, n) stored at linear index b*N + n
+                    const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
+                    std::memcpy(out.native_vnni_payload.data() + linear * payload_bytes,
+                                payload_src, payload_bytes);
+                    out.native_vnni_scales[linear] = scale_fp16;
                 }
-
-                // Pass 2: payload + ratio interleaved by N
-                for (int n = 0; n < N; ++n)
-                {
-                    const float inv_col = 128.0f / out.scales[n];
-                    for (int b = 0; b < blocks_per_row; ++b)
-                    {
-                        const void *raw_block = raw_accessor->get_raw_block_at(static_cast<size_t>(n), static_cast<size_t>(b));
-                        if (!raw_block)
-                        {
-                            LOG_ERROR("[packRatioVNNIPhase1] get_raw_block returned null at n=" << n << " b=" << b);
-                            return false;
-                        }
-
-                        const uint8_t *payload_src = nullptr;
-                        uint8_t payload_tmp[20];
-                        if (wt == TensorType::IQ4_NL)
-                        {
-                            const auto *blk = static_cast<const IQ4_NLBlock *>(raw_block);
-                            payload_src = blk->qs;
-                        }
-                        else if (wt == TensorType::IQ4_XS)
-                        {
-                            const auto *blk = static_cast<const IQ4_XSBlock *>(raw_block);
-                            const int sub_block_idx = (b & 7);
-                            payload_src = blk->qs + (sub_block_idx * 16);
-                        }
-                        else if (wt == TensorType::Q4_0)
-                        {
-                            const auto *blk = static_cast<const Q4_0Block *>(raw_block);
-                            payload_src = blk->qs;
-                        }
-                        else if (wt == TensorType::Q4_1)
-                        {
-                            const auto *blk = static_cast<const Q4_1Block *>(raw_block);
-                            payload_src = blk->qs;
-                        }
-                        else if (wt == TensorType::Q5_0)
-                        {
-                            const auto *blk = static_cast<const Q5_0Block *>(raw_block);
-                            std::memcpy(payload_tmp, blk->qs, 16);
-                            std::memcpy(payload_tmp + 16, blk->qh, 4);
-                            payload_src = payload_tmp;
-                        }
-                        else
-                        {
-                            const auto *blk = static_cast<const Q5_1Block *>(raw_block);
-                            std::memcpy(payload_tmp, blk->qs, 16);
-                            std::memcpy(payload_tmp + 16, blk->qh, 4);
-                            payload_src = payload_tmp;
-                        }
-
-                        const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
-                        std::memcpy(out.ratio_vnni_payload.data() + linear * payload_bytes, payload_src, payload_bytes);
-
-                        const float scale_b = quant_accessor->get_block_scale(static_cast<size_t>(n), static_cast<size_t>(b));
-                        const float r_f = std::round(std::clamp(scale_b * inv_col, -127.0f, 127.0f));
-                        out.ratio_vnni_ratio[linear] = static_cast<int8_t>(r_f);
-
-                        if (has_min)
-                        {
-                            float min_b = 0.0f;
-                            if (wt == TensorType::Q4_1)
-                            {
-                                const auto *blk = static_cast<const Q4_1Block *>(raw_block);
-                                min_b = fp16_to_fp32(blk->m);
-                            }
-                            else
-                            {
-                                const auto *blk = static_cast<const Q5_1Block *>(raw_block);
-                                min_b = fp16_to_fp32(blk->m);
-                            }
-                            const float min_q = std::round(std::clamp(min_b / out.scales[n], -127.0f, 127.0f));
-                            out.ratio_vnni_min[linear] = static_cast<int8_t>(min_q);
-                        }
-                    }
-                }
-
-                LOG_DEBUG("[packRatioVNNIPhase1] Built Phase-1 ratio container for "
-                          << N << "x" << K
-                          << " payload=" << (out.ratio_vnni_payload.size() / 1024) << " KB"
-                          << " ratio=" << (out.ratio_vnni_ratio.size() / 1024) << " KB");
-                return true;
             }
+
+            LOG_DEBUG("[packNativeVNNI] Built native-VNNI container for " << N << "x" << K
+                                                                          << " (codebook=" << static_cast<int>(out.native_vnni_codebook_id) << ")"
+                                                                          << " payload=" << (out.native_vnni_payload.size() / 1024) << " KB"
+                                                                          << " scales=" << (out.native_vnni_scales.size() * 2 / 1024) << " KB");
+            return true;
         }
 
         //
@@ -1677,30 +1333,13 @@ namespace llaminar2
 
             // Phase-1 compact path: IQ4_NL / Q4_0 (+ Q4_1 with optional min side-channel)
             // Uses native block access (no FP32 dequant -> INT8 requant round-trip).
-            if (packRatioVNNIPhase1(tensor, out))
+
+            // Native-VNNI path: Q4_0 and IQ4_NL get lossless native-VNNI packing.
+            // This runs in addition to (not instead of) other paths during transition.
+            if (packNativeVNNI(tensor, out))
             {
-                if (out.ratio_vnni_has_min == 0 && out.ratio_vnni_bitwidth == 4)
-                {
-                    out.int8_data.clear();
-                    out.int8_data_vnni.clear();
-                    LOG_DEBUG("[packWeightsToROCm] Packed " << N << "x" << K
-                                                            << " weights to ratio-VNNI (phase1)");
-                    return true;
-                }
-
-                if (out.ratio_vnni_has_min != 0)
-                {
-                    out.int8_data.clear();
-                    out.int8_data_vnni.clear();
-                    LOG_DEBUG("[packWeightsToROCm] Packed " << N << "x" << K
-                                                            << " weights to ratio-VNNI (phase1, has_min)");
-                    return true;
-                }
-
-                LOG_DEBUG("[packWeightsToROCm] Packed ratio-VNNI bitwidth="
-                          << static_cast<int>(out.ratio_vnni_bitwidth)
-                          << " has_min=" << static_cast<int>(out.ratio_vnni_has_min)
-                          << "; also building INT8 VNNI fallback for decode/native compatibility");
+                LOG_DEBUG("[packWeightsToROCm] Packed " << N << "x" << K
+                                                        << " weights to native-VNNI");
             }
 
             // Legacy generic path for all other quant formats:
@@ -1760,32 +1399,6 @@ namespace llaminar2
                         out.int8_data_vnni[dst + 2] = out.int8_data[src + 2];
                         out.int8_data_vnni[dst + 3] = out.int8_data[src + 3];
                     }
-                }
-            }
-
-            // Phase 3 Slice 8/11: non-Q4/Q5 ABI-v2 payload route.
-            // For selected low-bit families, project existing INT8 VNNI host pack into a payload-v2
-            // bitwidth=8/block=32 container so prefill can exercise descriptor
-            // based native execution without CK row-major repack.
-            if ((tensor->native_type() == TensorType::Q6_K ||
-                 tensor->native_type() == TensorType::Q4_K ||
-                 tensor->native_type() == TensorType::Q5_K ||
-                 tensor->native_type() == TensorType::Q3_K ||
-                 tensor->native_type() == TensorType::Q2_K ||
-                 tensor->native_type() == TensorType::IQ1_S ||
-                 tensor->native_type() == TensorType::IQ1_M ||
-                 tensor->native_type() == TensorType::IQ2_XXS ||
-                 tensor->native_type() == TensorType::IQ2_XS ||
-                 tensor->native_type() == TensorType::IQ2_S ||
-                 tensor->native_type() == TensorType::IQ3_XXS ||
-                 tensor->native_type() == TensorType::IQ3_S) &&
-                !out.int8_data_vnni.empty())
-            {
-                if (!buildBitwidth8PayloadV2FromVNNI(out.int8_data_vnni, N, K, out))
-                {
-                    LOG_WARN("[packWeightsToROCm] Failed to build bitwidth-8 payload-v2 container for tensor type "
-                             << static_cast<int>(tensor->native_type())
-                             << "; falling back to INT8 VNNI path");
                 }
             }
 
@@ -1954,32 +1567,6 @@ namespace llaminar2
                 return PrefillDispatchPath::CK_FALLBACK;
             }
 
-            const bool has_ratio_buffers = (impl_->d_weights_ratio_payload != nullptr && impl_->d_weights_ratio != nullptr);
-            const bool descriptor_supported =
-                ((impl_->ratio_vnni_bitwidth == 4 && impl_->ratio_vnni_payload_bytes == 16) ||
-                 (impl_->ratio_vnni_bitwidth == 5 && impl_->ratio_vnni_payload_bytes == 20) ||
-                 (impl_->ratio_vnni_bitwidth == 8 && impl_->ratio_vnni_payload_bytes == 32));
-            const bool ratio_metadata_supported =
-                (impl_->ratio_vnni_abi_version == ROCM_RATIO_VNNI_PREFILL_ABI_V2 &&
-                 descriptor_supported &&
-                 impl_->ratio_vnni_block_size == 32 &&
-                 impl_->ratio_vnni_ratio_bytes == 1 &&
-                 impl_->ratio_vnni_payload_stride_bytes == impl_->ratio_vnni_payload_bytes &&
-                 impl_->ratio_vnni_ratio_stride_bytes == impl_->ratio_vnni_ratio_bytes &&
-                 (impl_->ratio_vnni_has_min == 0 ||
-                  (impl_->ratio_vnni_has_min != 0 &&
-                   impl_->ratio_vnni_codebook_id == 0 &&
-                   impl_->d_weights_ratio_min != nullptr &&
-                   impl_->ratio_vnni_min_bytes == 1 &&
-                   impl_->ratio_vnni_min_stride_bytes == 1)));
-
-            // Prefer ratio-native when valid metadata exists because that preserves
-            // ratio-VNNI's memory intent (no forced full INT8 expansion).
-            if (has_ratio_buffers && ratio_metadata_supported)
-            {
-                return PrefillDispatchPath::RATIO_VNNI_NATIVE;
-            }
-
             if (impl_->d_weights_int8_vnni != nullptr)
             {
                 return PrefillDispatchPath::INT8_VNNI_NATIVE;
@@ -2011,8 +1598,6 @@ namespace llaminar2
                 {
                 case PrefillDispatchPath::INT8_VNNI_NATIVE:
                     return "int8_vnni_native";
-                case PrefillDispatchPath::RATIO_VNNI_NATIVE:
-                    return "ratio_vnni_native";
                 case PrefillDispatchPath::CK_FALLBACK:
                 default:
                     return "ck_fallback";
@@ -2464,73 +2049,6 @@ namespace llaminar2
                 if (profiling_enabled)
                     kernel_end = std::chrono::high_resolution_clock::now();
             }
-            else if (path == PrefillDispatchPath::RATIO_VNNI_NATIVE)
-            {
-                LOG_TRACE("[" << callsite << "] Trying ratio-VNNI native prefill (M=" << m
-                              << " N=" << n << " K=" << k << ")");
-                const bool is_iq4_codebook = (impl_->ratio_vnni_codebook_id == RATIO_VNNI_CODEBOOK_IQ4);
-                const int ratio_prefill_variant_effective = is_iq4_codebook
-                                                                ? ((debugEnv().rocm.ratio_prefill_iq4_variant >= 0)
-                                                                       ? debugEnv().rocm.ratio_prefill_iq4_variant
-                                                                       : debugEnv().rocm.ratio_prefill_variant)
-                                                                : ((debugEnv().rocm.ratio_prefill_linear_variant >= 0)
-                                                                       ? debugEnv().rocm.ratio_prefill_linear_variant
-                                                                       : debugEnv().rocm.ratio_prefill_variant);
-                const int ratio_prefill_kb_effective = is_iq4_codebook
-                                                           ? ((debugEnv().rocm.ratio_prefill_iq4_kb > 0)
-                                                                  ? debugEnv().rocm.ratio_prefill_iq4_kb
-                                                                  : debugEnv().rocm.ratio_prefill_kb)
-                                                           : ((debugEnv().rocm.ratio_prefill_linear_kb > 0)
-                                                                  ? debugEnv().rocm.ratio_prefill_linear_kb
-                                                                  : debugEnv().rocm.ratio_prefill_kb);
-                ROCmRatioVNNIPrefillAbiV2Desc abi{};
-                abi.abi_version = impl_->ratio_vnni_abi_version;
-                abi.bitwidth = impl_->ratio_vnni_bitwidth;
-                abi.codebook_id = impl_->ratio_vnni_codebook_id;
-                abi.has_min = impl_->ratio_vnni_has_min;
-                abi.block_size = impl_->ratio_vnni_block_size;
-                abi.payload_bytes = impl_->ratio_vnni_payload_bytes;
-                abi.ratio_bytes = impl_->ratio_vnni_ratio_bytes;
-                abi.min_bytes = impl_->ratio_vnni_min_bytes;
-                abi.flags = impl_->ratio_vnni_flags;
-                abi.payload_stride_bytes = impl_->ratio_vnni_payload_stride_bytes;
-                abi.ratio_stride_bytes = impl_->ratio_vnni_ratio_stride_bytes;
-                abi.min_stride_bytes = impl_->ratio_vnni_min_stride_bytes;
-                abi.blocks_per_row = impl_->ratio_vnni_blocks_per_row;
-
-                native_ok = rocmGemm_ratio_vnni_int8_int32_prefill_v2(
-                    d_A_int8,
-                    impl_->d_weights_ratio_payload,
-                    impl_->d_weights_ratio,
-                    impl_->d_weights_ratio_min,
-                    impl_->d_C_int32,
-                    m, n, k,
-                    &abi,
-                    ratio_prefill_variant_effective,
-                    ratio_prefill_kb_effective,
-                    rocm_device_id_, gpu_stream_);
-
-                if (!native_ok)
-                {
-                    native_ok = rocmGemm_ratio_vnni_int8_int32_prefill(
-                        d_A_int8,
-                        impl_->d_weights_ratio_payload,
-                        impl_->d_weights_ratio,
-                        impl_->d_weights_ratio_min,
-                        impl_->d_C_int32,
-                        m, n, k,
-                        impl_->ratio_vnni_bitwidth,
-                        impl_->ratio_vnni_codebook_id,
-                        impl_->ratio_vnni_has_min,
-                        impl_->ratio_vnni_block_size,
-                        impl_->ratio_vnni_payload_bytes,
-                        ratio_prefill_variant_effective,
-                        ratio_prefill_kb_effective,
-                        rocm_device_id_, gpu_stream_);
-                }
-                if (profiling_enabled)
-                    kernel_end = std::chrono::high_resolution_clock::now();
-            }
             else
             {
                 logFallback("shape");
@@ -2762,10 +2280,8 @@ namespace llaminar2
                 // Ensure weights are on device
                 ensureWeightsConverted();
 
-                // Option B: weights are stored as VNNI and/or ratio-VNNI on device
+                // Option B: weights are stored as VNNI on device
                 int8_t *d_weights_vnni = impl_ ? impl_->d_weights_int8_vnni : nullptr;
-                uint8_t *d_weights_ratio_payload = impl_ ? impl_->d_weights_ratio_payload : nullptr;
-                int8_t *d_weights_ratio = impl_ ? impl_->d_weights_ratio : nullptr;
                 float *d_scales_B = nullptr;
                 if (packed_)
                 {
@@ -2776,7 +2292,7 @@ namespace llaminar2
                     d_scales_B = impl_->d_scales_B;
                 }
 
-                if ((d_weights_vnni || (d_weights_ratio_payload && d_weights_ratio)) && d_scales_B)
+                if ((impl_ && impl_->has_native_vnni) || (d_weights_vnni && d_scales_B))
                 {
                     // Resolve bias device pointer if present
                     const float *d_bias = nullptr;
@@ -2806,18 +2322,6 @@ namespace llaminar2
                     {
                         return false;
                     }
-                    if (d_weights_ratio_payload &&
-                        !validatePointerDeviceOrLog(
-                            d_weights_ratio_payload, rocm_device_id_, "d_weights_ratio_payload", "ROCmQuantisedGemmKernel::multiply_tensor"))
-                    {
-                        return false;
-                    }
-                    if (d_weights_ratio &&
-                        !validatePointerDeviceOrLog(
-                            d_weights_ratio, rocm_device_id_, "d_weights_ratio", "ROCmQuantisedGemmKernel::multiply_tensor"))
-                    {
-                        return false;
-                    }
                     if (!validatePointerDeviceOrLog(
                             d_scales_B, rocm_device_id_, "d_scales_B", "ROCmQuantisedGemmKernel::multiply_tensor") ||
                         !validatePointerDeviceOrLog(
@@ -2828,6 +2332,44 @@ namespace llaminar2
                             impl_->d_C_int32, rocm_device_id_, "workspace::ACC_INT32", "ROCmQuantisedGemmKernel::multiply_tensor"))
                     {
                         return false;
+                    }
+
+                    // =====================================================================
+                    // Native-VNNI path: lossless Q4/IQ4 decode, FP16 block scales, scale_A inline
+                    // Output is final FP32 — no epilogue kernel needed.
+                    // =====================================================================
+                    if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
+                    {
+                        if (!rocmQuantGemm_quantizeActivations(
+                                d_input, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI activation quantization failed");
+                            return false;
+                        }
+
+                        if (!rocmGemv_native_vnni_fp32(
+                                impl_->d_A_int8,
+                                impl_->d_weights_native_payload,
+                                impl_->d_weights_native_scales,
+                                d_output,
+                                impl_->d_scales_A,
+                                n, k,
+                                impl_->native_vnni_codebook_id,
+                                rocm_device_id_, gpu_stream_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI GEMV failed");
+                            return false;
+                        }
+
+                        if (d_bias)
+                        {
+                            if (!rocmQuantGemm_biasAdd(d_output, d_bias, m, n, rocm_device_id_, gpu_stream_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI bias add failed");
+                                return false;
+                            }
+                        }
+                        return true;
                     }
 
                     // Use fused FP32→INT8+GEMV+scale kernel when alpha=1, beta=0 AND fused enabled
@@ -2854,26 +2396,7 @@ namespace llaminar2
                         const float *d_existing = (beta != 0.0f) ? d_output : nullptr;
                         bool fused_scale = false;
                         bool gemv_ok = false;
-                        if (d_weights_ratio_payload && d_weights_ratio &&
-                            impl_->ratio_vnni_bitwidth == 4 &&
-                            impl_->ratio_vnni_has_min == 0 &&
-                            impl_->ratio_vnni_block_size == 32 &&
-                            impl_->ratio_vnni_payload_bytes == 16)
-                        {
-                            gemv_ok = rocmGemv_ratio_vnni_int8_int32(
-                                impl_->d_A_int8,
-                                d_weights_ratio_payload,
-                                d_weights_ratio,
-                                impl_->d_C_int32,
-                                n, k,
-                                impl_->ratio_vnni_bitwidth,
-                                impl_->ratio_vnni_codebook_id,
-                                impl_->ratio_vnni_has_min,
-                                impl_->ratio_vnni_block_size,
-                                impl_->ratio_vnni_payload_bytes,
-                                rocm_device_id_, gpu_stream_);
-                        }
-                        else if (d_weights_vnni)
+                        if (d_weights_vnni)
                         {
                             fused_scale = rocmGemv_int8_int8_fp32_vnni_scaled(
                                 impl_->d_A_int8, d_weights_vnni, d_output,
@@ -2893,7 +2416,7 @@ namespace llaminar2
 
                         if (!fused_scale && !gemv_ok)
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV (ratio/VNNI) failed");
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV failed");
                             return false;
                         }
 
@@ -3035,7 +2558,7 @@ namespace llaminar2
                     return false;
                 }
 
-                if (!impl_->d_weights_int8_vnni && !(impl_->d_weights_ratio_payload && impl_->d_weights_ratio))
+                if (!impl_->d_weights_int8_vnni)
                 {
                     return false;
                 }
@@ -3067,31 +2590,7 @@ namespace llaminar2
                 const bool allocated_now = (!had_existing_rowmajor && *rowmajor_target != nullptr);
 
                 bool repack_ok = false;
-                const bool descriptor_supported =
-                    ((impl_->ratio_vnni_bitwidth == 4 && impl_->ratio_vnni_payload_bytes == 16) ||
-                     (impl_->ratio_vnni_bitwidth == 5 && impl_->ratio_vnni_payload_bytes == 20));
-                if (impl_->d_weights_ratio_payload && impl_->d_weights_ratio && descriptor_supported &&
-                    impl_->ratio_vnni_block_size == 32 && impl_->ratio_vnni_ratio_bytes == 1 &&
-                    impl_->ratio_vnni_payload_stride_bytes == impl_->ratio_vnni_payload_bytes &&
-                    impl_->ratio_vnni_ratio_stride_bytes == 1 &&
-                    (impl_->ratio_vnni_has_min == 0 ||
-                     (impl_->ratio_vnni_has_min != 0 && impl_->d_weights_ratio_min &&
-                      impl_->ratio_vnni_min_bytes == 1 && impl_->ratio_vnni_min_stride_bytes == 1)))
-                {
-                    repack_ok = rocmGemv_expandRatioVNNI_to_rowmajor(
-                        impl_->d_weights_ratio_payload,
-                        impl_->d_weights_ratio,
-                        impl_->d_weights_ratio_min,
-                        *rowmajor_target,
-                        nn, kk,
-                        impl_->ratio_vnni_bitwidth,
-                        impl_->ratio_vnni_codebook_id,
-                        impl_->ratio_vnni_has_min,
-                        impl_->ratio_vnni_block_size,
-                        impl_->ratio_vnni_payload_bytes,
-                        rocm_device_id_, gpu_stream_);
-                }
-                else if (impl_->d_weights_int8_vnni)
+                if (impl_->d_weights_int8_vnni)
                 {
                     repack_ok = rocmGemv_repackVNNI_to_rowmajor(
                         impl_->d_weights_int8_vnni,
@@ -3632,7 +3131,7 @@ namespace llaminar2
 
             // Get weight device pointers — Option B: VNNI and/or ratio-VNNI, repack to scratch
             validateWorkspace();
-            if ((!impl_->d_weights_int8_vnni && !(impl_->d_weights_ratio_payload && impl_->d_weights_ratio) && !impl_->d_weights_int8_rowmajor) ||
+            if ((!impl_->d_weights_int8_vnni && !impl_->d_weights_int8_rowmajor) ||
                 (!impl_->d_B_rowmajor_scratch && !impl_->d_weights_int8_rowmajor))
             {
                 static std::once_flag timed_path_unavailable_once;
@@ -3895,6 +3394,7 @@ namespace llaminar2
 
             // Step 4: Execute each projection using the SHARED quantized activations
             bool all_success = true;
+            bool native_vnni_quantized = !use_fused_m1; // If !use_fused_m1, quantization was already done above
             const bool serialize_rocm_gemm = debugEnv().validation.serialize_rocm_gemm_stage;
 
             auto runCKDispatch = [&](auto &&dispatch_fn, const char *op_name) -> bool
@@ -4101,13 +3601,61 @@ namespace llaminar2
                 if (m == 1)
                 {
                     int8_t *d_vnni = rocm_kernel->impl_ ? rocm_kernel->impl_->d_weights_int8_vnni : nullptr;
-                    uint8_t *d_ratio_payload = rocm_kernel->impl_ ? rocm_kernel->impl_->d_weights_ratio_payload : nullptr;
-                    int8_t *d_ratio = rocm_kernel->impl_ ? rocm_kernel->impl_->d_weights_ratio : nullptr;
-                    if (!d_vnni && !(d_ratio_payload && d_ratio))
+                    if (!rocm_kernel->impl_->has_native_vnni && !d_vnni)
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " VNNI/ratio weights not on device");
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " VNNI weights not on device");
                         all_success = false;
                         break;
+                    }
+
+                    // Native-VNNI path: lossless Q4/IQ4 decode with FP16 block scales
+                    if (rocm_kernel->impl_->has_native_vnni)
+                    {
+                        // Ensure activations are quantized (fused path may have skipped quantization)
+                        if (use_fused_m1 && !native_vnni_quantized)
+                        {
+                            if (!rocmQuantGemm_quantizeActivations(
+                                    const_cast<float *>(d_input), impl_->d_A_int8, impl_->d_scales_A,
+                                    m, k, rocm_device_id_, gpu_stream_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI activation quantization failed for projection " << i);
+                                all_success = false;
+                                break;
+                            }
+                            native_vnni_quantized = true;
+                        }
+
+                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                                 << " NATIVE-VNNI GEMV M=1 N=" << n << " K=" << k
+                                                                                                 << (d_bias ? " +bias" : ""));
+
+                        if (!rocmGemv_native_vnni_fp32(
+                                impl_->d_A_int8,
+                                rocm_kernel->impl_->d_weights_native_payload,
+                                rocm_kernel->impl_->d_weights_native_scales,
+                                d_output,
+                                impl_->d_scales_A,
+                                n, k,
+                                rocm_kernel->impl_->native_vnni_codebook_id,
+                                rocm_device_id_, gpu_stream_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI GEMV failed for projection " << i);
+                            all_success = false;
+                            break;
+                        }
+
+                        if (d_bias)
+                        {
+                            if (!rocmQuantGemm_biasAdd(d_output, d_bias, m, n, rocm_device_id_, gpu_stream_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI bias add failed for projection " << i);
+                                all_success = false;
+                                break;
+                            }
+                        }
+
+                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " native-VNNI GEMV complete");
+                        continue;
                     }
 
                     if (use_fused_m1 && d_vnni)
@@ -4151,26 +3699,7 @@ namespace llaminar2
 
                         bool fused_scale = false;
                         bool gemv_ok = false;
-                        if (d_ratio_payload && d_ratio &&
-                            rocm_kernel->impl_->ratio_vnni_bitwidth == 4 &&
-                            rocm_kernel->impl_->ratio_vnni_has_min == 0 &&
-                            rocm_kernel->impl_->ratio_vnni_block_size == 32 &&
-                            rocm_kernel->impl_->ratio_vnni_payload_bytes == 16)
-                        {
-                            gemv_ok = rocmGemv_ratio_vnni_int8_int32(
-                                impl_->d_A_int8,
-                                d_ratio_payload,
-                                d_ratio,
-                                rocm_kernel->impl_->d_CK_int32,
-                                n, k,
-                                rocm_kernel->impl_->ratio_vnni_bitwidth,
-                                rocm_kernel->impl_->ratio_vnni_codebook_id,
-                                rocm_kernel->impl_->ratio_vnni_has_min,
-                                rocm_kernel->impl_->ratio_vnni_block_size,
-                                rocm_kernel->impl_->ratio_vnni_payload_bytes,
-                                rocm_device_id_, gpu_stream_);
-                        }
-                        else if (d_vnni)
+                        if (d_vnni)
                         {
                             fused_scale = rocmGemv_int8_int8_fp32_vnni_scaled(
                                 impl_->d_A_int8, d_vnni, d_output,
@@ -4231,8 +3760,6 @@ namespace llaminar2
                 // Repack VNNI→row-major into this kernel's workspace scratch for CK
                 int8_t *d_weights_int8 = nullptr;
                 int8_t *d_vnni = rocm_kernel->impl_ ? rocm_kernel->impl_->d_weights_int8_vnni : nullptr;
-                uint8_t *d_ratio_payload = rocm_kernel->impl_ ? rocm_kernel->impl_->d_weights_ratio_payload : nullptr;
-                int8_t *d_ratio = rocm_kernel->impl_ ? rocm_kernel->impl_->d_weights_ratio : nullptr;
                 int8_t *d_scratch = rocm_kernel->impl_ ? rocm_kernel->impl_->d_B_rowmajor_scratch : nullptr;
 
                 if (d_scratch)
@@ -4709,19 +4236,10 @@ namespace llaminar2
                                                          packed_->int8_data.size(),
                                                          rocm_device_id_))
                             {
-                                if (upload.d_ratio_vnni_min)
-                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_min, rocm_device_id_);
-                                if (upload.d_ratio_vnni_ratio)
-                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_ratio, rocm_device_id_);
-                                if (upload.d_ratio_vnni_payload)
-                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_payload, rocm_device_id_);
                                 if (upload.d_int8_data_vnni)
                                     rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
                                 if (upload.d_scales)
                                     rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
-                                upload.d_ratio_vnni_min = nullptr;
-                                upload.d_ratio_vnni_ratio = nullptr;
-                                upload.d_ratio_vnni_payload = nullptr;
                                 upload.d_int8_data_vnni = nullptr;
                                 upload.d_scales = nullptr;
                                 cleanup_startup_async_resources();
@@ -4742,19 +4260,10 @@ namespace llaminar2
                             {
                                 rocmQuantGemm_freeDevice(upload.d_int8_data_rowmajor, rocm_device_id_);
                                 upload.d_int8_data_rowmajor = nullptr;
-                                if (upload.d_ratio_vnni_min)
-                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_min, rocm_device_id_);
-                                if (upload.d_ratio_vnni_ratio)
-                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_ratio, rocm_device_id_);
-                                if (upload.d_ratio_vnni_payload)
-                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_payload, rocm_device_id_);
                                 if (upload.d_int8_data_vnni)
                                     rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
                                 if (upload.d_scales)
                                     rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
-                                upload.d_ratio_vnni_min = nullptr;
-                                upload.d_ratio_vnni_ratio = nullptr;
-                                upload.d_ratio_vnni_payload = nullptr;
                                 upload.d_int8_data_vnni = nullptr;
                                 upload.d_scales = nullptr;
                                 cleanup_startup_async_resources();
@@ -4767,166 +4276,86 @@ namespace llaminar2
                                       << (packed_->int8_data.size() / 1024) << " KB");
                         }
 
-                        // Upload ratio-VNNI compact buffers if available
-                        if (!packed_->ratio_vnni_payload.empty() && !packed_->ratio_vnni_ratio.empty())
+                        // Upload native-VNNI payload + scales (lossless Q4_0/IQ4_NL)
+                        if (!packed_->native_vnni_payload.empty() && !packed_->native_vnni_scales.empty())
                         {
-                            if (!rocmQuantGemm_allocInt8(reinterpret_cast<int8_t **>(&upload.d_ratio_vnni_payload),
-                                                         packed_->ratio_vnni_payload.size(),
+                            // Allocate payload buffer
+                            if (!rocmQuantGemm_allocInt8(reinterpret_cast<int8_t **>(&upload.d_native_vnni_payload),
+                                                         packed_->native_vnni_payload.size(),
                                                          rocm_device_id_))
                             {
-                                if (upload.d_int8_data_vnni)
-                                    rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
-                                rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
-                                upload.d_int8_data_vnni = nullptr;
-                                upload.d_scales = nullptr;
-                                cleanup_startup_async_resources();
-                                LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc ratio payload");
-                                return;
+                                LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI payload");
+                                // Don't return — fall through, GEMV will use INT8-VNNI fallback
                             }
-                            if (!rocmQuantGemm_allocInt8(&upload.d_ratio_vnni_ratio,
-                                                         packed_->ratio_vnni_ratio.size(),
-                                                         rocm_device_id_))
+                            else
                             {
-                                rocmQuantGemm_freeDevice(upload.d_ratio_vnni_payload, rocm_device_id_);
-                                upload.d_ratio_vnni_payload = nullptr;
-                                if (upload.d_int8_data_vnni)
-                                    rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
-                                rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
-                                upload.d_int8_data_vnni = nullptr;
-                                upload.d_scales = nullptr;
-                                cleanup_startup_async_resources();
-                                LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc ratio bytes");
-                                return;
-                            }
-
-                            err = startupMemcpyAsyncOrSync(
-                                upload.d_ratio_vnni_payload,
-                                packed_->ratio_vnni_payload.data(),
-                                packed_->ratio_vnni_payload.size() * sizeof(uint8_t),
-                                async_upload_enabled,
-                                upload.startup_h2d_stream,
-                                &upload.startup_h2d_pinned_ratio_payload,
-                                "ROCmQuantisedGemmKernel::ensureWeightsConverted",
-                                "ratio_payload");
-                            if (err != hipSuccess)
-                            {
-                                rocmQuantGemm_freeDevice(upload.d_ratio_vnni_ratio, rocm_device_id_);
-                                rocmQuantGemm_freeDevice(upload.d_ratio_vnni_payload, rocm_device_id_);
-                                upload.d_ratio_vnni_ratio = nullptr;
-                                upload.d_ratio_vnni_payload = nullptr;
-                                if (upload.d_int8_data_vnni)
-                                    rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
-                                rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
-                                upload.d_int8_data_vnni = nullptr;
-                                upload.d_scales = nullptr;
-                                cleanup_startup_async_resources();
-                                LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload ratio payload: "
-                                          << hipGetErrorString(err));
-                                return;
-                            }
-
-                            err = startupMemcpyAsyncOrSync(
-                                upload.d_ratio_vnni_ratio,
-                                packed_->ratio_vnni_ratio.data(),
-                                packed_->ratio_vnni_ratio.size() * sizeof(int8_t),
-                                async_upload_enabled,
-                                upload.startup_h2d_stream,
-                                &upload.startup_h2d_pinned_ratio,
-                                "ROCmQuantisedGemmKernel::ensureWeightsConverted",
-                                "ratio");
-                            if (err != hipSuccess)
-                            {
-                                rocmQuantGemm_freeDevice(upload.d_ratio_vnni_ratio, rocm_device_id_);
-                                rocmQuantGemm_freeDevice(upload.d_ratio_vnni_payload, rocm_device_id_);
-                                upload.d_ratio_vnni_ratio = nullptr;
-                                upload.d_ratio_vnni_payload = nullptr;
-                                if (upload.d_int8_data_vnni)
-                                    rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
-                                rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
-                                upload.d_int8_data_vnni = nullptr;
-                                upload.d_scales = nullptr;
-                                cleanup_startup_async_resources();
-                                LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload ratio bytes: "
-                                          << hipGetErrorString(err));
-                                return;
-                            }
-
-                            if (packed_->ratio_vnni_has_min != 0)
-                            {
-                                if (packed_->ratio_vnni_min.empty())
-                                {
-                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_ratio, rocm_device_id_);
-                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_payload, rocm_device_id_);
-                                    upload.d_ratio_vnni_ratio = nullptr;
-                                    upload.d_ratio_vnni_payload = nullptr;
-                                    if (upload.d_int8_data_vnni)
-                                        rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
-                                    rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
-                                    upload.d_int8_data_vnni = nullptr;
-                                    upload.d_scales = nullptr;
-                                    cleanup_startup_async_resources();
-                                    LOG_ERROR("[ROCmQuantisedGemmKernel] ratio_vnni_has_min set but ratio_vnni_min is empty");
-                                    return;
-                                }
-
-                                if (!rocmQuantGemm_allocInt8(&upload.d_ratio_vnni_min,
-                                                             packed_->ratio_vnni_min.size(),
-                                                             rocm_device_id_))
-                                {
-                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_ratio, rocm_device_id_);
-                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_payload, rocm_device_id_);
-                                    upload.d_ratio_vnni_ratio = nullptr;
-                                    upload.d_ratio_vnni_payload = nullptr;
-                                    if (upload.d_int8_data_vnni)
-                                        rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
-                                    rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
-                                    upload.d_int8_data_vnni = nullptr;
-                                    upload.d_scales = nullptr;
-                                    cleanup_startup_async_resources();
-                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc ratio min bytes");
-                                    return;
-                                }
-
                                 err = startupMemcpyAsyncOrSync(
-                                    upload.d_ratio_vnni_min,
-                                    packed_->ratio_vnni_min.data(),
-                                    packed_->ratio_vnni_min.size() * sizeof(int8_t),
+                                    upload.d_native_vnni_payload,
+                                    packed_->native_vnni_payload.data(),
+                                    packed_->native_vnni_payload.size() * sizeof(uint8_t),
                                     async_upload_enabled,
                                     upload.startup_h2d_stream,
-                                    &upload.startup_h2d_pinned_ratio_min,
+                                    &upload.startup_h2d_pinned_native_payload,
                                     "ROCmQuantisedGemmKernel::ensureWeightsConverted",
-                                    "ratio_min");
+                                    "native_vnni_payload");
                                 if (err != hipSuccess)
                                 {
-                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_min, rocm_device_id_);
-                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_ratio, rocm_device_id_);
-                                    rocmQuantGemm_freeDevice(upload.d_ratio_vnni_payload, rocm_device_id_);
-                                    upload.d_ratio_vnni_min = nullptr;
-                                    upload.d_ratio_vnni_ratio = nullptr;
-                                    upload.d_ratio_vnni_payload = nullptr;
-                                    if (upload.d_int8_data_vnni)
-                                        rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
-                                    rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
-                                    upload.d_int8_data_vnni = nullptr;
-                                    upload.d_scales = nullptr;
-                                    cleanup_startup_async_resources();
-                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload ratio min bytes: "
-                                              << hipGetErrorString(err));
-                                    return;
+                                    rocmQuantGemm_freeDevice(upload.d_native_vnni_payload, rocm_device_id_);
+                                    upload.d_native_vnni_payload = nullptr;
+                                    LOG_WARN("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI payload: "
+                                             << hipGetErrorString(err));
                                 }
                             }
 
-                            LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded ratio-VNNI payload="
-                                      << (packed_->ratio_vnni_payload.size() / 1024) << " KB ratio="
-                                      << (packed_->ratio_vnni_ratio.size() / 1024) << " KB"
-                                      << (packed_->ratio_vnni_has_min != 0
-                                              ? (std::string(" min=") + std::to_string(packed_->ratio_vnni_min.size() / 1024) + " KB")
-                                              : std::string("")));
+                            // Allocate FP16 scales buffer
+                            if (upload.d_native_vnni_payload)
+                            {
+                                const size_t scales_bytes = packed_->native_vnni_scales.size() * sizeof(uint16_t);
+                                void *d_scales_tmp = nullptr;
+#ifdef HAVE_ROCM
+                                hipError_t alloc_err = hipMalloc(&d_scales_tmp, scales_bytes);
+                                if (alloc_err != hipSuccess)
+                                {
+                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI scales: "
+                                              << hipGetErrorString(alloc_err));
+                                    d_scales_tmp = nullptr;
+                                }
+#endif
+                                upload.d_native_vnni_scales = d_scales_tmp;
+                                if (d_scales_tmp)
+                                {
+                                    err = startupMemcpyAsyncOrSync(
+                                        d_scales_tmp,
+                                        packed_->native_vnni_scales.data(),
+                                        scales_bytes,
+                                        async_upload_enabled,
+                                        upload.startup_h2d_stream,
+                                        &upload.startup_h2d_pinned_native_scales,
+                                        "ROCmQuantisedGemmKernel::ensureWeightsConverted",
+                                        "native_vnni_scales");
+                                    if (err != hipSuccess)
+                                    {
+#ifdef HAVE_ROCM
+                                        hipFree(d_scales_tmp);
+#endif
+                                        upload.d_native_vnni_scales = nullptr;
+                                        LOG_WARN("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI scales: "
+                                                 << hipGetErrorString(err));
+                                    }
+                                }
+                            }
+
+                            if (upload.d_native_vnni_payload && upload.d_native_vnni_scales)
+                            {
+                                LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded native-VNNI payload="
+                                          << (packed_->native_vnni_payload.size() / 1024) << " KB scales="
+                                          << (packed_->native_vnni_scales.size() * 2 / 1024) << " KB");
+                            }
                         }
 
-                        if (packed_->int8_data_vnni.empty() && packed_->ratio_vnni_payload.empty())
+                        if (packed_->int8_data_vnni.empty())
                         {
-                            LOG_WARN("[ROCmQuantisedGemmKernel] No VNNI or ratio-VNNI layout available. "
+                            LOG_WARN("[ROCmQuantisedGemmKernel] No VNNI layout available. "
                                      "ROCm GEMV/CK prefill paths may not work.");
                         }
 
@@ -4993,10 +4422,9 @@ namespace llaminar2
                     auto &upload = upload_it->second;
                     packed_->d_int8_data_vnni = upload.d_int8_data_vnni;
                     packed_->d_int8_data_rowmajor = upload.d_int8_data_rowmajor;
-                    packed_->d_ratio_vnni_payload = upload.d_ratio_vnni_payload;
-                    packed_->d_ratio_vnni_ratio = upload.d_ratio_vnni_ratio;
-                    packed_->d_ratio_vnni_min = upload.d_ratio_vnni_min;
                     packed_->d_scales = upload.d_scales;
+                    packed_->d_native_vnni_payload = upload.d_native_vnni_payload;
+                    packed_->d_native_vnni_scales = upload.d_native_vnni_scales;
                     packed_->startup_repack_ready_event = upload.startup_repack_ready_event;
                     packed_->startup_repack_event_pending = upload.startup_repack_event_pending;
                     packed_->startup_commit_ready_event = upload.startup_commit_ready_event;
@@ -5007,32 +4435,20 @@ namespace llaminar2
                     // Point impl_ to packed_ device pointers
                     impl_->d_weights_int8_vnni = upload.d_int8_data_vnni;
                     impl_->d_weights_int8_rowmajor = upload.d_int8_data_rowmajor;
-                    impl_->d_weights_ratio_payload = upload.d_ratio_vnni_payload;
-                    impl_->d_weights_ratio = upload.d_ratio_vnni_ratio;
-                    impl_->d_weights_ratio_min = upload.d_ratio_vnni_min;
                     impl_->d_scales_B = upload.d_scales;
+                    impl_->d_weights_native_payload = upload.d_native_vnni_payload;
+                    impl_->d_weights_native_scales = upload.d_native_vnni_scales;
+                    impl_->native_vnni_codebook_id = packed_->native_vnni_codebook_id;
+                    impl_->native_vnni_blocks_per_row = packed_->native_vnni_blocks_per_row;
+                    impl_->has_native_vnni = (upload.d_native_vnni_payload != nullptr && upload.d_native_vnni_scales != nullptr);
                     impl_->startup_repack_ready_event = upload.startup_repack_ready_event;
                     impl_->startup_repack_event_pending = upload.startup_repack_event_pending;
                     impl_->startup_commit_ready_event = upload.startup_commit_ready_event;
                     impl_->startup_commit_event_pending = upload.startup_commit_event_pending;
                     impl_->startup_h2d_pinned_scales = upload.startup_h2d_pinned_scales;
                     impl_->startup_h2d_pinned_vnni = upload.startup_h2d_pinned_vnni;
-                    impl_->startup_h2d_pinned_ratio_payload = upload.startup_h2d_pinned_ratio_payload;
-                    impl_->startup_h2d_pinned_ratio = upload.startup_h2d_pinned_ratio;
-                    impl_->startup_h2d_pinned_ratio_min = upload.startup_h2d_pinned_ratio_min;
-                    impl_->ratio_vnni_bitwidth = packed_->ratio_vnni_bitwidth;
-                    impl_->ratio_vnni_codebook_id = packed_->ratio_vnni_codebook_id;
-                    impl_->ratio_vnni_has_min = packed_->ratio_vnni_has_min;
-                    impl_->ratio_vnni_block_size = packed_->ratio_vnni_block_size;
-                    impl_->ratio_vnni_payload_bytes = packed_->ratio_vnni_payload_bytes;
-                    impl_->ratio_vnni_abi_version = packed_->ratio_vnni_abi_version;
-                    impl_->ratio_vnni_ratio_bytes = packed_->ratio_vnni_ratio_bytes;
-                    impl_->ratio_vnni_min_bytes = packed_->ratio_vnni_min_bytes;
-                    impl_->ratio_vnni_flags = packed_->ratio_vnni_flags;
-                    impl_->ratio_vnni_blocks_per_row = packed_->ratio_vnni_blocks_per_row;
-                    impl_->ratio_vnni_payload_stride_bytes = packed_->ratio_vnni_payload_stride_bytes;
-                    impl_->ratio_vnni_ratio_stride_bytes = packed_->ratio_vnni_ratio_stride_bytes;
-                    impl_->ratio_vnni_min_stride_bytes = packed_->ratio_vnni_min_stride_bytes;
+                    impl_->startup_h2d_pinned_native_payload = upload.startup_h2d_pinned_native_payload;
+                    impl_->startup_h2d_pinned_native_scales = upload.startup_h2d_pinned_native_scales;
                 }
                 weights_converted_ = true;
                 return;
@@ -5097,87 +4513,6 @@ namespace llaminar2
                               << hipGetErrorString(err));
                     return;
                 }
-            }
-
-            if (!host_packed.ratio_vnni_payload.empty() && !host_packed.ratio_vnni_ratio.empty())
-            {
-                if (!rocmQuantGemm_allocInt8(reinterpret_cast<int8_t **>(&impl_->d_weights_ratio_payload),
-                                             host_packed.ratio_vnni_payload.size(),
-                                             rocm_device_id_))
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc ratio payload");
-                    return;
-                }
-                if (!rocmQuantGemm_allocInt8(&impl_->d_weights_ratio,
-                                             host_packed.ratio_vnni_ratio.size(),
-                                             rocm_device_id_))
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc ratio bytes");
-                    return;
-                }
-
-                err = hipMemcpy(impl_->d_weights_ratio_payload,
-                                host_packed.ratio_vnni_payload.data(),
-                                host_packed.ratio_vnni_payload.size() * sizeof(uint8_t),
-                                hipMemcpyHostToDevice);
-                if (err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload ratio payload: "
-                              << hipGetErrorString(err));
-                    return;
-                }
-
-                err = hipMemcpy(impl_->d_weights_ratio,
-                                host_packed.ratio_vnni_ratio.data(),
-                                host_packed.ratio_vnni_ratio.size() * sizeof(int8_t),
-                                hipMemcpyHostToDevice);
-                if (err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload ratio bytes: "
-                              << hipGetErrorString(err));
-                    return;
-                }
-
-                if (host_packed.ratio_vnni_has_min != 0)
-                {
-                    if (host_packed.ratio_vnni_min.empty())
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel] ratio_vnni_has_min set but ratio_vnni_min is empty");
-                        return;
-                    }
-                    if (!rocmQuantGemm_allocInt8(&impl_->d_weights_ratio_min,
-                                                 host_packed.ratio_vnni_min.size(),
-                                                 rocm_device_id_))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc ratio min bytes");
-                        return;
-                    }
-
-                    err = hipMemcpy(impl_->d_weights_ratio_min,
-                                    host_packed.ratio_vnni_min.data(),
-                                    host_packed.ratio_vnni_min.size() * sizeof(int8_t),
-                                    hipMemcpyHostToDevice);
-                    if (err != hipSuccess)
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload ratio min bytes: "
-                                  << hipGetErrorString(err));
-                        return;
-                    }
-                }
-
-                impl_->ratio_vnni_bitwidth = host_packed.ratio_vnni_bitwidth;
-                impl_->ratio_vnni_codebook_id = host_packed.ratio_vnni_codebook_id;
-                impl_->ratio_vnni_has_min = host_packed.ratio_vnni_has_min;
-                impl_->ratio_vnni_block_size = host_packed.ratio_vnni_block_size;
-                impl_->ratio_vnni_payload_bytes = host_packed.ratio_vnni_payload_bytes;
-                impl_->ratio_vnni_abi_version = host_packed.ratio_vnni_abi_version;
-                impl_->ratio_vnni_ratio_bytes = host_packed.ratio_vnni_ratio_bytes;
-                impl_->ratio_vnni_min_bytes = host_packed.ratio_vnni_min_bytes;
-                impl_->ratio_vnni_flags = host_packed.ratio_vnni_flags;
-                impl_->ratio_vnni_blocks_per_row = host_packed.ratio_vnni_blocks_per_row;
-                impl_->ratio_vnni_payload_stride_bytes = host_packed.ratio_vnni_payload_stride_bytes;
-                impl_->ratio_vnni_ratio_stride_bytes = host_packed.ratio_vnni_ratio_stride_bytes;
-                impl_->ratio_vnni_min_stride_bytes = host_packed.ratio_vnni_min_stride_bytes;
             }
 
             impl_->owns_weight_memory = true; // We now own the device memory
@@ -5331,10 +4666,8 @@ namespace llaminar2
                 ensureWeightsConverted();
                 // Option B: weights are VNNI and/or ratio-VNNI on device
                 int8_t *d_vnni = impl_ ? impl_->d_weights_int8_vnni : nullptr;
-                uint8_t *d_ratio_payload = impl_ ? impl_->d_weights_ratio_payload : nullptr;
-                int8_t *d_ratio = impl_ ? impl_->d_weights_ratio : nullptr;
                 float *d_s = packed_ ? packed_->d_scales : (impl_ ? impl_->d_scales_B : nullptr);
-                if ((d_vnni || (d_ratio_payload && d_ratio)) && d_s)
+                if ((impl_ && impl_->has_native_vnni) || (d_vnni && d_s))
                 {
                     LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] GEMV fast path M=1");
 
@@ -5345,6 +4678,32 @@ namespace llaminar2
                     }
 
                     validateWorkspace();
+
+                    // Native-VNNI path: lossless Q4/IQ4 decode, FP16 block scales, scale_A inline
+                    if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
+                    {
+                        if (!rocmQuantGemm_quantizeActivations(
+                                d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] Native-VNNI activation quantization failed");
+                            return false;
+                        }
+
+                        if (!rocmGemv_native_vnni_fp32(
+                                impl_->d_A_int8,
+                                impl_->d_weights_native_payload,
+                                impl_->d_weights_native_scales,
+                                d_C,
+                                impl_->d_scales_A,
+                                n, k,
+                                impl_->native_vnni_codebook_id,
+                                rocm_device_id_, gpu_stream_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] Native-VNNI GEMV failed");
+                            return false;
+                        }
+                        return true;
+                    }
 
                     // Use fused kernel when alpha=1, beta=0 AND fused enabled
                     if (alpha == 1.0f && beta == 0.0f && isFusedGemvEnabled() && d_vnni)
@@ -5370,26 +4729,7 @@ namespace llaminar2
                     const float *d_existing = (beta != 0.0f) ? d_C : nullptr;
                     bool fused_scale = false;
                     bool gemv_ok = false;
-                    if (d_ratio_payload && d_ratio &&
-                        impl_->ratio_vnni_bitwidth == 4 &&
-                        impl_->ratio_vnni_has_min == 0 &&
-                        impl_->ratio_vnni_block_size == 32 &&
-                        impl_->ratio_vnni_payload_bytes == 16)
-                    {
-                        gemv_ok = rocmGemv_ratio_vnni_int8_int32(
-                            impl_->d_A_int8,
-                            d_ratio_payload,
-                            d_ratio,
-                            impl_->d_C_int32,
-                            n, k,
-                            impl_->ratio_vnni_bitwidth,
-                            impl_->ratio_vnni_codebook_id,
-                            impl_->ratio_vnni_has_min,
-                            impl_->ratio_vnni_block_size,
-                            impl_->ratio_vnni_payload_bytes,
-                            rocm_device_id_, gpu_stream_);
-                    }
-                    else if (d_vnni)
+                    if (d_vnni)
                     {
                         fused_scale = rocmGemv_int8_int8_fp32_vnni_scaled(
                             impl_->d_A_int8, d_vnni, d_C,
@@ -5409,7 +4749,7 @@ namespace llaminar2
 
                     if (!fused_scale && !gemv_ok)
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 GEMV (ratio/VNNI) failed");
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 GEMV (VNNI) failed");
                         return false;
                     }
 
@@ -5429,10 +4769,10 @@ namespace llaminar2
             validateWorkspace();
 
             // Option B: Repack VNNI→row-major into workspace scratch for CK GEMM
-            if ((!impl_->d_weights_int8_vnni && !(impl_->d_weights_ratio_payload && impl_->d_weights_ratio)) ||
+            if (!impl_->d_weights_int8_vnni ||
                 !impl_->d_B_rowmajor_scratch)
             {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] No VNNI/ratio weights or repack scratch for CK GEMM");
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] No VNNI weights or repack scratch for CK GEMM");
                 return false;
             }
             if (!ensureRepackedWeightsForCK(
@@ -5507,10 +4847,8 @@ namespace llaminar2
                 ensureWeightsConverted();
                 // Option B: weights are VNNI and/or ratio-VNNI on device
                 int8_t *d_vnni = impl_ ? impl_->d_weights_int8_vnni : nullptr;
-                uint8_t *d_ratio_payload = impl_ ? impl_->d_weights_ratio_payload : nullptr;
-                int8_t *d_ratio = impl_ ? impl_->d_weights_ratio : nullptr;
                 float *d_s = packed_ ? packed_->d_scales : (impl_ ? impl_->d_scales_B : nullptr);
-                if ((d_vnni || (d_ratio_payload && d_ratio)) && d_s)
+                if ((impl_ && impl_->has_native_vnni) || (d_vnni && d_s))
                 {
                     LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] GEMV fast path M=1 +bias");
 
@@ -5521,6 +4859,41 @@ namespace llaminar2
                     }
 
                     validateWorkspace();
+
+                    // Native-VNNI path: lossless Q4/IQ4 decode, FP16 block scales, scale_A inline
+                    if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
+                    {
+                        if (!rocmQuantGemm_quantizeActivations(
+                                d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI activation quantization failed");
+                            return false;
+                        }
+
+                        if (!rocmGemv_native_vnni_fp32(
+                                impl_->d_A_int8,
+                                impl_->d_weights_native_payload,
+                                impl_->d_weights_native_scales,
+                                d_C,
+                                impl_->d_scales_A,
+                                n, k,
+                                impl_->native_vnni_codebook_id,
+                                rocm_device_id_, gpu_stream_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI GEMV failed");
+                            return false;
+                        }
+
+                        if (d_bias)
+                        {
+                            if (!rocmQuantGemm_biasAdd(d_C, d_bias, m, n, rocm_device_id_, gpu_stream_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI bias add failed");
+                                return false;
+                            }
+                        }
+                        return true;
+                    }
 
                     // Use fused kernel when alpha=1, beta=0 AND fused enabled
                     // Bias handled inside dispatch function via biasAdd
@@ -5542,26 +4915,7 @@ namespace llaminar2
                     const float *d_existing = (beta != 0.0f) ? d_C : nullptr;
                     bool fused_scale = false;
                     bool gemv_ok = false;
-                    if (d_ratio_payload && d_ratio &&
-                        impl_->ratio_vnni_bitwidth == 4 &&
-                        impl_->ratio_vnni_has_min == 0 &&
-                        impl_->ratio_vnni_block_size == 32 &&
-                        impl_->ratio_vnni_payload_bytes == 16)
-                    {
-                        gemv_ok = rocmGemv_ratio_vnni_int8_int32(
-                            impl_->d_A_int8,
-                            d_ratio_payload,
-                            d_ratio,
-                            impl_->d_C_int32,
-                            n, k,
-                            impl_->ratio_vnni_bitwidth,
-                            impl_->ratio_vnni_codebook_id,
-                            impl_->ratio_vnni_has_min,
-                            impl_->ratio_vnni_block_size,
-                            impl_->ratio_vnni_payload_bytes,
-                            rocm_device_id_, gpu_stream_);
-                    }
-                    else if (d_vnni)
+                    if (d_vnni)
                     {
                         fused_scale = rocmGemv_int8_int8_fp32_vnni_scaled(
                             impl_->d_A_int8, d_vnni, d_C,
@@ -5581,7 +4935,7 @@ namespace llaminar2
 
                     if (!fused_scale && !gemv_ok)
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 GEMV (ratio/VNNI) failed");
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 GEMV (VNNI) failed");
                         return false;
                     }
 
@@ -5601,10 +4955,10 @@ namespace llaminar2
             validateWorkspace();
 
             // Option B: Repack VNNI→row-major into workspace scratch for CK GEMM
-            if ((!impl_->d_weights_int8_vnni && !(impl_->d_weights_ratio_payload && impl_->d_weights_ratio)) ||
+            if (!impl_->d_weights_int8_vnni ||
                 !impl_->d_B_rowmajor_scratch)
             {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] No VNNI/ratio weights or repack scratch for CK GEMM");
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] No VNNI weights or repack scratch for CK GEMM");
                 return false;
             }
             if (!ensureRepackedWeightsForCK(

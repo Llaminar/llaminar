@@ -1585,6 +1585,133 @@ extern "C"
     }
 
     // =========================================================================
+    // Apply Scale-A Only Kernel (for grouped ratio-VNNI decode path)
+    //
+    // When sub-row grouping is used, the GEMV kernel already applies per-group
+    // weight scales during FP32 partial accumulation. The remaining scaling is
+    // just the activation scale:
+    //   output[m,n] = alpha * C_fp32_grouped[m,n] * scale_A[m]
+    //                 + beta * existing[m,n] + bias[n]
+    // =========================================================================
+
+    __global__ void applyScaleA_m1_vec4_kernel(
+        const float* __restrict__ d_C_fp32_grouped,  // [N] FP32 with B-scales already applied
+        float* __restrict__ d_output,                 // [N] FP32 output
+        const float* __restrict__ d_scale_A,          // [1] activation scale
+        int N,
+        float alpha)
+    {
+        const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+        const int n4 = tid * 4;
+
+        const float row_scale = alpha * d_scale_A[0];
+
+        if (n4 + 3 < N)
+        {
+            const float4 v = *reinterpret_cast<const float4*>(d_C_fp32_grouped + n4);
+
+            float4 out;
+            out.x = v.x * row_scale;
+            out.y = v.y * row_scale;
+            out.z = v.z * row_scale;
+            out.w = v.w * row_scale;
+
+            *reinterpret_cast<float4*>(d_output + n4) = out;
+            return;
+        }
+
+        for (int n = n4; n < N && n < n4 + 4; ++n)
+        {
+            d_output[n] = d_C_fp32_grouped[n] * row_scale;
+        }
+    }
+
+    __global__ void applyScaleA_full_kernel(
+        const float* __restrict__ d_C_fp32_grouped,  // [M×N] FP32 with B-scales applied
+        float* __restrict__ d_output,                 // [M×N] FP32 output
+        const float* __restrict__ d_scale_A,          // [M] activation scales
+        int M, int N,
+        float alpha, float beta,
+        const float* __restrict__ d_C_existing,       // [M×N] existing (for beta != 0)
+        const float* __restrict__ d_bias)             // [N] optional bias
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int total = M * N;
+        if (idx >= total) return;
+
+        const int m = idx / N;
+        const int n = idx % N;
+
+        float result = alpha * d_C_fp32_grouped[idx] * d_scale_A[m];
+
+        if (beta != 0.0f && d_C_existing != nullptr)
+        {
+            result += beta * d_C_existing[idx];
+        }
+        if (d_bias != nullptr)
+        {
+            result += d_bias[n];
+        }
+
+        d_output[idx] = result;
+    }
+
+    bool rocmQuantGemm_applyScaleA_fp32(
+        const float *d_C_fp32_grouped,   // [M×N] FP32 with B-scales already applied
+        float *d_output,                  // [M×N] FP32 output
+        const float *d_scales_A,          // [M] per-row activation scales
+        int M, int N,
+        float alpha, float beta,
+        const float *d_C_existing,
+        const float *d_bias,
+        int rocm_device_id, void* stream)
+    {
+        if (!d_C_fp32_grouped || !d_output || !d_scales_A)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyScaleA_fp32] Null pointer\n");
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+            return false;
+
+        // Decode-specialized fast path (M=1, no beta/bias)
+        if (M == 1 && beta == 0.0f && d_C_existing == nullptr && d_bias == nullptr)
+        {
+            const int block_size = 256;
+            const int elems_per_thread = 4;
+            const int grid_size = (N + block_size * elems_per_thread - 1) / (block_size * elems_per_thread);
+
+            hipLaunchKernelGGL(
+                applyScaleA_m1_vec4_kernel,
+                dim3(grid_size), dim3(block_size), 0, static_cast<hipStream_t>(stream),
+                d_C_fp32_grouped, d_output, d_scales_A, N, alpha);
+        }
+        else
+        {
+            const int block_size = 256;
+            const int total = M * N;
+            const int grid_size = (total + block_size - 1) / block_size;
+
+            hipLaunchKernelGGL(
+                applyScaleA_full_kernel,
+                dim3(grid_size), dim3(block_size), 0, static_cast<hipStream_t>(stream),
+                d_C_fp32_grouped, d_output, d_scales_A,
+                M, N, alpha, beta, d_C_existing, d_bias);
+        }
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyScaleA_fp32] Kernel launch failed: %s (M=%d, N=%d)\n",
+                    hipGetErrorString(err), M, N);
+            return false;
+        }
+
+        return true;
+    }
+
+    // =========================================================================
     // IN-PLACE BIAS ADDITION KERNEL
     // =========================================================================
 
