@@ -1183,6 +1183,184 @@ __global__ void gemv_int8_int8_grid_kpar_vnni_kernel_t(
 }
 
 
+// ============================================================================
+// LDS K-Reduction GEMV kernel: eliminates atomicAdd via intra-block reduction
+//
+// KEY INSIGHT: Instead of using 1-wavefront blocks with grid-level atomicAdd,
+// use WK-wavefront blocks where each wavefront computes a K-slice and the
+// partial sums are reduced via LDS within the block.
+//
+// Advantages over grid_kpar:
+//   1. Eliminates atomicAdd when kb_outer==1 (large-N shapes like FFN)
+//   2. Eliminates hipMemsetAsync when kb_outer==1
+//   3. Reduces atomicAdd count by WK× when kb_outer>1 (small-N shapes)
+//   4. Same total wavefront count → same occupancy and memory bandwidth
+//
+// Thread layout:
+//   Block: WK × (TILE_N / CPT) threads = 4 × 64 = 256
+//   wave_id = threadIdx.x / (TILE_N/CPT) → K-slice index (0..WK-1)
+//   lane_id = threadIdx.x % (TILE_N/CPT) → column index within tile
+//   Each wave handles TILE_N output columns across K/(WK*kb_outer) k-groups
+//
+// LDS usage: (WK-1) × TILE_N × sizeof(int32_t)
+//   WK=4, TILE_N=128: 3 × 128 × 4 = 1536 bytes (trivial)
+//
+// Grid: (ceil(N/TILE_N), kb_outer)
+//   When kb_outer==1: plain store (no atomicAdd, no memset)
+//   When kb_outer>1:  atomicAdd (but WK× fewer than grid_kpar)
+//
+// Benchmark motivation (MI50, gfx906):
+//   FFN Gate/Up (18944×3584): grid_kpar KB=4 → 756 GB/s (76% peak)
+//     - 148 N-blocks × 4 K-blocks = 592 wavefronts = 9.9 waves/CU
+//     - 18944 × 4 = 75776 atomicAdds per launch
+//   NEW lds_kreduce kb_outer=1: same 592 wavefronts, zero atomicAdds
+//   Q/Wo (3584×3584): grid_kpar KB=16 → 456 GB/s (46% peak)
+//     - 28 × 16 = 448 wavefronts, 3584 × 16 = 57344 atomicAdds
+//   NEW lds_kreduce kb_outer=4: 28×4×4 = 448 wavefronts, 3584 × 4 atomicAdds
+// ============================================================================
+template <int TILE_N, int CPT, int WK>
+__global__ __launch_bounds__(TILE_N / CPT * WK)
+void gemv_int8_int8_lds_kreduce_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,   // [K/4][N][4] flat VNNI
+    int32_t* __restrict__ d_C_int32,
+    int N, int K, int kb_outer)
+{
+    static_assert(CPT == 2 || CPT == 4, "CPT must be 2 or 4");
+    static_assert(WK >= 2 && WK <= 8, "WK must be 2-8");
+    constexpr int THREADS_PER_WAVE = TILE_N / CPT;
+    static_assert(THREADS_PER_WAVE == 64, "TILE_N/CPT must equal 64 (one wavefront)");
+
+    const int wave_id = threadIdx.x / THREADS_PER_WAVE;
+    const int lane_id = threadIdx.x % THREADS_PER_WAVE;
+    const int n_base = blockIdx.x * TILE_N + lane_id * CPT;
+    const int outer_k_block = blockIdx.y;
+
+    // --- Compute K-range for this block's outer K-slice ---
+    const int total_k_groups = K / 4;
+
+    // Evenly distribute k-groups across kb_outer grid blocks
+    const int kgroups_per_outer = (total_k_groups + kb_outer - 1) / kb_outer;
+    const int outer_kg_start = outer_k_block * kgroups_per_outer;
+    const int outer_kg_end = min(outer_kg_start + kgroups_per_outer, total_k_groups);
+    if (outer_kg_start >= total_k_groups) return;
+
+    const int outer_kgroup_count = outer_kg_end - outer_kg_start;
+
+    // --- Inner K-split: distribute outer range across WK wavefronts ---
+    // Balanced distribution: waves 0..remainder-1 get one extra k-group
+    const int kg_per_wave_base = outer_kgroup_count / WK;
+    const int kg_remainder = outer_kgroup_count % WK;
+    const int my_kg_start = outer_kg_start
+        + wave_id * kg_per_wave_base
+        + min(wave_id, kg_remainder);
+    const int my_kg_count = kg_per_wave_base + (wave_id < kg_remainder ? 1 : 0);
+    const int my_kg_end = my_kg_start + my_kg_count;
+
+    // Accumulators — each thread accumulates CPT output column values
+    int32_t acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) acc[c] = 0;
+
+    // Main K-reduction loop (innermost hot loop)
+    if (n_base < N && my_kg_count > 0)
+    {
+        const int32_t* __restrict__ b_row =
+            reinterpret_cast<const int32_t*>(d_B_int8_vnni) + n_base;
+        const size_t b_stride = static_cast<size_t>(N);
+
+        // #pragma unroll 4: expose 4 k-groups for memory-level parallelism.
+        // Compiler generates 4× global_load + 4× s_load + 8× v_dot4 interleaved.
+        #pragma unroll 4
+        for (int kg = my_kg_start; kg < my_kg_end; ++kg)
+        {
+            // A is uniform across all threads in this wave (M=1)
+            // → compiler uses scalar load (s_load_dword), broadcast to all lanes
+            const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
+
+            if constexpr (CPT == 2)
+            {
+                // 8-byte vectorized load: two adjacent VNNI columns
+                const int2 b_pair = *reinterpret_cast<const int2*>(
+                    b_row + kg * b_stride);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
+            }
+            else // CPT == 4
+            {
+                // 16-byte vectorized load: four adjacent VNNI columns
+                const int4 b_pack = *reinterpret_cast<const int4*>(
+                    b_row + kg * b_stride);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pack.x, acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pack.y, acc[1], false);
+                acc[2] = __builtin_amdgcn_sdot4(a_packed, b_pack.z, acc[2], false);
+                acc[3] = __builtin_amdgcn_sdot4(a_packed, b_pack.w, acc[3], false);
+            }
+        }
+    }
+
+    // =========================================================================
+    // LDS K-reduction: sum partial results across WK wavefronts
+    //
+    // Waves 1..WK-1 deposit their partial sums into LDS.
+    // After barrier, wave 0 reads and sums all partials + its own accumulator.
+    // This replaces global atomicAdd with fast LDS reads (5-10 cycles each).
+    // =========================================================================
+    __shared__ int32_t s_partial[WK - 1][TILE_N];
+
+    // Waves 1..WK-1 write partials to LDS
+    if (wave_id > 0 && n_base < N)
+    {
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            s_partial[wave_id - 1][lane_id * CPT + c] = acc[c];
+        }
+    }
+
+    __syncthreads();
+
+    // Wave 0 sums all partials and writes to global output
+    if (wave_id == 0 && n_base < N)
+    {
+        // Sum own partial + (WK-1) LDS contributions
+        #pragma unroll
+        for (int w = 0; w < WK - 1; ++w)
+        {
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+            {
+                acc[c] += s_partial[w][lane_id * CPT + c];
+            }
+        }
+
+        // Store output
+        if (kb_outer == 1)
+        {
+            // Plain store — no atomicAdd needed, no pre-zeroing required
+            if constexpr (CPT == 2)
+            {
+                *reinterpret_cast<int2*>(&d_C_int32[n_base]) =
+                    make_int2(acc[0], acc[1]);
+            }
+            else // CPT == 4
+            {
+                *reinterpret_cast<int4*>(&d_C_int32[n_base]) =
+                    make_int4(acc[0], acc[1], acc[2], acc[3]);
+            }
+        }
+        else
+        {
+            // Multi-block outer K-split: atomicAdd (but WK× fewer than grid_kpar)
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+            {
+                atomicAdd(&d_C_int32[n_base + c], acc[c]);
+            }
+        }
+    }
+}
+
 
 // ============================================================================
 // Native-VNNI GEMV kernel: lossless Q4/IQ4 decode with per-block FP16 scales
@@ -1541,6 +1719,194 @@ __global__ void gemv_fused_fp32_int8_vnni_kernel_t(
 
 
 // ============================================================================
+// Fused FP32→INT8 GEMV scatter kernel: Quantize + GEMV → partial buffer
+//
+// Same inner loop as gemv_fused_fp32_int8_vnni_kernel_t but writes unscaled
+// FP32 partials to d_partial[k_block * N + n], enabling grid-level K-splitting
+// WITHOUT atomicAdd or memset. Paired with gemv_reduce_scale_kernel_t to
+// produce the final FP32 output.
+//
+// This replaces the 3-kernel pipeline (quantize → GEMV → scale) with a
+// 2-kernel pipeline (fused_scatter → reduce+scale) that eliminates:
+//   - The separate quantize kernel launch
+//   - hipMemsetAsync for atomicAdd zeroing
+//   - All atomicAdd contention
+//
+// Grid: dim3(grid_n, KB), Block: dim3(TILE_N / CPT) = dim3(64)
+// ============================================================================
+template <int TILE_N, int CPT>
+__global__ void gemv_fused_scatter_int8_vnni_kernel_t(
+    const float* __restrict__ d_A_fp32,          // [K] FP32 activations
+    const int8_t* __restrict__ d_B_int8_vnni,    // [K/4][N][4] VNNI weights
+    float* __restrict__ d_partial_fp32,           // [KB × N] FP32 partial buffer
+    int N, int K, int kblocks)
+{
+    constexpr int THREADS = TILE_N / CPT;  // 64 threads = 1 wavefront
+    constexpr int QUANT_TILE_K = 256;
+
+    const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+    const bool active = (n_base < N);
+    const int k_block = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const int k_per_raw = (K + kblocks - 1) / kblocks;
+    const int k_per = ((k_per_raw + 3) / 4) * 4;
+    const int k_start = k_block * k_per;
+    const int k_end = min(k_start + k_per, K);
+
+    if (k_start >= K) return;
+
+    __shared__ float s_A_fp32[QUANT_TILE_K];
+    __shared__ float s_absmax;
+    __shared__ int8_t s_A_int8[QUANT_TILE_K];
+
+    float f_acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) f_acc[c] = 0.0f;
+
+    for (int k_tile_start = k_start; k_tile_start < k_end; k_tile_start += QUANT_TILE_K)
+    {
+        const int tile_end = min(k_tile_start + QUANT_TILE_K, k_end);
+        const int tile_len = tile_end - k_tile_start;
+        const int tile_kgroups = tile_len / 4;
+
+        // Phase 1: Cooperative load of FP32 activations to shared memory
+        for (int i = tid; i < tile_len; i += THREADS)
+            s_A_fp32[i] = d_A_fp32[k_tile_start + i];
+        __syncthreads();
+
+        // Phase 2: Find absmax via warp reduction
+        float local_max = 0.0f;
+        for (int i = tid; i < tile_len; i += THREADS)
+        {
+            float v = s_A_fp32[i];
+            float a = (v >= 0.0f) ? v : -v;
+            local_max = (a > local_max) ? a : local_max;
+        }
+
+        #pragma unroll
+        for (int offset = 32; offset > 0; offset >>= 1)
+        {
+            float other = __shfl_down(local_max, offset);
+            local_max = (other > local_max) ? other : local_max;
+        }
+
+        if (tid == 0) s_absmax = local_max;
+        __syncthreads();
+
+        const float absmax = s_absmax;
+        const float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
+        const float inv_scale = (absmax > 0.0f) ? (127.0f / absmax) : 0.0f;
+
+        // Phase 3: Cooperative quantize FP32 → INT8 in shared memory
+        for (int i = tid; i < tile_len; i += THREADS)
+        {
+            float val = s_A_fp32[i] * inv_scale;
+            int q = static_cast<int>(rintf(val));
+            q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+            s_A_int8[i] = static_cast<int8_t>(q);
+        }
+        __syncthreads();
+
+        // Phase 4: INT8 dot product using v_dot4_i32_i8
+        if (active)
+        {
+            int32_t tile_acc[CPT];
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c) tile_acc[c] = 0;
+
+            const int32_t* __restrict__ b_row =
+                reinterpret_cast<const int32_t*>(d_B_int8_vnni) + n_base;
+            const size_t b_stride = static_cast<size_t>(N);
+            const int kg_offset = k_tile_start / 4;
+
+            #pragma unroll 4
+            for (int tkg = 0; tkg < tile_kgroups; ++tkg)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(
+                    s_A_int8 + tkg * 4);
+
+                if constexpr (CPT == 2)
+                {
+                    const int2 b_pair = *reinterpret_cast<const int2*>(
+                        b_row + (kg_offset + tkg) * b_stride);
+                    tile_acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, tile_acc[0], false);
+                    tile_acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, tile_acc[1], false);
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int c = 0; c < CPT; ++c)
+                    {
+                        const int32_t b_packed = *(b_row + (kg_offset + tkg) * b_stride + c);
+                        tile_acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, tile_acc[c], false);
+                    }
+                }
+            }
+
+            // Convert tile INT32 → FP32 with tile-local scale
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+                f_acc[c] += static_cast<float>(tile_acc[c]) * scale;
+        }
+
+        __syncthreads();
+    }
+
+    // Phase 5: Write unscaled FP32 partials to buffer (plain store, no atomicAdd)
+    if (active)
+    {
+        const size_t partial_offset = static_cast<size_t>(k_block) * N;
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+            d_partial_fp32[partial_offset + n_base + c] = f_acc[c];
+    }
+}
+
+
+// ============================================================================
+// Reduce + scale kernel: Sum KB FP32 partials, apply scale_B + bias
+//
+// Used after gemv_fused_scatter_int8_vnni_kernel_t to combine K-block
+// partial results into the final FP32 output with scaling and bias.
+//
+// Grid: dim3((N + TILE_N - 1) / TILE_N), Block: dim3(TILE_N / CPT)
+// ============================================================================
+template <int TILE_N, int CPT>
+__global__ void gemv_reduce_scale_kernel_t(
+    const float* __restrict__ d_partial_fp32,    // [KB × N] partial buffer
+    float* __restrict__ d_C_fp32,                // [N] output
+    const float* __restrict__ d_scales_B,        // [N] per-column weight scales
+    const float* __restrict__ d_bias,            // [N] optional bias (nullable)
+    int N, int KB,
+    float alpha, float beta,
+    const float* __restrict__ d_C_existing)      // [N] used when beta != 0
+{
+    const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        const int n = n_base + c;
+        if (n >= N) return;
+
+        float sum = 0.0f;
+        #pragma unroll 16
+        for (int kb = 0; kb < KB; ++kb)
+            sum += d_partial_fp32[static_cast<size_t>(kb) * N + n];
+
+        float result = sum * d_scales_B[n] * alpha;
+        if (beta != 0.0f && d_C_existing)
+            result += beta * d_C_existing[n];
+        if (d_bias)
+            result += d_bias[n];
+
+        d_C_fp32[n] = result;
+    }
+}
+
+
+// ============================================================================
 // C API: Launch wrappers
 // ============================================================================
 
@@ -1625,9 +1991,6 @@ bool rocmGemv_int8_int8_int32_vnni(
     // Profiling: grid_kpar achieves 488-649 GB/s (48-63% peak) vs wide2's 176 GB/s.
     const bool use_grid_kpar = !use_wide_vec4 && use_vec4 && (N >= GEMV_INT8_VNNI_GRID_KPAR_TILE_N);
     const bool use_square = !use_wide_vec4 && !use_grid_kpar && (N >= GEMV_INT8_VNNI_SQUARE_TILE_N);
-    const int min_dim = min(N, K);
-    const int max_dim = max(N, K);
-    const bool is_squareish_shape = (min_dim >= 2048) && (max_dim * 100 <= min_dim * 140);
     const int int8_tn_override = g_int8_vnni_tn_override.load(std::memory_order_relaxed);
     const int int8_kb_override = g_int8_vnni_kb_override.load(std::memory_order_relaxed);
 
@@ -1717,29 +2080,31 @@ bool rocmGemv_int8_int8_int32_vnni(
         // Grid-level K-parallel with atomicAdd: KB independent blocks per output tile
         // Each block processes K/KB fraction; output must be zeroed before launch
         //
-        // KB heuristic: adapt based on N-tile count and K size.
-        // Key insight from PMC profiling: inner loop length (k-groups/wave) is the
-        // dominant factor for BW efficiency. Longer loops amortize per-block overhead
-        // (index calc, atomicAdd, wave scheduling). At ≥10 waves/CU, adding more
-        // waves doesn't help — it just shortens loops and adds overhead.
+        // KB heuristic: unified formula for all shapes.
         //
-        // Empirical targets (MI50 gfx906):
-        //   FFN Down: 148 kgrps/wave, 14.9 w/CU → 62% peak BW (best)
-        //   FFN Gate/Up: 32 kgrps/wave, 69.1 w/CU → 57% peak (too many waves)
-        //   Q/Wo: 16 kgrps/wave, 26.1 w/CU → 50% peak (inner loop too short)
+        // Key insight from exhaustive TN×KB sweep (MI50 gfx906, Qwen7B shapes):
+        //   ~8 waves/CU is the sweet spot for ALL shapes. More waves just adds
+        //   atomicAdd contention per N-tile without improving BW utilization.
+        //   Additionally, KB values that evenly divide k_groups avoid tail-effect
+        //   work imbalance (some wavefronts processing fewer k-groups than others).
         //
-        // Strategy: target ≥ MIN_KGROUPS_PER_BLOCK kgrps/wave while keeping
-        // waves/CU above TARGET_MIN_WAVES_PER_CU for latency hiding.
+        // Sweep results (optimal KB per shape):
+        //   Q/Wo (3584×3584):     KB=16, 7.5 w/CU, 56 kgrp/wave → 456 GB/s (46%)
+        //   K/V (512×3584):       KB=56, 3.7 w/CU, 16 kgrp/wave → 129 GB/s (13%)
+        //   FFN Gate/Up (18944×3584): KB=4, 9.9 w/CU, 224 kgrp/wave → 756 GB/s (76%)
+        //   FFN Down (3584×18944):    KB=16, 7.5 w/CU, 296 kgrp/wave → 760 GB/s (76%)
+        //
+        // Strategy:
+        //   1. Compute min KB for ~8 waves/CU (memory latency hiding)
+        //   2. Cap so inner loop runs ≥16 k-groups (proven floor from sweep)
+        //   3. Round to nearest factor of k_groups (avoid uneven work distribution)
+        //      Bias toward lower factor on ties (fewer atomicAdds = less contention)
         constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;  // 128
         constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;    // 2
         constexpr int TN_WIDE = GEMV_INT8_VNNI_WIDE_TILE_N;  // 256
         constexpr int NUM_CUS = 60;  // MI50
 
         int tn = TN;
-        if (is_squareish_shape)
-        {
-            tn = TN_WIDE;
-        }
         if (int8_tn_override == TN_WIDE)
         {
             tn = TN_WIDE;
@@ -1752,35 +2117,25 @@ bool rocmGemv_int8_int8_int32_vnni(
         const int grid_n = (N + tn - 1) / tn;
         const int k_groups = K / 4;
 
-        int kb;
-        if (K > 8192) {
-            // Large-K (FFN Down): inherently long inner loops, tune for occupancy
-            kb = max(4, min(32, K / 512));
-        } else {
-            // All other shapes: target ≥64 k-groups per wave for efficiency,
-            // while keeping ≥10 waves/CU for memory latency hiding.
-            // Cap KB so inner loop never drops below 16 k-groups (proven floor
-            // from Q/Wo baseline — going shorter always hurts).
-            constexpr int TARGET_KGROUPS = 64;
-            constexpr int TARGET_MIN_WAVES_PER_CU = 10;
-            constexpr int MIN_KGROUPS_FLOOR = 16;
-            
-            // Start from ideal KB for target k-groups
-            int kb_for_kgroups = max(2, k_groups / TARGET_KGROUPS);
-            
-            // But ensure minimum occupancy
-            int min_blocks = TARGET_MIN_WAVES_PER_CU * NUM_CUS;
-            int kb_for_occupancy = max(2, (min_blocks + grid_n - 1) / grid_n);
-            
-            // Take the larger of the two constraints, but cap to preserve
-            // minimum inner loop length (protects small-N shapes like K/V proj)
-            int kb_max = max(2, k_groups / MIN_KGROUPS_FLOOR);
-            kb = min(max(kb_for_kgroups, kb_for_occupancy), kb_max);
-        }
+        constexpr int TARGET_WAVES_PER_CU = 8;
+        constexpr int MIN_KGROUPS_PER_WAVE = 16;  // proven floor from sweep
 
-        if (is_squareish_shape)
+        int target_blocks = TARGET_WAVES_PER_CU * NUM_CUS;  // 480
+        int kb_raw = max(2, (target_blocks + grid_n - 1) / grid_n);
+
+        // Cap: ensure minimum inner loop length
+        int kb_max = max(2, k_groups / MIN_KGROUPS_PER_WAVE);
+        kb_raw = min(kb_raw, kb_max);
+
+        // Round to nearest factor of k_groups (prefer lower on tie → fewer atomicAdds)
+        int kb = kb_raw;
+        if (k_groups % kb_raw != 0)
         {
-            kb = 16;
+            for (int d = 1; d < kb_raw; ++d)
+            {
+                if (kb_raw - d >= 2 && k_groups % (kb_raw - d) == 0) { kb = kb_raw - d; break; }
+                if (kb_raw + d <= kb_max && k_groups % (kb_raw + d) == 0) { kb = kb_raw + d; break; }
+            }
         }
 
         if (int8_kb_override > 0)
@@ -2101,8 +2456,139 @@ bool rocmGemv_fused_fp32_int8_vnni(
     return true;
 }
 
+
 // =============================================================================
-// VNNI → Row-Major Repack Kernel
+// Fused Scatter FP32→FP32 GEMV: Quantize + GEMV → partials, then reduce+scale
+// =============================================================================
+//
+// 2-kernel pipeline replacing the 3-kernel pipeline:
+//   OLD: quantizeActivations → rocmGemv_int8_int8_int32_vnni → applyScaling
+//   NEW: fused_scatter (quant+GEMV→partials) → reduce+scale
+//
+// Eliminates:
+//   - Separate quant kernel launch (~10 μs)
+//   - hipMemsetAsync (~3 μs)
+//   - All atomicAdd contention
+//   - One kernel launch overhead (~5-8 μs)
+//
+// When KB=1 (enough N-blocks for full occupancy), falls back to the
+// single-kernel fused path for maximum launch elimination.
+//
+bool rocmGemv_fused_scatter_fp32_int8_vnni(
+    const float* d_A_fp32,           // [K] FP32 activations
+    const int8_t* d_B_int8_vnni,     // [K/4 × N × 4] VNNI-packed weights
+    float* d_C_fp32,                 // [N] FP32 output
+    const float* d_scales_B,         // [N] per-column weight scales
+    const float* d_bias,             // [N] optional bias (nullable)
+    float* d_partial_buf,            // [KB_MAX × N] pre-allocated partial buffer
+    int N, int K,
+    float alpha, float beta,
+    const float* d_C_existing,       // [N] used when beta != 0
+    int device_id, void* stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    if ((K % 4) != 0)
+    {
+        fprintf(stderr, "[rocmGemv_fused_scatter] K must be multiple of 4 (N=%d K=%d)\n", N, K);
+        return false;
+    }
+
+    if ((N % 4) != 0)
+    {
+        fprintf(stderr, "[rocmGemv_fused_scatter] N must be multiple of 4 (N=%d K=%d)\n", N, K);
+        return false;
+    }
+
+    constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;  // 128
+    constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;    // 2
+    constexpr int NUM_CUS = 60;  // MI50/MI60
+
+    const int grid_n = (N + TN - 1) / TN;
+    const int k_groups = K / 4;
+
+    // KB heuristic: same occupancy target as grid_kpar (~8 waves/CU),
+    // but min KB=1 since scatter has no atomicAdd penalty for KB=1.
+    constexpr int TARGET_WAVES_PER_CU = 8;
+    constexpr int MIN_KGROUPS_PER_WAVE = 16;
+
+    int target_blocks = TARGET_WAVES_PER_CU * NUM_CUS;  // 480
+    int kb_raw = max(1, (target_blocks + grid_n - 1) / grid_n);
+
+    int kb_max = max(1, k_groups / MIN_KGROUPS_PER_WAVE);
+    kb_raw = min(kb_raw, kb_max);
+
+    // Round to nearest factor of k_groups (avoid uneven work distribution)
+    int kb = kb_raw;
+    if (k_groups % kb_raw != 0)
+    {
+        for (int d = 1; d < kb_raw; ++d)
+        {
+            if (kb_raw - d >= 1 && k_groups % (kb_raw - d) == 0) { kb = kb_raw - d; break; }
+            if (kb_raw + d <= kb_max && k_groups % (kb_raw + d) == 0) { kb = kb_raw + d; break; }
+        }
+    }
+
+    if (kb <= 1)
+    {
+        // Single-kernel path: enough N-blocks for occupancy with KB=1.
+        // Use the existing fused kernel directly (no partial buffer needed).
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(gemv_fused_fp32_int8_vnni_kernel_t<TN, CPT>),
+            dim3(grid_n, 1), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+            d_A_fp32, d_B_int8_vnni, d_C_fp32, d_scales_B, nullptr, N, K, 1);
+
+        // Apply bias + alpha/beta if needed (the single-kernel path doesn't handle these)
+        if (d_bias || beta != 0.0f)
+        {
+            // The fused kernel wrote: d_C_fp32[n] = sum * scale_B[n]
+            // We need: result = alpha * sum * scale_B + beta * C_existing + bias
+            // Since alpha and beta are not applied by the fused kernel for kb=1 path,
+            // handle them via a quick fixup if non-trivial
+            if (alpha != 1.0f || beta != 0.0f)
+            {
+                fprintf(stderr, "[rocmGemv_fused_scatter] alpha/beta not yet supported in kb=1 path\n");
+                return false;
+            }
+            if (d_bias)
+            {
+                extern bool rocmQuantGemm_biasAdd(
+                    float *d_output, const float *d_bias,
+                    int M, int N, int rocm_device_id, void *stream);
+                if (!rocmQuantGemm_biasAdd(d_C_fp32, d_bias, 1, N, device_id, stream))
+                    return false;
+            }
+        }
+    }
+    else
+    {
+        // Two-kernel path: fused scatter → reduce+scale
+        // Kernel 1: fused quantize + INT8 GEMV → FP32 partials
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(gemv_fused_scatter_int8_vnni_kernel_t<TN, CPT>),
+            dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+            d_A_fp32, d_B_int8_vnni, d_partial_buf, N, K, kb);
+
+        // Kernel 2: reduce KB partials + apply scale_B + bias
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(gemv_reduce_scale_kernel_t<TN, CPT>),
+            dim3(grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+            d_partial_buf, d_C_fp32, d_scales_B, d_bias, N, kb,
+            alpha, beta, d_C_existing);
+    }
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemv_fused_scatter] Kernel launch failed: %s (N=%d K=%d kb=%d)\n",
+                hipGetErrorString(err), N, K, kb);
+        return false;
+    }
+
+    return true;
+}
+
+
 // =============================================================================
 //
 // Repacks weights from flat VNNI layout [K/4][N][4] to row-major [N×K]

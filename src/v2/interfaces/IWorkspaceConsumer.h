@@ -175,6 +175,9 @@ namespace llaminar2
 
         // ROCm VNNI→row-major repack scratch buffer (Option B: single-layout VRAM)
         constexpr const char *ROCM_B_REPACK = "rocm_b_repack"; ///< [N × K] INT8 scratch for VNNI→row-major repacking
+
+        // ROCm scatter+reduce partial buffer for fused GEMV
+        constexpr const char *ROCM_SCATTER_PARTIAL = "rocm_scatter_partial"; ///< [KB_MAX × N] FP32 scatter partials
     }
 
     // =============================================================================
@@ -201,8 +204,8 @@ namespace llaminar2
      */
     namespace RoPEWorkspaceBuffers
     {
-        constexpr const char *POSITION_IDS = "rope_position_ids"; ///< [max_seq_len] INT32 position IDs
-        constexpr const char *INV_FREQ = "rope_inv_freq";         ///< [head_dim/2] FP32 inverse frequency table
+        constexpr const char *POSITION_IDS = "rope_position_ids";   ///< [max_seq_len] INT32 position IDs
+        constexpr const char *INV_FREQ = "rope_inv_freq";           ///< [head_dim/2] FP32 inverse frequency table
         constexpr const char *DEVICE_PARAMS = "rope_device_params"; ///< RoPEDeviceParams struct for graph capture
     }
 

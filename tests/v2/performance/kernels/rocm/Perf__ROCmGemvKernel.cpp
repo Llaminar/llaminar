@@ -97,6 +97,18 @@ extern "C"
         int32_t *d_C_int32,
         int M, int N, int K,
         int rocm_device_id, void *stream);
+
+    bool rocmGemv_fused_scatter_fp32_int8_vnni(
+        const float *d_A_fp32,
+        const int8_t *d_B_int8_vnni,
+        float *d_C_fp32,
+        const float *d_scales_B,
+        const float *d_bias,
+        float *d_partial_buf,
+        int N, int K,
+        float alpha, float beta,
+        const float *d_C_existing,
+        int device_id, void *stream);
 }
 
 namespace
@@ -548,6 +560,105 @@ namespace
 #endif
         }
 
+        // =========================================================================
+        // Benchmark fused scatter+reduce pipeline (2-kernel approach)
+        // =========================================================================
+        BenchResult benchmarkFusedScatter(int N, int K, int warmup_runs = 5, int bench_runs = 20)
+        {
+            BenchResult result{};
+#ifndef HAVE_ROCM
+            return result;
+#else
+            std::mt19937 rng(42);
+            std::uniform_real_distribution<float> dist_a(-1.0f, 1.0f);
+            std::uniform_int_distribution<int> dist_b(-127, 127);
+            std::uniform_real_distribution<float> dist_s(0.001f, 0.1f);
+
+            std::vector<float> h_A(K);
+            std::vector<int8_t> h_B(static_cast<size_t>(K) * N);
+            std::vector<int8_t> h_B_vnni;
+            std::vector<float> h_scale(N);
+
+            for (auto &v : h_A)
+                v = dist_a(rng);
+            for (auto &v : h_B)
+                v = static_cast<int8_t>(dist_b(rng));
+            for (auto &v : h_scale)
+                v = dist_s(rng);
+
+            packVnniWeights(h_B, N, K, h_B_vnni);
+
+            float *d_A = nullptr, *d_scale = nullptr, *d_C = nullptr;
+            int8_t *d_B_vnni = nullptr;
+            float *d_partial = nullptr;
+
+            hipMalloc(&d_A, K * sizeof(float));
+            hipMalloc(&d_scale, N * sizeof(float));
+            hipMalloc(&d_C, N * sizeof(float));
+            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+
+            // Allocate partial buffer: max KB is ~56, but 64 covers all shapes safely
+            constexpr int MAX_KB = 64;
+            hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
+
+            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+            hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            hipDeviceSynchronize();
+
+            // Warmup
+            for (int i = 0; i < warmup_runs; ++i)
+            {
+                rocmGemv_fused_scatter_fp32_int8_vnni(
+                    d_A, d_B_vnni, d_C, d_scale, nullptr,
+                    d_partial, N, K, 1.0f, 0.0f, nullptr,
+                    device_id_, nullptr);
+            }
+            hipDeviceSynchronize();
+
+            // Timed runs
+            std::vector<double> times;
+            times.reserve(bench_runs);
+
+            hipEvent_t start, stop;
+            hipEventCreate(&start);
+            hipEventCreate(&stop);
+
+            for (int i = 0; i < bench_runs; ++i)
+            {
+                hipDeviceSynchronize();
+                hipEventRecord(start, 0);
+
+                rocmGemv_fused_scatter_fp32_int8_vnni(
+                    d_A, d_B_vnni, d_C, d_scale, nullptr,
+                    d_partial, N, K, 1.0f, 0.0f, nullptr,
+                    device_id_, nullptr);
+
+                hipEventRecord(stop, 0);
+                hipEventSynchronize(stop);
+                float ms = 0.0f;
+                hipEventElapsedTime(&ms, start, stop);
+                times.push_back(static_cast<double>(ms));
+            }
+
+            hipEventDestroy(start);
+            hipEventDestroy(stop);
+            hipFree(d_A);
+            hipFree(d_scale);
+            hipFree(d_C);
+            hipFree(d_B_vnni);
+            hipFree(d_partial);
+
+            computeStats(times, result.mean_ms, result.min_ms,
+                         result.max_ms, result.stddev_ms);
+
+            double bytes = static_cast<double>(K) * N * 1 + K * 4 + N * 4 + N * 4;
+            result.gbps = (bytes / (result.min_ms * 1e-3)) / 1e9;
+            result.success = true;
+            return result;
+#endif
+        }
+
         BenchResult benchmarkGemv(int N, int K, int warmup_runs = 5, int bench_runs = 20)
         {
             auto split = benchmarkGemvSplit(N, K, warmup_runs, bench_runs);
@@ -706,6 +817,73 @@ namespace
             hipFree(d_A_int8);
             hipFree(d_scale_A);
             hipFree(d_C_int32);
+
+            return checkCorrectness(gpu_out.data(), ref.data(), N);
+#endif
+        }
+
+        // =========================================================================
+        // Correctness test for fused scatter pipeline
+        // =========================================================================
+        CorrectnessResult testCorrectnessScatter(int N, int K)
+        {
+            CorrectnessResult bad{0, 0, 0, false};
+#ifndef HAVE_ROCM
+            return bad;
+#else
+            std::mt19937 rng(12345);
+            std::uniform_real_distribution<float> dist_a(-1.0f, 1.0f);
+            std::uniform_int_distribution<int> dist_b(-127, 127);
+            std::uniform_real_distribution<float> dist_s(0.001f, 0.1f);
+
+            std::vector<float> h_A(K);
+            std::vector<int8_t> h_B(static_cast<size_t>(K) * N);
+            std::vector<float> h_scale(N);
+
+            for (auto &v : h_A)
+                v = dist_a(rng);
+            for (auto &v : h_B)
+                v = static_cast<int8_t>(dist_b(rng));
+            for (auto &v : h_scale)
+                v = dist_s(rng);
+
+            std::vector<float> ref(N);
+            cpuReferenceGemv(h_A.data(), h_B.data(), h_scale.data(), ref.data(), N, K);
+
+            std::vector<int8_t> h_B_vnni;
+            packVnniWeights(h_B, N, K, h_B_vnni);
+
+            float *d_A = nullptr, *d_scale = nullptr, *d_C = nullptr;
+            int8_t *d_B_vnni = nullptr;
+            float *d_partial = nullptr;
+
+            hipMalloc(&d_A, K * sizeof(float));
+            hipMalloc(&d_scale, N * sizeof(float));
+            hipMalloc(&d_C, N * sizeof(float));
+            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+
+            constexpr int MAX_KB = 64;
+            hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
+
+            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+            hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            hipDeviceSynchronize();
+
+            rocmGemv_fused_scatter_fp32_int8_vnni(
+                d_A, d_B_vnni, d_C, d_scale, nullptr,
+                d_partial, N, K, 1.0f, 0.0f, nullptr,
+                device_id_, nullptr);
+            hipDeviceSynchronize();
+
+            std::vector<float> gpu_out(N);
+            hipMemcpy(gpu_out.data(), d_C, N * sizeof(float), hipMemcpyDeviceToHost);
+
+            hipFree(d_A);
+            hipFree(d_scale);
+            hipFree(d_C);
+            hipFree(d_B_vnni);
+            hipFree(d_partial);
 
             return checkCorrectness(gpu_out.data(), ref.data(), N);
 #endif
@@ -895,6 +1073,60 @@ namespace
     }
 
     // ============================================================================
+    // TEST: Correctness — Fused Scatter+Reduce pipeline
+    // ============================================================================
+
+    TEST_F(ROCmGemvPerfTest, Correctness_Scatter)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
+        printCorrectnessHeader("Fused Scatter+Reduce Correctness (M=1 decode)");
+
+        // Test all Qwen7B shapes + Qwen0.5B shapes
+        struct Shape
+        {
+            const char *name;
+            int N;
+            int K;
+        };
+        std::vector<Shape> shapes = {
+            // Qwen7B
+            {"7B Q proj", kQwen7B.hidden, kQwen7B.hidden},
+            {"7B K proj", kQwen7B.num_kv_heads * kQwen7B.head_dim, kQwen7B.hidden},
+            {"7B V proj", kQwen7B.num_kv_heads * kQwen7B.head_dim, kQwen7B.hidden},
+            {"7B Wo proj", kQwen7B.hidden, kQwen7B.hidden},
+            {"7B FFN Gate", kQwen7B.intermediate, kQwen7B.hidden},
+            {"7B FFN Up", kQwen7B.intermediate, kQwen7B.hidden},
+            {"7B FFN Down", kQwen7B.hidden, kQwen7B.intermediate},
+            {"7B LM Head", kQwen7B.vocab, kQwen7B.hidden},
+            // Qwen0.5B
+            {"0.5B Q proj", kQwen05B.hidden, kQwen05B.hidden},
+            {"0.5B K proj", kQwen05B.num_kv_heads * kQwen05B.head_dim, kQwen05B.hidden},
+            {"0.5B V proj", kQwen05B.num_kv_heads * kQwen05B.head_dim, kQwen05B.hidden},
+            {"0.5B Wo proj", kQwen05B.hidden, kQwen05B.hidden},
+            {"0.5B FFN Gate", kQwen05B.intermediate, kQwen05B.hidden},
+            {"0.5B FFN Up", kQwen05B.intermediate, kQwen05B.hidden},
+            {"0.5B FFN Down", kQwen05B.hidden, kQwen05B.intermediate},
+            {"0.5B LM Head", kQwen05B.vocab, kQwen05B.hidden},
+        };
+
+        for (const auto &s : shapes)
+        {
+            auto r = testCorrectnessScatter(s.N, s.K);
+            printCorrectnessRow(s.name, s.N, s.K, r);
+            EXPECT_TRUE(r.pass) << s.name << " N=" << s.N << " K=" << s.K
+                                << " cosine=" << r.cosine_sim;
+        }
+        printCorrectnessFooter();
+#endif
+    }
+
+    // ============================================================================
     // TEST: Performance — Qwen2.5-0.5B full decode layer
     // ============================================================================
 
@@ -951,7 +1183,7 @@ namespace
         fprintf(stderr, "  LM Head:               %8.3f ms\n", split_lm.total.min_ms);
         fprintf(stderr, "  All %d layers + LM:    %8.3f ms  (%.1f tok/s GEMV-only)\n",
                 kQwen05B.num_layers, all_layers_ms, 1000.0 / all_layers_ms);
-        fprintf(stderr, "  Effective bandwidth:   %8.1f GB/s  (of 480 GB/s HBM2)\n", effective_gbps);
+        fprintf(stderr, "  Effective bandwidth:   %8.1f GB/s  (of 1000 GB/s HBM2)\n", effective_gbps);
         fprintf(stderr, "  Weight data read:      %8.1f MB\n\n", all_layers_bytes / 1e6);
 
         auto shapes_with_lm = shapes;
@@ -1014,12 +1246,90 @@ namespace
         fprintf(stderr, "  LM Head:               %8.3f ms\n", split_lm.total.min_ms);
         fprintf(stderr, "  All %d layers + LM:    %8.3f ms  (%.1f tok/s GEMV-only)\n",
                 kQwen7B.num_layers, all_layers_ms, 1000.0 / all_layers_ms);
-        fprintf(stderr, "  Effective bandwidth:   %8.1f GB/s  (of 480 GB/s HBM2)\n", effective_gbps);
+        fprintf(stderr, "  Effective bandwidth:   %8.1f GB/s  (of 1000 GB/s HBM2)\n", effective_gbps);
         fprintf(stderr, "  Weight data read:      %8.1f MB\n\n", all_layers_bytes / 1e6);
 
         auto shapes_with_lm = shapes;
         shapes_with_lm.push_back(lm);
         printSplitBenchTable("GEMV Split Timing (INT8 VNNI)", shapes_with_lm, split_results);
+#endif
+    }
+
+    // ============================================================================
+    // TEST: Fused Scatter vs 3-kernel pipeline comparison (Qwen7B decode)
+    // ============================================================================
+
+    TEST_F(ROCmGemvPerfTest, Benchmark_ScatterVsBaseline)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
+
+        auto shapes = getDecodeShapes(kQwen7B);
+        auto lm = getLMHeadShape(kQwen7B);
+
+        // Table header
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "Shape" << "N" << "K"
+              << "3-Kernel min(ms)" << "Scatter min(ms)" << "Speedup"
+              << fort::endr;
+
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        for (int i = 1; i <= 5; ++i)
+            table.column(i).set_cell_text_align(fort::text_align::right);
+
+        double total_3k_layer = 0;
+        double total_sc_layer = 0;
+        double lm_3k = 0, lm_sc = 0;
+
+        std::vector<GemvShape> all_shapes = shapes;
+        all_shapes.push_back(lm);
+
+        for (const auto &s : all_shapes)
+        {
+            auto base = benchmarkGemvSplit(s.N, s.K);
+            auto scatter = benchmarkFusedScatter(s.N, s.K);
+
+            double speedup = base.total.min_ms / std::max(1e-9, scatter.min_ms);
+
+            char buf_base[32], buf_scatter[32], buf_spd[32];
+            snprintf(buf_base, sizeof(buf_base), "%.3f", base.total.min_ms);
+            snprintf(buf_scatter, sizeof(buf_scatter), "%.3f", scatter.min_ms);
+            snprintf(buf_spd, sizeof(buf_spd), "%.2fx", speedup);
+
+            table << s.name << s.N << s.K << buf_base << buf_scatter << buf_spd << fort::endr;
+
+            const bool is_lm = (s.N == lm.N && s.K == lm.K);
+            if (is_lm)
+            {
+                lm_3k = base.total.min_ms;
+                lm_sc = scatter.min_ms;
+            }
+            else
+            {
+                total_3k_layer += base.total.min_ms;
+                total_sc_layer += scatter.min_ms;
+            }
+        }
+
+        fprintf(stderr, "\n%s\n", table.to_string().c_str());
+
+        double all_3k = total_3k_layer * kQwen7B.num_layers + lm_3k;
+        double all_sc = total_sc_layer * kQwen7B.num_layers + lm_sc;
+
+        fprintf(stderr, "  3-Kernel per-layer:   %8.3f ms\n", total_3k_layer);
+        fprintf(stderr, "  Scatter  per-layer:   %8.3f ms\n", total_sc_layer);
+        fprintf(stderr, "  3-Kernel all %d + LM: %8.3f ms  (%.1f tok/s)\n",
+                kQwen7B.num_layers, all_3k, 1000.0 / all_3k);
+        fprintf(stderr, "  Scatter  all %d + LM: %8.3f ms  (%.1f tok/s)\n",
+                kQwen7B.num_layers, all_sc, 1000.0 / all_sc);
+        fprintf(stderr, "  Overall speedup:       %.2fx\n\n", all_3k / std::max(1e-9, all_sc));
 #endif
     }
 
@@ -1135,6 +1445,115 @@ namespace
         }
 
         fprintf(stderr, "╚═══════════════════╩═══════╩═══════╩═══════════════════╩═══════════════════╩═════════════════╝\n\n");
+#endif
+    }
+
+    TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_AllShapes_AutoSweep)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_INT8_ALLSHAPES_AUTOSWEEP");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_INT8_ALLSHAPES_AUTOSWEEP=1 to run";
+        }
+
+        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
+
+        struct SweepShape
+        {
+            const char *name;
+            int N;
+            int K;
+        };
+        const int kv_dim = kQwen7B.num_kv_heads * kQwen7B.head_dim;
+        const std::vector<SweepShape> shapes = {
+            {"Q proj", kQwen7B.hidden, kQwen7B.hidden},
+            {"K proj", kv_dim, kQwen7B.hidden},
+            {"V proj", kv_dim, kQwen7B.hidden},
+            {"Wo proj", kQwen7B.hidden, kQwen7B.hidden},
+            {"FFN Gate", kQwen7B.intermediate, kQwen7B.hidden},
+            {"FFN Up", kQwen7B.intermediate, kQwen7B.hidden},
+            {"FFN Down", kQwen7B.hidden, kQwen7B.intermediate},
+        };
+        const std::vector<int> tn_candidates = {128, 256};
+        const std::vector<int> kb_candidates = {4, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56};
+
+        for (const auto &shape : shapes)
+        {
+            rocmGemv_int8_vnni_reset_tuning_overrides();
+            const auto baseline = benchmarkGemvSplit(shape.N, shape.K, 5, 20);
+            ASSERT_TRUE(baseline.success);
+
+            const double HBM2_PEAK_GBPS = 1000.0;
+            const double weight_mb = static_cast<double>(shape.N) * shape.K / 1e6;
+
+            fort::utf8_table table;
+            table.set_border_style(FT_DOUBLE2_STYLE);
+            table << fort::header
+                  << "TN" << "KB" << "Blocks" << "Waves/CU" << "Kgrp/Wave"
+                  << "GEMV min(ms)" << "BW(GB/s)" << "%Peak" << "Speedup" << fort::endr;
+            for (int i = 0; i < 9; ++i)
+                table.column(i).set_cell_text_align(fort::text_align::right);
+
+            double best_gemv = std::numeric_limits<double>::max();
+            int best_tn = -1, best_kb = -1;
+
+            for (const int tn : tn_candidates)
+            {
+                for (const int kb : kb_candidates)
+                {
+                    const int grid_n = (shape.N + tn - 1) / tn;
+                    const int k_groups = shape.K / 4;
+                    const int total_blocks = grid_n * kb;
+                    const int waves_per_block = (tn == 256) ? 2 : 1;
+                    const double waves_per_cu = static_cast<double>(total_blocks * waves_per_block) / 60.0;
+                    const int kgrp_per_wave = k_groups / kb;
+
+                    if (kgrp_per_wave < 4)
+                        continue; // skip absurdly short inner loops
+
+                    rocmGemv_int8_vnni_set_tuning_overrides(tn, kb);
+                    const auto r = benchmarkGemvSplit(shape.N, shape.K, 3, 15);
+                    if (!r.success)
+                        continue;
+
+                    const double bw = weight_mb / r.gemv_min_ms;
+                    const double pct = (bw / HBM2_PEAK_GBPS) * 100.0;
+                    const double speedup = baseline.gemv_min_ms / std::max(1e-9, r.gemv_min_ms);
+
+                    char buf_wcu[32], buf_bw[32], buf_pct[32], buf_spd[32];
+                    snprintf(buf_wcu, sizeof(buf_wcu), "%.1f", waves_per_cu);
+                    snprintf(buf_bw, sizeof(buf_bw), "%.0f", bw);
+                    snprintf(buf_pct, sizeof(buf_pct), "%.1f%%", pct);
+                    snprintf(buf_spd, sizeof(buf_spd), "%.3f", speedup);
+
+                    table << tn << kb << total_blocks << buf_wcu << kgrp_per_wave
+                          << formatMs(r.gemv_min_ms) << buf_bw << buf_pct << buf_spd << fort::endr;
+
+                    if (r.gemv_min_ms < best_gemv)
+                    {
+                        best_gemv = r.gemv_min_ms;
+                        best_tn = tn;
+                        best_kb = kb;
+                    }
+                }
+            }
+
+            rocmGemv_int8_vnni_reset_tuning_overrides();
+            const double best_bw = weight_mb / best_gemv;
+            fprintf(stderr, "\n=== %s (N=%d, K=%d, %.1f MB) ===\n", shape.name, shape.N, shape.K, weight_mb);
+            fprintf(stderr, "Baseline GEMV: %.6f ms (%.0f GB/s, %.1f%% peak)\n",
+                    baseline.gemv_min_ms, weight_mb / baseline.gemv_min_ms,
+                    (weight_mb / baseline.gemv_min_ms / HBM2_PEAK_GBPS) * 100.0);
+            fprintf(stderr, "Best:    TN=%d KB=%d → %.6f ms (%.0f GB/s, %.1f%% peak)\n",
+                    best_tn, best_kb, best_gemv, best_bw, (best_bw / HBM2_PEAK_GBPS) * 100.0);
+            fprintf(stderr, "%s\n", table.to_string().c_str());
+        }
 #endif
     }
 
@@ -1313,12 +1732,12 @@ namespace
 
         fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
         fprintf(stderr, "\n╔══════════════════════════════════════════════════════════════════════════════════╗\n");
-        fprintf(stderr, "║  Bandwidth Roofline Analysis (MI60: 480 GB/s HBM2 theoretical)                 ║\n");
+        fprintf(stderr, "║  Bandwidth Roofline Analysis (MI50: 1000 GB/s HBM2 theoretical)                ║\n");
         fprintf(stderr, "╠═══════════════════╦════════════╦════════════╦══════════╦═════════════════════════╣\n");
         fprintf(stderr, "║ Shape             ║ Weight(MB) ║  Min(ms)   ║  GB/s    ║  %% of HBM2 peak       ║\n");
         fprintf(stderr, "╠═══════════════════╬════════════╬════════════╬══════════╬═════════════════════════╣\n");
 
-        const double HBM2_PEAK_GBPS = 480.0;
+        const double HBM2_PEAK_GBPS = 1000.0;
 
         struct RoofShape
         {

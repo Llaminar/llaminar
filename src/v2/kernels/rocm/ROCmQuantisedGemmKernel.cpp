@@ -348,6 +348,27 @@ namespace llaminar2
                 int device_id, void *stream);
 
             // =========================================================================
+            // Fused scatter+reduce GEMV: 2-kernel pipeline replacing the 3-kernel
+            // (quantize → GEMV → scale) pipeline. Scatter kernel fuses FP32→INT8
+            // quantization + INT8 GEMV and writes unscaled FP32 partials.
+            // Reduce kernel sums partials and applies scale_B + bias.
+            // Eliminates memset, separate quant launch, and one kernel launch.
+            // For KB=1, falls back to single-kernel fused path internally.
+            // Defined in ROCmGemvKernel.hip
+            // =========================================================================
+            bool rocmGemv_fused_scatter_fp32_int8_vnni(
+                const float *d_A_fp32,       // [K] FP32 activations
+                const int8_t *d_B_int8_vnni, // [K/4 × N × 4] VNNI-packed weights
+                float *d_C_fp32,             // [N] FP32 output
+                const float *d_scales_B,     // [N] per-column weight scales
+                const float *d_bias,         // [N] optional bias (nullable)
+                float *d_partial_buf,        // [KB_MAX × N] pre-allocated partial buffer
+                int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing, // [N] used when beta != 0
+                int device_id, void *stream);
+
+            // =========================================================================
             // PREFILL GEMM scaffold entrypoints (M>1)
             //
             // These functions are intentionally scaffold-first in early phases. They
@@ -493,6 +514,9 @@ namespace llaminar2
 
             // Option B: shared scratch buffer for VNNI→row-major repacking (from workspace)
             int8_t *d_B_rowmajor_scratch = nullptr; // [N x K] temporary row-major weights
+
+            // Scatter+reduce partial buffer (from workspace)
+            float *d_scatter_partial = nullptr; // [KB_MAX × N] FP32 scatter partials
 
             // Repack cache metadata (valid only when source pointers, dims, and scratch match)
             bool repack_cache_valid = false;
@@ -2372,14 +2396,16 @@ namespace llaminar2
                         return true;
                     }
 
-                    // Use fused FP32→INT8+GEMV+scale kernel when alpha=1, beta=0 AND fused enabled
+                    // Use fused scatter+reduce GEMV when alpha=1, beta=0 AND fused enabled
                     if (alpha == 1.0f && beta == 0.0f && isFusedGemvEnabled())
                     {
-                        if (!rocmGemv_fused_fp32_int8_vnni(
+                        if (!rocmGemv_fused_scatter_fp32_int8_vnni(
                                 d_input, d_weights_vnni, d_output, d_scales_B, d_bias,
-                                n, k, rocm_device_id_, gpu_stream_))
+                                impl_->d_scatter_partial,
+                                n, k, alpha, beta, nullptr,
+                                rocm_device_id_, gpu_stream_))
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Fused GEMV failed");
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Fused scatter GEMV failed");
                             return false;
                         }
                     }
@@ -3660,15 +3686,17 @@ namespace llaminar2
 
                     if (use_fused_m1 && d_vnni)
                     {
-                        // FUSED PATH: FP32→INT8 quantize + GEMV + scale in one kernel launch
+                        // FUSED SCATTER PATH: FP32→INT8 quantize + GEMV scatter + reduce in 1-2 launches
                         LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
-                                                                                                 << " FUSED GEMV M=1 N=" << n << " K=" << k
+                                                                                                 << " SCATTER GEMV M=1 N=" << n << " K=" << k
                                                                                                  << (d_bias ? " +bias" : ""));
-                        if (!rocmGemv_fused_fp32_int8_vnni(
+                        if (!rocmGemv_fused_scatter_fp32_int8_vnni(
                                 d_input, d_vnni, d_output, d_scales_B, d_bias,
-                                n, k, rocm_device_id_, gpu_stream_))
+                                rocm_kernel->impl_->d_scatter_partial,
+                                n, k, 1.0f, 0.0f, nullptr,
+                                rocm_device_id_, gpu_stream_))
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Fused GEMV failed for projection " << i);
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Scatter GEMV failed for projection " << i);
                             all_success = false;
                             break;
                         }
@@ -4035,6 +4063,15 @@ namespace llaminar2
             // This buffer is reused across layers since they execute sequentially.
             size_t repack_bytes = static_cast<size_t>(n) * k * sizeof(int8_t);
             reqs.buffers.push_back({GemmWorkspaceBuffers::ROCM_B_REPACK, repack_bytes, 256, true});
+
+            // Scatter+reduce partial buffer: KB_MAX × N × sizeof(float)
+            // KB_MAX=64 is the maximum k-blocks the scatter dispatch can produce.
+            // The workspace manager takes max across all kernel instances, so
+            // the largest N (LM Head: 152064) determines the actual allocation.
+            // Size: 64 × 152064 × 4 ≈ 37 MB — reused across layers.
+            constexpr int SCATTER_KB_MAX = 64;
+            size_t scatter_partial_bytes = static_cast<size_t>(SCATTER_KB_MAX) * n * sizeof(float);
+            reqs.buffers.push_back({GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL, scatter_partial_bytes, 256, true});
 
             LOG_DEBUG("[ROCmQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
                       << "quant_a=" << (quant_a_bytes / 1024) << "KB, "
@@ -4596,6 +4633,11 @@ namespace llaminar2
                 throw std::runtime_error(
                     "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ROCM_B_REPACK");
             }
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL))
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ROCM_SCATTER_PARTIAL");
+            }
 
             // Populate impl_ pointers from workspace
             const auto prev_repack_scratch = impl_->d_B_rowmajor_scratch;
@@ -4609,6 +4651,7 @@ namespace llaminar2
             impl_->d_scale_A_padded = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_SCALE_A_PADDED));
             impl_->d_E_padded = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_E_PADDED));
             impl_->d_B_rowmajor_scratch = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_B_REPACK));
+            impl_->d_scatter_partial = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL));
 
             if (impl_->d_B_rowmajor_scratch != prev_repack_scratch)
             {
@@ -4705,14 +4748,16 @@ namespace llaminar2
                         return true;
                     }
 
-                    // Use fused kernel when alpha=1, beta=0 AND fused enabled
+                    // Use fused scatter+reduce when alpha=1, beta=0 AND fused enabled
                     if (alpha == 1.0f && beta == 0.0f && isFusedGemvEnabled() && d_vnni)
                     {
-                        if (!rocmGemv_fused_fp32_int8_vnni(
+                        if (!rocmGemv_fused_scatter_fp32_int8_vnni(
                                 d_A, d_vnni, d_C, d_s, nullptr,
-                                n, k, rocm_device_id_, gpu_stream_))
+                                impl_->d_scatter_partial,
+                                n, k, alpha, beta, nullptr,
+                                rocm_device_id_, gpu_stream_))
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] Fused GEMV failed");
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] Scatter GEMV failed");
                             return false;
                         }
                         return true;
@@ -4895,13 +4940,15 @@ namespace llaminar2
                         return true;
                     }
 
-                    // Use fused kernel when alpha=1, beta=0 AND fused enabled
-                    // Bias handled inside dispatch function via biasAdd
+                    // Use fused scatter+reduce when alpha=1, beta=0 AND fused enabled
+                    // Bias handled inside scatter reduce kernel
                     if (alpha == 1.0f && beta == 0.0f && isFusedGemvEnabled() && d_vnni)
                     {
-                        return rocmGemv_fused_fp32_int8_vnni(
+                        return rocmGemv_fused_scatter_fp32_int8_vnni(
                             d_A, d_vnni, d_C, d_s, d_bias,
-                            n, k, rocm_device_id_, gpu_stream_);
+                            impl_->d_scatter_partial,
+                            n, k, alpha, beta, nullptr,
+                            rocm_device_id_, gpu_stream_);
                     }
 
                     // Fallback: separate quantize → GEMV → applyScaling for non-standard alpha/beta
