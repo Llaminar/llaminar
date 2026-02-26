@@ -2209,7 +2209,6 @@ namespace llaminar2
         bool trace_coherence = false;           ///< Log detailed coherence timings (LLAMINAR_ROCM_TRACE_COHERENCE)
         bool trace_kernels = false;             ///< Log per-kernel timing breakdown (LLAMINAR_ROCM_TRACE_KERNELS)
         bool sync_after_kernel = false;         ///< Force sync after each kernel (LLAMINAR_ROCM_SYNC_AFTER_KERNEL)
-        bool fused_gemv = false;                ///< Enable fused GEMV path (LLAMINAR_FUSED_GEMV)
         std::string gemv_mode = "fp32";         ///< GEMV mode: fp32 (default), fp16, int8
         std::string gemv_layout = "row";        ///< GEMV weight layout: row (default), vnni
         bool pack_vnni_only_host = false;       ///< Prefer VNNI-only host packed buffers (LLAMINAR_ROCM_PACK_VNNI_ONLY)
@@ -2251,7 +2250,6 @@ namespace llaminar2
             trace_coherence = false;
             trace_kernels = false;
             sync_after_kernel = false;
-            fused_gemv = false;
             gemv_mode = "fp32";
             gemv_layout = "row";
             pack_vnni_only_host = false;
@@ -2299,12 +2297,6 @@ namespace llaminar2
             if (sync_env)
             {
                 sync_after_kernel = (std::atoi(sync_env) != 0);
-            }
-
-            const char *fused_gemv_env = std::getenv("LLAMINAR_FUSED_GEMV");
-            if (fused_gemv_env)
-            {
-                fused_gemv = (std::atoi(fused_gemv_env) != 0);
             }
 
             const char *gemv_env = std::getenv("LLAMINAR_ROCM_GEMV_MODE");

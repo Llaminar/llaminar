@@ -766,13 +766,6 @@ namespace llaminar2
              */
             void validateWorkspace() const;
 
-            /**
-             * @brief Return whether fused GEMV fast path is enabled.
-             *
-             * Uses per-instance log-once state to avoid process-global mutable state.
-             */
-            bool isFusedGemvEnabled();
-
             // =========================================================================
             // Member data
             // =========================================================================
@@ -800,8 +793,6 @@ namespace llaminar2
 
             // Per-instance synchronization/logging state (no process-global mutable statics)
             std::unique_ptr<std::mutex> ck_dispatch_mutex_;
-            bool fused_gemv_logged_enabled_once_ = false;
-
             // PIMPL for CK implementation (avoids CK headers in this header)
             struct Impl;
             std::unique_ptr<Impl> impl_;

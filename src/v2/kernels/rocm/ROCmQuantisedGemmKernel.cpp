@@ -369,6 +369,46 @@ namespace llaminar2
                 int device_id, void *stream);
 
             // =========================================================================
+            // INT8-input scatter GEMV: pre-quantized activations + hybrid self-reduce.
+            // Combines "quantize once" efficiency with scatter pipeline benefits
+            // (no atomicAdd, no memset). Uses self-reduce for small N (K/V),
+            // 2-kernel scatter+reduce for large N (Q/Wo/FFN).
+            // Defined in ROCmGemvKernel.hip
+            // =========================================================================
+            bool rocmGemv_int8_scatter_vnni(
+                const int8_t *d_A_int8,      // [K] pre-quantized INT8 activations
+                const int8_t *d_B_int8_vnni, // [K/4 × N × 4] VNNI-packed weights
+                float *d_C_fp32,             // [N] FP32 output
+                const float *d_scale_A,      // [1] activation scale (device pointer)
+                const float *d_scales_B,     // [N] per-column weight scales
+                const float *d_bias,         // [N] optional bias (nullable)
+                float *d_partial_buf,        // [KB_MAX × N] pre-allocated partial buffer
+                int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing, // [N] used when beta != 0
+                int device_id, void *stream);
+
+            // =========================================================================
+            // Batched INT8 scatter GEMV: multiple projections in 2 kernel launches.
+            // QKV: 6→2 launches, Gate/Up: 4→2 launches.
+            // Better reduce occupancy from batched grid.
+            // Defined in ROCmGemvKernel.hip
+            // =========================================================================
+            bool rocmGemv_int8_scatter_batched_vnni(
+                const int8_t *d_A_int8,            // [K] pre-quantized INT8 activations
+                const float *d_scale_A,            // [1] activation scale (device pointer)
+                float *d_partial_buf,              // [KB_MAX × max_N] partial buffer
+                int num_projections,               // Number of projections (1..8)
+                const int8_t *const *d_B_ptrs,     // [num_proj] VNNI weight pointers
+                float *const *d_C_ptrs,            // [num_proj] FP32 output pointers
+                const float *const *d_scales_B_ptrs, // [num_proj] weight scale pointers
+                const float *const *d_bias_ptrs,   // [num_proj] bias pointers
+                const int *N_per_proj,             // [num_proj] output dimensions
+                int K,
+                float alpha, float beta,
+                int device_id, void *stream);
+
+            // =========================================================================
             // PREFILL GEMM scaffold entrypoints (M>1)
             //
             // These functions are intentionally scaffold-first in early phases. They
@@ -1553,21 +1593,6 @@ namespace llaminar2
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(ROCmQuantisedGemmKernel &&) noexcept = default;
         ROCmQuantisedGemmKernel &ROCmQuantisedGemmKernel::operator=(ROCmQuantisedGemmKernel &&) noexcept = default;
 
-        bool ROCmQuantisedGemmKernel::isFusedGemvEnabled()
-        {
-            const bool enabled = debugEnv().rocm.fused_gemv;
-            if (enabled && !fused_gemv_logged_enabled_once_)
-            {
-                std::lock_guard<std::mutex> lock(*ck_dispatch_mutex_);
-                if (!fused_gemv_logged_enabled_once_)
-                {
-                    LOG_INFO("[ROCmQuantisedGemmKernel] Fused GEMV enabled via DebugEnv (LLAMINAR_FUSED_GEMV=1)");
-                    fused_gemv_logged_enabled_once_ = true;
-                }
-            }
-            return enabled;
-        }
-
         /**
          * @brief Classify the best prefill route for the current shape and weight format.
          *
@@ -2396,16 +2421,23 @@ namespace llaminar2
                         return true;
                     }
 
-                    // Use fused scatter+reduce GEMV when alpha=1, beta=0 AND fused enabled
-                    if (alpha == 1.0f && beta == 0.0f && isFusedGemvEnabled())
+                    // Use INT8 scatter+reduce GEMV when alpha=1, beta=0 AND VNNI weights available
+                    if (alpha == 1.0f && beta == 0.0f && d_weights_vnni)
                     {
-                        if (!rocmGemv_fused_scatter_fp32_int8_vnni(
-                                d_input, d_weights_vnni, d_output, d_scales_B, d_bias,
+                        // Quantize activations (uses shared INT8 buffer)
+                        if (!rocmQuantGemm_quantizeActivations(
+                                d_input, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 scatter activation quantization failed");
+                            return false;
+                        }
+                        if (!rocmGemv_int8_scatter_vnni(
+                                impl_->d_A_int8, d_weights_vnni, d_output, impl_->d_scales_A, d_scales_B, d_bias,
                                 impl_->d_scatter_partial,
                                 n, k, alpha, beta, nullptr,
                                 rocm_device_id_, gpu_stream_))
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Fused scatter GEMV failed");
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 scatter GEMV failed");
                             return false;
                         }
                     }
@@ -3393,12 +3425,9 @@ namespace llaminar2
             // Step 2: Validate and populate workspace pointers (shared across all projections)
             validateWorkspace();
 
-            const bool use_fused_m1 = (m == 1 && isFusedGemvEnabled());
-
             // Step 3: Quantize activations ONCE (shared across all projections)
-            // For M=1 with fused GEMV, quantization is done in-kernel (shared memory).
-            // For M>1 or M=1 fallback, use the separate quantization kernel.
-            if (!use_fused_m1)
+            // All M=1 paths now use INT8 scatter kernels which require pre-quantized
+            // activations. For M>1, CK GEMM also uses pre-quantized activations.
             {
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Quantizing activations once, m=" << m << " k=" << k);
 
@@ -3413,15 +3442,20 @@ namespace llaminar2
                     return false;
                 }
             }
-            else
-            {
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] M=1 fused path: skipping separate quantize kernel");
-            }
 
-            // Step 4: Execute each projection using the SHARED quantized activations
+            // Step 4: Execute projections using the SHARED quantized activations
+            // For M=1, VNNI projections are batched into a single kernel dispatch.
+            // Native-VNNI (Q4/IQ4) and M>1 projections are dispatched individually.
             bool all_success = true;
-            bool native_vnni_quantized = !use_fused_m1; // If !use_fused_m1, quantization was already done above
             const bool serialize_rocm_gemm = debugEnv().validation.serialize_rocm_gemm_stage;
+
+            // Batched INT8 scatter GEMV collection arrays (for M=1 VNNI projections)
+            const int8_t* batch_B_ptrs[8] = {};
+            float* batch_C_ptrs[8] = {};
+            const float* batch_scales_B_ptrs[8] = {};
+            const float* batch_bias_ptrs[8] = {};
+            int batch_N[8] = {};
+            int batch_count = 0;
 
             auto runCKDispatch = [&](auto &&dispatch_fn, const char *op_name) -> bool
             {
@@ -3637,20 +3671,7 @@ namespace llaminar2
                     // Native-VNNI path: lossless Q4/IQ4 decode with FP16 block scales
                     if (rocm_kernel->impl_->has_native_vnni)
                     {
-                        // Ensure activations are quantized (fused path may have skipped quantization)
-                        if (use_fused_m1 && !native_vnni_quantized)
-                        {
-                            if (!rocmQuantGemm_quantizeActivations(
-                                    const_cast<float *>(d_input), impl_->d_A_int8, impl_->d_scales_A,
-                                    m, k, rocm_device_id_, gpu_stream_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI activation quantization failed for projection " << i);
-                                all_success = false;
-                                break;
-                            }
-                            native_vnni_quantized = true;
-                        }
-
+                        // Activations are always pre-quantized above (Step 3)
                         LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                                  << " NATIVE-VNNI GEMV M=1 N=" << n << " K=" << k
                                                                                                  << (d_bias ? " +bias" : ""));
@@ -3684,82 +3705,47 @@ namespace llaminar2
                         continue;
                     }
 
-                    if (use_fused_m1 && d_vnni)
+                    // BATCHED INT8 SCATTER PATH: collect pointers for single batched dispatch
+                    // All VNNI projections with the same K are batched into 2 kernel launches
+                    // (1 batched scatter + 1 batched reduce) instead of 2N individual launches.
+                    if (d_vnni && batch_count < 8)
                     {
-                        // FUSED SCATTER PATH: FP32→INT8 quantize + GEMV scatter + reduce in 1-2 launches
                         LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
-                                                                                                 << " SCATTER GEMV M=1 N=" << n << " K=" << k
+                                                                                                 << " (" << (proj.name ? proj.name : "unnamed")
+                                                                                                 << ") BATCHED SCATTER collect: N=" << n << " K=" << k
                                                                                                  << (d_bias ? " +bias" : ""));
-                        if (!rocmGemv_fused_scatter_fp32_int8_vnni(
-                                d_input, d_vnni, d_output, d_scales_B, d_bias,
+                        batch_B_ptrs[batch_count] = d_vnni;
+                        batch_C_ptrs[batch_count] = d_output;
+                        batch_scales_B_ptrs[batch_count] = d_scales_B;
+                        batch_bias_ptrs[batch_count] = d_bias;
+                        batch_N[batch_count] = n;
+                        batch_count++;
+                        continue; // Dispatch happens after the loop
+                    }
+
+                    // Fallback: single-projection INT8 scatter (batch overflow or no VNNI)
+                    if (d_vnni)
+                    {
+                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                                 << " SINGLE INT8 SCATTER M=1 N=" << n << " K=" << k);
+                        if (!rocmGemv_int8_scatter_vnni(
+                                impl_->d_A_int8, d_vnni, d_output,
+                                impl_->d_scales_A, d_scales_B, d_bias,
                                 rocm_kernel->impl_->d_scatter_partial,
                                 n, k, 1.0f, 0.0f, nullptr,
                                 rocm_device_id_, gpu_stream_))
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Scatter GEMV failed for projection " << i);
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] INT8 scatter GEMV failed for projection " << i);
                             all_success = false;
                             break;
                         }
                     }
                     else
                     {
-                        // OLD PATH: separate quantize (already done above) → GEMV → applyScaling
-                        const size_t gemv_int32_size = static_cast<size_t>(n);
-                        if (gemv_int32_size > rocm_kernel->impl_->d_CK_int32_capacity)
-                        {
-                            if (rocm_kernel->impl_->d_CK_int32)
-                                rocmQuantGemm_freeDevice(rocm_kernel->impl_->d_CK_int32, rocm_device_id_);
-                            rocm_kernel->impl_->d_CK_int32 = nullptr;
-                            rocm_kernel->impl_->d_CK_int32_capacity = 0;
-
-                            if (!rocmQuantGemm_allocInt32(&rocm_kernel->impl_->d_CK_int32, gemv_int32_size, rocm_device_id_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to allocate GEMV INT32 buffer");
-                                all_success = false;
-                                break;
-                            }
-                            rocm_kernel->impl_->d_CK_int32_capacity = gemv_int32_size;
-                        }
-
-                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
-                                                                                                 << " OLD GEMV M=1 N=" << n << " K=" << k
-                                                                                                 << (d_bias ? " +bias" : ""));
-
-                        bool fused_scale = false;
-                        bool gemv_ok = false;
-                        if (d_vnni)
-                        {
-                            fused_scale = rocmGemv_int8_int8_fp32_vnni_scaled(
-                                impl_->d_A_int8, d_vnni, d_output,
-                                impl_->d_scales_A, d_scales_B,
-                                n, k,
-                                1.0f, 0.0f,
-                                nullptr, d_bias,
-                                rocm_device_id_, gpu_stream_);
-
-                            if (!fused_scale)
-                            {
-                                gemv_ok = rocmGemv_int8_int8_int32_vnni(
-                                    impl_->d_A_int8, d_vnni, rocm_kernel->impl_->d_CK_int32,
-                                    n, k, rocm_device_id_, gpu_stream_);
-                            }
-                        }
-
-                        if (!fused_scale && !gemv_ok)
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] GEMV failed for projection " << i);
-                            all_success = false;
-                            break;
-                        }
-
-                        if (!fused_scale && !rocmQuantGemm_applyScaling(
-                                                rocm_kernel->impl_->d_CK_int32, d_output, impl_->d_scales_A, d_scales_B,
-                                                m, n, 1.0f, 0.0f, nullptr, d_bias, rocm_device_id_, gpu_stream_))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] GEMV scaling failed for projection " << i);
-                            all_success = false;
-                            break;
-                        }
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                                 << " has no VNNI weights and is not native-VNNI");
+                        all_success = false;
+                        break;
                     }
 
                     LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " GEMV complete");
@@ -3953,6 +3939,43 @@ namespace llaminar2
                 }
 
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " complete");
+            }
+
+            // =========================================================================
+            // BATCHED INT8 SCATTER DISPATCH: process all collected VNNI projections
+            // in a single 2-kernel launch (1 batched scatter + 1 batched reduce).
+            //
+            // This replaces N individual kernel launches with 2, saving launch overhead
+            // and improving GPU utilization (especially for small-N projections like K/V
+            // which individually have only 4 n-blocks but batched with Q get 36).
+            // =========================================================================
+            if (batch_count > 0 && all_success)
+            {
+                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Dispatching BATCHED INT8 SCATTER: "
+                          << batch_count << " projections, K=" << k);
+
+                if (!rocmGemv_int8_scatter_batched_vnni(
+                        impl_->d_A_int8,               // Pre-quantized INT8 activations
+                        impl_->d_scales_A,             // Activation scale
+                        impl_->d_scatter_partial,      // Shared partial buffer (workspace-managed)
+                        batch_count,
+                        batch_B_ptrs,
+                        batch_C_ptrs,
+                        batch_scales_B_ptrs,
+                        batch_bias_ptrs,
+                        batch_N,
+                        k,
+                        1.0f, 0.0f,
+                        rocm_device_id_, gpu_stream_))
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Batched INT8 scatter dispatch failed");
+                    all_success = false;
+                }
+                else
+                {
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Batched INT8 scatter complete: "
+                              << batch_count << " projections in 2 kernel launches");
+                }
             }
 
             // Restore original workspace binding
@@ -4748,16 +4771,23 @@ namespace llaminar2
                         return true;
                     }
 
-                    // Use fused scatter+reduce when alpha=1, beta=0 AND fused enabled
-                    if (alpha == 1.0f && beta == 0.0f && isFusedGemvEnabled() && d_vnni)
+                    // Use INT8 scatter+reduce GEMV when alpha=1, beta=0 AND VNNI weights available
+                    if (alpha == 1.0f && beta == 0.0f && d_vnni)
                     {
-                        if (!rocmGemv_fused_scatter_fp32_int8_vnni(
-                                d_A, d_vnni, d_C, d_s, nullptr,
+                        // Quantize activations (uses shared INT8 buffer)
+                        if (!rocmQuantGemm_quantizeActivations(
+                                d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 scatter activation quantization failed");
+                            return false;
+                        }
+                        if (!rocmGemv_int8_scatter_vnni(
+                                impl_->d_A_int8, d_vnni, d_C, impl_->d_scales_A, d_s, nullptr,
                                 impl_->d_scatter_partial,
                                 n, k, alpha, beta, nullptr,
                                 rocm_device_id_, gpu_stream_))
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] Scatter GEMV failed");
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 scatter GEMV failed");
                             return false;
                         }
                         return true;
@@ -4940,12 +4970,19 @@ namespace llaminar2
                         return true;
                     }
 
-                    // Use fused scatter+reduce when alpha=1, beta=0 AND fused enabled
+                    // Use INT8 scatter+reduce GEMV when alpha=1, beta=0 AND VNNI weights available
                     // Bias handled inside scatter reduce kernel
-                    if (alpha == 1.0f && beta == 0.0f && isFusedGemvEnabled() && d_vnni)
+                    if (alpha == 1.0f && beta == 0.0f && d_vnni)
                     {
-                        return rocmGemv_fused_scatter_fp32_int8_vnni(
-                            d_A, d_vnni, d_C, d_s, d_bias,
+                        // Quantize activations (uses shared INT8 buffer)
+                        if (!rocmQuantGemm_quantizeActivations(
+                                d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 scatter activation quantization failed");
+                            return false;
+                        }
+                        return rocmGemv_int8_scatter_vnni(
+                            impl_->d_A_int8, d_vnni, d_C, impl_->d_scales_A, d_s, d_bias,
                             impl_->d_scatter_partial,
                             n, k, alpha, beta, nullptr,
                             rocm_device_id_, gpu_stream_);
