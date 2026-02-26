@@ -102,6 +102,8 @@ namespace llaminar2
 
     bool GEMMStage::execute(IDeviceContext *ctx)
     {
+        ScopedGemmContext gemm_ctx(params_.gemm_context);
+
         if (!ctx)
         {
             LOG_ERROR("[GEMMStage] Null device context");

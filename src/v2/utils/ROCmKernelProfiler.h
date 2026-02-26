@@ -20,7 +20,7 @@
  *   // Option 2: Manual timing
  *   ROCM_KERNEL_PROFILE_BEGIN(timer);
  *   // ... launch kernel ...
- *   ROCM_KERNEL_PROFILE_END(timer, ROCmKernelType::GEMM_CK);
+ *   ROCM_KERNEL_PROFILE_END(timer, ROCmKernelType::GEMM);
  *
  * At end of inference, call ROCmKernelProfiler::printSummary() to see results.
  */
@@ -38,6 +38,7 @@
 #include <algorithm>
 
 #include "DebugEnv.h"
+#include "GemmContext.h"
 #include "fort.hpp"
 
 // Forward declare HIP types to avoid including hip_runtime.h in header
@@ -57,7 +58,10 @@ namespace llaminar2
     enum class ROCmKernelType : uint8_t
     {
         // GEMM variants
-        GEMM_CK = 0,         ///< Composable Kernel INT8/FP8 GEMM
+        GEMM = 0,            ///< Generic GEMM (untagged context)
+        GEMM_ATTN,           ///< Attention GEMM (QKV projections, Wo)
+        GEMM_FFN,            ///< FFN GEMM (gate, up, down projections)
+        GEMM_LM_HEAD,        ///< LM head projection GEMM
         GEMM_ROCBLAS,        ///< rocBLAS FP32/FP16/BF16 GEMM
         GEMM_WEIGHT_CONVERT, ///< Weight quantization/conversion
         GEMM_SCALE_OUTPUT,   ///< Output rescaling after INT8 GEMM
@@ -100,8 +104,14 @@ namespace llaminar2
     {
         switch (type)
         {
-        case ROCmKernelType::GEMM_CK:
-            return "GEMM_CK";
+        case ROCmKernelType::GEMM:
+            return "GEMM";
+        case ROCmKernelType::GEMM_ATTN:
+            return "GEMM_ATTN";
+        case ROCmKernelType::GEMM_FFN:
+            return "GEMM_FFN";
+        case ROCmKernelType::GEMM_LM_HEAD:
+            return "GEMM_LM_HEAD";
         case ROCmKernelType::GEMM_ROCBLAS:
             return "GEMM_ROCBLAS";
         case ROCmKernelType::GEMM_WEIGHT_CONVERT:
@@ -219,9 +229,18 @@ namespace llaminar2
 
         /**
          * @brief Record a kernel timing (in microseconds)
+         *
+         * When recording a GEMM type, the current GemmContext is checked
+         * to remap to the appropriate sub-type (GEMM_ATTN, GEMM_FFN, GEMM_LM_HEAD).
          */
         static void record(ROCmKernelType type, double elapsed_us)
         {
+            // Remap generic GEMM to context-specific sub-type
+            if (type == ROCmKernelType::GEMM)
+            {
+                type = remapGemmType(type);
+            }
+
             auto &inst = getInstance();
             std::lock_guard<std::mutex> lock(inst.mutex_);
 
@@ -270,6 +289,12 @@ namespace llaminar2
          */
         static void record(ROCmKernelType type, double elapsed_us, int device_id)
         {
+            // Remap generic GEMM to context-specific sub-type
+            if (type == ROCmKernelType::GEMM)
+            {
+                type = remapGemmType(type);
+            }
+
             auto &inst = getInstance();
             std::lock_guard<std::mutex> lock(inst.mutex_);
 
@@ -783,6 +808,25 @@ namespace llaminar2
         {
             static thread_local Phase phase = Phase::COMBINED;
             return phase;
+        }
+
+        /**
+         * @brief Remap generic GEMM type to context-specific sub-type
+         */
+        static ROCmKernelType remapGemmType(ROCmKernelType type)
+        {
+            GemmContext ctx = currentGemmContext();
+            switch (ctx)
+            {
+            case GemmContext::ATTN:
+                return ROCmKernelType::GEMM_ATTN;
+            case GemmContext::FFN:
+                return ROCmKernelType::GEMM_FFN;
+            case GemmContext::LM_HEAD:
+                return ROCmKernelType::GEMM_LM_HEAD;
+            default:
+                return type; // Keep as generic GEMM
+            }
         }
 
         std::mutex mutex_;

@@ -1031,7 +1031,7 @@ namespace llaminar2
 
                 // Execute CUTLASS INT8 GEMM using SHARED quantized activations and this kernel's weights
                 {
-                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUTLASS);
+                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
                     if (!cudaQuantGemm_execute(
                             d_A_int8,                           // SHARED quantized activations (from this kernel's workspace)
                             cuda_kernel->impl_->d_weights_int8, // This projection's weights
@@ -1243,7 +1243,7 @@ namespace llaminar2
 
             // Step 2: Execute CUTLASS INT8 GEMM
             {
-                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUTLASS);
+                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
                 if (!cudaQuantGemm_execute(
                         d_A_int8, impl_->d_weights_int8, d_C_int32,
                         m, n, k, cuda_device_id_, gpu_stream_))
@@ -1342,7 +1342,7 @@ namespace llaminar2
 
             // Step 2: Execute CUTLASS INT8 GEMM
             {
-                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUTLASS);
+                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
                 if (!cudaQuantGemm_execute(
                         d_A_int8, impl_->d_weights_int8, d_C_int32,
                         m, n, k, cuda_device_id_, gpu_stream_))

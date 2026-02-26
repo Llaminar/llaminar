@@ -20,7 +20,7 @@
  *   // Option 2: Manual timing
  *   CUDA_KERNEL_PROFILE_BEGIN(timer);
  *   // ... launch kernel ...
- *   CUDA_KERNEL_PROFILE_END(timer, CUDAKernelType::GEMM_CUTLASS);
+ *   CUDA_KERNEL_PROFILE_END(timer, CUDAKernelType::GEMM);
  *
  * At end of inference, call CUDAKernelProfiler::printSummary() to see results.
  */
@@ -38,6 +38,7 @@
 #include <algorithm>
 
 #include "DebugEnv.h"
+#include "GemmContext.h"
 #include "fort.hpp"
 
 // Forward declare CUDA types to avoid including cuda_runtime.h in header
@@ -57,7 +58,10 @@ namespace llaminar2
     enum class CUDAKernelType : uint8_t
     {
         // GEMM variants
-        GEMM_CUTLASS = 0,    ///< CUTLASS INT8 quantized GEMM
+        GEMM = 0,            ///< Generic GEMM (untagged context)
+        GEMM_ATTN,           ///< Attention GEMM (QKV projections, Wo)
+        GEMM_FFN,            ///< FFN GEMM (gate, up, down projections)
+        GEMM_LM_HEAD,        ///< LM head projection GEMM
         GEMM_CUBLAS,         ///< cuBLAS FP32/FP16/BF16 GEMM
         GEMM_WEIGHT_CONVERT, ///< Weight quantization/conversion
         GEMM_SCALE_OUTPUT,   ///< Output rescaling after INT8 GEMM
@@ -100,8 +104,14 @@ namespace llaminar2
     {
         switch (type)
         {
-        case CUDAKernelType::GEMM_CUTLASS:
-            return "GEMM_CUTLASS";
+        case CUDAKernelType::GEMM:
+            return "GEMM";
+        case CUDAKernelType::GEMM_ATTN:
+            return "GEMM_ATTN";
+        case CUDAKernelType::GEMM_FFN:
+            return "GEMM_FFN";
+        case CUDAKernelType::GEMM_LM_HEAD:
+            return "GEMM_LM_HEAD";
         case CUDAKernelType::GEMM_CUBLAS:
             return "GEMM_CUBLAS";
         case CUDAKernelType::GEMM_WEIGHT_CONVERT:
@@ -241,9 +251,18 @@ namespace llaminar2
 
         /**
          * @brief Record a kernel timing (in microseconds, auto-attributes to current device)
+         *
+         * When recording a GEMM type, the current GemmContext is checked
+         * to remap to the appropriate sub-type (GEMM_ATTN, GEMM_FFN, GEMM_LM_HEAD).
          */
         static void record(CUDAKernelType type, double elapsed_us)
         {
+            // Remap generic GEMM to context-specific sub-type
+            if (type == CUDAKernelType::GEMM)
+            {
+                type = remapGemmType(type);
+            }
+
             auto &inst = getInstance();
             std::lock_guard<std::mutex> lock(inst.mutex_);
 
@@ -272,6 +291,12 @@ namespace llaminar2
          */
         static void record(CUDAKernelType type, double elapsed_us, int device_id)
         {
+            // Remap generic GEMM to context-specific sub-type
+            if (type == CUDAKernelType::GEMM)
+            {
+                type = remapGemmType(type);
+            }
+
             auto &inst = getInstance();
             std::lock_guard<std::mutex> lock(inst.mutex_);
 
@@ -755,6 +780,25 @@ namespace llaminar2
         {
             static thread_local Phase phase = Phase::COMBINED;
             return phase;
+        }
+
+        /**
+         * @brief Remap generic GEMM type to context-specific sub-type
+         */
+        static CUDAKernelType remapGemmType(CUDAKernelType type)
+        {
+            GemmContext ctx = currentGemmContext();
+            switch (ctx)
+            {
+            case GemmContext::ATTN:
+                return CUDAKernelType::GEMM_ATTN;
+            case GemmContext::FFN:
+                return CUDAKernelType::GEMM_FFN;
+            case GemmContext::LM_HEAD:
+                return CUDAKernelType::GEMM_LM_HEAD;
+            default:
+                return type; // Keep as generic GEMM
+            }
         }
 
         std::mutex mutex_;

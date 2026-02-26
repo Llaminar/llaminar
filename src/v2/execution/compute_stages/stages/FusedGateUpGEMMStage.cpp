@@ -10,6 +10,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
+#include "../../../utils/GemmContext.h"
 
 namespace llaminar2
 {
@@ -25,6 +26,8 @@ namespace llaminar2
 
     bool FusedGateUpGEMMStage::execute(IDeviceContext *ctx)
     {
+        ScopedGemmContext gemm_ctx(GemmContext::FFN);
+
         LOG_DEBUG("[FusedGateUpGEMMStage] Execute: m=" << params_.m << " k=" << params_.k
                                                        << " n_gate=" << params_.n_gate << " n_up=" << params_.n_up);
 

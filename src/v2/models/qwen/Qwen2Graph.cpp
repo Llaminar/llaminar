@@ -2024,7 +2024,8 @@ namespace llaminar2
                                           .k = wo_k,
                                           .alpha = 1.0f,
                                           .beta = 0.0f,
-                                          .transpose_B = false}),
+                                          .transpose_B = false,
+                                          .gemm_context = GemmContext::ATTN}),
                                   device);
 
                     if (env.execution.exec_attention)
@@ -2209,7 +2210,8 @@ namespace llaminar2
                                   .k = down_k,
                                   .alpha = 1.0f,
                                   .beta = 0.0f,
-                                  .transpose_B = false}),
+                                  .transpose_B = false,
+                                  .gemm_context = GemmContext::FFN}),
                           device);
 
             if (env.execution.exec_swiglu)

@@ -8,6 +8,7 @@
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
+#include "../../../utils/GemmContext.h"
 
 namespace llaminar2
 {
@@ -98,6 +99,14 @@ namespace llaminar2
              * @brief Whether this GEMM requires AllReduce after execution
              */
             bool needs_allreduce = false;
+
+            /**
+             * @brief GEMM profiling context (attention, FFN, LM head)
+             *
+             * Used by GPU kernel profilers to attribute GEMM time to the
+             * correct functional category. Set by the graph builder.
+             */
+            GemmContext gemm_context = GemmContext::NONE;
         };
 
         explicit GEMMStage(Params params);

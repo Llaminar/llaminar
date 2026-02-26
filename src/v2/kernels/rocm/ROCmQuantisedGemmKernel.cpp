@@ -2198,7 +2198,7 @@ namespace llaminar2
             DeviceWorkspaceManager *workspace,
             int activation_row_offset)
         {
-            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_CK, static_cast<hipStream_t>(gpu_stream_));
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM, static_cast<hipStream_t>(gpu_stream_));
             (void)mpi_ctx;
             (void)device_idx;
             (void)transpose_B;

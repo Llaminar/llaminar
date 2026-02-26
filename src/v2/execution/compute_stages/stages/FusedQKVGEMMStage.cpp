@@ -10,6 +10,7 @@
 #include "../../../tensors/FP16Utils.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
+#include "../../../utils/GemmContext.h"
 
 #include <cmath>
 #include <cstring>
@@ -29,6 +30,8 @@ namespace llaminar2
 
     bool FusedQKVGEMMStage::execute(IDeviceContext *ctx)
     {
+        ScopedGemmContext gemm_ctx(GemmContext::ATTN);
+
         LOG_DEBUG("[FusedQKVGEMMStage] Execute: m=" << params_.m << " k=" << params_.k
                                                     << " n_q=" << params_.n_q << " n_k=" << params_.n_k << " n_v=" << params_.n_v
                                                     << " device=" << params_.device_id.to_string());

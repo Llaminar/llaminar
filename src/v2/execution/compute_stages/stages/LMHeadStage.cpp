@@ -8,6 +8,7 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
+#include "../../../utils/GemmContext.h"
 
 namespace llaminar2
 {
@@ -23,6 +24,8 @@ namespace llaminar2
 
     bool LMHeadStage::execute(IDeviceContext *ctx)
     {
+        ScopedGemmContext gemm_ctx(GemmContext::LM_HEAD);
+
         LOG_DEBUG("[LMHeadStage] Execute: seq_len=" << params_.seq_len
                                                     << " d_model=" << params_.d_model
                                                     << " vocab_size=" << params_.vocab_size);
