@@ -206,6 +206,12 @@ namespace llaminar2
 
             // GPU stream for graph capture (nullptr = default stream)
             void *gpu_stream_ = nullptr;
+
+            // Cached HBM redirect buffer for mapped output memory
+            // When output is host-mapped (e.g., logits), scattered GPU writes go over PCIe.
+            // This provides an HBM staging buffer; we bulk-DMA to mapped memory after.
+            float *d_mapped_redirect_ = nullptr;
+            size_t mapped_redirect_capacity_ = 0;
         };
 
     } // namespace cuda

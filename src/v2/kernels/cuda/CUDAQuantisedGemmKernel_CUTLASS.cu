@@ -544,6 +544,18 @@ extern "C"
     }
 
     /**
+     * @brief Async device-to-device float copy (for mapped output redirect)
+     */
+    bool cudaQuantGemm_copyDeviceToDeviceAsync(float *d_dst, const float *d_src, size_t count, int cuda_device_id, void *stream)
+    {
+        CUDA_CHECK(cudaSetDevice(cuda_device_id));
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        CUDA_CHECK(cudaMemcpyAsync(d_dst, d_src, count * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, cuda_stream));
+        return true;
+    }
+
+    /**
      * @brief Set active CUDA device
      */
     bool cudaQuantGemm_setDevice(int cuda_device_id)

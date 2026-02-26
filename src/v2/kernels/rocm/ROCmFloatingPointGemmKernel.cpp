@@ -26,6 +26,8 @@
 #include "utils/ROCmKernelProfiler.h"
 
 #include <stdexcept>
+#include <mutex>
+#include <hip/hip_runtime.h>
 
 namespace llaminar2
 {
@@ -99,7 +101,15 @@ namespace llaminar2
                                                                    << " (using cached hipBLAS kernel)");
         }
 
-        ROCmFloatingPointGemmKernel::~ROCmFloatingPointGemmKernel() = default;
+        ROCmFloatingPointGemmKernel::~ROCmFloatingPointGemmKernel()
+        {
+            if (d_mapped_redirect_)
+            {
+                hipFree(d_mapped_redirect_);
+                d_mapped_redirect_ = nullptr;
+                mapped_redirect_capacity_ = 0;
+            }
+        }
 
         ROCmFloatingPointGemmKernel::ROCmFloatingPointGemmKernel(ROCmFloatingPointGemmKernel &&other) noexcept
             : weights_(other.weights_),
@@ -108,10 +118,14 @@ namespace llaminar2
               precision_(other.precision_),
               N_(other.N_),
               K_(other.K_),
-              hipblas_kernel_(other.hipblas_kernel_) // Just copy the shared pointer
+              hipblas_kernel_(other.hipblas_kernel_), // Just copy the shared pointer
+              d_mapped_redirect_(other.d_mapped_redirect_),
+              mapped_redirect_capacity_(other.mapped_redirect_capacity_)
         {
             other.weights_ = nullptr;
             other.d_weights_ = nullptr;
+            other.d_mapped_redirect_ = nullptr;
+            other.mapped_redirect_capacity_ = 0;
             // Note: don't null other.hipblas_kernel_ - it's shared, not owned
         }
 
@@ -130,6 +144,14 @@ namespace llaminar2
                 other.weights_ = nullptr;
                 other.d_weights_ = nullptr;
                 // Note: don't null other.hipblas_kernel_ - it's shared, not owned
+
+                // Transfer redirect buffer ownership
+                if (d_mapped_redirect_)
+                    hipFree(d_mapped_redirect_);
+                d_mapped_redirect_ = other.d_mapped_redirect_;
+                mapped_redirect_capacity_ = other.mapped_redirect_capacity_;
+                other.d_mapped_redirect_ = nullptr;
+                other.mapped_redirect_capacity_ = 0;
             }
             return *this;
         }
@@ -228,6 +250,32 @@ namespace llaminar2
                 return false;
             }
 
+            // =================================================================
+            // MAPPED OUTPUT REDIRECT: Detect host-mapped FP32 output memory.
+            // Mapped memory (used for logits) causes PCIe-speed scattered writes
+            // instead of HBM-speed writes. Redirect to HBM buffer, then bulk DMA.
+            // =================================================================
+            float *d_mapped_output = nullptr;
+            if (C->isMapped())
+            {
+                const size_t needed = static_cast<size_t>(m) * n;
+                if (needed > mapped_redirect_capacity_)
+                {
+                    if (d_mapped_redirect_)
+                        hipFree(d_mapped_redirect_);
+                    hipMalloc(&d_mapped_redirect_, needed * sizeof(float));
+                    mapped_redirect_capacity_ = needed;
+                }
+                d_mapped_output = d_C;
+                d_C = d_mapped_redirect_;
+                static std::once_flag fp32gemm_mapped_once;
+                std::call_once(fp32gemm_mapped_once, [&]() {
+                    LOG_WARN("[ROCmFloatingPointGemmKernel] MAPPED REDIRECT: M=" << m << " N=" << n
+                             << " mapped_ptr=" << d_mapped_output << " -> hbm=" << d_C
+                             << " (" << (needed * 4 / 1024) << " KB)");
+                });
+            }
+
             // Apply activation row offset
             if (activation_row_offset > 0)
             {
@@ -263,7 +311,7 @@ namespace llaminar2
             // Use fused GEMM+bias when bias is provided, otherwise use regular GEMM
             if (d_bias)
             {
-                return hipblas_kernel_->execute_with_bias(
+                bool success = hipblas_kernel_->execute_with_bias(
                     d_A,                                    // d_A
                     static_cast<const float *>(d_weights_), // d_B
                     d_C,                                    // d_C
@@ -272,10 +320,19 @@ namespace llaminar2
                     false,       // transA = false
                     transpose_B, // transB
                     alpha, beta);
+                // Bulk DMA from HBM redirect buffer to mapped output
+                if (success && d_mapped_output)
+                {
+                    hipMemcpyAsync(d_mapped_output, d_C,
+                                   static_cast<size_t>(m) * n * sizeof(float),
+                                   hipMemcpyDeviceToDevice,
+                                   static_cast<hipStream_t>(gpu_stream_));
+                }
+                return success;
             }
             else
             {
-                return hipblas_kernel_->execute(
+                bool success = hipblas_kernel_->execute(
                     d_A,                                    // d_A
                     static_cast<const float *>(d_weights_), // d_B
                     d_C,                                    // d_C
@@ -283,6 +340,15 @@ namespace llaminar2
                     false,       // transA = false
                     transpose_B, // transB
                     alpha, beta);
+                // Bulk DMA from HBM redirect buffer to mapped output
+                if (success && d_mapped_output)
+                {
+                    hipMemcpyAsync(d_mapped_output, d_C,
+                                   static_cast<size_t>(m) * n * sizeof(float),
+                                   hipMemcpyDeviceToDevice,
+                                   static_cast<hipStream_t>(gpu_stream_));
+                }
+                return success;
             }
         }
 

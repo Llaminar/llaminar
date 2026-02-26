@@ -24,6 +24,15 @@
 #include "utils/CUDAKernelProfiler.h"
 
 #include <stdexcept>
+#include <mutex>
+
+// CUDA memory operations (implemented in CUDAQuantisedGemmKernel_CUTLASS.cu)
+extern "C"
+{
+    bool cudaQuantGemm_allocFloat(float **d_ptr, size_t count, int cuda_device_id);
+    bool cudaQuantGemm_copyDeviceToDeviceAsync(float *d_dst, const float *d_src, size_t count, int cuda_device_id, void *stream);
+    void cudaQuantGemm_freeDevice(void *d_ptr);
+}
 
 namespace llaminar2
 {
@@ -107,7 +116,15 @@ namespace llaminar2
                                                                    << " weights on CUDA device " << cuda_device_id_);
         }
 
-        CUDAFloatingPointGemmKernel::~CUDAFloatingPointGemmKernel() = default;
+        CUDAFloatingPointGemmKernel::~CUDAFloatingPointGemmKernel()
+        {
+            if (d_mapped_redirect_)
+            {
+                cudaQuantGemm_freeDevice(d_mapped_redirect_);
+                d_mapped_redirect_ = nullptr;
+                mapped_redirect_capacity_ = 0;
+            }
+        }
 
         CUDAFloatingPointGemmKernel::CUDAFloatingPointGemmKernel(CUDAFloatingPointGemmKernel &&other) noexcept
             : weights_(other.weights_),
@@ -116,10 +133,14 @@ namespace llaminar2
               precision_(other.precision_),
               N_(other.N_),
               K_(other.K_),
-              cublas_kernel_(std::move(other.cublas_kernel_))
+              cublas_kernel_(std::move(other.cublas_kernel_)),
+              d_mapped_redirect_(other.d_mapped_redirect_),
+              mapped_redirect_capacity_(other.mapped_redirect_capacity_)
         {
             other.weights_ = nullptr;
             other.d_weights_ = nullptr;
+            other.d_mapped_redirect_ = nullptr;
+            other.mapped_redirect_capacity_ = 0;
         }
 
         CUDAFloatingPointGemmKernel &CUDAFloatingPointGemmKernel::operator=(CUDAFloatingPointGemmKernel &&other) noexcept
@@ -136,6 +157,14 @@ namespace llaminar2
 
                 other.weights_ = nullptr;
                 other.d_weights_ = nullptr;
+
+                // Transfer redirect buffer ownership
+                if (d_mapped_redirect_)
+                    cudaQuantGemm_freeDevice(d_mapped_redirect_);
+                d_mapped_redirect_ = other.d_mapped_redirect_;
+                mapped_redirect_capacity_ = other.mapped_redirect_capacity_;
+                other.d_mapped_redirect_ = nullptr;
+                other.mapped_redirect_capacity_ = 0;
             }
             return *this;
         }
@@ -212,6 +241,32 @@ namespace llaminar2
                 return false;
             }
 
+            // =================================================================
+            // MAPPED OUTPUT REDIRECT: Detect host-mapped FP32 output memory.
+            // Mapped memory (used for logits) causes PCIe-speed scattered writes
+            // instead of HBM-speed writes. Redirect to HBM buffer, then bulk DMA.
+            // =================================================================
+            float *d_mapped_output = nullptr;
+            if (C->isMapped())
+            {
+                const size_t needed = static_cast<size_t>(m) * n;
+                if (needed > mapped_redirect_capacity_)
+                {
+                    if (d_mapped_redirect_)
+                        cudaQuantGemm_freeDevice(d_mapped_redirect_);
+                    cudaQuantGemm_allocFloat(&d_mapped_redirect_, needed, cuda_device_id_);
+                    mapped_redirect_capacity_ = needed;
+                }
+                d_mapped_output = d_C;
+                d_C = d_mapped_redirect_;
+                static std::once_flag fp32gemm_mapped_once;
+                std::call_once(fp32gemm_mapped_once, [&]() {
+                    LOG_WARN("[CUDAFloatingPointGemmKernel] MAPPED REDIRECT: M=" << m << " N=" << n
+                             << " mapped_ptr=" << d_mapped_output << " -> hbm=" << d_C
+                             << " (" << (needed * 4 / 1024) << " KB)");
+                });
+            }
+
             // Apply activation row offset
             if (activation_row_offset > 0)
             {
@@ -240,7 +295,7 @@ namespace llaminar2
             if (d_bias)
             {
                 CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUBLAS);
-                return cublas_kernel_->execute_with_bias(
+                bool success = cublas_kernel_->execute_with_bias(
                     d_A,                                    // d_A
                     static_cast<const float *>(d_weights_), // d_B
                     d_C,                                    // d_C
@@ -249,11 +304,20 @@ namespace llaminar2
                     false,       // transA = false
                     transpose_B, // transB
                     alpha, beta);
+                // Bulk DMA from HBM redirect buffer to mapped output
+                if (success && d_mapped_output)
+                {
+                    cudaQuantGemm_copyDeviceToDeviceAsync(
+                        d_mapped_output, d_C,
+                        static_cast<size_t>(m) * n,
+                        cuda_device_id_, gpu_stream_);
+                }
+                return success;
             }
             else
             {
                 CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUBLAS);
-                return cublas_kernel_->execute(
+                bool success = cublas_kernel_->execute(
                     d_A,                                    // d_A
                     static_cast<const float *>(d_weights_), // d_B
                     d_C,                                    // d_C
@@ -261,6 +325,15 @@ namespace llaminar2
                     false,       // transA = false
                     transpose_B, // transB
                     alpha, beta);
+                // Bulk DMA from HBM redirect buffer to mapped output
+                if (success && d_mapped_output)
+                {
+                    cudaQuantGemm_copyDeviceToDeviceAsync(
+                        d_mapped_output, d_C,
+                        static_cast<size_t>(m) * n,
+                        cuda_device_id_, gpu_stream_);
+                }
+                return success;
             }
         }
 

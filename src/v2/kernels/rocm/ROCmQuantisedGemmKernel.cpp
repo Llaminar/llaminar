@@ -2552,9 +2552,37 @@ namespace llaminar2
 
                 if (d_bias)
                 {
+                    // =================================================================
+                    // MAPPED OUTPUT REDIRECT for bias path (same fix as GEMV path).
+                    // Without this, biased LM head writes scatter to mapped memory
+                    // over PCIe instead of HBM.
+                    // =================================================================
+                    const bool bias_output_is_mapped = C_fp32->isMapped();
+                    float *d_bias_output = d_output;
+                    if (bias_output_is_mapped && impl_)
+                    {
+                        d_bias_output = impl_->d_C_fp32;
+                        static std::once_flag bias_mapped_once;
+                        std::call_once(bias_mapped_once, [&]()
+                                       { LOG_WARN("[multiply_tensor] BIAS PATH MAPPED REDIRECT: M=" << m << " N=" << n
+                                                  << " mapped_ptr=" << d_output
+                                                  << " -> d_C_fp32=" << impl_->d_C_fp32
+                                                  << " (" << (static_cast<size_t>(m) * n * 4 / 1024) << " KB)"); });
+                    }
+
                     LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using CK bias path (d_input="
-                              << d_input << ", d_output=" << d_output << ", d_bias=" << d_bias << ")");
-                    bool result = multiply_fp32_to_fp32_with_bias(d_input, d_output, d_bias, m, n, k, alpha, beta);
+                              << d_input << ", d_output=" << d_bias_output << ", d_bias=" << d_bias << ")");
+                    bool result = multiply_fp32_to_fp32_with_bias(d_input, d_bias_output, d_bias, m, n, k, alpha, beta);
+
+                    // Bulk DMA from HBM workspace to mapped output
+                    if (result && bias_output_is_mapped)
+                    {
+                        hipMemcpyAsync(d_output, impl_->d_C_fp32,
+                                       static_cast<size_t>(m) * n * sizeof(float),
+                                       hipMemcpyDeviceToDevice,
+                                       static_cast<hipStream_t>(gpu_stream_));
+                    }
+
                     if (ws && ws != saved_workspace)
                     {
                         workspace_ = saved_workspace;

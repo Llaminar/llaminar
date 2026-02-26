@@ -39,6 +39,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 
 namespace llaminar2
 {
@@ -109,6 +110,7 @@ namespace llaminar2
             bool cudaQuantGemm_copyHostToDevice(float *d_dst, const float *h_src, size_t count, int cuda_device_id);
             bool cudaQuantGemm_copyDeviceToHost(float *h_dst, const float *d_src, size_t count, int cuda_device_id);
             bool cudaQuantGemm_copyInt32DeviceToHost(int32_t *h_dst, const int32_t *d_src, size_t count, int cuda_device_id);
+            bool cudaQuantGemm_copyDeviceToDeviceAsync(float *d_dst, const float *d_src, size_t count, int cuda_device_id, void *stream);
             bool cudaQuantGemm_setDevice(int cuda_device_id);
         }
 
@@ -602,6 +604,15 @@ namespace llaminar2
             TensorType a_type = A->native_type();
             TensorType c_type = C->native_type();
 
+            // =================================================================
+            // MAPPED OUTPUT REDIRECT: Detect host-mapped FP32 output memory.
+            // Mapped memory (used for logits) causes PCIe-speed scattered writes
+            // (~12 GB/s) instead of HBM-speed writes (~900 GB/s on RTX 3090).
+            // Fix: redirect kernel output to HBM workspace, then bulk DMA.
+            // =================================================================
+            const bool output_is_mapped = (c_type == TensorType::FP32) && C->isMapped();
+            float *d_mapped_output = nullptr; // original mapped pointer for DMA copy
+
             if (a_type == TensorType::Q8_1 && c_type == TensorType::FP32)
             {
                 // Q8_1 → FP32: Use Q8_1 blocks directly
@@ -629,7 +640,30 @@ namespace llaminar2
                     return false;
                 }
 
+                // Redirect mapped output to HBM workspace
+                if (output_is_mapped)
+                {
+                    validateWorkspace();
+                    d_mapped_output = d_C;
+                    d_C = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
+                    static std::once_flag q8_mapped_once;
+                    std::call_once(q8_mapped_once, [&]() {
+                        LOG_WARN("[CUDAQuantisedGemmKernel] Q8→FP32 MAPPED REDIRECT: M=" << m << " N=" << n
+                                 << " mapped_ptr=" << d_mapped_output << " -> workspace=" << d_C
+                                 << " (" << (static_cast<size_t>(m) * n * 4 / 1024) << " KB)");
+                    });
+                }
+
                 bool success = multiply_q8_to_fp32(d_A_q8, d_C, m, n, k, alpha, beta);
+
+                // Bulk DMA from HBM workspace to mapped output
+                if (success && output_is_mapped)
+                {
+                    cudaQuantGemm_copyDeviceToDeviceAsync(
+                        d_mapped_output, d_C,
+                        static_cast<size_t>(m) * n,
+                        cuda_device_id_, gpu_stream_);
+                }
                 return success;
             }
             else if (a_type == TensorType::FP32 && c_type == TensorType::FP32)
@@ -642,6 +676,20 @@ namespace llaminar2
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel] A and C must be on GPU");
                     return false;
+                }
+
+                // Redirect mapped output to HBM workspace
+                if (output_is_mapped)
+                {
+                    validateWorkspace();
+                    d_mapped_output = d_C;
+                    d_C = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
+                    static std::once_flag fp32_mapped_once;
+                    std::call_once(fp32_mapped_once, [&]() {
+                        LOG_WARN("[CUDAQuantisedGemmKernel] FP32→FP32 MAPPED REDIRECT: M=" << m << " N=" << n
+                                 << " mapped_ptr=" << d_mapped_output << " -> workspace=" << d_C
+                                 << " (" << (static_cast<size_t>(m) * n * 4 / 1024) << " KB)");
+                    });
                 }
 
                 // Apply activation row offset
@@ -661,6 +709,15 @@ namespace llaminar2
                 else
                 {
                     success = multiply_fp32_to_fp32(d_A, d_C, m, n, k, alpha, beta);
+                }
+
+                // Bulk DMA from HBM workspace to mapped output
+                if (success && output_is_mapped)
+                {
+                    cudaQuantGemm_copyDeviceToDeviceAsync(
+                        d_mapped_output, d_C,
+                        static_cast<size_t>(m) * n,
+                        cuda_device_id_, gpu_stream_);
                 }
                 return success;
             }
@@ -1467,10 +1524,17 @@ namespace llaminar2
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A, scales_a_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32, acc_int32_bytes, 256, true});
 
+            // FP32 output workspace for mapped memory redirect
+            // When output is host-mapped (e.g., logits), scattered GPU writes go over PCIe.
+            // This buffer provides an HBM target; we bulk-DMA to mapped memory after.
+            size_t temp_c_fp32_bytes = static_cast<size_t>(m) * n * sizeof(float);
+            reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
+
             LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
                       << "quant_a=" << (quant_a_bytes / 1024) << "KB, "
                       << "scales_a=" << (scales_a_bytes) << "B, "
-                      << "acc=" << (acc_int32_bytes / 1024) << "KB");
+                      << "acc=" << (acc_int32_bytes / 1024) << "KB"
+                      << ", temp_c_fp32=" << (temp_c_fp32_bytes / 1024) << "KB");
 
             return reqs;
         }
