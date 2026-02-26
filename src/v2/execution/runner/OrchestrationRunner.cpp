@@ -316,6 +316,7 @@ namespace llaminar2
 
         SamplingParams params;
         params.temperature = 0.0f; // Greedy by default
+
         int token = sampler_.sample(logits, static_cast<size_t>(vocab), params);
 
         result.tokens.push_back(token);

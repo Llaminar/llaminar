@@ -871,6 +871,82 @@ namespace
 } // anonymous namespace
 
 // =============================================================================
+// KV Cache Conversion Kernels (FP16→FP32, Q8_1→FP32)
+//
+// These replace the CPU roundtrip (D2H → convert → H2D) that was used
+// previously in compute_tensor(). The CPU path had a bug with head_dim=128
+// that produced garbage output on 7B models.
+// =============================================================================
+
+/**
+ * @brief Convert FP16 (uint16_t) to FP32 on GPU
+ *
+ * Simple element-wise conversion using CUDA's __half2float intrinsic.
+ * One thread per element.
+ */
+__global__ void convert_fp16_to_fp32_kernel(const uint16_t *__restrict__ src,
+                                            float *__restrict__ dst,
+                                            int count)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count)
+    {
+        __half h;
+        memcpy(&h, &src[idx], sizeof(__half));
+        dst[idx] = __half2float(h);
+    }
+}
+
+/**
+ * @brief Q8_1 block structure for GPU dequantization
+ *
+ * Mirrors the host-side Q8_1Block in BlockStructures.h.
+ * Defined locally to avoid including host-only headers in CUDA code.
+ */
+struct GpuQ8_1Block
+{
+    uint16_t d;     // FP16 scale factor
+    int16_t sum_qs; // pre-computed sum (not used for dequant)
+    int8_t qs[32];  // 32 quantized int8 values
+};
+static_assert(sizeof(GpuQ8_1Block) == 36, "GpuQ8_1Block must be 36 bytes");
+
+/**
+ * @brief Dequantize Q8_1 blocks to FP32 on GPU
+ *
+ * Each thread processes one element within a block.
+ * Grid: (blocks_per_row * rows) blocks × 32 threads
+ */
+__global__ void dequant_q8_1_to_fp32_kernel(const GpuQ8_1Block *__restrict__ src,
+                                            float *__restrict__ dst,
+                                            int rows,
+                                            int cols,
+                                            int blocks_per_row)
+{
+    int block_idx = blockIdx.x;
+    int elem_idx = threadIdx.x; // 0..31
+
+    int total_blocks = rows * blocks_per_row;
+    if (block_idx >= total_blocks)
+        return;
+
+    int row = block_idx / blocks_per_row;
+    int block_in_row = block_idx % blocks_per_row;
+    int col = block_in_row * 32 + elem_idx;
+
+    if (col >= cols)
+        return;
+
+    const GpuQ8_1Block &blk = src[block_idx];
+    // Convert FP16 scale to FP32 using CUDA intrinsic
+    __half h_scale;
+    memcpy(&h_scale, &blk.d, sizeof(__half));
+    float scale = __half2float(h_scale);
+
+    dst[row * cols + col] = scale * static_cast<float>(blk.qs[elem_idx]);
+}
+
+// =============================================================================
 // Extern "C" Wrapper Functions
 // =============================================================================
 
@@ -1086,6 +1162,76 @@ extern "C"
     int cudaFlashAttn_synchronize()
     {
         return cudaDeviceSynchronize() == cudaSuccess ? 0 : -1;
+    }
+
+    /**
+     * @brief Convert FP16 KV cache data to FP32 on GPU
+     *
+     * Replaces the previous CPU roundtrip (D2H → fp16_to_fp32 loop → H2D).
+     *
+     * @param src      Device pointer to FP16 (uint16_t) source data
+     * @param dst      Device pointer to FP32 destination buffer
+     * @param count    Number of elements to convert
+     * @param stream   CUDA stream (nullptr for default stream)
+     * @return 0 on success, -1 on error
+     */
+    int cudaFlashAttn_convert_fp16_to_fp32(const void *src, float *dst, int count, void *stream)
+    {
+        if (!src || !dst || count <= 0)
+            return -1;
+
+        const int threads = 256;
+        const int blocks = (count + threads - 1) / threads;
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+        convert_fp16_to_fp32_kernel<<<blocks, threads, 0, cuda_stream>>>(
+            static_cast<const uint16_t *>(src), dst, count);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            printf("[cudaFlashAttn_convert_fp16_to_fp32] Kernel launch failed: %s\n",
+                   cudaGetErrorString(err));
+            return -1;
+        }
+        return 0;
+    }
+
+    /**
+     * @brief Dequantize Q8_1 KV cache data to FP32 on GPU
+     *
+     * Replaces the previous CPU roundtrip (D2H → Q8_1 dequant loop → H2D).
+     *
+     * @param src      Device pointer to Q8_1 blocks
+     * @param dst      Device pointer to FP32 destination buffer
+     * @param rows     Number of rows (batch_size * kv_len)
+     * @param cols     Number of columns (n_kv_heads * head_dim)
+     * @param stream   CUDA stream (nullptr for default stream)
+     * @return 0 on success, -1 on error
+     */
+    int cudaFlashAttn_dequant_q8_1_to_fp32(const void *src, float *dst,
+                                           int rows, int cols, void *stream)
+    {
+        if (!src || !dst || rows <= 0 || cols <= 0)
+            return -1;
+
+        const int blocks_per_row = (cols + 31) / 32;
+        const int total_blocks = rows * blocks_per_row;
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+        // One CUDA block per Q8_1 block, 32 threads per block (one per element)
+        dequant_q8_1_to_fp32_kernel<<<total_blocks, 32, 0, cuda_stream>>>(
+            static_cast<const GpuQ8_1Block *>(src), dst,
+            rows, cols, blocks_per_row);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            printf("[cudaFlashAttn_dequant_q8_1_to_fp32] Kernel launch failed: %s\n",
+                   cudaGetErrorString(err));
+            return -1;
+        }
+        return 0;
     }
 
 } // extern "C"

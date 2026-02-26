@@ -371,8 +371,12 @@ namespace llaminar2
         }
 
         // Allocate mapped host memory (GPU can write directly to this via PCIe)
+        // NOTE: Do NOT use cudaHostAllocWriteCombined here. WC memory makes CPU
+        // reads ~1000x slower (each load bypasses all CPU caches). Logits are
+        // GPU-written then CPU-read (argmax in sampler), so WC provides no
+        // benefit and causes a ~13ms penalty per token for 152K-vocab models.
         void *host_ptr = nullptr;
-        err = cudaHostAlloc(&host_ptr, bytes, cudaHostAllocMapped | cudaHostAllocWriteCombined);
+        err = cudaHostAlloc(&host_ptr, bytes, cudaHostAllocMapped);
         if (err != cudaSuccess)
         {
             LOG_ERROR("[CUDABackend] cudaHostAlloc(Mapped) failed for " << bytes << " bytes on device "

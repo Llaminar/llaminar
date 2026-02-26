@@ -113,18 +113,18 @@ namespace llaminar2
         {
             hipGetLastError();
             LOG_ERROR("[ROCmBackend::deviceToHost] Invalid source device pointer: src=" << src
-                                                                                         << " bytes=" << bytes
-                                                                                         << " device_id=" << device_id
-                                                                                         << " hip_error=" << hipGetErrorString(src_attr_err));
+                                                                                        << " bytes=" << bytes
+                                                                                        << " device_id=" << device_id
+                                                                                        << " hip_error=" << hipGetErrorString(src_attr_err));
             return false;
         }
 
         if (src_attrs.device != device_id)
         {
             LOG_ERROR("[ROCmBackend::deviceToHost] Source pointer device mismatch: src=" << src
-                                                                                           << " ptr_device=" << src_attrs.device
-                                                                                           << " requested_device=" << device_id
-                                                                                           << " bytes=" << bytes);
+                                                                                         << " ptr_device=" << src_attrs.device
+                                                                                         << " requested_device=" << device_id
+                                                                                         << " bytes=" << bytes);
             return false;
         }
 
@@ -151,18 +151,18 @@ namespace llaminar2
         {
             hipGetLastError();
             LOG_ERROR("[ROCmBackend::hostToDevice] Invalid destination device pointer: dst=" << dst
-                                                                                               << " bytes=" << bytes
-                                                                                               << " device_id=" << device_id
-                                                                                               << " hip_error=" << hipGetErrorString(dst_attr_err));
+                                                                                             << " bytes=" << bytes
+                                                                                             << " device_id=" << device_id
+                                                                                             << " hip_error=" << hipGetErrorString(dst_attr_err));
             return false;
         }
 
         if (dst_attrs.device != device_id)
         {
             LOG_ERROR("[ROCmBackend::hostToDevice] Destination pointer device mismatch: dst=" << dst
-                                                                                                 << " ptr_device=" << dst_attrs.device
-                                                                                                 << " requested_device=" << device_id
-                                                                                                 << " bytes=" << bytes);
+                                                                                              << " ptr_device=" << dst_attrs.device
+                                                                                              << " requested_device=" << device_id
+                                                                                              << " bytes=" << bytes);
             return false;
         }
 
@@ -409,8 +409,12 @@ namespace llaminar2
         }
 
         // Allocate mapped host memory (GPU can write directly to this via PCIe)
+        // NOTE: Do NOT use hipHostMallocWriteCombined here. WC memory makes CPU
+        // reads ~1000x slower (each load bypasses all CPU caches). Logits are
+        // GPU-written then CPU-read (argmax in sampler), so WC provides no
+        // benefit and causes a ~13ms penalty per token for 152K-vocab models.
         void *host_ptr = nullptr;
-        err = hipHostMalloc(&host_ptr, bytes, hipHostMallocMapped | hipHostMallocWriteCombined);
+        err = hipHostMalloc(&host_ptr, bytes, hipHostMallocMapped);
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmBackend] hipHostMalloc(Mapped) failed for " << bytes << " bytes on device "
@@ -572,12 +576,12 @@ namespace llaminar2
         {
             const auto &e = g_ptr_events[i];
             LOG_WARN("[ROCM_PTR_EVENTS] #" << e.sequence
-                                            << " kind=" << e.kind
-                                            << " ptr=" << e.base_ptr
-                                            << " bytes=" << e.size_bytes
-                                            << " dev=" << e.device_id
-                                            << " active=" << (e.active ? 1 : 0)
-                                            << " thread=" << e.thread_hash);
+                                           << " kind=" << e.kind
+                                           << " ptr=" << e.base_ptr
+                                           << " bytes=" << e.size_bytes
+                                           << " dev=" << e.device_id
+                                           << " active=" << (e.active ? 1 : 0)
+                                           << " thread=" << e.thread_hash);
         }
     }
 
