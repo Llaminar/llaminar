@@ -275,6 +275,28 @@ namespace llaminar2
         }
     }
 
+    void markOutputsDirtyFlagsOnly(const std::vector<CoherenceBuffer> &outputs)
+    {
+        if (outputs.empty())
+        {
+            return;
+        }
+
+        LOG_DEBUG("[StageCoherence] Marking " << outputs.size() << " outputs as device-dirty (flags only, no events)");
+
+        for (const auto &buf : outputs)
+        {
+            if (!buf.tensor)
+                continue;
+
+            auto *tensor_base = dynamic_cast<TensorBase *>(buf.tensor);
+            if (!tensor_base)
+                continue;
+
+            tensor_base->mark_device_dirty_flags_only();
+        }
+    }
+
     // =========================================================================
     // Buffer Extraction
     // =========================================================================

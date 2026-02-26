@@ -891,6 +891,29 @@ namespace llaminar2
         }
 
         /**
+         * @brief Mark tensor as modified on device WITHOUT recording a completion event
+         *
+         * Lightweight version for intermediate tensors that only flow GPU→GPU on the
+         * same compute stream. Skips hipEventRecord/cudaEventRecord overhead (~100-300μs
+         * per call on ROCm). If data() is later called, ensureOnHost() will fall back to
+         * a full device synchronize since no event is available.
+         *
+         * Use this for intermediate pipeline tensors. Use mark_device_dirty_with_event()
+         * for tensors that will be read back to CPU (e.g., logits for sampling).
+         *
+         * @note Thread-safe (acquires coherence_mutex_)
+         */
+        void mark_device_dirty_flags_only()
+        {
+            std::lock_guard<std::mutex> lock(coherence_mutex_);
+            device_valid_ = true;
+            host_valid_ = is_mapped_;
+            authoritative_device_ = gpu_device_;
+            if (is_mapped_)
+                mapped_needs_sync_ = true;
+        }
+
+        /**
          * @brief Mark tensor as modified on device and record a completion event
          *
          * This is the preferred method when fine-grained synchronization is desired.

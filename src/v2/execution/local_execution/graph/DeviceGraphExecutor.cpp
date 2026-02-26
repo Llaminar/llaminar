@@ -1399,6 +1399,15 @@ namespace llaminar2
         graph.reset();
         const auto &order = graph.getExecutionOrder();
 
+        // Mark the last stage as needing event-based dirty marking
+        // (its outputs will be read by CPU for sampling/logits)
+        if (!order.empty())
+        {
+            auto *last_node = graph.getNode(order.back());
+            if (last_node)
+                last_node->is_final_output = true;
+        }
+
         for (const auto &name : order)
         {
             auto *node = graph.getNode(name);
@@ -1689,30 +1698,38 @@ namespace llaminar2
                 }
 
                 // Cohere weights (needed for GPU execution - biases, etc.)
-                if (profiling)
-                    phase_start = std::chrono::high_resolution_clock::now();
-                auto weights = extractWeightBuffers(cached_dump_info);
-                if (profiling)
+                // OPTIMIZATION: Skip if weights were already confirmed on device
+                // (weights are immutable after loading, so first-pass coherence is sufficient)
+                if (!node.weights_cohered)
                 {
-                    phase_end = std::chrono::high_resolution_clock::now();
-                    extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                    phase_start = phase_end;
-                }
+                    if (profiling)
+                        phase_start = std::chrono::high_resolution_clock::now();
+                    auto weights = extractWeightBuffers(cached_dump_info);
+                    if (profiling)
+                    {
+                        phase_end = std::chrono::high_resolution_clock::now();
+                        extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                        phase_start = phase_end;
+                    }
 
-                if (!cohereInputs(weights, target_device)) // Weights are read-only like inputs
-                {
-                    LOG_ERROR("[DeviceGraphExecutor] Failed to cohere weights for stage '" << node.name << "'");
-                    return false;
-                }
-                if (profiling)
-                {
-                    phase_end = std::chrono::high_resolution_clock::now();
-                    weight_cohere_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                    if (!cohereInputs(weights, target_device)) // Weights are read-only like inputs
+                    {
+                        LOG_ERROR("[DeviceGraphExecutor] Failed to cohere weights for stage '" << node.name << "'");
+                        return false;
+                    }
+                    if (profiling)
+                    {
+                        phase_end = std::chrono::high_resolution_clock::now();
+                        weight_cohere_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                    }
+                    node.weights_cohered = true;
                 }
             }
 
             // For GPU targets, outputs also need GPU buffers allocated before kernel runs
-            if (policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL)
+            // OPTIMIZATION: Skip if outputs were already allocated on device
+            // (GPU output buffers persist across iterations, never need re-allocation)
+            if ((policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL) && !node.outputs_allocated)
             {
                 // Use cached dump_info (no separate getDumpInfo call needed)
 
@@ -1736,6 +1753,10 @@ namespace llaminar2
                     phase_end = std::chrono::high_resolution_clock::now();
                     output_alloc_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
                 }
+
+                // Cache output buffers for mark_dirty (avoid re-extracting every iteration)
+                node.cached_output_buffers = std::move(outputs);
+                node.outputs_allocated = true;
             }
         }
 
@@ -1949,19 +1970,37 @@ namespace llaminar2
 
             if (policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL)
             {
-                // Use cached dump_info (no separate getDumpInfo call needed)
-
-                if (profiling)
-                    phase_start = std::chrono::high_resolution_clock::now();
-                auto outputs = extractOutputBuffers(cached_dump_info);
-                if (profiling)
+                // OPTIMIZATION: Use cached output buffers instead of re-extracting
+                // The cached_output_buffers were populated during the first-pass output allocation
+                if (node.cached_output_buffers.empty())
                 {
-                    phase_end = std::chrono::high_resolution_clock::now();
-                    extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                    phase_start = phase_end;
+                    // First time or cache not populated — extract and cache
+                    if (profiling)
+                        phase_start = std::chrono::high_resolution_clock::now();
+                    node.cached_output_buffers = extractOutputBuffers(cached_dump_info);
+                    if (profiling)
+                    {
+                        phase_end = std::chrono::high_resolution_clock::now();
+                        extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                        phase_start = phase_end;
+                    }
+                }
+                else if (profiling)
+                {
+                    phase_start = std::chrono::high_resolution_clock::now();
                 }
 
-                markOutputsDirty(outputs, node.stage->gpuStream());
+                // OPTIMIZATION: Use flags-only dirty marking for intermediate stages.
+                // Only the final stage (producing logits for CPU readback) needs event
+                // recording. Intermediate GPU→GPU stages skip hipEventRecord overhead.
+                if (node.is_final_output)
+                {
+                    markOutputsDirty(node.cached_output_buffers, node.stage->gpuStream());
+                }
+                else
+                {
+                    markOutputsDirtyFlagsOnly(node.cached_output_buffers);
+                }
                 if (profiling)
                 {
                     phase_end = std::chrono::high_resolution_clock::now();

@@ -604,7 +604,7 @@ int main(int argc, char *argv[])
                     launch_config.omp_proc_bind = "close";
 
                     LOG_INFO("[Main] All target devices on NUMA node " << target_numa
-                                                                      << "; binding MPI process to cpu-set='" << cpu_set << "'");
+                                                                       << "; binding MPI process to cpu-set='" << cpu_set << "'");
                 }
             }
             else if (inference_numas.size() > 1)
@@ -1264,6 +1264,16 @@ int main(int argc, char *argv[])
             const char *architecture() const override
             {
                 return "orchestrated";
+            }
+
+            const GraphExecutorStats *executorStats() const override
+            {
+                return orch_runner_->executorStats();
+            }
+
+            void resetExecutorStats() override
+            {
+                orch_runner_->resetExecutorStats();
             }
 
         private:

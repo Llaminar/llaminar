@@ -38,6 +38,7 @@
 #include "../../../interfaces/ICollectiveContext.h"
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
+#include "../coherence/StageCoherence.h" // For CoherenceBuffer (cached in ComputeNode)
 #include <memory>
 #include <vector>
 #include <string>
@@ -60,6 +61,18 @@ namespace llaminar2
         std::vector<std::string> dependencies; ///< Names of nodes this depends on
         DeviceId device;                       ///< Target device for execution
         bool completed;                        ///< Execution complete flag
+
+        // =====================================================================
+        // Coherence fast-path flags (mutable for use in const execution context)
+        // Once weights are on-device and outputs are allocated, subsequent
+        // iterations can skip the entire coherence check + vector extraction.
+        // =====================================================================
+        mutable bool weights_cohered = false;   ///< Weights confirmed on device
+        mutable bool outputs_allocated = false; ///< Output GPU buffers allocated
+        mutable bool is_final_output = false;   ///< Outputs will be read by CPU (needs event sync)
+
+        /// Cached output buffers for mark_dirty (avoids re-extracting every iteration)
+        mutable std::vector<CoherenceBuffer> cached_output_buffers;
 
         ComputeNode() : device(DeviceId::cpu()), completed(false) {}
         ComputeNode(std::string n, std::unique_ptr<IComputeStage> s, DeviceId dev = DeviceId::cpu())
@@ -590,7 +603,7 @@ namespace llaminar2
         GraphExecutorConfig config_;
         GraphExecutorStats stats_;
         DeviceGraphBufferManager *buffer_manager_ = nullptr; ///< Optional buffer manager (not owned)
-        ICollectiveContext *collective_ctx_ = nullptr; ///< Optional collective context (not owned)
+        ICollectiveContext *collective_ctx_ = nullptr;       ///< Optional collective context (not owned)
 
         // Internal execution helpers
         bool executeSequential(ComputeGraph &graph, IDeviceContext *ctx);

@@ -145,11 +145,18 @@ namespace llaminar2
         // IOrchestrationRunner: Snapshot API
         // =====================================================================
 
-        void enableSnapshotCapture(const std::string& output_dir = "") override;
+        void enableSnapshotCapture(const std::string &output_dir = "") override;
         void disableSnapshotCapture() override;
         void clearSnapshots() override;
-        const float* getSnapshot(const std::string& key, size_t& out_size) const override;
+        const float *getSnapshot(const std::string &key, size_t &out_size) const override;
         std::vector<std::string> getSnapshotKeys() const override;
+
+        // =====================================================================
+        // IOrchestrationRunner: Profiling
+        // =====================================================================
+
+        const GraphExecutorStats *executorStats() const override;
+        void resetExecutorStats() override;
 
     private:
         // =====================================================================

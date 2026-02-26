@@ -31,7 +31,8 @@
 
 namespace llaminar2
 {
-    class ITokenizer; // Forward declaration
+    class ITokenizer;          // Forward declaration
+    struct GraphExecutorStats; // Forward declaration
 }
 
 namespace llaminar2
@@ -262,7 +263,7 @@ namespace llaminar2
          *
          * @param output_dir Optional directory to save snapshots
          */
-        virtual void enableSnapshotCapture(const std::string& output_dir = "") = 0;
+        virtual void enableSnapshotCapture(const std::string &output_dir = "") = 0;
 
         /**
          * @brief Disable snapshot capture and clear stored snapshots
@@ -281,7 +282,7 @@ namespace llaminar2
          * @param out_size Output parameter for snapshot size in bytes
          * @return Pointer to snapshot data (FP32), or nullptr if key doesn't exist
          */
-        virtual const float* getSnapshot(const std::string& key, size_t& out_size) const = 0;
+        virtual const float *getSnapshot(const std::string &key, size_t &out_size) const = 0;
 
         /**
          * @brief Get list of all captured snapshot keys
@@ -289,6 +290,25 @@ namespace llaminar2
          * @return Vector of snapshot identifiers
          */
         virtual std::vector<std::string> getSnapshotKeys() const = 0;
+
+        // =====================================================================
+        // Profiling
+        // =====================================================================
+
+        /**
+         * @brief Get executor profiling statistics
+         *
+         * Returns per-stage overhead breakdown (coherence, allocation, etc.)
+         * when profiling is enabled (LLAMINAR_PROFILING=1).
+         *
+         * @return Pointer to GraphExecutorStats, or nullptr if not available
+         */
+        virtual const GraphExecutorStats *executorStats() const { return nullptr; }
+
+        /**
+         * @brief Reset executor profiling statistics
+         */
+        virtual void resetExecutorStats() {}
     };
 
 } // namespace llaminar2

@@ -369,11 +369,15 @@ namespace llaminar2
          * @brief Get summary string
          */
         static std::string getSummary(uint64_t total_tokens = 0,
-                                       double wall_clock_prefill_ms = 0,
-                                       double wall_clock_decode_ms = 0)
+                                      double wall_clock_prefill_ms = 0,
+                                      double wall_clock_decode_ms = 0,
+                                      uint64_t prefill_tokens = 0,
+                                      uint64_t decode_tokens = 0)
         {
             auto &inst = getInstance();
             std::lock_guard<std::mutex> lock(inst.mutex_);
+
+            constexpr size_t COUNT = static_cast<size_t>(CUDAKernelType::COUNT);
 
             // Check if any stats were recorded
             bool has_stats = false;
@@ -405,140 +409,58 @@ namespace llaminar2
                 total_time_us += stats.total_us;
             }
 
-            // When wall clock is available, use it as the denominator for %
-            double wall_clock_total_ms = wall_clock_prefill_ms + wall_clock_decode_ms;
-            double pct_base_us = (wall_clock_total_ms > 0)
-                                     ? wall_clock_total_ms * 1000.0
-                                     : total_time_us;
+            // Check if phase data was collected
+            bool has_prefill = false, has_decode = false;
+            for (size_t i = 0; i < COUNT; ++i)
+            {
+                if (inst.prefill_stats_[i].call_count > 0)
+                    has_prefill = true;
+                if (inst.decode_stats_[i].call_count > 0)
+                    has_decode = true;
+            }
 
             std::ostringstream oss;
 
-            // Title table
+            // Helper lambda to render a single-device phase table
+            auto renderPhaseTable = [&](const std::string &phase_label,
+                                        const std::array<KernelStats, COUNT> &phase_stats,
+                                        uint64_t phase_tokens,
+                                        double wall_clock_ms)
             {
-                fort::utf8_table title;
-                title.set_border_style(FT_DOUBLE2_STYLE);
-                if (device_count > 1)
+                // Calculate total for this phase
+                double phase_total_us = 0.0;
+                for (size_t i = 0; i < COUNT; ++i)
+                    phase_total_us += phase_stats[i].total_us;
+
+                if (phase_total_us == 0.0)
+                    return;
+
+                // Sort by total time (descending) for this phase
+                std::array<size_t, COUNT> phase_indices;
+                for (size_t i = 0; i < phase_indices.size(); ++i)
+                    phase_indices[i] = i;
+                std::sort(phase_indices.begin(), phase_indices.end(), [&](size_t a, size_t b)
+                          { return phase_stats[a].total_us > phase_stats[b].total_us; });
+
+                double pct_base_us = (wall_clock_ms > 0) ? (wall_clock_ms * 1000.0) : phase_total_us;
+
+                // Title
                 {
+                    fort::utf8_table title;
+                    title.set_border_style(FT_DOUBLE2_STYLE);
                     std::ostringstream title_ss;
-                    title_ss << "CUDA KERNEL PROFILING SUMMARY (" << device_count << " GPUs)";
+                    title_ss << "CUDA KERNEL PROFILING — " << phase_label;
+                    if (phase_tokens > 0)
+                        title_ss << " (" << phase_tokens << " tokens)";
                     title << title_ss.str() << fort::endr;
-                }
-                else
-                {
-                    title << "CUDA KERNEL PROFILING SUMMARY" << fort::endr;
-                }
-                title[0][0].set_cell_text_align(fort::text_align::center);
-                title.row(0).set_cell_row_type(fort::row_type::header);
-                oss << "\n"
-                    << title.to_string();
-            }
-
-            // Sort by total time (descending)
-            std::array<size_t, static_cast<size_t>(CUDAKernelType::COUNT)> indices;
-            for (size_t i = 0; i < indices.size(); ++i)
-                indices[i] = i;
-            std::sort(indices.begin(), indices.end(), [&inst](size_t a, size_t b)
-                      { return inst.stats_[a].total_us > inst.stats_[b].total_us; });
-
-            // Main data table
-            fort::utf8_table table;
-            table.set_border_style(FT_DOUBLE2_STYLE);
-
-            if (device_count > 1)
-            {
-                // Multi-device header
-                table << fort::header << "Kernel Type" << "Total (ms)";
-                for (int dev : devices)
-                {
-                    std::ostringstream dev_ss;
-                    dev_ss << "cuda:" << dev;
-                    table << dev_ss.str();
-                }
-                table << "Balance" << fort::endr;
-
-                table.column(0).set_cell_text_align(fort::text_align::left);
-                table.column(1).set_cell_text_align(fort::text_align::right);
-                for (size_t i = 0; i < devices.size(); ++i)
-                {
-                    table.column(2 + i).set_cell_text_align(fort::text_align::right);
-                }
-                table.column(2 + devices.size()).set_cell_text_align(fort::text_align::right);
-
-                for (size_t idx : indices)
-                {
-                    const auto &stats = inst.stats_[idx];
-                    if (stats.call_count == 0)
-                        continue;
-
-                    double total_ms = stats.total_us / 1000.0;
-
-                    // Collect per-device times
-                    std::vector<double> dev_times;
-                    double max_time = 0.0, min_time = 1e12;
-                    for (int dev : devices)
-                    {
-                        auto it = inst.device_stats_.find(dev);
-                        if (it != inst.device_stats_.end())
-                        {
-                            double dev_ms = it->second.stats[idx].total_us / 1000.0;
-                            dev_times.push_back(dev_ms);
-                            if (dev_ms > 0)
-                            {
-                                max_time = std::max(max_time, dev_ms);
-                                min_time = std::min(min_time, dev_ms);
-                            }
-                        }
-                        else
-                        {
-                            dev_times.push_back(0.0);
-                        }
-                    }
-
-                    double balance = (max_time > 0) ? (min_time / max_time * 100.0) : 100.0;
-
-                    std::ostringstream total_ss, balance_ss;
-                    total_ss << std::fixed << std::setprecision(2) << total_ms;
-                    balance_ss << static_cast<int>(balance) << "%";
-
-                    table << cudaKernelTypeName(static_cast<CUDAKernelType>(idx)) << total_ss.str();
-                    for (double t : dev_times)
-                    {
-                        std::ostringstream dev_time_ss;
-                        dev_time_ss << std::fixed << std::setprecision(2) << t;
-                        table << dev_time_ss.str();
-                    }
-                    table << balance_ss.str() << fort::endr;
+                    title[0][0].set_cell_text_align(fort::text_align::center);
+                    title.row(0).set_cell_row_type(fort::row_type::header);
+                    oss << "\n"
+                        << title.to_string();
                 }
 
-                // Separator and total row
-                table << fort::separator;
-
-                // Show effective wall-clock (max across devices)
-                double max_device_time = 0.0;
-                for (const auto &[_, dev_stats] : inst.device_stats_)
-                {
-                    double dev_total = 0.0;
-                    for (const auto &s : dev_stats.stats)
-                    {
-                        dev_total += s.total_us;
-                    }
-                    max_device_time = std::max(max_device_time, dev_total);
-                }
-
-                std::ostringstream total_ss, wallclock_ss;
-                total_ss << std::fixed << std::setprecision(2) << (total_time_us / 1000.0) << " ms";
-                wallclock_ss << std::fixed << std::setprecision(2) << (max_device_time / 1000.0) << " ms wall";
-
-                table << "TOTAL GPU TIME" << total_ss.str();
-                for (size_t i = 0; i < devices.size(); ++i)
-                {
-                    table << "";
-                }
-                table << wallclock_ss.str() << fort::endr;
-            }
-            else
-            {
-                // Single device format
+                fort::utf8_table table;
+                table.set_border_style(FT_DOUBLE2_STYLE);
                 table << fort::header << "Kernel Type" << "Calls" << "Total (ms)" << "Avg (µs)" << "Max (µs)" << "%" << fort::endr;
                 table.column(0).set_cell_text_align(fort::text_align::left);
                 table.column(1).set_cell_text_align(fort::text_align::right);
@@ -547,15 +469,17 @@ namespace llaminar2
                 table.column(4).set_cell_text_align(fort::text_align::right);
                 table.column(5).set_cell_text_align(fort::text_align::right);
 
-                for (size_t idx : indices)
+                double profiled_us = 0.0;
+                for (size_t idx : phase_indices)
                 {
-                    const auto &stats = inst.stats_[idx];
+                    const auto &stats = phase_stats[idx];
                     if (stats.call_count == 0)
                         continue;
 
                     double avg_us = stats.total_us / static_cast<double>(stats.call_count);
                     double pct = (pct_base_us > 0) ? (stats.total_us / pct_base_us * 100.0) : 0.0;
                     double total_ms = stats.total_us / 1000.0;
+                    profiled_us += stats.total_us;
 
                     std::ostringstream total_ss, avg_ss, max_ss, pct_ss;
                     total_ss << std::fixed << std::setprecision(2) << total_ms;
@@ -564,42 +488,36 @@ namespace llaminar2
                     pct_ss << std::fixed << std::setprecision(1) << pct << "%";
 
                     table << cudaKernelTypeName(static_cast<CUDAKernelType>(idx))
-                          << stats.call_count
-                          << total_ss.str()
-                          << avg_ss.str()
-                          << max_ss.str()
-                          << pct_ss.str()
+                          << stats.call_count << total_ss.str() << avg_ss.str() << max_ss.str() << pct_ss.str()
                           << fort::endr;
                 }
 
-                // "Other (unprofiled)" row when wall clock is available
-                if (wall_clock_total_ms > 0)
+                // "Other (unprofiled)" row
+                if (wall_clock_ms > 0)
                 {
-                    double unprofiled_ms = wall_clock_total_ms - (total_time_us / 1000.0);
+                    double unprofiled_ms = wall_clock_ms - (profiled_us / 1000.0);
                     if (unprofiled_ms > 0.01)
                     {
-                        double unprofiled_pct = (unprofiled_ms * 1000.0 / pct_base_us) * 100.0;
+                        double unp_pct = (unprofiled_ms * 1000.0 / pct_base_us) * 100.0;
                         std::ostringstream unp_ms_ss, unp_pct_ss;
                         unp_ms_ss << std::fixed << std::setprecision(2) << unprofiled_ms;
-                        unp_pct_ss << std::fixed << std::setprecision(1) << unprofiled_pct << "%";
+                        unp_pct_ss << std::fixed << std::setprecision(1) << unp_pct << "%";
                         table << "Other (unprofiled)" << "" << unp_ms_ss.str() << "" << "" << unp_pct_ss.str() << fort::endr;
                     }
                 }
 
-                // Separator and total row
+                // Separator and total
                 table << fort::separator;
-
                 {
-                    // Show wall clock as total when available, otherwise GPU time
-                    double display_total_ms = (wall_clock_total_ms > 0) ? wall_clock_total_ms : (total_time_us / 1000.0);
+                    double display_total_ms = (wall_clock_ms > 0) ? wall_clock_ms : (phase_total_us / 1000.0);
                     std::ostringstream total_ss;
                     total_ss << std::fixed << std::setprecision(2) << display_total_ms << " ms";
 
-                    if (total_tokens > 0)
+                    if (phase_tokens > 0)
                     {
-                        double ms_per_token = display_total_ms / static_cast<double>(total_tokens);
+                        double toks_per_sec = (phase_tokens * 1000.0) / display_total_ms;
                         std::ostringstream throughput_ss;
-                        throughput_ss << std::fixed << std::setprecision(2) << ms_per_token << " ms/tok";
+                        throughput_ss << std::fixed << std::setprecision(2) << toks_per_sec << " tok/s";
                         table << "TOTAL" << "" << total_ss.str() << "" << "" << throughput_ss.str() << fort::endr;
                     }
                     else
@@ -607,83 +525,201 @@ namespace llaminar2
                         table << "TOTAL" << "" << total_ss.str() << "" << "" << "" << fort::endr;
                     }
                 }
-            }
 
-            oss << table.to_string();
+                oss << table.to_string();
+            };
 
-            // Phase breakdown (if phase data was collected)
-            bool has_prefill = false, has_decode = false;
-            for (size_t i = 0; i < static_cast<size_t>(CUDAKernelType::COUNT); ++i)
+            // Render phase-separated or combined tables
+            if ((has_prefill || has_decode) && device_count <= 1)
             {
-                if (inst.prefill_stats_[i].call_count > 0)
-                    has_prefill = true;
-                if (inst.decode_stats_[i].call_count > 0)
-                    has_decode = true;
+                // Phase-separated output for single device
+                if (has_prefill)
+                    renderPhaseTable("PREFILL", inst.prefill_stats_, prefill_tokens, wall_clock_prefill_ms);
+                if (has_decode)
+                    renderPhaseTable("DECODE", inst.decode_stats_, decode_tokens, wall_clock_decode_ms);
             }
-
-            if (has_prefill || has_decode)
+            else
             {
-                fort::utf8_table phase_table;
-                phase_table.set_border_style(FT_DOUBLE2_STYLE);
+                // Combined output (no phase data or multi-device)
+                double wall_clock_total_ms = wall_clock_prefill_ms + wall_clock_decode_ms;
+                double pct_base_us = (wall_clock_total_ms > 0) ? (wall_clock_total_ms * 1000.0) : total_time_us;
 
-                phase_table << fort::header << "Kernel Type" << "Prefill (ms)" << "Decode (ms)" << "Decode %" << fort::endr;
-                phase_table.column(0).set_cell_text_align(fort::text_align::left);
-                phase_table.column(1).set_cell_text_align(fort::text_align::right);
-                phase_table.column(2).set_cell_text_align(fort::text_align::right);
-                phase_table.column(3).set_cell_text_align(fort::text_align::right);
-
-                double prefill_gpu_total_us = 0.0;
-                double decode_gpu_total_us = 0.0;
-                for (size_t idx : indices)
+                // Title table
                 {
-                    const auto &pf = inst.prefill_stats_[idx];
-                    const auto &dc = inst.decode_stats_[idx];
-                    if (pf.call_count == 0 && dc.call_count == 0)
-                        continue;
-
-                    prefill_gpu_total_us += pf.total_us;
-                    decode_gpu_total_us += dc.total_us;
-
-                    double decode_pct_base = (wall_clock_decode_ms > 0) ? (wall_clock_decode_ms * 1000.0) : total_time_us;
-                    std::ostringstream pf_ss, dc_ss, pct_ss;
-                    pf_ss << std::fixed << std::setprecision(2) << (pf.total_us / 1000.0);
-                    dc_ss << std::fixed << std::setprecision(2) << (dc.total_us / 1000.0);
-                    double dc_pct = decode_pct_base > 0 ? (dc.total_us / decode_pct_base) * 100.0 : 0;
-                    pct_ss << std::fixed << std::setprecision(1) << dc_pct << "%";
-
-                    phase_table << cudaKernelTypeName(static_cast<CUDAKernelType>(idx))
-                                << pf_ss.str() << dc_ss.str() << pct_ss.str() << fort::endr;
+                    fort::utf8_table title;
+                    title.set_border_style(FT_DOUBLE2_STYLE);
+                    if (device_count > 1)
+                    {
+                        std::ostringstream title_ss;
+                        title_ss << "CUDA KERNEL PROFILING SUMMARY (" << device_count << " GPUs)";
+                        title << title_ss.str() << fort::endr;
+                    }
+                    else
+                    {
+                        title << "CUDA KERNEL PROFILING SUMMARY" << fort::endr;
+                    }
+                    title[0][0].set_cell_text_align(fort::text_align::center);
+                    title.row(0).set_cell_row_type(fort::row_type::header);
+                    oss << "\n"
+                        << title.to_string();
                 }
 
-                // "Other (unprofiled)" row in phase table
-                if (wall_clock_prefill_ms > 0 || wall_clock_decode_ms > 0)
+                // Sort by total time (descending)
+                std::array<size_t, COUNT> indices;
+                for (size_t i = 0; i < indices.size(); ++i)
+                    indices[i] = i;
+                std::sort(indices.begin(), indices.end(), [&inst](size_t a, size_t b)
+                          { return inst.stats_[a].total_us > inst.stats_[b].total_us; });
+
+                fort::utf8_table table;
+                table.set_border_style(FT_DOUBLE2_STYLE);
+
+                if (device_count > 1)
                 {
-                    double prefill_unp_ms = (wall_clock_prefill_ms > 0) ? (wall_clock_prefill_ms - prefill_gpu_total_us / 1000.0) : 0;
-                    double decode_unp_ms = (wall_clock_decode_ms > 0) ? (wall_clock_decode_ms - decode_gpu_total_us / 1000.0) : 0;
-                    if (prefill_unp_ms > 0.01 || decode_unp_ms > 0.01)
+                    // Multi-device header
+                    table << fort::header << "Kernel Type" << "Total (ms)";
+                    for (int dev : devices)
                     {
-                        double decode_pct_base = (wall_clock_decode_ms > 0) ? (wall_clock_decode_ms * 1000.0) : total_time_us;
-                        double unp_decode_pct = (decode_pct_base > 0) ? (decode_unp_ms * 1000.0 / decode_pct_base * 100.0) : 0;
-                        std::ostringstream upf_ss, udc_ss, upct_ss;
-                        upf_ss << std::fixed << std::setprecision(2) << std::max(0.0, prefill_unp_ms);
-                        udc_ss << std::fixed << std::setprecision(2) << std::max(0.0, decode_unp_ms);
-                        upct_ss << std::fixed << std::setprecision(1) << std::max(0.0, unp_decode_pct) << "%";
-                        phase_table << "Other (unprofiled)" << upf_ss.str() << udc_ss.str() << upct_ss.str() << fort::endr;
+                        std::ostringstream dev_ss;
+                        dev_ss << "cuda:" << dev;
+                        table << dev_ss.str();
+                    }
+                    table << "Balance" << fort::endr;
+
+                    table.column(0).set_cell_text_align(fort::text_align::left);
+                    table.column(1).set_cell_text_align(fort::text_align::right);
+                    for (size_t i = 0; i < devices.size(); ++i)
+                    {
+                        table.column(2 + i).set_cell_text_align(fort::text_align::right);
+                    }
+                    table.column(2 + devices.size()).set_cell_text_align(fort::text_align::right);
+
+                    for (size_t idx : indices)
+                    {
+                        const auto &stats = inst.stats_[idx];
+                        if (stats.call_count == 0)
+                            continue;
+
+                        double total_ms = stats.total_us / 1000.0;
+
+                        // Collect per-device times
+                        std::vector<double> dev_times;
+                        double max_time = 0.0, min_time = 1e12;
+                        for (int dev : devices)
+                        {
+                            auto it = inst.device_stats_.find(dev);
+                            if (it != inst.device_stats_.end())
+                            {
+                                double dev_ms = it->second.stats[idx].total_us / 1000.0;
+                                dev_times.push_back(dev_ms);
+                                if (dev_ms > 0)
+                                {
+                                    max_time = std::max(max_time, dev_ms);
+                                    min_time = std::min(min_time, dev_ms);
+                                }
+                            }
+                            else
+                            {
+                                dev_times.push_back(0.0);
+                            }
+                        }
+
+                        double balance = (max_time > 0) ? (min_time / max_time * 100.0) : 100.0;
+
+                        std::ostringstream total_ss, balance_ss;
+                        total_ss << std::fixed << std::setprecision(2) << total_ms;
+                        balance_ss << static_cast<int>(balance) << "%";
+
+                        table << cudaKernelTypeName(static_cast<CUDAKernelType>(idx)) << total_ss.str();
+                        for (double t : dev_times)
+                        {
+                            std::ostringstream dev_time_ss;
+                            dev_time_ss << std::fixed << std::setprecision(2) << t;
+                            table << dev_time_ss.str();
+                        }
+                        table << balance_ss.str() << fort::endr;
+                    }
+
+                    // Separator and total row
+                    table << fort::separator;
+
+                    // Show effective wall-clock (max across devices)
+                    double max_device_time = 0.0;
+                    for (const auto &[_, dev_stats] : inst.device_stats_)
+                    {
+                        double dev_total = 0.0;
+                        for (const auto &s : dev_stats.stats)
+                        {
+                            dev_total += s.total_us;
+                        }
+                        max_device_time = std::max(max_device_time, dev_total);
+                    }
+
+                    std::ostringstream total_ss, wallclock_ss;
+                    total_ss << std::fixed << std::setprecision(2) << (total_time_us / 1000.0) << " ms";
+                    wallclock_ss << std::fixed << std::setprecision(2) << (max_device_time / 1000.0) << " ms wall";
+
+                    table << "TOTAL GPU TIME" << total_ss.str();
+                    for (size_t i = 0; i < devices.size(); ++i)
+                    {
+                        table << "";
+                    }
+                    table << wallclock_ss.str() << fort::endr;
+                }
+                else
+                {
+                    // Single device format (no phase data)
+                    table << fort::header << "Kernel Type" << "Calls" << "Total (ms)" << "Avg (µs)" << "Max (µs)" << "%" << fort::endr;
+                    table.column(0).set_cell_text_align(fort::text_align::left);
+                    table.column(1).set_cell_text_align(fort::text_align::right);
+                    table.column(2).set_cell_text_align(fort::text_align::right);
+                    table.column(3).set_cell_text_align(fort::text_align::right);
+                    table.column(4).set_cell_text_align(fort::text_align::right);
+                    table.column(5).set_cell_text_align(fort::text_align::right);
+
+                    for (size_t idx : indices)
+                    {
+                        const auto &stats = inst.stats_[idx];
+                        if (stats.call_count == 0)
+                            continue;
+
+                        double avg_us = stats.total_us / static_cast<double>(stats.call_count);
+                        double pct = (pct_base_us > 0) ? (stats.total_us / pct_base_us * 100.0) : 0.0;
+                        double total_ms = stats.total_us / 1000.0;
+
+                        std::ostringstream total_ss, avg_ss, max_ss, pct_ss;
+                        total_ss << std::fixed << std::setprecision(2) << total_ms;
+                        avg_ss << std::fixed << std::setprecision(1) << avg_us;
+                        max_ss << std::fixed << std::setprecision(1) << stats.max_us;
+                        pct_ss << std::fixed << std::setprecision(1) << pct << "%";
+
+                        table << cudaKernelTypeName(static_cast<CUDAKernelType>(idx))
+                              << stats.call_count << total_ss.str() << avg_ss.str() << max_ss.str() << pct_ss.str()
+                              << fort::endr;
+                    }
+
+                    // Separator and total
+                    table << fort::separator;
+                    {
+                        double display_total_ms = (wall_clock_total_ms > 0) ? wall_clock_total_ms : (total_time_us / 1000.0);
+                        std::ostringstream total_ss;
+                        total_ss << std::fixed << std::setprecision(2) << display_total_ms << " ms";
+
+                        if (total_tokens > 0)
+                        {
+                            double ms_per_token = display_total_ms / static_cast<double>(total_tokens);
+                            std::ostringstream throughput_ss;
+                            throughput_ss << std::fixed << std::setprecision(2) << ms_per_token << " ms/tok";
+                            table << "TOTAL" << "" << total_ss.str() << "" << "" << throughput_ss.str() << fort::endr;
+                        }
+                        else
+                        {
+                            table << "TOTAL" << "" << total_ss.str() << "" << "" << "" << fort::endr;
+                        }
                     }
                 }
 
-                phase_table << fort::separator;
-                {
-                    double display_prefill_ms = (wall_clock_prefill_ms > 0) ? wall_clock_prefill_ms : (prefill_gpu_total_us / 1000.0);
-                    double display_decode_ms = (wall_clock_decode_ms > 0) ? wall_clock_decode_ms : (decode_gpu_total_us / 1000.0);
-                    std::ostringstream pf_ss, dc_ss;
-                    pf_ss << std::fixed << std::setprecision(2) << display_prefill_ms;
-                    dc_ss << std::fixed << std::setprecision(2) << display_decode_ms;
-                    phase_table << "PHASE TOTAL" << pf_ss.str() << dc_ss.str() << "" << fort::endr;
-                }
-
-                oss << "\nCUDA KERNEL PHASE BREAKDOWN (Prefill vs Decode):\n";
-                oss << phase_table.to_string();
+                oss << table.to_string();
             }
 
             return oss.str();
@@ -692,9 +728,13 @@ namespace llaminar2
         /**
          * @brief Print summary to stdout
          */
-        static void printSummary(uint64_t total_tokens = 0, double wall_clock_prefill_ms = 0, double wall_clock_decode_ms = 0)
+        static void printSummary(uint64_t total_tokens = 0,
+                                 double wall_clock_prefill_ms = 0,
+                                 double wall_clock_decode_ms = 0,
+                                 uint64_t prefill_tokens = 0,
+                                 uint64_t decode_tokens = 0)
         {
-            std::string summary = getSummary(total_tokens, wall_clock_prefill_ms, wall_clock_decode_ms);
+            std::string summary = getSummary(total_tokens, wall_clock_prefill_ms, wall_clock_decode_ms, prefill_tokens, decode_tokens);
             if (!summary.empty())
             {
                 fprintf(stdout, "%s", summary.c_str());

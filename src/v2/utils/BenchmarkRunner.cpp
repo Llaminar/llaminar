@@ -316,6 +316,8 @@ namespace llaminar2
             CUDAKernelProfiler::reset();
             ROCmKernelProfiler::reset();
         }
+        // Also reset executor overhead stats so warmup overhead isn't counted
+        runner_->resetExecutorStats();
 
         // ========================================================================
         // Benchmark Iterations - Run multiple times and average
@@ -336,6 +338,7 @@ namespace llaminar2
             }
 
             // Run prefill
+            KernelProfiler::setCurrentPhase(KernelProfiler::Phase::PREFILL);
             CUDAKernelProfiler::setCurrentPhase(CUDAKernelProfiler::Phase::PREFILL);
             ROCmKernelProfiler::setCurrentPhase(ROCmKernelProfiler::Phase::PREFILL);
             KVCacheProfiler::setCurrentPhase(KVCacheProfiler::Phase::PREFILL);
@@ -353,6 +356,7 @@ namespace llaminar2
             // Run decode (if requested)
             if (n_decode > 0)
             {
+                KernelProfiler::setCurrentPhase(KernelProfiler::Phase::DECODE);
                 CUDAKernelProfiler::setCurrentPhase(CUDAKernelProfiler::Phase::DECODE);
                 ROCmKernelProfiler::setCurrentPhase(ROCmKernelProfiler::Phase::DECODE);
                 KVCacheProfiler::setCurrentPhase(KVCacheProfiler::Phase::DECODE);
@@ -511,13 +515,24 @@ namespace llaminar2
         // Print kernel profiling summary if enabled
         if (KernelProfiler::isEnabled())
         {
-            uint64_t total_tokens = result.prefill_tokens + result.decode_tokens;
+            // Kernel profilers accumulate stats across ALL benchmark iterations,
+            // but result.prefill_time_ms/decode_time_ms are averages.
+            // Scale wall clocks and token counts by iteration count so %
+            // calculations use the total accumulated wall clock as denominator.
+            uint64_t total_tokens = (result.prefill_tokens + result.decode_tokens) * BENCHMARK_ITERATIONS;
+            double total_prefill_ms = result.prefill_time_ms * BENCHMARK_ITERATIONS;
+            double total_decode_ms = result.decode_time_ms * BENCHMARK_ITERATIONS;
+            uint64_t total_prefill_tokens = result.prefill_tokens * BENCHMARK_ITERATIONS;
+            uint64_t total_decode_tokens = result.decode_tokens * BENCHMARK_ITERATIONS;
 
-            KernelProfiler::printSummary(total_tokens);
+            KernelProfiler::printSummary(total_tokens, total_prefill_ms, total_decode_ms,
+                                         total_prefill_tokens, total_decode_tokens);
 
             KVCacheProfiler::printSummary();
-            CUDAKernelProfiler::printSummary(total_tokens, result.prefill_time_ms, result.decode_time_ms);
-            ROCmKernelProfiler::printSummary(total_tokens, result.prefill_time_ms, result.decode_time_ms);
+            CUDAKernelProfiler::printSummary(total_tokens, total_prefill_ms, total_decode_ms,
+                                             total_prefill_tokens, total_decode_tokens);
+            ROCmKernelProfiler::printSummary(total_tokens, total_prefill_ms, total_decode_ms,
+                                             total_prefill_tokens, total_decode_tokens);
         }
 
         // Print executor overhead profiling if enabled (LLAMINAR_PROFILING=1)

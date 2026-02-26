@@ -597,6 +597,24 @@ namespace llaminar2
         };
 
         /**
+         * @brief Inference phase for profiling separation
+         */
+        enum class Phase : int
+        {
+            COMBINED = 0,
+            PREFILL = 1,
+            DECODE = 2
+        };
+
+        /**
+         * @brief Set the current inference phase for phase-separated profiling
+         */
+        static void setCurrentPhase(Phase phase)
+        {
+            current_phase() = phase;
+        }
+
+        /**
          * @brief Check if profiling is enabled (from DebugEnv)
          */
         static bool isEnabled()
@@ -632,15 +650,22 @@ namespace llaminar2
             if (!isEnabled())
                 return;
 
+            auto &inst = getInstance();
+
             // Record to global stats (backward compatible)
-            auto &global = getInstance().stats_[static_cast<size_t>(type)];
-            global.add(duration_ns);
+            inst.stats_[static_cast<size_t>(type)].add(duration_ns);
+
+            // Record to phase-specific stats
+            Phase phase = current_phase();
+            if (phase == Phase::PREFILL)
+                inst.prefill_stats_[static_cast<size_t>(type)].add(duration_ns);
+            else if (phase == Phase::DECODE)
+                inst.decode_stats_[static_cast<size_t>(type)].add(duration_ns);
 
             // Record to per-device stats if device context is set
             const std::string &device = current_device_key();
             if (!device.empty())
             {
-                auto &inst = getInstance();
                 std::lock_guard<std::mutex> lock(inst.device_mutex_);
                 inst.device_stats_[device].stats[static_cast<size_t>(type)].add(duration_ns);
             }
@@ -657,14 +682,21 @@ namespace llaminar2
             if (!isEnabled())
                 return;
 
+            auto &inst = getInstance();
+
             // Record to global stats
-            auto &global = getInstance().stats_[static_cast<size_t>(type)];
-            global.add(duration_ns);
+            inst.stats_[static_cast<size_t>(type)].add(duration_ns);
+
+            // Record to phase-specific stats
+            Phase phase = current_phase();
+            if (phase == Phase::PREFILL)
+                inst.prefill_stats_[static_cast<size_t>(type)].add(duration_ns);
+            else if (phase == Phase::DECODE)
+                inst.decode_stats_[static_cast<size_t>(type)].add(duration_ns);
 
             // Record to per-device stats
             if (!device_key.empty())
             {
-                auto &inst = getInstance();
                 std::lock_guard<std::mutex> lock(inst.device_mutex_);
                 inst.device_stats_[device_key].stats[static_cast<size_t>(type)].add(duration_ns);
             }
@@ -712,9 +744,12 @@ namespace llaminar2
         {
             auto &inst = getInstance();
             for (auto &stats : inst.stats_)
-            {
                 stats.reset();
-            }
+            for (auto &stats : inst.prefill_stats_)
+                stats.reset();
+            for (auto &stats : inst.decode_stats_)
+                stats.reset();
+            current_phase() = Phase::COMBINED;
             // Reset per-device stats
             {
                 std::lock_guard<std::mutex> lock(inst.device_mutex_);
@@ -725,9 +760,17 @@ namespace llaminar2
         /**
          * @brief Print formatted summary of all kernel timings
          * @param total_tokens Total tokens processed (for tok/s calculation)
+         * @param wall_clock_prefill_ms Wall-clock time for prefill phase
+         * @param wall_clock_decode_ms Wall-clock time for decode phase
+         * @param prefill_tokens Number of tokens in prefill phase
+         * @param decode_tokens Number of tokens in decode phase
          * @return Formatted string with timing breakdown
          */
-        static std::string getSummary(uint64_t total_tokens = 0)
+        static std::string getSummary(uint64_t total_tokens = 0,
+                                      double wall_clock_prefill_ms = 0,
+                                      double wall_clock_decode_ms = 0,
+                                      uint64_t prefill_tokens = 0,
+                                      uint64_t decode_tokens = 0)
         {
             if (!isEnabled())
             {
@@ -738,184 +781,307 @@ namespace llaminar2
             size_t device_count = getDeviceCount();
             std::vector<std::string> devices = getDevices();
 
+            // Check if phase data was collected
+            bool has_prefill = false, has_decode = false;
+            for (size_t i = 0; i < static_cast<size_t>(KernelType::COUNT); ++i)
+            {
+                if (inst.prefill_stats_[i].call_count.load(std::memory_order_relaxed) > 0)
+                    has_prefill = true;
+                if (inst.decode_stats_[i].call_count.load(std::memory_order_relaxed) > 0)
+                    has_decode = true;
+            }
+
             std::ostringstream oss;
 
-            // Title table
+            // Helper lambda to render a single-device stats table
+            auto renderPhaseTable = [&](const std::string &phase_label,
+                                        const std::array<KernelStats, static_cast<size_t>(KernelType::COUNT)> &phase_stats,
+                                        uint64_t phase_tokens,
+                                        double wall_clock_ms)
             {
-                fort::utf8_table title;
-                title.set_border_style(FT_DOUBLE2_STYLE);
-                if (device_count > 1)
+                // Calculate total for this phase
+                uint64_t phase_total_ns = 0;
+                for (size_t i = 0; i < static_cast<size_t>(KernelType::COUNT); ++i)
                 {
+                    phase_total_ns += phase_stats[i].total_ns.load(std::memory_order_relaxed);
+                }
+
+                if (phase_total_ns == 0)
+                    return;
+
+                // Title
+                {
+                    fort::utf8_table title;
+                    title.set_border_style(FT_DOUBLE2_STYLE);
                     std::ostringstream title_ss;
-                    title_ss << "CPU KERNEL PROFILING SUMMARY (" << device_count << " devices)";
+                    title_ss << "CPU KERNEL PROFILING — " << phase_label;
+                    if (phase_tokens > 0)
+                        title_ss << " (" << phase_tokens << " tokens)";
                     title << title_ss.str() << fort::endr;
+                    title[0][0].set_cell_text_align(fort::text_align::center);
+                    title.row(0).set_cell_row_type(fort::row_type::header);
+                    oss << "\n"
+                        << title.to_string();
                 }
-                else
-                {
-                    title << "CPU KERNEL PROFILING SUMMARY" << fort::endr;
-                }
-                title[0][0].set_cell_text_align(fort::text_align::center);
-                title.row(0).set_cell_row_type(fort::row_type::header);
-                oss << "\n"
-                    << title.to_string();
-            }
 
-            // Main data table
-            fort::utf8_table table;
-            table.set_border_style(FT_DOUBLE2_STYLE);
+                // Sort by total time (descending)
+                std::array<size_t, static_cast<size_t>(KernelType::COUNT)> indices;
+                for (size_t i = 0; i < indices.size(); ++i)
+                    indices[i] = i;
+                std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b)
+                          { return phase_stats[a].total_ns.load(std::memory_order_relaxed) > phase_stats[b].total_ns.load(std::memory_order_relaxed); });
 
-            if (device_count > 1)
-            {
-                // Multi-device header
-                table << fort::header << "Kernel Type" << "Total (ms)";
-                for (const auto &dev : devices)
-                {
-                    std::string dev_short = dev.length() > 10 ? dev.substr(0, 10) : dev;
-                    table << dev_short;
-                }
-                table << "Balance" << fort::endr;
+                double pct_base_ns = (wall_clock_ms > 0) ? (wall_clock_ms * 1e6) : static_cast<double>(phase_total_ns);
 
-                table.column(0).set_cell_text_align(fort::text_align::left);
-                table.column(1).set_cell_text_align(fort::text_align::right);
-                for (size_t i = 0; i < devices.size(); ++i)
-                {
-                    table.column(2 + i).set_cell_text_align(fort::text_align::right);
-                }
-                table.column(2 + devices.size()).set_cell_text_align(fort::text_align::right);
-            }
-            else
-            {
-                // Single device header
-                table << fort::header << "Kernel Type" << "Calls" << "Total (ms)" << "Avg (µs)" << "Min/Max (µs)" << fort::endr;
+                fort::utf8_table table;
+                table.set_border_style(FT_DOUBLE2_STYLE);
+                table << fort::header << "Kernel Type" << "Calls" << "Total (ms)" << "Avg (µs)" << "Min/Max (µs)" << "%" << fort::endr;
                 table.column(0).set_cell_text_align(fort::text_align::left);
                 table.column(1).set_cell_text_align(fort::text_align::right);
                 table.column(2).set_cell_text_align(fort::text_align::right);
                 table.column(3).set_cell_text_align(fort::text_align::right);
                 table.column(4).set_cell_text_align(fort::text_align::right);
-            }
+                table.column(5).set_cell_text_align(fort::text_align::right);
 
-            uint64_t grand_total_ns = 0;
-
-            for (size_t i = 0; i < static_cast<size_t>(KernelType::COUNT); ++i)
-            {
-                const auto &stats = inst.stats_[i];
-                uint64_t count = stats.call_count.load(std::memory_order_relaxed);
-                if (count == 0)
-                    continue;
-
-                uint64_t total_ns = stats.total_ns.load(std::memory_order_relaxed);
-                double total_ms = total_ns / 1e6;
-                grand_total_ns += total_ns;
-
-                std::ostringstream total_ss;
-                total_ss << std::fixed << std::setprecision(2) << total_ms;
-
-                if (device_count > 1)
+                for (size_t idx : indices)
                 {
-                    // Collect per-device times for this kernel
-                    std::vector<double> device_times;
-                    double max_time = 0.0, min_time = 1e12;
+                    uint64_t count = phase_stats[idx].call_count.load(std::memory_order_relaxed);
+                    if (count == 0)
+                        continue;
 
-                    std::lock_guard<std::mutex> lock(inst.device_mutex_);
-                    for (const auto &dev : devices)
-                    {
-                        auto it = inst.device_stats_.find(dev);
-                        if (it != inst.device_stats_.end())
-                        {
-                            uint64_t dev_ns = it->second.stats[i].total_ns.load(std::memory_order_relaxed);
-                            double dev_ms = dev_ns / 1e6;
-                            device_times.push_back(dev_ms);
-                            max_time = std::max(max_time, dev_ms);
-                            min_time = std::min(min_time, dev_ms);
-                        }
-                        else
-                        {
-                            device_times.push_back(0.0);
-                        }
-                    }
+                    uint64_t total_ns_val = phase_stats[idx].total_ns.load(std::memory_order_relaxed);
+                    uint64_t min_ns_val = phase_stats[idx].min_ns.load(std::memory_order_relaxed);
+                    uint64_t max_ns_val = phase_stats[idx].max_ns.load(std::memory_order_relaxed);
+                    double total_ms = total_ns_val / 1e6;
+                    double avg_us = (total_ns_val / static_cast<double>(count)) / 1e3;
+                    double min_us = min_ns_val / 1e3;
+                    double max_us = max_ns_val / 1e3;
+                    double pct = (pct_base_ns > 0) ? (static_cast<double>(total_ns_val) / pct_base_ns * 100.0) : 0.0;
 
-                    // Calculate load balance (0-100%, higher is better)
-                    double balance = (max_time > 0) ? (min_time / max_time * 100.0) : 100.0;
-
-                    std::ostringstream balance_ss;
-                    balance_ss << static_cast<int>(balance) << "%";
-
-                    table << kernelTypeName(static_cast<KernelType>(i)) << total_ss.str();
-                    for (double t : device_times)
-                    {
-                        std::ostringstream dev_ss;
-                        dev_ss << std::fixed << std::setprecision(2) << t;
-                        table << dev_ss.str();
-                    }
-                    table << balance_ss.str() << fort::endr;
-                }
-                else
-                {
-                    // Single device format
-                    uint64_t min_ns = stats.min_ns.load(std::memory_order_relaxed);
-                    uint64_t max_ns = stats.max_ns.load(std::memory_order_relaxed);
-                    double avg_us = (total_ns / static_cast<double>(count)) / 1e3;
-                    double min_us = min_ns / 1e3;
-                    double max_us = max_ns / 1e3;
-
-                    std::ostringstream avg_ss, minmax_ss;
+                    std::ostringstream total_ss, avg_ss, minmax_ss, pct_ss;
+                    total_ss << std::fixed << std::setprecision(2) << total_ms;
                     avg_ss << std::fixed << std::setprecision(1) << avg_us;
                     minmax_ss << std::fixed << std::setprecision(1) << min_us << "/" << max_us;
+                    pct_ss << std::fixed << std::setprecision(1) << pct << "%";
 
-                    table << kernelTypeName(static_cast<KernelType>(i))
-                          << count
-                          << total_ss.str()
-                          << avg_ss.str()
-                          << minmax_ss.str()
+                    table << kernelTypeName(static_cast<KernelType>(idx))
+                          << count << total_ss.str() << avg_ss.str() << minmax_ss.str() << pct_ss.str()
                           << fort::endr;
                 }
-            }
 
-            // Separator and total row
-            table << fort::separator;
+                // Separator and total
+                table << fort::separator;
 
-            double grand_total_ms = grand_total_ns / 1e6;
-            std::ostringstream grand_ss;
-            grand_ss << std::fixed << std::setprecision(2) << grand_total_ms << " ms";
+                double phase_total_ms = phase_total_ns / 1e6;
+                double display_total_ms = (wall_clock_ms > 0) ? wall_clock_ms : phase_total_ms;
+                std::ostringstream grand_ss;
+                grand_ss << std::fixed << std::setprecision(2) << display_total_ms << " ms";
 
-            if (total_tokens > 0)
-            {
-                double toks_per_sec = (total_tokens * 1e9) / static_cast<double>(grand_total_ns);
-                std::ostringstream throughput_ss;
-                throughput_ss << std::fixed << std::setprecision(2) << toks_per_sec << " kernel tok/s";
-
-                if (device_count > 1)
+                if (phase_tokens > 0)
                 {
-                    table << "TOTAL KERNEL TIME" << grand_ss.str();
-                    for (size_t i = 0; i < devices.size(); ++i)
-                    {
-                        table << "";
-                    }
-                    table << throughput_ss.str() << fort::endr;
+                    double ms_per_tok = display_total_ms / static_cast<double>(phase_tokens);
+                    double toks_per_sec = (phase_tokens * 1000.0) / display_total_ms;
+                    std::ostringstream throughput_ss;
+                    throughput_ss << std::fixed << std::setprecision(2) << toks_per_sec << " tok/s";
+                    table << "TOTAL" << "" << grand_ss.str() << "" << "" << throughput_ss.str() << fort::endr;
                 }
                 else
                 {
-                    table << "TOTAL" << "" << grand_ss.str() << "" << throughput_ss.str() << fort::endr;
+                    table << "TOTAL" << "" << grand_ss.str() << "" << "" << "" << fort::endr;
                 }
+
+                oss << table.to_string();
+            };
+
+            // Render phase-separated or combined tables
+            if ((has_prefill || has_decode) && device_count <= 1)
+            {
+                // Phase-separated output for single device
+                if (has_prefill)
+                    renderPhaseTable("PREFILL", inst.prefill_stats_, prefill_tokens, wall_clock_prefill_ms);
+                if (has_decode)
+                    renderPhaseTable("DECODE", inst.decode_stats_, decode_tokens, wall_clock_decode_ms);
             }
             else
             {
+                // Combined output (no phase data or multi-device)
+                // Title table
+                {
+                    fort::utf8_table title;
+                    title.set_border_style(FT_DOUBLE2_STYLE);
+                    if (device_count > 1)
+                    {
+                        std::ostringstream title_ss;
+                        title_ss << "CPU KERNEL PROFILING SUMMARY (" << device_count << " devices)";
+                        title << title_ss.str() << fort::endr;
+                    }
+                    else
+                    {
+                        title << "CPU KERNEL PROFILING SUMMARY" << fort::endr;
+                    }
+                    title[0][0].set_cell_text_align(fort::text_align::center);
+                    title.row(0).set_cell_row_type(fort::row_type::header);
+                    oss << "\n"
+                        << title.to_string();
+                }
+
+                // Main data table
+                fort::utf8_table table;
+                table.set_border_style(FT_DOUBLE2_STYLE);
+
                 if (device_count > 1)
                 {
-                    table << "TOTAL KERNEL TIME" << grand_ss.str();
-                    for (size_t i = 0; i < devices.size() + 1; ++i)
+                    // Multi-device header
+                    table << fort::header << "Kernel Type" << "Total (ms)";
+                    for (const auto &dev : devices)
                     {
-                        table << "";
+                        std::string dev_short = dev.length() > 10 ? dev.substr(0, 10) : dev;
+                        table << dev_short;
                     }
-                    table << fort::endr;
+                    table << "Balance" << fort::endr;
+
+                    table.column(0).set_cell_text_align(fort::text_align::left);
+                    table.column(1).set_cell_text_align(fort::text_align::right);
+                    for (size_t i = 0; i < devices.size(); ++i)
+                    {
+                        table.column(2 + i).set_cell_text_align(fort::text_align::right);
+                    }
+                    table.column(2 + devices.size()).set_cell_text_align(fort::text_align::right);
                 }
                 else
                 {
-                    table << "TOTAL" << "" << grand_ss.str() << "" << "" << fort::endr;
+                    // Single device header
+                    table << fort::header << "Kernel Type" << "Calls" << "Total (ms)" << "Avg (µs)" << "Min/Max (µs)" << fort::endr;
+                    table.column(0).set_cell_text_align(fort::text_align::left);
+                    table.column(1).set_cell_text_align(fort::text_align::right);
+                    table.column(2).set_cell_text_align(fort::text_align::right);
+                    table.column(3).set_cell_text_align(fort::text_align::right);
+                    table.column(4).set_cell_text_align(fort::text_align::right);
                 }
-            }
 
-            oss << table.to_string();
+                uint64_t grand_total_ns = 0;
+
+                for (size_t i = 0; i < static_cast<size_t>(KernelType::COUNT); ++i)
+                {
+                    const auto &stats = inst.stats_[i];
+                    uint64_t count = stats.call_count.load(std::memory_order_relaxed);
+                    if (count == 0)
+                        continue;
+
+                    uint64_t total_ns = stats.total_ns.load(std::memory_order_relaxed);
+                    double total_ms = total_ns / 1e6;
+                    grand_total_ns += total_ns;
+
+                    std::ostringstream total_ss;
+                    total_ss << std::fixed << std::setprecision(2) << total_ms;
+
+                    if (device_count > 1)
+                    {
+                        // Collect per-device times for this kernel
+                        std::vector<double> device_times;
+                        double max_time = 0.0, min_time = 1e12;
+
+                        std::lock_guard<std::mutex> lock(inst.device_mutex_);
+                        for (const auto &dev : devices)
+                        {
+                            auto it = inst.device_stats_.find(dev);
+                            if (it != inst.device_stats_.end())
+                            {
+                                uint64_t dev_ns = it->second.stats[i].total_ns.load(std::memory_order_relaxed);
+                                double dev_ms = dev_ns / 1e6;
+                                device_times.push_back(dev_ms);
+                                max_time = std::max(max_time, dev_ms);
+                                min_time = std::min(min_time, dev_ms);
+                            }
+                            else
+                            {
+                                device_times.push_back(0.0);
+                            }
+                        }
+
+                        // Calculate load balance (0-100%, higher is better)
+                        double balance = (max_time > 0) ? (min_time / max_time * 100.0) : 100.0;
+
+                        std::ostringstream balance_ss;
+                        balance_ss << static_cast<int>(balance) << "%";
+
+                        table << kernelTypeName(static_cast<KernelType>(i)) << total_ss.str();
+                        for (double t : device_times)
+                        {
+                            std::ostringstream dev_ss;
+                            dev_ss << std::fixed << std::setprecision(2) << t;
+                            table << dev_ss.str();
+                        }
+                        table << balance_ss.str() << fort::endr;
+                    }
+                    else
+                    {
+                        // Single device format
+                        uint64_t min_ns = stats.min_ns.load(std::memory_order_relaxed);
+                        uint64_t max_ns = stats.max_ns.load(std::memory_order_relaxed);
+                        double avg_us = (total_ns / static_cast<double>(count)) / 1e3;
+                        double min_us = min_ns / 1e3;
+                        double max_us = max_ns / 1e3;
+
+                        std::ostringstream avg_ss, minmax_ss;
+                        avg_ss << std::fixed << std::setprecision(1) << avg_us;
+                        minmax_ss << std::fixed << std::setprecision(1) << min_us << "/" << max_us;
+
+                        table << kernelTypeName(static_cast<KernelType>(i))
+                              << count
+                              << total_ss.str()
+                              << avg_ss.str()
+                              << minmax_ss.str()
+                              << fort::endr;
+                    }
+                }
+
+                // Separator and total row
+                table << fort::separator;
+
+                double grand_total_ms = grand_total_ns / 1e6;
+                std::ostringstream grand_ss;
+                grand_ss << std::fixed << std::setprecision(2) << grand_total_ms << " ms";
+
+                if (total_tokens > 0)
+                {
+                    double toks_per_sec = (total_tokens * 1e9) / static_cast<double>(grand_total_ns);
+                    std::ostringstream throughput_ss;
+                    throughput_ss << std::fixed << std::setprecision(2) << toks_per_sec << " kernel tok/s";
+
+                    if (device_count > 1)
+                    {
+                        table << "TOTAL KERNEL TIME" << grand_ss.str();
+                        for (size_t i = 0; i < devices.size(); ++i)
+                        {
+                            table << "";
+                        }
+                        table << throughput_ss.str() << fort::endr;
+                    }
+                    else
+                    {
+                        table << "TOTAL" << "" << grand_ss.str() << "" << throughput_ss.str() << fort::endr;
+                    }
+                }
+                else
+                {
+                    if (device_count > 1)
+                    {
+                        table << "TOTAL KERNEL TIME" << grand_ss.str();
+                        for (size_t i = 0; i < devices.size() + 1; ++i)
+                        {
+                            table << "";
+                        }
+                        table << fort::endr;
+                    }
+                    else
+                    {
+                        table << "TOTAL" << "" << grand_ss.str() << "" << "" << fort::endr;
+                    }
+                }
+
+                oss << table.to_string();
+            }
 
             // Append transfer stats if any transfers occurred
             oss << TransferProfiler::getSummary();
@@ -926,9 +1092,13 @@ namespace llaminar2
         /**
          * @brief Print summary to stdout
          */
-        static void printSummary(uint64_t total_tokens = 0)
+        static void printSummary(uint64_t total_tokens = 0,
+                                 double wall_clock_prefill_ms = 0,
+                                 double wall_clock_decode_ms = 0,
+                                 uint64_t prefill_tokens = 0,
+                                 uint64_t decode_tokens = 0)
         {
-            std::print("{}", getSummary(total_tokens));
+            std::print("{}", getSummary(total_tokens, wall_clock_prefill_ms, wall_clock_decode_ms, prefill_tokens, decode_tokens));
         }
 
         /**
@@ -955,7 +1125,15 @@ namespace llaminar2
             return device_key;
         }
 
+        static Phase &current_phase()
+        {
+            static thread_local Phase phase = Phase::COMBINED;
+            return phase;
+        }
+
         std::array<KernelStats, static_cast<size_t>(KernelType::COUNT)> stats_;
+        std::array<KernelStats, static_cast<size_t>(KernelType::COUNT)> prefill_stats_;
+        std::array<KernelStats, static_cast<size_t>(KernelType::COUNT)> decode_stats_;
         std::mutex device_mutex_;
         std::unordered_map<std::string, DeviceStats> device_stats_;
     };

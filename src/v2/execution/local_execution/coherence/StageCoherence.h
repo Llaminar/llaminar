@@ -112,6 +112,18 @@ namespace llaminar2
     void markOutputsDirty(const std::vector<CoherenceBuffer> &outputs, void *stream = nullptr);
 
     /**
+     * @brief Mark output tensors as device-dirty using only flag updates (no events)
+     *
+     * Lightweight version for intermediate pipeline tensors that only flow GPU→GPU
+     * on the same compute stream. Skips hipEventRecord/cudaEventRecord overhead
+     * (~100-300μs per call on ROCm). If data() is later called, ensureOnHost()
+     * will fall back to a full device synchronize.
+     *
+     * @param outputs Output buffers to mark dirty
+     */
+    void markOutputsDirtyFlagsOnly(const std::vector<CoherenceBuffer> &outputs);
+
+    /**
      * @brief Extract CoherenceBuffer list from StageDumpInfo inputs
      *
      * Converts StageDumpInfo::InputBuffer entries to CoherenceBuffer format.

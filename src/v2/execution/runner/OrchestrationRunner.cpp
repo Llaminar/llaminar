@@ -1273,4 +1273,25 @@ namespace llaminar2
         return {};
     }
 
+    // =========================================================================
+    // Profiling
+    // =========================================================================
+
+    const GraphExecutorStats *OrchestrationRunner::executorStats() const
+    {
+        if (runner_)
+        {
+            return runner_->executorStats();
+        }
+        return nullptr;
+    }
+
+    void OrchestrationRunner::resetExecutorStats()
+    {
+        if (runner_)
+        {
+            runner_->resetExecutorStats();
+        }
+    }
+
 } // namespace llaminar2
