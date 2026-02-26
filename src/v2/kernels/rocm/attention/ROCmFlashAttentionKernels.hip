@@ -1524,18 +1524,36 @@ namespace
         }
 
         // Load Q into LDS (all threads cooperate)
+        // FP16 KV path: store Q as half in LDS (convert once, use many times)
+        // FP32/Q8_1 paths: store Q as float in LDS (matching their dot product type)
         extern __shared__ char smem[];
-        float *Q_shared = reinterpret_cast<float *>(smem);
+        [[maybe_unused]] float *Q_shared = nullptr;
+        [[maybe_unused]] __half *Q_shared_h = nullptr;
 
         const float *Q_ptr = Q + (batch_idx * n_heads + head_idx) * head_dim;
-        for (int d = tid * 2; d + 1 < head_dim; d += num_threads * 2)
+
+        if constexpr (KV_TYPE == KVTypeTag::FP16)
         {
-            const float2 qv = reinterpret_cast<const float2 *>(Q_ptr + d)[0];
-            reinterpret_cast<float2 *>(Q_shared + d)[0] = qv;
+            // Store Q as FP16 in LDS — eliminates per-KV-position FP32→FP16 conversion
+            // Halves LDS bandwidth for Q reads (4B → 2B per element per lane)
+            Q_shared_h = reinterpret_cast<__half *>(smem);
+            for (int d = tid; d < head_dim; d += num_threads)
+            {
+                Q_shared_h[d] = __float2half(Q_ptr[d]);
+            }
         }
-        for (int d = (head_dim & ~1) + tid; d < head_dim; d += num_threads)
+        else
         {
-            Q_shared[d] = Q_ptr[d];
+            Q_shared = reinterpret_cast<float *>(smem);
+            for (int d = tid * 2; d + 1 < head_dim; d += num_threads * 2)
+            {
+                const float2 qv = reinterpret_cast<const float2 *>(Q_ptr + d)[0];
+                reinterpret_cast<float2 *>(Q_shared + d)[0] = qv;
+            }
+            for (int d = (head_dim & ~1) + tid; d < head_dim; d += num_threads)
+            {
+                Q_shared[d] = Q_ptr[d];
+            }
         }
         __syncthreads();
 
@@ -1601,14 +1619,12 @@ namespace
                 if ((head_dim & 1) == 0)
                 {
                     const int head_dim_vec2 = head_dim / 2;
-                    const float2 *Q_ptr2 = reinterpret_cast<const float2 *>(Q_shared);
+                    const __half2 *Q_ptr2_h = reinterpret_cast<const __half2 *>(Q_shared_h);
                     const __half2 *K_ptr2 = reinterpret_cast<const __half2 *>(Kh);
                     for (int d2 = lane_id; d2 < head_dim_vec2; d2 += WAVEFRONT_SIZE)
                     {
-                        const float2 qv = Q_ptr2[d2];
+                        const __half2 qh2 = Q_ptr2_h[d2]; // Pre-converted FP16 from LDS
                         const __half2 kh2 = K_ptr2[d2];
-                        // fdot2: convert Q→FP16, then v_dot2_f32_f16 on gfx906
-                        __half2 qh2 = __float22half2_rn(qv);
                         partial_dot = __builtin_amdgcn_fdot2(qh2, kh2, partial_dot, false);
                     }
                 }
@@ -1616,7 +1632,7 @@ namespace
                 {
                     for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE)
                     {
-                        partial_dot += Q_shared[d] * __half2float(Kh[d]);
+                        partial_dot += __half2float(Q_shared_h[d]) * __half2float(Kh[d]);
                     }
                 }
             }
@@ -2032,7 +2048,13 @@ static int launch_decode(
     }
 
     // Split-K kernel (type-dispatched via template)
-    size_t smem_size = head_dim * sizeof(float); // Q in shared memory
+    // FP16 path stores Q as half in shared memory (halves LDS usage + bandwidth)
+    size_t smem_size;
+    if constexpr (KV_TYPE == KVTypeTag::FP16) {
+        smem_size = head_dim * sizeof(__half);
+    } else {
+        smem_size = head_dim * sizeof(float);
+    }
     dim3 grid_split(n_heads, effective_num_splits, batch_size);
     dim3 block_split(decode_threads_per_block);
 
