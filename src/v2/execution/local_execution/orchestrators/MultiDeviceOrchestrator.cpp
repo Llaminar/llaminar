@@ -26,6 +26,7 @@
 #include "../../../tensors/TensorFactory.h"
 #include "../../../backends/p2p/DirectP2P.h" // DirectP2PEngine for BAR pre-init in cross-vendor PP
 #include "../../../backends/BackendManager.h" // getBackendFor() for partial D2H in gatherLogits
+#include "../../../backends/GPUDeviceContextPool.h" // Compute stream registration for event-based collective sync
 #include "../../../utils/Logger.h"
 #include <algorithm>
 #include <future>
@@ -609,6 +610,48 @@ namespace llaminar2
                     std::vector<size_t>{max_tokens, static_cast<size_t>(vocab)});
                 LOG_DEBUG("MultiDeviceOrchestrator: Allocated combined logits buffer ["
                           << max_tokens << ", " << vocab << "]");
+            }
+        }
+
+        // =====================================================================
+        // REGISTER COMPUTE STREAMS WITH COLLECTIVE BACKEND
+        // =====================================================================
+        // Enables event-based pre-synchronization in RCCL/NCCL coordinators instead
+        // of hipDeviceSynchronize/cudaDeviceSynchronize. Each device's compute stream
+        // is passed so the coordinator can do hipEventRecord(compute_stream) +
+        // hipStreamWaitEvent(rccl_stream) before collectives — zero host stall.
+        // =====================================================================
+        if (tp_ctx_ && tp_ctx_->degree() > 1)
+        {
+            const auto &devices = tp_ctx_->devices();
+            auto &pool = GPUDeviceContextPool::instance();
+            std::vector<void *> compute_streams;
+            compute_streams.reserve(devices.size());
+
+            for (const auto &dev : devices)
+            {
+                if (dev.device_type == DeviceType::ROCm)
+                {
+                    compute_streams.push_back(pool.getAMDContext(dev.device_ordinal).defaultStream());
+                }
+                else if (dev.device_type == DeviceType::CUDA)
+                {
+                    compute_streams.push_back(pool.getNvidiaContext(dev.device_ordinal).defaultStream());
+                }
+                else
+                {
+                    LOG_WARN("MultiDeviceOrchestrator: Skipping compute stream registration for non-GPU device "
+                             << dev.toString());
+                    compute_streams.clear();
+                    break;
+                }
+            }
+
+            if (!compute_streams.empty())
+            {
+                tp_ctx_->setComputeStreams(compute_streams);
+                LOG_INFO("MultiDeviceOrchestrator: Registered " << compute_streams.size()
+                         << " compute streams for event-based collective sync");
             }
         }
     }

@@ -231,6 +231,20 @@ namespace llaminar2
             return true;
         }
 
+        /**
+         * @brief Register compute streams for stream-level pre-sync in coordinators
+         *
+         * When set, RCCL/NCCL coordinators use hipEventRecord + hipStreamWaitEvent
+         * instead of hipDeviceSynchronize for pre-collective synchronization,
+         * eliminating host-thread stalls on the collective hot path.
+         *
+         * @param compute_streams One stream handle (void*) per device, in device-slot order
+         */
+        virtual void setComputeStreams(const std::vector<void *> &compute_streams)
+        {
+            (void)compute_streams;
+        }
+
         // =====================================================================
         // Collective Operations
         // =====================================================================

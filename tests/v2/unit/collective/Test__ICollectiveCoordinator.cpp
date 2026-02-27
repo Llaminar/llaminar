@@ -84,6 +84,12 @@ public:
         // No-op for mock
     }
 
+    void setComputeStreams(const std::vector<void *> &compute_streams) override
+    {
+        (void)compute_streams;
+        // No-op for mock
+    }
+
     // =========================================================================
     // Test Instrumentation
     // =========================================================================
@@ -143,6 +149,11 @@ public:
     }
 
     void waitForDeviceEvent(int /*device_idx*/, void * /*worker_event*/) override
+    {
+        // No-op for mock
+    }
+
+    void setComputeStreams(const std::vector<void *> & /*compute_streams*/) override
     {
         // No-op for mock
     }

@@ -117,6 +117,17 @@ namespace llaminar2
          */
         void waitForDeviceEvent(int device_idx, void *worker_event) override;
 
+        /**
+         * @brief Register compute streams for stream-level pre-sync
+         *
+         * When compute streams are registered, the coordinator uses
+         * hipEventRecord + hipStreamWaitEvent instead of hipDeviceSynchronize
+         * for pre-collective synchronization. This eliminates host-thread stalls.
+         *
+         * @param compute_streams One cudaStream_t (as void*) per device, in device-slot order
+         */
+        void setComputeStreams(const std::vector<void *> &compute_streams) override;
+
         // =========================================================================
         // NCCL Collective Operations (thread-safe, queued to coordinator)
         // =========================================================================
@@ -318,6 +329,10 @@ namespace llaminar2
         std::vector<void *> comms_;             // ncclComm_t[]
         std::vector<void *> streams_;           // cudaStream_t[] - one per device
         std::vector<void *> completion_events_; // cudaEvent_t[] - signaled after each collective
+
+        // Compute stream state for stream-level pre-sync (set via setComputeStreams)
+        std::vector<void *> compute_streams_;   // cudaStream_t[] - one per device (compute streams)
+        std::vector<void *> compute_events_;    // cudaEvent_t[] - pre-created for event-based sync
 
         // Worker thread
         std::thread coordinator_thread_;

@@ -341,6 +341,55 @@ namespace llaminar2
 #endif
     }
 
+    void RCCLCoordinator::setComputeStreams(const std::vector<void *> &compute_streams)
+    {
+#ifdef HAVE_RCCL
+        if (static_cast<int>(compute_streams.size()) != num_devices_)
+        {
+            LOG_ERROR("[RCCLCoordinator] setComputeStreams: expected " << num_devices_
+                                                                       << " streams, got " << compute_streams.size());
+            return;
+        }
+
+        compute_streams_ = compute_streams;
+
+        // Pre-create events for recording on compute streams (one per device)
+        // These are used in doAllreduceMulti to establish stream-level dependencies
+        // instead of expensive hipDeviceSynchronize().
+        compute_events_.resize(num_devices_, nullptr);
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (compute_events_[i])
+            {
+                continue; // Already created
+            }
+            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[RCCLCoordinator] setComputeStreams: hipSetDevice failed for device "
+                          << device_ordinals_[i]);
+                compute_streams_.clear();
+                return;
+            }
+            hipEvent_t ev;
+            err = hipEventCreateWithFlags(&ev, hipEventDisableTiming);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[RCCLCoordinator] setComputeStreams: hipEventCreate failed for device "
+                          << device_ordinals_[i]);
+                compute_streams_.clear();
+                return;
+            }
+            compute_events_[i] = static_cast<void *>(ev);
+        }
+
+        LOG_INFO("[RCCLCoordinator] Compute streams registered for " << num_devices_
+                                                                      << " devices — using stream-level pre-sync");
+#else
+        (void)compute_streams;
+#endif
+    }
+
     // ============================================================================
     // Work Queue Implementation
     // ============================================================================
@@ -951,12 +1000,15 @@ namespace llaminar2
                 return false;
             }
 
-            // Use hipDeviceSynchronize() instead of hipStreamSynchronize(streams_[i])
-            // to ensure ALL streams complete, including any internal RCCL streams.
-            err = hipDeviceSynchronize();
+            // Stream-sync on RCCL stream only (not all streams).
+            // RCCL guarantees that when work completes on the user-provided stream,
+            // all internal RCCL work is also complete. hipDeviceSynchronize() was
+            // overkill — it stalls ALL streams including the compute stream.
+            hipStream_t rccl_stream = static_cast<hipStream_t>(streams_[i]);
+            err = hipStreamSynchronize(rccl_stream);
             if (err != hipSuccess)
             {
-                last_error_ = std::string("hipDeviceSynchronize failed for device ") +
+                last_error_ = std::string("hipStreamSynchronize failed for device ") +
                               std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
                 return false;
             }
@@ -1120,12 +1172,17 @@ namespace llaminar2
         const bool trace_device_state = debugEnv().validation.validate_gpu_ptrs;
         const size_t thread_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
 
-        // CRITICAL: Synchronize ALL streams on each device before RCCL operations.
-        // Compute kernels run on a dedicated per-device stream (AMDDeviceContext::default_stream_)
-        // created via hipStreamCreateWithFlags — NOT the HIP NULL stream. Using
-        // hipStreamSynchronize(nullptr) only syncs the NULL stream, which is a NO-OP
-        // for compute work. hipDeviceSynchronize() syncs ALL streams including the
-        // dedicated compute stream, ensuring RCCL reads completed data.
+        // Pre-collective sync: ensure compute kernels have finished writing to
+        // the buffers before RCCL reads them.
+        //
+        // Two modes:
+        // (a) Stream-level sync (preferred): Record event on compute stream, then
+        //     hipStreamWaitEvent(rccl_stream, compute_event) — zero host stall.
+        // (b) Device sync (fallback): hipDeviceSynchronize() — stalls host thread
+        //     until all GPU work completes. Used when compute streams aren't registered.
+        const bool use_stream_sync = !compute_streams_.empty() &&
+                                     static_cast<int>(compute_streams_.size()) == num_devices_;
+
         for (int i = 0; i < num_devices_; ++i)
         {
             if (trace_device_state)
@@ -1163,13 +1220,40 @@ namespace llaminar2
                 }
             }
 
-            // Sync ALL streams (compute kernels use a dedicated stream, not NULL stream)
-            err = hipDeviceSynchronize();
-            if (err != hipSuccess)
+            if (use_stream_sync)
             {
-                last_error_ = std::string("hipDeviceSynchronize failed for device ") +
-                              std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
-                return false;
+                // Stream-level pre-sync: record event on compute stream, then
+                // make RCCL stream wait for it. Zero host stall.
+                hipStream_t compute_stream = static_cast<hipStream_t>(compute_streams_[i]);
+                hipEvent_t compute_event = static_cast<hipEvent_t>(compute_events_[i]);
+                hipStream_t rccl_stream = static_cast<hipStream_t>(streams_[i]);
+
+                err = hipEventRecord(compute_event, compute_stream);
+                if (err != hipSuccess)
+                {
+                    last_error_ = std::string("hipEventRecord on compute stream failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                    return false;
+                }
+
+                err = hipStreamWaitEvent(rccl_stream, compute_event, 0);
+                if (err != hipSuccess)
+                {
+                    last_error_ = std::string("hipStreamWaitEvent failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                    return false;
+                }
+            }
+            else
+            {
+                // Fallback: full device sync (stalls host)
+                err = hipDeviceSynchronize();
+                if (err != hipSuccess)
+                {
+                    last_error_ = std::string("hipDeviceSynchronize failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                    return false;
+                }
             }
         }
 
@@ -1280,7 +1364,10 @@ namespace llaminar2
                                            size_t send_count, int dtype_int)
     {
 #ifdef HAVE_RCCL
-        // Sync ALL device streams before RCCL reads buffers (see doAllreduceMulti comment)
+        // Pre-collective sync: ensure compute done before RCCL reads.
+        // Uses stream-wait-event if compute streams registered, else device sync.
+        const bool use_stream_sync = !compute_streams_.empty() &&
+                                     static_cast<int>(compute_streams_.size()) == num_devices_;
         for (int i = 0; i < num_devices_; ++i)
         {
             hipError_t err = hipSetDevice(device_ordinals_[i]);
@@ -1289,12 +1376,35 @@ namespace llaminar2
                 last_error_ = std::string("hipSetDevice failed during pre-allgather sync: ") + hipGetErrorString(err);
                 return false;
             }
-            err = hipDeviceSynchronize();
-            if (err != hipSuccess)
+            if (use_stream_sync)
             {
-                last_error_ = std::string("hipDeviceSynchronize failed for device ") +
-                              std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
-                return false;
+                hipStream_t compute_stream = static_cast<hipStream_t>(compute_streams_[i]);
+                hipEvent_t compute_event = static_cast<hipEvent_t>(compute_events_[i]);
+                hipStream_t rccl_stream = static_cast<hipStream_t>(streams_[i]);
+                err = hipEventRecord(compute_event, compute_stream);
+                if (err != hipSuccess)
+                {
+                    last_error_ = std::string("hipEventRecord failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                    return false;
+                }
+                err = hipStreamWaitEvent(rccl_stream, compute_event, 0);
+                if (err != hipSuccess)
+                {
+                    last_error_ = std::string("hipStreamWaitEvent failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                    return false;
+                }
+            }
+            else
+            {
+                err = hipDeviceSynchronize();
+                if (err != hipSuccess)
+                {
+                    last_error_ = std::string("hipDeviceSynchronize failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                    return false;
+                }
             }
         }
 
@@ -1371,7 +1481,9 @@ namespace llaminar2
                                            int dtype_int, int root)
     {
 #ifdef HAVE_RCCL
-        // Sync ALL device streams before RCCL reads buffers (see doAllreduceMulti comment)
+        // Pre-collective sync: ensure compute done before RCCL reads.
+        const bool use_stream_sync = !compute_streams_.empty() &&
+                                     static_cast<int>(compute_streams_.size()) == num_devices_;
         for (int i = 0; i < num_devices_; ++i)
         {
             hipError_t err = hipSetDevice(device_ordinals_[i]);
@@ -1380,12 +1492,35 @@ namespace llaminar2
                 last_error_ = std::string("hipSetDevice failed during pre-broadcast sync: ") + hipGetErrorString(err);
                 return false;
             }
-            err = hipDeviceSynchronize();
-            if (err != hipSuccess)
+            if (use_stream_sync)
             {
-                last_error_ = std::string("hipDeviceSynchronize failed for device ") +
-                              std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
-                return false;
+                hipStream_t compute_stream = static_cast<hipStream_t>(compute_streams_[i]);
+                hipEvent_t compute_event = static_cast<hipEvent_t>(compute_events_[i]);
+                hipStream_t rccl_stream = static_cast<hipStream_t>(streams_[i]);
+                err = hipEventRecord(compute_event, compute_stream);
+                if (err != hipSuccess)
+                {
+                    last_error_ = std::string("hipEventRecord failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                    return false;
+                }
+                err = hipStreamWaitEvent(rccl_stream, compute_event, 0);
+                if (err != hipSuccess)
+                {
+                    last_error_ = std::string("hipStreamWaitEvent failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                    return false;
+                }
+            }
+            else
+            {
+                err = hipDeviceSynchronize();
+                if (err != hipSuccess)
+                {
+                    last_error_ = std::string("hipDeviceSynchronize failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                    return false;
+                }
             }
         }
 
@@ -1464,7 +1599,9 @@ namespace llaminar2
                                                size_t recv_count, int dtype_int, int op_int)
     {
 #ifdef HAVE_RCCL
-        // Sync ALL device streams before RCCL reads buffers (see doAllreduceMulti comment)
+        // Pre-collective sync: ensure compute done before RCCL reads.
+        const bool use_stream_sync = !compute_streams_.empty() &&
+                                     static_cast<int>(compute_streams_.size()) == num_devices_;
         for (int i = 0; i < num_devices_; ++i)
         {
             hipError_t err = hipSetDevice(device_ordinals_[i]);
@@ -1473,12 +1610,35 @@ namespace llaminar2
                 last_error_ = std::string("hipSetDevice failed during pre-reducescatter sync: ") + hipGetErrorString(err);
                 return false;
             }
-            err = hipDeviceSynchronize();
-            if (err != hipSuccess)
+            if (use_stream_sync)
             {
-                last_error_ = std::string("hipDeviceSynchronize failed for device ") +
-                              std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
-                return false;
+                hipStream_t compute_stream = static_cast<hipStream_t>(compute_streams_[i]);
+                hipEvent_t compute_event = static_cast<hipEvent_t>(compute_events_[i]);
+                hipStream_t rccl_stream = static_cast<hipStream_t>(streams_[i]);
+                err = hipEventRecord(compute_event, compute_stream);
+                if (err != hipSuccess)
+                {
+                    last_error_ = std::string("hipEventRecord failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                    return false;
+                }
+                err = hipStreamWaitEvent(rccl_stream, compute_event, 0);
+                if (err != hipSuccess)
+                {
+                    last_error_ = std::string("hipStreamWaitEvent failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                    return false;
+                }
+            }
+            else
+            {
+                err = hipDeviceSynchronize();
+                if (err != hipSuccess)
+                {
+                    last_error_ = std::string("hipDeviceSynchronize failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                    return false;
+                }
             }
         }
 

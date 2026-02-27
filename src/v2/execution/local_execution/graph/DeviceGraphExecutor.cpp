@@ -668,53 +668,38 @@ namespace llaminar2
 
             auto stage_start = std::chrono::high_resolution_clock::now();
 
-            // Pre-stage device sync for multi-GPU
+            // GPU pointer diagnostics for multi-GPU (no sync needed - just query attributes)
 #ifdef HAVE_ROCM
-            if (multi_gpu_sync && ctx->deviceId().is_rocm())
+            if (multi_gpu_sync && ctx->deviceId().is_rocm() && debugEnv().validation.validate_gpu_ptrs)
             {
-                HipDeviceGuard::forceSetDevice(device_ordinal);
-                hipError_t sync_err = hipDeviceSynchronize();
-                if (sync_err != hipSuccess)
+                const StageDumpInfo &dump_info = node->stage->getDumpInfo();
+                auto check_ptr = [&](const char *category, const char *tname, ITensor *tensor)
                 {
-                    LOG_ERROR("[DeviceGraphExecutor] PRE-STAGE hipDeviceSynchronize FAILED for stage '"
-                              << name << "' on device " << device_ordinal
-                              << ": " << hipGetErrorString(sync_err)
-                              << " (error " << sync_err << ")"
-                              << " — a PREVIOUS async kernel on this device faulted!");
-                }
-
-                // DIAGNOSTIC: Check all stage tensor GPU pointers are on the correct device.
-                // This catches cross-device pointer bugs BEFORE the kernel launches.
-                {
-                    const StageDumpInfo &dump_info = node->stage->getDumpInfo();
-                    auto check_ptr = [&](const char *category, const char *tname, ITensor *tensor)
+                    if (!tensor)
+                        return;
+                    auto *tb = dynamic_cast<TensorBase *>(tensor);
+                    if (!tb)
+                        return;
+                    void *gpu_ptr = tb->gpu_data_ptr();
+                    if (!gpu_ptr)
+                        return;
+                    hipPointerAttribute_t attr{};
+                    hipError_t err = hipPointerGetAttributes(&attr, gpu_ptr);
+                    if (err == hipSuccess && attr.device != device_ordinal)
                     {
-                        if (!tensor)
-                            return;
-                        auto *tb = dynamic_cast<TensorBase *>(tensor);
-                        if (!tb)
-                            return;
-                        void *gpu_ptr = tb->gpu_data_ptr();
-                        if (!gpu_ptr)
-                            return;
-                        hipPointerAttribute_t attr{};
-                        hipError_t err = hipPointerGetAttributes(&attr, gpu_ptr);
-                        if (err == hipSuccess && attr.device != device_ordinal)
-                        {
-                            LOG_ERROR("[GPU_PTR_CHECK] WRONG DEVICE! stage='" << name
-                                                                              << "' " << category << " tensor='" << (tname ? tname : "?")
-                                                                              << "' gpu_ptr=" << gpu_ptr
-                                                                              << " is on device " << attr.device
-                                                                              << " but expected device " << device_ordinal);
-                        }
-                    };
-                    for (const auto &inp : dump_info.inputs)
-                        check_ptr("input", inp.name, inp.tensor);
-                    for (const auto &out : dump_info.outputs)
-                        check_ptr("output", out.name, out.tensor);
-                    for (const auto &w : dump_info.weights)
-                        check_ptr("weight", w.name, const_cast<ITensor *>(w.tensor));
-                }
+                        LOG_ERROR("[GPU_PTR_CHECK] WRONG DEVICE! stage='" << name
+                                                                          << "' " << category << " tensor='" << (tname ? tname : "?")
+                                                                          << "' gpu_ptr=" << gpu_ptr
+                                                                          << " is on device " << attr.device
+                                                                          << " but expected device " << device_ordinal);
+                    }
+                };
+                for (const auto &inp : dump_info.inputs)
+                    check_ptr("input", inp.name, inp.tensor);
+                for (const auto &out : dump_info.outputs)
+                    check_ptr("output", out.name, out.tensor);
+                for (const auto &w : dump_info.weights)
+                    check_ptr("weight", w.name, const_cast<ITensor *>(w.tensor));
             }
 #endif
 
@@ -723,22 +708,6 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphExecutor] Stage failed: " << name);
                 return false;
             }
-
-            // Post-stage device sync for multi-GPU
-#ifdef HAVE_ROCM
-            if (multi_gpu_sync && ctx->deviceId().is_rocm())
-            {
-                hipError_t sync_err = hipDeviceSynchronize();
-                if (sync_err != hipSuccess)
-                {
-                    LOG_ERROR("[DeviceGraphExecutor] POST-STAGE hipDeviceSynchronize FAILED for stage '"
-                              << name << "' on device " << device_ordinal
-                              << ": " << hipGetErrorString(sync_err)
-                              << " (error " << sync_err << ")"
-                              << " — this stage's async kernel FAULTED!");
-                }
-            }
-#endif
 
             auto stage_end = std::chrono::high_resolution_clock::now();
             double stage_ms = std::chrono::duration<double, std::milli>(stage_end - stage_start).count();
@@ -792,21 +761,18 @@ namespace llaminar2
         [[maybe_unused]] const bool is_rocm = ctx->deviceId().is_rocm();
 
         // Helper lambdas for pre/post stage sync
+        // With stream-level sync in the RCCL/NCCL coordinators (event-based pre-sync
+        // + stream sync post-sync), per-stage device sync is no longer needed.
+        // Compute stages run on the same stream (implicit ordering), and the
+        // coordinator handles cross-stream sync for collectives.
 #ifdef HAVE_ROCM
         auto pre_stage_sync = [&]()
         {
-            if (multi_gpu_sync && is_rocm)
-            {
-                HipDeviceGuard::forceSetDevice(device_ordinal);
-                hipDeviceSynchronize();
-            }
+            // No-op: coordinator handles compute→collective sync via stream-wait-event
         };
         auto post_stage_sync = [&]()
         {
-            if (multi_gpu_sync && is_rocm)
-            {
-                hipDeviceSynchronize();
-            }
+            // No-op: coordinator handles collective→compute sync via host-side stream sync
         };
 #else
         auto pre_stage_sync = []() {};

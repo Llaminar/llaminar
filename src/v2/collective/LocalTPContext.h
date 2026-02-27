@@ -113,6 +113,12 @@ namespace llaminar2
         void synchronize() override;
 
         // =====================================================================
+        // Stream Configuration
+        // =====================================================================
+
+        void setComputeStreams(const std::vector<void *> &compute_streams) override;
+
+        // =====================================================================
         // BAR-Backed Tensor Registry (ILocalTPContext interface + concrete impl)
         // =====================================================================
 

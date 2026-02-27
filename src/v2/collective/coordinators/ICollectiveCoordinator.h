@@ -138,6 +138,17 @@ namespace llaminar2
          */
         virtual void waitForDeviceEvent(int device_idx, void *worker_event) = 0;
 
+        /**
+         * @brief Register compute streams for stream-level pre-collective sync
+         *
+         * When set, the coordinator uses hipStreamWaitEvent to establish a
+         * stream-level dependency between each compute stream and its RCCL/NCCL
+         * stream, replacing the heavyweight hipDeviceSynchronize() pre-sync.
+         *
+         * @param compute_streams One compute stream handle per device (same order as device_ordinals)
+         */
+        virtual void setComputeStreams(const std::vector<void *> &compute_streams) = 0;
+
         // =========================================================================
         // Submission API
         // =========================================================================

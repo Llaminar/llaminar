@@ -90,6 +90,7 @@ namespace llaminar2
         bool initialize(const DeviceGroup &group) override;
         bool isInitialized() const override { return initialized_; }
         void shutdown() override;
+        void setComputeStreams(const std::vector<void *> &compute_streams) override;
 
         // =====================================================================
         // Collective Operations

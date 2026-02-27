@@ -2425,6 +2425,18 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // Stream Configuration
+    // =========================================================================
+
+    void LocalTPContext::setComputeStreams(const std::vector<void *> &compute_streams)
+    {
+        if (backend_initialized_ && backend_impl_)
+        {
+            backend_impl_->setComputeStreams(compute_streams);
+        }
+    }
+
+    // =========================================================================
     // Device Management
     // =========================================================================
 

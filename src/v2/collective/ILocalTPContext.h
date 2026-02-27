@@ -219,6 +219,21 @@ namespace llaminar2
         virtual void synchronize() = 0;
 
         // =====================================================================
+        // Stream Configuration
+        // =====================================================================
+
+        /**
+         * @brief Register compute streams for event-based collective pre-synchronization
+         *
+         * When set, the collective backend can use lightweight event-based synchronization
+         * (hipEventRecord + hipStreamWaitEvent) instead of hipDeviceSynchronize before
+         * collective operations. One stream per device, in device order.
+         *
+         * @param compute_streams Opaque stream handles (hipStream_t* / cudaStream_t*), one per device
+         */
+        virtual void setComputeStreams(const std::vector<void *> &compute_streams) { (void)compute_streams; }
+
+        // =====================================================================
         // Device Management
         // =====================================================================
 

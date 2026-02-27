@@ -339,6 +339,56 @@ namespace llaminar2
 #endif
     }
 
+    void NCCLCoordinator::setComputeStreams(const std::vector<void *> &compute_streams)
+    {
+#ifdef HAVE_NCCL
+        if (static_cast<int>(compute_streams.size()) != num_devices_)
+        {
+            LOG_ERROR("[NCCLCoordinator] setComputeStreams: expected " << num_devices_
+                      << " streams, got " << compute_streams.size());
+            return;
+        }
+
+        compute_streams_ = compute_streams;
+
+        // Pre-create events for stream-level pre-sync
+        // Destroy any existing events first
+        for (auto &evt : compute_events_)
+        {
+            if (evt)
+                cudaEventDestroy(static_cast<cudaEvent_t>(evt));
+        }
+        compute_events_.resize(num_devices_);
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            cudaError_t err = cudaSetDevice(device_ordinals_[i]);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[NCCLCoordinator] setComputeStreams: cudaSetDevice failed for device "
+                          << device_ordinals_[i] << ": " << cudaGetErrorString(err));
+                compute_streams_.clear();
+                compute_events_.clear();
+                return;
+            }
+
+            cudaEvent_t evt;
+            err = cudaEventCreateWithFlags(&evt, cudaEventDisableTiming);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[NCCLCoordinator] setComputeStreams: cudaEventCreate failed for device "
+                          << device_ordinals_[i] << ": " << cudaGetErrorString(err));
+                compute_streams_.clear();
+                compute_events_.clear();
+                return;
+            }
+            compute_events_[i] = static_cast<void *>(evt);
+        }
+
+        LOG_INFO("[NCCLCoordinator] Registered " << num_devices_ << " compute streams for stream-level pre-sync");
+#endif
+    }
+
     // ============================================================================
     // Work Queue Implementation
     // ============================================================================
@@ -825,12 +875,14 @@ namespace llaminar2
                 return false;
             }
 
-            // Use cudaDeviceSynchronize() instead of cudaStreamSynchronize(streams_[i])
-            // to ensure ALL streams complete, including any internal NCCL streams.
-            err = cudaDeviceSynchronize();
+            // Stream-level sync on the NCCL stream only.
+            // NCCL guarantees that when the user-provided stream completes,
+            // all internal NCCL work is also complete.
+            cudaStream_t nccl_stream = static_cast<cudaStream_t>(streams_[i]);
+            err = cudaStreamSynchronize(nccl_stream);
             if (err != cudaSuccess)
             {
-                last_error_ = std::string("cudaDeviceSynchronize failed for device ") +
+                last_error_ = std::string("cudaStreamSynchronize failed for device ") +
                               std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
                 return false;
             }
@@ -991,12 +1043,11 @@ namespace llaminar2
                                            int dtype_int, int op_int)
     {
 #ifdef HAVE_NCCL
-        // CRITICAL: Synchronize ALL streams on each device before NCCL operations.
-        // Compute kernels run on a dedicated per-device stream (CUDADeviceContext::default_stream_)
-        // created via cudaStreamCreateWithFlags — NOT the CUDA NULL stream. Using
-        // cudaStreamSynchronize(nullptr) only syncs the NULL stream, which is a NO-OP
-        // for compute work. cudaDeviceSynchronize() syncs ALL streams including the
-        // dedicated compute stream, ensuring NCCL reads completed data.
+        // Pre-collective sync: ensure compute kernels have finished writing to
+        // the buffers before NCCL reads them.
+        // Uses stream-wait-event if compute streams registered, else device sync.
+        const bool use_stream_sync = !compute_streams_.empty() &&
+                                     static_cast<int>(compute_streams_.size()) == num_devices_;
         for (int i = 0; i < num_devices_; ++i)
         {
             cudaError_t err = cudaSetDevice(device_ordinals_[i]);
@@ -1005,13 +1056,35 @@ namespace llaminar2
                 last_error_ = std::string("cudaSetDevice failed during pre-allreduce sync: ") + cudaGetErrorString(err);
                 return false;
             }
-            // Sync ALL streams (compute kernels use a dedicated stream, not NULL stream)
-            err = cudaDeviceSynchronize();
-            if (err != cudaSuccess)
+            if (use_stream_sync)
             {
-                last_error_ = std::string("cudaDeviceSynchronize failed for device ") +
-                              std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
-                return false;
+                cudaStream_t compute_stream = static_cast<cudaStream_t>(compute_streams_[i]);
+                cudaEvent_t compute_event = static_cast<cudaEvent_t>(compute_events_[i]);
+                cudaStream_t nccl_stream = static_cast<cudaStream_t>(streams_[i]);
+                err = cudaEventRecord(compute_event, compute_stream);
+                if (err != cudaSuccess)
+                {
+                    last_error_ = std::string("cudaEventRecord failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
+                    return false;
+                }
+                err = cudaStreamWaitEvent(nccl_stream, compute_event, 0);
+                if (err != cudaSuccess)
+                {
+                    last_error_ = std::string("cudaStreamWaitEvent failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
+                    return false;
+                }
+            }
+            else
+            {
+                err = cudaDeviceSynchronize();
+                if (err != cudaSuccess)
+                {
+                    last_error_ = std::string("cudaDeviceSynchronize failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
+                    return false;
+                }
             }
         }
 
@@ -1089,7 +1162,9 @@ namespace llaminar2
                                            size_t send_count, int dtype_int)
     {
 #ifdef HAVE_NCCL
-        // Sync ALL device streams before NCCL reads buffers (see doAllreduceMulti comment)
+        // Pre-collective sync: ensure compute done before NCCL reads.
+        const bool use_stream_sync = !compute_streams_.empty() &&
+                                     static_cast<int>(compute_streams_.size()) == num_devices_;
         for (int i = 0; i < num_devices_; ++i)
         {
             cudaError_t err = cudaSetDevice(device_ordinals_[i]);
@@ -1098,12 +1173,35 @@ namespace llaminar2
                 last_error_ = std::string("cudaSetDevice failed during pre-allgather sync: ") + cudaGetErrorString(err);
                 return false;
             }
-            err = cudaDeviceSynchronize();
-            if (err != cudaSuccess)
+            if (use_stream_sync)
             {
-                last_error_ = std::string("cudaDeviceSynchronize failed for device ") +
-                              std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
-                return false;
+                cudaStream_t compute_stream = static_cast<cudaStream_t>(compute_streams_[i]);
+                cudaEvent_t compute_event = static_cast<cudaEvent_t>(compute_events_[i]);
+                cudaStream_t nccl_stream = static_cast<cudaStream_t>(streams_[i]);
+                err = cudaEventRecord(compute_event, compute_stream);
+                if (err != cudaSuccess)
+                {
+                    last_error_ = std::string("cudaEventRecord failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
+                    return false;
+                }
+                err = cudaStreamWaitEvent(nccl_stream, compute_event, 0);
+                if (err != cudaSuccess)
+                {
+                    last_error_ = std::string("cudaStreamWaitEvent failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
+                    return false;
+                }
+            }
+            else
+            {
+                err = cudaDeviceSynchronize();
+                if (err != cudaSuccess)
+                {
+                    last_error_ = std::string("cudaDeviceSynchronize failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
+                    return false;
+                }
             }
         }
 
@@ -1179,7 +1277,9 @@ namespace llaminar2
                                            int dtype_int, int root)
     {
 #ifdef HAVE_NCCL
-        // Sync ALL device streams before NCCL reads buffers (see doAllreduceMulti comment)
+        // Pre-collective sync: ensure compute done before NCCL reads.
+        const bool use_stream_sync = !compute_streams_.empty() &&
+                                     static_cast<int>(compute_streams_.size()) == num_devices_;
         for (int i = 0; i < num_devices_; ++i)
         {
             cudaError_t err = cudaSetDevice(device_ordinals_[i]);
@@ -1188,12 +1288,35 @@ namespace llaminar2
                 last_error_ = std::string("cudaSetDevice failed during pre-broadcast sync: ") + cudaGetErrorString(err);
                 return false;
             }
-            err = cudaDeviceSynchronize();
-            if (err != cudaSuccess)
+            if (use_stream_sync)
             {
-                last_error_ = std::string("cudaDeviceSynchronize failed for device ") +
-                              std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
-                return false;
+                cudaStream_t compute_stream = static_cast<cudaStream_t>(compute_streams_[i]);
+                cudaEvent_t compute_event = static_cast<cudaEvent_t>(compute_events_[i]);
+                cudaStream_t nccl_stream = static_cast<cudaStream_t>(streams_[i]);
+                err = cudaEventRecord(compute_event, compute_stream);
+                if (err != cudaSuccess)
+                {
+                    last_error_ = std::string("cudaEventRecord failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
+                    return false;
+                }
+                err = cudaStreamWaitEvent(nccl_stream, compute_event, 0);
+                if (err != cudaSuccess)
+                {
+                    last_error_ = std::string("cudaStreamWaitEvent failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
+                    return false;
+                }
+            }
+            else
+            {
+                err = cudaDeviceSynchronize();
+                if (err != cudaSuccess)
+                {
+                    last_error_ = std::string("cudaDeviceSynchronize failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
+                    return false;
+                }
             }
         }
 
@@ -1271,7 +1394,9 @@ namespace llaminar2
                                                size_t recv_count, int dtype_int, int op_int)
     {
 #ifdef HAVE_NCCL
-        // Sync ALL device streams before NCCL reads buffers (see doAllreduceMulti comment)
+        // Pre-collective sync: ensure compute done before NCCL reads.
+        const bool use_stream_sync = !compute_streams_.empty() &&
+                                     static_cast<int>(compute_streams_.size()) == num_devices_;
         for (int i = 0; i < num_devices_; ++i)
         {
             cudaError_t err = cudaSetDevice(device_ordinals_[i]);
@@ -1280,12 +1405,35 @@ namespace llaminar2
                 last_error_ = std::string("cudaSetDevice failed during pre-reducescatter sync: ") + cudaGetErrorString(err);
                 return false;
             }
-            err = cudaDeviceSynchronize();
-            if (err != cudaSuccess)
+            if (use_stream_sync)
             {
-                last_error_ = std::string("cudaDeviceSynchronize failed for device ") +
-                              std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
-                return false;
+                cudaStream_t compute_stream = static_cast<cudaStream_t>(compute_streams_[i]);
+                cudaEvent_t compute_event = static_cast<cudaEvent_t>(compute_events_[i]);
+                cudaStream_t nccl_stream = static_cast<cudaStream_t>(streams_[i]);
+                err = cudaEventRecord(compute_event, compute_stream);
+                if (err != cudaSuccess)
+                {
+                    last_error_ = std::string("cudaEventRecord failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
+                    return false;
+                }
+                err = cudaStreamWaitEvent(nccl_stream, compute_event, 0);
+                if (err != cudaSuccess)
+                {
+                    last_error_ = std::string("cudaStreamWaitEvent failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
+                    return false;
+                }
+            }
+            else
+            {
+                err = cudaDeviceSynchronize();
+                if (err != cudaSuccess)
+                {
+                    last_error_ = std::string("cudaDeviceSynchronize failed for device ") +
+                                  std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
+                    return false;
+                }
             }
         }
 

@@ -360,6 +360,14 @@ namespace llaminar2
 #endif
     }
 
+    void RCCLBackend::setComputeStreams(const std::vector<void *> &compute_streams)
+    {
+        if (coordinator_)
+        {
+            coordinator_->setComputeStreams(compute_streams);
+        }
+    }
+
     void RCCLBackend::shutdown()
     {
 #ifdef HAVE_RCCL

@@ -117,6 +117,14 @@ namespace llaminar2
          */
         void waitForDeviceEvent(int device_idx, void *worker_event) override;
 
+        /**
+         * @brief Register compute streams for stream-level pre-collective sync
+         *
+         * Eliminates hipDeviceSynchronize() in doAllreduceMulti and other collective
+         * implementations by using hipStreamWaitEvent(rccl_stream, compute_event).
+         */
+        void setComputeStreams(const std::vector<void *> &compute_streams) override;
+
         // =========================================================================
         // RCCL Collective Operations (thread-safe, queued to coordinator)
         // =========================================================================
@@ -319,6 +327,8 @@ namespace llaminar2
         std::vector<void *> comms_;             // rcclComm_t[]
         std::vector<void *> streams_;           // hipStream_t[] - one per device
         std::vector<void *> completion_events_; // hipEvent_t[] - signaled after each collective
+        std::vector<void *> compute_streams_;    // hipStream_t[] - device compute streams (optional, for stream-level pre-sync)
+        std::vector<void *> compute_events_;     // hipEvent_t[] - pre-created events for compute stream sync
 
         // Worker thread
         std::thread coordinator_thread_;
