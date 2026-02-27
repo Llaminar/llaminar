@@ -396,9 +396,11 @@ namespace llaminar2
 
             const bool force_device_positions = (gpu_stream_ != nullptr && position_ids != nullptr);
 
-            // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
-            // unless graph capture is active (force device position_ids for stable args).
-            if (seq_len == 1 && !force_device_positions)
+            // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy.
+            // GRAPH CAPTURE: Skip decode fast path when gpu_stream_ is set — scalar pos
+            // would be frozen in the captured graph. Fall through to contiguous path which
+            // uses device_params (H2D memcpy captured, re-reads from pinned memory on replay).
+            if (seq_len == 1 && !force_device_positions && !gpu_stream_)
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 return hipOps_rope_fp32_decode(d_Q, d_K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
@@ -713,7 +715,8 @@ namespace llaminar2
             // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
             const bool force_device_positions = (gpu_stream_ != nullptr && position_ids != nullptr);
 
-            if (seq_len == 1 && !force_device_positions)
+            // GRAPH CAPTURE: Skip decode fast path when gpu_stream_ is set — scalar pos frozen in graph.
+            if (seq_len == 1 && !force_device_positions && !gpu_stream_)
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 return hipOps_rope_bf16_decode(d_Q, d_K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
@@ -1024,7 +1027,8 @@ namespace llaminar2
             // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
             const bool force_device_positions = (gpu_stream_ != nullptr && position_ids != nullptr);
 
-            if (seq_len == 1 && !force_device_positions)
+            // GRAPH CAPTURE: Skip decode fast path when gpu_stream_ is set — scalar pos frozen in graph.
+            if (seq_len == 1 && !force_device_positions && !gpu_stream_)
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 return hipOps_rope_fp16_decode(d_Q, d_K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);

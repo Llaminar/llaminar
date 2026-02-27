@@ -370,11 +370,19 @@ namespace llaminar2
                 return false;
             }
 
-            // Set device
-            if (hipFlashAttn_setDevice(device_idx) != 0)
+            // Set device (skip during stream capture — device was set before capture began)
             {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Failed to set device " << device_idx);
-                return false;
+                hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
+                if (stream_)
+                    hipStreamIsCapturing(static_cast<hipStream_t>(stream_), &cap_status);
+                if (cap_status != hipStreamCaptureStatusActive)
+                {
+                    if (hipFlashAttn_setDevice(device_idx) != 0)
+                    {
+                        LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Failed to set device " << device_idx);
+                        return false;
+                    }
+                }
             }
 
             int result;
@@ -601,18 +609,30 @@ namespace llaminar2
             const attention::AttentionDeviceParams *d_attn_params = nullptr;
             if (stream_ && workspace_)
             {
-                // Lazy-allocate pinned host buffer
+                // Lazy-allocate pinned host buffer (must happen BEFORE capture)
                 if (!h_attn_params_)
                 {
-                    hipError_t err = hipHostMalloc(&h_attn_params_,
-                                                   sizeof(attention::AttentionDeviceParams),
-                                                   hipHostMallocDefault);
-                    if (err != hipSuccess)
+                    // Guard: hipHostMalloc is forbidden during stream capture
+                    hipStreamCaptureStatus alloc_cap = hipStreamCaptureStatusNone;
+                    hipStreamIsCapturing(static_cast<hipStream_t>(stream_), &alloc_cap);
+                    if (alloc_cap == hipStreamCaptureStatusActive)
                     {
                         LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] "
-                                  "hipHostMalloc failed for h_attn_params_: "
-                                  << hipGetErrorString(err));
-                        h_attn_params_ = nullptr;
+                                  "h_attn_params_ not pre-allocated before capture! "
+                                  "This should have been allocated during warmup decode.");
+                    }
+                    else
+                    {
+                        hipError_t err = hipHostMalloc(&h_attn_params_,
+                                                       sizeof(attention::AttentionDeviceParams),
+                                                       hipHostMallocDefault);
+                        if (err != hipSuccess)
+                        {
+                            LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] "
+                                      "hipHostMalloc failed for h_attn_params_: "
+                                      << hipGetErrorString(err));
+                            h_attn_params_ = nullptr;
+                        }
                     }
                 }
                 if (h_attn_params_)

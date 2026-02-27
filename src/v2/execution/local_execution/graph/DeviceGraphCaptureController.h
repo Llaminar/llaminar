@@ -340,13 +340,19 @@ namespace llaminar2
          * @brief Post-launch lifecycle for one captured segment.
          *
          * Applies output-dirty marking, replay callbacks, and step bookkeeping.
+         *
+         * @param skip_replay_callbacks When true, skips onGraphReplayed() callbacks.
+         *        Used during the capture phase where execute() already ran host-side
+         *        bookkeeping (e.g., KV cache head advancement). Calling onGraphReplayed()
+         *        during capture would double-advance host state.
          */
         static void postCapturedSegmentLaunch(
             ComputeGraph &graph,
             DeviceGraphExecutor::GraphSegment &segment,
             uint64_t current_step,
             void *stream,
-            const std::function<void(ComputeNode &, void *)> &mark_stage_outputs_dirty_cb);
+            const std::function<void(ComputeNode &, void *)> &mark_stage_outputs_dirty_cb,
+            bool skip_replay_callbacks = false);
     };
 
 } // namespace llaminar2

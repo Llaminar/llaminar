@@ -451,6 +451,13 @@ namespace llaminar2
             std::unique_ptr<IGPUGraphCapture> capture;     ///< GPU graph (only for capturable segments)
             std::vector<IComputeStage *> replay_callbacks; ///< Stages needing onGraphReplayed() (precomputed)
             uint64_t last_executed_step = 0;               ///< Last decode-step where this segment executed
+
+            // ── Pre-cached coherence buffers (populated once during capture) ──
+            // Eliminates per-decode-step getDumpInfo() + extractOutputBuffers()
+            // + dynamic_cast overhead (~1352 vector allocs + 676 virtual calls
+            // per step for Qwen2.5-7B with 338 capturable stages).
+            std::vector<CoherenceBuffer> cached_all_output_buffers; ///< Flattened outputs of all stages
+            bool replay_buffers_cached = false;                     ///< True after first post-launch caching
         };
 
         /**

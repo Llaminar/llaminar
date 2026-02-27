@@ -676,7 +676,10 @@ namespace llaminar2
             const bool force_device_positions = (gpu_stream_ != nullptr && position_ids != nullptr);
 
             // ZERO-COPY PATH: If position_ids is nullptr, use contiguous kernel
-            if (seq_len == 1 && !force_device_positions)
+            // GRAPH CAPTURE: Skip decode fast path when gpu_stream_ is set — the scalar `pos`
+            // argument would be frozen in the captured graph. Fall through to contiguous path
+            // which uses device_params (H2D memcpy captured, re-reads from pinned memory on replay).
+            if (seq_len == 1 && !force_device_positions && !gpu_stream_)
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 bool ok = cudaOps_rope_fp32_decode_v3(Q, K, d_inv_freq, pos,
@@ -851,7 +854,8 @@ namespace llaminar2
 
             const bool force_device_positions = (gpu_stream_ != nullptr && position_ids != nullptr);
 
-            if (seq_len == 1 && !force_device_positions)
+            // GRAPH CAPTURE: Skip decode fast path when gpu_stream_ is set — scalar pos frozen in graph.
+            if (seq_len == 1 && !force_device_positions && !gpu_stream_)
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 bool ok = cudaOps_rope_bf16_decode_v3(Q, K, d_inv_freq, pos,
@@ -1024,7 +1028,8 @@ namespace llaminar2
 
             const bool force_device_positions = (gpu_stream_ != nullptr && position_ids != nullptr);
 
-            if (seq_len == 1 && !force_device_positions)
+            // GRAPH CAPTURE: Skip decode fast path when gpu_stream_ is set — scalar pos frozen in graph.
+            if (seq_len == 1 && !force_device_positions && !gpu_stream_)
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 bool ok = cudaOps_rope_fp16_decode_v3(Q, K, d_inv_freq, pos,

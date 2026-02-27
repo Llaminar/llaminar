@@ -1247,6 +1247,27 @@ namespace llaminar2
                 post_captured_segment_launch(segment, stream);
             }};
 
+        // Capture-phase hooks: same as replay hooks except post_launch skips
+        // onGraphReplayed() callbacks. During capture, execute() already ran
+        // host-side bookkeeping; calling onGraphReplayed() would double-advance
+        // KV cache head positions and corrupt subsequent decode steps.
+        DeviceGraphCaptureController::ReplayHooks capture_hooks{
+            replay_hooks.cohere_inputs,
+            replay_hooks.execute_node,
+            [&](GraphSegment &segment, void *stream)
+            {
+                DeviceGraphCaptureController::postCapturedSegmentLaunch(
+                    graph,
+                    segment,
+                    current_step,
+                    stream,
+                    [&](ComputeNode &node, void *node_stream)
+                    {
+                        mark_stage_outputs_dirty(node, node_stream);
+                    },
+                    /*skip_replay_callbacks=*/true);
+            }};
+
         // ===== Phase 1: Warmup (first call) — build segments, execute normally =====
         // We do NOT capture on the first call. Some kernels lazily initialize workspace
         // buffers (hipMalloc), which isn't compatible with stream capture.
@@ -1274,7 +1295,7 @@ namespace llaminar2
                 gpu_ctx,
                 has_collective_nodes,
                 current_step,
-                replay_hooks);
+                capture_hooks);
 
             if (capture_result.reset_cache)
             {

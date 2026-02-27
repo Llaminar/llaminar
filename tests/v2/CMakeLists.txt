@@ -8206,6 +8206,30 @@ if(HAVE_ROCM)
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm Event Synchronization tests")
+
+    # Performance Test: HIP Graph Launch Overhead
+    # =============================================================================
+    # Measures hipGraphLaunch() overhead vs direct kernel dispatch across varying
+    # graph sizes (1-732 nodes). Isolates whether GPU graph capture is a net win
+    # or loss for decode-step-sized workloads on gfx906 (MI50).
+    set_source_files_properties(
+        performance/Perf__HIPGraphLaunchOverhead.cpp
+        PROPERTIES LANGUAGE HIP
+    )
+    add_executable(v2_perf_hip_graph_launch_overhead
+        performance/Perf__HIPGraphLaunchOverhead.cpp
+    )
+    target_link_libraries(v2_perf_hip_graph_launch_overhead
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_HIPGraphLaunchOverhead
+        COMMAND $<TARGET_FILE:v2_perf_hip_graph_launch_overhead>
+        LABELS "V2;Performance;ROCm;HIPGraph;GraphCapture;LaunchOverhead;gfx906;Benchmark"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added HIP Graph Launch Overhead performance benchmarks")
 endif()
 
 # =============================================================================

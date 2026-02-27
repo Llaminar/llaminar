@@ -898,6 +898,37 @@ __global__ void convert_fp16_to_fp32_kernel(const uint16_t *__restrict__ src,
 }
 
 /**
+ * @brief Dynamic FP16→FP32 conversion for CUDA graph replay
+ *
+ * Reads kv_len from device_params at runtime instead of using a frozen scalar.
+ * This is essential for graph capture correctness: the captured graph records
+ * a fixed grid size, but the actual element count changes between replay steps
+ * as kv_len grows. The kernel computes the actual count from device_params->kv_len
+ * and skips threads beyond that count.
+ *
+ * @param src           FP16 source data (KV cache)
+ * @param dst           FP32 destination buffer (workspace)
+ * @param cols_per_row  n_kv_heads * head_dim (constant across replays)
+ * @param device_params Device-side params containing dynamic kv_len
+ */
+__global__ void convert_fp16_to_fp32_dynamic_kernel(
+    const uint16_t *__restrict__ src,
+    float *__restrict__ dst,
+    int cols_per_row,
+    const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params)
+{
+    const int kv_len = device_params->kv_len;
+    const int count = kv_len * cols_per_row;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count)
+    {
+        __half h;
+        memcpy(&h, &src[idx], sizeof(__half));
+        dst[idx] = __half2float(h);
+    }
+}
+
+/**
  * @brief Q8_1 block structure for GPU dequantization
  *
  * Mirrors the host-side Q8_1Block in BlockStructures.h.
@@ -939,6 +970,43 @@ __global__ void dequant_q8_1_to_fp32_kernel(const GpuQ8_1Block *__restrict__ src
 
     const GpuQ8_1Block &blk = src[block_idx];
     // Convert FP16 scale to FP32 using CUDA intrinsic
+    __half h_scale;
+    memcpy(&h_scale, &blk.d, sizeof(__half));
+    float scale = __half2float(h_scale);
+
+    dst[row * cols + col] = scale * static_cast<float>(blk.qs[elem_idx]);
+}
+
+/**
+ * @brief Dynamic Q8_1→FP32 dequantization for CUDA graph replay
+ *
+ * Same as dequant_q8_1_to_fp32_kernel but reads kv_len from device_params
+ * to compute the actual row count at runtime. Essential for graph capture
+ * correctness where the frozen row count would be stale on replay.
+ */
+__global__ void dequant_q8_1_to_fp32_dynamic_kernel(
+    const GpuQ8_1Block *__restrict__ src,
+    float *__restrict__ dst,
+    int cols,
+    int blocks_per_row,
+    const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params)
+{
+    const int rows = device_params->kv_len; // Dynamic row count from device memory
+    const int block_idx = blockIdx.x;
+    const int elem_idx = threadIdx.x; // 0..31
+
+    const int total_blocks = rows * blocks_per_row;
+    if (block_idx >= total_blocks)
+        return;
+
+    const int row = block_idx / blocks_per_row;
+    const int block_in_row = block_idx % blocks_per_row;
+    const int col = block_in_row * 32 + elem_idx;
+
+    if (col >= cols)
+        return;
+
+    const GpuQ8_1Block &blk = src[block_idx];
     __half h_scale;
     memcpy(&h_scale, &blk.d, sizeof(__half));
     float scale = __half2float(h_scale);
@@ -1228,6 +1296,92 @@ extern "C"
         if (err != cudaSuccess)
         {
             printf("[cudaFlashAttn_dequant_q8_1_to_fp32] Kernel launch failed: %s\n",
+                   cudaGetErrorString(err));
+            return -1;
+        }
+        return 0;
+    }
+
+    /**
+     * @brief Dynamic FP16→FP32 conversion for CUDA graph replay
+     *
+     * Uses a kernel that reads kv_len from device_params at runtime,
+     * so the captured graph correctly handles growing kv_len during replay.
+     * Grid is oversized for max_kv_len; excess threads return early.
+     *
+     * @param src           Device pointer to FP16 source data
+     * @param dst           Device pointer to FP32 destination buffer
+     * @param cols_per_row  n_kv_heads * head_dim (constant)
+     * @param max_kv_len    Maximum kv_len for grid sizing (workspace capacity)
+     * @param device_params Device pointer to AttentionDeviceParams (has dynamic kv_len)
+     * @param stream        CUDA stream
+     * @return 0 on success, -1 on error
+     */
+    int cudaFlashAttn_convert_fp16_to_fp32_dynamic(
+        const void *src, float *dst,
+        int cols_per_row, int max_kv_len,
+        const void *device_params, void *stream)
+    {
+        if (!src || !dst || !device_params || cols_per_row <= 0 || max_kv_len <= 0)
+            return -1;
+
+        const int max_count = max_kv_len * cols_per_row;
+        const int threads = 256;
+        const int blocks = (max_count + threads - 1) / threads;
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+        convert_fp16_to_fp32_dynamic_kernel<<<blocks, threads, 0, cuda_stream>>>(
+            static_cast<const uint16_t *>(src), dst,
+            cols_per_row,
+            static_cast<const llaminar2::attention::AttentionDeviceParams *>(device_params));
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            printf("[cudaFlashAttn_convert_fp16_to_fp32_dynamic] Kernel launch failed: %s\n",
+                   cudaGetErrorString(err));
+            return -1;
+        }
+        return 0;
+    }
+
+    /**
+     * @brief Dynamic Q8_1→FP32 dequantization for CUDA graph replay
+     *
+     * Uses a kernel that reads kv_len (row count) from device_params at runtime,
+     * so the captured graph correctly handles growing kv_len during replay.
+     * Grid is oversized for max_kv_len; excess blocks return early.
+     *
+     * @param src           Device pointer to Q8_1 blocks
+     * @param dst           Device pointer to FP32 destination buffer
+     * @param cols          n_kv_heads * head_dim (constant)
+     * @param max_kv_len    Maximum kv_len for grid sizing (workspace capacity)
+     * @param device_params Device pointer to AttentionDeviceParams (has dynamic kv_len)
+     * @param stream        CUDA stream
+     * @return 0 on success, -1 on error
+     */
+    int cudaFlashAttn_dequant_q8_1_to_fp32_dynamic(
+        const void *src, float *dst,
+        int cols, int max_kv_len,
+        const void *device_params, void *stream)
+    {
+        if (!src || !dst || !device_params || cols <= 0 || max_kv_len <= 0)
+            return -1;
+
+        const int blocks_per_row = (cols + 31) / 32;
+        const int max_total_blocks = max_kv_len * blocks_per_row;
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+        // One CUDA block per Q8_1 block, 32 threads per block
+        dequant_q8_1_to_fp32_dynamic_kernel<<<max_total_blocks, 32, 0, cuda_stream>>>(
+            static_cast<const GpuQ8_1Block *>(src), dst,
+            cols, blocks_per_row,
+            static_cast<const llaminar2::attention::AttentionDeviceParams *>(device_params));
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            printf("[cudaFlashAttn_dequant_q8_1_to_fp32_dynamic] Kernel launch failed: %s\n",
                    cudaGetErrorString(err));
             return -1;
         }

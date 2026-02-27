@@ -1,5 +1,6 @@
 #include "DeviceGraphCaptureController.h"
 
+#include "../coherence/StageCoherence.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
@@ -204,8 +205,8 @@ namespace llaminar2
         }
 
         LOG_INFO("[DeviceGraphExecutor] Segmented graph: " << capturable_segments << " capturable segments ("
-                                                     << capturable_stages << " stages) + " << manual_segments << " manual segments ("
-                                                     << manual_stages << " stages)");
+                                                           << capturable_stages << " stages) + " << manual_segments << " manual segments ("
+                                                           << manual_stages << " stages)");
 
         for (auto &seg : segment_cache.segments)
         {
@@ -793,10 +794,9 @@ namespace llaminar2
                 return false;
             }
 
-            for (auto *stage : segment.replay_callbacks)
-            {
-                stage->onGraphReplayed();
-            }
+            // NOTE: Do NOT call onGraphReplayed() here. During capture phase,
+            // execute() already ran host-side bookkeeping (e.g., KV cache head
+            // advancement). Calling onGraphReplayed() would double-advance.
             segment.last_executed_step = current_step;
             gpu_ctx->synchronize();
             LOG_DEBUG("[DeviceGraphCaptureController] Segment captured+executed (Phase-2 semantics): "
@@ -809,6 +809,9 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphCaptureController] Segment initial launch failed");
             return false;
         }
+        // Capture phase: pass skip_replay_callbacks=true because execute() already
+        // ran host-side bookkeeping during capture recording. onGraphReplayed()
+        // must only run during the replay phase (Phase 3).
         post_launch_cb(segment, capture_stream);
         gpu_ctx->synchronize();
         LOG_DEBUG("[DeviceGraphCaptureController] Segment captured+launched: "
@@ -895,7 +898,18 @@ namespace llaminar2
             return result;
         }
 
-        if (!cohere_inputs_cb(segment))
+        // OPTIMIZATION: Skip coherence for normal replay of capturable segments.
+        // All buffers (inputs, weights, outputs) were ensured on device during
+        // the capture phase and haven't moved off GPU since. The graph replay
+        // writes to the same GPU buffers, so re-checking is_on_device() for every
+        // tensor of every stage (338 stages × ~4 buffers = 1352 checks with
+        // dynamic_cast + virtual getDumpInfo) is pure CPU overhead.
+        //
+        // Coherence IS needed for verify/recapture modes since they may re-execute
+        // stages in a different order or on different streams.
+        const bool skip_coherence = !recapture_mode && !verify_mode;
+
+        if (!skip_coherence && !cohere_inputs_cb(segment))
         {
             return result;
         }
@@ -1215,24 +1229,66 @@ namespace llaminar2
         DeviceGraphExecutor::GraphSegment &segment,
         uint64_t current_step,
         void *stream,
-        const std::function<void(ComputeNode &, void *)> &mark_stage_outputs_dirty_cb)
+        const std::function<void(ComputeNode &, void *)> &mark_stage_outputs_dirty_cb,
+        bool skip_replay_callbacks)
     {
-        // Captured graph launches bypass executeNode(), so we explicitly apply
-        // the lifecycle work executeNode would normally perform.
-        for (const auto &stage_name : segment.stage_names)
+        // OPTIMIZATION: Cache output buffers on first replay to avoid per-step
+        // getDumpInfo() + extractOutputBuffers() + dynamic_cast overhead.
+        // For Qwen2.5-7B (338 stages), this eliminates ~1352 vector allocations
+        // and ~676 virtual calls per decode step.
+        if (!segment.replay_buffers_cached)
         {
-            auto *node = graph.getNode(stage_name);
-            if (!node || !node->stage)
+            segment.cached_all_output_buffers.clear();
+            for (const auto &stage_name : segment.stage_names)
             {
-                continue;
-            }
+                auto *node = graph.getNode(stage_name);
+                if (!node || !node->stage)
+                {
+                    continue;
+                }
 
-            mark_stage_outputs_dirty_cb(*node, stream);
+                const auto &dump_info = node->stage->getDumpInfo();
+                for (const auto &output : dump_info.outputs)
+                {
+                    CoherenceBuffer buf;
+                    buf.tensor = output.tensor;
+                    buf.name = output.name;
+                    buf.data = output.data;
+                    buf.rows = output.rows;
+                    buf.cols = output.cols;
+                    buf.dtype = output.dtype;
+                    buf.is_inout = false;
+                    segment.cached_all_output_buffers.push_back(buf);
+                }
+            }
+            segment.replay_buffers_cached = true;
+
+            LOG_DEBUG("[DeviceGraphCaptureController] Cached " << segment.cached_all_output_buffers.size()
+                                                               << " output buffers for " << segment.stage_names.size() << " stages");
         }
 
-        for (auto *stage : segment.replay_callbacks)
+        // Use flags-only dirty marking — no hipEventRecord per output tensor.
+        // The final gpu_ctx->synchronize() in executeReplayPhase ensures all
+        // GPU work completes before the caller reads the output.
+        markOutputsDirtyFlagsOnly(segment.cached_all_output_buffers);
+
+        // Skip replay callbacks during the capture phase: execute() already ran
+        // all host-side bookkeeping (e.g., KV cache head/count advancement).
+        // Calling onGraphReplayed() here would double-advance host state, causing
+        // decode steps to write to wrong KV cache positions and produce garbage.
+        if (!skip_replay_callbacks)
         {
-            stage->onGraphReplayed();
+            for (auto *stage : segment.replay_callbacks)
+            {
+                stage->onGraphReplayed();
+            }
+            LOG_DEBUG("[DeviceGraphCaptureController] Ran " << segment.replay_callbacks.size()
+                                                            << " onGraphReplayed() callbacks");
+        }
+        else
+        {
+            LOG_DEBUG("[DeviceGraphCaptureController] SKIPPED " << segment.replay_callbacks.size()
+                                                                << " onGraphReplayed() callbacks (capture phase)");
         }
 
         segment.last_executed_step = current_step;

@@ -2027,9 +2027,17 @@ static int launch_decode(
     const int effective_num_splits = tuned.config.splits;
     const int decode_threads_per_block = tuned.config.tpb;
 
+    // Autotuning MUST be disabled during HIP stream capture.
+    // hipEventCreate/Synchronize/Destroy are forbidden during capture and
+    // will invalidate the capture graph.
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    if (hip_stream)
+        hipStreamIsCapturing(hip_stream, &capture_status);
+    const bool is_capturing = (capture_status == hipStreamCaptureStatusActive);
+
     hipEvent_t tune_start = nullptr;
     hipEvent_t tune_stop = nullptr;
-    const bool measure_tuning = tuned.should_time;
+    const bool measure_tuning = tuned.should_time && !is_capturing;
     if (measure_tuning)
     {
         if (hipEventCreate(&tune_start) == hipSuccess && hipEventCreate(&tune_stop) == hipSuccess)
