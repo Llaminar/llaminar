@@ -634,7 +634,7 @@ namespace llaminar2
         bool use_graph_buffer_management = true;                               ///< Use DeviceGraphBufferManager for buffer allocation (default: ON)
         bool exec_full_forward = true;                                         ///< Use orchestrator->executeForward() for complete inference (default: ON)
         bool fast_decode = true;                                               ///< Use fast decode path skipping coherence/debug overhead (default: ON, env: LLAMINAR_FAST_DECODE)
-        bool gpu_graphs = false;                                               ///< Use GPU graph capture/replay for decode (default: OFF, env: LLAMINAR_GPU_GRAPHS)
+        bool gpu_graphs = true;                                                ///< Use GPU graph capture/replay for decode (default: ON, env: LLAMINAR_GPU_GRAPHS)
         bool gpu_graph_verify = false;                                         ///< Verify graph replay vs direct execution (default: OFF, env: LLAMINAR_GPU_GRAPH_VERIFY)
         bool gpu_graph_recapture = false;                                      ///< Re-capture each decode step instead of replaying cached graph (default: OFF, env: LLAMINAR_GPU_GRAPH_RECAPTURE)
         int gpu_graph_max_stages = 0;                                          ///< Max stages per capturable segment (0=unlimited, env: LLAMINAR_GPU_GRAPH_MAX_STAGES)
