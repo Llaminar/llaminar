@@ -250,7 +250,12 @@ namespace llaminar2
             return false;
         }
 
-        void *use_stream = use_default_stream ? nullptr : capture_stream;
+        // Always use an explicit stream object — never nullptr (hipStream_t(0)).
+        // AMDDeviceContext creates a real hipStream_t via hipStreamCreateWithFlags,
+        // so defaultStream() is a distinct object from hipStream_t(0). Using nullptr
+        // would target the HIP legacy null stream, causing stream identity mismatches
+        // with event-based synchronization.
+        void *use_stream = use_default_stream ? gpu_ctx->defaultStream() : capture_stream;
         for (auto &seg : segment_cache.segments)
         {
             for (const auto &stage_name : seg.stage_names)
@@ -272,7 +277,7 @@ namespace llaminar2
             }
         }
 
-        gpu_ctx->synchronize();
+        gpu_ctx->synchronizeStream(use_stream);
         return true;
     }
 
@@ -352,7 +357,7 @@ namespace llaminar2
                 //
                 // GPU-side events let both device threads queue ALL segments
                 // without blocking, so all RCCL calls are enqueued promptly
-                // and the only host sync is the final gpu_ctx->synchronize()
+                // and the only host sync is the final stream-level sync
                 // at the end of executeReplayPhase().
                 manual_had_collective = true;
 
@@ -441,7 +446,11 @@ namespace llaminar2
         {
             if (manual_had_collective)
             {
-                gpu_ctx->synchronize();
+                // Collective stages ran on compute_stream (defaultStream),
+                // non-collective stages ran on capture_stream. Sync both
+                // instead of using device-wide hipDeviceSynchronize.
+                gpu_ctx->synchronizeStream(gpu_ctx->defaultStream());
+                gpu_ctx->synchronizeStream(capture_stream);
             }
             else
             {
@@ -556,7 +565,7 @@ namespace llaminar2
         }
 
         post_launch_cb(segment, capture_stream);
-        gpu_ctx->synchronize();
+        gpu_ctx->synchronizeStream(capture_stream);
 
         for (const auto &stage_name : segment.stage_names)
         {
@@ -627,7 +636,9 @@ namespace llaminar2
             return result;
         }
         post_launch_cb(segment, capture_stream);
-        gpu_ctx->synchronize();
+        gpu_ctx->synchronizeStream(capture_stream);
+
+        void *default_stream = gpu_ctx->defaultStream();
 
         struct StageOutput
         {
@@ -678,14 +689,14 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphCaptureController] Verify: missing stage during direct exec: " << stage_name);
                 return result;
             }
-            node->stage->setGPUStream(nullptr);
+            node->stage->setGPUStream(default_stream);
             if (!node->stage->execute(ctx))
             {
                 LOG_ERROR("[DeviceGraphCaptureController] Verify: direct exec failed: " << stage_name);
                 return result;
             }
         }
-        gpu_ctx->synchronize();
+        gpu_ctx->synchronizeStream(default_stream);
 
         std::vector<StageOutput> direct_outputs(segment.stage_names.size());
         for (size_t s = 0; s < segment.stage_names.size(); s++)
@@ -1390,7 +1401,12 @@ namespace llaminar2
                                       << " step=" << current_step
                                       << " ALL " << total_segments << " segments done, entering final synchronize()");
         }
-        gpu_ctx->synchronize();
+        // Sync both known streams instead of device-wide hipDeviceSynchronize.
+        // Graph segments replayed on capture_stream; manual segments (embedding)
+        // ran on defaultStream. Syncing only these two is cheaper than a
+        // device-wide barrier and avoids interference with global capture mode.
+        gpu_ctx->synchronizeStream(capture_stream);
+        gpu_ctx->synchronizeStream(gpu_ctx->defaultStream());
         if (trace_replay)
         {
             LOG_INFO("[ReplayTrace] " << device_id.toString()
