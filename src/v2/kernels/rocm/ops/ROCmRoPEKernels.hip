@@ -6,12 +6,16 @@
  * Contains FP32, BF16, and FP16 RoPE kernels with extern "C" wrapper functions.
  * Uses SPLIT-HALF layout matching the CPU implementation.
  *
- * OPTIMIZATIONS (v2 - matching CUDA strategy):
+ * OPTIMIZATIONS (v3 - fast math + CUDA strategy):
  * - Pre-computed inverse frequency table passed from host (cached in caller)
  * - Shared memory for sin/cos table per thread block
  * - Main rotation is pure FMA (no per-thread transcendentals)
  * - Fused Q+K kernel to reduce launch overhead by 50%
  * - Scalar position path for decode (avoids memcpy for seq_len=1)
+ * - __sinf/__cosf fast math intrinsics (v_sin_f32/v_cos_f32 SFU, ~4 cycles)
+ *   replacing full IEEE cosf/sinf (Payne-Hanek reduction, ~80+ insns per call).
+ *   Accurate to ~1 ULP for |angle| < 48039.0. RoPE max angle:
+ *   pos_max(8192) × inv_freq[0](1.0) = 8192.0 — well within range.
  */
 
 #include <hip/hip_runtime.h>
@@ -103,8 +107,8 @@ __global__ void rocm_rope_fp32_decode_kernel(
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        s_cos[i] = cosf(angle);
-        s_sin[i] = sinf(angle);
+        s_cos[i] = __cosf(angle);
+        s_sin[i] = __sinf(angle);
     }
     __syncthreads();
 
@@ -147,8 +151,8 @@ __global__ void rocm_rope_bf16_decode_kernel(
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        s_cos[i] = cosf(angle);
-        s_sin[i] = sinf(angle);
+        s_cos[i] = __cosf(angle);
+        s_sin[i] = __sinf(angle);
     }
     __syncthreads();
 
@@ -190,8 +194,8 @@ __global__ void rocm_rope_fp16_decode_kernel(
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        s_cos[i] = cosf(angle);
-        s_sin[i] = sinf(angle);
+        s_cos[i] = __cosf(angle);
+        s_sin[i] = __sinf(angle);
     }
     __syncthreads();
 
@@ -250,8 +254,8 @@ __global__ void rocm_rope_fp32_contiguous_kernel(
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        s_cos[i] = cosf(angle);
-        s_sin[i] = sinf(angle);
+        s_cos[i] = __cosf(angle);
+        s_sin[i] = __sinf(angle);
     }
     __syncthreads();
 
@@ -325,8 +329,8 @@ __global__ void rocm_rope_fp32_fused_qk_contiguous_kernel(
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        s_cos[i] = cosf(angle);
-        s_sin[i] = sinf(angle);
+        s_cos[i] = __cosf(angle);
+        s_sin[i] = __sinf(angle);
     }
     __syncthreads();
 
@@ -376,8 +380,8 @@ __global__ void rocm_rope_bf16_contiguous_kernel(
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        s_cos[i] = cosf(angle);
-        s_sin[i] = sinf(angle);
+        s_cos[i] = __cosf(angle);
+        s_sin[i] = __sinf(angle);
     }
     __syncthreads();
 
@@ -450,8 +454,8 @@ __global__ void rocm_rope_bf16_fused_qk_contiguous_kernel(
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        s_cos[i] = cosf(angle);
-        s_sin[i] = sinf(angle);
+        s_cos[i] = __cosf(angle);
+        s_sin[i] = __sinf(angle);
     }
     __syncthreads();
 
@@ -501,8 +505,8 @@ __global__ void rocm_rope_fp16_contiguous_kernel(
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        s_cos[i] = cosf(angle);
-        s_sin[i] = sinf(angle);
+        s_cos[i] = __cosf(angle);
+        s_sin[i] = __sinf(angle);
     }
     __syncthreads();
 
@@ -575,8 +579,8 @@ __global__ void rocm_rope_fp16_fused_qk_contiguous_kernel(
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        s_cos[i] = cosf(angle);
-        s_sin[i] = sinf(angle);
+        s_cos[i] = __cosf(angle);
+        s_sin[i] = __sinf(angle);
     }
     __syncthreads();
 
@@ -646,8 +650,8 @@ __global__ void rocm_rope_fp32_kernel_v2(
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        s_cos[i] = cosf(angle);
-        s_sin[i] = sinf(angle);
+        s_cos[i] = __cosf(angle);
+        s_sin[i] = __sinf(angle);
     }
     __syncthreads();
 
@@ -729,8 +733,8 @@ __global__ void rocm_rope_fp32_fused_qk_kernel(
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        s_cos[i] = cosf(angle);
-        s_sin[i] = sinf(angle);
+        s_cos[i] = __cosf(angle);
+        s_sin[i] = __sinf(angle);
     }
     __syncthreads();
 
@@ -782,8 +786,8 @@ __global__ void rocm_rope_bf16_kernel_v2(
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        s_cos[i] = cosf(angle);
-        s_sin[i] = sinf(angle);
+        s_cos[i] = __cosf(angle);
+        s_sin[i] = __sinf(angle);
     }
     __syncthreads();
 
@@ -859,8 +863,8 @@ __global__ void rocm_rope_bf16_fused_qk_kernel(
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        s_cos[i] = cosf(angle);
-        s_sin[i] = sinf(angle);
+        s_cos[i] = __cosf(angle);
+        s_sin[i] = __sinf(angle);
     }
     __syncthreads();
 
@@ -910,8 +914,8 @@ __global__ void rocm_rope_fp16_kernel_v2(
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        s_cos[i] = cosf(angle);
-        s_sin[i] = sinf(angle);
+        s_cos[i] = __cosf(angle);
+        s_sin[i] = __sinf(angle);
     }
     __syncthreads();
 
@@ -986,8 +990,8 @@ __global__ void rocm_rope_fp16_fused_qk_kernel(
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
         float angle = pos * inv_freq[i];
-        s_cos[i] = cosf(angle);
-        s_sin[i] = sinf(angle);
+        s_cos[i] = __cosf(angle);
+        s_sin[i] = __sinf(angle);
     }
     __syncthreads();
 

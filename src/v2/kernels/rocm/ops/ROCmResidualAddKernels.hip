@@ -53,7 +53,7 @@ __device__ __forceinline__ uint16_t float_to_fp16(float f)
 } // anonymous namespace
 
 // ============================================================================
-// FP32 Residual Add Kernel
+// FP32 Residual Add Kernel — V2 with float4 vectorization
 // ============================================================================
 
 __global__ void rocm_residual_add_fp32_kernel(
@@ -62,10 +62,31 @@ __global__ void rocm_residual_add_fp32_kernel(
     float* __restrict__ output,
     int size)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size)
+    const int size4 = size >> 2;
+    const int vec_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (vec_idx < size4)
     {
-        output[idx] = input[idx] + residual[idx];
+        const float4* in4  = reinterpret_cast<const float4*>(input);
+        const float4* res4 = reinterpret_cast<const float4*>(residual);
+        float4* out4       = reinterpret_cast<float4*>(output);
+
+        float4 a = in4[vec_idx];
+        float4 b = res4[vec_idx];
+        float4 r;
+        r.x = a.x + b.x;
+        r.y = a.y + b.y;
+        r.z = a.z + b.z;
+        r.w = a.w + b.w;
+        out4[vec_idx] = r;
+    }
+
+    // Scalar tail
+    const int tail_start = size4 << 2;
+    const int tail_idx = tail_start + (blockIdx.x * blockDim.x + threadIdx.x);
+    if (tail_idx >= tail_start && tail_idx < size && vec_idx >= size4)
+    {
+        output[tail_idx] = input[tail_idx] + residual[tail_idx];
     }
 }
 
@@ -125,7 +146,10 @@ bool rocmOps_residual_add_fp32(
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
     int threads_per_block = 256;
-    int num_blocks = (size + threads_per_block - 1) / threads_per_block;
+    // Grid sized for float4 vectorized elements (+ tail handled internally)
+    int size4 = size >> 2;
+    int num_blocks = (size4 + threads_per_block - 1) / threads_per_block;
+    if (num_blocks == 0 && size > 0) num_blocks = 1;
 
     hipLaunchKernelGGL(
         rocm_residual_add_fp32_kernel,
