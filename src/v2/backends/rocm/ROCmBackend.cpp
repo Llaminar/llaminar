@@ -258,6 +258,73 @@ namespace llaminar2
         return true;
     }
 
+    // Forward declaration for HIP top-k kernel (implemented in ROCmSamplingKernels.hip)
+    extern "C" bool rocmOps_topk_f32(
+        const float *data, int n, int k, float *out_values, int *out_indices,
+        int device_idx, void *stream);
+
+    bool ROCmBackend::topKF32(const void *data_device, int n, int k, int device_id,
+                              float *out_values, int *out_indices)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !data_device || n <= 0 || k <= 0)
+            return false;
+
+        // Clamp k to n
+        if (k > n)
+            k = n;
+
+        // Lazily allocate per-device result buffers
+        if (topk_buffers_.empty())
+            topk_buffers_.resize(device_count_);
+
+        auto &bufs = topk_buffers_[device_id];
+
+        // Reallocate if k grew beyond previous allocation
+        if (bufs.allocated_k < k)
+        {
+            hipSetDevice(device_id);
+            if (bufs.values_ptr)
+                hipFree(bufs.values_ptr);
+            if (bufs.indices_ptr)
+                hipFree(bufs.indices_ptr);
+
+            hipError_t err = hipMalloc(&bufs.values_ptr, k * sizeof(float));
+            if (err != hipSuccess)
+            {
+                bufs.values_ptr = nullptr;
+                bufs.allocated_k = 0;
+                return false;
+            }
+            err = hipMalloc(&bufs.indices_ptr, k * sizeof(int));
+            if (err != hipSuccess)
+            {
+                hipFree(bufs.values_ptr);
+                bufs.values_ptr = nullptr;
+                bufs.allocated_k = 0;
+                return false;
+            }
+            bufs.allocated_k = k;
+        }
+
+        // Launch kernel
+        hipSetDevice(device_id);
+        if (!rocmOps_topk_f32(
+                static_cast<const float *>(data_device), n, k,
+                static_cast<float *>(bufs.values_ptr),
+                static_cast<int *>(bufs.indices_ptr),
+                device_id, nullptr /* default stream */))
+        {
+            return false;
+        }
+
+        // Sync and D2H the result (k * 8 bytes total)
+        hipDeviceSynchronize();
+        hipMemcpy(out_values, bufs.values_ptr, k * sizeof(float), hipMemcpyDeviceToHost);
+        hipMemcpy(out_indices, bufs.indices_ptr, k * sizeof(int), hipMemcpyDeviceToHost);
+
+        return true;
+    }
+
     bool ROCmBackend::hostToDevice(void *dst, const void *src, size_t bytes, int device_id)
     {
         if (device_id >= device_count_ || device_id < 0)

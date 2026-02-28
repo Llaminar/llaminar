@@ -8981,4 +8981,47 @@ set_tests_properties(V2_Integration_SegmentedGraphCaptureExecution PROPERTIES
 )
 message(STATUS "V2 Tests: Added SegmentedGraphCaptureExecution integration tests")
 
+# =============================================================================
+# GPU Sampling Kernels Integration Tests (argmaxF32, topKF32)
+# =============================================================================
+# Validates GPU-side sampling primitives for both CUDA and ROCm backends.
+# Covers: argmax correctness, top-k ranking, numerical stability, edge cases,
+# large vocabulary (Qwen2 151936), and stress tests.
+# Mirrors the CPU sampler unit tests (Test__Sampler.cpp) for the GPU kernel API.
+
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_integration_gpu_sampling_kernels
+        integration/backends/Test__GPUSamplingKernels.cpp
+    )
+    if(UNIX AND NOT APPLE)
+        set(_gpu_backends_whole_sampling "")
+        if(HAVE_CUDA)
+            list(APPEND _gpu_backends_whole_sampling -Wl,--whole-archive cuda_backend -Wl,--no-whole-archive)
+        endif()
+        if(HAVE_ROCM)
+            list(APPEND _gpu_backends_whole_sampling -Wl,--whole-archive rocm_backend -Wl,--no-whole-archive)
+        endif()
+        target_link_libraries(v2_integration_gpu_sampling_kernels PRIVATE
+            -Wl,--start-group
+            llaminar2_core
+            ${_gpu_backends_whole_sampling}
+            -Wl,--end-group
+            GTest::gtest
+            GTest::gtest_main
+        )
+    else()
+        target_link_libraries(v2_integration_gpu_sampling_kernels PRIVATE
+            llaminar2_core
+            GTest::gtest
+            GTest::gtest_main
+        )
+    endif()
+    add_v2_test(V2_Integration_GPUSamplingKernels
+        COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+        LABELS "V2;Integration;Backend;GPU;CUDA;ROCm;Sampling;Argmax;TopK"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added GPU Sampling Kernels integration tests")
+endif()
+
 endif()

@@ -1281,6 +1281,11 @@ int main(int argc, char *argv[])
                 return orch_runner_->sampleGreedyOnDevice();
             }
 
+            int sampleOnDevice(const SamplingParams &params) override
+            {
+                return orch_runner_->sampleOnDevice(params);
+            }
+
             void setSkipLogitsGatherDecode(bool skip) override
             {
                 orch_runner_->setSkipLogitsGatherDecode(skip);
@@ -1397,6 +1402,10 @@ int main(int argc, char *argv[])
     }
 
     // Generate tokens autoregressively using decodeStep()
+    // Configure GPU-side sampling: set active params and skip logits gather
+    runner->setSamplingParams(sampling_params);
+    runner->setSkipLogitsGatherDecode(true);
+
     // n_predict = -1 means unlimited (generate until EOS)
     int max_tokens = (config.n_predict == -1) ? INT_MAX : config.n_predict;
     for (int i = 0; i < max_tokens; ++i)

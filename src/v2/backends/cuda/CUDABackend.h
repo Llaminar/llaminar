@@ -12,6 +12,7 @@
 
 #include "../IBackend.h"
 #include <future>
+#include <vector>
 
 namespace llaminar2
 {
@@ -69,6 +70,18 @@ namespace llaminar2
         size_t deviceMemoryTotal(int device_id) const override;
         size_t deviceMemoryFree(int device_id) const override;
 
+        // Host memory pinning for async DMA
+        bool pinHostMemory(void *ptr, size_t bytes) override;
+        bool unpinHostMemory(void *ptr) override;
+
+        // GPU-side argmax for greedy sampling
+        bool argmaxF32(const void *data_device, int n, int device_id,
+                       float *out_value, int *out_index) override;
+
+        // GPU-side top-k selection for sampling
+        bool topKF32(const void *data_device, int n, int k, int device_id,
+                     float *out_values, int *out_indices) override;
+
         // Capability queries
         bool supportsBF16(int device_id) const override;
         bool supportsFP16(int device_id) const override;
@@ -86,6 +99,23 @@ namespace llaminar2
 
     private:
         int device_count_;
+
+        // Per-device argmax result buffers (lazily allocated)
+        struct ArgmaxDeviceBuffers
+        {
+            void *value_ptr = nullptr;
+            void *index_ptr = nullptr;
+        };
+        std::vector<ArgmaxDeviceBuffers> argmax_buffers_;
+
+        // Per-device top-k result buffers (lazily allocated)
+        struct TopKDeviceBuffers
+        {
+            void *values_ptr = nullptr;
+            void *indices_ptr = nullptr;
+            int allocated_k = 0;
+        };
+        std::vector<TopKDeviceBuffers> topk_buffers_;
     };
 
 } // namespace llaminar2

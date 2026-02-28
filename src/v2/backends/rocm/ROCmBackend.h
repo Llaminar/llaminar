@@ -59,6 +59,10 @@ namespace llaminar2
         bool argmaxF32(const void *data_device, int n, int device_id,
                        float *out_value, int *out_index) override;
 
+        // GPU-side top-k selection for sampling
+        bool topKF32(const void *data_device, int n, int k, int device_id,
+                     float *out_values, int *out_indices) override;
+
         // Event operations (fine-grained synchronization)
         void *createEvent(int device_id) override;
         void destroyEvent(void *event, int device_id) override;
@@ -254,6 +258,15 @@ namespace llaminar2
             void *index_ptr = nullptr; // Device pointer for 1 int
         };
         std::vector<ArgmaxDeviceBuffers> argmax_buffers_;
+
+        // Per-device top-k result buffers (lazily allocated, resized to max k used)
+        struct TopKDeviceBuffers
+        {
+            void *values_ptr = nullptr;  // Device pointer for k floats
+            void *indices_ptr = nullptr; // Device pointer for k ints
+            int allocated_k = 0;         // Current allocation size
+        };
+        std::vector<TopKDeviceBuffers> topk_buffers_;
     };
 
 } // namespace llaminar2

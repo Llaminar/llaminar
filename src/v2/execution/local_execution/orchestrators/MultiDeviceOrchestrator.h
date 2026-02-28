@@ -396,6 +396,14 @@ namespace llaminar2
         int sampleGreedyOnDevice() override;
 
         /**
+         * @brief GPU-side sampling with top-k/top-p support
+         *
+         * For greedy, uses per-device argmax. For non-greedy, runs GPU top-k
+         * per device, then host-side merge + softmax + top-p + sample.
+         */
+        int sampleOnDevice(const SamplingParams &params) override;
+
+        /**
          * @brief Enable GPU-side decode sampling (skip D2H gatherLogits for seq_len=1)
          *
          * When enabled, forwardTP() skips gatherLogits for decode tokens.

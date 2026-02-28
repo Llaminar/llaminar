@@ -536,6 +536,33 @@ namespace llaminar2
             return false; // Not supported by default
         }
 
+        /**
+         * @brief GPU-side top-k selection over FP32 data
+         *
+         * Finds the k largest elements (value and index) entirely on the GPU.
+         * Results are in descending order of value (highest first).
+         * Used for top-k/top-p sampling to avoid a full D2H transfer.
+         *
+         * @param data_device Device pointer to FP32 data
+         * @param n Number of elements
+         * @param k Number of top elements to select (1..256)
+         * @param device_id Device where data resides
+         * @param out_values Host buffer for k float values (descending order)
+         * @param out_indices Host buffer for k int indices
+         * @return true if executed on device, false if not supported
+         */
+        virtual bool topKF32(const void *data_device, int n, int k, int device_id,
+                             float *out_values, int *out_indices)
+        {
+            (void)data_device;
+            (void)n;
+            (void)k;
+            (void)device_id;
+            (void)out_values;
+            (void)out_indices;
+            return false; // Not supported by default
+        }
+
         // ====================================================================
         // Compute Operations
         // ====================================================================

@@ -19,6 +19,7 @@ namespace llaminar2
     class TensorBase;
     struct PlacementPlan;
     struct GraphExecutorStats;
+    struct SamplingParams;
 
     /**
      * @brief Execution path type
@@ -130,6 +131,23 @@ namespace llaminar2
          *         -1 if not supported (caller should fall back to logits() + CPU argmax)
          */
         virtual int sampleGreedyOnDevice() { return -1; }
+
+        /**
+         * @brief GPU-side sampling with full top-k/top-p support
+         *
+         * For greedy (temperature=0), delegates to sampleGreedyOnDevice().
+         * For non-greedy, runs per-device GPU top-k selection, then performs
+         * cross-device merge + softmax + top-p filtering + sampling on host
+         * (operating on only k candidates, not the full vocabulary).
+         *
+         * @param params Sampling parameters (temperature, top_k, top_p, seed)
+         * @return Token ID (>= 0) on success, -1 if not supported
+         */
+        virtual int sampleOnDevice(const SamplingParams &params)
+        {
+            (void)params;
+            return -1;
+        }
 
         /**
          * @brief Enable GPU-side decode sampling mode

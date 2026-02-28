@@ -163,7 +163,9 @@ namespace llaminar2
         // =====================================================================
 
         int sampleGreedyOnDevice() override;
+        int sampleOnDevice(const SamplingParams &params) override;
         void setSkipLogitsGatherDecode(bool skip) override;
+        void setSamplingParams(const SamplingParams &params) override;
 
     private:
         // =====================================================================
@@ -307,7 +309,8 @@ namespace llaminar2
         // Inference state
         std::vector<int32_t> stop_tokens_;
         Sampler sampler_;
-        int32_t last_token_{0}; // Last token for decode step
+        SamplingParams active_sampling_params_; // Current sampling params for decodeStep()
+        int32_t last_token_{0};                 // Last token for decode step
         std::shared_ptr<ITokenizer> tokenizer_;
     };
 

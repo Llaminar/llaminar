@@ -227,6 +227,7 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDARoPEKernels.cu           # RoPE kernels (FP32, BF16, FP16)
         kernels/cuda/ops/CUDAEmbeddingKernels.cu      # Embedding lookup kernel
         kernels/cuda/ops/CUDAVectorAddKernels.cu      # Vector add kernels (for collective reductions)
+        kernels/cuda/ops/CUDASamplingKernels.cu        # Argmax + Top-K kernels for GPU-side sampling
         kernels/cuda/attention/CUDAFlashAttentionKernels.cu  # Flash Attention 2 and Flash Decoding kernels
         kernels/cuda/kvcache/CUDARingKVCache.cu       # Ring buffer KV cache with O(1) eviction
         # Profiling utilities
@@ -498,6 +499,7 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmEmbeddingKernels.hip            # Embedding kernels (FP32, BF16, FP16, Q8_1)
         kernels/rocm/ops/ROCmResidualAddKernels.hip          # Residual Add kernels (FP32, BF16, FP16)
         kernels/rocm/ops/ROCmArgmaxKernels.hip               # Argmax kernel for GPU-side greedy sampling
+        kernels/rocm/ops/ROCmSamplingKernels.hip              # Top-K kernel for GPU-side top-k/top-p sampling
         # Profiling utilities
         utils/ROCmKernelProfiler.hip                         # ROCm/HIP event-based kernel profiling
     )

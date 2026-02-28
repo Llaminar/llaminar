@@ -580,6 +580,148 @@ namespace llaminar2
     }
 
     // ====================================================================
+    // GPU-side Sampling Operations
+    // ====================================================================
+
+    // ── pinHostMemory / unpinHostMemory ────────────────────────────────────
+
+    bool CUDABackend::pinHostMemory(void *ptr, size_t bytes)
+    {
+        cudaError_t err = cudaHostRegister(ptr, bytes, cudaHostRegisterDefault);
+        if (err != cudaSuccess)
+        {
+            LOG_WARN("[CUDABackend::pinHostMemory] cudaHostRegister failed for "
+                     << bytes << " bytes: " << cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool CUDABackend::unpinHostMemory(void *ptr)
+    {
+        cudaError_t err = cudaHostUnregister(ptr);
+        if (err != cudaSuccess)
+        {
+            LOG_WARN("[CUDABackend::unpinHostMemory] cudaHostUnregister failed: "
+                     << cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    // Forward declarations for CUDA sampling kernels (CUDASamplingKernels.cu)
+    extern "C" bool cudaOps_argmax_f32(
+        const float *data, int n, float *out_value, int *out_index,
+        int device_idx, void *stream);
+
+    extern "C" bool cudaOps_topk_f32(
+        const float *data, int n, int k, float *out_values, int *out_indices,
+        int device_idx, void *stream);
+
+    bool CUDABackend::argmaxF32(const void *data_device, int n, int device_id,
+                                float *out_value, int *out_index)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !data_device || n <= 0)
+            return false;
+
+        // Lazily allocate per-device result buffers
+        if (argmax_buffers_.empty())
+            argmax_buffers_.resize(device_count_);
+
+        auto &bufs = argmax_buffers_[device_id];
+        if (!bufs.value_ptr)
+        {
+            cudaError_t err = cudaSetDevice(device_id);
+            if (err != cudaSuccess)
+                return false;
+            err = cudaMalloc(&bufs.value_ptr, sizeof(float));
+            if (err != cudaSuccess)
+                return false;
+            err = cudaMalloc(&bufs.index_ptr, sizeof(int));
+            if (err != cudaSuccess)
+            {
+                cudaFree(bufs.value_ptr);
+                bufs.value_ptr = nullptr;
+                return false;
+            }
+        }
+
+        cudaSetDevice(device_id);
+        if (!cudaOps_argmax_f32(
+                static_cast<const float *>(data_device), n,
+                static_cast<float *>(bufs.value_ptr),
+                static_cast<int *>(bufs.index_ptr),
+                device_id, nullptr))
+        {
+            return false;
+        }
+
+        cudaDeviceSynchronize();
+        cudaMemcpy(out_value, bufs.value_ptr, sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(out_index, bufs.index_ptr, sizeof(int), cudaMemcpyDeviceToHost);
+
+        return true;
+    }
+
+    bool CUDABackend::topKF32(const void *data_device, int n, int k, int device_id,
+                              float *out_values, int *out_indices)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !data_device || n <= 0 || k <= 0)
+            return false;
+
+        if (k > n)
+            k = n;
+
+        // Lazily allocate per-device result buffers
+        if (topk_buffers_.empty())
+            topk_buffers_.resize(device_count_);
+
+        auto &bufs = topk_buffers_[device_id];
+
+        if (bufs.allocated_k < k)
+        {
+            cudaSetDevice(device_id);
+            if (bufs.values_ptr)
+                cudaFree(bufs.values_ptr);
+            if (bufs.indices_ptr)
+                cudaFree(bufs.indices_ptr);
+
+            cudaError_t err = cudaMalloc(&bufs.values_ptr, k * sizeof(float));
+            if (err != cudaSuccess)
+            {
+                bufs.values_ptr = nullptr;
+                bufs.allocated_k = 0;
+                return false;
+            }
+            err = cudaMalloc(&bufs.indices_ptr, k * sizeof(int));
+            if (err != cudaSuccess)
+            {
+                cudaFree(bufs.values_ptr);
+                bufs.values_ptr = nullptr;
+                bufs.allocated_k = 0;
+                return false;
+            }
+            bufs.allocated_k = k;
+        }
+
+        cudaSetDevice(device_id);
+        if (!cudaOps_topk_f32(
+                static_cast<const float *>(data_device), n, k,
+                static_cast<float *>(bufs.values_ptr),
+                static_cast<int *>(bufs.indices_ptr),
+                device_id, nullptr))
+        {
+            return false;
+        }
+
+        cudaDeviceSynchronize();
+        cudaMemcpy(out_values, bufs.values_ptr, k * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(out_indices, bufs.indices_ptr, k * sizeof(int), cudaMemcpyDeviceToHost);
+
+        return true;
+    }
+
+    // ====================================================================
     // Async Operations (Route through NvidiaDeviceContext worker thread)
     // ====================================================================
 

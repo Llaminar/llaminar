@@ -296,13 +296,6 @@ namespace llaminar2
             return result;
         }
 
-        const float *logits = runner_->logits();
-        if (!logits)
-        {
-            result.error = "No logits available";
-            return result;
-        }
-
         // For PP: send to next stage if not tail
         if (!isPipelineTail())
         {
@@ -311,13 +304,37 @@ namespace llaminar2
             return result;
         }
 
-        // Tail stage: sample token — zero-copy via raw pointer
-        int vocab = vocabSize();
+        // Tail stage: try GPU-side sampling first, fall back to CPU
+        int token = -1;
 
-        SamplingParams params;
-        params.temperature = 0.0f; // Greedy by default
+        if (active_sampling_params_.is_greedy())
+        {
+            // Try GPU-side greedy (argmax)
+            token = runner_->sampleGreedyOnDevice();
+        }
+        else
+        {
+            // Try GPU-side top-k/top-p
+            token = runner_->sampleOnDevice(active_sampling_params_);
+            if (token >= 0)
+            {
+                LOG_TRACE("[decodeStep] GPU top-k/top-p sampled token=" << token);
+            }
+        }
 
-        int token = sampler_.sample(logits, static_cast<size_t>(vocab), params);
+        if (token < 0)
+        {
+            // Fallback: CPU-side sampling (requires logits D2H)
+            LOG_TRACE("[decodeStep] GPU sampling returned -1, falling back to CPU");
+            const float *logits = runner_->logits();
+            if (!logits)
+            {
+                result.error = "No logits available";
+                return result;
+            }
+            int vocab = vocabSize();
+            token = sampler_.sample(logits, static_cast<size_t>(vocab), active_sampling_params_);
+        }
 
         result.tokens.push_back(token);
         last_token_ = token; // Store for next decode step
@@ -355,8 +372,12 @@ namespace llaminar2
             return result;
         }
 
-        // Decode loop
+        // Store sampling params for decodeStep() and configure GPU-side decode
+        active_sampling_params_ = sampling;
         sampler_ = Sampler(sampling.seed);
+
+        // Enable GPU-side logits skip for decode (GPU sampling avoids full D2H)
+        runner_->setSkipLogitsGatherDecode(true);
 
         for (int i = 0; i < max_new_tokens; ++i)
         {
@@ -366,7 +387,7 @@ namespace llaminar2
             if (!step.error.empty())
             {
                 result.error = step.error;
-                return result;
+                break;
             }
 
             // Collect tokens from step (on tail stage)
@@ -381,6 +402,9 @@ namespace llaminar2
                 break;
             }
         }
+
+        // Restore normal logits gathering after generation
+        runner_->setSkipLogitsGatherDecode(false);
 
         return result;
     }
@@ -1303,12 +1327,26 @@ namespace llaminar2
         return -1;
     }
 
+    int OrchestrationRunner::sampleOnDevice(const SamplingParams &params)
+    {
+        if (runner_)
+        {
+            return runner_->sampleOnDevice(params);
+        }
+        return -1;
+    }
+
     void OrchestrationRunner::setSkipLogitsGatherDecode(bool skip)
     {
         if (runner_)
         {
             runner_->setSkipLogitsGatherDecode(skip);
         }
+    }
+
+    void OrchestrationRunner::setSamplingParams(const SamplingParams &params)
+    {
+        active_sampling_params_ = params;
     }
 
 } // namespace llaminar2

@@ -325,6 +325,16 @@ namespace llaminar2
         virtual int sampleGreedyOnDevice() { return -1; }
 
         /**
+         * @brief GPU-side sampling with full top-k/top-p support
+         * @see IInferenceRunner::sampleOnDevice
+         */
+        virtual int sampleOnDevice(const SamplingParams &params)
+        {
+            (void)params;
+            return -1;
+        }
+
+        /**
          * @brief Enable/disable skipping of logits D2H gather during decode
          *
          * When enabled, forwardTP() skips the gatherLogits call for decode
@@ -333,6 +343,14 @@ namespace llaminar2
          * @param skip true to skip logits gather, false to restore normal behavior
          */
         virtual void setSkipLogitsGatherDecode(bool /*skip*/) {}
+
+        /**
+         * @brief Set active sampling parameters for use in decodeStep()
+         *
+         * When set, decodeStep() will use these params to decide between
+         * GPU-side greedy (argmax) or GPU-side top-k/top-p sampling.
+         */
+        virtual void setSamplingParams(const SamplingParams & /*params*/) {}
     };
 
 } // namespace llaminar2

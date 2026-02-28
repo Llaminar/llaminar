@@ -28,6 +28,7 @@
 #include "../../../backends/BackendManager.h"       // getBackendFor() for partial D2H in gatherLogits
 #include "../../../backends/GPUDeviceContextPool.h" // Compute stream registration for event-based collective sync
 #include "../../../utils/Logger.h"
+#include "../../../utils/Sampler.h" // SamplingParams for sampleOnDevice()
 #include <algorithm>
 #include <future>
 #include <iomanip>
@@ -1796,6 +1797,202 @@ namespace llaminar2
         }
 
         return best_token;
+    }
+
+    int MultiDeviceOrchestrator::sampleOnDevice(const SamplingParams &params)
+    {
+        // Greedy: delegate to existing argmax path
+        if (params.is_greedy())
+            return sampleGreedyOnDevice();
+
+        // Only supported for TP mode with multiple GPU devices
+        if (mode_ != ParallelismMode::TP || device_runners_.size() < 2)
+            return -1;
+
+        // Determine effective top-k (default to 40 if top_k==0 and top_p < 1.0)
+        int effective_k = params.top_k;
+        if (effective_k <= 0)
+            effective_k = 40; // Sensible default for top-p only mode
+        if (effective_k > 256)
+            effective_k = 256; // Kernel limit
+
+        static bool logged_once = false;
+
+        // Collect per-device logits info
+        struct DeviceTopKInfo
+        {
+            const void *gpu_ptr;
+            std::optional<DeviceId> device;
+            size_t vocab_local;
+        };
+
+        std::vector<DeviceTopKInfo> infos;
+        infos.reserve(device_runners_.size());
+
+        for (const auto &runner : device_runners_)
+        {
+            if (!runner || !runner->hasInferenceState())
+                return -1;
+            const auto &state = runner->inferenceState();
+            if (!state.logits_local)
+                return -1;
+
+            const auto &shape = state.logits_local->shape();
+            if (shape.size() < 2)
+                return -1;
+
+            const void *gpu_ptr = state.logits_local->gpu_data_ptr();
+            if (!gpu_ptr)
+                return -1;
+
+            infos.push_back({gpu_ptr, state.logits_local->current_device(), shape[1]});
+        }
+
+        // Per-device GPU top-k → host merge
+        // Each device returns its k best (value, local_index) candidates
+        struct DeviceCandidate
+        {
+            float value;
+            int global_index; // Adjusted for vocab shard offset
+        };
+
+        std::vector<DeviceCandidate> all_candidates;
+        all_candidates.reserve(device_runners_.size() * effective_k);
+
+        // Host buffers for top-k results (reuse across calls via thread_local)
+        thread_local std::vector<float> topk_values(256);
+        thread_local std::vector<int> topk_indices(256);
+        if (static_cast<int>(topk_values.size()) < effective_k)
+        {
+            topk_values.resize(effective_k);
+            topk_indices.resize(effective_k);
+        }
+
+        size_t col_offset = 0;
+        for (const auto &info : infos)
+        {
+            if (!info.device.has_value())
+                return -1;
+
+            IBackend *backend = getBackendFor(*info.device);
+            if (!backend)
+                return -1;
+
+            if (!backend->topKF32(info.gpu_ptr,
+                                  static_cast<int>(info.vocab_local),
+                                  effective_k,
+                                  info.device->gpu_ordinal(),
+                                  topk_values.data(),
+                                  topk_indices.data()))
+            {
+                LOG_TRACE("[sampleOnDevice] topKF32 failed for device " << info.device->toString());
+                return -1;
+            }
+
+            for (int i = 0; i < effective_k; ++i)
+            {
+                if (topk_indices[i] >= 0)
+                {
+                    all_candidates.push_back(
+                        {topk_values[i],
+                         static_cast<int>(col_offset) + topk_indices[i]});
+                }
+            }
+            col_offset += info.vocab_local;
+        }
+
+        if (all_candidates.empty())
+            return -1;
+
+        // Sort all candidates by value descending
+        std::sort(all_candidates.begin(), all_candidates.end(),
+                  [](const DeviceCandidate &a, const DeviceCandidate &b)
+                  { return a.value > b.value; });
+
+        // Keep only global top-k
+        if (static_cast<int>(all_candidates.size()) > effective_k)
+            all_candidates.resize(effective_k);
+
+        // Apply temperature scaling
+        float temperature = params.temperature;
+        if (temperature <= 0.0f)
+            temperature = 1.0f; // Shouldn't happen (greedy caught above), but safety
+
+        // Softmax with temperature
+        float max_logit = all_candidates[0].value; // Already sorted desc
+        std::vector<float> probs(all_candidates.size());
+        float sum = 0.0f;
+        for (size_t i = 0; i < all_candidates.size(); ++i)
+        {
+            probs[i] = std::exp((all_candidates[i].value - max_logit) / temperature);
+            sum += probs[i];
+        }
+        for (auto &p : probs)
+            p /= sum;
+
+        // Top-p (nucleus) filtering
+        float top_p = params.top_p;
+        int nucleus_size = static_cast<int>(probs.size());
+        if (top_p < 1.0f && top_p > 0.0f)
+        {
+            float cumulative = 0.0f;
+            for (size_t i = 0; i < probs.size(); ++i)
+            {
+                cumulative += probs[i];
+                if (cumulative >= top_p)
+                {
+                    nucleus_size = static_cast<int>(i) + 1;
+                    break;
+                }
+            }
+            // Renormalize
+            float renorm_sum = 0.0f;
+            for (int i = 0; i < nucleus_size; ++i)
+                renorm_sum += probs[i];
+            for (int i = 0; i < nucleus_size; ++i)
+                probs[i] /= renorm_sum;
+        }
+
+        // Multinomial sampling with RNG
+        // Use seed if provided, otherwise use a random device
+        thread_local std::mt19937 rng{std::random_device{}()};
+        if (params.seed != 0)
+        {
+            static unsigned int last_seed = 0;
+            if (params.seed != last_seed)
+            {
+                rng.seed(params.seed);
+                last_seed = params.seed;
+            }
+        }
+
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        float r = dist(rng);
+        float cumulative = 0.0f;
+        int selected = all_candidates[0].global_index; // Fallback
+        for (int i = 0; i < nucleus_size; ++i)
+        {
+            cumulative += probs[i];
+            if (r <= cumulative)
+            {
+                selected = all_candidates[i].global_index;
+                break;
+            }
+        }
+
+        LOG_TRACE("[sampleOnDevice] top-k/p selected token=" << selected
+                                                             << " (k=" << effective_k << ", p=" << top_p
+                                                             << ", T=" << temperature << ", nucleus=" << nucleus_size << ")");
+
+        if (!logged_once)
+        {
+            LOG_INFO("[sampleOnDevice] GPU-side top-k/top-p active ("
+                     << device_runners_.size() << " devices, k=" << effective_k
+                     << ", vocab_local=" << infos[0].vocab_local << " each)");
+            logged_once = true;
+        }
+
+        return selected;
     }
 
     const float *MultiDeviceOrchestrator::logits() const
