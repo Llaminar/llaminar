@@ -46,6 +46,7 @@
 #pragma once
 
 #include "IMultiDeviceOrchestrator.h"
+#include "TPWorkerPool.h"
 #include "../../../backends/GlobalDeviceAddress.h"
 #include "../../../config/OrchestrationConfig.h"
 #include "../../../collective/ILocalPPContext.h"
@@ -408,9 +409,17 @@ namespace llaminar2
          *
          * When enabled, forwardTP() skips gatherLogits for decode tokens.
          * Caller MUST use sampleGreedyOnDevice() instead of logits() for decode.
-         * Prefill logits are still gathered normally.
          */
         void setSkipLogitsGatherDecode(bool skip) { skip_logits_gather_decode_ = skip; }
+
+        /**
+         * @brief Skip logits gather after prefill (seq_len > 1)
+         *
+         * In the standard generation flow, prefill logits are never consumed —
+         * the first generated token comes from a decode step. Skipping the
+         * D2H gather eliminates massive PCIe traffic for multi-token forwards.
+         */
+        void setSkipLogitsGatherPrefill(bool skip) { skip_logits_gather_prefill_ = skip; }
 
         /**
          * @brief Batched forward pass
@@ -786,6 +795,10 @@ namespace llaminar2
         /// Caller uses sampleGreedyOnDevice() instead for GPU-side argmax.
         bool skip_logits_gather_decode_ = false;
 
+        /// When true, forwardTP() skips gatherLogits for prefill (seq_len > 1).
+        /// Prefill logits are never consumed in the standard generation flow.
+        bool skip_logits_gather_prefill_ = false;
+
         /// Actual size of gathered logits from last gatherLogits() call
         /// This may be smaller than combined_logits_->numel() for decode (1 token vs max_seq_len)
         size_t last_gathered_logits_size_ = 0;
@@ -811,6 +824,11 @@ namespace llaminar2
         /// Hidden state input for PP nesting (when this orchestrator is a PP stage)
         /// Set via setHiddenState(), cleared after forward or via clearHiddenStateInput()
         TensorBase *hidden_state_input_ = nullptr;
+
+        /// Persistent worker pool for TP device forwarding.
+        /// Eliminates per-decode thread creation/destruction overhead (~100-150µs).
+        /// Lazy-initialized on first TP forward call.
+        std::unique_ptr<TPWorkerPool> tp_worker_pool_;
     };
 
 } // namespace llaminar2

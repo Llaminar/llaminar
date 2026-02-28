@@ -345,6 +345,17 @@ namespace llaminar2
         virtual void setSkipLogitsGatherDecode(bool /*skip*/) {}
 
         /**
+         * @brief Enable/disable skipping of logits D2H gather during prefill
+         *
+         * Prefill logits are never consumed in the standard generation flow
+         * (the first generated token comes from a decode step). Skipping the
+         * gather eliminates massive PCIe traffic for multi-device prefill.
+         *
+         * @param skip true to skip logits gather, false to restore normal behavior
+         */
+        virtual void setSkipLogitsGatherPrefill(bool /*skip*/) {}
+
+        /**
          * @brief Set active sampling parameters for use in decodeStep()
          *
          * When set, decodeStep() will use these params to decide between

@@ -159,6 +159,17 @@ namespace llaminar2
         virtual void setSkipLogitsGatherDecode(bool) {}
 
         /**
+         * @brief Skip logits gather after prefill (seq_len > 1)
+         *
+         * In the standard generation flow, prefill logits are never consumed —
+         * the first generated token comes from a decode step. Skipping the
+         * D2H logits gather for prefill eliminates massive PCIe traffic
+         * (e.g. 346 MB for 596 tokens × 152064 vocab across 2 devices).
+         * Default: no-op (not all runners support this).
+         */
+        virtual void setSkipLogitsGatherPrefill(bool) {}
+
+        /**
          * @brief Get current position in cache
          */
         virtual int get_position() const = 0;

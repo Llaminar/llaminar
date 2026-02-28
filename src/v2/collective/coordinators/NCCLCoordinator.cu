@@ -850,6 +850,78 @@ namespace llaminar2
 #endif
     }
 
+    bool NCCLCoordinator::allreduceSingleDeviceOnStream(void *buffer, size_t count,
+                                                        CollectiveDataType dtype, CollectiveOp op,
+                                                        int device_idx, void *stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "NCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (device_idx < 0 || device_idx >= num_devices_)
+        {
+            last_error_ = "Invalid device_idx " + std::to_string(device_idx) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+
+        if (!buffer)
+        {
+            last_error_ = "Null buffer for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        if (!stream)
+        {
+            last_error_ = "Null stream for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        // Per-device resources (no locking needed — each device_idx is accessed
+        // by exactly one thread in the barrier-free TP path)
+        const int ordinal = device_ordinals_[device_idx];
+        nccl::ncclComm_t comm = static_cast<nccl::ncclComm_t>(comms_[device_idx]);
+        cudaStream_t caller_stream = static_cast<cudaStream_t>(stream);
+
+        cudaError_t err;
+
+        // 1. Set device context
+        err = cudaSetDevice(ordinal);
+        if (err != cudaSuccess)
+        {
+            last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
+            return false;
+        }
+
+        // 2. Launch allreduce directly on the caller's stream.
+        //    No cross-stream event sync needed — the caller's stream provides
+        //    ordering (prior compute → allreduce → subsequent compute).
+        nccl::ncclResult_t r = nccl::ncclAllReduce(
+            buffer, buffer, count,
+            toNcclDataTypeInt(toDataTypeInt(dtype)), toNcclRedOpInt(toOpInt(op)),
+            comm, caller_stream);
+        if (r != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("ncclAllReduce(on-stream) failed: ") + nccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
     bool NCCLCoordinator::allgatherMulti(const std::vector<const void *> &send_buffers,
                                          const std::vector<void *> &recv_buffers,
                                          size_t send_count, CollectiveDataType dtype)

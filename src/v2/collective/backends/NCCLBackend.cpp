@@ -1413,6 +1413,44 @@ namespace llaminar2
 #endif
     }
 
+    bool NCCLBackend::allreduceSingleDeviceOnStream(
+        void *buffer, size_t count,
+        CollectiveDataType dtype, CollectiveOp op,
+        int device_idx, void *stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "No NCCLCoordinator";
+            return false;
+        }
+
+        if (!coordinator_->allreduceSingleDeviceOnStream(buffer, count, dtype, op, device_idx, stream))
+        {
+            last_error_ = "NCCLCoordinator allreduceSingleDeviceOnStream failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
     bool NCCLBackend::allgatherMulti(const std::vector<const void *> &send_buffers,
                                      const std::vector<void *> &recv_buffers, size_t send_count,
                                      CollectiveDataType dtype)

@@ -366,6 +366,9 @@ namespace llaminar2
         }
 
         // Prefill
+        // Skip D2H logits gather for prefill — logits are never consumed;
+        // the first generated token comes from a decode step.
+        runner_->setSkipLogitsGatherPrefill(true);
         if (!prefill(prompt_tokens))
         {
             result.error = last_error_;
@@ -1341,6 +1344,14 @@ namespace llaminar2
         if (runner_)
         {
             runner_->setSkipLogitsGatherDecode(skip);
+        }
+    }
+
+    void OrchestrationRunner::setSkipLogitsGatherPrefill(bool skip)
+    {
+        if (runner_)
+        {
+            runner_->setSkipLogitsGatherPrefill(skip);
         }
     }
 

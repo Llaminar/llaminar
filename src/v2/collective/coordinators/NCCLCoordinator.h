@@ -181,6 +181,27 @@ namespace llaminar2
                                         int device_idx);
 
         /**
+         * @brief Per-device allreduce directly on the caller's GPU stream (barrier-free)
+         *
+         * Issues ncclAllReduce directly onto the given stream with no cross-stream
+         * event synchronization. Stream ordering provides dependency management
+         * (prior compute → allreduce → subsequent compute).
+         *
+         * Thread-safe: each call accesses only device_idx's resources.
+         *
+         * @param buffer In-place buffer on device_idx's GPU
+         * @param count Elements to reduce
+         * @param dtype Data type
+         * @param op Reduction operation
+         * @param device_idx Device index (0 to num_devices-1)
+         * @param stream CUDA stream (cudaStream_t cast to void*) to issue the allreduce on
+         * @return true on success
+         */
+        bool allreduceSingleDeviceOnStream(void *buffer, size_t count,
+                                           CollectiveDataType dtype, CollectiveOp op,
+                                           int device_idx, void *stream);
+
+        /**
          * @brief Allgather across all local GPUs
          *
          * Each device contributes send_count elements, receives

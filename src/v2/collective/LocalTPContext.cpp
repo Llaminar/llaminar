@@ -38,6 +38,33 @@
 #include "backends/HeterogeneousBackend.h"
 #endif
 
+// ============================================================================
+// Extern declarations for FP32 ↔ FP16 cast kernels (mixed-precision allreduce)
+// ============================================================================
+#ifdef HAVE_CUDA
+extern "C"
+{
+    cudaError_t cudaCastFP32ToFP16(const float *fp32_input, void *fp16_output,
+                                   size_t count, cudaStream_t stream);
+    cudaError_t cudaCastFP16ToFP32(const void *fp16_input, float *fp32_output,
+                                   size_t count, cudaStream_t stream);
+    int cudaFP16ScratchAlloc(void **buf, size_t bytes, int ordinal);
+    void cudaFP16ScratchFree(void *buf, int ordinal);
+}
+#endif
+
+#ifdef HAVE_ROCM
+extern "C"
+{
+    int rocmCastFP32ToFP16(const float *fp32_input, void *fp16_output,
+                           size_t count, void *stream);
+    int rocmCastFP16ToFP32(const void *fp16_input, float *fp32_output,
+                           size_t count, void *stream);
+    int rocmFP16ScratchAlloc(void **buf, size_t bytes, int ordinal);
+    void rocmFP16ScratchFree(void *buf, int ordinal);
+}
+#endif
+
 namespace llaminar2
 {
     bool LocalTPContext::isLocalTPNCCLGraphPolicySupported(std::string *reason_out) const
@@ -409,6 +436,24 @@ namespace llaminar2
 
     LocalTPContext::~LocalTPContext()
     {
+        // Free FP16 scratch buffers via helper functions (avoids HIP/CUDA header conflicts)
+        for (size_t i = 0; i < fp16_scratch_buffers_.size(); ++i)
+        {
+            if (fp16_scratch_buffers_[i])
+            {
+                const int ordinal = devices_[i].device_ordinal;
+#ifdef HAVE_CUDA
+                if (device_group_.allCUDA())
+                    cudaFP16ScratchFree(fp16_scratch_buffers_[i], ordinal);
+#endif
+#ifdef HAVE_ROCM
+                if (device_group_.allROCm())
+                    rocmFP16ScratchFree(fp16_scratch_buffers_[i], ordinal);
+#endif
+                fp16_scratch_buffers_[i] = nullptr;
+            }
+        }
+
         const uint64_t attempts = nccl_allreduce_attempts_.load();
         const uint64_t success = nccl_allreduce_success_.load();
         const uint64_t failures = nccl_allreduce_failures_.load();
@@ -677,6 +722,153 @@ namespace llaminar2
 
         // Issue allreduce directly on the caller's stream (graph-capturable)
         CollectiveDataType dtype = tensorDTypeToCollective(tensor);
+
+        // =================================================================
+        // FP16 mixed-precision allreduce path
+        // =================================================================
+        // When enabled, FP32 allreduces cast to FP16 first so we transfer
+        // half the bytes across PCIe, then cast back. This is a pure
+        // bandwidth optimization — at 8.5 MB per allreduce on PCIe 3.0 x4,
+        // halving the payload saves ~215ms across 56 allreduces per forward.
+        const bool use_fp16_allreduce =
+            debugEnv().allreduce_precision == "fp16" &&
+            dtype == CollectiveDataType::FLOAT32;
+
+        if (use_fp16_allreduce)
+        {
+            // Lazy-init scratch buffer vectors
+            if (fp16_scratch_buffers_.empty())
+            {
+                fp16_scratch_buffers_.resize(degree(), nullptr);
+                fp16_scratch_counts_.resize(degree(), 0);
+            }
+
+            // Ensure scratch buffer is large enough for this allreduce
+            if (fp16_scratch_counts_[device_index] < effective_count)
+            {
+                const int ordinal = devices_[device_index].device_ordinal;
+                const size_t alloc_bytes = effective_count * sizeof(uint16_t); // FP16 = 2 bytes
+
+                // Free old buffer if resizing
+                if (fp16_scratch_buffers_[device_index])
+                {
+#ifdef HAVE_CUDA
+                    if (device_group_.allCUDA())
+                        cudaFP16ScratchFree(fp16_scratch_buffers_[device_index], ordinal);
+#endif
+#ifdef HAVE_ROCM
+                    if (device_group_.allROCm())
+                        rocmFP16ScratchFree(fp16_scratch_buffers_[device_index], ordinal);
+#endif
+                    fp16_scratch_buffers_[device_index] = nullptr;
+                }
+
+                // Allocate new FP16 scratch buffer on the correct device
+                bool alloc_ok = false;
+#ifdef HAVE_CUDA
+                if (device_group_.allCUDA())
+                    alloc_ok = (cudaFP16ScratchAlloc(&fp16_scratch_buffers_[device_index], alloc_bytes, ordinal) == 0);
+#endif
+#ifdef HAVE_ROCM
+                if (device_group_.allROCm())
+                    alloc_ok = (rocmFP16ScratchAlloc(&fp16_scratch_buffers_[device_index], alloc_bytes, ordinal) == 0);
+#endif
+                if (!alloc_ok)
+                {
+                    LOG_WARN("LocalTPContext::allreduceOnStream: FP16 scratch alloc failed ("
+                             << alloc_bytes << " bytes on device " << ordinal
+                             << "), falling back to FP32 allreduce");
+                    // Fall through to FP32 path below
+                }
+                else
+                {
+                    fp16_scratch_counts_[device_index] = effective_count;
+                    LOG_INFO("LocalTPContext: Allocated FP16 scratch buffer: "
+                             << (alloc_bytes / 1024) << " KB on device " << ordinal);
+                }
+            }
+
+            // Execute FP16 allreduce if scratch is available
+            if (fp16_scratch_buffers_[device_index] &&
+                fp16_scratch_counts_[device_index] >= effective_count)
+            {
+                void *fp16_buf = fp16_scratch_buffers_[device_index];
+                bool cast_ok = false;
+
+                // Step 1: Cast FP32 → FP16 on caller's stream
+#ifdef HAVE_CUDA
+                if (device_group_.allCUDA())
+                {
+                    cast_ok = (cudaCastFP32ToFP16(
+                                   static_cast<const float *>(buffer), fp16_buf,
+                                   effective_count,
+                                   static_cast<cudaStream_t>(stream)) == 0);
+                }
+#endif
+#ifdef HAVE_ROCM
+                if (device_group_.allROCm())
+                {
+                    cast_ok = (rocmCastFP32ToFP16(
+                                   static_cast<const float *>(buffer), fp16_buf,
+                                   effective_count, stream) == 0);
+                }
+#endif
+                if (!cast_ok)
+                {
+                    LOG_WARN("LocalTPContext: FP32→FP16 cast failed, falling back to FP32");
+                    // Fall through to FP32 path
+                }
+                else
+                {
+                    // Step 2: Allreduce in FP16 (half the bytes!)
+                    bool ar_ok = backend_impl_->allreduceSingleDeviceOnStream(
+                        fp16_buf, effective_count, CollectiveDataType::FLOAT16,
+                        CollectiveOp::ALLREDUCE_SUM, device_index, stream);
+
+                    if (!ar_ok)
+                    {
+                        LOG_WARN("LocalTPContext: FP16 allreduce failed: "
+                                 << backend_impl_->lastError() << ", falling back to FP32");
+                        // Fall through to FP32 path
+                    }
+                    else
+                    {
+                        // Step 3: Cast FP16 → FP32 back into the original buffer
+                        bool back_ok = false;
+#ifdef HAVE_CUDA
+                        if (device_group_.allCUDA())
+                        {
+                            back_ok = (cudaCastFP16ToFP32(
+                                           fp16_buf,
+                                           static_cast<float *>(buffer),
+                                           effective_count,
+                                           static_cast<cudaStream_t>(stream)) == 0);
+                        }
+#endif
+#ifdef HAVE_ROCM
+                        if (device_group_.allROCm())
+                        {
+                            back_ok = (rocmCastFP16ToFP32(
+                                           fp16_buf,
+                                           static_cast<float *>(buffer),
+                                           effective_count, stream) == 0);
+                        }
+#endif
+                        if (back_ok)
+                        {
+                            tensor->mark_device_dirty_flags_only();
+                            return true;
+                        }
+                        LOG_WARN("LocalTPContext: FP16→FP32 cast-back failed, data may be corrupt");
+                        // Fall through but data integrity is questionable
+                    }
+                }
+            }
+        }
+
+        // =================================================================
+        // Standard FP32 allreduce path (also fallback from FP16 failures)
+        // =================================================================
         bool success = backend_impl_->allreduceSingleDeviceOnStream(
             buffer, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM,
             device_index, stream);

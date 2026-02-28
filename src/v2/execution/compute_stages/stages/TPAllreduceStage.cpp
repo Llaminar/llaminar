@@ -9,6 +9,7 @@
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KernelProfiler.h"
+#include "../../../utils/DebugEnv.h"
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -54,6 +55,13 @@ namespace llaminar2
         if (params_.tp_ctx->degree() == 1)
         {
             LOG_DEBUG("TPAllreduceStage: single device, no-op");
+            return true;
+        }
+
+        // DIAGNOSTIC: Skip allreduce entirely for profiling (results will be wrong!)
+        // Use LLAMINAR_SKIP_ALLREDUCE=1 to measure allreduce cost by elimination.
+        if (debugEnv().skip_allreduce)
+        {
             return true;
         }
 

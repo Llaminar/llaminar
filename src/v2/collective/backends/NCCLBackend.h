@@ -239,6 +239,11 @@ namespace llaminar2
             CollectiveDataType dtype, CollectiveOp op,
             int device_idx) override;
 
+        bool allreduceSingleDeviceOnStream(
+            void *buffer, size_t count,
+            CollectiveDataType dtype, CollectiveOp op,
+            int device_idx, void *stream) override;
+
         /// Multi-GPU AllGather (each GPU sends from send_bufs, receives to recv_bufs)
         bool allgatherMulti(
             const std::vector<const void *> &send_bufs,

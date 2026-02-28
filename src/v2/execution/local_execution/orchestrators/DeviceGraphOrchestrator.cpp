@@ -744,6 +744,9 @@ namespace llaminar2
             }
 
             bool used_segmented_capture = false;
+
+            auto exec_t0 = std::chrono::high_resolution_clock::now();
+
             success = executor_.executeDecodeWithCapturePolicy(
                 *forward_cache.graph,
                 ctx,
@@ -753,6 +756,8 @@ namespace llaminar2
                 &forward_cache.collective_nodes,
                 capture_policy,
                 &used_segmented_capture);
+
+            auto exec_t1 = std::chrono::high_resolution_clock::now();
 
             if (success && used_segmented_capture &&
                 forward_cache.segment_cache.initialized &&
@@ -779,6 +784,20 @@ namespace llaminar2
 
             auto end = std::chrono::high_resolution_clock::now();
             double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+
+            // Decode step timing breakdown (enabled via TP_TIMING)
+            if (is_decode && debugEnv().tp_timing)
+            {
+                double setup_us = std::chrono::duration<double, std::micro>(exec_t0 - start).count();
+                double exec_us = std::chrono::duration<double, std::micro>(exec_t1 - exec_t0).count();
+                double sync_us = std::chrono::duration<double, std::micro>(end - exec_t1).count();
+                LOG_INFO("[DEVICE_DECODE] dev=" << input.device
+                                                << " setup=" << std::fixed << std::setprecision(1) << setup_us << "us"
+                                                << " exec=" << exec_us << "us"
+                                                << " sync=" << sync_us << "us"
+                                                << " total=" << (ms * 1000.0) << "us"
+                                                << " phase3=" << forward_cache.phase3_active);
+            }
 
             LOG_DEBUG("[DeviceGraphOrchestrator] Forward (cached decode) completed in "
                       << ms << "ms, success=" << success);

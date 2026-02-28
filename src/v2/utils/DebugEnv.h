@@ -2554,18 +2554,43 @@ namespace llaminar2
         TopologyEnvConfig topology;                ///< Topology-related environment configuration
         MPIBootstrapEnvConfig mpi_bootstrap;       ///< MPI bootstrap environment snapshot
 
-        bool tp_timing = false; ///< Enable TP forward timing breakdown (env: LLAMINAR_TP_TIMING)
+        bool tp_timing = false;      ///< Enable TP forward timing breakdown (env: LLAMINAR_TP_TIMING)
+        bool skip_allreduce = false; ///< DIAGNOSTIC: Skip allreduce for profiling (env: LLAMINAR_SKIP_ALLREDUCE)
+
+        /// Allreduce precision: "fp16", "bf16", or "fp32" (env: LLAMINAR_ALLREDUCE_PRECISION, default: "fp16")
+        /// FP16/BF16 halves PCIe transfer bandwidth; FP32 is lossless but slower on bandwidth-limited links.
+        std::string allreduce_precision = "fp16";
+
+        /// Timeout in ms for TPWorkerPool::collectAll() (env: LLAMINAR_TP_COLLECT_TIMEOUT_MS, default: 0 = unlimited)
+        /// 0 means wait forever (normal operation). Set to e.g. 30000 for a 30s safety net if debugging hangs.
+        int tp_collect_timeout_ms = 0;
 
         DebugEnv()
         {
             const char *tp_env = std::getenv("LLAMINAR_TP_TIMING");
             tp_timing = tp_env && std::string(tp_env) == "1";
+            const char *skip_ar = std::getenv("LLAMINAR_SKIP_ALLREDUCE");
+            skip_allreduce = skip_ar && std::string(skip_ar) == "1";
+            const char *ar_prec = std::getenv("LLAMINAR_ALLREDUCE_PRECISION");
+            if (ar_prec)
+                allreduce_precision = ar_prec;
+            const char *collect_timeout = std::getenv("LLAMINAR_TP_COLLECT_TIMEOUT_MS");
+            if (collect_timeout)
+                tp_collect_timeout_ms = std::atoi(collect_timeout);
         }
 
         void reload()
         {
             const char *tp_env = std::getenv("LLAMINAR_TP_TIMING");
             tp_timing = tp_env && std::string(tp_env) == "1";
+            const char *skip_ar = std::getenv("LLAMINAR_SKIP_ALLREDUCE");
+            skip_allreduce = skip_ar && std::string(skip_ar) == "1";
+            const char *ar_prec = std::getenv("LLAMINAR_ALLREDUCE_PRECISION");
+            if (ar_prec)
+                allreduce_precision = ar_prec;
+            const char *collect_timeout = std::getenv("LLAMINAR_TP_COLLECT_TIMEOUT_MS");
+            if (collect_timeout)
+                tp_collect_timeout_ms = std::atoi(collect_timeout);
             gemm.reload();
             profile.reload();
             rmsnorm.reload();

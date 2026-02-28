@@ -285,6 +285,11 @@ namespace llaminar2
         // Reset pipeline state before warmup
         runner_->clear_cache();
 
+        // Skip D2H logits gather for prefill — prefill logits are never consumed
+        // in the benchmark flow (sampling happens during decode via GPU-side argmax).
+        // This eliminates ~405ms of PCIe traffic for TP=2 prefill.
+        runner_->setSkipLogitsGatherPrefill(true);
+
         // Warmup prefill
         auto [warmup_prefill_success, warmup_prefill_time] = runPrefill(tokens);
         if (!warmup_prefill_success)

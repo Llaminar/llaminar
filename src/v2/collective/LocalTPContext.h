@@ -323,6 +323,18 @@ namespace llaminar2
         std::atomic<bool> abort_requested_{false};
 
         // =====================================================================
+        // FP16 Mixed-Precision Allreduce Scratch Buffers
+        // =====================================================================
+        // When LLAMINAR_ALLREDUCE_PRECISION=fp16 (default), FP32 allreduces
+        // cast to FP16 first to halve PCIe transfer bandwidth. These device-local
+        // scratch buffers hold the FP16 temporary (lazily allocated on first use).
+
+        /// FP16 scratch buffer per device (void* to device memory, lazily allocated)
+        std::vector<void *> fp16_scratch_buffers_;
+        /// Current allocated element count per device
+        std::vector<size_t> fp16_scratch_counts_;
+
+        // =====================================================================
         // BAR-Backed Tensor Registry
         // =====================================================================
         // For zero-copy allreduce, we need to know which stage outputs are

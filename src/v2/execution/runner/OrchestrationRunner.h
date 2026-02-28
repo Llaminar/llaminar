@@ -165,6 +165,7 @@ namespace llaminar2
         int sampleGreedyOnDevice() override;
         int sampleOnDevice(const SamplingParams &params) override;
         void setSkipLogitsGatherDecode(bool skip) override;
+        void setSkipLogitsGatherPrefill(bool skip) override;
         void setSamplingParams(const SamplingParams &params) override;
 
     private:

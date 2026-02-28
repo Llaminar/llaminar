@@ -1291,6 +1291,11 @@ int main(int argc, char *argv[])
                 orch_runner_->setSkipLogitsGatherDecode(skip);
             }
 
+            void setSkipLogitsGatherPrefill(bool skip) override
+            {
+                orch_runner_->setSkipLogitsGatherPrefill(skip);
+            }
+
         private:
             IOrchestrationRunner *orch_runner_;
             int position_;

@@ -8,7 +8,7 @@
  * tensor parallelism across multiple devices within a single MPI rank.
  *
  * Key features:
- * - Parallel forward pass execution across devices via std::async
+ * - Parallel forward pass execution across devices via TPWorkerPool (TP) / std::async (PP)
  * - AllGather for combining partial logits from column-parallel LM head
  * - Unified snapshot/profiling API across all device runners
  */
@@ -1294,186 +1294,188 @@ namespace llaminar2
 
         // TP timing diagnostic — enabled via LLAMINAR_TP_TIMING=1
         const bool tp_timing = debugEnv().tp_timing;
-        auto tp_t0 = tp_timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
+        auto tp_t0 = tp_timing ? std::chrono::high_resolution_clock::now()
+                               : std::chrono::high_resolution_clock::time_point{};
 
         LOG_DEBUG("MultiDeviceOrchestrator::forwardTP: seq_len=" << seq_len
                                                                  << ", devices=" << device_runners_.size());
+
+        // Decode latency breakdown timing
+        const bool decode_breakdown = tp_timing && seq_len == 1;
+        auto launch_t0 = decode_breakdown ? std::chrono::high_resolution_clock::now()
+                                          : std::chrono::high_resolution_clock::time_point{};
 
         // DIAGNOSTIC: Run forward passes SEQUENTIALLY to test if concurrency causes crash.
         // If sequential execution works but parallel crashes, it's a concurrent HIP issue.
         const bool serialize_devices = (std::getenv("LLAMINAR_SERIALIZE_TP_FORWARD") != nullptr);
 
-        // Launch parallel forward passes on all devices
-        std::vector<std::future<bool>> futures;
-        futures.reserve(device_runners_.size());
-
-        for (size_t i = 0; i < device_runners_.size(); ++i)
-        {
-            auto &runner = device_runners_[i];
-            if (runner)
-            {
-                // Cast to IInferenceRunner* to disambiguate the forward() call
-                // DeviceGraphOrchestrator has both forward(tokens, seq_len) -> bool
-                // and forward(tokens, seq_len, batch_size=1) -> const float*
-                IInferenceRunner *runner_iface = runner.get();
-
-                if (serialize_devices)
-                {
-                    // SERIAL mode: run each device's forward completely before starting the next
-                    LOG_WARN("MultiDeviceOrchestrator::forwardTP: SERIAL mode - device " << i << " running synchronously");
-                    bool ok = runner_iface->forward(tokens, seq_len);
-                    futures.push_back(std::async(std::launch::deferred, [ok]()
-                                                 { return ok; }));
-                }
-                else
-                {
-                    futures.push_back(std::async(std::launch::async,
-                                                 [runner_iface, tokens, seq_len]() -> bool
-                                                 {
-                                                     return runner_iface->forward(tokens, seq_len);
-                                                 }));
-                }
-            }
-        }
-
-        // Wait for all to complete and check results
-        // IMPORTANT: Store the FIRST exception so we can re-throw it with the real error message.
-        // When one device throws (e.g., VerificationFailure with NaN/Inf), it can cause CUDA
-        // context destruction, which then makes other devices fail with misleading "context is
-        // destroyed" errors. We want to surface the original root cause exception.
-        //
-        // CRITICAL: Use a polling loop instead of sequential futures[i].get() to handle
-        // the case where Device 1 fails but Device 0 is stuck. Sequential collection would
-        // block forever on futures[0].get(). The poll approach detects any failure early
-        // and, ONLY IF other devices remain stuck after a grace period, calls requestAbort()
-        // to unblock them via ncclCommAbort.
-        //
-        // IMPORTANT: We do NOT call requestAbort() immediately on first failure because the
-        // other device may be running normally (not stuck in RCCL) and ncclCommAbort would
-        // corrupt its GPU state causing a page fault. The grace period gives normally-failing
-        // devices time to complete.
         bool all_success = true;
         std::exception_ptr first_exception = nullptr;
         size_t first_exception_device = 0;
-        bool any_failure_detected = false;
 
-        std::vector<bool> collected(futures.size(), false);
-        size_t num_collected = 0;
-
-        // Grace period: after detecting first failure, allow up to 5 seconds for other
-        // devices to finish normally. Only escalate to ncclCommAbort if they're still stuck.
-        constexpr auto kAbortGracePeriod = std::chrono::seconds(5);
-        std::chrono::steady_clock::time_point first_failure_time{};
-
-        while (num_collected < futures.size())
+        if (serialize_devices)
         {
-            // Check if we've exceeded the grace period after a failure
-            if (any_failure_detected)
+            // ----- SERIAL MODE (diagnostic fallback) -----
+            for (size_t i = 0; i < device_runners_.size(); ++i)
             {
-                auto elapsed = std::chrono::steady_clock::now() - first_failure_time;
-                if (elapsed > kAbortGracePeriod)
+                auto &runner = device_runners_[i];
+                if (!runner)
+                    continue;
+                // Cast to IInferenceRunner* to disambiguate forward() overloads
+                IInferenceRunner *runner_iface = runner.get();
+                LOG_WARN("MultiDeviceOrchestrator::forwardTP: SERIAL mode - device "
+                         << i << " running synchronously");
+                try
                 {
-                    // Some devices are likely stuck in RCCL — force abort
-                    if (tp_ctx_ && !tp_ctx_->isAbortRequested())
+                    if (!runner_iface->forward(tokens, seq_len))
                     {
-                        LOG_WARN("MultiDeviceOrchestrator::forwardTP: Grace period expired, "
-                                 "aborting collectives to unblock "
-                                 << (futures.size() - num_collected)
-                                 << " stuck device(s)");
-                        tp_ctx_->requestAbort();
+                        LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device "
+                                  << i << " forward failed");
+                        all_success = false;
+                    }
+                }
+                catch (...)
+                {
+                    all_success = false;
+                    if (!first_exception)
+                    {
+                        first_exception = std::current_exception();
+                        first_exception_device = i;
                     }
                 }
             }
-
-            for (size_t i = 0; i < futures.size(); ++i)
+        }
+        else
+        {
+            // ----- PARALLEL MODE: persistent thread pool -----
+            // Lazy-initialize on first TP forward call. Workers persist for the
+            // lifetime of the orchestrator, eliminating per-step thread overhead.
+            if (!tp_worker_pool_)
             {
-                if (collected[i])
-                    continue;
+                tp_worker_pool_ = std::make_unique<TPWorkerPool>(device_runners_.size());
+                LOG_INFO("[TPWorkerPool] Created " << device_runners_.size()
+                                                   << " persistent worker threads");
+            }
 
-                // Non-blocking check: is this future ready?
-                auto status = futures[i].wait_for(std::chrono::milliseconds(10));
-                if (status != std::future_status::ready)
-                    continue;
-
-                collected[i] = true;
-                num_collected++;
-
-                try
+            // Dispatch parallel forward passes to persistent worker threads.
+            // dispatch() wakes all workers via condition_variable and returns
+            // immediately — no thread creation, no pthread_create syscall.
+            tp_worker_pool_->dispatch(
+                [this, tokens, seq_len](size_t i) -> bool
                 {
-                    bool success = futures[i].get();
-                    if (!success)
-                    {
-                        LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device " << i << " forward failed");
-                        all_success = false;
+                    IInferenceRunner *runner_iface = device_runners_[i].get();
+                    return runner_iface->forward(tokens, seq_len);
+                });
 
-                        if (!any_failure_detected)
-                        {
-                            any_failure_detected = true;
-                            first_failure_time = std::chrono::steady_clock::now();
-                        }
-                    }
+            auto launch_t1 = decode_breakdown ? std::chrono::high_resolution_clock::now()
+                                              : std::chrono::high_resolution_clock::time_point{};
+
+            // Collect results from all workers.
+            // Default: wait indefinitely (tp_collect_timeout_ms=0). Workers always
+            // complete (success, failure, or exception) because the catch(...) in
+            // workerLoop ensures no exception escapes. Set LLAMINAR_TP_COLLECT_TIMEOUT_MS
+            // to a positive value (e.g. 30000) for a safety-net timeout when debugging hangs.
+            auto results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
+
+            // Process results with fault-tolerant exception handling.
+            // IMPORTANT: Store the FIRST substantive exception. When one device
+            // throws (e.g., VerificationFailure), it can cause CUDA/HIP context
+            // destruction, making other devices fail with misleading "context is
+            // destroyed" errors. We want to surface the original root cause.
+            for (auto &r : results)
+            {
+                if (!r.completed)
+                {
+                    LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device "
+                              << r.worker_index << " did not complete (stuck)");
+                    all_success = false;
+                    continue;
                 }
-                catch (const std::exception &e)
+
+                if (r.exception)
                 {
                     all_success = false;
-
-                    if (!any_failure_detected)
+                    try
                     {
-                        any_failure_detected = true;
-                        first_failure_time = std::chrono::steady_clock::now();
+                        std::rethrow_exception(r.exception);
                     }
-
-                    // Check if this is a secondary "context destroyed" error vs the real root cause
-                    std::string error_msg = e.what();
-                    bool is_context_destroyed = (error_msg.find("context is destroyed") != std::string::npos ||
-                                                 error_msg.find("context destroyed") != std::string::npos ||
-                                                 error_msg.find("error 709") != std::string::npos);
-
-                    if (!first_exception)
+                    catch (const std::exception &e)
                     {
-                        // This is the first exception - store it
-                        first_exception = std::current_exception();
-                        first_exception_device = i;
-                        LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device " << i
-                                                                                << " threw PRIMARY exception: " << error_msg);
-                    }
-                    else if (!is_context_destroyed)
-                    {
-                        // This is a substantive error (not just context cleanup failure)
-                        // Replace the stored exception if the first one was a context error
-                        try
+                        std::string error_msg = e.what();
+                        bool is_context_destroyed =
+                            (error_msg.find("context is destroyed") != std::string::npos ||
+                             error_msg.find("context destroyed") != std::string::npos ||
+                             error_msg.find("error 709") != std::string::npos);
+
+                        if (!first_exception)
                         {
-                            std::rethrow_exception(first_exception);
+                            first_exception = r.exception;
+                            first_exception_device = r.worker_index;
+                            LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device "
+                                      << r.worker_index
+                                      << " threw PRIMARY exception: " << error_msg);
                         }
-                        catch (const std::exception &first_e)
+                        else if (!is_context_destroyed)
                         {
-                            std::string first_msg = first_e.what();
-                            bool first_is_context_destroyed =
-                                (first_msg.find("context is destroyed") != std::string::npos ||
-                                 first_msg.find("context destroyed") != std::string::npos ||
-                                 first_msg.find("error 709") != std::string::npos);
-
-                            if (first_is_context_destroyed)
+                            // Substantive error — replace if first was a context error
+                            try
                             {
-                                // Replace context error with the real error
-                                LOG_WARN("MultiDeviceOrchestrator::forwardTP: Replacing secondary context error "
-                                         "with primary error from device "
-                                         << i);
-                                first_exception = std::current_exception();
-                                first_exception_device = i;
+                                std::rethrow_exception(first_exception);
                             }
+                            catch (const std::exception &first_e)
+                            {
+                                std::string first_msg = first_e.what();
+                                bool first_is_ctx =
+                                    (first_msg.find("context is destroyed") != std::string::npos ||
+                                     first_msg.find("context destroyed") != std::string::npos ||
+                                     first_msg.find("error 709") != std::string::npos);
+                                if (first_is_ctx)
+                                {
+                                    LOG_WARN("MultiDeviceOrchestrator::forwardTP: Replacing "
+                                             "secondary context error with primary error from device "
+                                             << r.worker_index);
+                                    first_exception = r.exception;
+                                    first_exception_device = r.worker_index;
+                                }
+                            }
+                            LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device "
+                                      << r.worker_index
+                                      << " threw exception: " << error_msg);
                         }
-                        LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device " << i
-                                                                                << " threw exception: " << error_msg);
-                    }
-                    else
-                    {
-                        // Secondary context error - log but don't replace the primary exception
-                        LOG_WARN("MultiDeviceOrchestrator::forwardTP: Device " << i
-                                                                               << " threw SECONDARY exception (likely due to primary failure): "
-                                                                               << error_msg);
+                        else
+                        {
+                            LOG_WARN("MultiDeviceOrchestrator::forwardTP: Device "
+                                     << r.worker_index
+                                     << " threw SECONDARY exception (likely due to primary failure): "
+                                     << error_msg);
+                        }
                     }
                 }
+                else if (!r.success)
+                {
+                    LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device "
+                              << r.worker_index << " forward failed");
+                    all_success = false;
+                }
+            }
+
+            // Capture timing for decode breakdown (only in parallel mode)
+            if (decode_breakdown)
+            {
+                auto collect_t1 = std::chrono::high_resolution_clock::now();
+                double launch_us = std::chrono::duration<double, std::micro>(
+                                       launch_t1 - launch_t0)
+                                       .count();
+                double wait_us = std::chrono::duration<double, std::micro>(
+                                     collect_t1 - launch_t1)
+                                     .count();
+                double total_us = std::chrono::duration<double, std::micro>(
+                                      collect_t1 - launch_t0)
+                                      .count();
+                LOG_INFO("[DECODE_BREAKDOWN] launch=" << std::fixed << std::setprecision(1)
+                                                      << launch_us << "us"
+                                                      << " wait=" << wait_us << "us"
+                                                      << " total=" << total_us << "us");
             }
         }
 
@@ -1485,18 +1487,35 @@ namespace llaminar2
             std::rethrow_exception(first_exception);
         }
 
-        auto tp_t1 = tp_timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
+        auto tp_t1 = tp_timing ? std::chrono::high_resolution_clock::now()
+                               : std::chrono::high_resolution_clock::time_point{};
 
         if (all_success)
         {
             // Gather logits from all devices
-            // Pass seq_len so gatherLogits knows how many rows to gather
-            // (logits_local buffer is pre-allocated for max_seq_len)
-            //
-            // Skip for decode (seq_len=1) when GPU-side sampling enabled:
-            // caller will use sampleGreedyOnDevice() which does argmax on GPU,
-            // avoiding the ~286µs D2H of 600 KB logits.
-            bool need_gather = !(skip_logits_gather_decode_ && seq_len == 1);
+            // Skip logits gather when GPU-side sampling handles it:
+            // - Decode (seq_len=1): skip when skip_logits_gather_decode_ is set
+            //   (caller uses sampleGreedyOnDevice() for GPU-side argmax)
+            // - Prefill (seq_len>1): skip when skip_logits_gather_prefill_ is set
+            //   (prefill logits are never consumed in standard generation flow;
+            //    skipping avoids massive D2H traffic, e.g. 346 MB for 596 tokens)
+            bool need_gather;
+            if (seq_len == 1)
+                need_gather = !skip_logits_gather_decode_;
+            else
+                need_gather = !skip_logits_gather_prefill_;
+
+            if (!need_gather && seq_len > 1)
+            {
+                static bool logged_prefill_skip = false;
+                if (!logged_prefill_skip)
+                {
+                    LOG_INFO("[forwardTP] Skipping prefill logits gather (seq_len="
+                             << seq_len << ") — prefill logits are not consumed");
+                    logged_prefill_skip = true;
+                }
+            }
+
             if (need_gather && !gatherLogits(static_cast<size_t>(seq_len)))
             {
                 LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Failed to gather logits");

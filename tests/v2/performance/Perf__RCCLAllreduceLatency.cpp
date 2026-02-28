@@ -124,19 +124,23 @@ namespace
     constexpr int WARMUP_ITERS = 200; // Extra warmup for RCCL (first calls are slow)
     constexpr int BENCH_ITERS = 1000; // Enough iterations for stable percentiles
 
-    // Message sizes to test — focused on the small-message regime
-    // 14336 bytes = 3584 floats = Qwen2.5-7B hidden_dim × sizeof(float)
+    // Message sizes to test — covering both decode (14 KB) and prefill (~8.5 MB)
+    // 14336 bytes = 3584 floats = Qwen2.5-7B hidden_dim × sizeof(float) ← DECODE
+    // 8553472 bytes = 2138368 floats = 596 × 3584 × sizeof(float) ← PREFILL (596 tokens)
     const std::vector<size_t> MESSAGE_SIZES_BYTES = {
         256,     // 64 floats — tiny
         1024,    // 256 floats
         4096,    // 1024 floats — 1 KB
-        14336,   // 3584 floats — Qwen2.5-7B d_model ← OUR TARGET
+        14336,   // 3584 floats — Qwen2.5-7B d_model ← DECODE TARGET
         16384,   // 4096 floats — power of 2
         32768,   // 8192 floats
         65536,   // 16384 floats — 64 KB
         131072,  // 32768 floats — 128 KB
         524288,  // 131072 floats — 512 KB
         1048576, // 262144 floats — 1 MB
+        2097152, // 524288 floats — 2 MB
+        4194304, // 1048576 floats — 4 MB
+        8553472, // 2138368 floats — 8.5 MB ← PREFILL TARGET (596 × 3584)
     };
 
     // ============================================================================
@@ -179,8 +183,9 @@ namespace
         int num_devices_ = 0;
         bool initialized_ = false;
 
-        // Maximum buffer size (1 MB of floats)
-        static constexpr size_t MAX_BUFFER_BYTES = 1048576;
+        // Maximum buffer size (16 MB — enough for prefill allreduces)
+        // Prefill: 596 × 3584 × 4 = 8,553,472 bytes (~8.5 MB)
+        static constexpr size_t MAX_BUFFER_BYTES = 16 * 1024 * 1024;
         static constexpr size_t MAX_BUFFER_FLOATS = MAX_BUFFER_BYTES / sizeof(float);
 
         void SetUp() override
@@ -734,6 +739,85 @@ namespace
             std::cout << "\n"
                       << table.to_string() << "\n";
         }
+
+        void renderPrefillImpactSummary(const LatencyResult &prefill_result)
+        {
+            // Calculate impact for 7B Qwen2.5 PREFILL
+            // 28 layers × 2 allreduces (Wo + FFN down) = 56 allreduces per prefill
+            // Each allreduce: 596 × 3584 × 4 = 8,553,472 bytes (~8.5 MB)
+            constexpr int ALLREDUCES_PER_PREFILL = 56;
+            constexpr double SINGLE_GPU_PREFILL_TOK_S = 1134.63; // Measured baseline
+            constexpr int PREFILL_TOKENS = 596;
+
+            double total_allreduce_us = prefill_result.median_us * ALLREDUCES_PER_PREFILL;
+            double total_allreduce_ms = total_allreduce_us / 1000.0;
+
+            // Single GPU prefill time
+            double single_gpu_ms = static_cast<double>(PREFILL_TOKENS) / SINGLE_GPU_PREFILL_TOK_S * 1000.0;
+
+            // Theoretical TP=2: half the compute + allreduce overhead
+            double tp2_compute_ms = single_gpu_ms / 2.0;
+            double tp2_total_ms = tp2_compute_ms + total_allreduce_ms;
+            double tp2_tok_s = static_cast<double>(PREFILL_TOKENS) / tp2_total_ms * 1000.0;
+            double tp_efficiency = tp2_tok_s / SINGLE_GPU_PREFILL_TOK_S * 100.0;
+
+            fort::utf8_table table;
+            table.set_border_style(FT_DOUBLE2_STYLE);
+
+            table << fort::header << "IMPACT ANALYSIS: Qwen2.5-7B TP=2 PREFILL" << "" << fort::endr;
+            table << fort::header << "Metric" << "Value" << fort::endr;
+
+            table.column(0).set_cell_text_align(fort::text_align::left);
+            table.column(1).set_cell_text_align(fort::text_align::right);
+
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%.1f us (%.2f ms)", prefill_result.median_us, prefill_result.median_us / 1000.0);
+            table << "Single allreduce (8.5 MB, median)" << buf << fort::endr;
+
+            snprintf(buf, sizeof(buf), "%d", ALLREDUCES_PER_PREFILL);
+            table << "Allreduces per prefill" << buf << fort::endr;
+
+            snprintf(buf, sizeof(buf), "%.1f us (%.1f ms)", total_allreduce_us, total_allreduce_ms);
+            table << "Total allreduce time (prefill)" << buf << fort::endr;
+
+            table << fort::separator;
+
+            snprintf(buf, sizeof(buf), "%.1f ms (%.0f tok/s)", single_gpu_ms, SINGLE_GPU_PREFILL_TOK_S);
+            table << "Single GPU prefill (baseline)" << buf << fort::endr;
+
+            snprintf(buf, sizeof(buf), "%.1f ms", tp2_compute_ms);
+            table << "TP=2 compute (half of single)" << buf << fort::endr;
+
+            snprintf(buf, sizeof(buf), "%.1f ms", tp2_total_ms);
+            table << "TP=2 total (compute + allreduce)" << buf << fort::endr;
+
+            snprintf(buf, sizeof(buf), "%.0f tok/s", tp2_tok_s);
+            table << "TP=2 projected prefill throughput" << buf << fort::endr;
+
+            snprintf(buf, sizeof(buf), "%.1f%%", tp_efficiency);
+            table << "TP efficiency (vs single GPU)" << buf << fort::endr;
+
+            // Compute actual measured vs raw RCCL
+            constexpr double MEASURED_TP2_FORWARD_MS = 740.0;               // Our actual measured forward time
+            double measured_allreduce_ms = MEASURED_TP2_FORWARD_MS - 303.0; // 303ms was pure compute
+            double rccl_floor_pct = total_allreduce_ms / measured_allreduce_ms * 100.0;
+
+            table << fort::separator;
+            snprintf(buf, sizeof(buf), "%.0f ms", measured_allreduce_ms);
+            table << "Measured allreduce overhead (in-app)" << buf << fort::endr;
+
+            snprintf(buf, sizeof(buf), "%.1f ms", total_allreduce_ms);
+            table << "Raw RCCL floor (this benchmark)" << buf << fort::endr;
+
+            snprintf(buf, sizeof(buf), "%.1f%%", rccl_floor_pct);
+            table << "RCCL floor / measured overhead" << buf << fort::endr;
+
+            snprintf(buf, sizeof(buf), "%.1f ms", measured_allreduce_ms - total_allreduce_ms);
+            table << "Gap (our wrapping overhead)" << buf << fort::endr;
+
+            std::cout << "\n"
+                      << table.to_string() << "\n";
+        }
     };
 
     // ============================================================================
@@ -767,12 +851,22 @@ namespace
                                std::to_string(BENCH_ITERS) + " iterations)",
                            results);
 
-        // Find the 14336-byte (3584 float) result
+        // Find the 14336-byte (3584 float) result for decode
         for (const auto &r : results)
         {
             if (r.bytes == 14336)
             {
                 renderImpactSummary(r);
+                break;
+            }
+        }
+
+        // Find the 8553472-byte result for prefill
+        for (const auto &r : results)
+        {
+            if (r.bytes == 8553472)
+            {
+                renderPrefillImpactSummary(r);
                 break;
             }
         }
@@ -1270,6 +1364,323 @@ namespace
 
         std::cout << "\n"
                   << table.to_string() << "\n";
+    }
+
+    // ============================================================================
+    // TEST 9: Prefill-sized allreduce latency (8.5 MB per allreduce)
+    // Simulates TP=2 prefill: 56 allreduces of 596×3584 floats each
+    // ============================================================================
+
+    TEST_F(Perf__RCCLAllreduceLatency, PrefillAllreduce_8_5MB)
+    {
+        if (!initialized_)
+            GTEST_SKIP();
+
+        // Prefill: 596 seq_len × 3584 d_model = 2,138,368 floats = 8,553,472 bytes
+        constexpr size_t PREFILL_FLOATS = 596 * 3584; // 2,138,368
+        constexpr int N_ALLREDUCES = 56;              // 28 layers × 2
+
+        // --- Part A: Single allreduce latency at prefill size ---
+        std::vector<std::pair<std::string, LatencyResult>> rows;
+
+        auto host_timed = benchAllreduceHostTimed(PREFILL_FLOATS, "8.5MB host-timed");
+        rows.emplace_back("Single 8.5MB (host-timed)", host_timed);
+
+        auto gpu_timed = benchAllreduceGPUTimed(PREFILL_FLOATS, "8.5MB GPU-timed");
+        rows.emplace_back("Single 8.5MB (GPU event-timed)", gpu_timed);
+
+        // Decode-sized for comparison
+        auto decode_ref = benchAllreduceHostTimed(3584, "14KB reference");
+        rows.emplace_back("Single 14KB decode (reference)", decode_ref);
+
+        renderComparisonTable("Prefill AllReduce: Single Call Latency (8.5 MB = 596×3584 floats)", rows);
+
+        // --- Part B: 56 sequential allreduces at prefill size ---
+        // This simulates the actual prefill forward pass
+        {
+            constexpr int PREFILL_BENCH_ITERS = 100; // Fewer iterations for large transfers
+
+            std::vector<double> samples;
+            samples.reserve(PREFILL_BENCH_ITERS);
+
+            // Warmup
+            for (int w = 0; w < 20; ++w)
+            {
+                for (int ar = 0; ar < N_ALLREDUCES; ++ar)
+                {
+                    RCCL_CHECK(rccl::ncclGroupStart());
+                    for (int i = 0; i < num_devices_; ++i)
+                    {
+                        HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                        RCCL_CHECK(rccl::ncclAllReduce(
+                            devices_[i].d_buffer, devices_[i].d_buffer, PREFILL_FLOATS,
+                            rccl::ncclFloat, rccl::ncclSum, comms_[i], devices_[i].stream));
+                    }
+                    RCCL_CHECK(rccl::ncclGroupEnd());
+                }
+                for (int i = 0; i < num_devices_; ++i)
+                {
+                    HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                    HIP_CHECK(hipStreamSynchronize(devices_[i].stream));
+                }
+            }
+
+            // Benchmark: 56 sequential allreduces, each synced (mimics our pipeline)
+            for (int iter = 0; iter < PREFILL_BENCH_ITERS; ++iter)
+            {
+                for (int i = 0; i < num_devices_; ++i)
+                {
+                    HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                    HIP_CHECK(hipStreamSynchronize(devices_[i].stream));
+                }
+
+                auto t0 = std::chrono::high_resolution_clock::now();
+
+                for (int ar = 0; ar < N_ALLREDUCES; ++ar)
+                {
+                    RCCL_CHECK(rccl::ncclGroupStart());
+                    for (int i = 0; i < num_devices_; ++i)
+                    {
+                        HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                        RCCL_CHECK(rccl::ncclAllReduce(
+                            devices_[i].d_buffer, devices_[i].d_buffer, PREFILL_FLOATS,
+                            rccl::ncclFloat, rccl::ncclSum, comms_[i], devices_[i].stream));
+                    }
+                    RCCL_CHECK(rccl::ncclGroupEnd());
+                    // Sync after each allreduce (matches our pipeline: compute waits for allreduce)
+                    for (int i = 0; i < num_devices_; ++i)
+                    {
+                        HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                        HIP_CHECK(hipStreamSynchronize(devices_[i].stream));
+                    }
+                }
+
+                auto t1 = std::chrono::high_resolution_clock::now();
+                double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+                samples.push_back(us);
+            }
+
+            auto synced = computeStats(samples, static_cast<size_t>(PREFILL_FLOATS) * sizeof(float) * N_ALLREDUCES,
+                                       "56x8.5MB synced");
+
+            // Also measure rapid-fire (enqueue all, sync at end)
+            std::vector<double> rapid_samples;
+            rapid_samples.reserve(PREFILL_BENCH_ITERS);
+
+            for (int iter = 0; iter < PREFILL_BENCH_ITERS; ++iter)
+            {
+                for (int i = 0; i < num_devices_; ++i)
+                {
+                    HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                    HIP_CHECK(hipStreamSynchronize(devices_[i].stream));
+                }
+
+                auto t0 = std::chrono::high_resolution_clock::now();
+
+                for (int ar = 0; ar < N_ALLREDUCES; ++ar)
+                {
+                    RCCL_CHECK(rccl::ncclGroupStart());
+                    for (int i = 0; i < num_devices_; ++i)
+                    {
+                        HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                        RCCL_CHECK(rccl::ncclAllReduce(
+                            devices_[i].d_buffer, devices_[i].d_buffer, PREFILL_FLOATS,
+                            rccl::ncclFloat, rccl::ncclSum, comms_[i], devices_[i].stream));
+                    }
+                    RCCL_CHECK(rccl::ncclGroupEnd());
+                    // NO sync between allreduces
+                }
+
+                for (int i = 0; i < num_devices_; ++i)
+                {
+                    HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                    HIP_CHECK(hipStreamSynchronize(devices_[i].stream));
+                }
+
+                auto t1 = std::chrono::high_resolution_clock::now();
+                double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+                rapid_samples.push_back(us);
+            }
+
+            auto rapid = computeStats(rapid_samples, static_cast<size_t>(PREFILL_FLOATS) * sizeof(float) * N_ALLREDUCES,
+                                      "56x8.5MB rapid-fire");
+
+            // Report
+            fort::utf8_table table;
+            table.set_border_style(FT_DOUBLE2_STYLE);
+
+            table << fort::header << "PREFILL: 56x 8.5MB AllReduce (Qwen2.5-7B TP=2 forward)" << "" << fort::endr;
+            table << fort::header << "Metric" << "Value" << fort::endr;
+
+            table.column(0).set_cell_text_align(fort::text_align::left);
+            table.column(1).set_cell_text_align(fort::text_align::right);
+
+            char buf[96];
+
+            snprintf(buf, sizeof(buf), "%.1f us (%.2f ms)", synced.median_us, synced.median_us / 1000.0);
+            table << "56x synced (per-allreduce hipSync) median" << buf << fort::endr;
+
+            snprintf(buf, sizeof(buf), "%.1f us (%.2f ms)", synced.median_us / N_ALLREDUCES,
+                     synced.median_us / N_ALLREDUCES / 1000.0);
+            table << "  -> per allreduce (synced)" << buf << fort::endr;
+
+            table << fort::separator;
+
+            snprintf(buf, sizeof(buf), "%.1f us (%.2f ms)", rapid.median_us, rapid.median_us / 1000.0);
+            table << "56x rapid-fire (sync at end) median" << buf << fort::endr;
+
+            snprintf(buf, sizeof(buf), "%.1f us (%.2f ms)", rapid.median_us / N_ALLREDUCES,
+                     rapid.median_us / N_ALLREDUCES / 1000.0);
+            table << "  -> per allreduce (rapid-fire)" << buf << fort::endr;
+
+            table << fort::separator;
+
+            // Compare to measured in-app overhead
+            constexpr double MEASURED_ALLREDUCE_MS = 430.0; // From LLAMINAR_SKIP_ALLREDUCE diagnostic
+            snprintf(buf, sizeof(buf), "%.1f ms", MEASURED_ALLREDUCE_MS);
+            table << "Measured in-app allreduce overhead" << buf << fort::endr;
+
+            snprintf(buf, sizeof(buf), "%.2f ms", synced.median_us / 1000.0);
+            table << "Raw RCCL synced floor" << buf << fort::endr;
+
+            double gap_ms = MEASURED_ALLREDUCE_MS - synced.median_us / 1000.0;
+            snprintf(buf, sizeof(buf), "%.1f ms (%.0f%%)", gap_ms,
+                     gap_ms / MEASURED_ALLREDUCE_MS * 100.0);
+            table << "Gap (app overhead beyond RCCL)" << buf << fort::endr;
+
+            table << fort::separator;
+
+            // Bandwidth utilization
+            double total_bytes = static_cast<double>(PREFILL_FLOATS) * sizeof(float) * N_ALLREDUCES;
+            // For ring allreduce with 2 GPUs: data moved = 2*(N-1)/N * total = total bytes
+            double achieved_bw_gbs = total_bytes / (synced.median_us / 1e6) / 1e9;
+            snprintf(buf, sizeof(buf), "%.2f GB/s (synced)", achieved_bw_gbs);
+            table << "Achieved bandwidth" << buf << fort::endr;
+
+            double rapid_bw_gbs = total_bytes / (rapid.median_us / 1e6) / 1e9;
+            snprintf(buf, sizeof(buf), "%.2f GB/s (rapid-fire)", rapid_bw_gbs);
+            table << "Achieved bandwidth" << buf << fort::endr;
+
+            // PCIe gen3 x16 theoretical: ~15.75 GB/s
+            snprintf(buf, sizeof(buf), "%.2f GB/s (PCIe3 x16)", 15.75);
+            table << "Theoretical max bandwidth" << buf << fort::endr;
+
+            std::cout << "\n"
+                      << table.to_string() << "\n";
+        }
+    }
+
+    // ============================================================================
+    // TEST 10: Prefill fused vs sequential
+    // (Should we fuse all 56 allreduces into one larger allreduce?)
+    // ============================================================================
+
+    TEST_F(Perf__RCCLAllreduceLatency, PrefillFusedVsSequential_8_5MB)
+    {
+        if (!initialized_)
+            GTEST_SKIP();
+
+        constexpr size_t PREFILL_FLOATS = 596 * 3584; // 2,138,368 per allreduce
+        constexpr int N_ALLREDUCES = 56;
+        constexpr int PREFILL_BENCH_ITERS = 100;
+
+        std::vector<std::pair<std::string, LatencyResult>> rows;
+
+        // A: 56 individual allreduces, synced after each
+        {
+            std::vector<double> samples;
+            samples.reserve(PREFILL_BENCH_ITERS);
+
+            for (int iter = 0; iter < PREFILL_BENCH_ITERS; ++iter)
+            {
+                for (int i = 0; i < num_devices_; ++i)
+                {
+                    HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                    HIP_CHECK(hipStreamSynchronize(devices_[i].stream));
+                }
+
+                auto t0 = std::chrono::high_resolution_clock::now();
+
+                for (int ar = 0; ar < N_ALLREDUCES; ++ar)
+                {
+                    RCCL_CHECK(rccl::ncclGroupStart());
+                    for (int i = 0; i < num_devices_; ++i)
+                    {
+                        HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                        RCCL_CHECK(rccl::ncclAllReduce(
+                            devices_[i].d_buffer, devices_[i].d_buffer, PREFILL_FLOATS,
+                            rccl::ncclFloat, rccl::ncclSum, comms_[i], devices_[i].stream));
+                    }
+                    RCCL_CHECK(rccl::ncclGroupEnd());
+
+                    for (int i = 0; i < num_devices_; ++i)
+                    {
+                        HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                        HIP_CHECK(hipStreamSynchronize(devices_[i].stream));
+                    }
+                }
+
+                auto t1 = std::chrono::high_resolution_clock::now();
+                samples.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+            }
+
+            auto r = computeStats(samples, static_cast<size_t>(PREFILL_FLOATS) * 4 * N_ALLREDUCES, "56x synced");
+            rows.emplace_back("56x 8.5MB (synced each)", r);
+        }
+
+        // B: 56 allreduces batched in ncclGroupStart/End pairs (no sync between)
+        {
+            std::vector<double> samples;
+            samples.reserve(PREFILL_BENCH_ITERS);
+
+            for (int iter = 0; iter < PREFILL_BENCH_ITERS; ++iter)
+            {
+                for (int i = 0; i < num_devices_; ++i)
+                {
+                    HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                    HIP_CHECK(hipStreamSynchronize(devices_[i].stream));
+                }
+
+                auto t0 = std::chrono::high_resolution_clock::now();
+
+                for (int ar = 0; ar < N_ALLREDUCES; ++ar)
+                {
+                    RCCL_CHECK(rccl::ncclGroupStart());
+                    for (int i = 0; i < num_devices_; ++i)
+                    {
+                        HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                        RCCL_CHECK(rccl::ncclAllReduce(
+                            devices_[i].d_buffer, devices_[i].d_buffer, PREFILL_FLOATS,
+                            rccl::ncclFloat, rccl::ncclSum, comms_[i], devices_[i].stream));
+                    }
+                    RCCL_CHECK(rccl::ncclGroupEnd());
+                }
+
+                for (int i = 0; i < num_devices_; ++i)
+                {
+                    HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                    HIP_CHECK(hipStreamSynchronize(devices_[i].stream));
+                }
+
+                auto t1 = std::chrono::high_resolution_clock::now();
+                samples.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+            }
+
+            auto r = computeStats(samples, static_cast<size_t>(PREFILL_FLOATS) * 4 * N_ALLREDUCES, "56x rapid-fire");
+            rows.emplace_back("56x 8.5MB (rapid-fire, sync at end)", r);
+        }
+
+        // C: Single massive allreduce (if we could fuse all residuals)
+        // NOTE: This doesn't reflect reality (can't fuse across layers), but shows bandwidth ceiling
+        {
+            // 56 × 2,138,368 = 119,748,608 floats = ~457 MB — too big for our buffer
+            // Instead, test 2-layer fusion: 4 × 8.5MB batched in one group
+            constexpr int BATCH_2LAYER = 4;
+            auto batch4 = benchBatchedAllreduce(PREFILL_FLOATS, BATCH_2LAYER, "4x8.5MB batched");
+            rows.emplace_back("4x 8.5MB batched (2-layer fusion)", batch4);
+        }
+
+        renderComparisonTable("PREFILL: Synced vs Rapid-fire vs Fused (8.5 MB allreduces)", rows);
     }
 
 } // anonymous namespace
