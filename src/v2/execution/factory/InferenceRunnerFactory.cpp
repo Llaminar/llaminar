@@ -923,6 +923,15 @@ namespace llaminar2
             LOG_DEBUG("[InferenceRunner] Uploaded non-GEMM weights for " << device_name);
         }
 
+        // Release all host-side weight data now that everything is on GPU.
+        // This frees raw_data_, dequant_cache_, and mmap_owner_ for all tensors.
+        if (device.is_gpu() && gemm_pack_ok && non_gemm_upload_ok)
+        {
+            ScopedWeightLoadDetailTimer release_timer("weights.host_release");
+            size_t released = weight_mgr->releaseAllHostWeightData();
+            LOG_INFO("[InferenceRunner] Released host weight data: " << released << " tensors");
+        }
+
         // Layer weight accessor - capture weight_mgr by value (shared_ptr copy)
         // Weights are now in cache, so these calls will be fast
         weights.get_layer_weights = [weight_mgr](int layer_idx) -> Qwen2LayerWeights
@@ -1191,6 +1200,14 @@ namespace llaminar2
         else
         {
             LOG_DEBUG("[PPStageRunner] Uploaded non-GEMM weights for " << device_name);
+        }
+
+        // Release all host-side weight data now that everything is on GPU.
+        if (device.is_gpu() && pp_gemm_pack_ok && pp_non_gemm_upload_ok)
+        {
+            ScopedWeightLoadDetailTimer release_timer("weights.pp.host_release");
+            size_t released = weight_mgr->releaseAllHostWeightData();
+            LOG_INFO("[PPStageRunner] Released host weight data: " << released << " tensors");
         }
 
         // =====================================================================

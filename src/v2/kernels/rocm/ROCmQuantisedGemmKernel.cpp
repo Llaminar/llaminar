@@ -2873,16 +2873,10 @@ namespace llaminar2
                     d_weights_int8 = impl_->d_weights_int8_rowmajor;
                 }
 
-                if (!d_weights_int8)
-                {
-                    (void)try_materialize_persistent_rowmajor(n, k);
-                    if (impl_->d_weights_int8_rowmajor)
-                    {
-                        d_weights_int8 = impl_->d_weights_int8_rowmajor;
-                        if (WeightLoadingProfiler::isEnabled())
-                            WeightLoadingProfiler::addDetail("prefill_gemm.ck_rowmajor_persistent.reuse", 1.0);
-                    }
-                }
+                // Skip persistent materialization — it allocates a per-weight
+                // row-major copy that accumulates to ~model_size additional VRAM.
+                // Instead, always fall through to the scratch buffer repack path
+                // which reuses a single shared workspace buffer.
 
                 if (!d_weights_int8 && impl_->d_B_rowmajor_scratch)
                 {
@@ -4464,54 +4458,12 @@ namespace llaminar2
                                       << (packed_->int8_data_vnni.size() / 1024) << " KB");
                         }
 
-                        // Optional persistent row-major upload for CK prefill reuse.
-                        // When host row-major pack is available, keep a device copy so
-                        // repeated prefill calls can bypass VNNI/ratio->row-major repack.
-                        if (!packed_->int8_data.empty())
-                        {
-                            if (!rocmQuantGemm_allocInt8(&upload.d_int8_data_rowmajor,
-                                                         packed_->int8_data.size(),
-                                                         rocm_device_id_))
-                            {
-                                if (upload.d_int8_data_vnni)
-                                    rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
-                                if (upload.d_scales)
-                                    rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
-                                upload.d_int8_data_vnni = nullptr;
-                                upload.d_scales = nullptr;
-                                cleanup_startup_async_resources();
-                                LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc row-major weights");
-                                return;
-                            }
-
-                            err = startupMemcpyAsyncOrSync(
-                                upload.d_int8_data_rowmajor,
-                                packed_->int8_data.data(),
-                                packed_->int8_data.size() * sizeof(int8_t),
-                                async_upload_enabled,
-                                upload.startup_h2d_stream,
-                                nullptr,
-                                "ROCmQuantisedGemmKernel::ensureWeightsConverted",
-                                "rowmajor");
-                            if (err != hipSuccess)
-                            {
-                                rocmQuantGemm_freeDevice(upload.d_int8_data_rowmajor, rocm_device_id_);
-                                upload.d_int8_data_rowmajor = nullptr;
-                                if (upload.d_int8_data_vnni)
-                                    rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
-                                if (upload.d_scales)
-                                    rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
-                                upload.d_int8_data_vnni = nullptr;
-                                upload.d_scales = nullptr;
-                                cleanup_startup_async_resources();
-                                LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload row-major weights: "
-                                          << hipGetErrorString(err));
-                                return;
-                            }
-
-                            LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded persistent row-major weights for CK prefill reuse: "
-                                      << (packed_->int8_data.size() / 1024) << " KB");
-                        }
+                        // Row-major weights are NOT uploaded here.  The CK prefill
+                        // path repacks VNNI→row-major on-demand into the shared
+                        // workspace scratch buffer (d_B_rowmajor_scratch), which
+                        // reuses a single allocation for all GEMM calls.  Uploading
+                        // a persistent row-major copy per weight would double GPU
+                        // memory usage (VNNI + row-major) and OOM on large models.
 
                         // Upload native-VNNI payload + scales (lossless Q4_0/IQ4_NL)
                         if (!packed_->native_vnni_payload.empty() && !packed_->native_vnni_scales.empty())
@@ -4651,7 +4603,7 @@ namespace llaminar2
                     LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded pre-packed weights to ROCm:" << rocm_device_id_
                                                                                                << " " << packed_->N << "x" << packed_->K
                                                                                                << " vnni=" << (packed_->int8_data_vnni.size() / 1024) << " KB"
-                                                                                               << " rowmajor=" << (packed_->int8_data.size() / 1024) << " KB");
+                                                                                               << " (VNNI-only, row-major via scratch repack)");
                 }
 
                 {
@@ -4688,6 +4640,36 @@ namespace llaminar2
                     impl_->startup_h2d_pinned_native_scales = upload.startup_h2d_pinned_native_scales;
                 }
                 weights_converted_ = true;
+
+                // Release host-side packing buffers — data is now on GPU.
+                // This saves ~2× model_size of host memory for large models.
+                // Only safe when this packed_ won't be uploaded to additional devices;
+                // we check device_uploads.size() == 1 as a proxy (TP shards have
+                // separate packed_ per shard, so this is typically the only device).
+                if (packed_->device_uploads.size() <= 1)
+                {
+                    const size_t freed_bytes =
+                        packed_->int8_data.capacity() +
+                        packed_->int8_data_vnni.capacity() +
+                        packed_->scales.capacity() * sizeof(float) +
+                        packed_->native_vnni_payload.capacity() +
+                        packed_->native_vnni_scales.capacity() * sizeof(uint16_t);
+                    packed_->int8_data.clear();
+                    packed_->int8_data.shrink_to_fit();
+                    packed_->int8_data_vnni.clear();
+                    packed_->int8_data_vnni.shrink_to_fit();
+                    packed_->scales.clear();
+                    packed_->scales.shrink_to_fit();
+                    packed_->native_vnni_payload.clear();
+                    packed_->native_vnni_payload.shrink_to_fit();
+                    packed_->native_vnni_scales.clear();
+                    packed_->native_vnni_scales.shrink_to_fit();
+                    if (freed_bytes > 0)
+                    {
+                        LOG_DEBUG("[ROCmQuantisedGemmKernel] Released host packing buffers: "
+                                  << (freed_bytes / (1024 * 1024)) << " MB");
+                    }
+                }
                 return;
             }
 

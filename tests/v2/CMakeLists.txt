@@ -355,6 +355,22 @@ add_v2_test(V2_Unit_TensorBasics
     LABELS "V2;Unit;TensorOperations;FP32;Basics;GEMM"
 )
 
+# Test: Tensor Host Release Lifecycle (CPU-only tensor release guard regression)
+# Regression tests for the bug where releaseAllHostWeightData() released CPU-only
+# tensors that were never uploaded to GPU, causing null data access in graph stages.
+# Tests: FP32 release basics, isDeviceValid() guard pattern, Q8_0 quantized tensor
+# release, double-release idempotency, metadata preservation after release.
+add_executable(v2_test_tensor_host_release unit/tensors/Test__TensorHostRelease.cpp)
+target_link_libraries(v2_test_tensor_host_release
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TensorHostRelease
+    COMMAND $<TARGET_FILE:v2_test_tensor_host_release>
+    LABELS "V2;Unit;TensorOperations;HostRelease;Regression;Lifecycle;FP32;Q8_0"
+)
+
 # Test: TensorAllocateOnDevice - CPUTensorBase::allocateOnDevice() method
 add_executable(v2_test_tensor_allocate_on_device unit/tensors/Test__TensorAllocateOnDevice.cpp)
 target_link_libraries(v2_test_tensor_allocate_on_device 
@@ -3763,6 +3779,19 @@ add_v2_test(V2_Integration_TensorCoherence
     COMMAND $<TARGET_FILE:v2_integration_tensor_coherence>
     LABELS "V2;Integration;CUDA;TensorTransfer;Coherence;StateMachine;FP32;BF16;FP16;GPUMemory;DeviceManagement"
     MPI_PROCS 1  # Tests GPU coherence locally, no MPI needed
+)
+
+# Test: Host Release After GPU Upload (CUDA Pinned Memory Regression)
+# Regression tests for the bug where release_host_weight_data() after ensureOnDevice()
+# corrupted CUDA state because cudaHostUnregister() was not called before freeing
+# pinned host memory. Tests: single/multi-tensor release, double release idempotency,
+# interleaved upload-release cycles, large tensors, and post-release CUDA operations.
+add_executable(v2_integration_host_release_after_gpu_upload integration/execution/coherence/Test__HostReleaseAfterGpuUpload.cpp)
+target_link_libraries(v2_integration_host_release_after_gpu_upload llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_HostReleaseAfterGpuUpload
+    COMMAND $<TARGET_FILE:v2_integration_host_release_after_gpu_upload>
+    LABELS "V2;Integration;CUDA;PinnedMemory;HostRelease;Regression;Coherence;GPUMemory;DeviceManagement"
+    MPI_PROCS 1  # Tests GPU pinned memory locally, no MPI needed
 )
 
 # Test: GPU-Resident Data Flow (Phase 1: verifies no unnecessary D2H transfers)

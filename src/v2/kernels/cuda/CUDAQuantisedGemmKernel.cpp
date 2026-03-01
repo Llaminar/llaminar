@@ -418,6 +418,27 @@ namespace llaminar2
                 impl_->d_scales_B = upload.d_scales;
                 weights_converted_ = true;
 
+                // Release host-side packing buffers — data is now on GPU.
+                // This saves ~2× the quantized weight size of host memory.
+                // Only safe when this packed_ won't be uploaded to additional devices;
+                // we check device_uploads.size() == 1 as a proxy (TP shards have
+                // separate packed_ per shard, so this is typically the only device).
+                if (packed_->device_uploads.size() <= 1)
+                {
+                    const size_t freed_bytes =
+                        packed_->int8_data.capacity() +
+                        packed_->scales.capacity() * sizeof(float);
+                    packed_->int8_data.clear();
+                    packed_->int8_data.shrink_to_fit();
+                    packed_->scales.clear();
+                    packed_->scales.shrink_to_fit();
+                    if (freed_bytes > 0)
+                    {
+                        LOG_DEBUG("[CUDAQuantisedGemmKernel] Released host packing buffers: "
+                                  << (freed_bytes / (1024 * 1024)) << " MB");
+                    }
+                }
+
                 LOG_DEBUG("[CUDAQuantisedGemmKernel] Using cached pre-packed weights on CUDA:" << cuda_device_id_);
                 return;
             }

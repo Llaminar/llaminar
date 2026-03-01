@@ -1169,6 +1169,26 @@ namespace llaminar2
          */
         virtual bool is_raw_data_released() const { return false; }
 
+        /**
+         * @brief Release ALL host-side weight data for GPU-offloaded tensors
+         *
+         * After weights have been uploaded to GPU, this frees:
+         *  1. raw_data_ (original quantized blocks)
+         *  2. dequant_cache_ (FP32 decompressed cache, if populated)
+         *  3. mmap_owner_ reference (allows mmap unmap when all tensors release)
+         *
+         * This is more aggressive than release_raw_data() which only frees the
+         * original quantized blocks. Use this when the tensor is fully on GPU
+         * and no host-side operations are needed.
+         *
+         * @note Default calls release_raw_data(); subclasses override to clear dequant_cache_ + mmap_owner_
+         */
+        virtual void release_host_weight_data()
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+        }
+
         // ===== Generic Type Conversion API =====
 
         /**
@@ -1987,10 +2007,6 @@ namespace llaminar2
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
-        // Memory management - FP32 doesn't have separate raw data to release
-        void release_raw_data() override { /* no-op: FP32 has no separate raw block data */ }
-        bool is_raw_data_released() const override { return false; /* FP32 always has its data */ }
-
         // ===== IActivationTensor Interface =====
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
@@ -2094,6 +2110,25 @@ namespace llaminar2
         // ===== IQ8_1Decodable Interface =====
         const Q8_1Block *decode_to_q8_1(size_t row_idx, size_t k_block_offset) const override;
 
+        // ===== Host data release =====
+        void release_raw_data() override
+        {
+            if (!is_view_ && !is_mapped_)
+            {
+                AlignedVector<float> tmp;
+                std::swap(host_data_, tmp);
+            }
+            raw_data_released_ = true;
+        }
+
+        bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+        }
+
     protected:
         // ===== Lazy Transfer Accessors (Phase 1) =====
         void *raw_host_data_ptr() override;
@@ -2120,6 +2155,7 @@ namespace llaminar2
         AlignedVector<float> *parent_data_ptr_; // Borrowed data pointer (only used when is_view_)
         size_t view_offset_;                    // Offset into parent data (only used when is_view_)
         std::shared_ptr<FP32Tensor> parent_;    // Keep parent alive (only used when is_view_)
+        bool raw_data_released_ = false;        // Track if host data has been released
         // Note: mapped memory uses TensorBase::mapped_host_ptr_ (cast to float* in raw_host_data_ptr)
     };
 
@@ -2191,6 +2227,16 @@ namespace llaminar2
         // Memory management - FP16 doesn't have separate raw data to release
         void release_raw_data() override { /* no-op: FP16 has no separate raw block data */ }
         bool is_raw_data_released() const override { return false; /* FP16 always has its data */ }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+        }
 
         // IActivationTensor interface - activation-only operations
         std::unique_ptr<ITensorRoPE> createRoPE() override;
@@ -2405,6 +2451,16 @@ namespace llaminar2
         // Memory management - BF16 doesn't have separate raw data to release
         void release_raw_data() override { /* no-op: BF16 has no separate raw block data */ }
         bool is_raw_data_released() const override { return false; /* BF16 always has its data */ }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+        }
 
         // IActivationTensor interface - activation-only operations
         std::unique_ptr<ITensorRoPE> createRoPE() override;
@@ -2872,7 +2928,7 @@ namespace llaminar2
         IQ4_NLTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ4_NLTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                     size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ4_NLTensor() override;
 
         // TensorBase interface
@@ -2906,6 +2962,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // IINT8Unpackable interface
         void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
@@ -3062,8 +3129,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_; // Quantized blocks on device (if uploaded)
@@ -3107,7 +3174,7 @@ namespace llaminar2
         Q8_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q8_0Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                   size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q8_0Tensor() override;
 
         // TensorBase interface
@@ -3140,6 +3207,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -3278,8 +3356,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -3419,6 +3497,16 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -3887,6 +3975,16 @@ namespace llaminar2
         void release_raw_data() override;
         bool is_raw_data_released() const override { return raw_data_released_; }
 
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+        }
+
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
         void to_bf16(uint16_t *dst) const override;
@@ -4298,7 +4396,7 @@ namespace llaminar2
         Q4_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q4_0Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                   size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q4_0Tensor() override;
 
         // TensorBase interface
@@ -4331,6 +4429,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -4460,8 +4569,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -4501,7 +4610,7 @@ namespace llaminar2
         Q4_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q4_1Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                   size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q4_1Tensor() override;
 
         // TensorBase interface
@@ -4534,6 +4643,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -4661,8 +4781,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -4703,7 +4823,7 @@ namespace llaminar2
         Q5_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q5_0Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                   size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q5_0Tensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -4735,6 +4855,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -4853,8 +4984,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -4895,7 +5026,7 @@ namespace llaminar2
         Q5_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q5_1Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                   size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q5_1Tensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -4927,6 +5058,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -5045,8 +5187,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -5083,7 +5225,7 @@ namespace llaminar2
         Q6_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q6_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                   size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q6_KTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -5115,6 +5257,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // IINT8Unpackable interface
         void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
@@ -5198,8 +5351,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -5234,7 +5387,7 @@ namespace llaminar2
         Q2_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q2_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                   size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q2_KTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -5266,6 +5419,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // IINT8Unpackable interface
         void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
@@ -5348,8 +5512,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -5386,7 +5550,7 @@ namespace llaminar2
         Q5_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q5_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                   size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q5_KTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -5425,6 +5589,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -5514,8 +5689,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Points to parent's raw_data_.data()
         size_t view_byte_offset_;            // Byte offset from raw_data_ptr_
         std::shared_ptr<TensorBase> parent_; // Keeps parent alive
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m);
     };
@@ -5541,7 +5716,7 @@ namespace llaminar2
         Q3_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q3_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                   size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q3_KTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -5573,6 +5748,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // IINT8Unpackable interface
         void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
@@ -5656,8 +5842,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -5692,7 +5878,7 @@ namespace llaminar2
         Q4_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q4_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                   size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q4_KTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -5724,6 +5910,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -5820,8 +6017,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Points to parent's raw_data_.data()
         size_t view_byte_offset_;            // Byte offset from raw_data_ptr_
         std::shared_ptr<TensorBase> parent_; // Keeps parent alive
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m);
     };
@@ -5847,7 +6044,7 @@ namespace llaminar2
         Q8_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q8_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                   size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q8_KTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -5879,6 +6076,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -5968,8 +6176,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Points to parent's raw_data_.data()
         size_t view_byte_offset_;            // Byte offset from raw_data_ptr_
         std::shared_ptr<TensorBase> parent_; // Keeps parent alive
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
     };
 
     // ===== IQ Tensors =====
@@ -5995,7 +6203,7 @@ namespace llaminar2
         IQ4_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ4_XSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                     size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ4_XSTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -6027,6 +6235,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -6147,8 +6366,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -6177,7 +6396,7 @@ namespace llaminar2
         IQ2_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ2_XXSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                      size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ2_XXSTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -6209,6 +6428,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -6317,8 +6547,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -6347,7 +6577,7 @@ namespace llaminar2
         IQ2_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ2_XSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                     size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ2_XSTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -6379,6 +6609,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -6487,8 +6728,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -6517,7 +6758,7 @@ namespace llaminar2
         IQ3_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ3_XXSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                      size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ3_XXSTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -6549,6 +6790,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -6661,8 +6913,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -6691,7 +6943,7 @@ namespace llaminar2
         IQ2_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ2_STensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ2_STensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -6723,6 +6975,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -6831,8 +7094,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -6861,7 +7124,7 @@ namespace llaminar2
         IQ3_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ3_STensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ3_STensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -6893,6 +7156,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -7005,8 +7279,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -7035,7 +7309,7 @@ namespace llaminar2
         IQ1_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ1_STensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ1_STensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -7067,6 +7341,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -7175,8 +7460,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -7205,7 +7490,7 @@ namespace llaminar2
         IQ1_MTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ1_MTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
-              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ1_MTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -7237,6 +7522,17 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -7345,8 +7641,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
-        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
-        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
+        std::shared_ptr<void> mmap_owner_;   // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;          // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;

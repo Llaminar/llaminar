@@ -158,6 +158,12 @@ namespace llaminar2
         bool uploadNonGemmWeights(DeviceId target_device) override;
 
         /**
+         * @brief Release ALL host-side weight data after all GPU uploads are complete
+         * @return Number of tensors whose host data was released
+         */
+        size_t releaseAllHostWeightData() override;
+
+        /**
          * @brief Get statistics about preloaded weights
          *
          * @return Pair of (num_cpu_packed, num_gpu_packed)

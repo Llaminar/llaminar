@@ -102,8 +102,7 @@ namespace llaminar2
             const bool all_ready = std::all_of(expected.begin(), expected.end(), [&](const std::string &device_key)
                                                {
                 auto it = tickets.find(device_key);
-                return it != tickets.end() && it->second.state == WeightPrepState::READY;
-            });
+                return it != tickets.end() && it->second.state == WeightPrepState::READY; });
 
             if (!all_ready)
             {
@@ -143,7 +142,7 @@ namespace llaminar2
             TensorBase *ptr = base_it->second.get();
             if (released.insert(ptr).second)
             {
-                ptr->release_raw_data();
+                ptr->release_host_weight_data();
                 found_any = true;
             }
         }
@@ -161,7 +160,7 @@ namespace llaminar2
                 TensorBase *ptr = tensor.get();
                 if (released.insert(ptr).second)
                 {
-                    ptr->release_raw_data();
+                    ptr->release_host_weight_data();
                     found_any = true;
                 }
             }
@@ -1667,9 +1666,9 @@ namespace llaminar2
         }
 
         LOG_INFO("[WeightManager] Preload complete: loaded=" << loaded_tensors
-                                                               << ", uploads=" << total_uploads
-                                                               << ", failures=" << load_failures
-                                                               << (seeded_from_loader ? " (seeded from loader names)" : ""));
+                                                             << ", uploads=" << total_uploads
+                                                             << ", failures=" << load_failures
+                                                             << (seeded_from_loader ? " (seeded from loader names)" : ""));
         return true;
     }
 
@@ -1971,7 +1970,7 @@ namespace llaminar2
                         local_cpu_packed.fetch_add(1, std::memory_order_relaxed);
                         if (release_raw_data && job.tensor)
                         {
-                            job.tensor->release_raw_data();
+                            job.tensor->release_host_weight_data();
                         }
                     }
 
@@ -2208,6 +2207,69 @@ namespace llaminar2
         LOG_INFO("[WeightManager] Uploaded " << uploaded_count << " non-GEMM weights to "
                                              << target_device.to_string());
         return true;
+    }
+
+    size_t WeightManager::releaseAllHostWeightData()
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+
+        size_t released_count = 0;
+        size_t skipped_count = 0;
+        size_t error_count = 0;
+        std::unordered_set<TensorBase *> visited_ptrs;
+
+        auto try_release = [&](TensorBase *ptr)
+        {
+            if (!ptr || !visited_ptrs.insert(ptr).second)
+                return; // null or already visited
+
+            // Skip tensors that are already released
+            if (ptr->is_raw_data_released())
+            {
+                skipped_count++;
+                return;
+            }
+
+            // Only release host data for tensors that have valid GPU data.
+            // CPU-only tensors (originals without GPU upload) must keep their host data
+            // because graph stages may still reference them via raw pointers and need
+            // to lazy-upload via ensureOnDevice() during the first forward pass.
+            if (!ptr->isDeviceValid())
+            {
+                skipped_count++;
+                return;
+            }
+
+            try
+            {
+                ptr->release_host_weight_data();
+                released_count++;
+            }
+            catch (const std::exception &e)
+            {
+                LOG_WARN("[WeightManager] Failed to release host data for tensor "
+                         << ptr->debugName() << " (type=" << static_cast<int>(ptr->native_type())
+                         << "): " << e.what());
+                error_count++;
+            }
+        };
+
+        // Sweep main cache
+        for (auto &[name, tensor] : cache_)
+        {
+            try_release(tensor.get());
+        }
+
+        // Sweep per-device cache (clones for multi-GPU)
+        for (auto &[key, tensor] : per_device_cache_)
+        {
+            try_release(tensor.get());
+        }
+
+        LOG_INFO("[WeightManager] Released host weight data: " << released_count
+                                                               << " tensors released, " << skipped_count
+                                                               << " already released, " << error_count << " errors");
+        return released_count;
     }
 
     // =============================================================================

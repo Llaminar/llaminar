@@ -300,6 +300,23 @@ namespace llaminar2
         virtual bool uploadNonGemmWeights(DeviceId target_device) = 0;
 
         /**
+         * @brief Release ALL host-side weight data after all GPU uploads are complete.
+         *
+         * Sweeps through all cached weights (GEMM and non-GEMM) and calls
+         * release_host_weight_data() on each. This aggressively frees:
+         *  - raw_data_ (quantized block storage)
+         *  - dequant_cache_ (FP32 decompressed cache)
+         *  - mmap_owner_ references (allows GGUF mmap unmap)
+         *
+         * Call this ONCE after all packGemmWeights() and uploadNonGemmWeights()
+         * calls have completed for all devices. After this call, host-side
+         * tensor data() / fp32_data() will return stale/null results.
+         *
+         * @return Number of tensors whose host data was released
+         */
+        virtual size_t releaseAllHostWeightData() { return 0; }
+
+        /**
          * @brief Get statistics about preloaded weights
          *
          * @return Pair of (num_cpu_packed, num_gpu_packed)

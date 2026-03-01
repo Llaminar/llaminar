@@ -2207,9 +2207,9 @@ namespace llaminar
                 if (reg_it != device_kernel_registry_.end())
                 {
                     LOG_DEBUG("[KernelFactory][RMSNORM] registry hit dev=" << static_cast<int>(target_device.type)
-                                                                          << ":" << target_device.ordinal
-                                                                          << " tensor_type=" << static_cast<int>(tensor->native_type())
-                                                                          << " kernel=" << reg_it->second.get());
+                                                                           << ":" << target_device.ordinal
+                                                                           << " tensor_type=" << static_cast<int>(tensor->native_type())
+                                                                           << " kernel=" << reg_it->second.get());
                     return static_cast<llaminar2::ITensorRMSNorm *>(reg_it->second.get());
                 }
 
@@ -2219,9 +2219,9 @@ namespace llaminar
                     auto *raw_ptr = it->second.get();
                     device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
                     LOG_DEBUG("[KernelFactory][RMSNORM] cache hit dev=" << static_cast<int>(target_device.type)
-                                                                       << ":" << target_device.ordinal
-                                                                       << " tensor_type=" << static_cast<int>(tensor->native_type())
-                                                                       << " kernel=" << static_cast<const void *>(raw_ptr));
+                                                                        << ":" << target_device.ordinal
+                                                                        << " tensor_type=" << static_cast<int>(tensor->native_type())
+                                                                        << " kernel=" << static_cast<const void *>(raw_ptr));
                     return raw_ptr;
                 }
 
@@ -2937,15 +2937,14 @@ namespace llaminar
                 std::lock_guard<std::mutex> tensor_lock(tensor->packed_cache_mutex_);
 
                 // Check if tensor already has packed weights cached
-                TensorPackedWeightsCache *packed_cache = nullptr;
                 if (tensor->cache_.has_value())
                 {
                     try
                     {
-                        packed_cache = std::any_cast<TensorPackedWeightsCache *>(tensor->cache_);
-                        if (packed_cache)
+                        auto cached = std::any_cast<std::shared_ptr<TensorPackedWeightsCache>>(tensor->cache_);
+                        if (cached)
                         {
-                            return &packed_cache->packed;
+                            return &cached->packed;
                         }
                     }
                     catch (const std::bad_any_cast &)
@@ -2955,17 +2954,17 @@ namespace llaminar
                 }
 
                 // Pack weights into tensor's cache_
-                auto *new_cache = new TensorPackedWeightsCache();
+                auto new_cache = std::make_shared<TensorPackedWeightsCache>();
                 if (!llaminar2::gemm_v4::QuantisedGemmKernel::packWeightsInto(
                         tensor, new_cache->packed, 0, -1))
                 {
-                    delete new_cache;
                     LOG_ERROR("[KernelFactory] Failed to pack weights for tensor type "
                               << static_cast<int>(tensor->native_type()));
                     throw std::runtime_error("KernelFactory: failed to pack weights");
                 }
 
-                // Store in tensor's cache_ (tensor owns the packed data)
+                // Store as shared_ptr in tensor's cache_ (std::any properly
+                // destroys shared_ptr on overwrite/destruction, preventing leaks)
                 tensor->cache_ = new_cache;
 
                 LOG_TRACE("[KernelFactory] Packed weights for tensor "
@@ -2991,15 +2990,14 @@ namespace llaminar
                 std::lock_guard<std::mutex> tensor_lock(tensor->packed_cache_mutex_);
 
                 // Check if tensor already has CUDA packed weights cached
-                TensorCUDAPackedWeightsCache *packed_cache = nullptr;
                 if (tensor->cuda_cache_.has_value())
                 {
                     try
                     {
-                        packed_cache = std::any_cast<TensorCUDAPackedWeightsCache *>(tensor->cuda_cache_);
-                        if (packed_cache)
+                        auto cached = std::any_cast<std::shared_ptr<TensorCUDAPackedWeightsCache>>(tensor->cuda_cache_);
+                        if (cached)
                         {
-                            return &packed_cache->packed;
+                            return &cached->packed;
                         }
                     }
                     catch (const std::bad_any_cast &)
@@ -3009,10 +3007,9 @@ namespace llaminar
                 }
 
                 // Pack weights into tensor's cuda_cache_
-                auto *new_cache = new TensorCUDAPackedWeightsCache();
+                auto new_cache = std::make_shared<TensorCUDAPackedWeightsCache>();
                 if (!llaminar2::cuda::packWeightsToCUDA(tensor, new_cache->packed))
                 {
-                    delete new_cache;
                     LOG_ERROR("[KernelFactory] Failed to pack CUDA weights for tensor type "
                               << static_cast<int>(tensor->native_type()));
                     throw std::runtime_error("KernelFactory: failed to pack CUDA weights");
@@ -3023,7 +3020,8 @@ namespace llaminar
                 // after uploading the packed weights to GPU
                 new_cache->packed.source_tensor_ = const_cast<llaminar2::TensorBase *>(tensor);
 
-                // Store in tensor's cuda_cache_ (tensor owns the packed data)
+                // Store as shared_ptr in tensor's cuda_cache_ (std::any properly
+                // destroys shared_ptr on overwrite/destruction, preventing leaks)
                 tensor->cuda_cache_ = new_cache;
 
                 LOG_DEBUG("[KernelFactory] Packed CUDA INT8 weights for tensor "
@@ -3053,15 +3051,14 @@ namespace llaminar
                 std::lock_guard<std::mutex> tensor_lock(tensor->packed_cache_mutex_);
 
                 // Check if tensor already has ROCm packed weights cached
-                TensorROCmPackedWeightsCache *packed_cache = nullptr;
                 if (tensor->rocm_cache_.has_value())
                 {
                     try
                     {
-                        packed_cache = std::any_cast<TensorROCmPackedWeightsCache *>(tensor->rocm_cache_);
-                        if (packed_cache)
+                        auto cached = std::any_cast<std::shared_ptr<TensorROCmPackedWeightsCache>>(tensor->rocm_cache_);
+                        if (cached)
                         {
-                            return &packed_cache->packed;
+                            return &cached->packed;
                         }
                     }
                     catch (const std::bad_any_cast &)
@@ -3071,16 +3068,16 @@ namespace llaminar
                 }
 
                 // Pack weights into tensor's rocm_cache_
-                auto *new_cache = new TensorROCmPackedWeightsCache();
+                auto new_cache = std::make_shared<TensorROCmPackedWeightsCache>();
                 if (!llaminar2::rocm::packWeightsToROCm(tensor, new_cache->packed))
                 {
-                    delete new_cache;
                     LOG_ERROR("[KernelFactory] Failed to pack ROCm weights for tensor type "
                               << static_cast<int>(tensor->native_type()));
                     throw std::runtime_error("KernelFactory: failed to pack ROCm weights");
                 }
 
-                // Store in tensor's rocm_cache_ (tensor owns the packed data)
+                // Store as shared_ptr in tensor's rocm_cache_ (std::any properly
+                // destroys shared_ptr on overwrite/destruction, preventing leaks)
                 tensor->rocm_cache_ = new_cache;
 
                 LOG_DEBUG("[KernelFactory] Packed ROCm INT8 weights for tensor "
@@ -3180,42 +3177,20 @@ namespace llaminar
                 }
 
                 // Also clean up tensor's packed weights cache if present (CPU VNNI)
+                // Note: caches store std::shared_ptr<T>, so resetting the std::any
+                // drops the shared_ptr which handles cleanup automatically.
                 {
                     std::lock_guard<std::mutex> tensor_lock(tensor->packed_cache_mutex_);
                     if (tensor->cache_.has_value())
                     {
-                        try
-                        {
-                            auto *packed_cache = std::any_cast<TensorPackedWeightsCache *>(tensor->cache_);
-                            if (packed_cache)
-                            {
-                                delete packed_cache;
-                                tensor->cache_.reset();
-                            }
-                        }
-                        catch (const std::bad_any_cast &)
-                        {
-                            // cache_ contains something else - leave it alone
-                        }
+                        tensor->cache_.reset();
                     }
 
 #ifdef HAVE_CUDA
                     // Also clean up tensor's CUDA packed weights cache if present
                     if (tensor->cuda_cache_.has_value())
                     {
-                        try
-                        {
-                            auto *cuda_packed_cache = std::any_cast<TensorCUDAPackedWeightsCache *>(tensor->cuda_cache_);
-                            if (cuda_packed_cache)
-                            {
-                                delete cuda_packed_cache; // ~CUDAPackedWeights frees device memory
-                                tensor->cuda_cache_.reset();
-                            }
-                        }
-                        catch (const std::bad_any_cast &)
-                        {
-                            // cuda_cache_ contains something else - leave it alone
-                        }
+                        tensor->cuda_cache_.reset();
                     }
 #endif
 
@@ -3223,19 +3198,7 @@ namespace llaminar
                     // Also clean up tensor's ROCm packed weights cache if present
                     if (tensor->rocm_cache_.has_value())
                     {
-                        try
-                        {
-                            auto *rocm_packed_cache = std::any_cast<TensorROCmPackedWeightsCache *>(tensor->rocm_cache_);
-                            if (rocm_packed_cache)
-                            {
-                                delete rocm_packed_cache; // ~ROCmPackedWeights frees device memory
-                                tensor->rocm_cache_.reset();
-                            }
-                        }
-                        catch (const std::bad_any_cast &)
-                        {
-                            // rocm_cache_ contains something else - leave it alone
-                        }
+                        tensor->rocm_cache_.reset();
                     }
 #endif
                 }
@@ -3352,40 +3315,18 @@ namespace llaminar
                     std::lock_guard<std::mutex> tensor_lock(tensor->packed_cache_mutex_);
 
                     // Clean up CPU packed weights
+                    // Note: caches store std::shared_ptr<T>, so resetting the std::any
+                    // drops the shared_ptr which handles cleanup automatically.
                     if (tensor->cache_.has_value())
                     {
-                        try
-                        {
-                            auto *packed_cache = std::any_cast<TensorPackedWeightsCache *>(tensor->cache_);
-                            if (packed_cache)
-                            {
-                                delete packed_cache;
-                                tensor->cache_.reset();
-                            }
-                        }
-                        catch (const std::bad_any_cast &)
-                        {
-                            // cache_ contains something else - leave it alone
-                        }
+                        tensor->cache_.reset();
                     }
 
 #ifdef HAVE_CUDA
                     // Clean up CUDA packed weights
                     if (tensor->cuda_cache_.has_value())
                     {
-                        try
-                        {
-                            auto *cuda_packed_cache = std::any_cast<TensorCUDAPackedWeightsCache *>(tensor->cuda_cache_);
-                            if (cuda_packed_cache)
-                            {
-                                delete cuda_packed_cache; // ~CUDAPackedWeights frees device memory
-                                tensor->cuda_cache_.reset();
-                            }
-                        }
-                        catch (const std::bad_any_cast &)
-                        {
-                            // cuda_cache_ contains something else - leave it alone
-                        }
+                        tensor->cuda_cache_.reset();
                     }
 #endif
 
@@ -3393,19 +3334,7 @@ namespace llaminar
                     // Clean up ROCm packed weights
                     if (tensor->rocm_cache_.has_value())
                     {
-                        try
-                        {
-                            auto *rocm_packed_cache = std::any_cast<TensorROCmPackedWeightsCache *>(tensor->rocm_cache_);
-                            if (rocm_packed_cache)
-                            {
-                                delete rocm_packed_cache; // ~ROCmPackedWeights frees device memory
-                                tensor->rocm_cache_.reset();
-                            }
-                        }
-                        catch (const std::bad_any_cast &)
-                        {
-                            // rocm_cache_ contains something else - leave it alone
-                        }
+                        tensor->rocm_cache_.reset();
                     }
 #endif
                 }
