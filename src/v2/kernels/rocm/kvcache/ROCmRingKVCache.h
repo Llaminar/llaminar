@@ -668,6 +668,13 @@ namespace llaminar2
         // Entry storage: [n_layers][batch_size]
         std::vector<std::vector<EntryT>> entries_;
 
+        // Pooled device memory for all KV cache entries.
+        // Single hipMalloc replaces n_layers × batch_size × 4 individual calls.
+        // Layout: [n_layers][batch_size][4_buffers][max_seq_len × kv_storage_dim]
+        // where 4 buffers are: K, V, K_scratch, V_scratch
+        void *pool_base_ = nullptr;
+        size_t pool_size_ = 0;
+
         // GpuTensorView storage for get_k()/get_v(): [n_layers][batch_size][2]
         // Index 0 = K view, Index 1 = V view
         // Mutable because views are lazily created in const methods
@@ -689,8 +696,12 @@ namespace llaminar2
         int *h_head_params_ = nullptr;
 
         // Helper methods
-        void allocate_entry(EntryT &entry);
-        void free_entry(EntryT &entry);
+        void allocate_pool(); // Single hipMalloc for all entries
+        void free_pool();     // Single hipFree for all entries
+        void assign_entry_from_pool(EntryT &entry, int linear_index);
+        void allocate_entry(EntryT &entry); // Legacy: individual hipMalloc per entry
+        void free_entry(EntryT &entry);     // Nulls pointers (no hipFree if pooled)
+        void allocate_all_entries();        // Pool + assign entries + tensor_views + device_params
         void allocate_device_params();
         void free_device_params();
         void linearize_entry(EntryT &entry, hipStream_t stream);

@@ -3793,6 +3793,21 @@ add_v2_test(V2_Integration_MappedMemoryCoherence
     MPI_PROCS 1  # Tests mapped memory locally, no MPI needed
 )
 
+# Test: Stream/Coherence Integration (regression tests for TP stale event bugs)
+# Tests real GPU event recording/waiting, stale event persistence through flags-only marking,
+# and MockBackend event tracking verification. Requires at least one GPU (CUDA or ROCm).
+# Skips automatically on CPU-only machines.
+add_executable(v2_integration_stream_coherence integration/execution/coherence/Test__StreamCoherenceIntegration.cpp)
+target_include_directories(v2_integration_stream_coherence PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_integration_stream_coherence llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_StreamCoherence
+    COMMAND $<TARGET_FILE:v2_integration_stream_coherence>
+    LABELS "V2;Integration;Coherence;StreamCoherence;StaleEvent;EventTracking;MockBackend;GPUMemory"
+    MPI_PROCS 1  # Tests coherence locally, no MPI needed
+)
+
 # Performance: Coherence Transfer Overhead Benchmark (Phase 4: Performance Validation)
 # Measures transfer overhead for different tensor allocation strategies:
 # - ensureOnDevice (baseline with H2D upload)
@@ -5063,6 +5078,19 @@ add_v2_test(V2_Unit_StageCoherence
     MPI_PROCS 1
 )
 
+# Test: StreamCoherence (stream/event coherence interaction — regression tests)
+# Tests for two critical coherence bugs in TP collective stages:
+# Bug 1: Collective stages must use CoherencePolicy::OUTPUT (not NONE)
+# Bug 2: mark_device_dirty_flags_only preserves stale completion events
+# Uses MockCoherenceTensor to verify behavior without GPU hardware.
+add_executable(v2_test_stream_coherence unit/execution/local_execution/coherence/Test__StreamCoherence.cpp)
+target_link_libraries(v2_test_stream_coherence llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_StreamCoherence
+    COMMAND $<TARGET_FILE:v2_test_stream_coherence>
+    LABELS "V2;Unit;Coherence;StreamCoherence;StaleEvent;TPAllreduce;AllGather;Regression"
+    MPI_PROCS 1
+)
+
 # Test: LivenessAnalyzer (buffer lifetime analysis for memory optimization)
 # Tests buffer liveness tracking, aliasing group computation, memory savings calculation.
 # Part of Phase 4: Liveness Analysis for buffer management infrastructure
@@ -5839,6 +5867,19 @@ add_v2_test(V2_Integration_ModelLoader
     COMMAND $<TARGET_FILE:v2_test_model_loader>
     MPI_PROCS 1
     LABELS "V2;Integration;ModelLoading;GGUF;WeightLoading"
+)
+
+# Test: ModelLoader Split (multi-part GGUF)
+add_executable(v2_test_model_loader_split integration/loaders/Test__ModelLoaderSplit.cpp)
+target_link_libraries(v2_test_model_loader_split 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_ModelLoaderSplit 
+    COMMAND $<TARGET_FILE:v2_test_model_loader_split>
+    MPI_PROCS 1
+    LABELS "V2;Integration;ModelLoading;GGUF;SplitGGUF"
 )
 
 # Test: ModelLoader Row Slice (memory-efficient tensor row slicing from GGUF)

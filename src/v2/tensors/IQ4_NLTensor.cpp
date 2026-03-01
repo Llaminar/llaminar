@@ -70,6 +70,37 @@ namespace llaminar2
     {
         // Views don't allocate raw_data_, they borrow via raw_data_ptr_
     }
+    // Zero-copy constructor for mmap-backed data
+    IQ4_NLTensor::IQ4_NLTensor(const std::vector<size_t> &shape,
+          const uint8_t *mmap_data,
+          size_t byte_size,
+          std::shared_ptr<void> mmap_lifetime_owner)
+        : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(mmap_data),
+          view_byte_offset_(0), parent_(nullptr), mmap_owner_(std::move(mmap_lifetime_owner)),
+          data_byte_size_(byte_size), device_(DeviceId::cpu()), device_blocks_(nullptr)
+    {
+        if (shape.empty())
+        {
+            throw std::invalid_argument("IQ4_NLTensor: shape cannot be empty");
+        }
+
+        size_t n_elems = 1;
+        for (auto dim : shape)
+        {
+            n_elems *= dim;
+        }
+
+        size_t n_blocks = (n_elems + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
+        size_t expected_bytes = n_blocks * sizeof(IQ4_NLBlock);
+
+        if (byte_size < expected_bytes)
+        {
+            throw std::invalid_argument("IQ4_NLTensor: insufficient mmap data (" +
+                                        std::to_string(byte_size) + " bytes, expected " +
+                                        std::to_string(expected_bytes) + ")");
+        }
+    }
+
 
     IQ4_NLTensor::~IQ4_NLTensor()
     {

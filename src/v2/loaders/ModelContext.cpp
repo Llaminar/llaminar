@@ -190,6 +190,9 @@ namespace llaminar2
             ctx->owned_test_factory_ = std::move(owned_factory);
         }
 
+        // Configure mmap before loading (must precede loadModel)
+        ctx->loader_.setUseMmap(config.use_mmap);
+
         // Load model metadata
         if (!ctx->loader_.loadModel(model_path))
         {

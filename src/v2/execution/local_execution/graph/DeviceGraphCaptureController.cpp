@@ -6,7 +6,6 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
 #ifdef HAVE_ROCM
-#include "../../../backends/rocm/HipDeviceGuard.h"
 #include <hip/hip_runtime.h>
 #endif
 
@@ -48,14 +47,8 @@ namespace llaminar2
 
     void DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(IDeviceContext *ctx)
     {
-#ifdef HAVE_ROCM
-        if (ctx && ctx->deviceId().type == DeviceType::ROCm)
-        {
-            HipDeviceGuard::forceSetDevice(ctx->deviceId().toKernelDeviceIndex());
-        }
-#else
-        (void)ctx;
-#endif
+        if (ctx)
+            ctx->activateDevice();
     }
 
     void DeviceGraphCaptureController::executeWarmupPhase(

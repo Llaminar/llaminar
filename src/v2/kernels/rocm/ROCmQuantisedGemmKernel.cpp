@@ -1372,6 +1372,122 @@ namespace llaminar2
         //
         // =====================================================================
 
+        // =====================================================================
+        // Fast Q8_0 direct path: skip FP32 round-trip entirely.
+        // Q8_0 blocks are {fp16 scale, int8_t qs[32]}. We extract INT8 values
+        // directly and convert per-block scales to per-row scales.
+        // Produces both row-major and VNNI layouts in a single fused pass.
+        // =====================================================================
+        static bool packWeightsToROCm_Q8_0_fast(const TensorBase *tensor, ROCmPackedWeights &out)
+        {
+            const auto *q8_tensor = dynamic_cast<const Q8_0Tensor *>(tensor);
+            if (!q8_tensor)
+                return false;
+
+            const int N = static_cast<int>(tensor->rows());
+            const int K = static_cast<int>(tensor->cols());
+            if (K % 32 != 0)
+                return false; // Q8_0 blocks are 32 elements; non-aligned means partial blocks
+
+            const size_t blocks_per_row = static_cast<size_t>(K) / 32;
+            const Q8_0Block *blocks = q8_tensor->typed_data();
+            if (!blocks)
+                return false;
+
+            out.K = K;
+            out.N = N;
+            out.scales.resize(N);
+            out.int8_data.resize(static_cast<size_t>(N) * K);
+
+            const bool build_vnni = (K % 4) == 0;
+            const size_t k_groups = build_vnni ? (static_cast<size_t>(K) / 4) : 0;
+            if (build_vnni)
+                out.int8_data_vnni.resize(k_groups * static_cast<size_t>(N) * 4);
+            else
+                out.int8_data_vnni.clear();
+
+            // Fused pass: compute per-row scale, rescale INT8 values, emit row-major + VNNI
+#pragma omp parallel for schedule(static)
+            for (int n = 0; n < N; ++n)
+            {
+                const Q8_0Block *row_blocks = blocks + static_cast<size_t>(n) * blocks_per_row;
+
+                // Pass 1: find per-row max absolute dequantized value from block metadata.
+                // For Q8_0, actual value = block_scale * qs[i], and |qs[i]| <= 127.
+                // Per-row max_abs = max over blocks of (block_scale * max(|qs[i]|)).
+                // We can simply find max(block_scale * 127) across all blocks as a
+                // conservative upper bound, OR scan the actual qs values for tighter fit.
+                // For speed, we use the tight path: scan blocks for actual max.
+                float max_abs = 0.0f;
+                for (size_t b = 0; b < blocks_per_row; ++b)
+                {
+                    const float block_scale = fp16_to_fp32(row_blocks[b].d);
+                    // Find max |qs| in this block
+                    int max_qs = 0;
+                    for (int i = 0; i < 32; ++i)
+                    {
+                        int abs_qs = row_blocks[b].qs[i] < 0 ? -row_blocks[b].qs[i] : row_blocks[b].qs[i];
+                        if (abs_qs > max_qs)
+                            max_qs = abs_qs;
+                    }
+                    float val = block_scale * static_cast<float>(max_qs);
+                    if (val > max_abs)
+                        max_abs = val;
+                }
+
+                const float row_scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+                out.scales[n] = row_scale;
+                const float inv_row_scale = 1.0f / row_scale;
+
+                // Pass 2: rescale and emit both row-major and VNNI in one pass over blocks
+                int8_t *row_dst = out.int8_data.data() + static_cast<size_t>(n) * K;
+
+                for (size_t b = 0; b < blocks_per_row; ++b)
+                {
+                    const Q8_0Block &block = row_blocks[b];
+                    const float rescale = fp16_to_fp32(block.d) * inv_row_scale;
+                    const size_t col_base = b * 32;
+
+                    // Rescale INT8 values: new_qs = round(old_qs * block_scale / row_scale)
+                    for (int i = 0; i < 32; ++i)
+                    {
+                        float val = static_cast<float>(block.qs[i]) * rescale;
+                        int32_t q = static_cast<int32_t>(val + (val >= 0.0f ? 0.5f : -0.5f));
+                        q = q < -127 ? -127 : (q > 127 ? 127 : q);
+                        row_dst[col_base + i] = static_cast<int8_t>(q);
+                    }
+
+                    // Emit VNNI layout inline: [K/4][N][4]
+                    // Each block of 32 elements produces 8 VNNI groups of 4
+                    if (build_vnni)
+                    {
+                        for (int g = 0; g < 8; ++g)
+                        {
+                            const size_t kg = (col_base / 4) + g; // k_group index
+                            const size_t dst_offset = (kg * static_cast<size_t>(N) + static_cast<size_t>(n)) * 4;
+                            const size_t src_offset = col_base + g * 4;
+                            out.int8_data_vnni[dst_offset + 0] = row_dst[src_offset + 0];
+                            out.int8_data_vnni[dst_offset + 1] = row_dst[src_offset + 1];
+                            out.int8_data_vnni[dst_offset + 2] = row_dst[src_offset + 2];
+                            out.int8_data_vnni[dst_offset + 3] = row_dst[src_offset + 3];
+                        }
+                    }
+                }
+            }
+
+            // Phase 3 (opt-in): keep only VNNI host buffer and drop row-major host copy.
+            if (debugEnv().rocm.pack_vnni_only_host && !out.int8_data_vnni.empty())
+            {
+                out.int8_data.clear();
+                out.int8_data.shrink_to_fit();
+            }
+
+            LOG_DEBUG("[packWeightsToROCm] Q8_0 fast-path packed " << N << "x" << K
+                                                                   << " weights (direct INT8, no FP32 round-trip)"
+                                                                   << (out.int8_data_vnni.empty() ? "" : " + VNNI"));
+            return true;
+        }
+
         bool packWeightsToROCm(const TensorBase *tensor, ROCmPackedWeights &out)
         {
             if (!tensor)
@@ -1383,20 +1499,8 @@ namespace llaminar2
             const int N = static_cast<int>(tensor->rows()); // Output features (model weight rows)
             const int K = static_cast<int>(tensor->cols()); // Input features (model weight cols)
 
-            // Get dequantized FP32 data - use fp32_data() which explicitly dequantizes
-            const float *h_weights_fp32 = tensor->fp32_data();
-            if (!h_weights_fp32)
-            {
-                LOG_ERROR("[packWeightsToROCm] Failed to get FP32 data from tensor");
-                return false;
-            }
-
-            out.scales.resize(N);
             out.K = K;
             out.N = N;
-
-            // Phase-1 compact path: IQ4_NL / Q4_0 (+ Q4_1 with optional min side-channel)
-            // Uses native block access (no FP32 dequant -> INT8 requant round-trip).
 
             // Native-VNNI path: Q4_0 and IQ4_NL get lossless native-VNNI packing.
             // This runs in addition to (not instead of) other paths during transition.
@@ -1406,25 +1510,33 @@ namespace llaminar2
                                                         << " weights to native-VNNI");
             }
 
+            // === Fast path: Q8_0 direct INT8 extraction (no FP32 round-trip) ===
+            if (tensor->native_type() == TensorType::Q8_0 && packWeightsToROCm_Q8_0_fast(tensor, out))
+            {
+                return true;
+            }
+
+            // === Generic fallback: dequantize to FP32 then requantize to INT8 ===
+            const float *h_weights_fp32 = tensor->fp32_data();
+            if (!h_weights_fp32)
+            {
+                LOG_ERROR("[packWeightsToROCm] Failed to get FP32 data from tensor");
+                return false;
+            }
+
+            out.scales.resize(N);
+
             // Legacy generic path for all other quant formats:
-            //   int8_data: [N × K] row-major (same layout as model weights!)
-            //             This is Column-Major [K × N] for CK's mk_nk_mn convention
-            //   scales: [N] per-output-feature scales
             out.int8_data.resize(static_cast<size_t>(N) * K);
 
             // Per-row (per-output-feature) symmetric quantization
-            // NO transpose - keep same layout as model weights
-            //
-            // Input (h_weights_fp32):  [N × K] row-major, W[n,k] at n*K + k
-            // Output (out.int8_data):  [N × K] row-major, same layout!
-            //                          (viewed as Column-Major [K×N] for CK)
+#pragma omp parallel for schedule(static)
             for (int n = 0; n < N; ++n)
             {
                 // Find max_abs for this output feature (row n of model weights)
                 float max_abs = 0.0f;
                 for (int k = 0; k < K; ++k)
                 {
-                    // W[n,k] = h_weights_fp32[n * K + k]
                     float val = h_weights_fp32[n * K + k];
                     max_abs = std::max(max_abs, std::abs(val));
                 }
@@ -1432,16 +1544,14 @@ namespace llaminar2
                 // Symmetric quantization: scale = max_abs / 127
                 float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
                 float inv_scale = 1.0f / scale;
-                out.scales[n] = scale; // One scale per output feature
+                out.scales[n] = scale;
 
-                // Quantize in place - NO transpose!
-                // Both source and destination use offset n*K + k
                 for (int k = 0; k < K; ++k)
                 {
-                    float val = h_weights_fp32[n * K + k]; // Read W[n,k]
+                    float val = h_weights_fp32[n * K + k];
                     int8_t quantized = static_cast<int8_t>(
                         std::round(std::clamp(val * inv_scale, -127.0f, 127.0f)));
-                    out.int8_data[n * K + k] = quantized; // Write at same offset!
+                    out.int8_data[n * K + k] = quantized;
                 }
             }
 
@@ -1451,6 +1561,7 @@ namespace llaminar2
             {
                 const size_t k_groups = static_cast<size_t>(K) / 4;
                 out.int8_data_vnni.resize(k_groups * static_cast<size_t>(N) * 4);
+#pragma omp parallel for schedule(static)
                 for (int n = 0; n < N; ++n)
                 {
                     const size_t row_base = static_cast<size_t>(n) * K;
@@ -1467,7 +1578,6 @@ namespace llaminar2
             }
 
             // Phase 3 (opt-in): keep only VNNI host buffer and drop row-major host copy.
-            // Fallback: if VNNI is unavailable, retain row-major host buffer.
             if (debugEnv().rocm.pack_vnni_only_host)
             {
                 if (!out.int8_data_vnni.empty())

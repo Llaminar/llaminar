@@ -36,7 +36,7 @@ namespace llaminar2
             return (err == cudaSuccess);
         }
 
-        bool cudaGetDeviceOrdinal(int* device_ordinal)
+        bool cudaGetDeviceOrdinal(int *device_ordinal)
         {
             cudaError_t err = cudaGetDevice(device_ordinal);
             return (err == cudaSuccess);
@@ -168,7 +168,7 @@ namespace llaminar2
 
         /// Initialize NCCL communicators for exactly 2 devices (for copy operations)
         /// Returns both communicators so we can use ncclSend from rank 0 and ncclRecv on rank 1
-        bool ncclCommInitPairWrapper(void **comm_src_out, void **comm_dst_out, 
+        bool ncclCommInitPairWrapper(void **comm_src_out, void **comm_dst_out,
                                      int src_ordinal, int dst_ordinal, std::string &error_out)
         {
             // Ensure NCCL is loaded
@@ -179,7 +179,7 @@ namespace llaminar2
                 *comm_dst_out = nullptr;
                 return false;
             }
-            
+
             int devlist[2] = {src_ordinal, dst_ordinal};
             nccl::ncclComm_t comms[2];
             nccl::ncclResult_t r = nccl::ncclCommInitAll(comms, 2, devlist);
@@ -190,8 +190,8 @@ namespace llaminar2
                 *comm_dst_out = nullptr;
                 return false;
             }
-            *comm_src_out = static_cast<void *>(comms[0]);  // rank 0 = src
-            *comm_dst_out = static_cast<void *>(comms[1]);  // rank 1 = dst
+            *comm_src_out = static_cast<void *>(comms[0]); // rank 0 = src
+            *comm_dst_out = static_cast<void *>(comms[1]); // rank 1 = dst
             return true;
         }
 
@@ -200,6 +200,14 @@ namespace llaminar2
             if (comm && nccl::isLoaded())
             {
                 nccl::ncclCommDestroy(static_cast<nccl::ncclComm_t>(comm));
+            }
+        }
+
+        void ncclCommAbortWrapper(void *comm)
+        {
+            if (comm && nccl::isLoaded())
+            {
+                nccl::ncclCommAbort(static_cast<nccl::ncclComm_t>(comm));
             }
         }
 
@@ -602,7 +610,7 @@ namespace llaminar2
         // =========================================================================
         // Event-Based Device-to-Host and Host-to-Device Transfers (for staging)
         // =========================================================================
-        // 
+        //
         // Cross-device staging flow:
         // 1. cudaStagingD2HAsync: Async D2H on source device, records event
         // 2. CPU sync on D2H event (ensures data is in pinned host memory)
@@ -613,38 +621,38 @@ namespace llaminar2
         // are device-specific and cannot be waited on from a different device's stream.
         // =========================================================================
 
-        bool cudaStagingD2HAsync(void *dst_host, const void *src_device, size_t bytes, 
+        bool cudaStagingD2HAsync(void *dst_host, const void *src_device, size_t bytes,
                                  int device_ordinal, void *signal_event)
         {
             cudaError_t err = cudaSetDevice(device_ordinal);
             if (err != cudaSuccess)
                 return false;
-            
+
             // Async copy from device to pinned host on the default stream
             err = cudaMemcpyAsync(dst_host, src_device, bytes, ::cudaMemcpyDeviceToHost, 0);
             if (err != cudaSuccess)
                 return false;
-            
+
             // Record event after D2H completes (on default stream of this device)
             err = cudaEventRecord(static_cast<cudaEvent_t>(signal_event), 0);
             return (err == cudaSuccess);
         }
 
-        bool cudaStagingH2DAsync(void *dst_device, const void *src_host, size_t bytes, 
+        bool cudaStagingH2DAsync(void *dst_device, const void *src_host, size_t bytes,
                                  int device_ordinal, void *signal_event)
         {
             cudaError_t err = cudaSetDevice(device_ordinal);
             if (err != cudaSuccess)
                 return false;
-            
+
             // NOTE: Caller must have already sync'd the D2H event before calling this!
             // (We cannot cudaStreamWaitEvent on an event from a different device)
-            
+
             // Async copy from pinned host to device on the default stream
             err = cudaMemcpyAsync(dst_device, src_host, bytes, ::cudaMemcpyHostToDevice, 0);
             if (err != cudaSuccess)
                 return false;
-            
+
             // Record event after H2D completes
             err = cudaEventRecord(static_cast<cudaEvent_t>(signal_event), 0);
             return (err == cudaSuccess);

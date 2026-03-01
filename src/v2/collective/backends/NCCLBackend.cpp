@@ -43,6 +43,7 @@ namespace llaminar2
         bool ncclCommInitRankWrapper(void **comm_out, int nranks, void *unique_id, int rank, std::string &error_out);
         bool ncclCommInitAllWrapper(void **comms_out, int ndevs, const int *devlist, std::string &error_out);
         void ncclCommDestroyWrapper(void *comm);
+        void ncclCommAbortWrapper(void *comm);
 
         // NCCL collective operations
         bool ncclAllReduceWrapper(void *sendbuff, void *recvbuff, size_t count,
@@ -449,6 +450,36 @@ namespace llaminar2
 
         initialized_ = false;
         LOG_DEBUG("NCCLBackend: Shutdown complete");
+#endif
+    }
+
+    void NCCLBackend::abort()
+    {
+#ifdef HAVE_NCCL
+        LOG_WARN("NCCLBackend: Aborting all collective operations");
+
+        if (coordinator_)
+        {
+            coordinator_->abortCommunicators();
+        }
+
+        // Abort direct communicators (non-coordinator mode)
+        if (comm_)
+        {
+            nccl_backend_detail::ncclCommAbortWrapper(comm_);
+            comm_ = nullptr;
+        }
+        for (auto &c : all_comms_)
+        {
+            if (c)
+            {
+                nccl_backend_detail::ncclCommAbortWrapper(c);
+                c = nullptr;
+            }
+        }
+
+        initialized_ = false;
+        LOG_WARN("NCCLBackend: Abort complete");
 #endif
     }
 

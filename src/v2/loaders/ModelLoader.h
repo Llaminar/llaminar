@@ -25,6 +25,7 @@
 #pragma once
 
 #include "IModelLoader.h" // Interface
+#include "MmapRegion.h"   // RAII mmap wrapper for zero-copy loading
 #include "../backends/DeviceId.h"
 #include "../execution/config/RuntimeConfig.h" // for WeightPrecision
 #include "../tensors/TensorFactory.h"          // for owned_factory_
@@ -213,6 +214,44 @@ namespace llaminar2
         ~ModelLoader() override = default;
 
         /**
+         * @brief Enable or disable mmap-based file loading
+         *
+         * When enabled (default), the GGUF file is memory-mapped with MAP_POPULATE
+         * during loadModel(). Subsequent tensor loads use memcpy from the mapped
+         * region instead of seekg+read through an ifstream, eliminating file_mutex_
+         * serialization and enabling fully parallel tensor loading.
+         *
+         * When disabled (--no-mmap), falls back to the original ifstream + file_mutex_
+         * path. Use this for extremely large models that won't fit in RAM.
+         *
+         * Must be called BEFORE loadModel().
+         */
+        void setUseMmap(bool use_mmap) { use_mmap_ = use_mmap; }
+
+        /**
+         * @brief Check if mmap is active (file successfully memory-mapped)
+         */
+        bool isMmapActive() const { return mmap_region_ != nullptr; }
+
+        /**
+         * @brief Get shared_ptr to the mmap region for a given tensor
+         *
+         * Tensors hold this to keep the mmap alive for zero-copy access.
+         * Returns the appropriate region for split files.
+         */
+        std::shared_ptr<MmapRegion> getMmapRegion(const GGUFTensorInfo *info) const
+        {
+            if (!mmap_region_)
+                return nullptr;
+            if (model_.split_count > 1 && info->split_idx > 0)
+            {
+                size_t idx = info->split_idx - 1;
+                return (idx < split_mmap_regions_.size()) ? split_mmap_regions_[idx] : nullptr;
+            }
+            return mmap_region_;
+        }
+
+        /**
          * @brief Load GGUF file and parse metadata
          * @param file_path Path to .gguf model file
          * @return true if successful, false on error
@@ -324,7 +363,7 @@ namespace llaminar2
 
         std::vector<std::string> tensorNames() const override;
         std::string architecture() const override { return model_.architecture; }
-        size_t tensorCount() const override { return model_.tensor_count; }
+        size_t tensorCount() const override { return model_.tensors.size(); }
         size_t totalBytes() const override;
 
         int getInt(const std::string &key, int default_val = 0) const override;
@@ -402,6 +441,25 @@ namespace llaminar2
         std::vector<std::ifstream> split_streams_; // Additional file streams for multi-part GGUF
         GGUFModel model_;
         mutable std::mutex file_mutex_; // Protects file_stream_ and split_streams_ for thread-safety
+
+        // mmap state (when use_mmap_ is true)
+        bool use_mmap_ = true;
+        std::shared_ptr<MmapRegion> mmap_region_;                     // Main file mmap (shared for zero-copy tensors)
+        std::vector<std::shared_ptr<MmapRegion>> split_mmap_regions_; // Split file mmaps
+
+        /**
+         * @brief Get pointer into mmap'd region for a tensor's data
+         * @param info Tensor metadata (contains offset and split_idx)
+         * @return Pointer to tensor data in mmap region, or nullptr if not mmap'd
+         */
+        const uint8_t *getMmapPtr(const GGUFTensorInfo *info) const;
+
+        /**
+         * @brief Get the data offset for a tensor's split file
+         * @param info Tensor metadata
+         * @return Data offset for the file containing this tensor
+         */
+        uint64_t getDataOffset(const GGUFTensorInfo *info) const;
     };
 
     // =============================================================================

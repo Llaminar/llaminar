@@ -1,0 +1,674 @@
+/**
+ * @file Test__StreamCoherence.cpp
+ * @brief Unit tests for stream/coherence interaction in the TP collective stages
+ * @author GitHub Copilot
+ * @date January 2026
+ *
+ * Regression tests for two coherence bugs fixed in the TP pipeline:
+ *
+ * **Bug 1 — Collective stages had CoherencePolicy::NONE**:
+ *   When collective stages (TPAllreduceStage, AllGatherStage, AllGatherVStage)
+ *   returned CoherencePolicy::NONE, the DeviceGraphExecutor skipped marking
+ *   outputs as device-dirty after execution. Subsequent ensureOnHost() calls
+ *   returned stale host data (pre-allreduce), causing inference divergence.
+ *   Fix: Changed collective stages to CoherencePolicy::OUTPUT.
+ *
+ * **Bug 2 — Stale completion event after flags-only dirty marking**:
+ *   For intermediate pipeline stages, DeviceGraphExecutor uses
+ *   markOutputsDirtyFlagsOnly() which does NOT update device_completion_event_.
+ *   If a preceding stage recorded an event, that stale event persisted.
+ *   When ensureOnHost() was called, it waited on the stale event (from the
+ *   WRONG operation) and proceeded with D2H transfer before the allreduce
+ *   had actually completed. Fix: TPAllreduceStage::execute() now calls
+ *   mark_device_dirty_with_event(stage_stream) after the collective operation.
+ *
+ * **Test Strategy**:
+ *   Unit tests use MockCoherenceTensor (exposing protected coherence state)
+ *   and the StageCoherence functions to verify behavior without GPU hardware.
+ *   These tests verify the LOGIC of the coherence system, not the actual
+ *   GPU synchronization.
+ *
+ * @see src/v2/execution/local_execution/coherence/StageCoherence.h
+ * @see src/v2/tensors/TensorClasses.h (mark_device_dirty_with_event, mark_device_dirty_flags_only)
+ * @see tests/v2/mocks/MockBackend.h
+ */
+
+#include <gtest/gtest.h>
+
+// Project headers
+#include "execution/local_execution/coherence/StageCoherence.h"
+#include "execution/compute_stages/IComputeStage.h"
+#include "execution/compute_stages/stages/TPAllreduceStage.h"
+#include "execution/compute_stages/stages/AllGatherStage.h"
+#include "execution/compute_stages/stages/AllGatherVStage.h"
+#include "execution/compute_stages/stages/AllreduceStage.h"
+#include "execution/compute_stages/stages/LocalTPAllreduceStage.h"
+#include "execution/compute_stages/stages/GEMMStage.h"
+#include "tensors/Tensors.h"
+#include "backends/DeviceId.h"
+#include "backends/GlobalDeviceAddress.h"
+#include "collective/ILocalTPContext.h"
+#include "utils/MPIContext.h"
+
+#include <memory>
+#include <vector>
+#include <cstring>
+
+using namespace llaminar2;
+
+// =============================================================================
+// Test Helper: MockCoherenceTensor
+// =============================================================================
+
+/**
+ * @brief FP32Tensor subclass that exposes protected coherence state for testing
+ *
+ * Provides read access to device_completion_event_, device_valid_, host_valid_
+ * and tracks mark_device_dirty_with_event() calls through the virtual override.
+ *
+ * This enables unit testing of coherence state transitions without requiring
+ * a real GPU backend.
+ */
+class MockCoherenceTensor : public FP32Tensor
+{
+public:
+    using FP32Tensor::FP32Tensor;
+
+    // ---- Virtual override for tracking ----
+
+    int mark_dirty_with_event_call_count = 0;
+    void *last_event_stream = reinterpret_cast<void *>(0xDEAD); // sentinel
+
+    void mark_device_dirty_with_event(void *stream = nullptr) override
+    {
+        mark_dirty_with_event_call_count++;
+        last_event_stream = stream;
+        // Call base class — will try to get backend (which returns nullptr for CPU tensors)
+        // so it just sets the dirty flags without actually recording an event
+        FP32Tensor::mark_device_dirty_with_event(stream);
+    }
+
+    // ---- Expose protected state ----
+
+    void *getCompletionEvent() const { return device_completion_event_; }
+    bool getHostValid() const { return host_valid_; }
+    bool getDeviceValid() const { return device_valid_; }
+    std::optional<DeviceId> getGpuDevice() const { return gpu_device_; }
+    std::optional<DeviceId> getAuthoritativeDevice() const { return authoritative_device_; }
+
+    // ---- Inject fake state for testing ----
+
+    void injectCompletionEvent(void *event)
+    {
+        device_completion_event_ = event;
+    }
+
+    void injectGpuDevice(DeviceId device)
+    {
+        gpu_device_ = device;
+    }
+
+    void injectDeviceValid(bool valid)
+    {
+        device_valid_ = valid;
+    }
+
+    void injectHostValid(bool valid)
+    {
+        host_valid_ = valid;
+    }
+};
+
+// =============================================================================
+// Helper: Create CoherenceBuffer from MockCoherenceTensor
+// =============================================================================
+
+static CoherenceBuffer makeBuffer(MockCoherenceTensor *tensor, const char *name)
+{
+    CoherenceBuffer buf;
+    buf.tensor = tensor;
+    buf.name = name;
+    buf.data = tensor->data();
+    buf.rows = tensor->rows();
+    buf.cols = tensor->cols();
+    buf.dtype = "FP32";
+    buf.is_inout = false;
+    return buf;
+}
+
+// =============================================================================
+// Test Suite: CollectiveStageCoherencePolicy
+// =============================================================================
+//
+// Regression tests for Bug 1: Collective stages MUST return OUTPUT, not NONE.
+// With NONE the executor skips dirty-marking → stale host data after D2H.
+// =============================================================================
+
+class Test__StreamCoherence : public ::testing::Test
+{
+protected:
+    void SetUp() override
+    {
+        mpi_ctx_ = std::make_shared<MPIContext>(0, 2, MPI_COMM_NULL);
+    }
+
+    std::shared_ptr<MPIContext> mpi_ctx_;
+};
+
+TEST_F(Test__StreamCoherence, TPAllreduceStage_CoherencePolicy_IsOutput)
+{
+    // TPAllreduceStage MUST return OUTPUT so executor marks outputs dirty
+    // after the collective operation completes
+    auto tp_ctx = createLocalTPContext(
+        {GlobalDeviceAddress::cuda(0)}, {}, CollectiveBackendType::AUTO);
+
+    TPAllreduceStage::Params params;
+    params.tp_ctx = tp_ctx.get();
+
+    TPAllreduceStage stage(params);
+    EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::OUTPUT);
+}
+
+TEST_F(Test__StreamCoherence, AllGatherStage_CoherencePolicy_IsOutput)
+{
+    // AllGatherStage MUST return OUTPUT
+    auto input = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{4, 32}, DeviceId::cpu());
+    auto output = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{4, 64}, DeviceId::cpu());
+
+    AllGatherStage::Params params;
+    params.local_input = input.get();
+    params.full_output = output.get();
+    params.mpi_ctx = mpi_ctx_.get();
+    params.actual_seq_len = 4;
+
+    AllGatherStage stage(params);
+    EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::OUTPUT);
+}
+
+TEST_F(Test__StreamCoherence, AllGatherVStage_CoherencePolicy_IsOutput)
+{
+    // AllGatherVStage MUST return OUTPUT
+    AllGatherVStage::Params params;
+    params.mpi_ctx = mpi_ctx_.get();
+    params.recv_counts = {32, 32};
+    params.displacements = {0, 32};
+
+    AllGatherVStage stage(params);
+    EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::OUTPUT);
+}
+
+TEST_F(Test__StreamCoherence, AllreduceStage_CoherencePolicy_IsNone)
+{
+    // MPI AllreduceStage (non-TP) correctly uses NONE — it handles its own sync
+    AllreduceStage::Params params;
+    params.mpi_ctx = mpi_ctx_.get();
+
+    AllreduceStage stage(params);
+    EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::NONE);
+}
+
+TEST_F(Test__StreamCoherence, LocalTPAllreduceStage_CoherencePolicy_IsNone)
+{
+    // LocalTPAllreduceStage handles its own multi-device synchronization
+    // so it correctly returns NONE
+    LocalTPAllreduceStage::Params params;
+
+    LocalTPAllreduceStage stage(params);
+    EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::NONE);
+}
+
+TEST_F(Test__StreamCoherence, GEMMStage_CoherencePolicy_IsFull)
+{
+    // Normal compute stages default to FULL coherence
+    auto A = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{4, 8}, DeviceId::cpu());
+    auto B = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{8, 16}, DeviceId::cpu());
+    auto C = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{4, 16}, DeviceId::cpu());
+
+    GEMMStage::Params params;
+    params.A = A.get();
+    params.B = B.get();
+    params.C = C.get();
+    params.m = 4;
+    params.n = 16;
+    params.k = 8;
+
+    GEMMStage stage(params);
+    EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::FULL);
+}
+
+// =============================================================================
+// Test Suite: DirtyMarkingBehavior
+// =============================================================================
+//
+// Tests for Bug 2: mark_device_dirty_flags_only() does NOT update the
+// completion event, while mark_device_dirty_with_event() DOES.
+// This distinction is critical for correct GPU→CPU synchronization.
+// =============================================================================
+
+TEST_F(Test__StreamCoherence, FlagsOnly_PreservesStaleCompletionEvent)
+{
+    // CRITICAL: mark_device_dirty_flags_only() must NOT clear
+    // device_completion_event_. If it did, subsequent ensureOnHost()
+    // would fall back to full device sync (slow but correct).
+    // The real bug is that it PRESERVES a stale event from a PREVIOUS
+    // operation, causing ensureOnHost() to wait on the wrong point.
+
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{4, 64}, DeviceId::cpu());
+
+    // Simulate: a previous operation left a completion event
+    void *stale_event = reinterpret_cast<void *>(0xCAFEBABE);
+    tensor->injectCompletionEvent(stale_event);
+
+    // Call flags-only dirty marking (what the executor does for intermediate stages)
+    tensor->mark_device_dirty_flags_only();
+
+    // The stale event MUST still be there — this is the root cause of Bug 2
+    EXPECT_EQ(tensor->getCompletionEvent(), stale_event)
+        << "mark_device_dirty_flags_only() must not modify device_completion_event_";
+
+    // Verify the dirty flags were set correctly
+    EXPECT_TRUE(tensor->getDeviceValid());
+    EXPECT_FALSE(tensor->getHostValid()); // Non-mapped tensors → host is stale
+}
+
+TEST_F(Test__StreamCoherence, FlagsOnly_SetsDeviceDirtyState)
+{
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{8, 32}, DeviceId::cpu());
+
+    // Start in host-authoritative state
+    EXPECT_TRUE(tensor->getHostValid());
+    EXPECT_FALSE(tensor->getDeviceValid());
+
+    tensor->mark_device_dirty_flags_only();
+
+    // Device should now be valid, host stale (non-mapped)
+    EXPECT_TRUE(tensor->getDeviceValid());
+    EXPECT_FALSE(tensor->getHostValid());
+}
+
+TEST_F(Test__StreamCoherence, WithEvent_ClearsStaleEventAndRecordsNew)
+{
+    // mark_device_dirty_with_event() should create and record a new event,
+    // replacing any stale event. This is what TPAllreduceStage::execute()
+    // calls after allreduce to ensure ensureOnHost() waits on the allreduce.
+    //
+    // Note: Without a real GPU backend, mark_device_dirty_with_event() just
+    // sets the dirty flags (no event is actually created since getBackendForDevice
+    // returns nullptr for CPU tensors). We verify the call was made via the
+    // MockCoherenceTensor tracking.
+
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{4, 64}, DeviceId::cpu());
+
+    void *fake_stream = reinterpret_cast<void *>(0x1234);
+    tensor->mark_device_dirty_with_event(fake_stream);
+
+    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 1);
+    EXPECT_EQ(tensor->last_event_stream, fake_stream);
+
+    // Dirty flags must be set
+    EXPECT_TRUE(tensor->getDeviceValid());
+    EXPECT_FALSE(tensor->getHostValid());
+}
+
+TEST_F(Test__StreamCoherence, WithEvent_CalledMultipleTimes_TracksCorrectStream)
+{
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{4, 64}, DeviceId::cpu());
+
+    void *stream1 = reinterpret_cast<void *>(0x1111);
+    void *stream2 = reinterpret_cast<void *>(0x2222);
+
+    tensor->mark_device_dirty_with_event(stream1);
+    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 1);
+    EXPECT_EQ(tensor->last_event_stream, stream1);
+
+    tensor->mark_device_dirty_with_event(stream2);
+    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 2);
+    EXPECT_EQ(tensor->last_event_stream, stream2);
+}
+
+// =============================================================================
+// Test Suite: StageCoherenceFunctions
+// =============================================================================
+//
+// Tests that markOutputsDirty() and markOutputsDirtyFlagsOnly() call the
+// correct underlying TensorBase methods. This validates the "plumbing"
+// between the executor and the tensor coherence system.
+// =============================================================================
+
+TEST_F(Test__StreamCoherence, MarkOutputsDirty_CallsWithEvent)
+{
+    // markOutputsDirty (the event-based version) should call
+    // mark_device_dirty_with_event() on each output tensor.
+    // This is what happens for final-output stages (e.g., lm_head).
+
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{4, 64}, DeviceId::cpu());
+
+    std::vector<CoherenceBuffer> outputs;
+    outputs.push_back(makeBuffer(tensor.get(), "test_output"));
+
+    void *fake_stream = reinterpret_cast<void *>(0xABCD);
+    markOutputsDirty(outputs, fake_stream);
+
+    // Should have called the virtual mark_device_dirty_with_event
+    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 1);
+    EXPECT_EQ(tensor->last_event_stream, fake_stream);
+}
+
+TEST_F(Test__StreamCoherence, MarkOutputsDirtyFlagsOnly_DoesNotCallWithEvent)
+{
+    // markOutputsDirtyFlagsOnly (the lightweight version) should NOT call
+    // mark_device_dirty_with_event(). It calls mark_device_dirty_flags_only()
+    // which is non-virtual and only sets flags.
+
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{4, 64}, DeviceId::cpu());
+
+    std::vector<CoherenceBuffer> outputs;
+    outputs.push_back(makeBuffer(tensor.get(), "test_output"));
+
+    markOutputsDirtyFlagsOnly(outputs);
+
+    // The virtual mark_device_dirty_with_event must NOT have been called
+    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 0)
+        << "markOutputsDirtyFlagsOnly() must NOT call mark_device_dirty_with_event()";
+
+    // But the tensor should still be marked device-dirty
+    EXPECT_TRUE(tensor->getDeviceValid());
+    EXPECT_FALSE(tensor->getHostValid());
+}
+
+TEST_F(Test__StreamCoherence, MarkOutputsDirty_MultipleOutputs)
+{
+    // Verify all outputs get event-based marking
+    auto tensor1 = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{4, 64}, DeviceId::cpu());
+    auto tensor2 = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{8, 32}, DeviceId::cpu());
+
+    std::vector<CoherenceBuffer> outputs;
+    outputs.push_back(makeBuffer(tensor1.get(), "out_1"));
+    outputs.push_back(makeBuffer(tensor2.get(), "out_2"));
+
+    void *stream = reinterpret_cast<void *>(0x5678);
+    markOutputsDirty(outputs, stream);
+
+    EXPECT_EQ(tensor1->mark_dirty_with_event_call_count, 1);
+    EXPECT_EQ(tensor2->mark_dirty_with_event_call_count, 1);
+    EXPECT_EQ(tensor1->last_event_stream, stream);
+    EXPECT_EQ(tensor2->last_event_stream, stream);
+}
+
+TEST_F(Test__StreamCoherence, MarkOutputsDirtyFlagsOnly_PreservesExistingEvent)
+{
+    // Regression test for the exact Bug 2 scenario:
+    // 1. Tensor has a stale event from a previous operation
+    // 2. markOutputsDirtyFlagsOnly() is called (intermediate stage)
+    // 3. The stale event MUST persist (it's NOT cleared by flags-only)
+    //
+    // Without the fix in TPAllreduceStage (calling mark_device_dirty_with_event
+    // explicitly), ensureOnHost() would wait on this stale event.
+
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{4, 64}, DeviceId::cpu());
+
+    // Inject stale event from "previous QKV projection"
+    void *stale_event = reinterpret_cast<void *>(0xDEADFACE);
+    tensor->injectCompletionEvent(stale_event);
+
+    std::vector<CoherenceBuffer> outputs;
+    outputs.push_back(makeBuffer(tensor.get(), "allreduce_output"));
+
+    markOutputsDirtyFlagsOnly(outputs);
+
+    // Stale event persists — this is the behavior that caused Bug 2
+    EXPECT_EQ(tensor->getCompletionEvent(), stale_event);
+
+    // Virtual method must NOT have been called
+    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 0);
+}
+
+TEST_F(Test__StreamCoherence, MarkOutputsDirty_ReplacesStaleEvent)
+{
+    // After the fix: markOutputsDirty (event-based) REPLACES the stale event.
+    // This is what happens when stage itself or executor calls with-event variant.
+
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{4, 64}, DeviceId::cpu());
+
+    void *stale_event = reinterpret_cast<void *>(0xDEADFACE);
+    tensor->injectCompletionEvent(stale_event);
+
+    std::vector<CoherenceBuffer> outputs;
+    outputs.push_back(makeBuffer(tensor.get(), "allreduce_output"));
+
+    void *correct_stream = reinterpret_cast<void *>(0xA11EDECE);
+    markOutputsDirty(outputs, correct_stream);
+
+    // Virtual method MUST have been called with the correct stream
+    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 1);
+    EXPECT_EQ(tensor->last_event_stream, correct_stream);
+
+    // Note: Without a real backend, the event itself isn't actually replaced
+    // in the base class (getBackendForDevice returns nullptr for CPU tensors).
+    // But the call IS made, which is what matters for correctness.
+}
+
+// =============================================================================
+// Test Suite: CoherenceStateTransitions
+// =============================================================================
+//
+// Tests the complete state machine of coherence transitions relevant to
+// the TP pipeline: host → device → dirty (flags-only) → dirty (with event)
+// =============================================================================
+
+TEST_F(Test__StreamCoherence, InitialState_HostAuthoritative)
+{
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{4, 64}, DeviceId::cpu());
+
+    EXPECT_TRUE(tensor->getHostValid());
+    EXPECT_FALSE(tensor->getDeviceValid());
+    EXPECT_EQ(tensor->getCompletionEvent(), nullptr);
+    EXPECT_FALSE(tensor->getGpuDevice().has_value());
+}
+
+TEST_F(Test__StreamCoherence, FlagsOnly_TransitionsToDeviceAuthoritative)
+{
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{4, 64}, DeviceId::cpu());
+
+    tensor->mark_device_dirty_flags_only();
+
+    EXPECT_TRUE(tensor->getDeviceValid());
+    EXPECT_FALSE(tensor->getHostValid());
+    EXPECT_EQ(tensor->getCompletionEvent(), nullptr); // No event created/modified
+}
+
+TEST_F(Test__StreamCoherence, WithEvent_TransitionsToDeviceAuthoritative)
+{
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{4, 64}, DeviceId::cpu());
+
+    tensor->mark_device_dirty_with_event(nullptr);
+
+    EXPECT_TRUE(tensor->getDeviceValid());
+    EXPECT_FALSE(tensor->getHostValid());
+    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 1);
+}
+
+TEST_F(Test__StreamCoherence, SequentialDirtyMarking_EventOverwriteSequence)
+{
+    // Simulates the pipeline sequence:
+    // 1. GEMM kernel runs → executor calls markOutputsDirtyFlagsOnly (intermediate)
+    // 2. Allreduce runs → stage calls mark_device_dirty_with_event
+    //
+    // Verifies that step 2 correctly invokes the event-based path even after
+    // step 1 already set the flags.
+
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{4, 64}, DeviceId::cpu());
+
+    // Step 1: GEMM output marked flags-only (intermediate stage)
+    tensor->mark_device_dirty_flags_only();
+    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 0);
+    EXPECT_TRUE(tensor->getDeviceValid());
+
+    // Step 2: Allreduce calls mark_device_dirty_with_event
+    void *allreduce_stream = reinterpret_cast<void *>(0xBCC10001);
+    tensor->mark_device_dirty_with_event(allreduce_stream);
+    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 1);
+    EXPECT_EQ(tensor->last_event_stream, allreduce_stream);
+    EXPECT_TRUE(tensor->getDeviceValid());
+}
+
+// =============================================================================
+// Test Suite: NullAndEdgeCases
+// =============================================================================
+
+TEST_F(Test__StreamCoherence, MarkOutputsDirty_NullTensor_Skipped)
+{
+    CoherenceBuffer buf;
+    buf.tensor = nullptr;
+    buf.name = "null_tensor";
+    buf.data = nullptr;
+    buf.rows = 0;
+    buf.cols = 0;
+    buf.dtype = "FP32";
+    buf.is_inout = false;
+
+    std::vector<CoherenceBuffer> outputs = {buf};
+
+    // Should not crash
+    markOutputsDirty(outputs, nullptr);
+    markOutputsDirtyFlagsOnly(outputs);
+}
+
+TEST_F(Test__StreamCoherence, MarkOutputsDirty_EmptyList_NoOp)
+{
+    std::vector<CoherenceBuffer> empty;
+
+    // Should be fast no-ops
+    markOutputsDirty(empty, nullptr);
+    markOutputsDirtyFlagsOnly(empty);
+}
+
+TEST_F(Test__StreamCoherence, MarkOutputsDirty_NullStream_Accepted)
+{
+    // nullptr stream means default stream (stream 0) — should work fine
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{4, 64}, DeviceId::cpu());
+
+    std::vector<CoherenceBuffer> outputs;
+    outputs.push_back(makeBuffer(tensor.get(), "test_output"));
+
+    markOutputsDirty(outputs, nullptr);
+
+    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 1);
+    EXPECT_EQ(tensor->last_event_stream, nullptr);
+}
+
+TEST_F(Test__StreamCoherence, ClearCompletionEvent_RemovesEvent)
+{
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{4, 64}, DeviceId::cpu());
+
+    void *event = reinterpret_cast<void *>(0xFEED);
+    tensor->injectCompletionEvent(event);
+    EXPECT_EQ(tensor->getCompletionEvent(), event);
+
+    tensor->clearCompletionEvent();
+    EXPECT_EQ(tensor->getCompletionEvent(), nullptr);
+}
+
+// =============================================================================
+// Test Suite: Bug2 Scenario — End-to-End Stale Event Lifecycle
+// =============================================================================
+//
+// Simulates the full lifecycle that triggered Bug 2:
+// Stage A (GEMM) → Stage B (allreduce) → D2H readback
+// =============================================================================
+
+TEST_F(Test__StreamCoherence, Bug2Scenario_StaleEventLifecycle)
+{
+    // This test simulates the exact sequence of operations that caused Bug 2:
+    //
+    // 1. Stage A (GEMM) runs, executor marks output with flags-only (intermediate)
+    //    → No event recorded, but if tensor had a prior event, it persists
+    //
+    // 2. Stage B (TPAllreduce) runs, executor marks output with flags-only (OUTPUT policy)
+    //    → Bug: stale event from step 0 persists
+    //    → Fix: TPAllreduceStage::execute() calls mark_device_dirty_with_event()
+    //
+    // 3. Host reads data via data() → calls ensureOnHost()
+    //    → Bug: waits on stale event (too early), gets pre-allreduce data
+    //    → Fix: waits on allreduce's event, gets post-allreduce data
+
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{4, 896}, DeviceId::cpu());
+
+    // Simulate prior event from earlier operation (e.g., previous decode iteration)
+    void *prior_event = reinterpret_cast<void *>(0x01D00001);
+    tensor->injectCompletionEvent(prior_event);
+
+    // Step 1: GEMM stage output — flags-only marking (intermediate)
+    std::vector<CoherenceBuffer> gemm_outputs;
+    gemm_outputs.push_back(makeBuffer(tensor.get(), "gemm_output"));
+    markOutputsDirtyFlagsOnly(gemm_outputs);
+
+    // Verify: stale event persists (this is expected, and the source of the bug)
+    EXPECT_EQ(tensor->getCompletionEvent(), prior_event)
+        << "After flags-only marking, stale event should persist";
+    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 0)
+        << "flags-only should not invoke event-based marking";
+
+    // Step 2: TPAllreduce stage — the FIX is that the stage itself calls
+    // mark_device_dirty_with_event() after the allreduce completes
+    void *allreduce_stream = reinterpret_cast<void *>(0xBCC10002);
+    tensor->mark_device_dirty_with_event(allreduce_stream);
+
+    // Verify: event-based marking was called
+    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 1);
+    EXPECT_EQ(tensor->last_event_stream, allreduce_stream);
+
+    // Step 3: In a real scenario with a GPU backend, ensureOnHost() would now
+    // wait on the NEW event (from allreduce) rather than the stale one.
+    // We can't test the actual D2H here without a GPU, but we verified the
+    // call chain is correct.
+}
+
+TEST_F(Test__StreamCoherence, Bug2Scenario_WithoutFix_StaleEventPersists)
+{
+    // This test shows what WOULD happen without the fix:
+    // markOutputsDirtyFlagsOnly is called twice (GEMM + allreduce),
+    // and the stale event is never replaced.
+
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{4, 896}, DeviceId::cpu());
+
+    void *stale_event = reinterpret_cast<void *>(0x57A1E001);
+    tensor->injectCompletionEvent(stale_event);
+
+    // Two consecutive flags-only markings (simulating the bug scenario
+    // where both stages use flags-only)
+    std::vector<CoherenceBuffer> outputs;
+    outputs.push_back(makeBuffer(tensor.get(), "tensor"));
+
+    markOutputsDirtyFlagsOnly(outputs); // GEMM stage
+    markOutputsDirtyFlagsOnly(outputs); // Allreduce stage (BUG: should use event)
+
+    // Stale event STILL there — this is the bug!
+    EXPECT_EQ(tensor->getCompletionEvent(), stale_event)
+        << "Without the fix: flags-only marking never replaces the stale event";
+    EXPECT_EQ(tensor->mark_dirty_with_event_call_count, 0)
+        << "Without the fix: event-based marking is never called";
+}

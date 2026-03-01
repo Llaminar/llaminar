@@ -33,10 +33,11 @@ namespace llaminar2
     {
         STAGE_PARAMS_COMMON_FIELDS;
 
-        ITPContext *tp_ctx = nullptr;     ///< TP context (LOCAL or GLOBAL, required)
-        TensorBase *tensor = nullptr;     ///< Tensor to all-reduce (in-place)
-        size_t count = 0;                 ///< Elements to reduce (0 = use tensor->numel())
-        std::string stage_name;           ///< Stage identifier for BAR-backed tensor lookup (optional)
+        ITPContext *tp_ctx = nullptr; ///< TP context (LOCAL or GLOBAL, required)
+        TensorBase *tensor = nullptr; ///< Tensor to all-reduce (in-place)
+        size_t count = 0;             ///< Elements to reduce (0 = use tensor->numel())
+        std::string stage_name;       ///< Stage identifier for BAR-backed tensor lookup (optional)
+        std::string precision;        ///< Allreduce precision override ("fp32", "fp16", "bf16", "" = use global default)
     };
 
     /**
@@ -117,12 +118,15 @@ namespace llaminar2
         /**
          * @brief Get coherence policy
          *
-         * TP stages handle their own synchronization across devices,
-         * so we return NONE to avoid interfering with device-specific sync.
+         * OUTPUT: The allreduce operates in-place on GPU buffers that are
+         * already on-device (cohered by the preceding GEMM stage), so we
+         * skip INPUT coherence. But we MUST mark outputs dirty so that
+         * snapshot callbacks and subsequent host reads trigger a D2H copy
+         * to get the post-allreduce data (not stale pre-allreduce data).
          *
-         * @return CoherencePolicy::NONE
+         * @return CoherencePolicy::OUTPUT
          */
-        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
+        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::OUTPUT; }
 
         // =====================================================================
         // Accessors
@@ -149,21 +153,5 @@ namespace llaminar2
     private:
         Params params_;
     };
-
-    // =========================================================================
-    // Backward Compatibility Aliases (Deprecated)
-    // =========================================================================
-
-    /**
-     * @brief Backward compatibility alias for LocalTPAllreduceStage
-     * @deprecated Use TPAllreduceStage instead
-     */
-    using LocalTPAllreduceStage [[deprecated("Use TPAllreduceStage instead")]] = TPAllreduceStage;
-
-    /**
-     * @brief Backward compatibility alias for LocalTPAllreduceParams
-     * @deprecated Use TPAllreduceParams instead
-     */
-    using LocalTPAllreduceParams [[deprecated("Use TPAllreduceParams instead")]] = TPAllreduceParams;
 
 } // namespace llaminar2

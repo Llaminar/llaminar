@@ -498,30 +498,7 @@ namespace llaminar2
 
         HipDeviceGuard::setDevice(device_id_);
 
-        // Allocate entries
-        entries_.resize(n_layers_);
-        for (int layer = 0; layer < n_layers_; ++layer)
-        {
-            entries_[layer].resize(batch_size_);
-            for (int seq = 0; seq < batch_size_; ++seq)
-            {
-                allocate_entry(entries_[layer][seq]);
-            }
-        }
-
-        // Initialize tensor_views_ storage for get_k()/get_v() wrappers
-        tensor_views_.resize(n_layers_);
-        for (int layer = 0; layer < n_layers_; ++layer)
-        {
-            tensor_views_[layer].resize(batch_size_);
-            // Views are created lazily in get_k()/get_v()
-        }
-
-        LOG_DEBUG("[ROCmRingKVCache] Allocated "
-                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
-                  << " MB total (including scratch)");
-
-        allocate_device_params();
+        allocate_all_entries();
     }
 
     template <ActivationPrecision Precision>
@@ -557,30 +534,7 @@ namespace llaminar2
 
         HipDeviceGuard::setDevice(device_id_);
 
-        // Allocate entries
-        entries_.resize(n_layers_);
-        for (int layer = 0; layer < n_layers_; ++layer)
-        {
-            entries_[layer].resize(batch_size_);
-            for (int seq = 0; seq < batch_size_; ++seq)
-            {
-                allocate_entry(entries_[layer][seq]);
-            }
-        }
-
-        // Initialize tensor_views_ storage for get_k()/get_v() wrappers
-        tensor_views_.resize(n_layers_);
-        for (int layer = 0; layer < n_layers_; ++layer)
-        {
-            tensor_views_[layer].resize(batch_size_);
-            // Views are created lazily in get_k()/get_v()
-        }
-
-        LOG_DEBUG("[ROCmRingKVCache] Allocated "
-                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
-                  << " MB total (including scratch)");
-
-        allocate_device_params();
+        allocate_all_entries();
     }
 
     template <ActivationPrecision Precision>
@@ -606,30 +560,7 @@ namespace llaminar2
 
         HipDeviceGuard::setDevice(device_id_);
 
-        // Allocate entries
-        entries_.resize(n_layers_);
-        for (int layer = 0; layer < n_layers_; ++layer)
-        {
-            entries_[layer].resize(batch_size_);
-            for (int seq = 0; seq < batch_size_; ++seq)
-            {
-                allocate_entry(entries_[layer][seq]);
-            }
-        }
-
-        // Initialize tensor_views_ storage for get_k()/get_v() wrappers
-        tensor_views_.resize(n_layers_);
-        for (int layer = 0; layer < n_layers_; ++layer)
-        {
-            tensor_views_[layer].resize(batch_size_);
-            // Views are created lazily in get_k()/get_v()
-        }
-
-        LOG_DEBUG("[ROCmRingKVCache] Allocated "
-                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
-                  << " MB total (including scratch)");
-
-        allocate_device_params();
+        allocate_all_entries();
     }
 
     template <ActivationPrecision Precision>
@@ -668,30 +599,7 @@ namespace llaminar2
 
         HipDeviceGuard::setDevice(device_id_);
 
-        // Allocate entries
-        entries_.resize(n_layers_);
-        for (int layer = 0; layer < n_layers_; ++layer)
-        {
-            entries_[layer].resize(batch_size_);
-            for (int seq = 0; seq < batch_size_; ++seq)
-            {
-                allocate_entry(entries_[layer][seq]);
-            }
-        }
-
-        // Initialize tensor_views_ storage for get_k()/get_v() wrappers
-        tensor_views_.resize(n_layers_);
-        for (int layer = 0; layer < n_layers_; ++layer)
-        {
-            tensor_views_[layer].resize(batch_size_);
-            // Views are created lazily in get_k()/get_v()
-        }
-
-        LOG_DEBUG("[ROCmRingKVCache] Allocated "
-                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
-                  << " MB total (including scratch)");
-
-        allocate_device_params();
+        allocate_all_entries();
     }
 
     template <ActivationPrecision Precision>
@@ -707,13 +615,139 @@ namespace llaminar2
 
         free_device_params();
 
-        for (auto &layer_entries : entries_)
+        if (pool_base_)
         {
-            for (auto &entry : layer_entries)
+            // All entries point into the single pool — free it once
+            free_pool();
+            // Null out entry pointers (they're dangling now)
+            for (auto &layer_entries : entries_)
             {
-                free_entry(entry);
+                for (auto &entry : layer_entries)
+                {
+                    entry.d_K = nullptr;
+                    entry.d_V = nullptr;
+                    entry.d_K_scratch = nullptr;
+                    entry.d_V_scratch = nullptr;
+                }
             }
         }
+        else
+        {
+            // Fallback: individually allocated entries
+            for (auto &layer_entries : entries_)
+            {
+                for (auto &entry : layer_entries)
+                {
+                    free_entry(entry);
+                }
+            }
+        }
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::allocate_pool()
+    {
+        size_t buffer_size = static_cast<size_t>(max_seq_len_) *
+                             static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
+        size_t total_entries = static_cast<size_t>(n_layers_) * static_cast<size_t>(batch_size_);
+        // 4 buffers per entry: K, V, K_scratch, V_scratch
+        pool_size_ = total_entries * 4 * buffer_size;
+
+        if (pool_size_ == 0)
+        {
+            pool_base_ = nullptr;
+            return;
+        }
+
+        hipError_t err = hipMalloc(&pool_base_, pool_size_);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmRingKVCache] Failed to allocate pooled KV cache ("
+                      << (pool_size_ / (1024 * 1024)) << " MB): "
+                      << hipGetErrorString(err));
+            pool_base_ = nullptr;
+            pool_size_ = 0;
+            return;
+        }
+
+        // Zero-initialize the entire pool
+        hipMemset(pool_base_, 0, pool_size_);
+
+        LOG_DEBUG("[ROCmRingKVCache] Pooled KV cache: 1 hipMalloc for "
+                  << total_entries << " entries × 4 buffers = "
+                  << (pool_size_ / (1024 * 1024)) << " MB (replaced "
+                  << (total_entries * 4) << " individual hipMalloc calls)");
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::free_pool()
+    {
+        if (pool_base_)
+        {
+            hipError_t err = hipFree(pool_base_);
+            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: hipFree(pool_base_) failed: %s\n",
+                        hipGetErrorString(err));
+            }
+            pool_base_ = nullptr;
+            pool_size_ = 0;
+        }
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::assign_entry_from_pool(EntryT &entry, int linear_index)
+    {
+        size_t buffer_size = static_cast<size_t>(max_seq_len_) *
+                             static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
+        char *base = static_cast<char *>(pool_base_);
+        size_t entry_offset = static_cast<size_t>(linear_index) * 4 * buffer_size;
+
+        entry.d_K = reinterpret_cast<DataT *>(base + entry_offset + 0 * buffer_size);
+        entry.d_V = reinterpret_cast<DataT *>(base + entry_offset + 1 * buffer_size);
+        entry.d_K_scratch = reinterpret_cast<DataT *>(base + entry_offset + 2 * buffer_size);
+        entry.d_V_scratch = reinterpret_cast<DataT *>(base + entry_offset + 3 * buffer_size);
+        entry.head = 0;
+        entry.count = 0;
+        entry.scratch_valid = false;
+    }
+
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::allocate_all_entries()
+    {
+        // Single pooled allocation for all KV cache entries
+        allocate_pool();
+
+        entries_.resize(n_layers_);
+        int linear_idx = 0;
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            entries_[layer].resize(batch_size_);
+            for (int seq = 0; seq < batch_size_; ++seq)
+            {
+                if (pool_base_)
+                {
+                    assign_entry_from_pool(entries_[layer][seq], linear_idx++);
+                }
+                else
+                {
+                    allocate_entry(entries_[layer][seq]); // Fallback if pool alloc failed
+                }
+            }
+        }
+
+        // Initialize tensor_views_ storage for get_k()/get_v() wrappers
+        tensor_views_.resize(n_layers_);
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            tensor_views_[layer].resize(batch_size_);
+        }
+
+        LOG_DEBUG("[ROCmRingKVCache] Allocated "
+                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                  << " MB total (including scratch)");
+
+        allocate_device_params();
     }
 
     template <ActivationPrecision Precision>

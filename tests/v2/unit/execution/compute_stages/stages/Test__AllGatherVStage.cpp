@@ -282,8 +282,12 @@ TEST_F(Test__AllGatherVStage, FactoryCreatesStage)
 
 /**
  * @test Verify AllGatherVStage reports correct coherence policy
+ *
+ * AllGatherVStage uses OUTPUT policy so the executor marks outputs dirty
+ * (flags only) after execution. The stage itself handles event recording
+ * for fine-grained synchronization when needed.
  */
-TEST_F(Test__AllGatherVStage, CoherencePolicyIsNone)
+TEST_F(Test__AllGatherVStage, CoherencePolicyIsOutput)
 {
     AllGatherVStage::Params params;
     params.mpi_ctx = mpi_ctx_.get();
@@ -292,8 +296,8 @@ TEST_F(Test__AllGatherVStage, CoherencePolicyIsNone)
 
     auto stage = std::make_unique<AllGatherVStage>(params);
 
-    // MPI stages handle their own synchronization
-    EXPECT_EQ(stage->coherencePolicy(), CoherencePolicy::NONE);
+    // Collective stages use OUTPUT policy for executor-managed dirty marking
+    EXPECT_EQ(stage->coherencePolicy(), CoherencePolicy::OUTPUT);
 }
 
 /**

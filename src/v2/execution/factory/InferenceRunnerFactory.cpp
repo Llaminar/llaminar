@@ -538,7 +538,7 @@ namespace llaminar2
             orchestrator->initializeGraphCache(graph_config.n_layers);
         }
 
-        // Initialize inference state (allocates buffers)
+        // Initialize inference state (allocates activation buffers + KV cache)
         // Pass mapped memory config for GPU zero-copy access
         InferenceStateInitConfig init_config;
         init_config.use_mapped_memory = config.use_mapped_memory;
@@ -597,71 +597,71 @@ namespace llaminar2
             ScopedWeightLoadDetailTimer timer("graph.build.collective_setup");
             if (local_tp_collectives_enabled)
             {
-            // Build local cluster inventory (detects CUDA/ROCm GPUs)
-            ClusterInventory cluster_inventory = buildLocalClusterInventory(mpi_ctx);
+                // Build local cluster inventory (detects CUDA/ROCm GPUs)
+                ClusterInventory cluster_inventory = buildLocalClusterInventory(mpi_ctx);
 
-            // Only enable GPU collectives if we have GPUs
-            if (cluster_inventory.hasAnyGPU())
-            {
-                // Create intra-node context which automatically selects:
-                // - NCCL for all-CUDA groups
-                // - RCCL for all-ROCm groups
-                // - MPI fallback for mixed or CPU-only groups
-                auto collective_ctx = CollectiveContextFactory::createIntraNode(
-                    cluster_inventory, mpi_ctx);
-                if (collective_ctx)
+                // Only enable GPU collectives if we have GPUs
+                if (cluster_inventory.hasAnyGPU())
                 {
-                    orchestrator->setCollectiveContext(std::move(collective_ctx));
-                    LOG_INFO("[InferenceRunner] GPU-native collectives enabled (NCCL/RCCL)");
+                    // Create intra-node context which automatically selects:
+                    // - NCCL for all-CUDA groups
+                    // - RCCL for all-ROCm groups
+                    // - MPI fallback for mixed or CPU-only groups
+                    auto collective_ctx = CollectiveContextFactory::createIntraNode(
+                        cluster_inventory, mpi_ctx);
+                    if (collective_ctx)
+                    {
+                        orchestrator->setCollectiveContext(std::move(collective_ctx));
+                        LOG_INFO("[InferenceRunner] GPU-native collectives enabled (NCCL/RCCL)");
+                    }
+                    else
+                    {
+                        LOG_WARN("[InferenceRunner] Failed to create CollectiveContext - using CPU MPI fallback");
+                    }
                 }
                 else
                 {
-                    LOG_WARN("[InferenceRunner] Failed to create CollectiveContext - using CPU MPI fallback");
+                    LOG_DEBUG("[InferenceRunner] No GPUs detected - using CPU MPI for collectives");
                 }
-            }
-            else
-            {
-                LOG_DEBUG("[InferenceRunner] No GPUs detected - using CPU MPI for collectives");
-            }
             }
             else if (mpi_ctx && mpi_ctx->world_size() > 1)
             {
-            // GLOBAL TP path: use MPI-based collectives from compute stages.
-            // Optional experiment path: route collective stages through
-            // DeviceGraphExecutor intercept + MPI-backed CollectiveContext.
-            if (env.execution.force_mpi_collective_context)
-            {
-                // Build CPU-only world inventory to force MPI backend selection
-                // without triggering NCCL/RCCL pre-initialization in BackendRouter.
-                ClusterInventory cluster_inventory;
-                cluster_inventory.world_size = mpi_ctx ? mpi_ctx->world_size() : 1;
-                cluster_inventory.ranks.resize(cluster_inventory.world_size);
-                for (int r = 0; r < cluster_inventory.world_size; ++r)
+                // GLOBAL TP path: use MPI-based collectives from compute stages.
+                // Optional experiment path: route collective stages through
+                // DeviceGraphExecutor intercept + MPI-backed CollectiveContext.
+                if (env.execution.force_mpi_collective_context)
                 {
-                    auto &rank_inv = cluster_inventory.ranks[r];
-                    rank_inv.rank = r;
-                    rank_inv.node_id = 0;
-                    rank_inv.local_rank = r;
-                    rank_inv.hostname = "localhost";
-                }
-                cluster_inventory.buildNodeAggregations();
+                    // Build CPU-only world inventory to force MPI backend selection
+                    // without triggering NCCL/RCCL pre-initialization in BackendRouter.
+                    ClusterInventory cluster_inventory;
+                    cluster_inventory.world_size = mpi_ctx ? mpi_ctx->world_size() : 1;
+                    cluster_inventory.ranks.resize(cluster_inventory.world_size);
+                    for (int r = 0; r < cluster_inventory.world_size; ++r)
+                    {
+                        auto &rank_inv = cluster_inventory.ranks[r];
+                        rank_inv.rank = r;
+                        rank_inv.node_id = 0;
+                        rank_inv.local_rank = r;
+                        rank_inv.hostname = "localhost";
+                    }
+                    cluster_inventory.buildNodeAggregations();
 
-                auto collective_ctx = CollectiveContextFactory::createIntraNode(cluster_inventory, mpi_ctx);
-                if (collective_ctx)
-                {
-                    orchestrator->setCollectiveContext(std::move(collective_ctx));
-                    LOG_INFO("[InferenceRunner] GLOBAL TP mode: forcing MPI-backed CollectiveContext via LLAMINAR_FORCE_MPI_COLLECTIVE_CONTEXT=1");
+                    auto collective_ctx = CollectiveContextFactory::createIntraNode(cluster_inventory, mpi_ctx);
+                    if (collective_ctx)
+                    {
+                        orchestrator->setCollectiveContext(std::move(collective_ctx));
+                        LOG_INFO("[InferenceRunner] GLOBAL TP mode: forcing MPI-backed CollectiveContext via LLAMINAR_FORCE_MPI_COLLECTIVE_CONTEXT=1");
+                    }
+                    else
+                    {
+                        LOG_WARN("[InferenceRunner] GLOBAL TP mode: failed to create MPI-backed CollectiveContext, using stage MPI path");
+                    }
                 }
                 else
                 {
-                    LOG_WARN("[InferenceRunner] GLOBAL TP mode: failed to create MPI-backed CollectiveContext, using stage MPI path");
+                    // Default GLOBAL TP behavior: use MPI-based collectives from compute stages.
+                    LOG_DEBUG("[InferenceRunner] GLOBAL TP mode: using stage MPI collectives (CollectiveContext disabled)");
                 }
-            }
-            else
-            {
-                // Default GLOBAL TP behavior: use MPI-based collectives from compute stages.
-                LOG_DEBUG("[InferenceRunner] GLOBAL TP mode: using stage MPI collectives (CollectiveContext disabled)");
-            }
             }
         }
 
@@ -842,7 +842,7 @@ namespace llaminar2
         else
         {
             LOG_DEBUG("[InferenceRunner] Parallel eager load workers=" << worker_count
-                                                                        << " weights=" << weights_to_load.size());
+                                                                       << " weights=" << weights_to_load.size());
             std::vector<std::future<void>> load_tasks;
             load_tasks.reserve(worker_count);
             for (unsigned i = 0; i < worker_count; ++i)
@@ -876,11 +876,10 @@ namespace llaminar2
         if (overlap_enabled)
         {
             gemm_pack_future = std::async(std::launch::async, [weight_mgr, device]()
-            {
+                                          {
                 ScopedWeightLoadTimer timer(WeightLoadPhase::GEMM_PACK);
                 ScopedWeightLoadDetailTimer detail_timer("weights.gemm_pack.async_work");
-                return weight_mgr->packGemmWeights(device);
-            });
+                return weight_mgr->packGemmWeights(device); });
         }
 
         bool non_gemm_upload_ok = true;
@@ -911,7 +910,7 @@ namespace llaminar2
         else
         {
             LOG_DEBUG("[InferenceRunner] Packed GEMM weights for " << device_name
-                                                                    << (overlap_enabled ? " (overlapped)" : ""));
+                                                                   << (overlap_enabled ? " (overlapped)" : ""));
         }
 
         if (!non_gemm_upload_ok)
@@ -1148,11 +1147,10 @@ namespace llaminar2
         if (pp_overlap_enabled)
         {
             pp_gemm_pack_future = std::async(std::launch::async, [weight_mgr, device]()
-            {
+                                             {
                 ScopedWeightLoadTimer timer(WeightLoadPhase::GEMM_PACK);
                 ScopedWeightLoadDetailTimer detail_timer("weights.pp.gemm_pack.async_work");
-                return weight_mgr->packGemmWeights(device);
-            });
+                return weight_mgr->packGemmWeights(device); });
         }
 
         bool pp_non_gemm_upload_ok = true;
@@ -1183,7 +1181,7 @@ namespace llaminar2
         else
         {
             LOG_DEBUG("[PPStageRunner] Packed GEMM weights for " << device_name
-                                                                  << (pp_overlap_enabled ? " (overlapped)" : ""));
+                                                                 << (pp_overlap_enabled ? " (overlapped)" : ""));
         }
 
         if (!pp_non_gemm_upload_ok)

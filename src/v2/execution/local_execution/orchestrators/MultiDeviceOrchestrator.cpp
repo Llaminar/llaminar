@@ -658,6 +658,24 @@ namespace llaminar2
         if (tp_ctx_ && tp_ctx_->degree() > 1)
         {
             const auto &devices = tp_ctx_->devices();
+
+            // Ensure GPU backend factories are registered before accessing contexts.
+            // Factory registration is deferred (not done at static init time) to avoid
+            // ~500-800ms CUDA enumeration cost when GPU backends are not needed.
+            // MultiDeviceOrchestrator needs contexts for compute stream registration
+            // before any DeviceGraphOrchestrator has had a chance to register them.
+            for (const auto &dev : devices)
+            {
+#ifdef HAVE_ROCM
+                if (dev.device_type == DeviceType::ROCm)
+                    ensureAMDFactoryRegistered();
+#endif
+#ifdef HAVE_CUDA
+                if (dev.device_type == DeviceType::CUDA)
+                    ensureNvidiaFactoryRegistered();
+#endif
+            }
+
             auto &pool = GPUDeviceContextPool::instance();
             std::vector<void *> compute_streams;
             compute_streams.reserve(devices.size());
@@ -1353,6 +1371,19 @@ namespace llaminar2
             if (!tp_worker_pool_)
             {
                 tp_worker_pool_ = std::make_unique<TPWorkerPool>(device_runners_.size());
+
+                // Wire abort callback: when one worker fails (exception or false return),
+                // abort the collective backend to unblock any workers stuck in NCCL/RCCL
+                // collective calls. Without this, a failed worker exits the forward pass
+                // while other workers block forever in ncclAllReduce waiting for all ranks.
+                if (tp_ctx_)
+                {
+                    tp_worker_pool_->setFailureCallback([this]()
+                                                        {
+                        LOG_WARN("[TPWorkerPool] Worker failure detected — aborting collective backend");
+                        tp_ctx_->requestAbort(); });
+                }
+
                 LOG_INFO("[TPWorkerPool] Created " << device_runners_.size()
                                                    << " persistent worker threads");
             }
@@ -1516,7 +1547,12 @@ namespace llaminar2
                 }
             }
 
-            if (need_gather && !gatherLogits(static_cast<size_t>(seq_len)))
+            // During prefill the LM head computes only 1 row of logits (the
+            // last-token position) written to row 0 of logits_local.  We must
+            // gather exactly 1 row; gathering seq_len rows would include
+            // uninitialised data in rows 1..seq_len-1.
+            size_t gather_rows = (seq_len > 1) ? 1 : static_cast<size_t>(seq_len);
+            if (need_gather && !gatherLogits(gather_rows))
             {
                 LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Failed to gather logits");
                 all_success = false;

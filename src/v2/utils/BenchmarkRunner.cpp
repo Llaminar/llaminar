@@ -95,15 +95,17 @@ namespace llaminar2
 
     std::pair<bool, double> BenchmarkRunner::runPrefill(const std::vector<int> &tokens)
     {
-        // Synchronize all ranks before timing
-        MPI_Barrier(MPI_COMM_WORLD);
+        // Synchronize all ranks before timing (skip for single-rank)
+        if (mpi_ctx_->world_size() > 1)
+            MPI_Barrier(mpi_ctx_->comm());
 
         auto start = std::chrono::high_resolution_clock::now();
 
         bool success = runner_->forward(tokens.data(), tokens.size());
 
         // Synchronize after forward for accurate timing
-        MPI_Barrier(MPI_COMM_WORLD);
+        if (mpi_ctx_->world_size() > 1)
+            MPI_Barrier(mpi_ctx_->comm());
 
         auto end = std::chrono::high_resolution_clock::now();
         double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -122,8 +124,9 @@ namespace llaminar2
         const bool profile_sampler = debugEnv().profile.enabled;
         double sampler_total_us = 0.0;
 
-        // Synchronize before timing decode phase
-        MPI_Barrier(MPI_COMM_WORLD);
+        // Synchronize before timing decode phase (skip for single-rank)
+        if (mpi_ctx_->world_size() > 1)
+            MPI_Barrier(mpi_ctx_->comm());
 
         auto start = std::chrono::high_resolution_clock::now();
 
@@ -160,8 +163,9 @@ namespace llaminar2
                 }
             }
 
-            // Broadcast token to all ranks
-            MPI_Bcast(&next_token, 1, MPI_INT, 0, MPI_COMM_WORLD);
+            // Broadcast token to all ranks (skip for single-rank)
+            if (mpi_ctx_->world_size() > 1)
+                MPI_Bcast(&next_token, 1, MPI_INT, 0, mpi_ctx_->comm());
 
             // Check for stop token
             if (tokenizer_->is_stop_token(next_token))
@@ -175,15 +179,17 @@ namespace llaminar2
             if (!runner_->forward(&next_token, 1))
             {
                 // Synchronize on failure
-                MPI_Barrier(MPI_COMM_WORLD);
+                if (mpi_ctx_->world_size() > 1)
+                    MPI_Barrier(mpi_ctx_->comm());
                 auto end = std::chrono::high_resolution_clock::now();
                 double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
                 return {false, time_ms, tokens_generated, generated_text};
             }
         }
 
-        // Synchronize after decode phase
-        MPI_Barrier(MPI_COMM_WORLD);
+        // Synchronize after decode phase (skip for single-rank)
+        if (mpi_ctx_->world_size() > 1)
+            MPI_Barrier(mpi_ctx_->comm());
 
         auto end = std::chrono::high_resolution_clock::now();
         double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -233,8 +239,9 @@ namespace llaminar2
             }
         }
 
-        // Broadcast token count
-        MPI_Bcast(&token_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        // Broadcast token count (skip for single-rank)
+        if (mpi_ctx_->world_size() > 1)
+            MPI_Bcast(&token_count, 1, MPI_INT, 0, mpi_ctx_->comm());
 
         if (token_count <= 0)
         {
@@ -246,7 +253,8 @@ namespace llaminar2
         {
             tokens.resize(token_count);
         }
-        MPI_Bcast(tokens.data(), token_count, MPI_INT, 0, MPI_COMM_WORLD);
+        if (mpi_ctx_->world_size() > 1)
+            MPI_Bcast(tokens.data(), token_count, MPI_INT, 0, mpi_ctx_->comm());
 
         result.prefill_tokens = token_count;
 

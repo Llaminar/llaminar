@@ -651,8 +651,10 @@ int main(int argc, char *argv[])
     }
 
     // ========================================================================
-    // MPI Runtime - We are running under mpirun
+    // Runtime Initialization (MPI child process)
     // ========================================================================
+
+    std::shared_ptr<MPIContext> mpi_ctx;
 
     // OpenMPI vader's default CMA single-copy path can emit noisy
     // "Read -1, expected ..., errno = 1" warnings in containerized environments
@@ -669,10 +671,9 @@ int main(int argc, char *argv[])
     // Re-parse arguments (MPI_Init may modify argc/argv)
     config = parser.parseArgs(argc, argv);
 
-    auto mpi_ctx = MPIContextFactory::global();
+    mpi_ctx = MPIContextFactory::global();
 
     // MPI runtime should rely on launcher-provided affinity/thread settings
-    // (e.g. run_llaminar.sh + mpirun binding), not retune OpenMP internally.
     if (std::getenv("OMP_NUM_THREADS") == nullptr)
     {
         LOG_WARN("[Main] Running under MPI without OMP_NUM_THREADS set. For strict per-rank core pinning, "
@@ -689,6 +690,7 @@ int main(int argc, char *argv[])
 
     const bool cpu_global_mode = config.cpu_global_tp_all_local;
 
+    // CPU affinity verification (for CPU modes where NUMA pinning matters)
     if (cpu_explicit_numa_mode || cpu_global_mode)
     {
         int required_numa = -1;
@@ -728,7 +730,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    // CPU shorthand runtime semantics (inside MPI runtime):
+    // CPU shorthand runtime semantics:
     // convert `-d cpu` into explicit per-rank CPU mapping and GLOBAL TP config.
     if (config.cpu_global_tp_all_local)
     {
@@ -764,6 +766,11 @@ int main(int argc, char *argv[])
 
     // Set logger rank for log output
     Logger::getInstance().setRank(mpi_ctx->rank());
+
+    auto mpi_finalize = [&]()
+    {
+        MPI_Finalize();
+    };
 
     if (mpi_ctx->rank() == 0)
     {
@@ -849,7 +856,7 @@ int main(int argc, char *argv[])
         {
             LOG_INFO("[Main] --dry-run requested: configuration validated, skipping model load/inference");
         }
-        MPI_Finalize();
+        mpi_finalize();
         return 0;
     }
 
@@ -861,7 +868,7 @@ int main(int argc, char *argv[])
             LOG_ERROR("Error: Model path required (-m)\n\n");
             std::cout << OrchestrationConfigParser::getHelpText() << std::endl;
         }
-        MPI_Finalize();
+        mpi_finalize();
         return 1;
     }
 
@@ -878,7 +885,7 @@ int main(int argc, char *argv[])
         {
             LOG_ERROR("Error: Failed to create orchestration runner");
         }
-        MPI_Finalize();
+        mpi_finalize();
         return 1;
     }
 
@@ -888,7 +895,7 @@ int main(int argc, char *argv[])
         {
             LOG_ERROR("Failed to initialize: " << runner->lastError());
         }
-        MPI_Finalize();
+        mpi_finalize();
         return 1;
     }
 
@@ -900,7 +907,7 @@ int main(int argc, char *argv[])
         {
             LOG_ERROR("Failed to get tokenizer from runner");
         }
-        MPI_Finalize();
+        mpi_finalize();
         return 1;
     }
 
@@ -973,7 +980,7 @@ int main(int argc, char *argv[])
             {
                 LOG_ERROR("Chat mode requires a model with a chat template.");
                 LOG_ERROR("Use --chat-template to specify one (e.g., --chat-template chatml)");
-                MPI_Finalize();
+                mpi_finalize();
                 return 1;
             }
 
@@ -1044,16 +1051,17 @@ int main(int argc, char *argv[])
             int result = chat_ui.run();
 
             runner->shutdown();
-            MPI_Finalize();
+            mpi_finalize();
             return result;
         }
         else
         {
             // Non-rank-0 processes wait for chat to complete
             // TODO: Implement proper multi-rank chat support
-            MPI_Barrier(MPI_COMM_WORLD);
+            if (mpi_ctx->world_size() > 1)
+                MPI_Barrier(mpi_ctx->comm());
             runner->shutdown();
-            MPI_Finalize();
+            mpi_finalize();
             return 0;
         }
     }
@@ -1070,9 +1078,10 @@ int main(int argc, char *argv[])
                 LOG_ERROR("Chat mode requires a model with a chat template.");
                 LOG_ERROR("Use --chat-template to specify one (e.g., --chat-template chatml)");
             }
-            MPI_Barrier(MPI_COMM_WORLD);
+            if (mpi_ctx->world_size() > 1)
+                MPI_Barrier(mpi_ctx->comm());
             runner->shutdown();
-            MPI_Finalize();
+            mpi_finalize();
             return 1;
         }
 
@@ -1110,12 +1119,13 @@ int main(int argc, char *argv[])
         }
 
         // Broadcast token count first (to handle errors and allocate on other ranks)
-        MPI_Bcast(&token_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        if (mpi_ctx->world_size() > 1)
+            MPI_Bcast(&token_count, 1, MPI_INT, 0, mpi_ctx->comm());
 
         if (token_count <= 0)
         {
             runner->shutdown();
-            MPI_Finalize();
+            mpi_finalize();
             return 1;
         }
 
@@ -1124,7 +1134,8 @@ int main(int argc, char *argv[])
         {
             token_ids.resize(token_count);
         }
-        MPI_Bcast(token_ids.data(), token_count, MPI_INT, 0, MPI_COMM_WORLD);
+        if (mpi_ctx->world_size() > 1)
+            MPI_Bcast(token_ids.data(), token_count, MPI_INT, 0, mpi_ctx->comm());
 
         // All ranks participate in prefill
         if (mpi_ctx->rank() == 0)
@@ -1139,7 +1150,7 @@ int main(int argc, char *argv[])
                 LOG_ERROR("Chat prefill failed: " << runner->lastError());
             }
             runner->shutdown();
-            MPI_Finalize();
+            mpi_finalize();
             return 1;
         }
 
@@ -1168,7 +1179,7 @@ int main(int argc, char *argv[])
                     LOG_ERROR("Decode step failed: " << result.error);
                 }
                 runner->shutdown();
-                MPI_Finalize();
+                mpi_finalize();
                 return 1;
             }
 
@@ -1205,7 +1216,7 @@ int main(int argc, char *argv[])
         }
 
         runner->shutdown();
-        MPI_Finalize();
+        mpi_finalize();
         return 0;
     }
 
@@ -1308,7 +1319,7 @@ int main(int argc, char *argv[])
         benchmark.printResults(result);
 
         runner->shutdown();
-        MPI_Finalize();
+        mpi_finalize();
         return result.success ? 0 : 1;
     }
 
@@ -1331,7 +1342,7 @@ int main(int argc, char *argv[])
                 LOG_ERROR("Tokenization resulted in empty token sequence");
             }
             runner->shutdown();
-            MPI_Finalize();
+            mpi_finalize();
             return 1;
         }
 
@@ -1357,7 +1368,7 @@ int main(int argc, char *argv[])
             LOG_ERROR("Error tokenizing prompt: " << e.what());
         }
         runner->shutdown();
-        MPI_Finalize();
+        mpi_finalize();
         return 1;
     }
 
@@ -1390,7 +1401,7 @@ int main(int argc, char *argv[])
             LOG_ERROR("Error: Prefill forward pass failed: " << runner->lastError());
         }
         runner->shutdown();
-        MPI_Finalize();
+        mpi_finalize();
         return 1;
     }
 
@@ -1427,7 +1438,7 @@ int main(int argc, char *argv[])
                 LOG_ERROR("\nError: Decode step failed at token " << (i + 1) << ": " << result.error);
             }
             runner->shutdown();
-            MPI_Finalize();
+            mpi_finalize();
             return 1;
         }
 
@@ -1478,6 +1489,6 @@ int main(int argc, char *argv[])
         mpi_ctx->barrier();
     }
 
-    MPI_Finalize();
+    mpi_finalize();
     return 0;
 }

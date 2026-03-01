@@ -154,6 +154,19 @@ namespace llaminar2
         virtual void *getWorkspace(size_t bytes) = 0;
 
         /**
+         * @brief Make this device the active device on the calling thread
+         *
+         * Sets the thread-local GPU device context so that subsequent
+         * CUDA/ROCm API calls (e.g. cudaFuncSetAttribute, kernel launches)
+         * target the correct device. Essential for multi-GPU TP execution
+         * where each worker thread must activate its assigned device.
+         *
+         * CPU: No-op
+         * GPU: Delegates to IBackend::setDevice()
+         */
+        virtual void activateDevice() {}
+
+        /**
          * @brief Get available device memory
          * @return Free memory in bytes
          */
@@ -389,6 +402,7 @@ namespace llaminar2
         ~CUDADeviceContext() override;
 
         std::string deviceName() const override;
+        void activateDevice() override;
 
         // Synchronization
         void synchronize() override;
@@ -427,6 +441,7 @@ namespace llaminar2
         ~ROCmDeviceContext() override;
 
         std::string deviceName() const override;
+        void activateDevice() override;
 
         // Synchronization
         void synchronize() override;

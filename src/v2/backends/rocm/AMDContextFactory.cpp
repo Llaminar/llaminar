@@ -57,6 +57,13 @@ namespace llaminar2
                 return;
             }
 
+            const char *skip_rocm_env = std::getenv("LLAMINAR_SKIP_ROCM_STARTUP");
+            if (skip_rocm_env && std::atoi(skip_rocm_env) != 0)
+            {
+                LOG_INFO("[AMDContextFactory] Skipping ROCm factory registration (LLAMINAR_SKIP_ROCM_STARTUP=1)");
+                return;
+            }
+
             auto &pool = GPUDeviceContextPool::instance();
             if (pool.hasAMDSupport())
                 return; // Already registered

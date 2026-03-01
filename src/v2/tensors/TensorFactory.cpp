@@ -284,6 +284,65 @@ namespace llaminar2
         }
     }
 
+    std::unique_ptr<TensorBase> TensorFactory::createQuantizedZeroCopy(
+        TensorType type,
+        const std::vector<size_t> &shape,
+        const uint8_t *mmap_data,
+        size_t byte_size,
+        std::shared_ptr<void> mmap_lifetime_owner)
+    {
+        // No NUMA binding needed — data lives in mmap'd memory, not heap-allocated
+
+        switch (type)
+        {
+        case TensorType::IQ4_NL:
+            return std::make_unique<IQ4_NLTensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::Q8_0:
+            return std::make_unique<Q8_0Tensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::Q4_0:
+            return std::make_unique<Q4_0Tensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::Q4_1:
+            return std::make_unique<Q4_1Tensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::Q5_0:
+            return std::make_unique<Q5_0Tensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::Q5_1:
+            return std::make_unique<Q5_1Tensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::Q6_K:
+            return std::make_unique<Q6_KTensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::Q2_K:
+            return std::make_unique<Q2_KTensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::Q5_K:
+            return std::make_unique<Q5_KTensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::Q3_K:
+            return std::make_unique<Q3_KTensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::Q4_K:
+            return std::make_unique<Q4_KTensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::Q8_K:
+            return std::make_unique<Q8_KTensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::IQ4_XS:
+            return std::make_unique<IQ4_XSTensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::IQ2_XXS:
+            return std::make_unique<IQ2_XXSTensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::IQ2_XS:
+            return std::make_unique<IQ2_XSTensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::IQ3_XXS:
+            return std::make_unique<IQ3_XXSTensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::IQ2_S:
+            return std::make_unique<IQ2_STensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::IQ3_S:
+            return std::make_unique<IQ3_STensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::IQ1_S:
+            return std::make_unique<IQ1_STensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::IQ1_M:
+            return std::make_unique<IQ1_MTensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        default:
+            LOG_ERROR("TensorFactory::createQuantizedZeroCopy: unsupported type " << static_cast<int>(type));
+            std::ostringstream oss;
+            oss << "TensorFactory::createQuantizedZeroCopy: unsupported type " << static_cast<int>(type);
+            throw std::runtime_error(oss.str());
+        }
+    }
+
     void TensorFactory::ensureNumaBinding()
     {
         if (numa_node_ >= 0)

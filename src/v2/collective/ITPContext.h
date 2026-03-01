@@ -145,13 +145,16 @@ namespace llaminar2
          * @param stage_name Stage identifier
          * @param count Elements to reduce (0 = use tensor->numel())
          * @param stream GPU stream (hipStream_t/cudaStream_t cast to void*), or nullptr
+         * @param precision Override precision ("fp32", "fp16", "bf16"). Empty string = use global default.
          * @return true on success, false on error
          */
         virtual bool allreduceOnStream(TensorBase *tensor, const std::string &stage_name,
-                                       size_t count, void *stream)
+                                       size_t count, void *stream,
+                                       const std::string &precision = "")
         {
             (void)stream;
-            // Default: delegate to normal allreduce, ignoring stream
+            (void)precision;
+            // Default: delegate to normal allreduce, ignoring stream and precision
             return allreduce(tensor, stage_name, count);
         }
 

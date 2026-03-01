@@ -112,6 +112,7 @@ namespace llaminar2
             bool cudaQuantGemm_copyInt32DeviceToHost(int32_t *h_dst, const int32_t *d_src, size_t count, int cuda_device_id);
             bool cudaQuantGemm_copyDeviceToDeviceAsync(float *d_dst, const float *d_src, size_t count, int cuda_device_id, void *stream);
             bool cudaQuantGemm_setDevice(int cuda_device_id);
+            bool cudaQuantGemm_streamSync(int cuda_device_id, void *stream);
         }
 
         // =====================================================================
@@ -647,11 +648,10 @@ namespace llaminar2
                     d_mapped_output = d_C;
                     d_C = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
                     static std::once_flag q8_mapped_once;
-                    std::call_once(q8_mapped_once, [&]() {
-                        LOG_WARN("[CUDAQuantisedGemmKernel] Q8→FP32 MAPPED REDIRECT: M=" << m << " N=" << n
-                                 << " mapped_ptr=" << d_mapped_output << " -> workspace=" << d_C
-                                 << " (" << (static_cast<size_t>(m) * n * 4 / 1024) << " KB)");
-                    });
+                    std::call_once(q8_mapped_once, [&]()
+                                   { LOG_WARN("[CUDAQuantisedGemmKernel] Q8→FP32 MAPPED REDIRECT: M=" << m << " N=" << n
+                                                                                                      << " mapped_ptr=" << d_mapped_output << " -> workspace=" << d_C
+                                                                                                      << " (" << (static_cast<size_t>(m) * n * 4 / 1024) << " KB)"); });
                 }
 
                 bool success = multiply_q8_to_fp32(d_A_q8, d_C, m, n, k, alpha, beta);
@@ -685,11 +685,10 @@ namespace llaminar2
                     d_mapped_output = d_C;
                     d_C = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
                     static std::once_flag fp32_mapped_once;
-                    std::call_once(fp32_mapped_once, [&]() {
-                        LOG_WARN("[CUDAQuantisedGemmKernel] FP32→FP32 MAPPED REDIRECT: M=" << m << " N=" << n
-                                 << " mapped_ptr=" << d_mapped_output << " -> workspace=" << d_C
-                                 << " (" << (static_cast<size_t>(m) * n * 4 / 1024) << " KB)");
-                    });
+                    std::call_once(fp32_mapped_once, [&]()
+                                   { LOG_WARN("[CUDAQuantisedGemmKernel] FP32→FP32 MAPPED REDIRECT: M=" << m << " N=" << n
+                                                                                                        << " mapped_ptr=" << d_mapped_output << " -> workspace=" << d_C
+                                                                                                        << " (" << (static_cast<size_t>(m) * n * 4 / 1024) << " KB)"); });
                 }
 
                 // Apply activation row offset

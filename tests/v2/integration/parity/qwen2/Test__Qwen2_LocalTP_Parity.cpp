@@ -50,7 +50,7 @@ static const std::vector<TestConfig> kLocalTPConfigs = {
             .decode_cosine_threshold = 0.90f,
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.25f, // Relaxed from 0.20 - TP introduces quantization variance
+            .kl_threshold = 0.35f, // INT8 CUTLASS GEMM + column-parallel TP adds quantization variance
             .excluded_stages = kTPExcludedStages,
         },
     },

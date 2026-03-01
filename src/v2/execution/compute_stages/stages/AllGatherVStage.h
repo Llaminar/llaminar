@@ -65,7 +65,7 @@ namespace llaminar2
         StageDumpInfo buildDumpInfoImpl() const override;
 
         /// MPI stages handle their own synchronization - no automatic coherence
-        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
+        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::OUTPUT; }
 
         /// Check if this stage uses the new CollectiveContext
         bool usesCollectiveContext() const { return params_.collective_ctx != nullptr; }

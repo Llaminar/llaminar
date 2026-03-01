@@ -81,8 +81,9 @@ extern "C"
         int device_idx,
         void *stream)
     {
-        if (!stream)
-            cudaSetDevice(device_idx);
+        // Always set device — stream carries device context but kernel launch
+        // uses the runtime's current-device for PTX code lookup.
+        cudaSetDevice(device_idx);
 
         int threads_per_block = 256;
         int num_blocks = (size + threads_per_block - 1) / threads_per_block;
@@ -107,8 +108,9 @@ extern "C"
         int device_idx,
         void *stream)
     {
-        if (!stream)
-            cudaSetDevice(device_idx);
+        // Always set device — stream carries device context but kernel launch
+        // uses the runtime's current-device for PTX code lookup.
+        cudaSetDevice(device_idx);
 
         int threads_per_block = 256;
         int num_blocks = (size + threads_per_block - 1) / threads_per_block;
@@ -133,8 +135,9 @@ extern "C"
         int device_idx,
         void *stream)
     {
-        if (!stream)
-            cudaSetDevice(device_idx);
+        // Always set device — stream carries device context but kernel launch
+        // uses the runtime's current-device for PTX code lookup.
+        cudaSetDevice(device_idx);
 
         int threads_per_block = 256;
         int num_blocks = (size + threads_per_block - 1) / threads_per_block;

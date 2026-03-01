@@ -60,6 +60,37 @@ namespace llaminar2
           view_byte_offset_(view_byte_offset), parent_(parent), device_(DeviceId::cpu()), device_blocks_(nullptr)
     {
     }
+    // Zero-copy constructor for mmap-backed data
+    IQ2_XXSTensor::IQ2_XXSTensor(const std::vector<size_t> &shape,
+          const uint8_t *mmap_data,
+          size_t byte_size,
+          std::shared_ptr<void> mmap_lifetime_owner)
+        : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(mmap_data),
+          view_byte_offset_(0), parent_(nullptr), mmap_owner_(std::move(mmap_lifetime_owner)),
+          data_byte_size_(byte_size), device_(DeviceId::cpu()), device_blocks_(nullptr)
+    {
+        if (shape.empty())
+        {
+            throw std::invalid_argument("IQ2_XXSTensor: shape cannot be empty");
+        }
+
+        size_t n_elems = 1;
+        for (auto dim : shape)
+        {
+            n_elems *= dim;
+        }
+
+        size_t n_blocks = (n_elems + IQ2_XXSBlock::BLOCK_SIZE - 1) / IQ2_XXSBlock::BLOCK_SIZE;
+        size_t expected_bytes = n_blocks * sizeof(IQ2_XXSBlock);
+
+        if (byte_size < expected_bytes)
+        {
+            throw std::invalid_argument("IQ2_XXSTensor: insufficient mmap data (" +
+                                        std::to_string(byte_size) + " bytes, expected " +
+                                        std::to_string(expected_bytes) + ")");
+        }
+    }
+
 
     // View creation (row-slice only - preserves K dimension)
     std::shared_ptr<TensorBase> IQ2_XXSTensor::create_view(

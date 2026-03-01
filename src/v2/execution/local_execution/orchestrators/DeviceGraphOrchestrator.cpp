@@ -1783,17 +1783,21 @@ namespace llaminar2
         // Logits ALWAYS use mapped memory on GPU devices (regardless of init_config)
         // because logits are returned to the caller for sampling - they must be host-accessible.
         // Mapped memory avoids the slow synchronous hipMemcpy/cudaMemcpy in ensureOnHost().
+        // LM head always computes M=1 (last token only), so logits is [batch_size, vocab_size].
+        // This reduces allocation from [max_seq×vocab] (>1 GB) to [batch×vocab] (<1 MB).
         if (device.is_gpu())
         {
             state_.logits = FP32Tensor::createMapped(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(vocab_size)},
+                {static_cast<size_t>(batch_size), static_cast<size_t>(vocab_size)},
                 device);
-            LOG_INFO("[DeviceGraphOrchestrator] Allocated logits with mapped memory (zero-copy for sampling)");
+            LOG_INFO("[DeviceGraphOrchestrator] Allocated logits with mapped memory (zero-copy for sampling)"
+                     << " [" << batch_size << " × " << vocab_size << "] = "
+                     << (batch_size * vocab_size * sizeof(float) / (1024 * 1024)) << " MB");
         }
         else
         {
             state_.logits = factory.createFP32(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(vocab_size)},
+                {static_cast<size_t>(batch_size), static_cast<size_t>(vocab_size)},
                 device);
         }
 
@@ -1801,10 +1805,10 @@ namespace llaminar2
         if (config.lm_head_column_parallel && config.vocab_local > 0)
         {
             state_.logits_local = factory.createFP32(
-                std::vector<size_t>{static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(config.vocab_local)},
+                std::vector<size_t>{static_cast<size_t>(batch_size), static_cast<size_t>(config.vocab_local)},
                 device);
             LOG_DEBUG("[DeviceGraphOrchestrator] Allocated logits_local buffer: ["
-                      << batch_size * max_seq_len << ", " << config.vocab_local << "]");
+                      << batch_size << ", " << config.vocab_local << "]");
         }
 
         // Allocate norm buffer (FP32 - output of RMSNorm for GEMM input)
@@ -2497,15 +2501,15 @@ namespace llaminar2
         }
 
         // Return pointer to logits for requested sequence
-        // Layout: [batch_size * padded_seq_len, vocab_size]
-        // For sequence seq_idx, logits start at row (seq_idx * padded_seq_len_)
+        // Layout: [batch_size, vocab_size] (LM head always computes M=1 per batch entry)
+        // For sequence seq_idx, logits start at row seq_idx
         const float *base = state_.logits->fp32_data();
         if (!base)
         {
             return nullptr;
         }
 
-        return base + (seq_idx * padded_seq_len_ * state_.vocab_size);
+        return base + (seq_idx * state_.vocab_size);
     }
 
     int DeviceGraphOrchestrator::getPosition(int seq_idx) const

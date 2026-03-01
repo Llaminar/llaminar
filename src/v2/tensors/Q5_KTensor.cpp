@@ -71,6 +71,36 @@ namespace llaminar2
           device_blocks_(nullptr)
     {
     }
+    // Zero-copy constructor for mmap-backed data
+    Q5_KTensor::Q5_KTensor(const std::vector<size_t> &shape,
+                           const uint8_t *mmap_data,
+                           size_t byte_size,
+                           std::shared_ptr<void> mmap_lifetime_owner)
+        : shape_(shape), raw_data_(), device_(DeviceId::cpu()), device_blocks_(nullptr),
+          is_view_(true), raw_data_ptr_(mmap_data), view_byte_offset_(0),
+          parent_(nullptr), mmap_owner_(std::move(mmap_lifetime_owner)), data_byte_size_(byte_size)
+    {
+        if (shape.empty())
+        {
+            throw std::invalid_argument("Q5_KTensor: shape cannot be empty");
+        }
+
+        size_t n_elems = 1;
+        for (auto dim : shape)
+        {
+            n_elems *= dim;
+        }
+
+        size_t n_blocks = (n_elems + Q5_KBlock::BLOCK_SIZE - 1) / Q5_KBlock::BLOCK_SIZE;
+        size_t expected_bytes = n_blocks * sizeof(Q5_KBlock);
+
+        if (byte_size < expected_bytes)
+        {
+            throw std::invalid_argument("Q5_KTensor: insufficient mmap data (" +
+                                        std::to_string(byte_size) + " bytes, expected " +
+                                        std::to_string(expected_bytes) + ")");
+        }
+    }
 
     std::shared_ptr<TensorBase> Q5_KTensor::create_view(
         const std::vector<size_t> &new_shape,
@@ -516,7 +546,6 @@ namespace llaminar2
     }
 
     Q5_KTensor::~Q5_KTensor() {}
-
 
     const float *Q5_KTensor::data() const
     {

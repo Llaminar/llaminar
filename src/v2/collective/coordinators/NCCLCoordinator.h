@@ -91,6 +91,18 @@ namespace llaminar2
         void shutdown() override;
 
         /**
+         * @brief Abort all NCCL communicators to unblock stuck collective operations
+         *
+         * Calls ncclCommAbort() on every communicator to immediately unblock
+         * any threads waiting in NCCL collective calls (allreduce, etc.).
+         * After abort, the communicators are invalidated and no further
+         * collectives should be attempted.
+         *
+         * Thread-safe: can be called from any thread.
+         */
+        void abortCommunicators();
+
+        /**
          * @brief Check if coordinator is initialized and ready
          */
         bool isInitialized() const override { return initialized_.load(); }

@@ -2557,9 +2557,12 @@ namespace llaminar2
         bool tp_timing = false;      ///< Enable TP forward timing breakdown (env: LLAMINAR_TP_TIMING)
         bool skip_allreduce = false; ///< DIAGNOSTIC: Skip allreduce for profiling (env: LLAMINAR_SKIP_ALLREDUCE)
 
-        /// Allreduce precision: "fp16", "bf16", or "fp32" (env: LLAMINAR_ALLREDUCE_PRECISION, default: "fp16")
+        /// Global allreduce precision fallback: "fp16", "bf16", or "fp32"
+        /// (env: LLAMINAR_ALLREDUCE_PRECISION, default: "fp32")
+        /// This is the ULTIMATE FALLBACK — per-layer precision from the model schema
+        /// takes priority. Only used when no schema-level precision is configured.
         /// FP16/BF16 halves PCIe transfer bandwidth; FP32 is lossless but slower on bandwidth-limited links.
-        std::string allreduce_precision = "fp16";
+        std::string allreduce_precision = "fp32";
 
         /// Timeout in ms for TPWorkerPool::collectAll() (env: LLAMINAR_TP_COLLECT_TIMEOUT_MS, default: 0 = unlimited)
         /// 0 means wait forever (normal operation). Set to e.g. 30000 for a 30s safety net if debugging hangs.

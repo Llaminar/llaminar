@@ -7,9 +7,10 @@
  * GPUDeviceContextPool (which lives in llaminar2_core) to create
  * NvidiaDeviceContext instances without directly depending on CUDA headers.
  *
- * NOTE: The static initializer works reliably here because nvcc device linking
- * forces inclusion of all .cu object files. The public function
- * ensureNvidiaFactoryRegistered() is provided for symmetry with the AMD path.
+ * NOTE: The static initializer is intentionally a no-op to avoid ~500-800ms
+ * CUDA enumeration during process startup (before main). Registration is
+ * deferred to ensureNvidiaFactoryRegistered(), called explicitly by
+ * DeviceGraphOrchestrator when a CUDA context is first needed.
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -56,6 +57,13 @@ namespace llaminar2
                 return;
             }
 
+            const char *skip_cuda_env = std::getenv("LLAMINAR_SKIP_CUDA_STARTUP");
+            if (skip_cuda_env && std::atoi(skip_cuda_env) != 0)
+            {
+                LOG_INFO("[NvidiaContextFactory] Skipping CUDA factory registration (LLAMINAR_SKIP_CUDA_STARTUP=1)");
+                return;
+            }
+
             auto &pool = GPUDeviceContextPool::instance();
             if (pool.hasNvidiaSupport())
                 return; // Already registered
@@ -78,25 +86,26 @@ namespace llaminar2
         /**
          * @brief RAII helper for static initialization registration
          *
-         * This struct's constructor runs during static initialization (before main)
-         * to register the NVIDIA factory with GPUDeviceContextPool.
+         * NOTE: The static constructor intentionally does NOT enumerate CUDA
+         * devices. GPU enumeration during static init runs before main() and
+         * cannot be controlled by environment variables or CLI flags, adding
+         * ~500-800ms to every process start even when CUDA is not needed.
+         *
+         * Actual registration is deferred to ensureNvidiaFactoryRegistered()
+         * which is called explicitly from DeviceGraphOrchestrator when a CUDA
+         * context is first needed. This makes startup zero-cost when only
+         * ROCm or CPU backends are used.
          */
         struct NvidiaFactoryRegistrar
         {
             NvidiaFactoryRegistrar()
             {
-                try
-                {
-                    doRegisterNvidiaFactory();
-                }
-                catch (const std::exception &e)
-                {
-                    LOG_WARN("[NvidiaContextFactory] Failed to register CUDA factory: " << e.what());
-                }
+                // Intentionally empty - registration deferred to
+                // ensureNvidiaFactoryRegistered() for controllable startup.
             }
         };
 
-        // Static instance triggers registration during library load
+        // Static instance kept for linker inclusion (ensures TU is not stripped)
         static NvidiaFactoryRegistrar nvidia_factory_registrar;
 
     } // anonymous namespace

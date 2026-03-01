@@ -314,6 +314,13 @@ namespace llaminar2
         const char *cpu_only_env = std::getenv("LLAMINAR_FORCE_CPU_ONLY_STARTUP");
         const bool force_cpu_only_startup = (cpu_only_env && std::atoi(cpu_only_env) != 0);
 
+        // Selective backend skip: when we know the target backend, skip the other(s)
+        // to avoid expensive GPU driver initialization (~250ms per CUDA device).
+        const char *skip_cuda_env = std::getenv("LLAMINAR_SKIP_CUDA_STARTUP");
+        const bool skip_cuda = (skip_cuda_env && std::atoi(skip_cuda_env) != 0);
+        const char *skip_rocm_env = std::getenv("LLAMINAR_SKIP_ROCM_STARTUP");
+        const bool skip_rocm = (skip_rocm_env && std::atoi(skip_rocm_env) != 0);
+
         // Enumerate GPUs with optional NUMA filtering
         std::vector<ComputeDevice> cuda_devices;
         std::vector<ComputeDevice> rocm_devices;
@@ -321,8 +328,16 @@ namespace llaminar2
 
         if (!force_cpu_only_startup)
         {
-            cuda_devices = enumerate_cuda_devices();
-            rocm_devices = enumerate_rocm_devices();
+            if (!skip_cuda)
+                cuda_devices = enumerate_cuda_devices();
+            else
+                LOG_INFO("[DeviceManager] Skipping CUDA enumeration (LLAMINAR_SKIP_CUDA_STARTUP=1)");
+
+            if (!skip_rocm)
+                rocm_devices = enumerate_rocm_devices();
+            else
+                LOG_INFO("[DeviceManager] Skipping ROCm enumeration (LLAMINAR_SKIP_ROCM_STARTUP=1)");
+
             vulkan_devices = enumerate_vulkan_devices();
         }
         else

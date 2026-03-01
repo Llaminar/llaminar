@@ -546,6 +546,7 @@ namespace llaminar2
             }
             TensorFactory metadata_factory(*metadata_mpi_ctx);
             ModelLoader metadata_loader(&metadata_factory);
+            metadata_loader.setUseMmap(false); // Only reading header metadata, skip mmap
             if (metadata_loader.loadModel(config_.model_path))
             {
                 model_config.n_layers = static_cast<int>(metadata_loader.blockCount());
@@ -928,6 +929,7 @@ namespace llaminar2
         ModelContextConfig weight_config = ModelContextConfig::fromExecutionPlan(plan_);
         weight_config.mpi_ctx = mpi_ctx_;
         weight_config.weight_precision = WeightPrecision::NATIVE;
+        weight_config.use_mmap = config_.use_mmap;
 
         // Validate config
         auto errors = weight_config.validate();

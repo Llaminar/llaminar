@@ -320,7 +320,8 @@ TEST_F(Test__CollectiveStageIntegration, AllGatherStage_WithoutContext_ReportsCo
     // Stage type and properties should still be correct
     EXPECT_EQ(stage.type(), ComputeStageType::ALLGATHER);
     EXPECT_TRUE(stage.requiresAllreduce());
-    EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::NONE);
+    // AllGatherStage uses OUTPUT policy for executor-managed dirty marking
+    EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::OUTPUT);
 }
 
 /**

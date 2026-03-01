@@ -170,6 +170,15 @@ namespace llaminar2
             // schema.kv_cache_scale = 8.0f;  // Default, explicit for documentation
 
             // Required parameters
+            // ==============================================================
+            // TP Allreduce Precision Policy
+            // ==============================================================
+            // First 6 layers use FP32 allreduce to preserve early-layer precision.
+            // Deeper layers can tolerate FP16 since individual errors have less
+            // compounding effect on final output quality.
+            schema.tp_allreduce_default_precision = "fp16";
+            schema.tp_allreduce_fp32_layer_count = 6;
+
             schema.required_params = {
                 "n_layers", "d_model", "n_heads", "n_kv_heads",
                 "head_dim", "d_ff", "vocab_size",

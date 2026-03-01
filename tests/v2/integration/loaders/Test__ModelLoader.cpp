@@ -792,8 +792,8 @@ TEST_F(Test__ModelLoader, GGUFValueAccessors)
     std::memcpy(val_string.data.data() + 8, str.c_str(), len);
     EXPECT_EQ(val_string.asString(), "test_string");
 
-    // Test wrong type returns default
-    EXPECT_EQ(val_uint32.asUInt64(), 0);
+    // Test cross-type widening (asUInt64 should widen UINT32)
+    EXPECT_EQ(val_uint32.asUInt64(), 12345);
     EXPECT_FLOAT_EQ(val_uint32.asFloat32(), 0.0f);
     EXPECT_EQ(val_uint32.asString(), "");
 

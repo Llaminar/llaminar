@@ -657,7 +657,8 @@ namespace llaminar2
     }
 
     bool LocalTPContext::allreduceOnStream(TensorBase *tensor, const std::string &stage_name,
-                                           size_t count, void *stream)
+                                           size_t count, void *stream,
+                                           const std::string &precision)
     {
         // When no stream is provided, fall back to the normal allreduce path
         if (!stream)
@@ -726,12 +727,13 @@ namespace llaminar2
         // =================================================================
         // FP16 mixed-precision allreduce path
         // =================================================================
-        // When enabled, FP32 allreduces cast to FP16 first so we transfer
-        // half the bytes across PCIe, then cast back. This is a pure
-        // bandwidth optimization — at 8.5 MB per allreduce on PCIe 3.0 x4,
-        // halving the payload saves ~215ms across 56 allreduces per forward.
+        // Precision can be set per-layer via the schema precision policy,
+        // or globally via LLAMINAR_ALLREDUCE_PRECISION environment variable.
+        // Per-call precision (from schema) takes priority over the global env.
+        const std::string &effective_precision =
+            precision.empty() ? debugEnv().allreduce_precision : precision;
         const bool use_fp16_allreduce =
-            debugEnv().allreduce_precision == "fp16" &&
+            effective_precision == "fp16" &&
             dtype == CollectiveDataType::FLOAT32;
 
         if (use_fp16_allreduce)

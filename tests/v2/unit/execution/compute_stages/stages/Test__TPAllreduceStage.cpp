@@ -115,9 +115,13 @@ TEST_F(Test__TPAllreduceStage, RequiresAllreduce)
 }
 
 /**
- * @test Coherence policy is NONE
+ * @test Coherence policy is OUTPUT
+ *
+ * Collective stages use OUTPUT policy so the executor marks outputs dirty
+ * (flags only) after execution. The stage itself records a completion event
+ * via mark_device_dirty_with_event() for fine-grained synchronization.
  */
-TEST_F(Test__TPAllreduceStage, CoherencePolicyIsNone)
+TEST_F(Test__TPAllreduceStage, CoherencePolicyIsOutput)
 {
     auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
 
@@ -126,7 +130,7 @@ TEST_F(Test__TPAllreduceStage, CoherencePolicyIsNone)
 
     auto stage = std::make_unique<TPAllreduceStage>(params);
 
-    EXPECT_EQ(stage->coherencePolicy(), CoherencePolicy::NONE);
+    EXPECT_EQ(stage->coherencePolicy(), CoherencePolicy::OUTPUT);
 }
 
 /**
@@ -410,37 +414,6 @@ TEST_F(Test__TPAllreduceStage, SetParamsUpdatesTensor)
     stage->setParams(params);
 
     EXPECT_EQ(stage->getTensor(), tensor);
-}
-
-// =============================================================================
-// Backward Compatibility Tests
-// =============================================================================
-
-/**
- * @test LocalTPAllreduceStage alias resolves to TPAllreduceStage
- *
- * Note: The [[deprecated]] attribute generates a warning, which we can't
- * easily suppress in a single test. This test verifies type compatibility.
- */
-TEST_F(Test__TPAllreduceStage, BackwardCompatibilityAliasCompiles)
-{
-    // This test verifies that LocalTPAllreduceParams alias exists and is compatible
-    // The deprecated warning is expected
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
-
-    LocalTPAllreduceParams params; // Using deprecated alias
-    params.tp_ctx = tp_ctx.get();
-    params.tensor = test_tensor_.get();
-
-    // LocalTPAllreduceStage should resolve to TPAllreduceStage
-    auto stage = std::make_unique<LocalTPAllreduceStage>(params);
-
-    // Stage should work normally
-    EXPECT_EQ(stage->name(), "TPAllreduce"); // Name is now TPAllreduce, not LocalTPAllreduce
-    EXPECT_TRUE(stage->execute(ctx_.get()));
-#pragma GCC diagnostic pop
 }
 
 // =============================================================================

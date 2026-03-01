@@ -634,6 +634,22 @@ namespace llaminar2
         const auto &order = graph.getExecutionOrder();
 
         // =====================================================================
+        // Mark the last stage as needing event-based dirty marking.
+        // Its outputs will be read back to CPU (for sampling, verification,
+        // or snapshot capture). Without an event recorded on the compute stream,
+        // ensureOnHost() cannot synchronize properly when the compute stream
+        // uses cudaStreamNonBlocking / hipStreamNonBlocking — cudaMemcpy on
+        // the NULL stream does NOT implicitly synchronize with non-blocking
+        // streams, so D2H would race with the final kernel and copy stale data.
+        // =====================================================================
+        if (!order.empty())
+        {
+            auto *last_node = graph.getNode(order.back());
+            if (last_node)
+                last_node->is_final_output = true;
+        }
+
+        // =====================================================================
         // Multi-GPU Stage Sync
         //
         // In LocalTP (multi-device) execution, each device runs its own graph
@@ -754,6 +770,17 @@ namespace llaminar2
 
         const auto &order = graph.getExecutionOrder();
         const bool profile_full_node_path = config_.enable_profiling;
+
+        // =====================================================================
+        // Mark the last stage as needing event-based dirty marking (same
+        // rationale as executeSequential — see comment there).
+        // =====================================================================
+        if (!order.empty())
+        {
+            auto *last_node = graph.getNode(order.back());
+            if (last_node)
+                last_node->is_final_output = true;
+        }
 
         // Multi-GPU stage sync (same rationale as executeSequential)
         const bool multi_gpu_sync = collective_ctx_ && ctx->isGPU();
@@ -933,10 +960,8 @@ namespace llaminar2
         }
 
         // Step 2: Execute all stages into the captured stream
-        // Set HIP device once before the loop (same as executeFastDecode)
-#ifdef HAVE_ROCM
+        // Set GPU device once before the loop (same as executeFastDecode)
         DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(ctx);
-#endif
 
         const auto &order = graph.getExecutionOrder();
         bool exec_success = true;
@@ -1197,9 +1222,7 @@ namespace llaminar2
                 });
         };
 
-#ifdef HAVE_ROCM
         DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(ctx);
-#endif
 
         DeviceGraphCaptureController::ReplayHooks replay_hooks{
             [&](const GraphSegment &segment)

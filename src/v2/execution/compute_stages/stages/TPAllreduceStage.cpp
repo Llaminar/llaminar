@@ -110,7 +110,8 @@ namespace llaminar2
             if (stage_stream)
             {
                 success = params_.tp_ctx->allreduceOnStream(
-                    params_.tensor, params_.stage_name, effective_count, stage_stream);
+                    params_.tensor, params_.stage_name, effective_count, stage_stream,
+                    params_.precision);
             }
             else
             {
@@ -126,6 +127,20 @@ namespace llaminar2
         if (!success)
         {
             LOG_ERROR("TPAllreduceStage (" << scope_str << "): allreduce failed");
+        }
+
+        // Record a completion event so that ensureOnHost() waits for the
+        // allreduce to finish before doing D2H.  Without this, the stale
+        // event from the preceding GEMM stage causes ensureOnHost() to
+        // copy pre-allreduce data (the old event fires before the NCCL
+        // kernel completes on this stream).
+        if (success)
+        {
+            auto *tensor_base = dynamic_cast<TensorBase *>(params_.tensor);
+            if (tensor_base)
+            {
+                tensor_base->mark_device_dirty_with_event(stage_stream);
+            }
         }
 
         return success;

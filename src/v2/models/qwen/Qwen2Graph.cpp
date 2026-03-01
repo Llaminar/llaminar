@@ -57,6 +57,19 @@ namespace llaminar2
                                                                 << " n_heads=" << config_.n_heads
                                                                 << " n_kv_heads=" << config_.n_kv_heads);
 
+        // Populate per-layer allreduce precision from schema if not already set
+        if (config_.tp_allreduce_precision.empty() && config_.n_layers > 0)
+        {
+            Qwen2SchemaFactory factory;
+            auto schema = factory.createSchema();
+            config_.populateAllreducePrecision(
+                schema.tp_allreduce_default_precision,
+                schema.tp_allreduce_fp32_layer_count);
+            LOG_DEBUG("[Qwen2Graph] Populated per-layer allreduce precision: "
+                      << "fp32_layers=" << schema.tp_allreduce_fp32_layer_count
+                      << " default=" << schema.tp_allreduce_default_precision);
+        }
+
         LOG_DEBUG("[Qwen2Graph] Initialized (full) with " << config_.n_layers
                                                           << " layers, precision="
                                                           << activationPrecisionToString(config_.activation_precision));
@@ -77,6 +90,16 @@ namespace llaminar2
                                                                      << " mpi_ctx=" << (mpi_ctx_ ? "valid" : "nullptr")
                                                                      << " world_size=" << (mpi_ctx_ ? mpi_ctx_->world_size() : -1)
                                                                      << " default_device=" << config_.default_device.to_string());
+
+        // Populate per-layer allreduce precision from schema if not already set
+        if (config_.tp_allreduce_precision.empty() && config_.n_layers > 0)
+        {
+            Qwen2SchemaFactory factory;
+            auto schema = factory.createSchema();
+            config_.populateAllreducePrecision(
+                schema.tp_allreduce_default_precision,
+                schema.tp_allreduce_fp32_layer_count);
+        }
 
         LOG_DEBUG("[Qwen2Graph] Initialized (layer-only)");
     }
@@ -2479,6 +2502,7 @@ namespace llaminar2
             params.tensor = buffer;
             params.count = count;
             params.stage_name = stage_name;
+            params.precision = config_.getAllreducePrecisionForLayer(layer_idx);
 
             return std::make_unique<TPAllreduceStage>(params);
         }

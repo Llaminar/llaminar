@@ -150,6 +150,22 @@ namespace llaminar2
 
         size_t numWorkers() const { return num_workers_; }
 
+        /**
+         * @brief Set a callback invoked on first worker failure.
+         *
+         * When a worker completes with an exception or returns false, this
+         * callback fires immediately on the failing worker's thread. Use it
+         * to abort collective operations (e.g., NCCL/RCCL) so that workers
+         * stuck in collectives can unblock and complete.
+         *
+         * The callback must be thread-safe and non-blocking.
+         */
+        void setFailureCallback(std::function<void()> cb)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            failure_callback_ = std::move(cb);
+        }
+
     private:
         void workerLoop(size_t index)
         {
@@ -180,8 +196,18 @@ namespace llaminar2
                     {
                         // Record first failure
                         size_t expected = SIZE_MAX;
-                        first_failure_index_.compare_exchange_strong(
-                            expected, index, std::memory_order_acq_rel);
+                        if (first_failure_index_.compare_exchange_strong(
+                                expected, index, std::memory_order_acq_rel))
+                        {
+                            // First failure — invoke abort callback to unblock stuck workers
+                            std::function<void()> cb;
+                            {
+                                std::lock_guard<std::mutex> lock(mutex_);
+                                cb = failure_callback_;
+                            }
+                            if (cb)
+                                cb();
+                        }
                     }
                 }
                 catch (...)
@@ -190,8 +216,18 @@ namespace llaminar2
                     result.exception = std::current_exception();
                     // Record first failure
                     size_t expected = SIZE_MAX;
-                    first_failure_index_.compare_exchange_strong(
-                        expected, index, std::memory_order_acq_rel);
+                    if (first_failure_index_.compare_exchange_strong(
+                            expected, index, std::memory_order_acq_rel))
+                    {
+                        // First failure — invoke abort callback to unblock stuck workers
+                        std::function<void()> cb;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            cb = failure_callback_;
+                        }
+                        if (cb)
+                            cb();
+                    }
                 }
                 result.completed = true;
 
@@ -215,6 +251,7 @@ namespace llaminar2
         std::mutex mutex_;
         std::condition_variable dispatch_cv_;
         std::function<bool(size_t)> work_fn_;
+        std::function<void()> failure_callback_;
         uint64_t generation_ = 0;
         bool shutdown_ = false;
 

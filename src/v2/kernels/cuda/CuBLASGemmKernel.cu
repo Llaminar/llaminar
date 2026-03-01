@@ -259,11 +259,9 @@ namespace llaminar2
                 return false;
             }
 
-            // Ensure we're on the correct device (not during graph capture)
-            if (!gpu_stream_)
-            {
-                CUDA_CHECK(cudaSetDevice(device_id_));
-            }
+            // Always set device — stream carries device context but kernel launch
+            // uses the runtime's current-device for PTX code lookup.
+            CUDA_CHECK(cudaSetDevice(device_id_));
 
             // cuBLAS expects column-major. We have row-major data.
             // To compute C = A @ B in row-major:
@@ -357,11 +355,9 @@ namespace llaminar2
                 return false;
             }
 
-            // Ensure we're on the correct device (not during graph capture)
-            if (!gpu_stream_)
-            {
-                CUDA_CHECK(cudaSetDevice(device_id_));
-            }
+            // Always set device — stream carries device context but kernel launch
+            // uses the runtime's current-device for PTX code lookup.
+            CUDA_CHECK(cudaSetDevice(device_id_));
 
             // Create operation descriptors
             cublasLtMatmulDesc_t operationDesc = nullptr;

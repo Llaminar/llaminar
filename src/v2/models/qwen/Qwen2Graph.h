@@ -238,6 +238,52 @@ namespace llaminar2
                 return nullptr;
             return &tp_config->forRank(local_rank);
         }
+
+        // =================================================================
+        // Per-Layer TP Allreduce Precision
+        // =================================================================
+
+        /// Per-layer allreduce precision map: layer_idx → precision string.
+        /// Populated from the GraphSchema precision policy (first N layers FP32,
+        /// rest use schema default). Layers not in the map fall back to the
+        /// global DebugEnv::allreduce_precision ("fp32" by default).
+        std::unordered_map<int, std::string> tp_allreduce_precision;
+
+        /**
+         * @brief Get allreduce precision for a specific layer
+         *
+         * Resolution order:
+         * 1. Per-layer override from tp_allreduce_precision map
+         * 2. Global fallback from debugEnv().allreduce_precision
+         *
+         * @param layer_idx Transformer layer index (0-based)
+         * @return Precision string ("fp32", "fp16", "bf16")
+         */
+        std::string getAllreducePrecisionForLayer(int layer_idx) const
+        {
+            auto it = tp_allreduce_precision.find(layer_idx);
+            if (it != tp_allreduce_precision.end())
+                return it->second;
+            return ""; // Empty = defer to global DebugEnv default
+        }
+
+        /**
+         * @brief Populate the precision map from a GraphSchema precision policy
+         *
+         * Applies the schema's fp32_layer_count + default_precision to build
+         * the per-layer map for this model's n_layers.
+         *
+         * @param schema_default Default precision for layers beyond fp32 count
+         * @param fp32_count Number of initial layers forced to FP32
+         */
+        void populateAllreducePrecision(const std::string &schema_default, int fp32_count)
+        {
+            tp_allreduce_precision.clear();
+            for (int i = 0; i < n_layers; ++i)
+            {
+                tp_allreduce_precision[i] = (i < fp32_count) ? "fp32" : schema_default;
+            }
+        }
     };
 
     // =========================================================================

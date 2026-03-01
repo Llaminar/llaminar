@@ -377,6 +377,11 @@ namespace llaminar2
         return getCUDABackend().deviceName(gpu_device_id_);
     }
 
+    void CUDADeviceContext::activateDevice()
+    {
+        getCUDABackend().setDevice(gpu_device_id_);
+    }
+
     void CUDADeviceContext::synchronize()
     {
         getCUDABackend().synchronize(gpu_device_id_);
@@ -500,6 +505,11 @@ namespace llaminar2
     std::string ROCmDeviceContext::deviceName() const
     {
         return getROCmBackend().deviceName(gpu_device_id_);
+    }
+
+    void ROCmDeviceContext::activateDevice()
+    {
+        getROCmBackend().setDevice(gpu_device_id_);
     }
 
     void ROCmDeviceContext::synchronize()

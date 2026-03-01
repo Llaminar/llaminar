@@ -2870,6 +2870,9 @@ namespace llaminar2
         const IQ4_NLBlock *blocks() const { return typed_data(); }
 
         IQ4_NLTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        IQ4_NLTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ4_NLTensor() override;
 
         // TensorBase interface
@@ -3048,7 +3051,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         std::vector<size_t> shape_;
@@ -3059,6 +3062,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_; // Quantized blocks on device (if uploaded)
@@ -3100,6 +3105,9 @@ namespace llaminar2
         const Q8_0Block *blocks() const { return typed_data(); }
 
         Q8_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        Q8_0Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q8_0Tensor() override;
 
         // TensorBase interface
@@ -3259,7 +3267,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         std::vector<size_t> shape_;
@@ -3270,6 +3278,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -4286,6 +4296,9 @@ namespace llaminar2
         const Q4_0Block *blocks() const { return typed_data(); }
 
         Q4_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        Q4_0Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q4_0Tensor() override;
 
         // TensorBase interface
@@ -4447,6 +4460,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -4484,6 +4499,9 @@ namespace llaminar2
         const Q4_1Block *blocks() const { return typed_data(); }
 
         Q4_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        Q4_1Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q4_1Tensor() override;
 
         // TensorBase interface
@@ -4632,7 +4650,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         std::vector<size_t> shape_;
@@ -4643,6 +4661,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -4681,6 +4701,9 @@ namespace llaminar2
         const Q5_0Block *blocks() const { return typed_data(); }
 
         Q5_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        Q5_0Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q5_0Tensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -4819,7 +4842,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         std::vector<size_t> shape_;
@@ -4830,6 +4853,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -4868,6 +4893,9 @@ namespace llaminar2
         const Q5_1Block *blocks() const { return typed_data(); }
 
         Q5_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        Q5_1Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q5_1Tensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -5006,7 +5034,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         std::vector<size_t> shape_;
@@ -5017,6 +5045,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -5051,6 +5081,9 @@ namespace llaminar2
         const Q6_KBlock *blocks() const { return typed_data(); }
 
         Q6_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        Q6_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q6_KTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -5154,7 +5187,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         std::vector<size_t> shape_;
@@ -5165,6 +5198,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -5197,6 +5232,9 @@ namespace llaminar2
         const Q2_KBlock *blocks() const { return typed_data(); }
 
         Q2_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        Q2_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q2_KTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -5299,7 +5337,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         std::vector<size_t> shape_;
@@ -5310,6 +5348,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -5344,6 +5384,9 @@ namespace llaminar2
         const Q5_KBlock *blocks() const { return typed_data(); }
 
         Q5_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        Q5_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q5_KTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -5449,7 +5492,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         // View constructor (borrows parent's data)
@@ -5471,6 +5514,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Points to parent's raw_data_.data()
         size_t view_byte_offset_;            // Byte offset from raw_data_ptr_
         std::shared_ptr<TensorBase> parent_; // Keeps parent alive
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m);
     };
@@ -5494,6 +5539,9 @@ namespace llaminar2
         const Q3_KBlock *blocks() const { return typed_data(); }
 
         Q3_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        Q3_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q3_KTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -5597,7 +5645,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         std::vector<size_t> shape_;
@@ -5608,6 +5656,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -5640,6 +5690,9 @@ namespace llaminar2
         const Q4_KBlock *blocks() const { return typed_data(); }
 
         Q4_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        Q4_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q4_KTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -5745,7 +5798,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         // View constructor (borrows parent's data)
@@ -5767,6 +5820,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Points to parent's raw_data_.data()
         size_t view_byte_offset_;            // Byte offset from raw_data_ptr_
         std::shared_ptr<TensorBase> parent_; // Keeps parent alive
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m);
     };
@@ -5790,6 +5845,9 @@ namespace llaminar2
         const Q8_KBlock *blocks() const { return typed_data(); }
 
         Q8_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        Q8_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~Q8_KTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -5888,7 +5946,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         // View constructor (borrows parent's data)
@@ -5910,6 +5968,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Points to parent's raw_data_.data()
         size_t view_byte_offset_;            // Byte offset from raw_data_ptr_
         std::shared_ptr<TensorBase> parent_; // Keeps parent alive
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
     };
 
     // ===== IQ Tensors =====
@@ -5933,6 +5993,9 @@ namespace llaminar2
         const IQ4_XSBlock *blocks() const { return typed_data(); }
 
         IQ4_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        IQ4_XSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ4_XSTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -6070,7 +6133,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         IQ4_XSTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
@@ -6084,6 +6147,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -6110,6 +6175,9 @@ namespace llaminar2
         const IQ2_XXSBlock *blocks() const { return typed_data(); }
 
         IQ2_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        IQ2_XXSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ2_XXSTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -6235,7 +6303,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         IQ2_XXSTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
@@ -6249,6 +6317,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -6275,6 +6345,9 @@ namespace llaminar2
         const IQ2_XSBlock *blocks() const { return typed_data(); }
 
         IQ2_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        IQ2_XSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ2_XSTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -6400,7 +6473,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         IQ2_XSTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
@@ -6414,6 +6487,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -6440,6 +6515,9 @@ namespace llaminar2
         const IQ3_XXSBlock *blocks() const { return typed_data(); }
 
         IQ3_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        IQ3_XXSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ3_XXSTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -6569,7 +6647,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         IQ3_XXSTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
@@ -6583,6 +6661,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -6609,6 +6689,9 @@ namespace llaminar2
         const IQ2_SBlock *blocks() const { return typed_data(); }
 
         IQ2_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        IQ2_STensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ2_STensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -6734,7 +6817,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         IQ2_STensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
@@ -6748,6 +6831,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -6774,6 +6859,9 @@ namespace llaminar2
         const IQ3_SBlock *blocks() const { return typed_data(); }
 
         IQ3_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        IQ3_STensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ3_STensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -6903,7 +6991,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         IQ3_STensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
@@ -6917,6 +7005,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -6943,6 +7033,9 @@ namespace llaminar2
         const IQ1_SBlock *blocks() const { return typed_data(); }
 
         IQ1_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        IQ1_STensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ1_STensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -7068,7 +7161,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         IQ1_STensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
@@ -7082,6 +7175,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;
@@ -7108,6 +7203,9 @@ namespace llaminar2
         const IQ1_MBlock *blocks() const { return typed_data(); }
 
         IQ1_MTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        IQ1_MTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+              size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
         ~IQ1_MTensor() override;
 
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -7233,7 +7331,7 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override { return data_byte_size_ > 0 ? data_byte_size_ : raw_data_.size(); }
 
     private:
         IQ1_MTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
@@ -7247,6 +7345,8 @@ namespace llaminar2
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;          // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;                  // Byte size for mmap-backed tensors (raw_data_ is empty)
 
         DeviceId device_;
         void *device_blocks_;

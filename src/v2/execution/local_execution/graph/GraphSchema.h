@@ -523,6 +523,21 @@ namespace llaminar2
         /// - Use KV activation profiling tool (python/tools/profile_kv_activations.py)
         ///   to determine optimal scales for specific models
         float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must handle Q projection max_abs (~130 for Qwen2)
+
+        // =================================================================
+        // TP Allreduce Precision Policy
+        // =================================================================
+
+        /// Default allreduce precision for layers NOT covered by fp32_layer_count.
+        /// Valid values: "fp32", "fp16", "bf16"
+        /// The global DebugEnv default ("fp32") serves as the ultimate fallback.
+        std::string tp_allreduce_default_precision = "fp32";
+
+        /// Number of initial transformer layers forced to FP32 allreduce.
+        /// These early layers are the most sensitive to precision loss since
+        /// errors compound through subsequent layers. Layers beyond this count
+        /// use tp_allreduce_default_precision.
+        int tp_allreduce_fp32_layer_count = 0;
     };
 
     // =========================================================================

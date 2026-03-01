@@ -184,6 +184,26 @@ namespace llaminar2
                                                     const std::vector<uint8_t> &raw_data);
 
         /**
+         * @brief Create quantized tensor with zero-copy mmap-backed data
+         *
+         * The tensor borrows data directly from a memory-mapped file region
+         * instead of copying. The mmap_lifetime_owner keeps the mapped region
+         * alive as long as the tensor exists.
+         *
+         * @param type Quantization type
+         * @param shape Tensor dimensions
+         * @param mmap_data Pointer into mmap'd region (must remain valid)
+         * @param byte_size Size of the tensor data in bytes
+         * @param mmap_lifetime_owner Shared pointer that keeps the mmap region alive
+         * @return Quantized tensor referencing mmap'd memory (no copy)
+         */
+        std::unique_ptr<TensorBase> createQuantizedZeroCopy(TensorType type,
+                                                            const std::vector<size_t> &shape,
+                                                            const uint8_t *mmap_data,
+                                                            size_t byte_size,
+                                                            std::shared_ptr<void> mmap_lifetime_owner);
+
+        /**
          * @brief Ensure NUMA memory binding is active for the calling thread
          *
          * Sets numa_set_membind() so all subsequent allocations on this thread

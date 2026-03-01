@@ -99,7 +99,8 @@ namespace llaminar2
         bool allreduce(TensorBase *tensor) override;
         bool allreduce(TensorBase *tensor, const std::string &stage_name, size_t count = 0) override;
         bool allreduceOnStream(TensorBase *tensor, const std::string &stage_name,
-                               size_t count, void *stream) override;
+                               size_t count, void *stream,
+                               const std::string &precision = "") override;
         bool allreduce(const TensorBase *input, TensorBase *output) override;
         bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) override;
         bool gatherFromDevices(
@@ -325,7 +326,7 @@ namespace llaminar2
         // =====================================================================
         // FP16 Mixed-Precision Allreduce Scratch Buffers
         // =====================================================================
-        // When LLAMINAR_ALLREDUCE_PRECISION=fp16 (default), FP32 allreduces
+        // When allreduce precision is "fp16" (set per-layer via schema or globally\n        // via LLAMINAR_ALLREDUCE_PRECISION), FP32 allreduces cast to FP16 first
         // cast to FP16 first to halve PCIe transfer bandwidth. These device-local
         // scratch buffers hold the FP16 temporary (lazily allocated on first use).
 

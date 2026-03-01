@@ -31,7 +31,8 @@ extern "C"
         bool causal, int window_size, int position_offset,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         const float *mask,
-        void *stream);
+        void *stream,
+        int device_idx);
 
     // Flash Decoding for single-token decode with split-K parallelism
     int cudaFlashAttn_decode_fp32(
@@ -41,7 +42,8 @@ extern "C"
         int n_heads, int n_kv_heads, int head_dim,
         int num_splits,
         const llaminar2::attention::AttentionDeviceParams *device_params,
-        void *stream);
+        void *stream,
+        int device_idx);
 
     int cudaFlashAttn_allocWorkspace(
         void **partial_output, void **partial_m, void **partial_l,
@@ -332,16 +334,13 @@ namespace llaminar2
                 return false;
             }
 
-            // Set device — skip when running under graph capture (stream_ is non-null).
-            // cudaSetDevice() is NOT graph-capturable and corrupts the capture on CUDA.
-            // The device was already set before the capture scope began.
-            if (!stream_)
+            // Always set the active device — required for workspace allocation (cudaMalloc)
+            // and cudaFuncSetAttribute calls which operate on the current device, not the stream's device.
+            // In multi-GPU TP mode, the thread-local device may be wrong.
+            if (cudaFlashAttn_setDevice(device_idx) != 0)
             {
-                if (cudaFlashAttn_setDevice(device_idx) != 0)
-                {
-                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Failed to set device " << device_idx);
-                    return false;
-                }
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Failed to set device " << device_idx);
+                return false;
             }
 
             int result;
@@ -379,7 +378,8 @@ namespace llaminar2
                         static_cast<float *>(partial_l_buf_),
                         batch_size, kv_len,
                         n_heads, n_kv_heads, head_dim,
-                        num_splits, device_params, stream_);
+                        num_splits, device_params, stream_,
+                        device_idx);
                 }
             }
             else
@@ -397,7 +397,8 @@ namespace llaminar2
                         n_heads, n_kv_heads, head_dim,
                         causal, window_size, position_offset,
                         device_params, mask,
-                        stream_);
+                        stream_,
+                        device_idx);
                 }
             }
 

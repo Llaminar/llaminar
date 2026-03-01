@@ -375,10 +375,9 @@ extern "C"
             throw std::runtime_error(oss.str());
         }
 
-        if (!stream)
-        {
-            CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
-        }
+        // Always set device — stream carries device context but kernel
+        // launch uses the runtime's current-device for PTX code lookup.
+        CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
 
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
@@ -475,10 +474,9 @@ extern "C"
             throw std::runtime_error(oss.str());
         }
 
-        if (!stream)
-        {
-            CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
-        }
+        // Always set device — stream carries device context but kernel
+        // launch uses the runtime's current-device for PTX code lookup.
+        CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
 
         dim3 block(16, 16);
         dim3 grid((N + 15) / 16, (M + 15) / 16);
@@ -524,10 +522,9 @@ extern "C"
             throw std::runtime_error(oss.str());
         }
 
-        if (!stream)
-        {
-            CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
-        }
+        // Always set device — stream carries device context but kernel
+        // launch uses the runtime's current-device for PTX code lookup.
+        CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
 
         dim3 grid(M);
         dim3 block(std::min(K, 256));
@@ -626,6 +623,23 @@ extern "C"
     bool cudaQuantGemm_setDevice(int cuda_device_id)
     {
         CUDA_CHECK(cudaSetDevice(cuda_device_id));
+        return true;
+    }
+
+    /**
+     * @brief Synchronize a CUDA stream (for diagnostics)
+     */
+    bool cudaQuantGemm_streamSync(int cuda_device_id, void *stream)
+    {
+        CUDA_CHECK(cudaSetDevice(cuda_device_id));
+        if (stream)
+        {
+            CUDA_CHECK(cudaStreamSynchronize(static_cast<cudaStream_t>(stream)));
+        }
+        else
+        {
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
         return true;
     }
 

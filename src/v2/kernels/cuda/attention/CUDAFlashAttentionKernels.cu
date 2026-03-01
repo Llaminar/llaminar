@@ -1036,16 +1036,20 @@ extern "C"
         bool causal, int window_size, int position_offset,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         const float *mask,
-        void *stream)
+        void *stream,
+        int device_idx)
     {
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
         float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
-        // Get cached device config
-        int device;
-        cudaGetDevice(&device);
-        const FA2DeviceConfig &dev_cfg = getFA2DeviceConfig(device);
+        // Use explicit device_idx instead of cudaGetDevice() — the thread-local
+        // active device may be wrong in multi-GPU TP mode where each worker thread
+        // operates on a different device via streams.
+        // We MUST cudaSetDevice() before cudaFuncSetAttribute() below since that
+        // API applies to the currently active device, not the stream's device.
+        cudaSetDevice(device_idx);
+        const FA2DeviceConfig &dev_cfg = getFA2DeviceConfig(device_idx);
 
         if (dev_cfg.sm_major < 8)
         {
@@ -1083,9 +1087,15 @@ extern "C"
         // Dispatch to correct kernel variant based on consumer warp count
         if (cfg.num_consumer_warps == 6)
         {
-            cudaFuncSetAttribute(flash_attention_2_pipelined_kernel<6>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 cfg.smem_size);
+            err = cudaFuncSetAttribute(flash_attention_2_pipelined_kernel<6>,
+                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       cfg.smem_size);
+            if (err != cudaSuccess)
+            {
+                printf("[cudaFlashAttn_prefill_fa2] cudaFuncSetAttribute<6>(smem=%zu) on dev %d FAILED: %s\n",
+                       cfg.smem_size, device_idx, cudaGetErrorString(err));
+                return -1;
+            }
 
             flash_attention_2_pipelined_kernel<6><<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(
                 Q, K, V, O,
@@ -1098,9 +1108,15 @@ extern "C"
         else
         {
             // 4 consumer warps for head_dim=128
-            cudaFuncSetAttribute(flash_attention_2_pipelined_kernel<4>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 cfg.smem_size);
+            err = cudaFuncSetAttribute(flash_attention_2_pipelined_kernel<4>,
+                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       cfg.smem_size);
+            if (err != cudaSuccess)
+            {
+                printf("[cudaFlashAttn_prefill_fa2] cudaFuncSetAttribute<4>(smem=%zu) on dev %d FAILED: %s\n",
+                       cfg.smem_size, device_idx, cudaGetErrorString(err));
+                return -1;
+            }
 
             flash_attention_2_pipelined_kernel<4><<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(
                 Q, K, V, O,
@@ -1112,6 +1128,7 @@ extern "C"
         }
 
         err = cudaGetLastError();
+
         if (err != cudaSuccess)
         {
             printf("[cudaFlashAttn_prefill_fa2] CUDA error: %s (smem=%zu bytes, tile_q=%d, tile_kv=%d, head_dim=%d, "
@@ -1139,8 +1156,11 @@ extern "C"
         int n_heads, int n_kv_heads, int head_dim,
         int num_splits,
         const llaminar2::attention::AttentionDeviceParams *device_params,
-        void *stream)
+        void *stream,
+        int device_idx)
     {
+        // Ensure correct device is active for kernel launch and any implicit allocations
+        cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
         float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));

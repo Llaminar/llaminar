@@ -22,6 +22,7 @@
 
 #include "backends/IBackend.h"
 #include "utils/Logger.h"
+#include <algorithm>
 #include <cstring>
 #include <future>
 #include <map>
@@ -174,37 +175,52 @@ namespace llaminar2
             }
 
             // =================================================================
-            // IBackend Event Operations
+            // IBackend Event Operations (with tracking)
             // =================================================================
+
+            /**
+             * @brief Record of a single event operation for test verification
+             */
+            struct EventRecord
+            {
+                enum Type
+                {
+                    CREATE,
+                    DESTROY,
+                    RECORD,
+                    WAIT
+                };
+                Type type;
+                void *event;
+                int device_id;
+                void *stream; ///< Only valid for RECORD operations
+            };
 
             void *createEvent(int device_id) override
             {
-                (void)device_id;
-                // Return a unique non-null pointer as event handle
                 std::lock_guard<std::mutex> lock(mutex_);
                 void *event = reinterpret_cast<void *>(next_event_id_++);
+                event_records_.push_back({EventRecord::CREATE, event, device_id, nullptr});
                 return event;
             }
 
             void destroyEvent(void *event, int device_id) override
             {
-                (void)event;
-                (void)device_id;
-                // No-op for mock
+                std::lock_guard<std::mutex> lock(mutex_);
+                event_records_.push_back({EventRecord::DESTROY, event, device_id, nullptr});
             }
 
             bool recordEvent(void *event, int device_id, void *stream = nullptr) override
             {
-                (void)event;
-                (void)device_id;
-                (void)stream;
+                std::lock_guard<std::mutex> lock(mutex_);
+                event_records_.push_back({EventRecord::RECORD, event, device_id, stream});
                 return true;
             }
 
             bool waitForEvent(void *event, int device_id) override
             {
-                (void)event;
-                (void)device_id;
+                std::lock_guard<std::mutex> lock(mutex_);
+                event_records_.push_back({EventRecord::WAIT, event, device_id, nullptr});
                 return true;
             }
 
@@ -536,6 +552,86 @@ namespace llaminar2
                 num_devices_ = count;
             }
 
+            // =================================================================
+            // Event Tracking API (Test-specific)
+            // =================================================================
+
+            /**
+             * @brief Get all event operation records
+             */
+            std::vector<EventRecord> getEventRecords() const
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return event_records_;
+            }
+
+            /**
+             * @brief Get count of event create operations
+             */
+            size_t getEventCreateCount() const
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return std::count_if(event_records_.begin(), event_records_.end(),
+                                     [](const EventRecord &r)
+                                     { return r.type == EventRecord::CREATE; });
+            }
+
+            /**
+             * @brief Get count of event record operations
+             */
+            size_t getEventRecordCount() const
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return std::count_if(event_records_.begin(), event_records_.end(),
+                                     [](const EventRecord &r)
+                                     { return r.type == EventRecord::RECORD; });
+            }
+
+            /**
+             * @brief Get count of event wait operations
+             */
+            size_t getEventWaitCount() const
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return std::count_if(event_records_.begin(), event_records_.end(),
+                                     [](const EventRecord &r)
+                                     { return r.type == EventRecord::WAIT; });
+            }
+
+            /**
+             * @brief Get event record operations that used a specific stream
+             */
+            std::vector<EventRecord> getEventRecordsForStream(void *stream) const
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                std::vector<EventRecord> result;
+                for (const auto &r : event_records_)
+                {
+                    if (r.type == EventRecord::RECORD && r.stream == stream)
+                        result.push_back(r);
+                }
+                return result;
+            }
+
+            /**
+             * @brief Reset all event tracking records
+             */
+            void resetEventRecords()
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                event_records_.clear();
+            }
+
+            /**
+             * @brief Reset all tracking (transfers + events)
+             */
+            void resetAll()
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stats_.clear();
+                event_records_.clear();
+            }
+
         private:
             struct AllocationInfo
             {
@@ -552,6 +648,7 @@ namespace llaminar2
 
             mutable std::mutex mutex_;
             TransferStats stats_;
+            std::vector<EventRecord> event_records_;
             std::map<void *, AllocationInfo> allocations_;
             std::map<void *, AllocationInfo> mapped_allocations_;
             int num_devices_ = 1;

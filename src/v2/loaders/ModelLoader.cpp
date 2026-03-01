@@ -21,20 +21,93 @@ namespace llaminar2
 
     uint32_t GGUFValue::asUInt32() const
     {
-        if (type != GGUFValueType::UINT32 || data.size() < 4)
-            return 0;
-        uint32_t val;
-        std::memcpy(&val, data.data(), 4);
-        return val;
+        // Handle all integer types that fit in uint32_t (widening conversion)
+        switch (type)
+        {
+        case GGUFValueType::UINT8:
+            if (data.size() >= 1)
+            {
+                return static_cast<uint32_t>(data[0]);
+            }
+            break;
+        case GGUFValueType::INT8:
+            if (data.size() >= 1)
+            {
+                int8_t val;
+                std::memcpy(&val, data.data(), 1);
+                return static_cast<uint32_t>(val);
+            }
+            break;
+        case GGUFValueType::UINT16:
+            if (data.size() >= 2)
+            {
+                uint16_t val;
+                std::memcpy(&val, data.data(), 2);
+                return static_cast<uint32_t>(val);
+            }
+            break;
+        case GGUFValueType::INT16:
+            if (data.size() >= 2)
+            {
+                int16_t val;
+                std::memcpy(&val, data.data(), 2);
+                return static_cast<uint32_t>(val);
+            }
+            break;
+        case GGUFValueType::UINT32:
+            if (data.size() >= 4)
+            {
+                uint32_t val;
+                std::memcpy(&val, data.data(), 4);
+                return val;
+            }
+            break;
+        case GGUFValueType::INT32:
+            if (data.size() >= 4)
+            {
+                int32_t val;
+                std::memcpy(&val, data.data(), 4);
+                return static_cast<uint32_t>(val);
+            }
+            break;
+        default:
+            break;
+        }
+        return 0;
     }
 
     uint64_t GGUFValue::asUInt64() const
     {
-        if (type != GGUFValueType::UINT64 || data.size() < 8)
-            return 0;
-        uint64_t val;
-        std::memcpy(&val, data.data(), 8);
-        return val;
+        // Handle all integer types via widening
+        switch (type)
+        {
+        case GGUFValueType::UINT8:
+        case GGUFValueType::INT8:
+        case GGUFValueType::UINT16:
+        case GGUFValueType::INT16:
+        case GGUFValueType::UINT32:
+        case GGUFValueType::INT32:
+            return static_cast<uint64_t>(asUInt32());
+        case GGUFValueType::UINT64:
+            if (data.size() >= 8)
+            {
+                uint64_t val;
+                std::memcpy(&val, data.data(), 8);
+                return val;
+            }
+            break;
+        case GGUFValueType::INT64:
+            if (data.size() >= 8)
+            {
+                int64_t val;
+                std::memcpy(&val, data.data(), 8);
+                return static_cast<uint64_t>(val);
+            }
+            break;
+        default:
+            break;
+        }
+        return 0;
     }
 
     float GGUFValue::asFloat32() const
@@ -60,6 +133,60 @@ namespace llaminar2
     // =============================================================================
     // GGUF TENSOR INFO HELPERS
     // =============================================================================
+
+    /**
+     * @brief Convert GGUF quantization type to V2 TensorType
+     * @note Only valid for quantized types (caller must check isQuantized() first)
+     */
+    static TensorType ggufToTensorType(GGUFTensorType type)
+    {
+        switch (type)
+        {
+        case GGUFTensorType::Q4_0:
+            return TensorType::Q4_0;
+        case GGUFTensorType::Q4_1:
+            return TensorType::Q4_1;
+        case GGUFTensorType::Q5_0:
+            return TensorType::Q5_0;
+        case GGUFTensorType::Q5_1:
+            return TensorType::Q5_1;
+        case GGUFTensorType::Q8_0:
+            return TensorType::Q8_0;
+        case GGUFTensorType::Q2_K:
+            return TensorType::Q2_K;
+        case GGUFTensorType::Q3_K:
+            return TensorType::Q3_K;
+        case GGUFTensorType::Q4_K:
+            return TensorType::Q4_K;
+        case GGUFTensorType::Q5_K:
+            return TensorType::Q5_K;
+        case GGUFTensorType::Q6_K:
+            return TensorType::Q6_K;
+        case GGUFTensorType::Q8_K:
+            return TensorType::Q8_K;
+        case GGUFTensorType::IQ4_NL:
+            return TensorType::IQ4_NL;
+        case GGUFTensorType::IQ4_XS:
+            return TensorType::IQ4_XS;
+        case GGUFTensorType::IQ2_XXS:
+            return TensorType::IQ2_XXS;
+        case GGUFTensorType::IQ2_XS:
+            return TensorType::IQ2_XS;
+        case GGUFTensorType::IQ3_XXS:
+            return TensorType::IQ3_XXS;
+        case GGUFTensorType::IQ2_S:
+            return TensorType::IQ2_S;
+        case GGUFTensorType::IQ3_S:
+            return TensorType::IQ3_S;
+        case GGUFTensorType::IQ1_S:
+            return TensorType::IQ1_S;
+        case GGUFTensorType::IQ1_M:
+            return TensorType::IQ1_M;
+        default:
+            LOG_ERROR("[ModelLoader] ggufToTensorType: unsupported type " << static_cast<int>(type));
+            return TensorType::Q8_0; // Fallback (should never reach here)
+        }
+    }
 
     bool GGUFTensorInfo::isQuantized() const
     {
@@ -319,8 +446,73 @@ namespace llaminar2
             LOG_DEBUG("  Split files: " << model_.split_count);
         }
 
+        // Memory-map the file for zero-syscall tensor loading
+        if (use_mmap_)
+        {
+            mmap_region_ = MmapRegion::create(file_path);
+            if (mmap_region_)
+            {
+                LOG_INFO("[ModelLoader] mmap enabled: " << file_path
+                                                        << " (" << (mmap_region_->size() / (1024 * 1024)) << " MB)");
+
+                // If multi-part, also mmap the split files
+                if (model_.split_count > 1)
+                {
+                    split_mmap_regions_.resize(model_.split_count - 1);
+                    for (uint16_t idx = 1; idx < model_.split_count; ++idx)
+                    {
+                        split_mmap_regions_[idx - 1] = MmapRegion::create(model_.split_paths[idx]);
+                        if (!split_mmap_regions_[idx - 1])
+                        {
+                            LOG_WARN("[ModelLoader] Failed to mmap split file " << idx
+                                                                                << ", falling back to ifstream for all files");
+                            mmap_region_.reset();
+                            split_mmap_regions_.clear();
+                            break;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                LOG_WARN("[ModelLoader] mmap failed, falling back to ifstream loading");
+            }
+        }
+        else
+        {
+            LOG_INFO("[ModelLoader] mmap disabled (--no-mmap), using ifstream loading");
+        }
+
         loaded_ = true;
         return true;
+    }
+
+    const uint8_t *ModelLoader::getMmapPtr(const GGUFTensorInfo *info) const
+    {
+        uint64_t data_offset = getDataOffset(info);
+        if (model_.split_count > 1 && info->split_idx > 0)
+        {
+            // Tensor is in a split file
+            const auto &region = split_mmap_regions_[info->split_idx - 1];
+            return region->data() + data_offset + info->offset;
+        }
+        return mmap_region_->data() + data_offset + info->offset;
+    }
+
+    uint64_t ModelLoader::getDataOffset(const GGUFTensorInfo *info) const
+    {
+        if (model_.split_count > 1)
+        {
+            if (info->split_idx == 0)
+            {
+                return model_.split_data_offsets[0];
+            }
+            else if (info->split_idx < model_.split_count)
+            {
+                return model_.split_data_offsets[info->split_idx];
+            }
+        }
+        return model_.data_offset;
     }
 
     void ModelLoader::initializeTestModel(uint32_t block_count)
@@ -398,9 +590,80 @@ namespace llaminar2
             factory_->ensureNumaBinding();
         }
 
-        // Read raw bytes from file (thread-safe section)
-        std::vector<uint8_t> raw;
+        // =====================================================================
+        // ZERO-COPY FAST PATH: mmap + quantized + NATIVE → no allocation/copy
+        //
+        // When all conditions are met, we create tensors that point directly
+        // into the mmap region. This eliminates:
+        //   1. The ~N MB std::vector<uint8_t> raw allocation
+        //   2. memcpy from mmap → raw
+        //   3. memcpy from raw → tensor's internal raw_data_
+        // The tensor holds a shared_ptr<MmapRegion> to keep the mapping alive.
+        // =====================================================================
+        if (mmap_region_ && info->isQuantized() &&
+            weight_precision == WeightPrecision::NATIVE && factory_)
         {
+            // Bounds check
+            uint64_t data_offset = getDataOffset(info);
+            const MmapRegion *region = mmap_region_.get();
+            if (model_.split_count > 1 && info->split_idx > 0)
+            {
+                region = split_mmap_regions_[info->split_idx - 1].get();
+            }
+
+            uint64_t end_offset = data_offset + info->offset + info->size_bytes;
+            if (end_offset > region->size())
+            {
+                LOG_ERROR("[ModelLoader] Tensor data extends past end of file: " << tensor_name
+                                                                                 << " (need " << end_offset << " bytes, file is " << region->size() << " bytes)");
+                return nullptr;
+            }
+
+            // Direct pointer into mmap region — no allocation, no copy
+            const uint8_t *src = region->data() + data_offset + info->offset;
+
+            // Compute shape
+            std::vector<size_t> shape;
+            for (auto d : info->dimensions)
+            {
+                shape.push_back(static_cast<size_t>(d));
+            }
+
+            // Create tensor with zero-copy mmap backing
+            auto mmap_owner = getMmapRegion(info);
+            return factory_->createQuantizedZeroCopy(
+                ggufToTensorType(info->type), shape, src, info->size_bytes, std::move(mmap_owner));
+        }
+
+        // Read raw bytes from file (non-zero-copy paths: FP32/FP16/BF16, weight conversion, or no-mmap)
+        std::vector<uint8_t> raw;
+        if (mmap_region_)
+        {
+            // MMAP FAST PATH: No mutex, no syscall — memcpy from mapped region
+            uint64_t data_offset = getDataOffset(info);
+            uint64_t end_offset = data_offset + info->offset + info->size_bytes;
+
+            // Bounds check: ensure the tensor data fits within the mmap region
+            const MmapRegion *region = mmap_region_.get();
+            if (model_.split_count > 1 && info->split_idx > 0)
+            {
+                region = split_mmap_regions_[info->split_idx - 1].get();
+            }
+
+            if (end_offset > region->size())
+            {
+                LOG_ERROR("[ModelLoader] Tensor data extends past end of file: " << tensor_name
+                                                                                 << " (need " << end_offset << " bytes, file is " << region->size() << " bytes)");
+                return nullptr;
+            }
+
+            const uint8_t *src = region->data() + data_offset + info->offset;
+            raw.resize(info->size_bytes);
+            std::memcpy(raw.data(), src, info->size_bytes);
+        }
+        else
+        {
+            // IFSTREAM PATH: Original seekg+read under file_mutex_ (--no-mmap fallback)
             std::lock_guard<std::mutex> lock(file_mutex_);
 
             // Select correct file stream based on split index
@@ -849,9 +1112,19 @@ namespace llaminar2
             factory_->ensureNumaBinding();
         }
 
-        // Read only the slice bytes (thread-safe section)
+        // Read only the slice bytes
         std::vector<uint8_t> raw;
+        if (mmap_region_)
         {
+            // MMAP FAST PATH: pointer arithmetic + memcpy, no mutex
+            const uint8_t *tensor_base = getMmapPtr(info);
+            const uint8_t *src = tensor_base + slice_offset;
+            raw.resize(slice_bytes);
+            std::memcpy(raw.data(), src, slice_bytes);
+        }
+        else
+        {
+            // IFSTREAM PATH: seekg+read under file_mutex_ (--no-mmap fallback)
             std::lock_guard<std::mutex> lock(file_mutex_);
 
             // Select correct file stream based on split index
@@ -1301,8 +1574,21 @@ namespace llaminar2
         // Allocate buffer for sliced data
         std::vector<uint8_t> raw(slice_bytes);
 
-        // Read row by row, extracting only the needed column range (thread-safe section)
+        // Read row by row, extracting only the needed column range
+        if (mmap_region_)
         {
+            // MMAP FAST PATH: scatter-gather memcpy from mapped region, no mutex
+            const uint8_t *tensor_base = getMmapPtr(info);
+            for (size_t row = 0; row < total_rows; ++row)
+            {
+                const uint8_t *src = tensor_base + (row * bytes_per_row) + block_offset_bytes;
+                uint8_t *dst = raw.data() + (row * bytes_per_slice_row);
+                std::memcpy(dst, src, bytes_per_slice_row);
+            }
+        }
+        else
+        {
+            // IFSTREAM PATH: seek+read per row under file_mutex_ (--no-mmap fallback)
             std::lock_guard<std::mutex> lock(file_mutex_);
 
             // Select correct file stream based on split index
@@ -1992,15 +2278,8 @@ namespace llaminar2
             auto it = model_.metadata.find(key);
             if (it != model_.metadata.end())
             {
-                // Try both uint32 and uint64
-                if (it->second.type == GGUFValueType::UINT32)
-                {
-                    return static_cast<uint64_t>(it->second.asUInt32());
-                }
-                else if (it->second.type == GGUFValueType::UINT64)
-                {
-                    return it->second.asUInt64();
-                }
+                // asUInt64() handles all integer types via widening
+                return it->second.asUInt64();
             }
             return 0;
         };
@@ -2090,7 +2369,20 @@ namespace llaminar2
 
     std::string ModelLoader::generateSplitPath(const std::string &base_path, uint16_t split_no, uint16_t split_count)
     {
-        // Extract directory and filename without extension
+        // If base_path already has a split suffix (e.g. "model-00001-of-00002.gguf"),
+        // strip it to get the true prefix, then re-generate with the new split index.
+        std::string stripped_prefix;
+        uint16_t existing_no, existing_count;
+        if (parseSplitPath(base_path, stripped_prefix, existing_no, existing_count))
+        {
+            // base_path already has split formatting — use its prefix
+            char buffer[512];
+            snprintf(buffer, sizeof(buffer), "%s-%05d-of-%05d.gguf",
+                     stripped_prefix.c_str(), split_no + 1, split_count);
+            return std::string(buffer);
+        }
+
+        // No existing split suffix — append one
         size_t last_slash = base_path.find_last_of("/\\");
         std::string dir = (last_slash != std::string::npos) ? base_path.substr(0, last_slash + 1) : "";
         std::string filename = (last_slash != std::string::npos) ? base_path.substr(last_slash + 1) : base_path;
@@ -2213,19 +2505,28 @@ namespace llaminar2
                 uint32_t value_type;
                 stream.read(reinterpret_cast<char *>(&value_type), sizeof(value_type));
 
-                // Skip value data (complex, but we can estimate)
-                // For simplicity, read and discard based on type
-                // This is a simplified version - full implementation would parse all types
+                // Skip value data based on type
+                // Must handle ALL GGUFValueType values with correct sizes
                 switch (value_type)
                 {
+                case 0: // UINT8
+                case 1: // INT8
+                case 7: // BOOL
+                    stream.seekg(1, std::ios::cur);
+                    break;
+                case 2: // UINT16
+                case 3: // INT16
+                    stream.seekg(2, std::ios::cur);
+                    break;
                 case 4: // UINT32
-                    stream.seekg(4, std::ios::cur);
-                    break;
                 case 5: // INT32
-                    stream.seekg(4, std::ios::cur);
-                    break;
                 case 6: // FLOAT32
                     stream.seekg(4, std::ios::cur);
+                    break;
+                case 10: // UINT64
+                case 11: // INT64
+                case 12: // FLOAT64
+                    stream.seekg(8, std::ios::cur);
                     break;
                 case 8: // STRING
                 {
@@ -2240,13 +2541,53 @@ namespace llaminar2
                     uint64_t arr_len;
                     stream.read(reinterpret_cast<char *>(&arr_type), sizeof(arr_type));
                     stream.read(reinterpret_cast<char *>(&arr_len), sizeof(arr_len));
-                    // Skip array elements (simplified)
-                    size_t elem_size = (arr_type == 4 || arr_type == 5 || arr_type == 6) ? 4 : 8;
-                    stream.seekg(elem_size * arr_len, std::ios::cur);
+
+                    // Handle string arrays specially (variable-length elements)
+                    if (arr_type == 8) // STRING array
+                    {
+                        for (uint64_t ai = 0; ai < arr_len; ++ai)
+                        {
+                            uint64_t str_len;
+                            stream.read(reinterpret_cast<char *>(&str_len), sizeof(str_len));
+                            stream.seekg(str_len, std::ios::cur);
+                        }
+                    }
+                    else
+                    {
+                        // Fixed-size array elements
+                        size_t elem_size = 0;
+                        switch (arr_type)
+                        {
+                        case 0:
+                        case 1:
+                        case 7:
+                            elem_size = 1;
+                            break; // UINT8, INT8, BOOL
+                        case 2:
+                        case 3:
+                            elem_size = 2;
+                            break; // UINT16, INT16
+                        case 4:
+                        case 5:
+                        case 6:
+                            elem_size = 4;
+                            break; // UINT32, INT32, FLOAT32
+                        case 10:
+                        case 11:
+                        case 12:
+                            elem_size = 8;
+                            break; // UINT64, INT64, FLOAT64
+                        default:
+                            LOG_ERROR("[ModelLoader] Unknown array element type " << arr_type << " in split " << idx);
+                            return false;
+                        }
+                        stream.seekg(static_cast<std::streamoff>(elem_size * arr_len), std::ios::cur);
+                    }
                     break;
                 }
                 default:
-                    stream.seekg(8, std::ios::cur); // Guess
+                    LOG_ERROR("[ModelLoader] Unknown metadata value type " << value_type << " in split " << idx);
+                    return false;
                 }
             }
 
@@ -2270,6 +2611,14 @@ namespace llaminar2
                 for (uint32_t d = 0; d < n_dims; ++d)
                 {
                     stream.read(reinterpret_cast<char *>(&info.dimensions[d]), sizeof(uint64_t));
+                }
+
+                // CRITICAL: GGUF dimension quirk - metadata is backwards from actual data
+                // For 2D tensors, swap dimensions to match actual file layout
+                // Must match the swap in parseTensorInfo() above
+                if (n_dims == 2)
+                {
+                    std::swap(info.dimensions[0], info.dimensions[1]);
                 }
 
                 // Read tensor type

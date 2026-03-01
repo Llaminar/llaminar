@@ -304,6 +304,47 @@ namespace llaminar2
         LOG_INFO("[NCCLCoordinator] Shutdown complete");
     }
 
+    void NCCLCoordinator::abortCommunicators()
+    {
+#ifdef HAVE_NCCL
+        LOG_WARN("[NCCLCoordinator] Aborting all " << comms_.size()
+                                                   << " communicators to unblock pending NCCL operations");
+
+        for (int i = 0; i < static_cast<int>(comms_.size()); ++i)
+        {
+            if (comms_[i] != nullptr)
+            {
+                if (i < static_cast<int>(device_ordinals_.size()))
+                {
+                    cudaSetDevice(device_ordinals_[i]);
+                }
+                nccl::ncclResult_t r = nccl::ncclCommAbort(
+                    static_cast<nccl::ncclComm_t>(comms_[i]));
+                if (r != nccl::ncclSuccess)
+                {
+                    LOG_WARN("[NCCLCoordinator] ncclCommAbort on device "
+                             << i << " returned: " << nccl::ncclGetErrorString(r));
+                }
+                comms_[i] = nullptr; // Prevent double-free in cleanup
+            }
+        }
+
+        // Mark as uninitialized so no further collectives are attempted
+        initialized_.store(false);
+
+        // Signal coordinator thread to stop (it may be waiting)
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            running_.store(false);
+        }
+        queue_cv_.notify_all();
+
+        LOG_WARN("[NCCLCoordinator] All communicators aborted");
+#else
+        LOG_WARN("[NCCLCoordinator] abortCommunicators() called but NCCL not available");
+#endif
+    }
+
     // ============================================================================
     // Synchronization with Device Workers
     // ============================================================================
