@@ -491,7 +491,9 @@ if(HAVE_ROCM)
         kernels/rocm/ROCmQuantisedGemmKernel.hip           # Common INT8 GEMM utilities (quantization, scaling, memory)
         kernels/rocm/ROCmQuantisedGemmKernel_CK.hip        # ComposableKernel INT8×INT8→INT32 GEMM dispatch
         kernels/rocm/ROCmQuantisedGemmKernel_INT8_VNNI.hip # INT8 VNNI wide-tile V3+V7 kernels (gfx906)
-        kernels/rocm/ROCmGemvKernel.hip               # Bandwidth-optimized INT8 GEMV for decode (M=1)
+        kernels/rocm/ROCmGemvKernel.hip               # GEMV kernel suite documentation index (split into files below)
+        kernels/rocm/ROCmGemvKernel_INT8_VNNI.hip    # INT8 VNNI GEMV/GEMM kernels for decode + prefill (gfx906)
+        kernels/rocm/ROCmGemvKernel_native_VNNI.hip  # Native-VNNI 4-bit (Q4_0/IQ4_NL) GEMV kernels (gfx906)
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
         kernels/rocm/kvcache/ROCmRingKVCacheKernels.hip       # Ring buffer KV cache kernels
         kernels/rocm/ops/ROCmSwiGLUKernels.hip               # SwiGLU kernels (FP32, BF16, FP16)
