@@ -348,6 +348,209 @@ This is a lossy step (re-quantizing FP32 → INT8 with a per-row scale), but it 
 | CK expand quality for prefill | Medium | Low | Row-scale + INT8 re-quantization is lossy, same as current CK path; decode is the critical path |
 | Regression in Q5/Q4_1 formats | None | None | These formats are out of scope for Sprint 1; ratio-VNNI removal only affects Q4_0/IQ4_NL paths |
 
+## IQ Shape Specialization (Post-LDS Kernel)
+
+### Motivation
+
+The IQ LDS kernel (`gemv_iq_lds_kernel_t`) gives 76-190% decode speedups by caching
+grid lookup tables in LDS.  But the initial dispatch (simple `N > 2048` threshold) is
+suboptimal for several shape categories.  Shape specialization applies different kernel
+strategies based on the N/K ratio, inspired by the INT8 VNNI prefill kernel's V3/V7
+dispatch (`K >= N → V3/LDS-pipeline`, `K < N → V7/safe-tile`).
+
+### Benchmark Baseline (IQ3_XXS, representative)
+
+| Shape | N | K | K/N | Category | Kernel | Eff% | Issue |
+|-------|---|---|-----|----------|--------|------|-------|
+| 0.5B_AttnOut | 896 | 896 | 1.0 | Small balanced | non-LDS TN=64 | 46% | Launch floor |
+| 0.5B_QKV | 2688 | 896 | 0.33 | N-heavy (small) | LDS TN=256 | 34% | **Regression**: only 11 LDS blocks for 60 CUs |
+| 0.5B_FFN_Up | 4864 | 896 | 0.18 | N-heavy (small K) | LDS TN=256 | 38% | Short K, LDS overhead not amortized |
+| 0.5B_FFN_Dn | 896 | 4864 | 5.4 | K-heavy (small N) | non-LDS TN=64 | 53% | Good — K-loop benefits from constant$ |
+| 0.5B_LM_Head | 151936 | 896 | 0.006 | Very N-heavy | LDS TN=256 | 61% | BW-limited, good |
+| 3B_AttnOut | 2048 | 2048 | 1.0 | Balanced | non-LDS TN=64 | 47% | Fallback at threshold boundary |
+| 3B_FFN_Up | 11008 | 2048 | 0.19 | N-heavy | LDS TN=256 | 52% | Good |
+| 3B_FFN_Dn | 2048 | 11008 | 5.4 | K-heavy | non-LDS TN=64 | 40% | **Poor**: long K-loop + constant$ thrashing |
+| 3B_LM_Head | 151936 | 2048 | 0.013 | Very N-heavy | LDS TN=256 | 75% | Near-optimal |
+| 7B_QKV | 10752 | 3584 | 0.33 | N-heavy | LDS TN=256 | 50% | Good |
+| 7B_FFN_Up | 18944 | 3584 | 0.19 | N-heavy | LDS TN=256 | 55% | Good |
+| 7B_FFN_Dn | 3584 | 18944 | 5.3 | K-heavy | LDS TN=256 | 49% | Long K, moderate |
+
+### Strategy 1: CU-Saturation Threshold (replaces N > 2048)
+
+**Problem**: The LDS kernel uses TN=256, so `grid_n = N/256`.  For small N this
+creates too few blocks.  0.5B_QKV (N=2688) gets only 11 blocks — not enough to
+fill 60 CUs even with K-partitioning.
+
+**Fix**: Replace the static `N > 2048` threshold with a hardware-relative CU-saturation check:
+```
+grid_n_lds = ceil(N / 256)
+use_iq_lds = is_iq && grid_n_lds >= NUM_CUS / 2   (e.g., 60/2 = 30)
+```
+This ensures ~(CU_count/2) N-blocks × KB Y-blocks = enough work for full CU coverage.
+For shapes below the threshold, the non-LDS TN=64 kernel creates 4× more N-blocks.
+The threshold is hardware-relative, not a hardcoded count.
+
+### Strategy 2: K-Heavy Aspect Ratio (FFN_Dn pattern)
+
+**Problem**: K-heavy shapes (K >> N) have long K-loops with many grid lookups.
+The non-LDS kernel relies on constant cache, which thrashes when 60+ CUs hammer
+the same grid table.  3B_FFN_Dn (N=2048, K=11008) hits only 40% efficiency.
+
+**Fix**: Force LDS kernel for K-dominated shapes using ratio-based checks:
+```
+is_k_heavy = (K >= 4.0 * N)                  // Aspect ratio: K-dominated shape
+           && (grid_n_lds >= NUM_CUS / 10)    // Min parallelism for 256-thread WGs
+use_iq_lds = is_iq && (grid_n_lds >= NUM_CUS/2 || is_k_heavy)
+```
+For K-heavy shapes, the LDS grid cache eliminates constant memory contention on
+the long K-loop.  The aspect ratio threshold (K/N ≥ 4) captures the FFN_Dn pattern
+regardless of absolute size.  The grid_n floor (~10% of CUs) ensures the LDS
+kernel has workable parallelism — shapes with too few N-blocks (e.g., 0.5B FFN_Dn
+with grid_n=4) stay on the more parallel TN=64 kernel.
+
+All thresholds are **ratio-based or hardware-relative** (no hardcoded row/column
+counts) so they scale to arbitrary model dimensions.
+
+### Strategy 3: CPT=2 for N-Heavy Shapes (Future)
+
+For very N-heavy shapes (LM_Head, FFN_Up), processing 2 output columns per thread
+shares activation loads across both.  INT8 V7 uses N_TILE=128 (vs V3's 64) for the
+same reason.
+
+### Strategy 4: K-Loop Double Buffering (Future)
+
+For K-heavy shapes, explicit software pipelining (load block b+1 while computing
+block b) would overlap global memory latency with compute.  INT8 V3 uses LDS
+double-buffering for the same effect.
+
+### Implementation Priority
+
+1. **Strategies 1+2 combined** — fix threshold + K-heavy override (this sprint)
+2. **Strategy 3: CPT=2** — activation reuse for BW-bound shapes (next sprint)
+3. **Strategy 4: K-loop pipeline** — overlap loads/compute for K-heavy (future)
+
+---
+
+## ISA-Level IQ Format Optimization Plan
+
+### Context
+
+ISA analysis (disassembly + instruction census) of the IQ format kernels reveals that
+IQ1 and IQ2 performance (29–39% of INT8 baseline) is limited by three root causes,
+not occupancy. VGPR counts are low (22–32) giving max occupancy (32–40 waves/CU).
+
+### Root Causes
+
+**RC1: L1 Cache Thrashing (IQ1)**
+The `d_iq1s_grid` constant table is 16KB — exactly the vector L1 capacity on GFX9.
+Grid lookups use `global_load_dwordx2` with per-lane scattered addresses, continuously
+evicting payload/scale data. Actual memory traffic is ~4.25× the useful weight data
+due to grid fetches. IQ2_S (8KB grid) fits with headroom; IQ3 (1–2KB) fits easily.
+
+**RC2: Dependent-Load Latency Chain**
+Q4_0 has a single load phase: payload → decode (pure VALU) → dot4. IQ formats have
+*two* sequential load phases: payload load → wait → index extract → grid load → wait → dot4.
+Critical path: ~508 cycles (IQ1) vs ~420 cycles (Q4_0).
+
+**RC3: Double dot4 Count for IQ1 Asymmetric Correction**
+The ISA shows two parallel accumulator chains: 8× `v_dot4_i32_i8` for `act × weight`
+and 8× `v_dot4_i32_i8` for `act × 1` (computing `sum_a` for the asymmetric min
+correction). 50% of dot4 throughput is pure overhead.
+
+**RC4: Massive Decode VALU for IQ2/IQ3 Sign Application**
+`iq_apply_signs_4()` expanded to ~15 VALU per call (4× BFE extract + shifts + ORs +
+mask expand + XOR + add). Called 8× per block = ~120 decode VALU vs only 8 dot4.
+**Fixed by O4**: SWAR multiply reduces to ~5 VALU per call (see O4 results below).
+
+### ISA Census Summary
+
+| Metric | Q4_0 | IQ1_S | IQ1_M | IQ2_S |
+|--------|------|-------|-------|-------|
+| Total instructions | 337 | 164 | 174 | 253 |
+| VALU (%) | 181 (54%) | 74 (45%) | 82 (47%) | 159 (63%) |
+| SALU (%) | 123 (37%) | 74 (45%) | 75 (43%) | 78 (31%) |
+| VMEM loads | 22 | 10 | 11 | 10 |
+| v_dot4_i32_i8 | 8 | 16 | 16 | 8 |
+| VALU/VMEM ratio | 8.2:1 | 7.4:1 | 7.5:1 | 15.9:1 |
+
+### Optimization Roadmap
+
+| # | Optimization | Target | Expected Gain | Actual Gain | Status |
+|---|-------------|--------|---------------|-------------|--------|
+| ~~O1~~ | ~~Ternary-encoded compact grid for IQ1~~ | ~~IQ1_S/M~~ | ~~+30-40%~~ | Regression | **Reverted** |
+| O2 | 2-block loop unrolling with grid prefetch | IQ2 non-LDS | +15-25% | +0.4-0.8% (noise) | **Done — marginal** |
+| O3 | Precompute activation prefix sums | IQ1_S/M | +10-15% | — | Planned |
+| **O4** | **SWAR multiply-based sign expansion** | **IQ2/IQ3** | **+10-20%** | **+8.6-20.9%** | **Done — major win** |
+| O5 | CPT=2 for IQ formats | All IQ | +5-10% | — | Planned |
+
+### O2: 2-Block Loop Unrolling (Marginal)
+
+Processes two K-blocks per iteration in the non-LDS kernel so the compiler can
+overlap constant-memory grid lookup latencies between blocks. Block N+1's grid
+loads are issued while block N's dot4 chain executes.
+
+**Result**: Applied only to IQ2 non-LDS path (IQ1 regressed due to 16KB grid L1
+pressure; LDS kernel already has ~20-cycle latency with 4 overlapping reads).
+Benchmarks showed +0.4-0.8% improvement, within measurement noise. The compiler
+was already scheduling loads well enough that manual 2-block unrolling added no
+meaningful benefit. Kept in code (zero regression risk) but not impactful.
+
+### O3: Activation Prefix Sums (Planned)
+
+Eliminate the 8 extra `v_dot4_i32_i8` for `sum_a` in IQ1_S/M (RC3). Precompute
+`prefix_sum[i] = Σ_{j<i} activations[j]` once at kernel start, then
+`sum_a_block = prefix[(b+1)*32] - prefix[b*32]` — 1 subtraction instead of 8 dot4's.
+This removes 50% of dot4 throughput overhead for IQ1 asymmetric correction.
+
+### O4: SWAR Multiply-Based Sign Expansion (Major Win)
+
+Replaced the per-bit BFE extraction chain in `iq_apply_signs_4()` with a
+multiply-based SWAR (SIMD Within A Register) bit-to-byte expansion:
+
+```cpp
+// OLD: 4× v_bfe_i32 + shifts + ORs ≈ 15 VALU per call
+uint32_t mask =
+    (uint32_t)(-(sign_lo4 & 1)) & 0xFF) |
+    ((uint32_t)(-((sign_lo4 >> 1) & 1)) & 0xFF) << 8) | ...
+
+// NEW: 2× v_mul_lo + 1× v_and ≈ 5 VALU per call
+uint32_t spread = (uint32_t(sign_lo4 & 0xF) * 0x08040201u) & 0x01010101u;
+uint32_t mask = spread * 255u;
+return (grid4 ^ mask) + spread;
+```
+
+**Math**: `sign_lo4 * 0x08040201` scatters each sign bit to its own byte lane
+(no cross-byte carry since max value 15 × 0x08040201 = 0x783C1E0F, all bytes < 256).
+Then `spread * 255` expands 0x00→0x00, 0x01→0xFF per byte.
+
+**ISA Impact** (verified via llvm-objdump):
+
+| Kernel | v_bfe Before | v_bfe After | Total Insns Before | Total Insns After | Reduction |
+|--------|-------------|-------------|-------------------|-------------------|-----------|
+| IQ3_S LDS | 29 | 7 | 288 | 227 | **-21%** |
+| IQ2_S LDS | 27 | 6 | 266 | 207 | **-22%** |
+| IQ2_XXS LDS | 25 | 5 | — | — | **-20%** |
+
+**Benchmark Results** (vs pre-O4 baseline):
+
+| Format | Before (μs / eff%) | After (μs / eff%) | Speedup | Eff Δ |
+|--------|-------------------|-------------------|---------|-------|
+| IQ2_XXS | 58.9 / 36% | **46.6 / 44%** | **-20.9%** | **+8pp** |
+| IQ2_S | 68.3 / 38% | **57.1 / 44%** | **-16.4%** | **+6pp** |
+| IQ2_XS | 67.5 / 35% | **57.3 / 41%** | **-15.1%** | **+6pp** |
+| IQ3_S | 71.0 / 50% | **61.6 / 57%** | **-13.2%** | **+7pp** |
+| IQ3_XXS | 61.4 / 51% | **56.1 / 56%** | **-8.6%** | **+5pp** |
+| All other formats | — | — | ±0.2% (noise) | 0 |
+
+IQ1_S/M unchanged (they don't call `iq_apply_signs_4` — grid values are already signed).
+
+### O5: CPT=2 for IQ Formats (Planned)
+
+Process 2 output columns per thread, sharing activation loads across both columns.
+Reduces activation bandwidth by 50%.
+
+---
+
 ## Notes
 
 - **IQ4_NL LUT**: The `k_ratio_vnni_iq4_lut_i8[16]` constant is still needed for IQ4_NL native-VNNI. Rename to `k_iq4_codebook_i8[16]` and keep it.

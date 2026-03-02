@@ -8059,6 +8059,29 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added Native-VNNI throughput benchmark (16 formats)")
 
+    # Performance Microbenchmark: IQ Decode Strategy Lab
+    # Isolated decode-only benchmark for IQ grid-index quantization formats.
+    # Tests multiple decode strategies (baseline, vsub4, LDS cache, ksigns64)
+    # head-to-head without the full GEMV pipeline.
+    set_source_files_properties(
+        performance/kernels/rocm/Microbench__IQDecodeLab.hip
+        PROPERTIES LANGUAGE HIP
+    )
+    add_executable(v2_perf_iq_decode_lab
+        performance/kernels/rocm/Microbench__IQDecodeLab.hip
+    )
+    target_link_libraries(v2_perf_iq_decode_lab
+        hip::host
+        hip::device
+        llaminar2_core
+    )
+    add_v2_test(V2_Perf_IQDecodeLab
+        COMMAND $<TARGET_FILE:v2_perf_iq_decode_lab>
+        LABELS "V2;Performance;ROCm;GEMV;IQ;Decode;Microbenchmark;gfx906;Experiment"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added IQ decode strategy lab microbenchmark")
+
     set_source_files_properties(
         performance/kernels/rocm/Microbench__ROCmPrefillStrategyLab.hip
         PROPERTIES LANGUAGE HIP
