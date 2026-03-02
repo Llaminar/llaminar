@@ -898,38 +898,19 @@ __global__ void gemv_native_vnni_kernel_t(
                         if constexpr (Traits::center_4bit == 8)
                         {
                             // Q4_0: w = nibble - 8 → range [-8,+7]
-                            // v_perm_b32 register LUT: same pattern as IQ4_NL
-                            //   nibble 0→0xF8(-8), 1→0xF9(-7), ..., 7→0xFF(-1)
-                            //   nibble 8→0x00(0),  9→0x01(1),  ..., 15→0x07(7)
-                            constexpr uint32_t CB_LO_A = 0xFBFAF9F8u;  // cb[0..3]
-                            constexpr uint32_t CB_LO_B = 0xFFFEFDFCu;  // cb[4..7]
-                            constexpr uint32_t CB_HI_A = 0x03020100u;  // cb[8..11]
-                            constexpr uint32_t CB_HI_B = 0x07060504u;  // cb[12..15]
+                            // SWAR byte-wise subtraction: (nibble + 0x78) ^ 0x80
+                            //   nibble [0,15] + 0x78 = [0x78, 0x87] — no inter-byte carry
+                            //   XOR 0x80 → signed INT8: 0x78→0xF8(-8) ... 0x87→0x07(+7)
+                            constexpr uint32_t SWAR_ADD = 0x78787878u;
+                            constexpr uint32_t SWAR_XOR = 0x80808080u;
+                            constexpr uint32_t NIBBLE_MASK = 0x0F0F0F0Fu;
 
                             #pragma unroll
                             for (int g = 0; g < 4; ++g)
                             {
                                 const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
-
-                                const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
-                                {
-                                    const uint32_t sel = lo_nibs & 0x07070707u;
-                                    const uint32_t r_lo = __builtin_amdgcn_perm(CB_LO_A, CB_LO_B, sel);
-                                    const uint32_t r_hi = __builtin_amdgcn_perm(CB_HI_A, CB_HI_B, sel);
-                                    uint32_t m = (lo_nibs >> 3) & 0x01010101u;
-                                    m |= (m << 1); m |= (m << 2); m |= (m << 4);
-                                    packed_groups[g] = static_cast<int32_t>((r_hi & m) | (r_lo & ~m));
-                                }
-
-                                const uint32_t hi_nibs = (raw >> 4) & 0x0F0F0F0Fu;
-                                {
-                                    const uint32_t sel = hi_nibs & 0x07070707u;
-                                    const uint32_t r_lo = __builtin_amdgcn_perm(CB_LO_A, CB_LO_B, sel);
-                                    const uint32_t r_hi = __builtin_amdgcn_perm(CB_HI_A, CB_HI_B, sel);
-                                    uint32_t m = (hi_nibs >> 3) & 0x01010101u;
-                                    m |= (m << 1); m |= (m << 2); m |= (m << 4);
-                                    packed_groups[g + 4] = static_cast<int32_t>((r_hi & m) | (r_lo & ~m));
-                                }
+                                packed_groups[g]     = static_cast<int32_t>(((raw & NIBBLE_MASK) + SWAR_ADD) ^ SWAR_XOR);
+                                packed_groups[g + 4] = static_cast<int32_t>((((raw >> 4) & NIBBLE_MASK) + SWAR_ADD) ^ SWAR_XOR);
                             }
                         }
                         else
