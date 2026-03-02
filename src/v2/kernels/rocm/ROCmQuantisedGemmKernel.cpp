@@ -1852,19 +1852,29 @@ namespace llaminar2
                         const int group = sub_idx % 4;
                         const int shift = group * 2;
 
-                        // Extract 32 2-bit values and pack into 8 bytes
+                        // Extract 32 2-bit values
                         uint8_t payload_buf[12];
-                        for (int g = 0; g < 8; ++g)
+                        uint8_t raw2[32];
+                        for (int e = 0; e < 32; ++e)
+                            raw2[e] = (blk->qs[chunk * 32 + e] >> shift) & 3;
+
+                        // Pre-transposed packing: byte[j] of each half holds one element
+                        // from each of 4 groups at fields 0,1,2,3.  GPU decode becomes
+                        // simple field extraction (AND + shift) with zero v_perm transpose.
+                        //
+                        // half 0: payload[j] = e[j] | e[j+4]<<2 | e[j+8]<<4 | e[j+12]<<6
+                        // half 1: payload[4+j] = e[16+j] | e[16+j+4]<<2 | ...
+                        for (int half = 0; half < 2; ++half)
                         {
-                            const int base = g * 4;
-                            uint8_t packed = 0;
-                            for (int lane = 0; lane < 4; ++lane)
+                            const int base = half * 16;
+                            for (int j = 0; j < 4; ++j)
                             {
-                                const int e = base + lane;
-                                const uint8_t q2 = (blk->qs[chunk * 32 + e] >> shift) & 3;
-                                packed |= static_cast<uint8_t>(q2 << (lane * 2));
+                                payload_buf[half * 4 + j] = static_cast<uint8_t>(
+                                    raw2[base + j]
+                                    | (raw2[base + j + 4] << 2)
+                                    | (raw2[base + j + 8] << 4)
+                                    | (raw2[base + j + 12] << 6));
                             }
-                            payload_buf[g] = packed;
                         }
 
                         // Scale indices for Q2_K: lo = 8*chunk + 2*group, hi = lo + 1

@@ -724,37 +724,30 @@ __global__ void gemv_native_vnni_kernel_t(
                     }
                     else if constexpr (Traits::is_2bit)
                     {
-                        // Q2_K: 2-bit SWAR decode + v_perm byte transpose from 12-byte payload
-                        // Payload layout:
-                        //   [0..7]:   q2 — packed 2-bit:  byte[g] = elem[4g]&3 | (elem[4g+1]&3)<<2 | ...
-                        //   [8..11]:  embedded FP16 mins: min_lo (2B) + min_hi (2B)
-                        // Decoded: int8 = q2 (unsigned, range [0, 3])
-                        // Asymmetric min correction applied via split sum_a in accumulation
+                        // Q2_K: Pre-transposed 2-bit decode — zero-transpose field extraction
                         //
-                        // SWAR extracts all 4 × 2-bit field planes from 4 q2 bytes at once,
-                        // then v_perm byte transpose converts field-strided → element-strided.
+                        // Payload layout (pre-transposed during CPU packing):
+                        //   [0..3]:  half 0 — byte[j] = e[j] | e[j+4]<<2 | e[j+8]<<4 | e[j+12]<<6
+                        //   [4..7]:  half 1 — same pattern for elements 16-31
+                        //   [8..11]: embedded FP16 mins: min_lo (2B) + min_hi (2B)
+                        //
+                        // Field extraction directly produces group-order packed INT8:
+                        //   groups[bg]     = raw & 0x03030303  → {e[0], e[1], e[2], e[3]}
+                        //   groups[bg + 1] = (raw>>2) & 0x03   → {e[4], e[5], e[6], e[7]}
+                        //   etc.
+                        //
+                        // Previous ISA cost:  66 VALU (14 field extract + 16 v_perm transpose)
+                        // New ISA cost:       ~50 VALU (14 field extract only, zero v_perm)
+                        // Payload size:       unchanged (12 bytes)
                         #pragma unroll
                         for (int half = 0; half < 2; ++half)
                         {
                             const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + half * 4);
-
-                            // SWAR: extract 4 × 2-bit field planes across all 4 bytes
-                            const uint32_t f0 = raw & 0x03030303u;
-                            const uint32_t f1 = (raw >> 2) & 0x03030303u;
-                            const uint32_t f2 = (raw >> 4) & 0x03030303u;
-                            const uint32_t f3 = (raw >> 6) & 0x03030303u;
-
-                            // v_perm 4×4 byte transpose: field-strided → element-strided
-                            const uint32_t r01 = __builtin_amdgcn_perm(f0, f1, 0x05010400u);
-                            const uint32_t r23 = __builtin_amdgcn_perm(f2, f3, 0x05010400u);
-                            const uint32_t r45 = __builtin_amdgcn_perm(f0, f1, 0x07030602u);
-                            const uint32_t r67 = __builtin_amdgcn_perm(f2, f3, 0x07030602u);
-
                             const int bg = half * 4;
-                            packed_groups[bg]     = static_cast<int32_t>(__builtin_amdgcn_perm(r01, r23, 0x05040100u));
-                            packed_groups[bg + 1] = static_cast<int32_t>(__builtin_amdgcn_perm(r01, r23, 0x07060302u));
-                            packed_groups[bg + 2] = static_cast<int32_t>(__builtin_amdgcn_perm(r45, r67, 0x05040100u));
-                            packed_groups[bg + 3] = static_cast<int32_t>(__builtin_amdgcn_perm(r45, r67, 0x07060302u));
+                            packed_groups[bg]     = static_cast<int32_t>(raw & 0x03030303u);
+                            packed_groups[bg + 1] = static_cast<int32_t>((raw >> 2) & 0x03030303u);
+                            packed_groups[bg + 2] = static_cast<int32_t>((raw >> 4) & 0x03030303u);
+                            packed_groups[bg + 3] = static_cast<int32_t>((raw >> 6) & 0x03030303u);
                         }
                     }
                     else if constexpr (Traits::is_6bit)
