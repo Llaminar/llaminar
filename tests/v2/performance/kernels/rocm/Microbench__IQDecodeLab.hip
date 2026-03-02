@@ -60,6 +60,26 @@ __device__ __constant__ uint64_t dc_iq1s_grid[2048];    // IQ1_S/M: 2048 × 8B =
 __device__ __constant__ uint64_t dc_ksigns64[128];
 
 // =============================================================================
+// Compact IQ1 grid: 2-bit ternary encoding
+//   Each {-1, 0, +1} value stored as 2 bits: 00=0, 01=+1, 11=-1
+//   8 values per entry → 16 bits per entry → 2048 × 2B = 4KB (vs 16KB full)
+//   Goal: 4KB fits comfortably in 16KB L1 cache, eliminating thrashing
+// =============================================================================
+__device__ __constant__ uint16_t dc_iq1_compact[2048];  // 2048 × 2B = 4KB
+
+// Expansion LUT: maps 8 bits (4 × 2-bit packed values) → 4 packed int8 bytes
+// 256 × 4B = 1KB — tiny, highly cacheable, shared across all lookups
+__device__ __constant__ uint32_t dc_iq1_expand_lut[256]; // 256 × 4B = 1KB
+
+// Split-table nibble LUT: maps 4-bit nibble (2 × 2-bit values) → 2 packed int8
+// 16 × 2B = 32 bytes — fits in HALF a 64B cache line.
+// The idea: decompose the 256-entry (1KB) expand LUT into a 16-entry (32B)
+// nibble-indexed table. Each byte of compact data splits into 2 nibbles,
+// each nibble indexes this tiny table for 2 values. 4 lookups per compact
+// entry (vs 2 for full LUT), but 32× smaller = zero cache pressure.
+__device__ __constant__ uint16_t dc_iq1_nibble_lut[16]; // 16 × 2B = 32B
+
+// =============================================================================
 // Host-side ksigns64 generation
 // =============================================================================
 static void generate_ksigns64(uint64_t out[128])
@@ -73,6 +93,111 @@ static void generate_ksigns64(uint64_t out[128])
             bytes[j] = (i & (1 << j)) ? 0xFF : 0x00;
         memcpy(&out[i], bytes, 8);
     }
+}
+
+// =============================================================================
+// Compact IQ1 grid generation
+// =============================================================================
+
+// Compress full iq1s_grid[2048] × uint64_t → compact[2048] × uint16_t
+// Encoding: for each of 8 signed int8 values {-1, 0, +1}:
+//   00 = 0, 01 = +1, 11 = -1  (encoding 10 never occurs)
+static void generate_iq1_compact_grid(uint16_t out[2048], const uint64_t* full_grid)
+{
+    for (int i = 0; i < 2048; i++)
+    {
+        uint16_t compact = 0;
+        uint64_t entry = full_grid[i];
+        for (int j = 0; j < 8; j++)
+        {
+            auto val = static_cast<int8_t>((entry >> (j * 8)) & 0xFF);
+            uint16_t bits = (val == 0) ? 0u : (val == 1 ? 1u : 3u);
+            compact |= static_cast<uint16_t>(bits << (j * 2));
+        }
+        out[i] = compact;
+    }
+}
+
+// Generate expansion LUT: maps 8 bits (4 × 2-bit packed) → 4 packed int8
+// Same encoding as above: 00→0x00, 01→0x01, 11→0xFF
+static void generate_iq1_expand_lut(uint32_t out[256])
+{
+    for (int i = 0; i < 256; i++)
+    {
+        uint32_t expanded = 0;
+        for (int j = 0; j < 4; j++)
+        {
+            int bits = (i >> (j * 2)) & 3;
+            uint8_t val;
+            if (bits == 0) val = 0;
+            else if (bits == 1) val = 1;
+            else val = static_cast<uint8_t>(0xFF); // -1 in int8
+            expanded |= (static_cast<uint32_t>(val) << (j * 8));
+        }
+        out[i] = expanded;
+    }
+}
+
+// Generate nibble split-table LUT: maps 4-bit nibble (2 × 2-bit packed) → 2 packed int8
+// Same encoding as compact grid: 00→0x00, 01→0x01, 11→0xFF (-1)
+static void generate_iq1_nibble_lut(uint16_t out[16])
+{
+    for (int nib = 0; nib < 16; nib++)
+    {
+        uint8_t bytes[2];
+        for (int j = 0; j < 2; j++)
+        {
+            int bits = (nib >> (j * 2)) & 3;
+            if (bits == 0) bytes[j] = 0;
+            else if (bits == 1) bytes[j] = 1;
+            else bytes[j] = static_cast<uint8_t>(0xFF); // -1 as int8
+        }
+        memcpy(&out[nib], bytes, 2);
+    }
+}
+
+// Verify nibble LUT produces identical results to full expand LUT
+static bool verify_iq1_nibble_lut(const uint16_t nibble_lut[16],
+                                   const uint32_t expand_lut[256])
+{
+    for (int byte_val = 0; byte_val < 256; byte_val++)
+    {
+        uint32_t from_expand = expand_lut[byte_val];
+        uint16_t lo_nib = nibble_lut[byte_val & 0xF];
+        uint16_t hi_nib = nibble_lut[byte_val >> 4];
+        uint32_t from_nibble = static_cast<uint32_t>(lo_nib)
+                             | (static_cast<uint32_t>(hi_nib) << 16);
+        if (from_expand != from_nibble)
+        {
+            fprintf(stderr, "Nibble LUT verification FAILED at byte %d\n", byte_val);
+            fprintf(stderr, "  expand_lut: 0x%08x\n", from_expand);
+            fprintf(stderr, "  nibble_lut: 0x%08x\n", from_nibble);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Verify compact encoding roundtrips correctly against full grid
+static bool verify_iq1_compact_grid(const uint16_t compact[2048],
+                                    const uint32_t expand_lut[256],
+                                    const uint64_t full_grid[2048])
+{
+    for (int i = 0; i < 2048; i++)
+    {
+        uint16_t c = compact[i];
+        uint32_t lo = expand_lut[c & 0xFF];
+        uint32_t hi = expand_lut[c >> 8];
+        uint64_t reconstructed = static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+        if (reconstructed != full_grid[i])
+        {
+            fprintf(stderr, "Compact grid verification FAILED at index %d\n", i);
+            fprintf(stderr, "  full:   0x%016lx\n", full_grid[i]);
+            fprintf(stderr, "  recon:  0x%016lx\n", reconstructed);
+            return false;
+        }
+    }
+    return true;
 }
 
 // =============================================================================
@@ -123,6 +248,18 @@ __device__ __forceinline__ uint32_t iq_apply_signs_4_baseline(uint32_t grid4, ui
         ((static_cast<uint32_t>(-((sign_lo4 >> 3) & 1)) & 0xFFu) << 24);
     uint32_t carry = mask & 0x01010101u;
     return (grid4 ^ mask) + carry;
+}
+
+// O4: SWAR multiply-based sign application (current production version)
+// 2× v_mul_lo + 1× v_and + 1× v_xor + 1× v_add ≈ 5 VALU (vs ~15 for BFE baseline)
+// Math: spread = (sign * 0x08040201) & 0x01010101 scatters bit[i] to byte[i]
+//       mask = spread * 255 expands 0x01→0xFF per byte
+//       (grid ^ mask) + spread is two's complement conditional negate
+__device__ __forceinline__ uint32_t iq_apply_signs_4_swar(uint32_t grid4, uint8_t sign_lo4)
+{
+    uint32_t spread = (static_cast<uint32_t>(sign_lo4 & 0xFu) * 0x08040201u) & 0x01010101u;
+    uint32_t mask = spread * 255u;
+    return (grid4 ^ mask) + spread;
 }
 
 // --- IQ3 baseline ---
@@ -247,6 +384,406 @@ __device__ __forceinline__ void decode_iq1m_baseline(
     g = dc_iq1s_grid[idx3];
     out[6] = static_cast<int32_t>(static_cast<uint32_t>(g));
     out[7] = static_cast<int32_t>(static_cast<uint32_t>(g >> 32));
+}
+
+
+// =============================================================================
+// IQ1 Strategy: Compact 2-bit grid + expansion LUT (constant memory)
+//   Grid: 2048 × 2B = 4KB in constant memory (vs 16KB full grid)
+//   LUT:  256 × 4B = 1KB in constant memory
+//   Total: 5KB — fits in 16KB L1 cache with 11KB headroom
+//
+//   Key insight: IQ1 values are ternary {-1, 0, +1}, storable as 2 bits.
+//   16KB → 4KB eliminates L1 cache thrashing on gfx906 (16KB TCP per CU).
+//   LUT is only 1KB with high reuse → near-zero cache overhead.
+//
+//   Tradeoff: extra lookup indirection (grid→LUT) adds ~5 cycles latency
+//   but eliminates ~100+ cycle cache misses.
+// =============================================================================
+
+__device__ __forceinline__ void decode_iq1s_compact_lut(
+    const uint8_t* __restrict__ payload, int32_t* __restrict__ out)
+{
+    const uint16_t qh_word = static_cast<uint16_t>(payload[4])
+                           | (static_cast<uint16_t>(payload[5]) << 8);
+    #pragma unroll
+    for (int l = 0; l < 4; ++l)
+    {
+        const int idx = payload[l] | (((qh_word >> (3 * l)) & 7) << 8);
+        const uint16_t compact = dc_iq1_compact[idx];  // 2B load (vs 8B)
+        out[l * 2]     = static_cast<int32_t>(dc_iq1_expand_lut[compact & 0xFF]);
+        out[l * 2 + 1] = static_cast<int32_t>(dc_iq1_expand_lut[compact >> 8]);
+    }
+}
+
+__device__ __forceinline__ void decode_iq1m_compact_lut(
+    const uint8_t* __restrict__ payload, int32_t* __restrict__ out)
+{
+    const uint8_t qh0 = payload[4], qh1 = payload[5];
+    const int idx0 = payload[0] | ((qh0 & 0x07) << 8);
+    const int idx1 = payload[1] | (((qh0 >> 4) & 0x07) << 8);
+    const int idx2 = payload[2] | ((qh1 & 0x07) << 8);
+    const int idx3 = payload[3] | (((qh1 >> 4) & 0x07) << 8);
+
+    uint16_t c;
+    c = dc_iq1_compact[idx0];
+    out[0] = static_cast<int32_t>(dc_iq1_expand_lut[c & 0xFF]);
+    out[1] = static_cast<int32_t>(dc_iq1_expand_lut[c >> 8]);
+    c = dc_iq1_compact[idx1];
+    out[2] = static_cast<int32_t>(dc_iq1_expand_lut[c & 0xFF]);
+    out[3] = static_cast<int32_t>(dc_iq1_expand_lut[c >> 8]);
+    c = dc_iq1_compact[idx2];
+    out[4] = static_cast<int32_t>(dc_iq1_expand_lut[c & 0xFF]);
+    out[5] = static_cast<int32_t>(dc_iq1_expand_lut[c >> 8]);
+    c = dc_iq1_compact[idx3];
+    out[6] = static_cast<int32_t>(dc_iq1_expand_lut[c & 0xFF]);
+    out[7] = static_cast<int32_t>(dc_iq1_expand_lut[c >> 8]);
+}
+
+
+// =============================================================================
+// IQ1 Strategy: Compact 2-bit grid + SWAR expansion (no LUT, pure ALU)
+//   Same 4KB compact grid, but expand 2-bit→byte using SWAR bit tricks.
+//   Eliminates the expand LUT entirely — zero extra memory.
+//
+//   SWAR expansion for 4 × 2-bit ternary values → 4 packed int8:
+//     1. Separate value bits (even positions) and sign bits (odd positions)
+//     2. Scatter each to byte positions via multiply: * 0x00041041 & 0x01010101
+//     3. Combine: value_bytes | (sign_bytes * 255)
+//
+//   Cost: ~9 VALU per 4-value group × 2 groups = ~18 VALU per entry.
+//   Win if memory savings outweigh the ALU overhead.
+// =============================================================================
+
+// SWAR helper: expand 4 packed 2-bit ternary values → 4 packed int8 bytes
+__device__ __forceinline__ uint32_t iq1_expand_swar(uint32_t packed8)
+{
+    // packed8 bits: [b3 a3 b2 a2 b1 a1 b0 a0]
+    // where bi=sign, ai=value. Encoding: 00=0, 01=+1, 11=-1
+    uint32_t a_raw = packed8 & 0x55u;                    // value bits at even positions
+    uint32_t b_raw = (packed8 >> 1) & 0x55u;             // sign bits at even positions
+    // Scatter bits 0,2,4,6 → bytes 0,1,2,3 via multiply trick:
+    // bit_i at position 2i → byte i position 0
+    uint32_t a = (a_raw * 0x00041041u) & 0x01010101u;    // value in each byte
+    uint32_t b = (b_raw * 0x00041041u) & 0x01010101u;    // sign in each byte
+    // Combine: value | sign_mask. Sign mask: 0→0x00, 1→0xFF.
+    // When b=0: a|0 = a. When b=1,a=1: 1|0xFF = 0xFF (-1). b=1,a=0: never occurs.
+    return a | (b * 255u);
+}
+
+__device__ __forceinline__ void decode_iq1s_compact_swar(
+    const uint8_t* __restrict__ payload, int32_t* __restrict__ out)
+{
+    const uint16_t qh_word = static_cast<uint16_t>(payload[4])
+                           | (static_cast<uint16_t>(payload[5]) << 8);
+    #pragma unroll
+    for (int l = 0; l < 4; ++l)
+    {
+        const int idx = payload[l] | (((qh_word >> (3 * l)) & 7) << 8);
+        const uint16_t compact = dc_iq1_compact[idx];  // 2B load
+        out[l * 2]     = static_cast<int32_t>(iq1_expand_swar(compact & 0xFFu));
+        out[l * 2 + 1] = static_cast<int32_t>(iq1_expand_swar(compact >> 8));
+    }
+}
+
+__device__ __forceinline__ void decode_iq1m_compact_swar(
+    const uint8_t* __restrict__ payload, int32_t* __restrict__ out)
+{
+    const uint8_t qh0 = payload[4], qh1 = payload[5];
+    const int idx0 = payload[0] | ((qh0 & 0x07) << 8);
+    const int idx1 = payload[1] | (((qh0 >> 4) & 0x07) << 8);
+    const int idx2 = payload[2] | ((qh1 & 0x07) << 8);
+    const int idx3 = payload[3] | (((qh1 >> 4) & 0x07) << 8);
+
+    uint16_t c;
+    c = dc_iq1_compact[idx0];
+    out[0] = static_cast<int32_t>(iq1_expand_swar(c & 0xFFu));
+    out[1] = static_cast<int32_t>(iq1_expand_swar(c >> 8));
+    c = dc_iq1_compact[idx1];
+    out[2] = static_cast<int32_t>(iq1_expand_swar(c & 0xFFu));
+    out[3] = static_cast<int32_t>(iq1_expand_swar(c >> 8));
+    c = dc_iq1_compact[idx2];
+    out[4] = static_cast<int32_t>(iq1_expand_swar(c & 0xFFu));
+    out[5] = static_cast<int32_t>(iq1_expand_swar(c >> 8));
+    c = dc_iq1_compact[idx3];
+    out[6] = static_cast<int32_t>(iq1_expand_swar(c & 0xFFu));
+    out[7] = static_cast<int32_t>(iq1_expand_swar(c >> 8));
+}
+
+
+// =============================================================================
+// IQ1 Strategy: Compact grid in LDS (4KB LDS + 1KB constant LUT)
+//   Same compact encoding, but grid preloaded to LDS.
+//   Only 4KB LDS (vs 16KB for full grid LDS).
+//   On gfx906: 64KB LDS / 4KB = up to 16 WGs limited by LDS alone
+//   (vs 64KB/16KB = 4 WGs for full grid in LDS).
+//   Expansion LUT stays in constant memory (1KB, highly cacheable).
+// =============================================================================
+
+__device__ __forceinline__ void decode_iq1s_compact_lds(
+    const uint8_t* __restrict__ payload, int32_t* __restrict__ out,
+    const uint16_t* __restrict__ lds_compact)
+{
+    const uint16_t qh_word = static_cast<uint16_t>(payload[4])
+                           | (static_cast<uint16_t>(payload[5]) << 8);
+    #pragma unroll
+    for (int l = 0; l < 4; ++l)
+    {
+        const int idx = payload[l] | (((qh_word >> (3 * l)) & 7) << 8);
+        const uint16_t compact = lds_compact[idx];  // LDS read (2B)
+        out[l * 2]     = static_cast<int32_t>(dc_iq1_expand_lut[compact & 0xFF]);
+        out[l * 2 + 1] = static_cast<int32_t>(dc_iq1_expand_lut[compact >> 8]);
+    }
+}
+
+__device__ __forceinline__ void decode_iq1m_compact_lds(
+    const uint8_t* __restrict__ payload, int32_t* __restrict__ out,
+    const uint16_t* __restrict__ lds_compact)
+{
+    const uint8_t qh0 = payload[4], qh1 = payload[5];
+    const int idx0 = payload[0] | ((qh0 & 0x07) << 8);
+    const int idx1 = payload[1] | (((qh0 >> 4) & 0x07) << 8);
+    const int idx2 = payload[2] | ((qh1 & 0x07) << 8);
+    const int idx3 = payload[3] | (((qh1 >> 4) & 0x07) << 8);
+
+    uint16_t c;
+    c = lds_compact[idx0];
+    out[0] = static_cast<int32_t>(dc_iq1_expand_lut[c & 0xFF]);
+    out[1] = static_cast<int32_t>(dc_iq1_expand_lut[c >> 8]);
+    c = lds_compact[idx1];
+    out[2] = static_cast<int32_t>(dc_iq1_expand_lut[c & 0xFF]);
+    out[3] = static_cast<int32_t>(dc_iq1_expand_lut[c >> 8]);
+    c = lds_compact[idx2];
+    out[4] = static_cast<int32_t>(dc_iq1_expand_lut[c & 0xFF]);
+    out[5] = static_cast<int32_t>(dc_iq1_expand_lut[c >> 8]);
+    c = lds_compact[idx3];
+    out[6] = static_cast<int32_t>(dc_iq1_expand_lut[c & 0xFF]);
+    out[7] = static_cast<int32_t>(dc_iq1_expand_lut[c >> 8]);
+}
+
+
+// =============================================================================
+// IQ1 Strategy: Explicit prefetch — hoist all index computation, then load
+//   Separates index computation from grid loads, giving the compiler full
+//   freedom to issue all 4 loads together.  On gfx906, buffer loads have
+//   ~100+ cycle latency on cache miss — overlapping 4 loads saves ~300 cycles.
+//   (The #pragma unroll baseline MAY already achieve this, but explicit
+//   separation makes it guaranteed.)
+// =============================================================================
+
+__device__ __forceinline__ void decode_iq1s_prefetch(
+    const uint8_t* __restrict__ payload, int32_t* __restrict__ out)
+{
+    const uint16_t qh_word = static_cast<uint16_t>(payload[4])
+                           | (static_cast<uint16_t>(payload[5]) << 8);
+
+    // Phase 1: compute ALL indices (pure ALU, no memory)
+    const int idx0 = payload[0] | (((qh_word)       & 7) << 8);
+    const int idx1 = payload[1] | (((qh_word >> 3)  & 7) << 8);
+    const int idx2 = payload[2] | (((qh_word >> 6)  & 7) << 8);
+    const int idx3 = payload[3] | (((qh_word >> 9)  & 7) << 8);
+
+    // Phase 2: issue ALL loads together (compiler can pipeline)
+    const uint64_t g0 = dc_iq1s_grid[idx0];
+    const uint64_t g1 = dc_iq1s_grid[idx1];
+    const uint64_t g2 = dc_iq1s_grid[idx2];
+    const uint64_t g3 = dc_iq1s_grid[idx3];
+
+    // Phase 3: unpack results
+    out[0] = static_cast<int32_t>(static_cast<uint32_t>(g0));
+    out[1] = static_cast<int32_t>(static_cast<uint32_t>(g0 >> 32));
+    out[2] = static_cast<int32_t>(static_cast<uint32_t>(g1));
+    out[3] = static_cast<int32_t>(static_cast<uint32_t>(g1 >> 32));
+    out[4] = static_cast<int32_t>(static_cast<uint32_t>(g2));
+    out[5] = static_cast<int32_t>(static_cast<uint32_t>(g2 >> 32));
+    out[6] = static_cast<int32_t>(static_cast<uint32_t>(g3));
+    out[7] = static_cast<int32_t>(static_cast<uint32_t>(g3 >> 32));
+}
+
+__device__ __forceinline__ void decode_iq1m_prefetch(
+    const uint8_t* __restrict__ payload, int32_t* __restrict__ out)
+{
+    const uint8_t qh0 = payload[4], qh1 = payload[5];
+
+    // Phase 1: ALL indices
+    const int idx0 = payload[0] | ((qh0 & 0x07) << 8);
+    const int idx1 = payload[1] | (((qh0 >> 4) & 0x07) << 8);
+    const int idx2 = payload[2] | ((qh1 & 0x07) << 8);
+    const int idx3 = payload[3] | (((qh1 >> 4) & 0x07) << 8);
+
+    // Phase 2: ALL loads
+    const uint64_t g0 = dc_iq1s_grid[idx0];
+    const uint64_t g1 = dc_iq1s_grid[idx1];
+    const uint64_t g2 = dc_iq1s_grid[idx2];
+    const uint64_t g3 = dc_iq1s_grid[idx3];
+
+    // Phase 3: unpack
+    out[0] = static_cast<int32_t>(static_cast<uint32_t>(g0));
+    out[1] = static_cast<int32_t>(static_cast<uint32_t>(g0 >> 32));
+    out[2] = static_cast<int32_t>(static_cast<uint32_t>(g1));
+    out[3] = static_cast<int32_t>(static_cast<uint32_t>(g1 >> 32));
+    out[4] = static_cast<int32_t>(static_cast<uint32_t>(g2));
+    out[5] = static_cast<int32_t>(static_cast<uint32_t>(g2 >> 32));
+    out[6] = static_cast<int32_t>(static_cast<uint32_t>(g3));
+    out[7] = static_cast<int32_t>(static_cast<uint32_t>(g3 >> 32));
+}
+
+
+// =============================================================================
+// IQ1 Strategy: Compact grid in LDS + SWAR expansion (pure ALU, no LUT)
+//   Combines 4KB LDS (compact grid) with SWAR expansion (no constant memory).
+//   This avoids the compact_lds regression caused by constant-memory LUT reads.
+//   Goal: LDS speed for grid reads + ALU-only expansion = zero constant pressure.
+// =============================================================================
+
+__device__ __forceinline__ void decode_iq1s_compact_lds_swar(
+    const uint8_t* __restrict__ payload, int32_t* __restrict__ out,
+    const uint16_t* __restrict__ lds_compact)
+{
+    const uint16_t qh_word = static_cast<uint16_t>(payload[4])
+                           | (static_cast<uint16_t>(payload[5]) << 8);
+    #pragma unroll
+    for (int l = 0; l < 4; ++l)
+    {
+        const int idx = payload[l] | (((qh_word >> (3 * l)) & 7) << 8);
+        const uint16_t compact = lds_compact[idx];  // LDS read (2B, ~1 cycle)
+        out[l * 2]     = static_cast<int32_t>(iq1_expand_swar(compact & 0xFFu));
+        out[l * 2 + 1] = static_cast<int32_t>(iq1_expand_swar(compact >> 8));
+    }
+}
+
+__device__ __forceinline__ void decode_iq1m_compact_lds_swar(
+    const uint8_t* __restrict__ payload, int32_t* __restrict__ out,
+    const uint16_t* __restrict__ lds_compact)
+{
+    const uint8_t qh0 = payload[4], qh1 = payload[5];
+    const int idx0 = payload[0] | ((qh0 & 0x07) << 8);
+    const int idx1 = payload[1] | (((qh0 >> 4) & 0x07) << 8);
+    const int idx2 = payload[2] | ((qh1 & 0x07) << 8);
+    const int idx3 = payload[3] | (((qh1 >> 4) & 0x07) << 8);
+
+    uint16_t c;
+    c = lds_compact[idx0];
+    out[0] = static_cast<int32_t>(iq1_expand_swar(c & 0xFFu));
+    out[1] = static_cast<int32_t>(iq1_expand_swar(c >> 8));
+    c = lds_compact[idx1];
+    out[2] = static_cast<int32_t>(iq1_expand_swar(c & 0xFFu));
+    out[3] = static_cast<int32_t>(iq1_expand_swar(c >> 8));
+    c = lds_compact[idx2];
+    out[4] = static_cast<int32_t>(iq1_expand_swar(c & 0xFFu));
+    out[5] = static_cast<int32_t>(iq1_expand_swar(c >> 8));
+    c = lds_compact[idx3];
+    out[6] = static_cast<int32_t>(iq1_expand_swar(c & 0xFFu));
+    out[7] = static_cast<int32_t>(iq1_expand_swar(c >> 8));
+}
+
+
+// =============================================================================
+// IQ1 Strategy: Split-table — nibble-indexed LUT (32B) replaces 1KB expand LUT
+//   Key insight: decompose each 8-bit byte into two 4-bit nibbles.
+//   A 16-entry × 2-byte LUT (32B total) maps each nibble → 2 packed int8.
+//   4 nibble lookups per compact entry (vs 2 expand_lut lookups), but the
+//   table is 32× smaller — fits in HALF a cache line, zero eviction ever.
+//
+//   Variants:
+//     split_const: compact grid (4KB constant) + nibble LUT (32B constant)
+//     split_lds:   compact grid (4KB LDS) + nibble LUT (32B LDS) = ~4KB total
+//
+//   Cost per entry: 4 masks + 4 shifts + 4 LUT reads + 2 OR + 2 shifts ≈ 16 ops
+//   vs SWAR: ~19 VALU ops (pure ALU)
+//   vs full LUT: 2 reads from 1KB table (cache-hostile on gfx906)
+// =============================================================================
+
+// Split-table expansion helper: 16-bit compact → 2 × int32 via nibble LUT
+// Works with either constant-memory or LDS-resident LUT pointer
+__device__ __forceinline__ void iq1_expand_split(
+    uint16_t compact, int32_t& out_lo, int32_t& out_hi,
+    const uint16_t* __restrict__ nib_lut)
+{
+    const uint32_t b0 = compact & 0xFFu;
+    const uint32_t b1 = compact >> 8;
+    out_lo = static_cast<int32_t>(
+        static_cast<uint32_t>(nib_lut[b0 & 0xF]) |
+        (static_cast<uint32_t>(nib_lut[b0 >> 4]) << 16));
+    out_hi = static_cast<int32_t>(
+        static_cast<uint32_t>(nib_lut[b1 & 0xF]) |
+        (static_cast<uint32_t>(nib_lut[b1 >> 4]) << 16));
+}
+
+// IQ1_S: compact grid (constant) + nibble LUT (constant, 32B)
+__device__ __forceinline__ void decode_iq1s_split_const(
+    const uint8_t* __restrict__ payload, int32_t* __restrict__ out)
+{
+    const uint16_t qh_word = static_cast<uint16_t>(payload[4])
+                           | (static_cast<uint16_t>(payload[5]) << 8);
+    #pragma unroll
+    for (int l = 0; l < 4; ++l)
+    {
+        const int idx = payload[l] | (((qh_word >> (3 * l)) & 7) << 8);
+        const uint16_t compact = dc_iq1_compact[idx];
+        iq1_expand_split(compact, out[l * 2], out[l * 2 + 1], dc_iq1_nibble_lut);
+    }
+}
+
+// IQ1_M: compact grid (constant) + nibble LUT (constant, 32B)
+__device__ __forceinline__ void decode_iq1m_split_const(
+    const uint8_t* __restrict__ payload, int32_t* __restrict__ out)
+{
+    const uint8_t qh0 = payload[4], qh1 = payload[5];
+    const int idx0 = payload[0] | ((qh0 & 0x07) << 8);
+    const int idx1 = payload[1] | (((qh0 >> 4) & 0x07) << 8);
+    const int idx2 = payload[2] | ((qh1 & 0x07) << 8);
+    const int idx3 = payload[3] | (((qh1 >> 4) & 0x07) << 8);
+
+    uint16_t c;
+    c = dc_iq1_compact[idx0];
+    iq1_expand_split(c, out[0], out[1], dc_iq1_nibble_lut);
+    c = dc_iq1_compact[idx1];
+    iq1_expand_split(c, out[2], out[3], dc_iq1_nibble_lut);
+    c = dc_iq1_compact[idx2];
+    iq1_expand_split(c, out[4], out[5], dc_iq1_nibble_lut);
+    c = dc_iq1_compact[idx3];
+    iq1_expand_split(c, out[6], out[7], dc_iq1_nibble_lut);
+}
+
+// IQ1_S: compact grid (LDS) + nibble LUT (LDS)
+__device__ __forceinline__ void decode_iq1s_split_lds(
+    const uint8_t* __restrict__ payload, int32_t* __restrict__ out,
+    const uint16_t* __restrict__ lds_compact,
+    const uint16_t* __restrict__ lds_nibble)
+{
+    const uint16_t qh_word = static_cast<uint16_t>(payload[4])
+                           | (static_cast<uint16_t>(payload[5]) << 8);
+    #pragma unroll
+    for (int l = 0; l < 4; ++l)
+    {
+        const int idx = payload[l] | (((qh_word >> (3 * l)) & 7) << 8);
+        const uint16_t compact = lds_compact[idx];
+        iq1_expand_split(compact, out[l * 2], out[l * 2 + 1], lds_nibble);
+    }
+}
+
+// IQ1_M: compact grid (LDS) + nibble LUT (LDS)
+__device__ __forceinline__ void decode_iq1m_split_lds(
+    const uint8_t* __restrict__ payload, int32_t* __restrict__ out,
+    const uint16_t* __restrict__ lds_compact,
+    const uint16_t* __restrict__ lds_nibble)
+{
+    const uint8_t qh0 = payload[4], qh1 = payload[5];
+    const int idx0 = payload[0] | ((qh0 & 0x07) << 8);
+    const int idx1 = payload[1] | (((qh0 >> 4) & 0x07) << 8);
+    const int idx2 = payload[2] | ((qh1 & 0x07) << 8);
+    const int idx3 = payload[3] | (((qh1 >> 4) & 0x07) << 8);
+
+    uint16_t c;
+    c = lds_compact[idx0];
+    iq1_expand_split(c, out[0], out[1], lds_nibble);
+    c = lds_compact[idx1];
+    iq1_expand_split(c, out[2], out[3], lds_nibble);
+    c = lds_compact[idx2];
+    iq1_expand_split(c, out[4], out[5], lds_nibble);
+    c = lds_compact[idx3];
+    iq1_expand_split(c, out[6], out[7], lds_nibble);
 }
 
 
@@ -509,11 +1046,17 @@ __device__ __forceinline__ void decode_iq2xxs_ksigns64(
 
 // Strategy tag for kernel dispatch
 enum Strategy : int {
-    STRAT_BASELINE   = 0,
-    STRAT_VSUB4      = 1,
-    STRAT_LDS_CACHE  = 2,
-    STRAT_KSIGNS64   = 3,
-    STRAT_COUNT      = 4,
+    STRAT_BASELINE     = 0,
+    STRAT_VSUB4        = 1,
+    STRAT_LDS_CACHE    = 2,
+    STRAT_KSIGNS64     = 3,
+    STRAT_COMPACT_LUT  = 4,  // IQ1 only: compact 2-bit grid + expansion LUT
+    STRAT_COMPACT_SWAR = 5,  // IQ1 only: compact 2-bit grid + SWAR expansion
+    STRAT_PREFETCH     = 6,  // IQ1 only: explicit index hoisting + load separation
+    STRAT_SWAR_SIGNS   = 7,  // IQ2/IQ3: O4 production SWAR sign application
+    STRAT_SPLIT_CONST  = 8,  // IQ1 only: compact grid (const) + nibble LUT (const, 32B)
+    STRAT_SPLIT_LDS    = 9,  // IQ1 only: compact grid (LDS) + nibble LUT (LDS, 32B)
+    STRAT_COUNT        = 10,
 };
 
 static const char* STRATEGY_NAMES[STRAT_COUNT] = {
@@ -521,6 +1064,12 @@ static const char* STRATEGY_NAMES[STRAT_COUNT] = {
     "vsub4_signs",
     "LDS_cache",
     "ksigns64",
+    "compact_lut",
+    "compact_swar",
+    "prefetch",
+    "swar_signs",
+    "split_const",
+    "split_lds",
 };
 
 // Generic decode-only benchmark kernel:
@@ -601,11 +1150,29 @@ __global__ void bench_decode_kernel(
         }
         else if constexpr (FMT == FMT_IQ1_S)
         {
-            decode_iq1s_baseline(payload, packed_groups);
+            if constexpr (STRAT == STRAT_COMPACT_LUT)
+                decode_iq1s_compact_lut(payload, packed_groups);
+            else if constexpr (STRAT == STRAT_COMPACT_SWAR)
+                decode_iq1s_compact_swar(payload, packed_groups);
+            else if constexpr (STRAT == STRAT_PREFETCH)
+                decode_iq1s_prefetch(payload, packed_groups);
+            else if constexpr (STRAT == STRAT_SPLIT_CONST)
+                decode_iq1s_split_const(payload, packed_groups);
+            else
+                decode_iq1s_baseline(payload, packed_groups);
         }
         else if constexpr (FMT == FMT_IQ1_M)
         {
-            decode_iq1m_baseline(payload, packed_groups);
+            if constexpr (STRAT == STRAT_COMPACT_LUT)
+                decode_iq1m_compact_lut(payload, packed_groups);
+            else if constexpr (STRAT == STRAT_COMPACT_SWAR)
+                decode_iq1m_compact_swar(payload, packed_groups);
+            else if constexpr (STRAT == STRAT_PREFETCH)
+                decode_iq1m_prefetch(payload, packed_groups);
+            else if constexpr (STRAT == STRAT_SPLIT_CONST)
+                decode_iq1m_split_const(payload, packed_groups);
+            else
+                decode_iq1m_baseline(payload, packed_groups);
         }
 
         // Accumulate into sink (prevents DCE)
@@ -705,6 +1272,160 @@ __global__ void bench_decode_lds_kernel(
 
 
 // =============================================================================
+// IQ1 Compact LDS kernel: only 4KB LDS needed (vs 16KB for full grid)
+//   Preloads compact 2-bit grid to LDS, uses constant-memory LUT for expansion.
+//   4KB LDS → up to 16 WGs/CU limited by LDS alone (vs 4 for full grid).
+// =============================================================================
+
+template <IQFormat FMT>
+__global__ void bench_decode_compact_lds_kernel(
+    const uint8_t* __restrict__ d_payload,
+    int32_t*       __restrict__ d_sink,
+    int N, int blocks_per_row)
+{
+    static_assert(FMT == FMT_IQ1_S || FMT == FMT_IQ1_M,
+                  "compact LDS only for IQ1 formats");
+
+    // Only 4KB LDS (vs 16KB for full grid)
+    __shared__ uint16_t lds_compact[2048];  // 2048 × 2B = 4KB
+
+    // Cooperative preload from constant memory
+    for (int i = threadIdx.x; i < 2048; i += blockDim.x)
+        lds_compact[i] = dc_iq1_compact[i];
+    __syncthreads();
+
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= N) return;
+
+    constexpr int payload_bytes = (FMT == FMT_IQ1_S) ? 6 : 10;
+    int32_t acc = 0;
+
+    for (int b = 0; b < blocks_per_row; ++b)
+    {
+        const size_t linear = static_cast<size_t>(b) * N + tid;
+        const uint8_t* payload = d_payload + linear * payload_bytes;
+
+        int32_t packed_groups[8];
+
+        if constexpr (FMT == FMT_IQ1_S)
+            decode_iq1s_compact_lds(payload, packed_groups, lds_compact);
+        else
+            decode_iq1m_compact_lds(payload, packed_groups, lds_compact);
+
+        #pragma unroll
+        for (int g = 0; g < 8; ++g)
+            acc += packed_groups[g];
+    }
+
+    d_sink[tid] = acc;
+}
+
+
+// =============================================================================
+// IQ1 Compact LDS + SWAR kernel: 4KB LDS + pure ALU expansion
+//   Avoids the constant-memory LUT that made compact_lds regress.
+//   Grid reads from LDS (~1 cycle), expansion via SWAR (~9 VALU per group).
+//   4KB LDS = 4× less LDS than full grid → better occupancy potential.
+// =============================================================================
+
+template <IQFormat FMT>
+__global__ void bench_decode_compact_lds_swar_kernel(
+    const uint8_t* __restrict__ d_payload,
+    int32_t*       __restrict__ d_sink,
+    int N, int blocks_per_row)
+{
+    static_assert(FMT == FMT_IQ1_S || FMT == FMT_IQ1_M,
+                  "compact LDS SWAR only for IQ1 formats");
+
+    __shared__ uint16_t lds_compact[2048];  // 4KB
+
+    for (int i = threadIdx.x; i < 2048; i += blockDim.x)
+        lds_compact[i] = dc_iq1_compact[i];
+    __syncthreads();
+
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= N) return;
+
+    constexpr int payload_bytes = (FMT == FMT_IQ1_S) ? 6 : 10;
+    int32_t acc = 0;
+
+    for (int b = 0; b < blocks_per_row; ++b)
+    {
+        const size_t linear = static_cast<size_t>(b) * N + tid;
+        const uint8_t* payload = d_payload + linear * payload_bytes;
+
+        int32_t packed_groups[8];
+
+        if constexpr (FMT == FMT_IQ1_S)
+            decode_iq1s_compact_lds_swar(payload, packed_groups, lds_compact);
+        else
+            decode_iq1m_compact_lds_swar(payload, packed_groups, lds_compact);
+
+        #pragma unroll
+        for (int g = 0; g < 8; ++g)
+            acc += packed_groups[g];
+    }
+
+    d_sink[tid] = acc;
+}
+
+
+// =============================================================================
+// IQ1 Split-table LDS kernel: compact grid (4KB) + nibble LUT (32B) in LDS
+//   Total LDS: 4128 bytes — essentially same as compact_lds_swar.
+//   Replaces SWAR ALU expansion with 4 tiny LUT reads from LDS.
+//   The 32B nibble LUT spans only 8 LDS banks (16 entries × 2B).
+// =============================================================================
+
+template <IQFormat FMT>
+__global__ void bench_decode_split_lds_kernel(
+    const uint8_t* __restrict__ d_payload,
+    int32_t*       __restrict__ d_sink,
+    int N, int blocks_per_row)
+{
+    static_assert(FMT == FMT_IQ1_S || FMT == FMT_IQ1_M,
+                  "split LDS only for IQ1 formats");
+
+    // 4KB compact grid + 32B nibble LUT = 4128B total LDS
+    __shared__ uint16_t lds_compact[2048];  // 4096 bytes
+    __shared__ uint16_t lds_nibble[16];     // 32 bytes
+
+    // Cooperative preload of compact grid
+    for (int i = threadIdx.x; i < 2048; i += blockDim.x)
+        lds_compact[i] = dc_iq1_compact[i];
+    // Preload nibble LUT (only first 16 threads needed)
+    if (threadIdx.x < 16)
+        lds_nibble[threadIdx.x] = dc_iq1_nibble_lut[threadIdx.x];
+    __syncthreads();
+
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= N) return;
+
+    constexpr int payload_bytes = (FMT == FMT_IQ1_S) ? 6 : 10;
+    int32_t acc = 0;
+
+    for (int b = 0; b < blocks_per_row; ++b)
+    {
+        const size_t linear = static_cast<size_t>(b) * N + tid;
+        const uint8_t* payload = d_payload + linear * payload_bytes;
+
+        int32_t packed_groups[8];
+
+        if constexpr (FMT == FMT_IQ1_S)
+            decode_iq1s_split_lds(payload, packed_groups, lds_compact, lds_nibble);
+        else
+            decode_iq1m_split_lds(payload, packed_groups, lds_compact, lds_nibble);
+
+        #pragma unroll
+        for (int g = 0; g < 8; ++g)
+            acc += packed_groups[g];
+    }
+
+    d_sink[tid] = acc;
+}
+
+
+// =============================================================================
 // Host-side benchmark infrastructure
 // =============================================================================
 
@@ -745,6 +1466,38 @@ static bool initGridTables()
     generate_ksigns64(h_ksigns64);
     e = hipMemcpyToSymbol(dc_ksigns64, h_ksigns64, sizeof(dc_ksigns64));
     if (e != hipSuccess) { fprintf(stderr, "Failed ksigns64: %s\n", hipGetErrorString(e)); return false; }
+
+    // Generate compact IQ1 grid (2-bit ternary encoding, 4KB)
+    uint16_t h_iq1_compact[2048];
+    generate_iq1_compact_grid(h_iq1_compact, llaminar2::iq1s_grid);
+    e = hipMemcpyToSymbol(dc_iq1_compact, h_iq1_compact, sizeof(dc_iq1_compact));
+    if (e != hipSuccess) { fprintf(stderr, "Failed iq1_compact: %s\n", hipGetErrorString(e)); return false; }
+
+    // Generate expansion LUT (maps 4×2-bit → 4×int8, 1KB)
+    uint32_t h_iq1_expand_lut[256];
+    generate_iq1_expand_lut(h_iq1_expand_lut);
+    e = hipMemcpyToSymbol(dc_iq1_expand_lut, h_iq1_expand_lut, sizeof(dc_iq1_expand_lut));
+    if (e != hipSuccess) { fprintf(stderr, "Failed iq1_expand_lut: %s\n", hipGetErrorString(e)); return false; }
+
+    // Verify compact encoding matches full grid
+    if (!verify_iq1_compact_grid(h_iq1_compact, h_iq1_expand_lut, llaminar2::iq1s_grid))
+    {
+        fprintf(stderr, "FATAL: Compact IQ1 grid verification failed\n");
+        return false;
+    }
+
+    // Generate and upload nibble split-table LUT (32 bytes)
+    uint16_t h_iq1_nibble_lut[16];
+    generate_iq1_nibble_lut(h_iq1_nibble_lut);
+    e = hipMemcpyToSymbol(dc_iq1_nibble_lut, h_iq1_nibble_lut, sizeof(dc_iq1_nibble_lut));
+    if (e != hipSuccess) { fprintf(stderr, "Failed nibble_lut: %s\n", hipGetErrorString(e)); return false; }
+
+    // Verify nibble LUT matches full expand LUT
+    if (!verify_iq1_nibble_lut(h_iq1_nibble_lut, h_iq1_expand_lut))
+    {
+        fprintf(stderr, "FATAL: Nibble LUT verification failed\n");
+        return false;
+    }
 
     return true;
 }
@@ -800,6 +1553,42 @@ void launchDecodeLDSKernel(const uint8_t* d_payload, int32_t* d_sink,
     const int grid = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(bench_decode_lds_kernel<FMT>),
+        dim3(grid), dim3(THREADS_PER_BLOCK), 0, stream,
+        d_payload, d_sink, N, blocks_per_row);
+}
+
+// IQ1-specific: compact grid in LDS (4KB instead of 16KB)
+template <IQFormat FMT>
+void launchCompactLDSKernel(const uint8_t* d_payload, int32_t* d_sink,
+                            int N, int blocks_per_row, hipStream_t stream)
+{
+    const int grid = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(bench_decode_compact_lds_kernel<FMT>),
+        dim3(grid), dim3(THREADS_PER_BLOCK), 0, stream,
+        d_payload, d_sink, N, blocks_per_row);
+}
+
+// IQ1-specific: compact grid in LDS + SWAR expansion (no constant LUT)
+template <IQFormat FMT>
+void launchCompactLDSSWARKernel(const uint8_t* d_payload, int32_t* d_sink,
+                                int N, int blocks_per_row, hipStream_t stream)
+{
+    const int grid = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(bench_decode_compact_lds_swar_kernel<FMT>),
+        dim3(grid), dim3(THREADS_PER_BLOCK), 0, stream,
+        d_payload, d_sink, N, blocks_per_row);
+}
+
+// IQ1-specific: compact grid in LDS + nibble LUT in LDS (split-table)
+template <IQFormat FMT>
+void launchSplitLDSKernel(const uint8_t* d_payload, int32_t* d_sink,
+                          int N, int blocks_per_row, hipStream_t stream)
+{
+    const int grid = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(bench_decode_split_lds_kernel<FMT>),
         dim3(grid), dim3(THREADS_PER_BLOCK), 0, stream,
         d_payload, d_sink, N, blocks_per_row);
 }
@@ -887,6 +1676,25 @@ std::vector<StrategyEntry> getStrategies()
     if constexpr (FMT == FMT_IQ2_S || FMT == FMT_IQ2_XS || FMT == FMT_IQ2_XXS)
         strats.push_back({"ksigns64", launchDecodeKernel<FMT, STRAT_KSIGNS64>});
 
+    // IQ1-specific strategies — the main experiment focus
+    if constexpr (FMT == FMT_IQ1_S || FMT == FMT_IQ1_M)
+    {
+        // Compact 2-bit grid + expansion LUT (constant memory, 5KB total)
+        strats.push_back({"compact_lut", launchDecodeKernel<FMT, STRAT_COMPACT_LUT>});
+        // Compact 2-bit grid + SWAR bit expansion (no LUT, pure ALU)
+        strats.push_back({"compact_swar", launchDecodeKernel<FMT, STRAT_COMPACT_SWAR>});
+        // Compact grid in LDS (4KB) + LUT in constant memory
+        strats.push_back({"compact_lds", launchCompactLDSKernel<FMT>});
+        // Compact grid in LDS (4KB) + SWAR expansion (no constant memory)
+        strats.push_back({"cmpct_lds_sw", launchCompactLDSSWARKernel<FMT>});
+        // Split-table: compact grid (constant) + 32B nibble LUT (constant)
+        strats.push_back({"split_const", launchDecodeKernel<FMT, STRAT_SPLIT_CONST>});
+        // Split-table: compact grid (LDS) + 32B nibble LUT (LDS)
+        strats.push_back({"split_lds", launchSplitLDSKernel<FMT>});
+        // Explicit index hoisting + load separation (full grid)
+        strats.push_back({"prefetch", launchDecodeKernel<FMT, STRAT_PREFETCH>});
+    }
+
     return strats;
 }
 
@@ -922,7 +1730,9 @@ int main(int argc, char** argv)
         fprintf(stderr, "FATAL: Failed to initialize IQ grid tables\n");
         return 1;
     }
-    fprintf(stderr, "[OK] Grid tables + ksigns64 uploaded to constant memory\n\n");
+    fprintf(stderr, "[OK] Grid tables + ksigns64 + compact IQ1 grid (4KB) + expand LUT (1KB) + nibble LUT (32B) uploaded\n");
+    fprintf(stderr, "     Compact IQ1 verification: PASSED\n");
+    fprintf(stderr, "     Nibble LUT verification:  PASSED\n\n");
 
     // Benchmark shape: 7B FFN_Up (18944×3584) — representative of production workload
     // blocks_per_row = K / 32 = 112
@@ -972,7 +1782,7 @@ int main(int argc, char** argv)
                 baseline_min = result.min_us;
 
             double speedup = baseline_min / result.min_us;
-            fprintf(stderr, "  %-15s  min=%8.1f μs  mean=%8.1f μs  %.2f Gelem/s  %+.1f%%\n",
+            fprintf(stderr, "  %-15s  min=%8.1f μs  mean=%8.1f μs  %6.2f Gelem/s  %+.1f%%\n",
                     strat.name,
                     result.min_us, result.mean_us,
                     result.elements_per_sec / 1e9,
@@ -996,11 +1806,11 @@ int main(int argc, char** argv)
     run_format(FMT_IQ1_M,   getStrategies<FMT_IQ1_M>());
 
     // ---- Summary table ----
-    fprintf(stderr, "╔══════════════════════════════════════════════════════════════════════════════╗\n");
-    fprintf(stderr, "║                        SUMMARY: Best Strategy Per Format                      ║\n");
-    fprintf(stderr, "╠═══════════╦═════════════════╦═══════════╦════════════════╦═══════════════════╣\n");
-    fprintf(stderr, "║  Format   ║    Strategy     ║  Min (μs) ║  Gelem/s       ║  vs Baseline      ║\n");
-    fprintf(stderr, "╠═══════════╬═════════════════╬═══════════╬════════════════╬═══════════════════╣\n");
+    fprintf(stderr, "╔══════════════════════════════════════════════════════════════════════════════════╗\n");
+    fprintf(stderr, "║                          SUMMARY: Best Strategy Per Format                        ║\n");
+    fprintf(stderr, "╠═══════════╦═════════════════╦═══════════╦════════════════╦════════════════════════╣\n");
+    fprintf(stderr, "║  Format   ║    Strategy     ║  Min (μs) ║  Gelem/s       ║  vs Baseline           ║\n");
+    fprintf(stderr, "╠═══════════╬═════════════════╬═══════════╬════════════════╬════════════════════════╣\n");
 
     // Find best strategy per format
     for (int f = 0; f < FMT_COUNT; ++f)
@@ -1024,10 +1834,10 @@ int main(int argc, char** argv)
         }
 
         double speedup = baseline_min / best_min;
-        fprintf(stderr, "║ %-9s ║ %-15s ║ %9.1f ║ %12.2f   ║ %+15.1f%%  ║\n",
+        fprintf(stderr, "║ %-9s ║ %-15s ║ %9.1f ║ %12.2f   ║ %+20.1f%%  ║\n",
                 fmt_name, best_strat, best_min, best_gelem, (speedup - 1.0) * 100.0);
     }
-    fprintf(stderr, "╚═══════════╩═════════════════╩═══════════╩════════════════╩═══════════════════╝\n\n");
+    fprintf(stderr, "╚═══════════╩═════════════════╩═══════════╩════════════════╩════════════════════════╝\n\n");
 
     // Cleanup
     (void)hipFree(d_sink);

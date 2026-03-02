@@ -479,7 +479,7 @@ mask expand + XOR + add). Called 8× per block = ~120 decode VALU vs only 8 dot4
 |---|-------------|--------|---------------|-------------|--------|
 | ~~O1~~ | ~~Ternary-encoded compact grid for IQ1~~ | ~~IQ1_S/M~~ | ~~+30-40%~~ | Regression | **Reverted** |
 | O2 | 2-block loop unrolling with grid prefetch | IQ2 non-LDS | +15-25% | +0.4-0.8% (noise) | **Done — marginal** |
-| O3 | Precompute activation prefix sums | IQ1_S/M | +10-15% | — | Planned |
+| ~~O3~~ | ~~Cooperative block-sum precomputation via LDS~~ | ~~IQ1_S/M, Q2_K~~ | ~~+10-15%~~ | Regression (-3 to -11%) | **Reverted** |
 | **O4** | **SWAR multiply-based sign expansion** | **IQ2/IQ3** | **+10-20%** | **+8.6-20.9%** | **Done — major win** |
 | O5 | CPT=2 for IQ formats | All IQ | +5-10% | — | Planned |
 
@@ -495,12 +495,54 @@ Benchmarks showed +0.4-0.8% improvement, within measurement noise. The compiler
 was already scheduling loads well enough that manual 2-block unrolling added no
 meaningful benefit. Kept in code (zero regression risk) but not impactful.
 
-### O3: Activation Prefix Sums (Planned)
+### O3: Cooperative Block-Sum Precomputation via LDS (Reverted)
 
-Eliminate the 8 extra `v_dot4_i32_i8` for `sum_a` in IQ1_S/M (RC3). Precompute
-`prefix_sum[i] = Σ_{j<i} activations[j]` once at kernel start, then
-`sum_a_block = prefix[(b+1)*32] - prefix[b*32]` — 1 subtraction instead of 8 dot4's.
-This removes 50% of dot4 throughput overhead for IQ1 asymmetric correction.
+Attempted to eliminate redundant `sum_a` computation (8 sdot4 per block per thread)
+for asymmetric formats (IQ1_S, Q4_1, Q5_1) and dual-scale-asymmetric formats
+(IQ1_M, Q2_K). All 64 threads in a wavefront compute IDENTICAL `sum_a` values
+(pure cross-lane redundancy). Fix: distribute blocks across threads cooperatively
+in a pre-loop, store to LDS, then read precomputed sums in the main loop.
+
+**Implementation** (fully coded, tested, benchmarked, then reverted):
+- Added `needs_block_sums` and `sums_per_block` compile-time traits to NVNNITraits
+- Non-LDS kernel: cooperative pre-loop with `extern __shared__`, `__syncthreads()`
+- LDS kernel: dynamic shared memory after static grid table + cooperative pre-loop
+- Dispatch: computed and passed dynamic shared memory sizes
+- All 4 unit tests passed (correct results)
+
+**Benchmark Results** (vs O4 baseline — REGRESSION across all targets):
+
+| Format | O4 Eff | O3 Eff | O4 BW | O3 BW | Change |
+|--------|--------|--------|-------|-------|--------|
+| Q2_K | 49% | 45% | 320.3 | 295.3 | **-7.8%** |
+| IQ1_S | 30% | 28% | 215.7 | 192.6 | **-10.7%** |
+| IQ1_M | 32% | 31% | 260.5 | 246.3 | **-5.5%** |
+| Q4_1 | 85% | 84% | 352.0 | 347.3 | -1.3% (noise) |
+| Q5_1 | 89% | 88% | 348.6 | 349.5 | ~0% |
+
+**Root Cause Analysis**:
+
+1. **ILP loss (non-LDS kernel)**: On gfx906, the inline `sum_a` sdot4 chain is
+   independent of the main dot-product sdot4 chain. The compiler/SIMD scheduler
+   interleaves them, making `sum_a` computation effectively **free** (hidden
+   behind the main accumulation). Replacing free VALU work with LDS reads adds
+   latency to the critical path without reducing total execution time.
+
+2. **Occupancy degradation (LDS kernel)**: For IQ1_S/IQ1_M, the static grid
+   table uses 16384 bytes of LDS. Adding even ~112-224 bytes of dynamic shared
+   memory for block sums pushes total LDS past the 16384-byte boundary:
+   `floor(65536/16608) = 3` vs `floor(65536/16384) = 4` WGs/CU → 25% occupancy
+   drop (16 → 12 waves).
+
+3. **Extra barrier overhead (LDS kernel)**: The 256-thread workgroup requires an
+   additional `__syncthreads()` after the block-sum pre-loop, adding ~50-100
+   cycles of inter-wavefront synchronization.
+
+**Key Insight**: The cross-lane redundancy that O3 targets (all threads computing
+identical `sum_a`) is NOT actually a bottleneck on AMD wavefront64 because all
+64 lanes execute in lockstep — the redundant work takes the SAME number of cycles
+as non-redundant work. The VALU pipe is wide enough that the sum_a chain hides
+behind the main dot-product chain via instruction-level parallelism.
 
 ### O4: SWAR Multiply-Based Sign Expansion (Major Win)
 
