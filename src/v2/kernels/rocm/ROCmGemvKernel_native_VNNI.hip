@@ -568,12 +568,15 @@ __global__ void gemv_native_vnni_kernel_t(
                         // IQ4_NL / IQ4_XS: nibble → codebook INT8 via register-based v_perm_b32
                         //
                         // The 16-entry codebook {-127..113} is packed into 4 constexpr registers.
-                        // v_perm_b32(src0, src1, sel) selects 4 bytes from {src1[3:0], src0[3:0]}
-                        // using sel[i] & 0x7 for each output byte i.
+                        // v_perm_b32(src0, src1, sel) selects 4 bytes from {src0[3:0], src1[3:0]}
+                        // using sel[i] & 0x7 for each output byte i (0-3 → src0, 4-7 → src1).
                         //
-                        // Two v_perm calls cover indices 0-7 and 8-15. A branchless byte-wise
-                        // mux selects per nibble based on bit 3. This eliminates 32 data-dependent
-                        // constant-memory lookups per block, replacing them with pure ALU.
+                        // Two v_perm calls look up the low (0-7) and high (8-15) codebook halves
+                        // using nibble & 7 as selector.  A third v_perm byte-muxes the results:
+                        //   mux_sel = 0x03020100 | ((nibble >> 1) & 0x04040404)
+                        // Byte i of mux_sel = i (pick r_lo) when nibble < 8, or i+4 (pick r_hi)
+                        // when nibble >= 8.  This replaces the old shift+and+mul(4-cyc)+bfi chain
+                        // with shift+and+or+perm — all 1-cycle ops.
                         //
                         // Codebook (uint8 representation):
                         //   0-3:  {0x81, 0x98, 0xAD, 0xBF}  = {-127, -104, -83, -65}
@@ -584,25 +587,23 @@ __global__ void gemv_native_vnni_kernel_t(
                         constexpr uint32_t CB_LO_B = 0xF6EADDCFu;  // cb[4..7] (src1 for nibbles 0-7)
                         constexpr uint32_t CB_HI_A = 0x26190D01u;  // cb[8..11] (src0 for nibbles 8-15)
                         constexpr uint32_t CB_HI_B = 0x71594535u;  // cb[12..15] (src1 for nibbles 8-15)
+                        constexpr uint32_t MUX_IDENTITY = 0x03020100u;  // byte-identity permutation
+                        constexpr uint32_t MUX_BIT3_MASK = 0x04040404u; // bit3 → +4 offset per byte
 
                         #pragma unroll
                         for (int g = 0; g < 4; ++g)
                         {
-                            // Load 4 payload bytes as a packed uint32
                             const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
 
                             // --- Low nibbles (elements [4g..4g+3]) ---
                             const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
                             {
-                                const uint32_t sel = lo_nibs & 0x07070707u;  // low 3 bits per byte
+                                const uint32_t sel = lo_nibs & 0x07070707u;
                                 const uint32_t r_lo = __builtin_amdgcn_perm(CB_LO_A, CB_LO_B, sel);
                                 const uint32_t r_hi = __builtin_amdgcn_perm(CB_HI_A, CB_HI_B, sel);
-                                // Byte-wise mux: select r_hi where nibble >= 8 (bit 3 set)
-                                uint32_t m = (lo_nibs >> 3) & 0x01010101u;  // 0x01 or 0x00 per byte
-                                m |= (m << 1);   // 0x03
-                                m |= (m << 2);   // 0x0F
-                                m |= (m << 4);   // 0xFF
-                                packed_groups[g] = static_cast<int32_t>((r_hi & m) | (r_lo & ~m));
+                                // Byte-wise mux via v_perm: sel[i] = i (r_lo) or i+4 (r_hi)
+                                const uint32_t mux = MUX_IDENTITY | ((lo_nibs >> 1) & MUX_BIT3_MASK);
+                                packed_groups[g] = static_cast<int32_t>(__builtin_amdgcn_perm(r_lo, r_hi, mux));
                             }
 
                             // --- High nibbles (elements [4g+16..4g+19]) ---
@@ -611,11 +612,8 @@ __global__ void gemv_native_vnni_kernel_t(
                                 const uint32_t sel = hi_nibs & 0x07070707u;
                                 const uint32_t r_lo = __builtin_amdgcn_perm(CB_LO_A, CB_LO_B, sel);
                                 const uint32_t r_hi = __builtin_amdgcn_perm(CB_HI_A, CB_HI_B, sel);
-                                uint32_t m = (hi_nibs >> 3) & 0x01010101u;
-                                m |= (m << 1);
-                                m |= (m << 2);
-                                m |= (m << 4);
-                                packed_groups[g + 4] = static_cast<int32_t>((r_hi & m) | (r_lo & ~m));
+                                const uint32_t mux = MUX_IDENTITY | ((hi_nibs >> 1) & MUX_BIT3_MASK);
+                                packed_groups[g + 4] = static_cast<int32_t>(__builtin_amdgcn_perm(r_lo, r_hi, mux));
                             }
                         }
                     }
