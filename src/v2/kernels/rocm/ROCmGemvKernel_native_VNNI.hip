@@ -108,13 +108,20 @@ struct NVNNITraits {
     static constexpr bool is_dual_scale_asym = (FMT == NVNNI_Q2_K || FMT == NVNNI_IQ1_M);
     // Offset of embedded FP16 min_lo/min_hi within payload (only for dual_scale_asym)
     static constexpr int embedded_min_offset = (FMT == NVNNI_IQ1_M) ? 6 : 8;
+    // IQ1 embedded scales: scale_d/scale_lo + block_m/scale_hi packed as uint32_t at this offset.
+    // Eliminates separate d_block_scales/d_block_mins pointer arithmetic (−6 VALU/iter).
+    static constexpr bool has_embedded_scales = (FMT == NVNNI_IQ1_S || FMT == NVNNI_IQ1_M);
+    static constexpr int  embedded_scale_offset =
+        (FMT == NVNNI_IQ1_S) ? 6 :    // after qs[4]+qh[2]
+        (FMT == NVNNI_IQ1_M) ? 10 :   // after qs[4]+qh[2]+delta_lo[2]+delta_hi[2]
+        -1;
     static constexpr bool is_5bit       = (FMT == NVNNI_Q5_0 || FMT == NVNNI_Q5_1);
     static constexpr bool is_6bit       = (FMT == NVNNI_Q6_K);
     static constexpr bool is_3bit       = (FMT == NVNNI_Q3_K);
     static constexpr bool is_2bit       = (FMT == NVNNI_Q2_K);
     static constexpr bool uses_lut      = (FMT == NVNNI_IQ4_NL);
     static constexpr int  payload_bytes =
-        is_iq1_grid ? ((FMT == NVNNI_IQ1_M) ? 10 : 6) :
+        is_iq1_grid ? ((FMT == NVNNI_IQ1_M) ? 14 : 10) :
         is_iq3_grid ? (has_qh ? 13 : 12) :
         is_iq2_grid ? (has_qh ? 9 : 8) :
         is_6bit ? 24 : is_5bit ? 20 : (is_3bit || is_2bit) ? 12 : 16;
@@ -255,7 +262,14 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
         {
             const size_t linear = b_offset_N + static_cast<size_t>(n);
             const uint8_t* payload = d_payload + linear * Traits::payload_bytes;
-            const uint16_t scale_bits = d_block_scales[linear];
+
+            // IQ1: scale/min embedded at end of payload → single pointer,
+            // eliminates separate d_block_scales/d_block_mins address tracking.
+            uint16_t scale_bits;
+            if constexpr (Traits::has_embedded_scales)
+                scale_bits = *reinterpret_cast<const uint16_t*>(payload + Traits::embedded_scale_offset);
+            else
+                scale_bits = d_block_scales[linear];
 
             int32_t packed_groups[8];
 
@@ -351,7 +365,11 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
 
                 const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-                const uint16_t hi_bits = d_block_mins[linear];
+                uint16_t hi_bits;
+                if constexpr (Traits::has_embedded_scales)
+                    hi_bits = *reinterpret_cast<const uint16_t*>(payload + Traits::embedded_scale_offset + 2);
+                else
+                    hi_bits = d_block_mins[linear];
                 const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&hi_bits));
                 f_acc[c] += static_cast<float>(acc_lo) * scale_lo
                           + static_cast<float>(acc_hi) * scale_hi;
@@ -387,7 +405,11 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
 
                 if constexpr (Traits::is_asymmetric)
                 {
-                    const uint16_t min_bits = d_block_mins[linear];
+                    uint16_t min_bits;
+                    if constexpr (Traits::has_embedded_scales)
+                        min_bits = *reinterpret_cast<const uint16_t*>(payload + Traits::embedded_scale_offset + 2);
+                    else
+                        min_bits = d_block_mins[linear];
                     const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
                     f_acc[c] += static_cast<float>(sum_a) * block_m;
                 }

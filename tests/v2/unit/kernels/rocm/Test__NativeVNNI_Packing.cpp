@@ -114,10 +114,11 @@ namespace
          { return TestTensorFactory::createIQ2_XXSRandom({N, K}); }},
 
         // Tier 4: IQ1 ultra-low-bit grid-index super-blocks
-        {"IQ1_S", 16, 6, true, true,
+        // payload_bytes includes embedded scale+min (IQ1_S: 4+2+2+2=10, IQ1_M: 4+2+4+2+2=14)
+        {"IQ1_S", 16, 10, true, true,
          [](size_t N, size_t K)
          { return TestTensorFactory::createIQ1_SRandom({N, K}); }},
-        {"IQ1_M", 17, 10, true, true,
+        {"IQ1_M", 17, 14, true, true,
          [](size_t N, size_t K)
          { return TestTensorFactory::createIQ1_MRandom({N, K}); }},
     };
@@ -457,7 +458,8 @@ namespace
 
     /**
      * @test IQ1 formats use uint64_t iq1s_grid LUT (8 signed values per lookup).
-     * Verify payload layout: IQ1_S has 6 bytes, IQ1_M has 10 bytes per sub-block.
+     * Verify payload layout: IQ1_S has 10 bytes (6 + embedded scale+min),
+     * IQ1_M has 14 bytes (10 + embedded scale+min) per sub-block.
      * Both are asymmetric (delta correction via min).
      */
     TEST_F(NativeVNNIPackingTest, IQ1_PayloadSizePerSubBlock)
@@ -469,7 +471,7 @@ namespace
             auto tensor = TestTensorFactory::createIQ1_SRandom({N, K});
             ROCmPackedWeights packed;
             ASSERT_TRUE(packWeightsToROCm(tensor.get(), packed));
-            EXPECT_EQ(packed.native_vnni_payload.size(), blocks * N * 6);
+            EXPECT_EQ(packed.native_vnni_payload.size(), blocks * N * 10);
             EXPECT_EQ(packed.native_vnni_codebook_id, 16);
             // IQ1_S is asymmetric (delta correction in mins)
             EXPECT_FALSE(packed.native_vnni_mins.empty());
@@ -478,7 +480,7 @@ namespace
             auto tensor = TestTensorFactory::createIQ1_MRandom({N, K});
             ROCmPackedWeights packed;
             ASSERT_TRUE(packWeightsToROCm(tensor.get(), packed));
-            EXPECT_EQ(packed.native_vnni_payload.size(), blocks * N * 10);
+            EXPECT_EQ(packed.native_vnni_payload.size(), blocks * N * 14);
             EXPECT_EQ(packed.native_vnni_codebook_id, 17);
             // IQ1_M is dual-scale asymmetric (embedded delta in payload)
             EXPECT_FALSE(packed.native_vnni_mins.empty());

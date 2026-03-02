@@ -1443,14 +1443,14 @@ namespace llaminar2
                 break;
             case TensorType::IQ1_S:
                 codebook_id = 16;
-                payload_bytes = 6;    // 4 qs_lo + 2 qh_word (high index bits + delta sign)
+                payload_bytes = 10;   // 4 qs_lo + 2 qh_word + 2 scale_d + 2 block_m (embedded)
                 is_asymmetric = true; // delta correction via min = dl * delta
                 is_superblock = true;
                 max_abs_factor = 1.125f; // max |grid + delta| = |1 + 0.125|
                 break;
             case TensorType::IQ1_M:
                 codebook_id = 17;
-                payload_bytes = 10;   // 4 qs_lo + 2 qh + 4 embedded FP16 delta_lo/delta_hi
+                payload_bytes = 14;   // 4 qs_lo + 2 qh + 4 delta_lo/hi + 2 scale_lo + 2 scale_hi (embedded)
                 is_asymmetric = true; // dual scale + embedded delta corrections
                 is_superblock = true;
                 max_abs_factor = 1.125f;
@@ -2091,7 +2091,7 @@ namespace llaminar2
                         uint16_t qh_word;
                         std::memcpy(&qh_word, &blk->qh[sub_idx], sizeof(uint16_t));
 
-                        uint8_t payload_buf[6];
+                        uint8_t payload_buf[10];
                         payload_buf[0] = qs[0];
                         payload_buf[1] = qs[1];
                         payload_buf[2] = qs[2];
@@ -2110,8 +2110,13 @@ namespace llaminar2
                         const float delta = (qh_word & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
                         min_fp16 = fp32_to_fp16(dl * delta);
 
+                        // Embed scale_d and block_m at end of payload (eliminates
+                        // separate d_block_scales/d_block_mins address tracking in kernel)
+                        std::memcpy(payload_buf + 6, &scale_fp16, 2);
+                        std::memcpy(payload_buf + 8, &min_fp16, 2);
+
                         uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload_buf, 6);
+                        std::memcpy(dst, payload_buf, 10);
                         out.native_vnni_scales[linear] = scale_fp16;
                         out.native_vnni_mins[linear] = min_fp16;
                         continue;
@@ -2150,7 +2155,7 @@ namespace llaminar2
                         scale_fp16 = fp32_to_fp16(dl1);
                         min_fp16 = fp32_to_fp16(dl2);
 
-                        uint8_t payload_buf[10];
+                        uint8_t payload_buf[14];
                         payload_buf[0] = qs[0];
                         payload_buf[1] = qs[1];
                         payload_buf[2] = qs[2];
@@ -2178,8 +2183,13 @@ namespace llaminar2
                         std::memcpy(payload_buf + 6, &delta_lo_fp16, 2);
                         std::memcpy(payload_buf + 8, &delta_hi_fp16, 2);
 
+                        // Embed scale_lo and scale_hi at end of payload (eliminates
+                        // separate d_block_scales/d_block_mins address tracking in kernel)
+                        std::memcpy(payload_buf + 10, &scale_fp16, 2);
+                        std::memcpy(payload_buf + 12, &min_fp16, 2);
+
                         uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload_buf, 10);
+                        std::memcpy(dst, payload_buf, 14);
                         out.native_vnni_scales[linear] = scale_fp16;
                         out.native_vnni_mins[linear] = min_fp16;
                         continue;
