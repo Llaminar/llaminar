@@ -7931,6 +7931,42 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm Quantised GEMM kernel integration tests")
 
+    # Unit Test: Native-VNNI Packing (CPU-only)
+    # Validates packNativeVNNI() output for all 16 supported quantization formats.
+    # Tests codebook_id, payload/scales/mins sizes, FP16 scale validity, dimension sweeps.
+    add_executable(v2_unit_native_vnni_packing
+        unit/kernels/rocm/Test__NativeVNNI_Packing.cpp
+    )
+    target_link_libraries(v2_unit_native_vnni_packing
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_NativeVNNI_Packing
+        COMMAND $<TARGET_FILE:v2_unit_native_vnni_packing>
+        LABELS "V2;Unit;ROCm;GEMV;NativeVNNI;Quantized;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added native-VNNI packing unit tests (16 formats)")
+
+    # Integration Test: Native-VNNI GEMV Accuracy
+    # Runs M=1 GEMV on GPU for all 16 native-VNNI formats and compares output
+    # against CPU FP32 reference (dequantized weights × FP32 input).
+    add_executable(v2_integration_native_vnni_gemv
+        integration/kernels/rocm/Test__NativeVNNI_GEMV.cpp
+    )
+    target_link_libraries(v2_integration_native_vnni_gemv
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_NativeVNNI_GEMV
+        COMMAND $<TARGET_FILE:v2_integration_native_vnni_gemv>
+        LABELS "V2;Integration;ROCm;GEMV;NativeVNNI;Quantized;gfx906;IQ;Accuracy"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added native-VNNI GEMV integration tests (16 formats)")
+
     # Performance Test: ROCm Quantised GEMM Kernel Benchmarks
     # Measures throughput and accuracy for Qwen model dimensions (0.5B, 7B, 14B, 32B)
     add_executable(v2_perf_rocm_quantised_gemm_kernel 
@@ -8005,6 +8041,23 @@ if(HAVE_ROCM)
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm IQ4 decode microbenchmark")
+
+    # Performance Test: Native-VNNI Throughput (all 16 formats)
+    # Measures per-format bandwidth efficiency at model-realistic dimensions.
+    add_executable(v2_perf_native_vnni_throughput
+        performance/kernels/rocm/Perf__NativeVNNI_Throughput.cpp
+    )
+    target_link_libraries(v2_perf_native_vnni_throughput
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_NativeVNNI_Throughput
+        COMMAND $<TARGET_FILE:v2_perf_native_vnni_throughput>
+        LABELS "V2;Performance;ROCm;GEMV;NativeVNNI;Quantized;gfx906;Benchmark;Bandwidth"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added Native-VNNI throughput benchmark (16 formats)")
 
     set_source_files_properties(
         performance/kernels/rocm/Microbench__ROCmPrefillStrategyLab.hip

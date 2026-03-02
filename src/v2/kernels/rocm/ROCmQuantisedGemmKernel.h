@@ -182,8 +182,10 @@ namespace llaminar2
                 void *startup_h2d_pinned_vnni = nullptr;
                 uint8_t *d_native_vnni_payload = nullptr;
                 void *d_native_vnni_scales = nullptr; // __half* on device; void* for header compatibility
+                void *d_native_vnni_mins = nullptr;   // __half* on device; NULL for symmetric formats
                 void *startup_h2d_pinned_native_payload = nullptr;
                 void *startup_h2d_pinned_native_scales = nullptr;
+                void *startup_h2d_pinned_native_mins = nullptr;
                 void *startup_h2d_stream = nullptr;
                 void *startup_repack_stream = nullptr;
                 void *startup_commit_stream = nullptr;
@@ -203,7 +205,8 @@ namespace llaminar2
             // Achieves lossless weight reconstruction by keeping per-block FP16 scales separate.
             std::vector<uint8_t> native_vnni_payload; ///< [blocks_per_row × N × 16] nibble payload interleaved by N
             std::vector<uint16_t> native_vnni_scales; ///< [blocks_per_row × N] FP16 per-block scales (raw uint16_t bits)
-            uint8_t native_vnni_codebook_id = 0;      ///< 0=linear (Q4_0), 4=IQ4 (IQ4_NL)
+            std::vector<uint16_t> native_vnni_mins;   ///< [blocks_per_row × N] FP16 per-block mins (asymmetric formats only)
+            uint8_t native_vnni_codebook_id = 0;      ///< NativeVNNIFormat: 0=Q4_0, 4=IQ4_NL, 5=Q4_1, 6=Q5_0, 7=Q5_1
             uint32_t native_vnni_blocks_per_row = 0;  ///< K / 32
 
             int K = 0; ///< Input features (rows in CK B matrix)
@@ -222,6 +225,7 @@ namespace llaminar2
             float *d_scales = nullptr;                  ///< Device pointer to scales
             uint8_t *d_native_vnni_payload = nullptr;   ///< Device pointer to native-VNNI payload
             void *d_native_vnni_scales = nullptr;       ///< Device pointer to native-VNNI FP16 scales (__half*)
+            void *d_native_vnni_mins = nullptr;         ///< Device pointer to native-VNNI FP16 mins (__half*, NULL for symmetric)
             void *startup_repack_ready_event = nullptr; ///< Optional startup repack completion event (hipEvent_t*)
             bool startup_repack_event_pending = false;  ///< True until startup repack event is consumed by CK stream wait
             void *startup_commit_ready_event = nullptr; ///< Optional startup commit completion event (hipEvent_t*)
@@ -248,6 +252,7 @@ namespace llaminar2
                     scales = std::move(other.scales);
                     native_vnni_payload = std::move(other.native_vnni_payload);
                     native_vnni_scales = std::move(other.native_vnni_scales);
+                    native_vnni_mins = std::move(other.native_vnni_mins);
                     native_vnni_codebook_id = other.native_vnni_codebook_id;
                     native_vnni_blocks_per_row = other.native_vnni_blocks_per_row;
                     K = other.K;
@@ -258,6 +263,7 @@ namespace llaminar2
                     d_scales = other.d_scales;
                     d_native_vnni_payload = other.d_native_vnni_payload;
                     d_native_vnni_scales = other.d_native_vnni_scales;
+                    d_native_vnni_mins = other.d_native_vnni_mins;
                     startup_repack_ready_event = other.startup_repack_ready_event;
                     startup_repack_event_pending = other.startup_repack_event_pending;
                     startup_commit_ready_event = other.startup_commit_ready_event;
@@ -270,6 +276,7 @@ namespace llaminar2
                     other.d_scales = nullptr;
                     other.d_native_vnni_payload = nullptr;
                     other.d_native_vnni_scales = nullptr;
+                    other.d_native_vnni_mins = nullptr;
                     other.native_vnni_codebook_id = 0;
                     other.native_vnni_blocks_per_row = 0;
                     other.startup_repack_ready_event = nullptr;

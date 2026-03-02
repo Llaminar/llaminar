@@ -78,6 +78,7 @@
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.
 #include "tensors/BlockStructures.h" // Q8_1Block
 #include "tensors/FP16Utils.h"
+#include "tensors/IQQuantTables.h" // iq3s_grid, iq2xs_grid, ksigns_iq2xs etc.
 #include "tensors/TensorKernels.h"
 #include "tensors/KernelSnapshotInfo.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -102,6 +103,31 @@
 #endif
 #include <cstring>
 #include <chrono>
+
+// IQ grid table initialization (implemented in ROCmGemvKernel_native_VNNI.hip)
+extern "C" bool rocmInitIQGridTables(
+    int device_id,
+    const void *h_iq3s_grid, const void *h_iq3xxs_grid,
+    const void *h_iq2s_grid, const void *h_iq2xs_grid,
+    const void *h_iq2xxs_grid, const void *h_iq1s_grid);
+
+// --------------------------------------------------------------------------
+// Q4_K helper: extract 6-bit scale and min from packed scales[12] array.
+// Matches llama.cpp get_scale_min_k4(). Sub-block index j in [0..7].
+// --------------------------------------------------------------------------
+static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *sc, uint8_t *m)
+{
+    if (j < 4)
+    {
+        *sc = q[j] & 63;
+        *m = q[j + 4] & 63;
+    }
+    else
+    {
+        *sc = (q[j + 4] & 0xF) | (((q[j - 4]) >> 6) << 4);
+        *m = (q[j + 4] >> 4) | (((q[j]) >> 6) << 4);
+    }
+}
 
 namespace llaminar2
 {
@@ -318,14 +344,18 @@ namespace llaminar2
                 int N, int K,
                 int device_id, void *stream);
 
-            // Native-VNNI GEMV: lossless Q4/IQ4 decode with FP16 per-block scales.
+            // Native-VNNI GEMV: lossless decode with FP16 per-block scales.
+            // Supports Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL via codebook_id.
             // Output is FP32 with scale_A applied inline — no epilogue kernel needed.
+            // Uses scatter+reduce pattern: KB=1 → direct, KB>1 → scatter+reduce.
             bool rocmGemv_native_vnni_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
-                const void *d_block_scales, // __half* (FP16)
+                const void *d_block_scales, // __half* (FP16 d)
+                const void *d_block_mins,   // __half* (FP16 m), NULL for symmetric formats
                 float *d_C_fp32,
                 const float *d_scale_A,
+                float *d_partial_fp32, // [KB_MAX × N] partial buffer (nullable when KB=1)
                 int N, int K,
                 uint8_t codebook_id,
                 int device_id, void *stream);
@@ -524,8 +554,9 @@ namespace llaminar2
             int8_t *d_weights_int8_vnni = nullptr;       // [K/4 x N x 4] VNNI layout (sole device copy)
             int8_t *d_weights_int8_rowmajor = nullptr;   // [N x K] optional persistent CK row-major buffer (startup repack)
             float *d_scales_B = nullptr;                 // [N] per-column scales
-            uint8_t *d_weights_native_payload = nullptr; // [blocks_per_row × N × 16]
+            uint8_t *d_weights_native_payload = nullptr; // [blocks_per_row × N × payload_bytes]
             void *d_weights_native_scales = nullptr;     // [blocks_per_row × N] __half*
+            void *d_weights_native_mins = nullptr;       // [blocks_per_row × N] __half* (asymmetric only, else NULL)
             uint8_t native_vnni_codebook_id = 0;
             uint32_t native_vnni_blocks_per_row = 0;
             bool has_native_vnni = false;
@@ -537,6 +568,7 @@ namespace llaminar2
             void *startup_h2d_pinned_vnni = nullptr;
             void *startup_h2d_pinned_native_payload = nullptr;
             void *startup_h2d_pinned_native_scales = nullptr;
+            void *startup_h2d_pinned_native_mins = nullptr;
 
             // Work buffer pointers - obtained from workspace at execution time
             // These are NOT owned by the kernel - they point into workspace-managed memory
@@ -946,6 +978,9 @@ namespace llaminar2
 
                 free_if_set(upload.startup_h2d_pinned_scales);
                 free_if_set(upload.startup_h2d_pinned_vnni);
+                free_if_set(upload.startup_h2d_pinned_native_payload);
+                free_if_set(upload.startup_h2d_pinned_native_scales);
+                free_if_set(upload.startup_h2d_pinned_native_mins);
 #else
                 (void)upload;
 #endif
@@ -1213,6 +1248,14 @@ namespace llaminar2
                         rocmQuantGemm_freeDevice(upload.d_int8_data_rowmajor, device_id);
                     if (upload.d_scales)
                         rocmQuantGemm_freeDevice(upload.d_scales, device_id);
+                    if (upload.d_native_vnni_payload)
+                        rocmQuantGemm_freeDevice(upload.d_native_vnni_payload, device_id);
+#ifdef HAVE_ROCM
+                    if (upload.d_native_vnni_scales)
+                        hipFree(upload.d_native_vnni_scales);
+                    if (upload.d_native_vnni_mins)
+                        hipFree(upload.d_native_vnni_mins);
+#endif
 #ifdef HAVE_ROCM
                     freeStartupPinnedStaging(upload);
                     if (upload.startup_h2d_done_event)
@@ -1257,31 +1300,210 @@ namespace llaminar2
                 return false;
 
             const TensorType wt = tensor->native_type();
-            if (wt != TensorType::Q4_0 && wt != TensorType::IQ4_NL)
-                return false;
 
-            auto *raw_accessor = dynamic_cast<const ITensorGemmTileDataProvider *>(tensor);
+            // Supported native-VNNI formats: Q4_0, IQ4_NL, Q4_1, Q5_0, Q5_1, IQ4_XS, Q4_K, Q5_K, Q6_K, Q3_K, Q2_K
+            // 32-element block formats have per-block FP16 scale (and optionally min).
+            // IQ4_XS has 256-element super-blocks of 8×32 sub-blocks, each using IQ4_NL LUT.
+            // Q4_K has 256-element super-blocks of 8×32 sub-blocks with packed 6-bit scales/mins.
+            // Q5_K is like Q4_K but with 5th-bit array (qh[32]).
+            // Q6_K has 256-element super-blocks, repacked into 8×32 dual-scale blocks.
+            // Q3_K has 256-element super-blocks, repacked into 8×32 dual-scale blocks (3-bit symmetric).
+            // Q2_K has 256-element super-blocks, repacked into 8×32 dual-scale+min blocks (2-bit asymmetric).
+            // During packing, super-block formats have their sub-block scales precomputed:
+            //   IQ4_XS: d*(ls-32) → FP16, reuses IQ4_NL kernel (codebook_id=4)
+            //   Q4_K:   d*sc → FP16 scale, -dmin*m → FP16 min, reuses Q4_1 kernel (codebook_id=5)
+            //   Q5_K:   d*sc → FP16 scale, -dmin*m → FP16 min, reuses Q5_1 kernel (codebook_id=7)
+            //   Q6_K:   d*scales[lo] → FP16 scale_lo, d*scales[hi] → FP16 scale_hi (codebook_id=8)
+            //   Q3_K:   d*(raw6-32) → FP16 scale_lo/hi (codebook_id=9)
+            //   Q2_K:   d*(sc&0xF) → FP16 scale_lo/hi, -dmin*(sc>>4) → embedded FP16 mins (codebook_id=10)
+            //   IQ3_S:  d*(1+2*nibble) → FP16 scale, grid LUT on GPU, direct signs (codebook_id=11)
+            //   IQ3_XXS:d*(0.5+nibble)*0.5 → FP16 scale, grid LUT on GPU, pre-resolved signs (codebook_id=12)
+            //   IQ2_S:  d*(0.5+nibble)*0.25 → dual FP16, grid LUT, direct signs (codebook_id=13)
+            //   IQ2_XS: d*(0.5+nibble)*0.25 → dual FP16, grid LUT, pre-resolved signs (codebook_id=14)
+            //   IQ2_XXS:d*(0.5+nibble)*0.25 → FP16, grid LUT, pre-resolved signs (codebook_id=15)
+            //
+            // Codebook IDs match the NativeVNNIFormat enum in ROCmGemvKernel_native_VNNI.hip:
+            //   0=Q4_0, 4=IQ4_NL (also IQ4_XS), 5=Q4_1 (also Q4_K), 6=Q5_0,
+            //   7=Q5_1 (also Q5_K), 8=Q6_K, 9=Q3_K, 10=Q2_K,
+            //   11=IQ3_S, 12=IQ3_XXS, 13=IQ2_S, 14=IQ2_XS, 15=IQ2_XXS
+            uint8_t codebook_id;
+            int payload_bytes;
+            bool is_asymmetric;
+            bool is_superblock = false; // IQ4_XS/Q4_K: 256-element super-blocks → 8 sub-blocks of 32
+            float max_abs_factor;       // Conservative max element magnitude / scale
+
+            switch (wt)
+            {
+            case TensorType::Q4_0:
+                codebook_id = 0;
+                payload_bytes = 16;
+                is_asymmetric = false;
+                max_abs_factor = 8.0f; // range [-8,+7]
+                break;
+            case TensorType::IQ4_NL:
+                codebook_id = 4;
+                payload_bytes = 16;
+                is_asymmetric = false;
+                max_abs_factor = 127.0f; // LUT range [-127,+113]
+                break;
+            case TensorType::IQ4_XS:
+                codebook_id = 4; // Reuses IQ4_NL kernel — same LUT decode
+                payload_bytes = 16;
+                is_asymmetric = false;
+                is_superblock = true;
+                max_abs_factor = 127.0f; // LUT range [-127,+113] (same codebook)
+                break;
+            case TensorType::Q4_1:
+                codebook_id = 5;
+                payload_bytes = 16;
+                is_asymmetric = true;
+                max_abs_factor = 15.0f; // range [0,+15]
+                break;
+            case TensorType::Q4_K:
+                codebook_id = 5; // Reuses Q4_1 kernel — same asymmetric nibble decode
+                payload_bytes = 16;
+                is_asymmetric = true;
+                is_superblock = true;
+                max_abs_factor = 15.0f; // range [0,+15] (same nibble range as Q4_1)
+                break;
+            case TensorType::Q5_0:
+                codebook_id = 6;
+                payload_bytes = 20; // qs[16] + qh[4]
+                is_asymmetric = false;
+                max_abs_factor = 16.0f; // range [-16,+15]
+                break;
+            case TensorType::Q5_1:
+                codebook_id = 7;
+                payload_bytes = 20; // qs[16] + qh[4]
+                is_asymmetric = true;
+                max_abs_factor = 31.0f; // range [0,+31]
+                break;
+            case TensorType::Q5_K:
+                codebook_id = 7;    // Reuses Q5_1 kernel — 5-bit asymmetric with min correction
+                payload_bytes = 20; // qs[16] + qh[4] (repacked from super-block)
+                is_asymmetric = true;
+                is_superblock = true;
+                max_abs_factor = 31.0f; // range [0,+31] (same 5-bit range as Q5_1)
+                break;
+            case TensorType::Q6_K:
+                codebook_id = 8;      // New Q6_K kernel — 6-bit symmetric with dual-scale blocks
+                payload_bytes = 24;   // 16B low nibbles + 8B upper 2-bit per 32-element block
+                is_asymmetric = true; // Repurpose mins array for scale_hi (dual-scale)
+                is_superblock = true;
+                max_abs_factor = 32.0f; // range [-32, +31]
+                break;
+            case TensorType::Q3_K:
+                codebook_id = 9;      // Q3_K kernel — 3-bit symmetric with dual-scale blocks
+                payload_bytes = 12;   // 8B packed 2-bit + 4B high bits per 32-element block
+                is_asymmetric = true; // Repurpose mins array for scale_hi (dual-scale)
+                is_superblock = true;
+                max_abs_factor = 4.0f; // range [-4, +3]
+                break;
+            case TensorType::Q2_K:
+                codebook_id = 10;     // Q2_K kernel — 2-bit asymmetric with dual-scale + embedded mins
+                payload_bytes = 12;   // 8B packed 2-bit + 4B embedded FP16 mins per 32-element block
+                is_asymmetric = true; // Repurpose mins array for scale_hi (dual-scale)
+                is_superblock = true;
+                max_abs_factor = 3.0f; // range [0, +3]
+                break;
+            case TensorType::IQ3_S:
+                codebook_id = 11;
+                payload_bytes = 13; // 8 qs + 1 qh + 4 signs
+                is_asymmetric = false;
+                is_superblock = true;
+                max_abs_factor = 15.0f; // max grid byte value
+                break;
+            case TensorType::IQ3_XXS:
+                codebook_id = 12;
+                payload_bytes = 12; // 8 qs + 4 pre-resolved signs
+                is_asymmetric = false;
+                is_superblock = true;
+                max_abs_factor = 62.0f;
+                break;
+            case TensorType::IQ2_S:
+                codebook_id = 13;
+                payload_bytes = 9;    // 4 qs + 1 qh + 4 signs
+                is_asymmetric = true; // dual scale stored in mins[]
+                is_superblock = true;
+                max_abs_factor = 43.0f;
+                break;
+            case TensorType::IQ2_XS:
+                codebook_id = 14;
+                payload_bytes = 9;    // 4 qs + 1 synth qh + 4 pre-resolved signs
+                is_asymmetric = true; // dual scale stored in mins[]
+                is_superblock = true;
+                max_abs_factor = 43.0f;
+                break;
+            case TensorType::IQ2_XXS:
+                codebook_id = 15;
+                payload_bytes = 8; // 4 qs + 4 pre-resolved signs
+                is_asymmetric = false;
+                is_superblock = true;
+                max_abs_factor = 43.0f;
+                break;
+            case TensorType::IQ1_S:
+                codebook_id = 16;
+                payload_bytes = 6;    // 4 qs_lo + 2 qh_word (high index bits + delta sign)
+                is_asymmetric = true; // delta correction via min = dl * delta
+                is_superblock = true;
+                max_abs_factor = 1.125f; // max |grid + delta| = |1 + 0.125|
+                break;
+            case TensorType::IQ1_M:
+                codebook_id = 17;
+                payload_bytes = 10;   // 4 qs_lo + 2 qh + 4 embedded FP16 delta_lo/delta_hi
+                is_asymmetric = true; // dual scale + embedded delta corrections
+                is_superblock = true;
+                max_abs_factor = 1.125f;
+                break;
+            default:
+                return false;
+            }
+
+            // Lazy-initialize IQ grid lookup tables in GPU __constant__ memory
+            // (once per process, thread-safe via static flag)
+            if (codebook_id >= 11 && codebook_id <= 17)
+            {
+                static bool iq_grids_initialized = false;
+                if (!iq_grids_initialized)
+                {
+                    LOG_INFO("[packNativeVNNI] Initializing IQ grid LUT tables in GPU constant memory");
+                    if (!rocmInitIQGridTables(
+                            0, // device_id (TODO: multi-GPU)
+                            llaminar2::iq3s_grid,
+                            llaminar2::iq3xxs_grid,
+                            llaminar2::iq2s_grid,
+                            llaminar2::iq2xs_grid,
+                            llaminar2::iq2xxs_grid,
+                            llaminar2::iq1s_grid))
+                    {
+                        LOG_ERROR("[packNativeVNNI] Failed to initialize IQ grid tables");
+                        return false;
+                    }
+                    iq_grids_initialized = true;
+                }
+            }
+
+            // Only need IINT8Unpackable for get_block_scale() / get_block_min()
             auto *quant_accessor = dynamic_cast<const IINT8Unpackable *>(tensor);
-            if (!raw_accessor || !quant_accessor)
+            if (!quant_accessor)
                 return false;
 
             const int N = static_cast<int>(tensor->rows());
             const int K = static_cast<int>(tensor->cols());
-            if ((K % 32) != 0 || raw_accessor->block_size() != 32)
+            if ((K % 32) != 0)
                 return false;
 
             const int blocks_per_row = K / 32;
-            const int payload_bytes = 16; // 32 nibbles = 16 bytes
 
             out.native_vnni_payload.resize(static_cast<size_t>(blocks_per_row) * N * payload_bytes);
             out.native_vnni_scales.resize(static_cast<size_t>(blocks_per_row) * N);
-            out.native_vnni_codebook_id = (wt == TensorType::IQ4_NL) ? 4 : 0;
+            if (is_asymmetric)
+                out.native_vnni_mins.resize(static_cast<size_t>(blocks_per_row) * N);
+            out.native_vnni_codebook_id = codebook_id;
             out.native_vnni_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
 
-            // Also need per-row scales for the INT8 activation scaling (used by CK expand and activation quant).
-            // For native-VNNI we set per-row scale = 1.0 (scale is per-block, not per-row),
-            // but we still need the scales array for activation quantization compatibility.
-            // We compute per-row max-abs from dequantized weights for CK prefill compat.
+            // Per-row max-abs for CK prefill INT8 requantization compatibility.
+            // The native-VNNI GEMV path doesn't use these, but the CK GEMM fallback does.
             out.scales.resize(N);
             for (int n = 0; n < N; ++n)
             {
@@ -1290,53 +1512,729 @@ namespace llaminar2
                 {
                     const float scale_b = std::abs(quant_accessor->get_block_scale(
                         static_cast<size_t>(n), static_cast<size_t>(b)));
-                    // Conservative: scale * 8 covers full Q4_0 range
-                    max_abs = std::max(max_abs, scale_b * 8.0f);
+                    float block_max = scale_b * max_abs_factor;
+                    if (is_asymmetric)
+                    {
+                        const float min_b = std::abs(quant_accessor->get_block_min(
+                            static_cast<size_t>(n), static_cast<size_t>(b)));
+                        block_max += min_b;
+                    }
+                    max_abs = std::max(max_abs, block_max);
                 }
                 out.scales[n] = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
             }
 
-            // Interleave payload and scales by N for coalesced GPU access
+            // Interleave payload, scales (and mins) by N for coalesced GPU access.
+            // Access raw blocks via dynamic_cast to concrete tensor type + typed_data().
+            // This avoids ITensorGemmTileDataProvider (being retired).
+            const uint8_t *raw_bytes = static_cast<const uint8_t *>(tensor->raw_data());
+            if (!raw_bytes)
+            {
+                LOG_ERROR("[packNativeVNNI] tensor->raw_data() returned null");
+                return false;
+            }
+
             for (int n = 0; n < N; ++n)
             {
                 for (int b = 0; b < blocks_per_row; ++b)
                 {
-                    const void *raw_block = raw_accessor->get_raw_block_at(
-                        static_cast<size_t>(n), static_cast<size_t>(b));
-                    if (!raw_block)
+                    const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
+                    const uint8_t *payload_src = nullptr;
+                    const uint8_t *qh_src = nullptr; // Non-null only for 5-bit formats
+                    uint16_t scale_fp16 = 0;
+                    uint16_t min_fp16 = 0;
+
+                    const size_t block_idx = static_cast<size_t>(n) * blocks_per_row + b;
+
+                    switch (wt)
                     {
-                        LOG_ERROR("[packNativeVNNI] get_raw_block returned null at n=" << n << " b=" << b);
+                    case TensorType::Q4_0:
+                    {
+                        const auto *blk = reinterpret_cast<const Q4_0Block *>(
+                            raw_bytes + block_idx * sizeof(Q4_0Block));
+                        payload_src = blk->qs;
+                        scale_fp16 = blk->d;
+                        break;
+                    }
+                    case TensorType::IQ4_NL:
+                    {
+                        const auto *blk = reinterpret_cast<const IQ4_NLBlock *>(
+                            raw_bytes + block_idx * sizeof(IQ4_NLBlock));
+                        payload_src = blk->qs;
+                        scale_fp16 = blk->d;
+                        break;
+                    }
+                    case TensorType::IQ4_XS:
+                    {
+                        // IQ4_XS: 256-element super-block → 8 sub-blocks of 32 elements
+                        // Each sub-block uses the IQ4_NL LUT (same codebook).
+                        // We precompute the combined scale: d * (ls - 32) → FP16
+                        const int super_blocks_per_row = K / 256;
+                        const int sb_idx = b / 8;  // super-block index in this row
+                        const int sub_idx = b % 8; // sub-block within super-block
+                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
+                        const auto *blk = reinterpret_cast<const IQ4_XSBlock *>(
+                            raw_bytes + abs_sb * sizeof(IQ4_XSBlock));
+                        payload_src = blk->qs + sub_idx * 16; // 16 nibble bytes per sub-block
+
+                        // Extract 6-bit sub-block scale: low 4 bits from scales_l, high 2 from scales_h
+                        const int ls = ((blk->scales_l[sub_idx / 2] >> (4 * (sub_idx % 2))) & 0xf) | (((blk->scales_h >> (2 * sub_idx)) & 3) << 4);
+                        const float combined_scale = fp16_to_fp32(blk->d) * static_cast<float>(ls - 32);
+                        scale_fp16 = fp32_to_fp16(combined_scale);
+                        break;
+                    }
+                    case TensorType::Q4_K:
+                    {
+                        // Q4_K: 256-element super-block → 8 sub-blocks of 32 elements
+                        // Asymmetric: value = d*sc*nibble - dmin*m
+                        // Precompute combined scale d*sc → FP16 and combined min -dmin*m → FP16
+                        // This maps to Q4_1 kernel (unsigned nibble [0,15] + min correction)
+                        const int super_blocks_per_row = K / 256;
+                        const int sb_idx = b / 8;  // super-block index in this row
+                        const int sub_idx = b % 8; // sub-block within super-block (0-7)
+                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
+                        const auto *blk = reinterpret_cast<const Q4_KBlock *>(
+                            raw_bytes + abs_sb * sizeof(Q4_KBlock));
+
+                        // Q4_K nibble layout: qs[128] → 4 groups of 32 bytes
+                        // Sub-blocks come in pairs sharing 32 qs bytes:
+                        //   sub_idx 0,1 share qs[0..31]  (0=low nibbles, 1=high nibbles)
+                        //   sub_idx 2,3 share qs[32..63] etc.
+                        // The Q4_1 kernel expects 16 bytes in standard GGML nibble packing:
+                        //   byte[i] = elem[i] | (elem[i+16] << 4) for i in [0,15]
+                        // So we must extract 32 nibbles from one half and repack them.
+                        const int group_idx = sub_idx / 2;
+                        const int is_high = sub_idx & 1;
+                        const uint8_t *src32 = blk->qs + group_idx * 32;
+
+                        // Repack: extract 32 nibbles from low or high half, pack into 16 bytes
+                        uint8_t repacked[16];
+                        if (is_high)
+                        {
+                            // Odd sub-block: elem[i] = src32[i] >> 4
+                            for (int i = 0; i < 16; ++i)
+                                repacked[i] = (src32[i] >> 4) | (src32[i + 16] & 0xF0);
+                        }
+                        else
+                        {
+                            // Even sub-block: elem[i] = src32[i] & 0xF
+                            for (int i = 0; i < 16; ++i)
+                                repacked[i] = (src32[i] & 0xF) | ((src32[i + 16] & 0xF) << 4);
+                        }
+
+                        // Copy repacked payload to output
+                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
+                        std::memcpy(dst, repacked, 16);
+
+                        // Extract 6-bit scale and min for this sub-block
+                        uint8_t sc, m_val;
+                        get_scale_min_k4(sub_idx, blk->scales, &sc, &m_val);
+                        const float d = fp16_to_fp32(blk->d);
+                        const float dmin = fp16_to_fp32(blk->dmin);
+                        scale_fp16 = fp32_to_fp16(d * static_cast<float>(sc));
+                        min_fp16 = fp32_to_fp16(-dmin * static_cast<float>(m_val));
+
+                        // Payload already written — store scale/min and skip the generic memcpy
+                        out.native_vnni_scales[linear] = scale_fp16;
+                        out.native_vnni_mins[linear] = min_fp16;
+                        continue; // skip generic payload copy below
+                    }
+                    case TensorType::Q5_K:
+                    {
+                        // Q5_K: 256-element super-block → 8 sub-blocks of 32 elements
+                        // Asymmetric: value = d*sc*(nibble + qh_bit*16) - dmin*m
+                        // Reuses Q5_1 kernel: 5-bit unsigned [0,31] + min correction
+                        // Same scales[12] as Q4_K, same qs[128] layout, plus qh[32] for 5th bits
+                        const int super_blocks_per_row = K / 256;
+                        const int sb_idx = b / 8;
+                        const int sub_idx = b % 8;
+                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
+                        const auto *blk = reinterpret_cast<const Q5_KBlock *>(
+                            raw_bytes + abs_sb * sizeof(Q5_KBlock));
+
+                        // Nibble repacking: identical to Q4_K
+                        // Sub-blocks come in pairs sharing 32 qs bytes (even=low, odd=high)
+                        const int group_idx = sub_idx / 2;
+                        const int is_high = sub_idx & 1;
+                        const uint8_t *src32 = blk->qs + group_idx * 32;
+
+                        uint8_t repacked_qs[16];
+                        if (is_high)
+                        {
+                            for (int i = 0; i < 16; ++i)
+                                repacked_qs[i] = (src32[i] >> 4) | (src32[i + 16] & 0xF0);
+                        }
+                        else
+                        {
+                            for (int i = 0; i < 16; ++i)
+                                repacked_qs[i] = (src32[i] & 0xF) | ((src32[i + 16] & 0xF) << 4);
+                        }
+
+                        // High-bit extraction: collect bit sub_idx from qh[0..31]
+                        // qh[i] has 8 bits, one per sub-block. Bit sub_idx = 5th bit of element i.
+                        // Pack 32 bits into 4 bytes (same layout as Q5_1Block::qh)
+                        uint8_t repacked_qh[4] = {0, 0, 0, 0};
+                        for (int i = 0; i < 32; ++i)
+                        {
+                            const int bit_val = (blk->qh[i] >> sub_idx) & 1;
+                            repacked_qh[i / 8] |= static_cast<uint8_t>(bit_val << (i % 8));
+                        }
+
+                        // Write payload: 16 bytes nibbles + 4 bytes qh
+                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
+                        std::memcpy(dst, repacked_qs, 16);
+                        std::memcpy(dst + 16, repacked_qh, 4);
+
+                        // Extract 6-bit scale and min (same as Q4_K)
+                        uint8_t sc, m_val;
+                        get_scale_min_k4(sub_idx, blk->scales, &sc, &m_val);
+                        const float d = fp16_to_fp32(blk->d);
+                        const float dmin = fp16_to_fp32(blk->dmin);
+                        scale_fp16 = fp32_to_fp16(d * static_cast<float>(sc));
+                        min_fp16 = fp32_to_fp16(-dmin * static_cast<float>(m_val));
+
+                        // Payload already written — store scale/min and skip generic memcpy
+                        out.native_vnni_scales[linear] = scale_fp16;
+                        out.native_vnni_mins[linear] = min_fp16;
+                        continue;
+                    }
+                    case TensorType::Q6_K:
+                    {
+                        // Q6_K: 256-element super-block → 8 dual-scale blocks of 32 elements
+                        // Symmetric: value = d * scales[sub] * (raw6 - 32)
+                        // Each 32-element block has 2 INT8 sub-block scales:
+                        //   scale_lo = d * scales[2*sub_idx]  (elements 0-15)
+                        //   scale_hi = d * scales[2*sub_idx+1] (elements 16-31)
+                        // scale_hi stored in mins array (repurposed for dual-scale)
+                        const int super_blocks_per_row = K / 256;
+                        const int sb_idx = b / 8;  // super-block index in this row
+                        const int sub_idx = b % 8; // block within super-block (0-7)
+                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
+                        const auto *blk = reinterpret_cast<const Q6_KBlock *>(
+                            raw_bytes + abs_sb * sizeof(Q6_KBlock));
+
+                        // Decode 32 elements from Q6_K's interleaved storage to raw 6-bit [0,63]
+                        // Q6_K layout: 2 halves × 128 elements, each half has 4 sub-groups
+                        // of 32 that share ql/qh bytes in an interleaved pattern.
+                        const int half = (sub_idx * 32) / 128;             // 0 or 1
+                        const int sub_in_half = (sub_idx * 32 % 128) / 32; // 0-3
+                        const uint8_t *ql = blk->ql + half * 64;
+                        const uint8_t *qh = blk->qh + half * 32;
+
+                        uint8_t raw6[32];
+                        for (int l = 0; l < 32; ++l)
+                        {
+                            switch (sub_in_half)
+                            {
+                            case 0: // ql[l] low nibble, qh[l] bits 0-1
+                                raw6[l] = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+                                break;
+                            case 1: // ql[l+32] low nibble, qh[l] bits 2-3
+                                raw6[l] = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+                                break;
+                            case 2: // ql[l] high nibble, qh[l] bits 4-5
+                                raw6[l] = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+                                break;
+                            case 3: // ql[l+32] high nibble, qh[l] bits 6-7
+                                raw6[l] = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+                                break;
+                            }
+                        }
+
+                        // Pack raw6[32] into 24-byte Q6_K native-VNNI payload:
+                        //   [0..15]:  ql — paired nibbles = (raw6[i]&0xF) | ((raw6[i+16]&0xF)<<4)
+                        //   [16..23]: qh — packed 2-bit = (raw6[4i]>>4)&3 | ... (4 per byte)
+                        uint8_t payload[24];
+                        for (int i = 0; i < 16; ++i)
+                            payload[i] = (raw6[i] & 0xF) | ((raw6[i + 16] & 0xF) << 4);
+                        for (int i = 0; i < 8; ++i)
+                            payload[16 + i] = ((raw6[4 * i + 0] >> 4) & 3) | (((raw6[4 * i + 1] >> 4) & 3) << 2) | (((raw6[4 * i + 2] >> 4) & 3) << 4) | (((raw6[4 * i + 3] >> 4) & 3) << 6);
+
+                        // Write payload
+                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
+                        std::memcpy(dst, payload, 24);
+
+                        // Compute dual scales from signed INT8 sub-block scales
+                        const float d = fp16_to_fp32(blk->d);
+                        const int8_t *sc = blk->scales;
+                        const int sc_lo_idx = half * 8 + sub_in_half * 2;
+                        const int sc_hi_idx = sc_lo_idx + 1;
+                        scale_fp16 = fp32_to_fp16(d * static_cast<float>(sc[sc_lo_idx]));
+                        min_fp16 = fp32_to_fp16(d * static_cast<float>(sc[sc_hi_idx])); // repurposed as scale_hi
+
+                        // Payload already written — store dual scales and skip generic memcpy
+                        out.native_vnni_scales[linear] = scale_fp16;
+                        out.native_vnni_mins[linear] = min_fp16;
+                        continue;
+                    }
+                    case TensorType::Q3_K:
+                    {
+                        // Q3_K: 256-element super-block → 8 dual-scale blocks of 32 elements
+                        // Symmetric: value = d * (raw6_scale - 32) * (low2 | (hbit<<2) - 4)
+                        // 3-bit: low 2 bits from qs[64] (interleaved), high bit from hmask[32]
+                        // 16 sub-blocks of 16 → paired into 8×32 for dual-scale
+                        const int super_blocks_per_row = K / 256;
+                        const int sb_idx = b / 8;
+                        const int sub_idx = b % 8;
+                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
+                        const auto *blk = reinterpret_cast<const Q3_KBlock *>(
+                            raw_bytes + abs_sb * sizeof(Q3_KBlock));
+
+                        // Block sub_idx maps to: chunk = sub_idx/4, group = sub_idx%4
+                        const int chunk = sub_idx / 4;
+                        const int group = sub_idx % 4;
+                        const int shift = group * 2;
+                        const int hmask_bit_pos = 4 * chunk + group;
+
+                        // Extract 32 elements: qs[chunk*32 + e] >> shift & 3, hmask[e] >> hmask_bit_pos & 1
+                        uint8_t raw3[32];
+                        for (int e = 0; e < 32; ++e)
+                        {
+                            const int low2 = (blk->qs[chunk * 32 + e] >> shift) & 3;
+                            const int hbit = (blk->hmask[e] >> hmask_bit_pos) & 1;
+                            raw3[e] = static_cast<uint8_t>(low2 | (hbit << 2));
+                        }
+
+                        // Pack into 12-byte payload: [0..7] = packed 2-bit, [8..11] = packed high bits
+                        uint8_t payload_buf[12];
+                        for (int g = 0; g < 8; ++g)
+                        {
+                            payload_buf[g] = static_cast<uint8_t>(
+                                (raw3[4 * g + 0] & 3) |
+                                ((raw3[4 * g + 1] & 3) << 2) |
+                                ((raw3[4 * g + 2] & 3) << 4) |
+                                ((raw3[4 * g + 3] & 3) << 6));
+                        }
+                        for (int j = 0; j < 4; ++j)
+                        {
+                            payload_buf[8 + j] = 0;
+                            for (int bit = 0; bit < 8; ++bit)
+                                payload_buf[8 + j] |= static_cast<uint8_t>(
+                                    ((raw3[8 * j + bit] >> 2) & 1) << bit);
+                        }
+
+                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
+                        std::memcpy(dst, payload_buf, 12);
+
+                        // Unpack 16 × 6-bit scales from scales[12] and compute dual scales
+                        int8_t unpacked_scales[16];
+                        {
+                            const uint32_t kmask1 = 0x03030303;
+                            const uint32_t kmask2 = 0x0f0f0f0f;
+                            uint32_t aux[4];
+                            std::memcpy(aux, blk->scales, 12);
+                            uint32_t tmp = aux[2];
+                            aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+                            aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+                            aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+                            aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+                            std::memcpy(unpacked_scales, aux, 16);
+                        }
+
+                        // Scale indices: lo = chunk*8 + group, hi = lo + 4
+                        const float d = fp16_to_fp32(blk->d);
+                        const int sc_lo_idx = chunk * 8 + group;
+                        const int sc_hi_idx = sc_lo_idx + 4;
+                        scale_fp16 = fp32_to_fp16(d * static_cast<float>(unpacked_scales[sc_lo_idx] - 32));
+                        min_fp16 = fp32_to_fp16(d * static_cast<float>(unpacked_scales[sc_hi_idx] - 32));
+
+                        out.native_vnni_scales[linear] = scale_fp16;
+                        out.native_vnni_mins[linear] = min_fp16;
+                        continue;
+                    }
+                    case TensorType::Q2_K:
+                    {
+                        // Q2_K: 256-element super-block → 8 dual-scale+min blocks of 32 elements
+                        // Asymmetric: value = d * (sc&0xF) * q2 - dmin * (sc>>4)
+                        // 2-bit values from qs[64] (interleaved), 4-bit packed scale+min in scales[16]
+                        const int super_blocks_per_row = K / 256;
+                        const int sb_idx = b / 8;
+                        const int sub_idx = b % 8;
+                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
+                        const auto *blk = reinterpret_cast<const Q2_KBlock *>(
+                            raw_bytes + abs_sb * sizeof(Q2_KBlock));
+
+                        // Block sub_idx maps to: chunk = sub_idx/4, group = sub_idx%4
+                        const int chunk = sub_idx / 4;
+                        const int group = sub_idx % 4;
+                        const int shift = group * 2;
+
+                        // Extract 32 2-bit values and pack into 8 bytes
+                        uint8_t payload_buf[12];
+                        for (int g = 0; g < 8; ++g)
+                        {
+                            const int base = g * 4;
+                            uint8_t packed = 0;
+                            for (int lane = 0; lane < 4; ++lane)
+                            {
+                                const int e = base + lane;
+                                const uint8_t q2 = (blk->qs[chunk * 32 + e] >> shift) & 3;
+                                packed |= static_cast<uint8_t>(q2 << (lane * 2));
+                            }
+                            payload_buf[g] = packed;
+                        }
+
+                        // Scale indices for Q2_K: lo = 8*chunk + 2*group, hi = lo + 1
+                        const int sc_lo_idx = 8 * chunk + 2 * group;
+                        const int sc_hi_idx = sc_lo_idx + 1;
+                        const float d_val = fp16_to_fp32(blk->d);
+                        const float dmin = fp16_to_fp32(blk->dmin);
+
+                        // Compute dual scales: d * (sc & 0xF) → FP16
+                        scale_fp16 = fp32_to_fp16(d_val * static_cast<float>(blk->scales[sc_lo_idx] & 0xF));
+                        min_fp16 = fp32_to_fp16(d_val * static_cast<float>(blk->scales[sc_hi_idx] & 0xF));
+
+                        // Embed FP16 mins into payload[8..11]: -dmin*(sc>>4) for each half
+                        const uint16_t emb_min_lo = fp32_to_fp16(
+                            -dmin * static_cast<float>(blk->scales[sc_lo_idx] >> 4));
+                        const uint16_t emb_min_hi = fp32_to_fp16(
+                            -dmin * static_cast<float>(blk->scales[sc_hi_idx] >> 4));
+                        std::memcpy(payload_buf + 8, &emb_min_lo, 2);
+                        std::memcpy(payload_buf + 10, &emb_min_hi, 2);
+
+                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
+                        std::memcpy(dst, payload_buf, 12);
+
+                        out.native_vnni_scales[linear] = scale_fp16;
+                        out.native_vnni_mins[linear] = min_fp16;
+                        continue;
+                    }
+
+                        // ========== IQ Grid Formats (Tier 3) ==========
+                        // All IQ formats: 256-element super-blocks → 8 sub-blocks of 32
+                        // Grid indices stored compactly; GPU decodes via __constant__ LUT
+                        // Signs either direct bytes (IQ3_S, IQ2_S) or pre-resolved from ksigns_iq2xs
+
+                    case TensorType::IQ3_S:
+                    {
+                        // IQ3_S: 9-bit grid index → iq3s_grid[512], direct sign bytes
+                        // Payload: [qs×8][qh×1][signs×4] = 13 bytes
+                        const int super_blocks_per_row = K / 256;
+                        const int sb_idx = b / 8;
+                        const int sub_idx = b % 8;
+                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
+                        const auto *blk = reinterpret_cast<const IQ3_SBlock *>(
+                            raw_bytes + abs_sb * sizeof(IQ3_SBlock));
+
+                        uint8_t payload_buf[13];
+                        // Grid indices: 8 low bytes of 9-bit indices
+                        std::memcpy(payload_buf, blk->qs + sub_idx * 8, 8);
+                        // QH byte: bit g = high bit of grid index g
+                        payload_buf[8] = blk->qh[sub_idx];
+                        // Sign bytes: 4 direct sign bytes (8 bits each, covering 8 elements)
+                        std::memcpy(payload_buf + 9, blk->signs + sub_idx * 4, 4);
+
+                        // Scale: d * (1 + 2 * nibble), from scales[sub_idx/2]
+                        const float d_val = fp16_to_fp32(blk->d);
+                        const uint8_t sc_byte = blk->scales[sub_idx / 2];
+                        const int nibble = (sub_idx & 1) ? (sc_byte >> 4) : (sc_byte & 0xF);
+                        scale_fp16 = fp32_to_fp16(d_val * static_cast<float>(1 + 2 * nibble));
+
+                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
+                        std::memcpy(dst, payload_buf, 13);
+                        out.native_vnni_scales[linear] = scale_fp16;
+                        continue;
+                    }
+                    case TensorType::IQ3_XXS:
+                    {
+                        // IQ3_XXS: 8-bit grid index → iq3xxs_grid[256], indirect signs
+                        // Payload: [qs×8][signs×4] = 12 bytes
+                        const int super_blocks_per_row = K / 256;
+                        const int sb_idx = b / 8;
+                        const int sub_idx = b % 8;
+                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
+                        const auto *blk = reinterpret_cast<const IQ3_XXSBlock *>(
+                            raw_bytes + abs_sb * sizeof(IQ3_XXSBlock));
+
+                        uint8_t payload_buf[12];
+                        // Grid indices: 8 bytes (8-bit indices into iq3xxs_grid[256])
+                        std::memcpy(payload_buf, blk->qs + sub_idx * 8, 8);
+
+                        // Scales+signs packed in qs[64..95] as uint32_t per sub-block
+                        uint32_t aux32;
+                        std::memcpy(&aux32, blk->qs + 64 + sub_idx * 4, 4);
+
+                        // Pre-resolve indirect signs via ksigns_iq2xs
+                        payload_buf[8] = llaminar2::ksigns_iq2xs[(aux32 >> 0) & 127];
+                        payload_buf[9] = llaminar2::ksigns_iq2xs[(aux32 >> 7) & 127];
+                        payload_buf[10] = llaminar2::ksigns_iq2xs[(aux32 >> 14) & 127];
+                        payload_buf[11] = llaminar2::ksigns_iq2xs[(aux32 >> 21) & 127];
+
+                        // Scale: d * (0.5 + nibble) * 0.5
+                        const float d_val = fp16_to_fp32(blk->d);
+                        const int nibble = static_cast<int>(aux32 >> 28);
+                        scale_fp16 = fp32_to_fp16(d_val * (0.5f + static_cast<float>(nibble)) * 0.5f);
+
+                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
+                        std::memcpy(dst, payload_buf, 12);
+                        out.native_vnni_scales[linear] = scale_fp16;
+                        continue;
+                    }
+                    case TensorType::IQ2_S:
+                    {
+                        // IQ2_S: 10-bit grid index → iq2s_grid[1024], direct sign bytes, dual scale
+                        // Payload: [qs×4][qh×1][signs×4] = 9 bytes
+                        const int super_blocks_per_row = K / 256;
+                        const int sb_idx = b / 8;
+                        const int sub_idx = b % 8;
+                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
+                        const auto *blk = reinterpret_cast<const IQ2_SBlock *>(
+                            raw_bytes + abs_sb * sizeof(IQ2_SBlock));
+
+                        uint8_t payload_buf[9];
+                        // Grid indices: 4 low bytes (low 8 bits of 10-bit index)
+                        std::memcpy(payload_buf, blk->qs + sub_idx * 4, 4);
+                        // QH byte: qh[sub_idx] — 2 bits per group packed as pairs
+                        payload_buf[4] = blk->qh[sub_idx];
+                        // Sign bytes: 4 direct sign bytes from second half of qs[]
+                        std::memcpy(payload_buf + 5, blk->qs + 32 + sub_idx * 4, 4);
+
+                        // Dual scales: d * (0.5 + nibble) * 0.25
+                        const float d_val = fp16_to_fp32(blk->d);
+                        const uint8_t sc = blk->scales[sub_idx];
+                        scale_fp16 = fp32_to_fp16(d_val * (0.5f + static_cast<float>(sc & 0xF)) * 0.25f);
+                        min_fp16 = fp32_to_fp16(d_val * (0.5f + static_cast<float>(sc >> 4)) * 0.25f);
+
+                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
+                        std::memcpy(dst, payload_buf, 9);
+                        out.native_vnni_scales[linear] = scale_fp16;
+                        out.native_vnni_mins[linear] = min_fp16;
+                        continue;
+                    }
+                    case TensorType::IQ2_XS:
+                    {
+                        // IQ2_XS: 9-bit grid index → iq2xs_grid[512], indirect signs, dual scale
+                        // Payload: [qs×4][qh×1][signs×4] = 9 bytes
+                        const int super_blocks_per_row = K / 256;
+                        const int sb_idx = b / 8;
+                        const int sub_idx = b % 8;
+                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
+                        const auto *blk = reinterpret_cast<const IQ2_XSBlock *>(
+                            raw_bytes + abs_sb * sizeof(IQ2_XSBlock));
+
+                        uint8_t payload_buf[9];
+                        uint8_t qh_byte = 0;
+                        // Each qs[l] is uint16_t: low 9 bits = grid index, top 7 bits = sign index
+                        for (int l = 0; l < 4; ++l)
+                        {
+                            const uint16_t entry = blk->qs[sub_idx * 4 + l];
+                            payload_buf[l] = static_cast<uint8_t>(entry & 0xFF);      // low 8 of 9-bit index
+                            qh_byte |= static_cast<uint8_t>(((entry >> 8) & 1) << l); // bit 8 → qh bit l
+                            payload_buf[5 + l] = llaminar2::ksigns_iq2xs[entry >> 9]; // pre-resolve sign
+                        }
+                        payload_buf[4] = qh_byte;
+
+                        // Dual scales: d * (0.5 + nibble) * 0.25
+                        const float d_val = fp16_to_fp32(blk->d);
+                        const uint8_t sc = blk->scales[sub_idx];
+                        scale_fp16 = fp32_to_fp16(d_val * (0.5f + static_cast<float>(sc & 0xF)) * 0.25f);
+                        min_fp16 = fp32_to_fp16(d_val * (0.5f + static_cast<float>(sc >> 4)) * 0.25f);
+
+                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
+                        std::memcpy(dst, payload_buf, 9);
+                        out.native_vnni_scales[linear] = scale_fp16;
+                        out.native_vnni_mins[linear] = min_fp16;
+                        continue;
+                    }
+                    case TensorType::IQ2_XXS:
+                    {
+                        // IQ2_XXS: 8-bit grid index → iq2xxs_grid[256], indirect signs
+                        // Payload: [qs×4][signs×4] = 8 bytes
+                        const int super_blocks_per_row = K / 256;
+                        const int sb_idx = b / 8;
+                        const int sub_idx = b % 8;
+                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
+                        const auto *blk = reinterpret_cast<const IQ2_XXSBlock *>(
+                            raw_bytes + abs_sb * sizeof(IQ2_XXSBlock));
+
+                        // qs is uint16_t[32] = 64 bytes; each sub-block = 8 bytes as 2×uint32_t
+                        const uint8_t *qs_bytes = reinterpret_cast<const uint8_t *>(blk->qs);
+                        uint32_t aux32[2];
+                        std::memcpy(aux32, qs_bytes + sub_idx * 8, 8);
+
+                        uint8_t payload_buf[8];
+                        // Grid indices: 4 bytes from aux32[0]
+                        payload_buf[0] = static_cast<uint8_t>(aux32[0]);
+                        payload_buf[1] = static_cast<uint8_t>(aux32[0] >> 8);
+                        payload_buf[2] = static_cast<uint8_t>(aux32[0] >> 16);
+                        payload_buf[3] = static_cast<uint8_t>(aux32[0] >> 24);
+                        // Pre-resolve indirect signs from aux32[1]
+                        payload_buf[4] = llaminar2::ksigns_iq2xs[(aux32[1] >> 0) & 127];
+                        payload_buf[5] = llaminar2::ksigns_iq2xs[(aux32[1] >> 7) & 127];
+                        payload_buf[6] = llaminar2::ksigns_iq2xs[(aux32[1] >> 14) & 127];
+                        payload_buf[7] = llaminar2::ksigns_iq2xs[(aux32[1] >> 21) & 127];
+
+                        // Scale: d * (0.5 + nibble) * 0.25
+                        const float d_val = fp16_to_fp32(blk->d);
+                        const int nibble = static_cast<int>(aux32[1] >> 28);
+                        scale_fp16 = fp32_to_fp16(d_val * (0.5f + static_cast<float>(nibble)) * 0.25f);
+
+                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
+                        std::memcpy(dst, payload_buf, 8);
+                        out.native_vnni_scales[linear] = scale_fp16;
+                        continue;
+                    }
+
+                    case TensorType::IQ1_S:
+                    {
+                        // IQ1_S: 11-bit grid index → iq1s_grid[2048], signed values {-1,0,+1}
+                        // Payload: [qs×4][qh_word×2] = 6 bytes
+                        // Delta correction via asymmetric min: min = dl * delta
+                        const int super_blocks_per_row = K / 256;
+                        const int sb_idx = b / 8;
+                        const int sub_idx = b % 8;
+                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
+                        const auto *blk = reinterpret_cast<const IQ1_SBlock *>(
+                            raw_bytes + abs_sb * sizeof(IQ1_SBlock));
+
+                        const uint8_t *qs = blk->qs + sub_idx * 4;
+                        uint16_t qh_word;
+                        std::memcpy(&qh_word, &blk->qh[sub_idx], sizeof(uint16_t));
+
+                        uint8_t payload_buf[6];
+                        payload_buf[0] = qs[0];
+                        payload_buf[1] = qs[1];
+                        payload_buf[2] = qs[2];
+                        payload_buf[3] = qs[3];
+                        payload_buf[4] = static_cast<uint8_t>(qh_word & 0xFF);
+                        payload_buf[5] = static_cast<uint8_t>((qh_word >> 8) & 0xFF);
+
+                        // Precompute scale: d * (2 * scale_sel + 1)
+                        const float d_val = fp16_to_fp32(blk->d);
+                        const int scale_sel = (qh_word >> 12) & 7;
+                        const float dl = d_val * (2.0f * static_cast<float>(scale_sel) + 1.0f);
+                        scale_fp16 = fp32_to_fp16(dl);
+
+                        // Delta correction: min = dl * delta, delta = ±0.125
+                        constexpr float IQ1S_DELTA = 0.125f;
+                        const float delta = (qh_word & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
+                        min_fp16 = fp32_to_fp16(dl * delta);
+
+                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
+                        std::memcpy(dst, payload_buf, 6);
+                        out.native_vnni_scales[linear] = scale_fp16;
+                        out.native_vnni_mins[linear] = min_fp16;
+                        continue;
+                    }
+
+                    case TensorType::IQ1_M:
+                    {
+                        // IQ1_M: 11-bit grid index → iq1s_grid[2048], dual-scale + embedded delta
+                        // Payload: [qs×4][qh×2][delta_lo_fp16][delta_hi_fp16] = 10 bytes
+                        const int super_blocks_per_row = K / 256;
+                        const int sb_idx = b / 8;
+                        const int sub_idx = b % 8;
+                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
+                        const auto *blk = reinterpret_cast<const IQ1_MBlock *>(
+                            raw_bytes + abs_sb * sizeof(IQ1_MBlock));
+
+                        const uint8_t *qs = blk->qs + sub_idx * 4;
+                        const uint8_t *qh = blk->qh + sub_idx * 2;
+
+                        // Reconstruct global FP16 scale from packed high nibbles of scales[]
+                        const uint16_t *sc = reinterpret_cast<const uint16_t *>(blk->scales);
+                        const uint16_t scale_u16 = static_cast<uint16_t>(
+                            (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                            ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+                        const float d_val = fp16_to_fp32(scale_u16);
+
+                        // Per-sub-block dual scales from 3-bit selectors in sc[] words
+                        const int sc_word_idx = sub_idx / 2;
+                        const int sc_bit_offset = 6 * (sub_idx % 2);
+                        const int sc3_lo = (sc[sc_word_idx] >> (sc_bit_offset + 0)) & 0x7;
+                        const int sc3_hi = (sc[sc_word_idx] >> (sc_bit_offset + 3)) & 0x7;
+                        const float dl1 = d_val * (2.0f * static_cast<float>(sc3_lo) + 1.0f);
+                        const float dl2 = d_val * (2.0f * static_cast<float>(sc3_hi) + 1.0f);
+
+                        // Dual scales stored in scales[]/mins[] arrays
+                        scale_fp16 = fp32_to_fp16(dl1);
+                        min_fp16 = fp32_to_fp16(dl2);
+
+                        uint8_t payload_buf[10];
+                        payload_buf[0] = qs[0];
+                        payload_buf[1] = qs[1];
+                        payload_buf[2] = qs[2];
+                        payload_buf[3] = qs[3];
+                        payload_buf[4] = qh[0];
+                        payload_buf[5] = qh[1];
+
+                        // Compute averaged delta corrections per dual-scale half and embed as FP16
+                        // Lo half (groups 0,1): delta signs from qh[0] bits 3,7
+                        // Hi half (groups 2,3): delta signs from qh[1] bits 3,7
+                        constexpr float IQ1S_DELTA = 0.125f;
+                        const bool d0_neg = (qh[0] & 0x08) != 0;
+                        const bool d1_neg = (qh[0] & 0x80) != 0;
+                        const bool d2_neg = (qh[1] & 0x08) != 0;
+                        const bool d3_neg = (qh[1] & 0x80) != 0;
+
+                        // Average delta within each half: exact when signs match, 0 when different
+                        const float delta_lo = IQ1S_DELTA * 0.5f *
+                                               (static_cast<float>(d0_neg ? -1 : 1) + static_cast<float>(d1_neg ? -1 : 1));
+                        const float delta_hi = IQ1S_DELTA * 0.5f *
+                                               (static_cast<float>(d2_neg ? -1 : 1) + static_cast<float>(d3_neg ? -1 : 1));
+
+                        const uint16_t delta_lo_fp16 = fp32_to_fp16(dl1 * delta_lo);
+                        const uint16_t delta_hi_fp16 = fp32_to_fp16(dl2 * delta_hi);
+                        std::memcpy(payload_buf + 6, &delta_lo_fp16, 2);
+                        std::memcpy(payload_buf + 8, &delta_hi_fp16, 2);
+
+                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
+                        std::memcpy(dst, payload_buf, 10);
+                        out.native_vnni_scales[linear] = scale_fp16;
+                        out.native_vnni_mins[linear] = min_fp16;
+                        continue;
+                    }
+
+                    case TensorType::Q4_1:
+                    {
+                        const auto *blk = reinterpret_cast<const Q4_1Block *>(
+                            raw_bytes + block_idx * sizeof(Q4_1Block));
+                        payload_src = blk->qs;
+                        scale_fp16 = blk->d;
+                        min_fp16 = blk->m;
+                        break;
+                    }
+                    case TensorType::Q5_0:
+                    {
+                        const auto *blk = reinterpret_cast<const Q5_0Block *>(
+                            raw_bytes + block_idx * sizeof(Q5_0Block));
+                        payload_src = blk->qs;
+                        qh_src = blk->qh;
+                        scale_fp16 = blk->d;
+                        break;
+                    }
+                    case TensorType::Q5_1:
+                    {
+                        const auto *blk = reinterpret_cast<const Q5_1Block *>(
+                            raw_bytes + block_idx * sizeof(Q5_1Block));
+                        payload_src = blk->qs;
+                        qh_src = blk->qh;
+                        scale_fp16 = blk->d;
+                        min_fp16 = blk->m;
+                        break;
+                    }
+                    default:
+                        LOG_ERROR("[packNativeVNNI] Unexpected type in block loop");
                         return false;
                     }
 
-                    const uint8_t *payload_src = nullptr;
-                    uint16_t scale_fp16 = 0;
+                    // Copy payload: qs[16] for 4-bit, qs[16]+qh[4] for 5-bit
+                    uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
+                    std::memcpy(dst, payload_src, 16);
+                    if (qh_src)
+                        std::memcpy(dst + 16, qh_src, 4);
 
-                    if (wt == TensorType::Q4_0)
-                    {
-                        const auto *blk = static_cast<const Q4_0Block *>(raw_block);
-                        payload_src = blk->qs;
-                        scale_fp16 = blk->d;
-                    }
-                    else // IQ4_NL
-                    {
-                        const auto *blk = static_cast<const IQ4_NLBlock *>(raw_block);
-                        payload_src = blk->qs;
-                        scale_fp16 = blk->d;
-                    }
-
-                    // Interleave by N: block (b, n) stored at linear index b*N + n
-                    const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
-                    std::memcpy(out.native_vnni_payload.data() + linear * payload_bytes,
-                                payload_src, payload_bytes);
                     out.native_vnni_scales[linear] = scale_fp16;
+                    if (is_asymmetric)
+                        out.native_vnni_mins[linear] = min_fp16;
                 }
             }
 
             LOG_DEBUG("[packNativeVNNI] Built native-VNNI container for " << N << "x" << K
                                                                           << " (codebook=" << static_cast<int>(out.native_vnni_codebook_id) << ")"
                                                                           << " payload=" << (out.native_vnni_payload.size() / 1024) << " KB"
-                                                                          << " scales=" << (out.native_vnni_scales.size() * 2 / 1024) << " KB");
+                                                                          << " scales=" << (out.native_vnni_scales.size() * 2 / 1024) << " KB"
+                                                                          << (is_asymmetric ? (" mins=" + std::to_string(out.native_vnni_mins.size() * 2 / 1024) + " KB") : ""));
             return true;
         }
 
@@ -1502,7 +2400,7 @@ namespace llaminar2
             out.K = K;
             out.N = N;
 
-            // Native-VNNI path: Q4_0 and IQ4_NL get lossless native-VNNI packing.
+            // Native-VNNI path: Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL get lossless native-VNNI packing.
             // This runs in addition to (not instead of) other paths during transition.
             if (packNativeVNNI(tensor, out))
             {
@@ -2531,8 +3429,10 @@ namespace llaminar2
                                 impl_->d_A_int8,
                                 impl_->d_weights_native_payload,
                                 impl_->d_weights_native_scales,
+                                impl_->d_weights_native_mins,
                                 d_gemv_output,
                                 impl_->d_scales_A,
+                                impl_->d_scatter_partial,
                                 n, k,
                                 impl_->native_vnni_codebook_id,
                                 rocm_device_id_, gpu_stream_))
@@ -3851,8 +4751,10 @@ namespace llaminar2
                                 impl_->d_A_int8,
                                 rocm_kernel->impl_->d_weights_native_payload,
                                 rocm_kernel->impl_->d_weights_native_scales,
+                                rocm_kernel->impl_->d_weights_native_mins,
                                 d_output,
                                 impl_->d_scales_A,
+                                impl_->d_scatter_partial,
                                 n, k,
                                 rocm_kernel->impl_->native_vnni_codebook_id,
                                 rocm_device_id_, gpu_stream_))
@@ -4465,7 +5367,7 @@ namespace llaminar2
                         // a persistent row-major copy per weight would double GPU
                         // memory usage (VNNI + row-major) and OOM on large models.
 
-                        // Upload native-VNNI payload + scales (lossless Q4_0/IQ4_NL)
+                        // Upload native-VNNI payload + scales + mins (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL)
                         if (!packed_->native_vnni_payload.empty() && !packed_->native_vnni_scales.empty())
                         {
                             // Allocate payload buffer
@@ -4539,6 +5441,49 @@ namespace llaminar2
                                 LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded native-VNNI payload="
                                           << (packed_->native_vnni_payload.size() / 1024) << " KB scales="
                                           << (packed_->native_vnni_scales.size() * 2 / 1024) << " KB");
+                            }
+
+                            // Allocate FP16 mins buffer (asymmetric formats: Q4_1, Q5_1)
+                            if (upload.d_native_vnni_payload && !packed_->native_vnni_mins.empty())
+                            {
+                                const size_t mins_bytes = packed_->native_vnni_mins.size() * sizeof(uint16_t);
+                                void *d_mins_tmp = nullptr;
+#ifdef HAVE_ROCM
+                                hipError_t alloc_err = hipMalloc(&d_mins_tmp, mins_bytes);
+                                if (alloc_err != hipSuccess)
+                                {
+                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI mins: "
+                                              << hipGetErrorString(alloc_err));
+                                    d_mins_tmp = nullptr;
+                                }
+#endif
+                                upload.d_native_vnni_mins = d_mins_tmp;
+                                if (d_mins_tmp)
+                                {
+                                    err = startupMemcpyAsyncOrSync(
+                                        d_mins_tmp,
+                                        packed_->native_vnni_mins.data(),
+                                        mins_bytes,
+                                        async_upload_enabled,
+                                        upload.startup_h2d_stream,
+                                        &upload.startup_h2d_pinned_native_mins,
+                                        "ROCmQuantisedGemmKernel::ensureWeightsConverted",
+                                        "native_vnni_mins");
+                                    if (err != hipSuccess)
+                                    {
+#ifdef HAVE_ROCM
+                                        hipFree(d_mins_tmp);
+#endif
+                                        upload.d_native_vnni_mins = nullptr;
+                                        LOG_WARN("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI mins: "
+                                                 << hipGetErrorString(err));
+                                    }
+                                    else
+                                    {
+                                        LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded native-VNNI mins="
+                                                  << (mins_bytes / 1024) << " KB");
+                                    }
+                                }
                             }
                         }
 
@@ -4614,6 +5559,7 @@ namespace llaminar2
                     packed_->d_scales = upload.d_scales;
                     packed_->d_native_vnni_payload = upload.d_native_vnni_payload;
                     packed_->d_native_vnni_scales = upload.d_native_vnni_scales;
+                    packed_->d_native_vnni_mins = upload.d_native_vnni_mins;
                     packed_->startup_repack_ready_event = upload.startup_repack_ready_event;
                     packed_->startup_repack_event_pending = upload.startup_repack_event_pending;
                     packed_->startup_commit_ready_event = upload.startup_commit_ready_event;
@@ -4627,6 +5573,7 @@ namespace llaminar2
                     impl_->d_scales_B = upload.d_scales;
                     impl_->d_weights_native_payload = upload.d_native_vnni_payload;
                     impl_->d_weights_native_scales = upload.d_native_vnni_scales;
+                    impl_->d_weights_native_mins = upload.d_native_vnni_mins;
                     impl_->native_vnni_codebook_id = packed_->native_vnni_codebook_id;
                     impl_->native_vnni_blocks_per_row = packed_->native_vnni_blocks_per_row;
                     impl_->has_native_vnni = (upload.d_native_vnni_payload != nullptr && upload.d_native_vnni_scales != nullptr);
@@ -4638,6 +5585,7 @@ namespace llaminar2
                     impl_->startup_h2d_pinned_vnni = upload.startup_h2d_pinned_vnni;
                     impl_->startup_h2d_pinned_native_payload = upload.startup_h2d_pinned_native_payload;
                     impl_->startup_h2d_pinned_native_scales = upload.startup_h2d_pinned_native_scales;
+                    impl_->startup_h2d_pinned_native_mins = upload.startup_h2d_pinned_native_mins;
                 }
                 weights_converted_ = true;
 
@@ -4653,7 +5601,8 @@ namespace llaminar2
                         packed_->int8_data_vnni.capacity() +
                         packed_->scales.capacity() * sizeof(float) +
                         packed_->native_vnni_payload.capacity() +
-                        packed_->native_vnni_scales.capacity() * sizeof(uint16_t);
+                        packed_->native_vnni_scales.capacity() * sizeof(uint16_t) +
+                        packed_->native_vnni_mins.capacity() * sizeof(uint16_t);
                     packed_->int8_data.clear();
                     packed_->int8_data.shrink_to_fit();
                     packed_->int8_data_vnni.clear();
@@ -4664,6 +5613,8 @@ namespace llaminar2
                     packed_->native_vnni_payload.shrink_to_fit();
                     packed_->native_vnni_scales.clear();
                     packed_->native_vnni_scales.shrink_to_fit();
+                    packed_->native_vnni_mins.clear();
+                    packed_->native_vnni_mins.shrink_to_fit();
                     if (freed_bytes > 0)
                     {
                         LOG_DEBUG("[ROCmQuantisedGemmKernel] Released host packing buffers: "
@@ -4918,8 +5869,10 @@ namespace llaminar2
                                 impl_->d_A_int8,
                                 impl_->d_weights_native_payload,
                                 impl_->d_weights_native_scales,
+                                impl_->d_weights_native_mins,
                                 d_C,
                                 impl_->d_scales_A,
+                                impl_->d_scatter_partial,
                                 n, k,
                                 impl_->native_vnni_codebook_id,
                                 rocm_device_id_, gpu_stream_))
@@ -5108,8 +6061,10 @@ namespace llaminar2
                                 impl_->d_A_int8,
                                 impl_->d_weights_native_payload,
                                 impl_->d_weights_native_scales,
+                                impl_->d_weights_native_mins,
                                 d_C,
                                 impl_->d_scales_A,
+                                impl_->d_scatter_partial,
                                 n, k,
                                 impl_->native_vnni_codebook_id,
                                 rocm_device_id_, gpu_stream_))
