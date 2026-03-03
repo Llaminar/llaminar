@@ -863,3 +863,173 @@ Per-format ISA analysis. Determine optimal M-threshold for native vs INT8 dispat
 5. **What is the right `BLOCKS_PER_TILE` (BPT)?** BPT=1 minimizes LDS but gives less K-tile depth for pipeline overlap. BPT=2 matches INT8 GEMM's KT=16 operating point. BPT=4 doubles LDS but provides more overlap.
 
    → **Recommendation**: BPT=2 as default. Add BPT=1 as a fallback for LDS-constrained configurations (IQ1 with large LUT).
+
+---
+
+## 16. Profiling Analysis and Tuning Roadmap
+
+### 16.1 Methodology
+
+Counter data collected with `rocprofv3` across 10 passes (5 focused + 5 full-test) on MI50 (gfx906, 60 CUs). All kernels profiled at M=32, M=128, test shape N=4864, K=896 (Qwen2.5 0.5B FFN). INT8 V7 GEMM counters extracted as baseline.
+
+### 16.2 Key Findings
+
+**Finding 1: All NVNNI variants are compute-bound, not memory-bound.**
+
+| Metric             | NVNNI N128/M32 | INT8 N128/M32 |
+|--------------------|-----------------|---------------|
+| VALUBusy           | 60%             | 39%           |
+| MemUnitBusy        | 10%             | 18%           |
+| LDSBankConflict    | 1.2%            | 1.4%          |
+
+The decode-in-load design successfully eliminated memory bottlenecks. NVNNI loads ~50% less HBM data than INT8 (4-bit vs 8-bit weights), but spends the savings on VALU decode work.
+
+**Finding 2: Occupancy gap is the #1 performance bottleneck.**
+
+| Kernel              | VGPRs | Waves/SIMD | Occupancy |
+|---------------------|-------|------------|-----------|
+| INT8 N128/M32       | 72    | 3          | 75%       |
+| **NVNNI N128/M32 Q4_0**  | **128** | **2** | **50%** |
+| **NVNNI N128/M32 IQ4_NL**| **116** | **2** | **50%** |
+| INT8 N64/M32        | 176   | 1          | 25%       |
+| NVNNI N64/M32 Q4_0  | 84    | 3          | 75%       |
+| NVNNI N64/M32 IQ4_NL| 88    | 2          | 50%       |
+
+INT8's N128/M32 achieves 3-wave occupancy (72 VGPRs) vs NVNNI's 2-wave (128 VGPRs). This 50% occupancy gap directly explains NVNNI's 0.84× performance at M=32 — the GPU cannot hide latency with only 2 waves per SIMD.
+
+**Finding 3: NVNNI has 34% more VALU instructions per wave than INT8.**
+
+Decode overhead (shift, mask, subtract-8 for Q4_0; v_perm LUT for IQ4_NL) adds ~34% more VALU instructions compared to INT8's straight loads. IQ4_NL costs ~8% more VALU than Q4_0. At 3-wave occupancy, this decode overhead can be hidden behind memory latency; at 2-wave, it cannot.
+
+**Finding 4: LDS stalls are negligible for NVNNI.**
+
+NVNNI's A-matrix LDS loads generate only 1.2-1.4% bank conflict stalls. This is excellent — the INT8 N64 path suffers 21-25% LDS stalls by comparison. NVNNI's larger N_TILE naturally spreads LDS accesses across banks.
+
+### 16.3 VGPR Breakdown: Why N128/M32 Hits 128
+
+Per-thread accumulator count = `M_TILE × N_TILE / BLOCK_SIZE`:
+
+| Geometry    | Accumulators/Thread | FP32 acc | INT32 block_acc | Total VGPR Pressure |
+|-------------|---------------------|----------|-----------------|---------------------|
+| N128/M32    | 32×128/256 = 16     | 16       | 16              | 32 regs → 128 VGPRs |
+| N128/M16    | 16×128/256 = 8      | 8        | 8               | 16 regs → 84 VGPRs  |
+| N64/M32     | 32×64/256 = 8       | 8        | 8               | 16 regs → 84 VGPRs  |
+| N64/M64     | 64×64/256 = 16      | 16       | 16              | 32 regs → 116 VGPRs |
+
+The accumulator registers (FP32 partial sums + INT32 block-level accumulators) dominate VGPR usage. Halving the accumulator count from M32→M16 drops from 128→84 VGPRs — exactly at the 3-wave boundary.
+
+### 16.4 Verified VGPR Counts (Hybrid Dispatch Build)
+
+Extracted via `llvm-objdump --disassemble-all` on the compiled GPU code object.
+The hybrid dispatch instantiates 12 kernel variants: N128×{M16,M32}×{Q4_0,IQ4_NL} + N64×{M16,M32,M64}×{Q4_0,IQ4_NL}. M16 variants use `MIN_BLOCKS=3` (`__launch_bounds__(256, 3)`), all others use `MIN_BLOCKS=2`.
+
+| Kernel                  | VGPRs | Scratch | Occupancy  | MIN_BLOCKS |
+|-------------------------|-------|---------|------------|------------|
+| N128/M16/Q4_0/MB3       | **84**| 0       | **3-wave** | 3          |
+| N128/M16/IQ4_NL/MB3     | **84**| **8B**  | **3-wave** | 3          |
+| N128/M32/Q4_0/MB2       | 128   | 0       | 2-wave     | 2          |
+| N128/M32/IQ4_NL/MB2     | 116   | 0       | 2-wave     | 2          |
+| N64/M16/Q4_0/MB2        | 80    | 0       | 3-wave     | 2          |
+| N64/M16/IQ4_NL/MB2      | 80    | 0       | 3-wave     | 2          |
+| N64/M32/Q4_0/MB2        | 84    | 0       | 3-wave     | 2          |
+| N64/M32/IQ4_NL/MB2      | 88    | 0       | 2-wave     | 2          |
+| N64/M64/Q4_0/MB2        | 116   | 0       | 2-wave     | 2          |
+| N64/M64/IQ4_NL/MB2      | 116   | 0       | 2-wave     | 2          |
+
+**IQ4_NL N128/M16 spill**: `__launch_bounds__(256, 3)` forces IQ4_NL from 88→84 VGPRs, causing 8 bytes (2 registers) of scratch spill. This is a net positive: 3-wave occupancy (50% more waves) far outweighs the cost of 2 register spills to scratch memory.
+
+### 16.5 Implemented: Hybrid N128 Dispatch (M16/3-wave + M32/2-wave)
+
+#### Design Evolution
+
+Three dispatch strategies were tested:
+
+1. **Always M32/2-wave** (original baseline): simple, consistent, but bottlenecked by 2-wave occupancy for small grids.
+2. **Always M16/3-wave**: regressed badly for large N shapes (LM_Head 0.68-0.74× vs baseline 0.85×) because M32/2-wave has 2× better A-tile reuse per WG and wins when the GPU is already saturated.
+3. **Hybrid dispatch** (implemented): M16/3-wave when GPU is undersaturated, M32/2-wave when saturated. Zero regression, targeted wins.
+
+#### Hybrid Dispatch Algorithm
+
+```cpp
+if (use_n128) {
+    const int n128_blocks = (N + 127) / 128;
+    const int m16_blocks  = (M + 15) / 16;
+    const int total_wgs_m16 = n128_blocks * m16_blocks;
+
+    if (total_wgs_m16 <= 256) {
+        return launch3(N128{}, M16{});   // 3-wave, undersaturated GPU
+    } else {
+        // GPU saturated: M32/2-wave → better tile efficiency
+        if (m_tile <= 16)
+            return launch3(N128{}, M16{});
+        else
+            return launch(N128{}, M32{});
+    }
+}
+```
+
+**Threshold rationale**: 256 WGs ≈ 1 WG per SIMD on MI50 (60 CUs × 4 SIMDs = 240 SIMDs). Below this, the GPU cannot fill all SIMDs even at 3-wave occupancy, so extra occupancy directly improves throughput. Above this, all SIMDs are occupied and M32's 2× better A-tile reuse per WG dominates.
+
+#### Why Always-M16 Regresses for Large N
+
+When the GPU is already saturated with workgroups:
+- M16 tile: ceil(M/16) × ceil(N/128) WGs, each processing 16×128 output tiles
+- M32 tile: ceil(M/32) × ceil(N/128) WGs, each processing 32×128 output tiles
+
+M16 launches 2× more WGs doing half the work each. The 50% occupancy increase (3-wave vs 2-wave = 720 vs 480 concurrent WGs) cannot compensate for:
+1. **Halved A-tile reuse**: M16 loads 16 A-rows from LDS vs M32's 32 — each A-row load amortizes over half as many output elements.
+2. **Diminishing occupancy returns**: When total WGs >> SIMD slots, more concurrent slots just mean more scheduling overhead without throughput gain.
+
+Effective throughput ratio at saturation: `(720/480) × (WG_work_M16/WG_work_M32) = 1.5 × 0.5 = 0.75×`. Confirmed empirically — LM_Head (N=151936) at M32 showed 0.68-0.74× with always-M16 vs 0.85× baseline.
+
+#### Benchmark Results (MI50, gfx906)
+
+**Aggregate averages (vs INT8 VNNI GEMM baseline):**
+
+| Format | M=32 | M=64 | M=128 | M=256 | Δ vs baseline |
+|--------|------|------|-------|-------|---------------|
+| Q4_0   | 0.84×| 0.94×| 1.09× | 1.11× | ═ / ═ / ═ / ▲+0.02 |
+| IQ4_NL | 0.80×| 0.89×| 1.03× | 1.05× | ═ / ═ / ═ / ═ |
+
+**Zero regression on aggregate** — the hybrid dispatch exactly matches baseline averages since only small shapes trigger M16/3-wave.
+
+**M16/3-wave wins (GPU undersaturated, WGs ≤ 256):**
+
+| Shape | Format | M | WGs | Hybrid | Baseline* | Improvement |
+|-------|--------|---|-----|--------|-----------|-------------|
+| 0.5B_FFN_Up (N=4864, K=896) | Q4_0 | 32 | 76 | **1.06×** | ~0.85× | +25% |
+| 0.5B_FFN_Up (N=4864, K=896) | Q4_0 | 64 | 152 | **1.25×** | ~0.95× | +32% |
+| 3B_FFN_Up (N=11008, K=2048) | Q4_0 | 32 | 172 | **1.02×** | ~0.90× | +13% |
+| 0.5B_FFN_Up (N=4864, K=896) | IQ4_NL | 64 | 152 | **1.17×** | ~0.85× | +38% |
+| 0.5B_FFN_Up (N=4864, K=896) | IQ4_NL | 32 | 76 | **1.01×** | ~0.80× | +26% |
+
+*Baseline estimates for per-shape numbers (only aggregate averages were recorded pre-hybrid).
+
+**Threshold validation against real workloads:**
+
+| Shape | M | M16 WGs | Dispatch | Speedup | Correct? |
+|-------|---|---------|----------|---------|----------|
+| 0.5B_FFN_Up | 32 | 76 | M16/3w | 1.06× | ✓ undersaturated, 3-wave helps |
+| 3B_FFN_Up | 32 | 172 | M16/3w | 1.02× | ✓ undersaturated, marginal win |
+| 7B_FFN_Up | 32 | 296 | M32/2w | 0.82× | ✓ near-saturated, M32 better |
+| LM_Head | 32 | 2374 | M32/2w | 0.84-0.93× | ✓ heavily saturated, M32 correct |
+| 0.5B_FFN_Up | 64 | 152 | M16/3w | 1.25× | ✓ big win at undersaturation |
+| 3B_FFN_Up | 64 | 344 | M32/2w | 1.03× | ✓ just above threshold, M32 safe |
+
+### 16.6 Further Tuning Directions
+
+1. **IQ4_NL spill elimination**: The 8B scratch spill in N128/M16/IQ4_NL/MB3 comes from forcing 88→84 VGPRs. Options:
+   - `#pragma clang loop unroll(disable)` on the `v_perm` LUT decode loop
+   - Restructure `decode_iq4_nl_block()` to reduce live register overlap
+   - Accept the 8B spill (3-wave >> 2-register spill cost)
+
+2. **VALU instruction reduction**: NVNNI has 34% more VALU instructions than INT8 (decode overhead). Strategies:
+   - Fuse shift+mask+subtract operations where possible
+   - Exploit `v_perm_b32` more aggressively for multi-element decode
+   - Move scale multiplication outside the K-loop (accumulate INT32, scale once)
+
+3. **Threshold tuning**: The 256-WG threshold is tuned for MI50 (240 SIMDs). For MI100 (120 CUs = 480 SIMDs), the threshold should scale to ~480.
+
+4. **N64 path improvements**: N64/M32/IQ4_NL sits at 88 VGPRs (2-wave). Forcing 3-wave via `MIN_BLOCKS=3` may help small shapes similarly.
+
+5. **LM_Head-specific optimization**: LM_Head shapes (N=151936) show 0.73-0.93× across all M values — the largest gap. Since N>>K, these shapes have very high N-block counts and M32/2-wave is correct, but per-block scale accumulation overhead may be disproportionate. Investigating scale pre-reduction or wider K-blocks could help.

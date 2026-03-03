@@ -184,8 +184,8 @@ __device__ __forceinline__ void decode_block(
 // Output: FP32 with scale_A applied inline. No separate epilogue needed.
 // ============================================================================
 
-template <int N_TILE, int BPT, int M_TILE, NativeVNNIGemmFormat FMT>
-__global__ __launch_bounds__(256, 2)
+template <int N_TILE, int BPT, int M_TILE, NativeVNNIGemmFormat FMT, int MIN_BLOCKS = 2>
+__global__ __launch_bounds__(256, MIN_BLOCKS)
 void native_vnni_gemm_kernel(
     const int8_t*    __restrict__ d_A_int8,       // [M × K] INT8 activations, row-major
     const uint8_t*   __restrict__ d_payload,      // [blocks_per_row × N × 16] native-VNNI payload
@@ -796,7 +796,7 @@ static bool launch_native_vnni_gemm(
 
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
 
-    // Templated launch helper
+    // Templated launch helper (default 2-wave)
     auto launch = [&](auto n_tile_tag, auto m_tile_tag) -> bool
     {
         constexpr int NT = decltype(n_tile_tag)::value;
@@ -805,6 +805,22 @@ static bool launch_native_vnni_gemm(
         dim3 block(BLOCK_SIZE, 1, 1);
 
         native_vnni_gemm_kernel<NT, BPT, MT, FMT>
+            <<<grid, block, 0, hip_stream>>>(
+                d_A_int8, d_payload, d_block_scales,
+                d_output, d_scales_A, M, N, K);
+
+        return hipGetLastError() == hipSuccess;
+    };
+
+    // 3-wave variant: MIN_BLOCKS=3 tells compiler to target ≤84 VGPRs
+    auto launch3 = [&](auto n_tile_tag, auto m_tile_tag) -> bool
+    {
+        constexpr int NT = decltype(n_tile_tag)::value;
+        constexpr int MT = decltype(m_tile_tag)::value;
+        dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1);
+        dim3 block(BLOCK_SIZE, 1, 1);
+
+        native_vnni_gemm_kernel<NT, BPT, MT, FMT, 3>
             <<<grid, block, 0, hip_stream>>>(
                 d_A_int8, d_payload, d_block_scales,
                 d_output, d_scales_A, M, N, K);
@@ -830,14 +846,21 @@ static bool launch_native_vnni_gemm(
 
     // N_TILE selection: N-heavy → N128 (wider coverage), K-heavy → N64 (deeper K)
     //
-    // N128/M64 is NOT used because it hits the 128-VGPR cap from
-    // __launch_bounds__(256, 2) and spills ~40-46 VGPRs to scratch.
-    // Instead, N128 caps at M_TILE=32 (112-114 VGPRs, 0 spills).
-    // This doubles the M-grid dimension but halves the N-grid and gets
-    // 100% B-load thread utilization (vs 50% at N64).
+    // N128 dispatch uses a HYBRID tile strategy:
+    //   - M16 tiles with 3-wave occupancy (84 VGPRs) when GPU is undersaturated
+    //   - M32 tiles with 2-wave occupancy (128 VGPRs) when GPU is saturated
+    //
+    // M16/3-wave halves accumulators (16→8/thread) for 50% more waves/SIMD.
+    // This wins when total WG count is small (GPU can't fill all SIMDs at
+    // 2-wave). For large grids, M32/2-wave has 2× better A-tile reuse per
+    // WG and dominates once all SIMDs are already occupied.
+    //
+    // Threshold: total M16 WGs ≤ 256 (~1 WG/SIMD on MI50/60: 60 CUs × 4).
+    // Below this, 3-wave occupancy provides the biggest speedup over INT8.
+    // Above this, M32 tile efficiency wins despite lower occupancy.
     const bool use_n128 = (N > K);
 
-    // Dispatch macro for the (N_TILE, M_TILE) combination
+    // Dispatch tags for (N_TILE, M_TILE) combinations
     using N64  = std::integral_constant<int, 64>;
     using N128 = std::integral_constant<int, 128>;
     using M16  = std::integral_constant<int, 16>;
@@ -845,11 +868,21 @@ static bool launch_native_vnni_gemm(
     using M64  = std::integral_constant<int, 64>;
 
     if (use_n128) {
-        // N128 caps M_TILE at 32 to avoid VGPR spills
-        const int m_tile_n128 = (m_tile <= 16) ? 16 : 32;
-        switch (m_tile_n128) {
-            case 16:  return launch(N128{}, M16{});
-            default:  return launch(N128{}, M32{});
+        // Hybrid N128 dispatch: M16/3-wave for small grids, M32/2-wave for large
+        const int n128_blocks = (N + 127) / 128;
+        const int m16_blocks  = (M + 15) / 16;
+        const int total_wgs_m16 = n128_blocks * m16_blocks;
+
+        if (total_wgs_m16 <= 256) {
+            // GPU undersaturated: M16/3-wave → more waves hide latency
+            return launch3(N128{}, M16{});
+        } else {
+            // GPU saturated: M32/2-wave → better tile efficiency
+            const int m_tile_n128 = (m_tile <= 16) ? 16 : 32;
+            if (m_tile_n128 <= 16)
+                return launch3(N128{}, M16{});
+            else
+                return launch(N128{}, M32{});
         }
     } else {
         switch (m_tile) {
