@@ -8059,6 +8059,27 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added Native-VNNI throughput benchmark (16 formats)")
 
+    # Performance Test: Native-VNNI GEMM (Q4_0 + IQ4_NL, M>1 prefill)
+    # Benchmarks native-VNNI GEMM kernel against INT8 V3/V7 baseline.
+    # Reports speedup, correctness (cosine similarity), and GFLOPS.
+    add_executable(v2_perf_native_vnni_gemm
+        performance/kernels/rocm/Perf__NativeVNNI_GEMM.cpp
+    )
+    target_link_libraries(v2_perf_native_vnni_gemm
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+        OpenMP::OpenMP_CXX
+    )
+    target_compile_options(v2_perf_native_vnni_gemm PRIVATE -fopenmp)
+    target_link_options(v2_perf_native_vnni_gemm PRIVATE -fopenmp)
+    add_v2_test(V2_Perf_NativeVNNI_GEMM
+        COMMAND $<TARGET_FILE:v2_perf_native_vnni_gemm>
+        LABELS "V2;Performance;ROCm;GEMM;NativeVNNI;Quantized;gfx906;Benchmark;Prefill"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added Native-VNNI GEMM benchmark (Q4_0 + IQ4_NL)")
+
     # Performance Microbenchmark: IQ Decode Strategy Lab
     # Isolated decode-only benchmark for IQ grid-index quantization formats.
     # Tests multiple decode strategies (baseline, vsub4, LDS cache, ksigns64)

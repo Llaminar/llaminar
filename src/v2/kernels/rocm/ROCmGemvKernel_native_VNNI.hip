@@ -697,6 +697,9 @@ __global__ void gemv_native_vnni_kernel_t(
                         constexpr uint32_t MUX_IDENTITY = 0x03020100u;  // byte-identity permutation
                         constexpr uint32_t MUX_BIT3_MASK = 0x04040404u; // bit3 → +4 offset per byte
 
+                        // NOTE: __builtin_amdgcn_perm(a, b, sel) on HIP/ROCm maps sel 0-3 → b,
+                        // sel 4-7 → a. We pass (B, A) so sel 0-3 picks from A, sel 4-7 from B.
+                        // Mux perm uses (r_hi, r_lo) so bit3=0 → r_lo, bit3=1 → r_hi.
                         #pragma unroll
                         for (int g = 0; g < 4; ++g)
                         {
@@ -706,21 +709,20 @@ __global__ void gemv_native_vnni_kernel_t(
                             const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
                             {
                                 const uint32_t sel = lo_nibs & 0x07070707u;
-                                const uint32_t r_lo = __builtin_amdgcn_perm(CB_LO_A, CB_LO_B, sel);
-                                const uint32_t r_hi = __builtin_amdgcn_perm(CB_HI_A, CB_HI_B, sel);
-                                // Byte-wise mux via v_perm: sel[i] = i (r_lo) or i+4 (r_hi)
+                                const uint32_t r_lo = __builtin_amdgcn_perm(CB_LO_B, CB_LO_A, sel);
+                                const uint32_t r_hi = __builtin_amdgcn_perm(CB_HI_B, CB_HI_A, sel);
                                 const uint32_t mux = MUX_IDENTITY | ((lo_nibs >> 1) & MUX_BIT3_MASK);
-                                packed_groups[g] = static_cast<int32_t>(__builtin_amdgcn_perm(r_lo, r_hi, mux));
+                                packed_groups[g] = static_cast<int32_t>(__builtin_amdgcn_perm(r_hi, r_lo, mux));
                             }
 
                             // --- High nibbles (elements [4g+16..4g+19]) ---
                             const uint32_t hi_nibs = (raw >> 4) & 0x0F0F0F0Fu;
                             {
                                 const uint32_t sel = hi_nibs & 0x07070707u;
-                                const uint32_t r_lo = __builtin_amdgcn_perm(CB_LO_A, CB_LO_B, sel);
-                                const uint32_t r_hi = __builtin_amdgcn_perm(CB_HI_A, CB_HI_B, sel);
+                                const uint32_t r_lo = __builtin_amdgcn_perm(CB_LO_B, CB_LO_A, sel);
+                                const uint32_t r_hi = __builtin_amdgcn_perm(CB_HI_B, CB_HI_A, sel);
                                 const uint32_t mux = MUX_IDENTITY | ((hi_nibs >> 1) & MUX_BIT3_MASK);
-                                packed_groups[g + 4] = static_cast<int32_t>(__builtin_amdgcn_perm(r_lo, r_hi, mux));
+                                packed_groups[g + 4] = static_cast<int32_t>(__builtin_amdgcn_perm(r_hi, r_lo, mux));
                             }
                         }
                     }
@@ -808,6 +810,7 @@ __global__ void gemv_native_vnni_kernel_t(
                         //
                         // 3-bit codebook: {-4,-3,-2,-1,0,1,2,3} = {0xFC,0xFD,0xFE,0xFF,0x00,0x01,0x02,0x03}
                         // Only 8 entries → single v_perm call (selector bits [2:0] = value)
+                        // NOTE: v_perm args reversed on HIP: pass (B,A) so sel 0-3 → A, sel 4-7 → B
                         constexpr uint32_t Q3_CB_A = 0xFFFEFDFCu;  // indices 0-3: {-4,-3,-2,-1}
                         constexpr uint32_t Q3_CB_B = 0x03020100u;  // indices 4-7: {0,1,2,3}
 
@@ -819,12 +822,12 @@ __global__ void gemv_native_vnni_kernel_t(
                             // Low nibbles → groups 0-3 (elements [4g..4g+3])
                             const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
                             packed_groups[g] = static_cast<int32_t>(
-                                __builtin_amdgcn_perm(Q3_CB_A, Q3_CB_B, lo_nibs));
+                                __builtin_amdgcn_perm(Q3_CB_B, Q3_CB_A, lo_nibs));
 
                             // High nibbles → groups 4-7 (elements [4g+16..4g+19])
                             const uint32_t hi_nibs = (raw >> 4) & 0x0F0F0F0Fu;
                             packed_groups[g + 4] = static_cast<int32_t>(
-                                __builtin_amdgcn_perm(Q3_CB_A, Q3_CB_B, hi_nibs));
+                                __builtin_amdgcn_perm(Q3_CB_B, Q3_CB_A, hi_nibs));
                         }
                     }
                     else if constexpr (Traits::is_2bit)

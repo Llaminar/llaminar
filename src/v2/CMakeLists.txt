@@ -494,6 +494,7 @@ if(HAVE_ROCM)
         kernels/rocm/ROCmGemvKernel.hip               # GEMV kernel suite documentation index (split into files below)
         kernels/rocm/ROCmGemvKernel_INT8_VNNI.hip    # INT8 VNNI GEMV/GEMM kernels for decode + prefill (gfx906)
         kernels/rocm/ROCmGemvKernel_native_VNNI.hip  # Native-VNNI 4-bit (Q4_0/IQ4_NL) GEMV kernels (gfx906)
+        kernels/rocm/ROCmGemmKernel_native_VNNI.hip  # Native-VNNI 4-bit (Q4_0/IQ4_NL) GEMM kernels for M>1 prefill (gfx906)
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
         kernels/rocm/kvcache/ROCmRingKVCacheKernels.hip       # Ring buffer KV cache kernels
         kernels/rocm/ops/ROCmSwiGLUKernels.hip               # SwiGLU kernels (FP32, BF16, FP16)

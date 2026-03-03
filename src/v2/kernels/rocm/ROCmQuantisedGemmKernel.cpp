@@ -344,6 +344,21 @@ namespace llaminar2
                 int N, int K,
                 int device_id, void *stream);
 
+            // Native-VNNI GEMM: lossless decode with FP16 per-block scales (M>1 prefill).
+            // Supports Q4_0 and IQ4_NL via codebook_id.
+            // Output is FP32 with scale_A applied inline — no separate epilogue needed.
+            // Halved HBM bandwidth vs INT8 GEMM (4.5 bpw vs 8 bpw for Q4_0/IQ4_NL).
+            // Defined in ROCmGemmKernel_native_VNNI.hip
+            bool rocmGemm_native_vnni_fp32(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const void *d_block_scales, // __half* (FP16 d)
+                float *d_output,
+                const float *d_scales_A,
+                int M, int N, int K,
+                uint8_t codebook_id,
+                int device_id, void *stream);
+
             // Native-VNNI GEMV: lossless decode with FP16 per-block scales.
             // Supports Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL via codebook_id.
             // Output is FP32 with scale_A applied inline — no epilogue kernel needed.
@@ -1870,10 +1885,7 @@ namespace llaminar2
                             for (int j = 0; j < 4; ++j)
                             {
                                 payload_buf[half * 4 + j] = static_cast<uint8_t>(
-                                    raw2[base + j]
-                                    | (raw2[base + j + 4] << 2)
-                                    | (raw2[base + j + 8] << 4)
-                                    | (raw2[base + j + 12] << 6));
+                                    raw2[base + j] | (raw2[base + j + 4] << 2) | (raw2[base + j + 8] << 4) | (raw2[base + j + 12] << 6));
                             }
                         }
 
@@ -3941,6 +3953,60 @@ namespace llaminar2
                                          : static_cast<const float *>(bias->gpu_data_ptr());
                 }
 
+                // Try native-VNNI GEMM first (halved HBM bandwidth for Q4_0/IQ4_NL)
+                // This path reads compact native-VNNI payloads (4.5 bpw) directly,
+                // decodes to INT8 in-register, and produces FP32 output with per-block
+                // FP16 scales applied inline — no separate scaling epilogue needed.
+                if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f && !d_prefill_bias)
+                {
+                    const uint8_t cb_id = impl_->native_vnni_codebook_id;
+                    if (cb_id == 0 || cb_id == 4)
+                    {
+                        if (rocmGemm_native_vnni_fp32(
+                                d_A_int8,
+                                impl_->d_weights_native_payload,
+                                impl_->d_weights_native_scales,
+                                d_prefill_output,
+                                d_scales_A,
+                                m, n, k,
+                                cb_id,
+                                rocm_device_id_, gpu_stream_))
+                        {
+                            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] "
+                                      "Native-VNNI GEMM succeeded (M="
+                                      << m << " N=" << n << " K=" << k
+                                      << " codebook=" << static_cast<int>(cb_id) << ")");
+
+                            // Handle mapped output redirect (same copy-out as INT8 path)
+                            if (!use_gpu_path || output_is_mapped)
+                            {
+                                const size_t nvnni_c_size = static_cast<size_t>(m) * n;
+                                if (output_is_mapped)
+                                {
+                                    float *host_dst = C_fp32->mutable_data();
+                                    hipMemcpyAsync(host_dst, d_prefill_output,
+                                                   nvnni_c_size * sizeof(float),
+                                                   hipMemcpyDeviceToHost,
+                                                   static_cast<hipStream_t>(gpu_stream_));
+                                    hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
+                                }
+                                else
+                                {
+                                    hipMemcpyAsync(d_output, d_prefill_output,
+                                                   nvnni_c_size * sizeof(float),
+                                                   hipMemcpyDeviceToDevice,
+                                                   static_cast<hipStream_t>(gpu_stream_));
+                                }
+                            }
+                            return true;
+                        }
+                        static std::once_flag nvnni_gemm_tensor_fallback;
+                        std::call_once(nvnni_gemm_tensor_fallback, [&]()
+                                       { LOG_WARN("[ROCmQuantisedGemmKernel::multiply_tensor] "
+                                                  "Native-VNNI GEMM failed; falling back to INT8 GEMM"); });
+                    }
+                }
+
                 if (tryPrefillNativeGemm(
                         d_A_int8,
                         d_prefill_output,
@@ -5988,6 +6054,40 @@ namespace llaminar2
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel] Activation quantization failed");
                 return false;
+            }
+
+            // Step 1b: Try native-VNNI GEMM (halved HBM bandwidth, no epilogue)
+            // This path reads the compact native-VNNI payload (4.5 bpw for Q4_0/IQ4_NL)
+            // directly, decodes to INT8 in-register, and produces FP32 output with
+            // per-block FP16 scales applied inline. No separate scaling epilogue needed.
+            if (m > 1 && impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
+            {
+                const uint8_t cb_id = impl_->native_vnni_codebook_id;
+                // Currently supports Q4_0 (0) and IQ4_NL (4)
+                if (cb_id == 0 || cb_id == 4)
+                {
+                    if (rocmGemm_native_vnni_fp32(
+                            impl_->d_A_int8,
+                            impl_->d_weights_native_payload,
+                            impl_->d_weights_native_scales,
+                            d_C,
+                            impl_->d_scales_A,
+                            m, n, k,
+                            cb_id,
+                            rocm_device_id_, gpu_stream_))
+                    {
+                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] "
+                                  "Native-VNNI GEMM succeeded (M="
+                                  << m << " N=" << n << " K=" << k
+                                  << " codebook=" << static_cast<int>(cb_id) << ")");
+                        return true;
+                    }
+                    // Fall through to INT8 GEMM if native-VNNI GEMM fails
+                    static std::once_flag nvnni_gemm_fallback_once;
+                    std::call_once(nvnni_gemm_fallback_once, [&]()
+                                   { LOG_WARN("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] "
+                                              "Native-VNNI GEMM failed; falling back to INT8 GEMM"); });
+                }
             }
 
             if (m > 1 && tryPrefillNativeGemm(
