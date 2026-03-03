@@ -148,7 +148,7 @@ struct NVNNITraits {
 // O4: SWAR multiply-based bit-to-byte expansion replaces per-bit BFE chain.
 //
 // Previous ISA: 4× v_bfe_i32 + 4× v_and + 3× v_lshl_or ≈ 15 VALU per call.
-// New ISA:      2× v_mul_lo + 1× v_and + 1× v_xor + 1× v_add ≈ 5 VALU per call.
+// New ISA:      1× v_mul_u24 + 1× v_and + 1× v_lshl + 1× v_sub + 1× v_xad ≈ 5 VALU (all 1-cyc).
 //
 // Math:
 //   spread = (sign_lo4 * 0x00204081) & 0x01010101
@@ -157,21 +157,27 @@ struct NVNNITraits {
 //     after masking.  No cross-byte carry because
 //     max(sign_lo4) = 15 and 15 * 0x00204081 = 0x01E3C78F (each byte < 256).
 //
-//   mask = spread * 255
-//     Expands 0x00→0x00, 0x01→0xFF per byte.  No cross-byte carry because
-//     max per byte is 1×255 = 255 < 256.
+//   mask = (spread << 8) - spread
+//     Expands 0x00→0x00, 0x01→0xFF per byte.  Algebraically equivalent to
+//     spread * 255, but compiles to v_lshlrev_b32 + v_sub_u32 (2× 1-cycle)
+//     instead of v_mul_lo_u32 (1× 4-cycle).  Cross-byte borrows are benign
+//     because each byte in spread is 0 or 1, so (shifted_byte - spread_byte)
+//     always produces 0x00 or 0xFF with exactly the carries needed by
+//     adjacent byte lanes.
 //
 //   Result: (grid4 ^ mask) + spread  is two's complement conditional negate.
 //     (carry = mask & 0x01010101 = spread, since mask bytes are 0x00 or 0xFF)
-//
-// BUG FIX: The original constant 0x08040201 (bits 0,9,18,27) only captured
-// bit 0 of sign_lo4 — bits 1,2,3 were always masked away.  The correct
-// constant is 0x00204081 (bits 0,7,14,21) which places each bit k in the
-// bit-0 position of byte k.
 __device__ inline uint32_t iq_apply_signs_4(uint32_t grid4, uint8_t sign_lo4)
 {
     uint32_t spread = (static_cast<uint32_t>(sign_lo4 & 0xFu) * 0x00204081u) & 0x01010101u;
-    uint32_t mask = spread * 255u;
+    // mask = (spread << 8) - spread  ≡  spread * 255
+    // Inline asm prevents the compiler from strength-reducing this back to
+    // v_mul_lo_u32 (4-cycle).  The shift+sub form uses v_lshlrev_b32 +
+    // v_sub_u32 (2× 1-cycle), eliminating 11 stall cycles per block.
+    uint32_t mask;
+    asm("v_lshlrev_b32 %0, 8, %1\n\t"
+        "v_sub_u32 %0, %0, %1"
+        : "=v"(mask) : "v"(spread));
     return (grid4 ^ mask) + spread;
 }
 
