@@ -293,22 +293,87 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                 constexpr int sign_off = n_qs + (Traits::has_qh ? 1 : 0);
                 const uint8_t qh_byte = Traits::has_qh ? payload[n_qs] : 0;
 
-                if constexpr (Traits::is_iq3_grid)
+                if constexpr (Traits::is_iq3_grid && !Traits::has_qh)
                 {
+                    // O5: Wide payload load for IQ3_XXS (12B = 3 dwords).
+                    //
+                    // The compiler generates 12× global_load_ubyte for 12 bytes
+                    // of payload when each byte feeds a separate dependency chain.
+                    // Manually loading as 3 dwords + extracting via shift+mask
+                    // replaces 12 VMEM with 3 VMEM + ~16 cheap 1-cycle VALU.
+                    //
+                    // ISA impact (IQ3_XXS LDS inner loop):
+                    //   Before: 12× global_load_ubyte + 1× global_load_ushort = 13 VMEM
+                    //   After:  3× global_load_dword  + 1× global_load_ushort =  4 VMEM
+                    //                                                           (−69%)
+                    //
+                    // Payload layout: [qs0..qs7][signs0..signs3] = 12 bytes
+                    // payload_bytes=12 is 4-byte aligned → dword loads are safe.
+                    const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
+                    const uint32_t w0 = pw[0];  // qs[0..3]
+                    const uint32_t w1 = pw[1];  // qs[4..7]
+                    const uint32_t w2 = pw[2];  // signs[0..3]
+
+                    #pragma unroll
+                    for (int g = 0; g < 8; ++g)
+                    {
+                        const uint32_t word = (g < 4) ? w0 : w1;
+                        const int idx = (word >> ((g & 3) * 8)) & 0xFF;
+                        const uint32_t grid4 = iq3_grid_read<FMT, USE_LDS>(idx, lds32);
+                        // sign byte g/2: byte (g/2) of w2.  Max g/2=3 → shift 24 OK.
+                        const uint8_t sb = static_cast<uint8_t>(w2 >> ((g / 2) * 8));
+                        const uint8_t sn = (g & 1) ? (sb >> 4) : (sb & 0xF);
+                        packed_groups[g] = static_cast<int32_t>(iq_apply_signs_4(grid4, sn));
+                    }
+                }
+                else if constexpr (Traits::is_iq3_grid && Traits::has_qh)
+                {
+                    // IQ3_S (13B): compiler already generates decent coalesced loads
+                    // (dwordx2 + ushort + ubyte).  Keep original byte access.
                     #pragma unroll
                     for (int g = 0; g < 8; ++g)
                     {
                         int idx = payload[g];
-                        if constexpr (Traits::has_qh)
-                            idx |= (static_cast<int>((qh_byte >> g) & 1) << 8);
+                        idx |= (static_cast<int>((qh_byte >> g) & 1) << 8);
                         const uint32_t grid4 = iq3_grid_read<FMT, USE_LDS>(idx, lds32);
                         const uint8_t sb = payload[sign_off + g / 2];
                         const uint8_t sn = (g & 1) ? (sb >> 4) : (sb & 0xF);
                         packed_groups[g] = static_cast<int32_t>(iq_apply_signs_4(grid4, sn));
                     }
                 }
-                else // is_iq2_grid
+                else if constexpr (Traits::is_iq2_grid && !Traits::has_qh)
                 {
+                    // O5: Wide payload load for IQ2_XXS (8B = 2 dwords).
+                    //
+                    // ISA impact (IQ2_XXS LDS inner loop):
+                    //   Before: 8× global_load_ubyte + 1× global_load_ushort = 9 VMEM
+                    //   After:  2× global_load_dword + 1× global_load_ushort = 3 VMEM
+                    //                                                         (−67%)
+                    //
+                    // Payload layout: [qs0..qs3][signs0..signs3] = 8 bytes
+                    // payload_bytes=8 is 4-byte aligned → dword loads are safe.
+                    const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
+                    const uint32_t w_qs    = pw[0];  // qs[0..3]
+                    const uint32_t w_signs = pw[1];  // signs[0..3]
+
+                    #pragma unroll
+                    for (int l = 0; l < 4; ++l)
+                    {
+                        const int idx = (w_qs >> (l * 8)) & 0xFF;
+                        const uint64_t grid8 = iq2_grid_read<FMT, USE_LDS>(idx, lds64);
+                        const uint32_t g_lo = static_cast<uint32_t>(grid8);
+                        const uint32_t g_hi = static_cast<uint32_t>(grid8 >> 32);
+                        const uint8_t signs = static_cast<uint8_t>(w_signs >> (l * 8));
+                        packed_groups[l * 2]     = static_cast<int32_t>(
+                            iq_apply_signs_4(g_lo, signs & 0xF));
+                        packed_groups[l * 2 + 1] = static_cast<int32_t>(
+                            iq_apply_signs_4(g_hi, signs >> 4));
+                    }
+                }
+                else // is_iq2_grid && has_qh (IQ2_XS, IQ2_S)
+                {
+                    // IQ2_XS/IQ2_S (9B): compiler already generates decent loads.
+                    // Keep original byte access (signs straddle dword boundary).
                     #pragma unroll
                     for (int l = 0; l < 4; ++l)
                     {
@@ -801,36 +866,64 @@ __global__ void gemv_native_vnni_kernel_t(
                     }
                     else if constexpr (Traits::is_iq_grid)
                     {
-                        // IQ grid decode: constant-memory LUT lookup + sign application
-                        // Payload: [qs × N_QS][qh × 0or1][signs × 4]
-                        //   IQ3_S:   [qs×8][qh×1][signs×4] = 13B   IQ3_XXS: [qs×8][signs×4] = 12B
-                        //   IQ2_S:   [qs×4][qh×1][signs×4] = 9B    IQ2_XS:  [qs×4][qh×1][signs×4] = 9B
-                        //   IQ2_XXS: [qs×4][signs×4] = 8B
+                        // IQ grid decode: LUT lookup + sign application
+                        // O5: Wide payload loads for XXS variants.
                         constexpr int n_qs = Traits::is_iq3_grid ? 8 : 4;
                         constexpr int sign_off = n_qs + (Traits::has_qh ? 1 : 0);
                         const uint8_t qh_byte = Traits::has_qh ? payload[n_qs] : 0;
 
-                        if constexpr (Traits::is_iq3_grid)
+                        if constexpr (Traits::is_iq3_grid && !Traits::has_qh)
                         {
-                            // IQ3: 8 grid lookups × 4 elements = 32 elements
-                            // Each uint32_t grid entry → 4 unsigned bytes
+                            // IQ3_XXS: wide dword loads (see O5 in iq_decode_accumulate_block)
+                            const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
+                            const uint32_t w0 = pw[0], w1 = pw[1], w2 = pw[2];
+                            #pragma unroll
+                            for (int g = 0; g < 8; ++g)
+                            {
+                                const uint32_t word = (g < 4) ? w0 : w1;
+                                const int idx = (word >> ((g & 3) * 8)) & 0xFF;
+                                const uint32_t grid4 = iq3_grid_lookup<FMT>(idx);
+                                const uint8_t sb = static_cast<uint8_t>(w2 >> ((g / 2) * 8));
+                                const uint8_t sn = (g & 1) ? (sb >> 4) : (sb & 0xF);
+                                packed_groups[g] = static_cast<int32_t>(iq_apply_signs_4(grid4, sn));
+                            }
+                        }
+                        else if constexpr (Traits::is_iq3_grid)
+                        {
+                            // IQ3_S: original byte access (compiler coalesces adequately)
                             #pragma unroll
                             for (int g = 0; g < 8; ++g)
                             {
                                 int idx = payload[g];
-                                if constexpr (Traits::has_qh)
-                                    idx |= (static_cast<int>((qh_byte >> g) & 1) << 8);
+                                idx |= (static_cast<int>((qh_byte >> g) & 1) << 8);
                                 const uint32_t grid4 = iq3_grid_lookup<FMT>(idx);
-                                // 4 sign bits: lower nibble for even g, upper for odd
                                 const uint8_t sb = payload[sign_off + g / 2];
                                 const uint8_t sn = (g & 1) ? (sb >> 4) : (sb & 0xF);
                                 packed_groups[g] = static_cast<int32_t>(iq_apply_signs_4(grid4, sn));
                             }
                         }
+                        else if constexpr (Traits::is_iq2_grid && !Traits::has_qh)
+                        {
+                            // IQ2_XXS: wide dword loads (see O5 in iq_decode_accumulate_block)
+                            const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
+                            const uint32_t w_qs = pw[0], w_signs = pw[1];
+                            #pragma unroll
+                            for (int l = 0; l < 4; ++l)
+                            {
+                                const int idx = (w_qs >> (l * 8)) & 0xFF;
+                                const uint64_t grid8 = iq2_grid_lookup<FMT>(idx);
+                                const uint32_t g_lo = static_cast<uint32_t>(grid8);
+                                const uint32_t g_hi = static_cast<uint32_t>(grid8 >> 32);
+                                const uint8_t signs = static_cast<uint8_t>(w_signs >> (l * 8));
+                                packed_groups[l * 2]     = static_cast<int32_t>(
+                                    iq_apply_signs_4(g_lo, signs & 0xF));
+                                packed_groups[l * 2 + 1] = static_cast<int32_t>(
+                                    iq_apply_signs_4(g_hi, signs >> 4));
+                            }
+                        }
                         else
                         {
-                            // IQ2: 4 grid lookups × 8 elements = 32 elements
-                            // Each uint64_t grid entry → 8 unsigned bytes → 2 sdot4 groups
+                            // IQ2_XS/IQ2_S: original byte access
                             #pragma unroll
                             for (int l = 0; l < 4; ++l)
                             {
