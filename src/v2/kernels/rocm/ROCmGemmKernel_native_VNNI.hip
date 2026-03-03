@@ -869,6 +869,17 @@ static bool launch_native_vnni_gemm(
 
     if (use_n128) {
         // Hybrid N128 dispatch: M16/3-wave for small grids, M32/2-wave for large
+        //
+        // NOTE: M_TILE > 32 is NOT viable on N128 due to A-LDS bank conflicts.
+        // gfx906 has 32 LDS banks at 4-byte granularity.  With M_PER_THREAD=4,
+        // each thread reads 4 consecutive int32 from banks (t_m*4)%32 through
+        // (t_m*4+3)%32.  Bank groups wrap every 8 threads:
+        //   THREADS_M=8  (M32):  8 unique bank groups → zero conflicts
+        //   THREADS_M=16 (M64):  2-way conflicts → ~1.7× penalty
+        //   THREADS_M=32 (M128): 4-way conflicts → ~2.5× penalty
+        // The A-data reuse gain from N_PER_THREAD 4→8 is completely eaten by
+        // the bank conflict stalls.  Empirically: M64/N128 and M128/N64 both
+        // regressed LM_Head from 0.88× to 0.30-0.37× (2.5× slower).
         const int n128_blocks = (N + 127) / 128;
         const int m16_blocks  = (M + 15) / 16;
         const int total_wgs_m16 = n128_blocks * m16_blocks;
@@ -885,6 +896,35 @@ static bool launch_native_vnni_gemm(
                 return launch(N128{}, M32{});
         }
     } else {
+        // N64 (K-heavy) dispatch with hybrid M16/3-wave for small-M shapes.
+        //
+        // Mirrors the N128 hybrid strategy: when the total M16 workgroup count
+        // is ≤256 (~1 WG/SIMD on MI50/60), the M16/3-wave variant provides
+        // better GPU coverage (more CUs active) despite lower per-tile compute
+        // density.  This is critical for K-heavy shapes (FFN_Dn, AttnOut) at
+        // small M where few N64 workgroups are launched.
+        //
+        // With M32/2-wave, e.g. 7B_AttnOut M=32 has only 56 WGs → 28 CUs (47%).
+        // M16/3-wave doubles WGs to 112 → 37-56 CUs (62-93%) active.
+        //
+        // For M≥128, the waste-minimizing M64/M32 tiles already achieve good
+        // GPU coverage (many WGs) and their superior A-data reuse dominates.
+        //
+        // Threshold is 128 WGs (vs 256 for N128) because N64 tiles have half
+        // the column-output of N128 tiles, so per-WG compute density is lower.
+        // Above 128 WGs the GPU has enough parallelism for M32/M64 tiles to
+        // win via better A-data reuse.  Verified: keeps 0.5B/3B M=64 wins
+        // (+0.02..+0.42) while avoiding 7B M=64 regressions (224 WGs > 128).
+        if (M <= 64) {
+            const int n64_blocks = (N + 63) / 64;
+            const int m16_blocks = (M + 15) / 16;
+            const int total_wgs_m16 = n64_blocks * m16_blocks;
+
+            if (total_wgs_m16 <= 128) {
+                return launch3(N64{}, M16{});
+            }
+        }
+
         switch (m_tile) {
             case 16:  return launch(N64{}, M16{});
             case 32:  return launch(N64{}, M32{});

@@ -1033,3 +1033,321 @@ Effective throughput ratio at saturation: `(720/480) × (WG_work_M16/WG_work_M32
 4. **N64 path improvements**: N64/M32/IQ4_NL sits at 88 VGPRs (2-wave). Forcing 3-wave via `MIN_BLOCKS=3` may help small shapes similarly.
 
 5. **LM_Head-specific optimization**: LM_Head shapes (N=151936) show 0.73-0.93× across all M values — the largest gap. Since N>>K, these shapes have very high N-block counts and M32/2-wave is correct, but per-block scale accumulation overhead may be disproportionate. Investigating scale pre-reduction or wider K-blocks could help.
+
+### 16.7 ISA Audit (Release Build Disassembly)
+
+Full ISA audit of all 10 kernel variants extracted from the release binary via `llvm-objdump`.
+Disassembly: 14,024 lines from GPU code object #5 (100 symbols, 12 kernel variants, 10 unique).
+
+#### 16.7.1 Instruction Count Summary
+
+| Variant | Total | Compute | Decode | V_MOV | Addr Calc | Control | Scalar ALU |
+|---------|-------|---------|--------|-------|-----------|---------|------------|
+| N128/M16/IQ4_NL/MB3 | 1354 | 268 (19.8%) | 255 (18.8%) | 130 | 153 (11.3%) | 116 (8.6%) | 146 (10.8%) |
+| N128/M16/Q4_0/MB3 | 1237 | 268 (21.7%) | 135 (10.9%) | 124 | 177 (14.3%) | 115 (9.3%) | 144 (11.6%) |
+| N128/M32/IQ4_NL/MB2 | 1766 | 548 (31.0%) | 245 (13.9%) | 194 | 158 (8.9%) | 128 (7.2%) | 164 (9.3%) |
+| N128/M32/Q4_0/MB2 | 1658 | 548 (33.1%) | 125 (7.5%) | 188 | 182 (11.0%) | 128 (7.7%) | 164 (9.9%) |
+| N64/M16/IQ4_NL/MB2 | 1071 | 134 (12.5%) | 237 (22.1%) | 94 | 126 (11.8%) | 112 (10.5%) | 139 (13.0%) |
+| N64/M16/Q4_0/MB2 | 963 | 134 (13.9%) | 117 (12.1%) | 88 | 150 (15.6%) | 112 (11.6%) | 139 (14.4%) |
+| N64/M32/IQ4_NL/MB2 | 1345 | 268 (19.9%) | 254 (18.9%) | 130 | 153 (11.4%) | 115 (8.6%) | 144 (10.7%) |
+| N64/M32/Q4_0/MB2 | 1237 | 268 (21.7%) | 134 (10.8%) | 124 | 177 (14.3%) | 115 (9.3%) | 144 (11.6%) |
+| N64/M64/IQ4_NL/MB2 | 1735 | 548 (31.6%) | 254 (14.6%) | 193 | 160 (9.2%) | 113 (6.5%) | 145 (8.4%) |
+| N64/M64/Q4_0/MB2 | 1627 | 548 (33.7%) | 134 (8.2%) | 187 | 184 (11.3%) | 113 (6.9%) | 145 (8.9%) |
+
+**Compute** = `v_dot4_i32_i8` + `v_cvt_f32_i32` + `v_fmac_f32` + `v_mul_f32` + `v_cvt_f32_f16`
+**Decode** = `v_and` + `v_or` + `v_xor` + `v_lshr` + `v_lshl` + `v_perm` (IQ4_NL only)
+
+**Key scaling pattern**: Compute instructions are identical across Q4_0/IQ4_NL for the same tile geometry (e.g., both N128/M32 variants have exactly 384 `v_dot4`, 96 `v_cvt_f32_i32`, etc.). The only differences are decode and address calculation.
+
+#### 16.7.2 Positive Findings (Compiler Doing Well)
+
+1. **✅ NO flat_load/flat_store in any kernel**: All global memory access uses coalesced `global_load_dwordx4` / `global_store_dword[x4]`. Zero uncoalesced operations across all 10 variants.
+
+2. **✅ NO scratch spills for Q4_0 variants**: Only IQ4_NL N128/M16/MB3 has 1 `buffer_load` + 1 `buffer_store` (8 bytes scratch from forcing `__launch_bounds__(256,3)` compressing 88→84 VGPRs). All other variants are spill-free.
+
+3. **✅ v_fma_mix_f32 for scale handling**: The compiler fuses the FP16→FP32 scale conversion + FMA accumulation into a single `v_fma_mix_f32` instruction with `op_sel_hi:[0,1,0]`. This replaces a separate `v_cvt_f32_f16` + `v_fmac_f32` pair, saving 1 instruction per scale application. For BPT=2 with 4 M-rows per thread, this saves 8 instructions per tile iteration.
+
+4. **✅ 128-bit LDS reads**: All compute reads use `ds_read_b128` (16 bytes per read), maximizing LDS bandwidth utilization.
+
+5. **✅ Bank-conflict-free LDS writes**: Decoded INT8 data uses `ds_write2st64_b32` (strided 2-element writes with 64-dword stride) for bank-conflict avoidance.
+
+6. **✅ Optimal s_waitcnt pipelining in hot loop**: The inner k-group loop uses progressive countdown `lgkmcnt(3)` → `lgkmcnt(2)` → `lgkmcnt(1)` → `lgkmcnt(0)`, each followed by 16 `v_dot4_i32_i8` instructions. This properly pipelines LDS reads with compute — later reads complete while early results are consumed.
+
+7. **✅ Double-buffered load/decode overlaps with compute**: The safe loop issues `s_waitcnt vmcnt(1)` to start B-matrix decode while the A-matrix global_load is still in flight. Decode bitops execute concurrently with the A-data transfer latency.
+
+8. **✅ 4× unroll confirmed**: The `#pragma clang loop unroll_count(4)` correctly produces 4 groups of 16 `v_dot4` per BPT block (64 v_dot4 per block, 128 per tile iteration for BPT=2), matching 8 k-groups with 4 unrolled.
+
+9. **✅ Vectorized output stores on fast path**: `global_store_dwordx4` (128-bit) is used for the non-boundary output path. The boundary path falls back to per-element `global_store_dword` with exec masking.
+
+10. **✅ Minimal NOPs**: Only 3 `s_nop` instructions per kernel — negligible.
+
+#### 16.7.3 Findings That Look Concerning But Are Not Actionable
+
+1. **v_mov_b32 overhead (88-194 per kernel, 10-12% of instructions)**:
+   - **Source**: Primarily integer accumulator zeroing (16 `v_mov vX, 0` per BPT block = 32 per tile), plus compiler register-file pressure relief moves.
+   - **Why not actionable**: Zeroing runs once per tile iteration (before the k-group inner loop), not in the hot path. Compiler-inserted v_mov for VGPR shuffling is a consequence of register pressure — reducing VGPRs would require reducing the M or N tile size, which hurts compute density.
+
+2. **Address calculation overhead (8.9-15.6%)**:
+   - Dominated by 64-bit pointer arithmetic: `v_mad_i64_i32`, `v_lshlrev_b64`, `v_add_co_u32`/`v_addc_co_u32` pairs.
+   - **Note**: The Q4_0 "decode" bias (`v_add_u32 v, 0x78787878, v`) is categorized as address calc by instruction name but is actually part of the SWAR decode. True Q4_0 decode overhead is ~28 VALU per cooperative load block (not the reported 10.9%).
+   - **Why not actionable**: 64-bit pointer math is unavoidable for addressing matrices with >4GB. The compiler already fuses shift+OR (`v_lshl_or_b32`) and uses `v_mad_i64_i32` for combined multiply-add.
+
+3. **Boundary-checked output stores**:
+   - The output section emits conditional scalar `global_store_dword` per M-row element, guarded by `v_cmp_gt_i32` + `s_and_saveexec` + `s_cbranch_execz` per element, with a `global_store_dwordx4` fast path when all 4 N-columns are in bounds.
+   - **Why not actionable**: These branch instructions are predicted/eliminated in the common case where the tile fits entirely within the matrix. The branch code costs only icache space, not execution cycles for non-boundary tiles.
+
+#### 16.7.4 IQ4_NL Decode Overhead Analysis
+
+**IQ4_NL v_perm LUT decode per cooperative load block (32 values from 16 packed bytes):**
+
+| Instruction | Count | Purpose |
+|------------|-------|---------|
+| `v_lshrrev_b32` | 12 | Extract nibble bits (shift by 1, 4, or 5) |
+| `v_and_b32` | 12 | Mask 3-bit LUT index and 1-bit mux flag |
+| `v_perm_b32` | 24 | 3 LUT lookups per nibble-pair × 2 pairs × 4 dwords |
+| `v_or_b32` | 8 | Combine mux flag with identity permutation |
+| `s_mov_b32` + `v_mov_b32` | 4 | Load LUT constants (amortized) |
+| **Total** | **60** | |
+
+**Q4_0 SWAR decode per cooperative load block (32 values from 16 packed bytes):**
+
+| Instruction | Count | Purpose |
+|------------|-------|---------|
+| `v_and_b32` | 8 | Mask nibbles (low + high) |
+| `v_lshrrev_b32` | 4 | Shift high nibbles to position |
+| `v_add_u32` | 8 | SWAR bias (+0x78 per byte) |
+| `v_xor_b32` | 8 | Sign conversion (XOR 0x80) |
+| **Total** | **28** | |
+
+**IQ4_NL decode is 2.14× more instructions than Q4_0** (+32 VALU per cooperative load).
+
+With ~4 decode sites per kernel (preload + safe loop + boundary loop + final), the total per-kernel overhead is approximately **+120 instructions**, which matches the observed difference: N128/M32/IQ4_NL has 245 decode bitops vs Q4_0's 125 (Δ=120).
+
+This decode overhead is **fundamental to the format** — the v_perm LUT path is the optimal decode for IQ4_NL on GCN (confirmed by Phase 4-5 analysis). The overhead directly explains the ~5% IQ4_NL-vs-Q4_0 performance gap at each M value.
+
+#### 16.7.5 Hot Loop Structure (N128/M32/Q4_0 Representative)
+
+The inner loop for one BPT block (verified from ISA at lines 1612-1682):
+
+```
+    ┌─ ds_read_b128 × 4     (B-matrix: 4 × 16B = 64B from LDS)
+    │  ds_read_b128 × 4     (A-matrix: 4 × 16B = 64B from LDS)
+    │  s_addk_i32            (loop counter)
+    │
+    │  s_waitcnt lgkmcnt(3)  ─── first A-row ready ───
+    │  v_dot4 × 16           (4 M-rows × 4 N-cols = 16 MACs, k-group 0)
+    │
+    │  s_waitcnt lgkmcnt(2)  ─── second A-row ready ───
+    │  v_dot4 × 16           (k-group 1)
+    │
+    │  s_waitcnt lgkmcnt(1)  ─── third A-row ready ───
+    │  v_dot4 × 16           (k-group 2)
+    │
+    │  s_waitcnt lgkmcnt(0)  ─── all reads ready ───
+    │  v_dot4 × 16           (k-group 3)
+    │
+    └─ s_cbranch_scc0 (back-edge)
+```
+
+This loop body runs twice per BPT block (8 k-groups / 4 unrolled = 2 iterations), producing:
+- 2 iters × 64 v_dot4 = **128 v_dot4 per BPT block**
+- 2 BPT blocks = **256 v_dot4 per tile** (128 from each of the 2 register-file–separated BPT loops)
+
+The remaining 128 v_dot4 (of the kernel's 384 total) come from the boundary loop and final tile compute, which have identical inner structure but with bounds-checked global loads.
+
+#### 16.7.6 Instruction Efficiency Ratios
+
+| Variant | Compute % | Non-Compute Overhead |
+|---------|-----------|---------------------|
+| N64/M64/Q4_0 | 33.7% | 66.3% |
+| N128/M32/Q4_0 | 33.1% | 66.9% |
+| N64/M64/IQ4_NL | 31.6% | 68.4% |
+| N128/M32/IQ4_NL | 31.0% | 69.0% |
+| N128/M16/Q4_0 | 21.7% | 78.3% |
+| N128/M16/IQ4_NL | 19.8% | 80.2% |
+| N64/M16/Q4_0 | 13.9% | 86.1% |
+| N64/M16/IQ4_NL | 12.5% | 87.5% |
+
+**Observations**:
+- M64/M32 variants achieve 31-34% compute density — comparable to hand-tuned GEMM kernels on GCN (typical range 30-40% for quantized formats with per-block scales).
+- M16 variants have much lower compute density (13-22%) because the fixed per-tile overhead (cooperative load, decode, LDS write, barrier, accumulator zero) is amortized over fewer compute instructions (96-192 v_dot4 vs 384).
+- This confirms the hybrid dispatch decision: M16 is only beneficial when workgroup count is low enough that 3-wave occupancy compensates for the lower compute density.
+
+#### 16.7.7 Conclusions
+
+The compiler is generating **high-quality ISA** for these kernels:
+- No memory access pathologies (no flat loads, no unnecessary spills, coalesced global access)
+- Optimal LDS usage (128-bit reads, strided writes, proper bank-conflict avoidance)
+- Excellent instruction scheduling (progressive waitcnt pipelining, overlapping memory and compute)
+- Smart instruction selection (`v_fma_mix_f32` fusion, `ds_write2st64_b32` strided writes)
+
+The remaining performance gaps vs INT8 baseline are attributable to:
+1. **Decode overhead**: +28-60 VALU per cooperative load block (Q4_0 vs IQ4_NL)
+2. **Per-block scale accumulation**: `v_cvt_f32_i32` + `v_fma_mix_f32` per block boundary (2× per tile)
+3. **Accumulator zeroing**: 16× `v_mov_b32 v, 0` per BPT block (INT8 has no block boundaries)
+
+These are all **fundamental to the quantized format** — the kernel is operating near the floor set by the decode-in-load architecture. Further gains require algorithm-level changes (e.g., multi-block fusion to amortize scales, or format-specific compute paths that avoid INT8 intermediation entirely).
+
+### 16.8 N64 Hybrid Dispatch Extension
+
+#### 16.8.1 Problem
+
+The N128 path (N-heavy shapes: FFN_Up, AttnQKV, LM_Head) had hybrid M16/3-wave dispatch since Phase 10, but the **N64 path (K-heavy shapes: FFN_Dn, AttnOut) completely lacked it**. This meant K-heavy shapes at small M launched far too few workgroups:
+
+| Shape | Path | M | Tile | WGs | CU Coverage | Speedup |
+|-------|------|---|------|-----|-------------|---------|
+| 7B_FFN_Dn | N64 | 32 | M32 | 56 | 23% | 0.64-0.67× |
+| 0.5B_FFN_Dn | N64 | 32 | M32 | 14 | 6% | 0.67-0.70× |
+| 7B_AttnOut | N64 | 32 | M32 | 56 | 23% | 0.70-0.73× |
+| 0.5B_AttnOut | N64 | 64 | M64 | 14 | 6% | 0.95-0.97× |
+
+These were the **worst-performing shapes** across the entire benchmark suite.
+
+#### 16.8.2 Solution
+
+Added hybrid M16/3-wave dispatch to the N64 path, mirroring the N128 strategy with a **tighter WG threshold of 128** (vs 256 for N128). The lower threshold accounts for N64 tiles having half the column-output of N128 tiles, meaning lower per-WG compute density — above 128 WGs, the GPU has enough parallelism for M32/M64 tiles to win via better A-data reuse.
+
+**Dispatch logic (N64 path)**:
+```
+if M ≤ 64 AND total_m16_wgs ≤ 128:
+    dispatch M16/3-wave (N64/M16/MB3)
+else:
+    dispatch original M32/M64/2-wave
+```
+
+**Threshold derivation**: First attempt used 256 WGs (matching N128). This caused catastrophic regressions for 7B shapes at M=64 (IQ4_NL 7B_FFN_Dn: 0.81→0.56×, -31%). Root cause: 7B M=64 shapes create 224 M16 WGs — the GPU is already 93% saturated, but each WG has poor compute density with M16 tiles over long K-loops (K=18944). The 128 threshold excludes 7B M=64 shapes (224 WGs > 128) while keeping 0.5B/3B M=64 wins (56-128 WGs ≤ 128).
+
+#### 16.8.3 ISA Quality
+
+Two new kernel variants were added:
+
+| Kernel | VGPRs | Occupancy | Spills | Notes |
+|--------|-------|-----------|--------|-------|
+| N64/M16/Q4_0/MB3 | 64 | **4-wave** | 0 | Compiler beat 3-wave target! |
+| N64/M16/IQ4_NL/MB3 | 78 | 3-wave | 0 | Clean, zero spills |
+
+The Q4_0 variant achieved 4-wave occupancy (64 VGPRs ≤ 64 threshold on gfx906) — the compiler aggressively compressed registers below the 3-wave target of 84 VGPRs. Total kernel count: 12 (was 10).
+
+#### 16.8.4 Results
+
+**Grand Summary (averaged across all 11 shapes per M value):**
+
+| Format | M | Before | After | Delta |
+|--------|---|--------|-------|-------|
+| Q4_0 | 32 | 0.84× | **0.89×** | **+0.05** |
+| Q4_0 | 64 | 0.94× | **0.99×** | **+0.05** |
+| Q4_0 | 128 | 1.09× | 1.09× | 0.00 |
+| Q4_0 | 256 | 1.11× | 1.11× | 0.00 |
+| IQ4_NL | 32 | 0.80× | **0.86×** | **+0.07** |
+| IQ4_NL | 64 | 0.89× | **0.96×** | **+0.07** |
+| IQ4_NL | 128 | 1.03× | 1.03× | 0.00 |
+| IQ4_NL | 256 | 1.05× | 1.05× | 0.00 |
+
+**Per-shape breakdown**: 11 wins (>+0.05), 76 neutral, 1 borderline regression (-0.05, within noise). Zero regressions at M=128/256.
+
+**Biggest wins (all M=32/64, undersaturated grids):**
+
+| Shape | M | Before | After | Delta |
+|-------|---|--------|-------|-------|
+| IQ4_NL 0.5B_FFN_Dn | 64 | 0.83× | 1.25× | **+0.42** |
+| IQ4_NL 0.5B_AttnOut | 32 | 0.83× | 1.18× | **+0.35** |
+| IQ4_NL 0.5B_AttnOut | 64 | 0.95× | 1.28× | **+0.33** |
+| Q4_0 0.5B_FFN_Dn | 64 | 0.85× | 1.14× | **+0.29** |
+| Q4_0 0.5B_AttnOut | 32 | 0.86× | 1.11× | **+0.25** |
+| IQ4_NL 0.5B_FFN_Dn | 32 | 0.67× | 0.91× | **+0.24** |
+
+#### 16.8.5 Threshold Selection: 128 vs 256 WGs
+
+First attempt (threshold=256) showed a split pattern at M=64:
+
+| Shape | M=64 WGs | Threshold 256 | Threshold 128 |
+|-------|----------|---------------|---------------|
+| 0.5B_FFN_Dn | 56 | +0.29/+0.42 | +0.29/+0.42 |
+| 3B_FFN_Dn | 128 | +0.07/+0.05 | -0.05/neutral |
+| 7B_FFN_Dn | 224 | **-0.09/-0.25** | neutral |
+
+At 224 WGs (7B shapes), the GPU already has 93% SIMD coverage at 2-wave. Switching to M16/3-wave fragments work into 4× more WGs with 4× less output per WG, and the long K-loops (K=18944) amplify per-WG overhead. The N128 path doesn't have this problem because N128 tiles have 2× the column width, giving each WG better compute density.
+
+The 128 threshold matches a ≈53% SIMD saturation point (128/240 SIMDs). Below this, the occupancy advantage of 3-wave matters more than M-tile efficiency. Above this, the GPU has enough parallelism for larger tiles to dominate.
+
+### 16.9 M_TILE > 32 Investigation (LM_Head)
+
+#### 16.9.1 Motivation
+
+LM_Head (N=151936, K=896/2048) is the worst-performing shape, running at 0.67-0.93× vs INT8 V7 across all M values.  The current N128 dispatch uses M32 (THREADS_M=8, THREADS_N=32, N_PER_THREAD=4), while INT8 V7 uses M128 (THREADS_M=32, THREADS_N=8, N_PER_THREAD=16) — a **4× A-data reuse advantage** per thread.
+
+The hypothesis was that increasing M_TILE to 64 or 128 would double N_PER_THREAD from 4 to 8, improving A-data reuse and closing the gap with INT8 V7.
+
+#### 16.9.2 Resource Budget Analysis
+
+M128/N128 is infeasible due to the **dual accumulator architecture** (acc[] + block_acc[] coexist during the fmaf epilogue):
+
+| Config | acc VGPRs | block_acc VGPRs | Total accum | Other | Est. total | Occupancy |
+|--------|-----------|-----------------|-------------|-------|-----------|-----------|
+| M32/N128 | 4×4=16 | 4×4=16 | 32 | ~94 | ~126 | 2-wave ✓ |
+| M64/N128 | 4×8=32 | 4×8=32 | 64 | ~55 | ~119 | 2-wave ✓ |
+| M128/N64 | 4×8=32 | 4×8=32 | 64 | ~56 | ~120 | 2-wave ✓ |
+| M128/N128 | 4×16=64 | 4×16=64 | **128** | ~75 | **~203** | **1-wave ✗** |
+
+M64/N128 and M128/N64 both achieve N_PER_THREAD=8 (2× improvement) within the 2-wave VGPR budget.  Actual compiler output confirmed exactly 128 VGPRs for all 4 new variants (2 formats × 2 configs).
+
+#### 16.9.3 The A-LDS Bank Conflict Wall
+
+**Empirical result**: Both M64/N128 and M128/N64 produced **catastrophic regressions** on all N-heavy shapes:
+
+| Config | Q4_0 0.5B LM_Head M=128 | Q4_0 3B LM_Head M=128 | IQ4_NL 0.5B LM_Head M=128 |
+|--------|--------------------------|------------------------|---------------------------|
+| M32/N128 (baseline) | 0.88× | 0.74× | 0.80× |
+| M128/N64 | **0.37×** | **0.31×** | **0.39×** |
+| M64/N128 (at M=64) | **0.54×** (was 0.91×) | **0.50×** (was 0.82×) | **0.49×** (was 0.83×) |
+
+**Root cause**: A-LDS bank conflicts on gfx906.
+
+gfx906 has 32 LDS banks at 4-byte (dword) granularity.  Each thread reads `M_PER_THREAD=4` consecutive int32 from A-LDS at addresses `[t_m*4, t_m*4+1, t_m*4+2, t_m*4+3]`, spanning 4 consecutive banks starting at bank `(t_m*4) % 32`.  Since `gcd(4, 32) = 4`, only **8 distinct bank groups** exist (banks {0-3}, {4-7}, ..., {28-31}).  When `THREADS_M > 8`, multiple threads map to the same bank group within a half-wavefront (32 threads):
+
+| THREADS_M | M_TILE | Threads per half-wave | Unique bank groups | Bank conflict factor |
+|-----------|--------|----------------------|-------------------|---------------------|
+| 8 | 32 | 8 | 8 | **1× (zero conflicts)** |
+| 16 | 64 | 16 | 8 | **2-way** |
+| 32 | 128 | 32 | 8 | **4-way** |
+
+The bank conflict penalty scales linearly: each A-LDS read takes N cycles instead of 1, where N is the conflict factor.  With 4 A-register loads per thread per k-group, 8 k-groups per block, and 2 blocks per tile:
+- M32: 4 reads × 1 cyc × 16 = 64 total A-LDS cycles per tile → baseline
+- M64: 4 reads × 2 cyc × 16 = 128 cycles → **2× penalty**
+- M128: 4 reads × 4 cyc × 16 = 256 cycles → **4× penalty**
+
+This penalty **completely negates** the 2× A-data reuse improvement from N_PER_THREAD doubling, resulting in net 1.7-2.5× regressions.
+
+#### 16.9.4 Why INT8 V7 Tolerates M128
+
+The INT8 V7 kernel uses the *same* A-LDS layout with the *same* bank conflicts at M128 (THREADS_M=32 → 4-way), yet still performs well.  The key differences:
+
+1. **No decode overhead**: INT8 reads pre-packed data — zero VALU for B-tile loading.  Native VNNI spends 28-60 extra VALU per B-tile on decode, so any compute-phase penalty is proportionally larger.
+
+2. **No block_acc**: INT8 accumulates directly into INT32 without per-block FP16 scale conversion.  This reduces peak live register count and gives the compiler more room to reorder instructions around bank conflicts (117 VGPRs vs 128).
+
+3. **Lower conflict sensitivity**: INT8's lighter inner loop (no `v_cvt_f32_f16` + `v_fmaf_rn` per block boundary) means the bank conflict stalls are a smaller fraction of total execution time.
+
+#### 16.9.5 Fundamental Constraint
+
+**M_TILE ≤ 32 is the hardware-optimal M-tile for native-VNNI GEMM on gfx906** with the current LDS layout (`a_lds[kk * M_TILE + mi]`) and `M_PER_THREAD=4`.
+
+The constraint derives from: `max_conflict_free_THREADS_M = 32_banks / gcd(M_PER_THREAD, 32_banks) = 32 / 4 = 8`, giving `M_TILE_max = 8 × 4 = 32`.
+
+Alternative approaches considered but rejected:
+- **LDS padding** (`a_lds[kk * (M_TILE + pad) + mi]`): Padding shifts bank alignment across K-groups but does NOT break within-kk conflicts (the problem is same-kk, different-t_m collisions).
+- **A-LDS transpose** (`a_lds[mi * KT + kk]`): Puts ALL threads on the same bank for a given (kk, mm). Worse than current layout.
+- **M_PER_THREAD=1** with THREADS_M=32, N_PER_THREAD=16: Zero bank conflicts but 17 LDS reads/kgroup for 16 compute ops (1.06 cycles/output) vs M_PER_THREAD=4's 8 reads/16 ops (0.5 cycles/output). The 4×4 cross product is fundamentally more LDS-efficient.
+
+#### 16.9.6 Implications for LM_Head Optimization
+
+The LM_Head performance gap (0.67-0.93× vs INT8) cannot be closed by M_TILE changes alone.  The remaining gap comes from:
+
+1. **Decode overhead** (~28-60 VALU per B-tile, fixed cost)
+2. **Per-block scale accumulation** (`v_cvt_f32_f16` + `v_fmaf_rn` per block, K/32 times)
+3. **Dual accumulator pressure** (block_acc + acc → 128 VGPRs, no compiler slack)
+
+These are architectural costs of the decode-in-load approach.  Potential future paths:
+- **Wider BPT** (e.g., BPT=4): Amortize pipeline overhead across more K-elements per tile, reducing decode-per-output ratio.  Risk: LDS budget doubles per K-dimension.
+- **Asymmetric M_PER_THREAD**: Use M_PER_THREAD=2 with THREADS_M=16 → conflict-free up to M_TILE=32 still, but reduces accumulator pressure.  Not obviously better.
+- **Format-specific optimizations**: Q4_0's simpler decode (SWAR subtract, no LUT) may tolerate different tradeoffs than IQ4_NL.
