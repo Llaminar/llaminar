@@ -328,15 +328,31 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                 }
                 else if constexpr (Traits::is_iq3_grid && Traits::has_qh)
                 {
-                    // IQ3_S (13B): compiler already generates decent coalesced loads
-                    // (dwordx2 + ushort + ubyte).  Keep original byte access.
+                    // O6: Wide payload loads for IQ3_S (13B = 3 dwords + 1 ubyte).
+                    //
+                    // The compiler generates dwordx2(0-7) + ushort(8-9) + 3×ubyte(10,11,12)
+                    // = 5 payload VMEM.  Loading bytes 0-11 as 3 consecutive dwords
+                    // (which the compiler coalesces to dwordx3) reduces payload to:
+                    //   1× dwordx3 + 1× ubyte = 2 payload VMEM  (−60%)
+                    //
+                    // Payload layout: [qs0..qs7][qh][signs0..signs3] = 13 bytes
+                    const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
+                    const uint32_t w0 = pw[0];  // qs[0..3]
+                    const uint32_t w1 = pw[1];  // qs[4..7]
+                    const uint32_t w2 = pw[2];  // {qh, signs[0], signs[1], signs[2]}
+                    const uint8_t signs3 = payload[12];  // signs[3]
+
                     #pragma unroll
                     for (int g = 0; g < 8; ++g)
                     {
-                        int idx = payload[g];
-                        idx |= (static_cast<int>((qh_byte >> g) & 1) << 8);
+                        const uint32_t word = (g < 4) ? w0 : w1;
+                        int idx = (word >> ((g & 3) * 8)) & 0xFF;
+                        idx |= (static_cast<int>((w2 >> g) & 1) << 8);  // qh bit g from w2 low byte
                         const uint32_t grid4 = iq3_grid_read<FMT, USE_LDS>(idx, lds32);
-                        const uint8_t sb = payload[sign_off + g / 2];
+                        // signs[0..2] in w2 bytes 1,2,3; signs[3] separate
+                        const uint8_t sb = (g < 6)
+                            ? static_cast<uint8_t>(w2 >> ((g / 2 + 1) * 8))
+                            : signs3;
                         const uint8_t sn = (g & 1) ? (sb >> 4) : (sb & 0xF);
                         packed_groups[g] = static_cast<int32_t>(iq_apply_signs_4(grid4, sn));
                     }
@@ -372,24 +388,37 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                 }
                 else // is_iq2_grid && has_qh (IQ2_XS, IQ2_S)
                 {
-                    // IQ2_XS/IQ2_S (9B): compiler already generates decent loads.
-                    // Keep original byte access (signs straddle dword boundary).
+                    // O6: Wide payload loads for IQ2_XS/IQ2_S (9B = dwordx2 + ubyte).
+                    //
+                    // The compiler generates dword(0-3) + ushort(4-5) + 3×ubyte(6,7,8)
+                    // = 5 payload VMEM.  Loading bytes 0-7 as dwordx2 reduces payload to:
+                    //   1× dwordx2 + 1× ubyte = 2 payload VMEM  (−60%)
+                    //
+                    // Payload layout: [qs0..qs3][qh][signs0..signs3] = 9 bytes
+                    const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
+                    const uint32_t w_qs       = pw[0];  // qs[0..3]
+                    const uint32_t w_qh_signs = pw[1];  // {qh, signs[0], signs[1], signs[2]}
+                    const uint8_t signs3 = payload[8];   // signs[3]
+
                     #pragma unroll
                     for (int l = 0; l < 4; ++l)
                     {
-                        int idx = payload[l];
+                        int idx = (w_qs >> (l * 8)) & 0xFF;
                         if constexpr (Traits::qh_bits_per_lookup == 1)
-                            idx |= (static_cast<int>((qh_byte >> l) & 1) << 8);
+                            idx |= (static_cast<int>((w_qh_signs >> l) & 1) << 8);
                         else if constexpr (Traits::qh_bits_per_lookup == 2)
-                            idx |= (static_cast<int>((qh_byte >> (2 * l)) & 3) << 8);
+                            idx |= (static_cast<int>((w_qh_signs >> (2 * l)) & 3) << 8);
                         const uint64_t grid8 = iq2_grid_read<FMT, USE_LDS>(idx, lds64);
                         const uint32_t g_lo = static_cast<uint32_t>(grid8);
                         const uint32_t g_hi = static_cast<uint32_t>(grid8 >> 32);
-                        const uint8_t signs = payload[sign_off + l];
+                        // signs[0..2] in w_qh_signs bytes 1,2,3; signs[3] separate
+                        const uint8_t signs_byte = (l < 3)
+                            ? static_cast<uint8_t>(w_qh_signs >> ((l + 1) * 8))
+                            : signs3;
                         packed_groups[l * 2]     = static_cast<int32_t>(
-                            iq_apply_signs_4(g_lo, signs & 0xF));
+                            iq_apply_signs_4(g_lo, signs_byte & 0xF));
                         packed_groups[l * 2 + 1] = static_cast<int32_t>(
-                            iq_apply_signs_4(g_hi, signs >> 4));
+                            iq_apply_signs_4(g_hi, signs_byte >> 4));
                     }
                 }
             }
@@ -890,14 +919,20 @@ __global__ void gemv_native_vnni_kernel_t(
                         }
                         else if constexpr (Traits::is_iq3_grid)
                         {
-                            // IQ3_S: original byte access (compiler coalesces adequately)
+                            // O6: IQ3_S wide dword loads (see iq_decode_accumulate_block)
+                            const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
+                            const uint32_t w0 = pw[0], w1 = pw[1], w2 = pw[2];
+                            const uint8_t signs3 = payload[12];
                             #pragma unroll
                             for (int g = 0; g < 8; ++g)
                             {
-                                int idx = payload[g];
-                                idx |= (static_cast<int>((qh_byte >> g) & 1) << 8);
+                                const uint32_t word = (g < 4) ? w0 : w1;
+                                int idx = (word >> ((g & 3) * 8)) & 0xFF;
+                                idx |= (static_cast<int>((w2 >> g) & 1) << 8);
                                 const uint32_t grid4 = iq3_grid_lookup<FMT>(idx);
-                                const uint8_t sb = payload[sign_off + g / 2];
+                                const uint8_t sb = (g < 6)
+                                    ? static_cast<uint8_t>(w2 >> ((g / 2 + 1) * 8))
+                                    : signs3;
                                 const uint8_t sn = (g & 1) ? (sb >> 4) : (sb & 0xF);
                                 packed_groups[g] = static_cast<int32_t>(iq_apply_signs_4(grid4, sn));
                             }
@@ -923,23 +958,28 @@ __global__ void gemv_native_vnni_kernel_t(
                         }
                         else
                         {
-                            // IQ2_XS/IQ2_S: original byte access
+                            // O6: IQ2_XS/IQ2_S wide dword loads (see iq_decode_accumulate_block)
+                            const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
+                            const uint32_t w_qs = pw[0], w_qh_signs = pw[1];
+                            const uint8_t signs3 = payload[8];
                             #pragma unroll
                             for (int l = 0; l < 4; ++l)
                             {
-                                int idx = payload[l];
+                                int idx = (w_qs >> (l * 8)) & 0xFF;
                                 if constexpr (Traits::qh_bits_per_lookup == 1)
-                                    idx |= (static_cast<int>((qh_byte >> l) & 1) << 8);
+                                    idx |= (static_cast<int>((w_qh_signs >> l) & 1) << 8);
                                 else if constexpr (Traits::qh_bits_per_lookup == 2)
-                                    idx |= (static_cast<int>((qh_byte >> (2 * l)) & 3) << 8);
+                                    idx |= (static_cast<int>((w_qh_signs >> (2 * l)) & 3) << 8);
                                 const uint64_t grid8 = iq2_grid_lookup<FMT>(idx);
                                 const uint32_t g_lo = static_cast<uint32_t>(grid8);
                                 const uint32_t g_hi = static_cast<uint32_t>(grid8 >> 32);
-                                const uint8_t signs = payload[sign_off + l];
+                                const uint8_t signs_byte = (l < 3)
+                                    ? static_cast<uint8_t>(w_qh_signs >> ((l + 1) * 8))
+                                    : signs3;
                                 packed_groups[l * 2]     = static_cast<int32_t>(
-                                    iq_apply_signs_4(g_lo, signs & 0xF));
+                                    iq_apply_signs_4(g_lo, signs_byte & 0xF));
                                 packed_groups[l * 2 + 1] = static_cast<int32_t>(
-                                    iq_apply_signs_4(g_hi, signs >> 4));
+                                    iq_apply_signs_4(g_hi, signs_byte >> 4));
                             }
                         }
                     }
