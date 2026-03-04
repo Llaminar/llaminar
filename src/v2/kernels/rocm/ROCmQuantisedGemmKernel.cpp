@@ -97,6 +97,7 @@
 #include <algorithm>
 #include <string>
 #include <mutex>
+#include <set>
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -1482,16 +1483,35 @@ namespace llaminar2
                 return false;
             }
 
-            // Lazy-initialize IQ grid lookup tables in GPU __constant__ memory
-            // (once per process, thread-safe via static flag)
+            // Lazy-initialize IQ grid lookup tables in GPU __constant__ memory.
+            // Each device has its own __constant__ memory, so we track which
+            // devices have been initialized.  Thread-safe via static mutex.
             if (codebook_id >= 11 && codebook_id <= 17)
             {
-                static bool iq_grids_initialized = false;
-                if (!iq_grids_initialized)
+                static std::mutex iq_grid_mutex;
+                static std::set<int> iq_grids_initialized_devices;
+
+                // Determine which GPU is currently active
+                int current_device = 0;
+#ifdef HAVE_ROCM
+                hipGetDevice(&current_device);
+#elif defined(HAVE_CUDA)
+                cudaGetDevice(&current_device);
+#endif
+
+                bool needs_init = false;
                 {
-                    LOG_INFO("[packNativeVNNI] Initializing IQ grid LUT tables in GPU constant memory");
+                    std::lock_guard<std::mutex> lock(iq_grid_mutex);
+                    needs_init = (iq_grids_initialized_devices.find(current_device) ==
+                                  iq_grids_initialized_devices.end());
+                }
+
+                if (needs_init)
+                {
+                    LOG_INFO("[packNativeVNNI] Initializing IQ grid LUT tables on device "
+                             << current_device);
                     if (!rocmInitIQGridTables(
-                            0, // device_id (TODO: multi-GPU)
+                            current_device,
                             llaminar2::iq3s_grid,
                             llaminar2::iq3xxs_grid,
                             llaminar2::iq2s_grid,
@@ -1499,11 +1519,12 @@ namespace llaminar2
                             llaminar2::iq2xxs_grid,
                             llaminar2::iq1s_grid))
                     {
-                        LOG_ERROR("[packNativeVNNI] Failed to initialize IQ grid tables (GEMV)");
+                        LOG_ERROR("[packNativeVNNI] Failed to initialize IQ grid tables (GEMV) on device "
+                                  << current_device);
                         return false;
                     }
                     if (!rocmInitIQGridTables_gemm(
-                            0, // device_id (TODO: multi-GPU)
+                            current_device,
                             llaminar2::iq3s_grid,
                             llaminar2::iq3xxs_grid,
                             llaminar2::iq2s_grid,
@@ -1511,10 +1532,13 @@ namespace llaminar2
                             llaminar2::iq2xxs_grid,
                             llaminar2::iq1s_grid))
                     {
-                        LOG_ERROR("[packNativeVNNI] Failed to initialize IQ grid tables (GEMM)");
+                        LOG_ERROR("[packNativeVNNI] Failed to initialize IQ grid tables (GEMM) on device "
+                                  << current_device);
                         return false;
                     }
-                    iq_grids_initialized = true;
+
+                    std::lock_guard<std::mutex> lock(iq_grid_mutex);
+                    iq_grids_initialized_devices.insert(current_device);
                 }
             }
 
@@ -2170,8 +2194,15 @@ namespace llaminar2
 
                     case TensorType::IQ1_M:
                     {
-                        // IQ1_M: 11-bit grid index → iq1s_grid[2048], dual-scale + embedded delta
-                        // Payload: [qs×4][qh×2][delta_lo_fp16][delta_hi_fp16] = 10 bytes
+                        // IQ1_M: 11-bit grid index → iq1s_grid[2048], dual-scale + per-group delta
+                        //
+                        // Delta baking strategy: grid values are stored ×8 in the kernel's
+                        // 8× lookup table ({-1,1,3}→{-8,8,24}), and ±IQ1S_DELTA (±0.125)
+                        // becomes ±1 added directly to each grid int8 in the decode.
+                        // Scales are stored as dl/8 to compensate, and emin offsets are zero
+                        // since the delta is baked into the grid values.
+                        //
+                        // Payload: [qs×4][qh×2][zero_lo_fp16][zero_hi_fp16][scale_lo_fp16][scale_hi_fp16] = 14 bytes
                         const int super_blocks_per_row = (K + 255) / 256;
                         const int sb_idx = b / 8;
                         const int sub_idx = b % 8;
@@ -2197,9 +2228,9 @@ namespace llaminar2
                         const float dl1 = d_val * (2.0f * static_cast<float>(sc3_lo) + 1.0f);
                         const float dl2 = d_val * (2.0f * static_cast<float>(sc3_hi) + 1.0f);
 
-                        // Dual scales stored in scales[]/mins[] arrays
-                        scale_fp16 = fp32_to_fp16(dl1);
-                        min_fp16 = fp32_to_fp16(dl2);
+                        // Scales divided by 8 to compensate for 8× grid values in kernel
+                        scale_fp16 = fp32_to_fp16(dl1 * 0.125f);
+                        min_fp16 = fp32_to_fp16(dl2 * 0.125f);
 
                         uint8_t payload_buf[14];
                         payload_buf[0] = qs[0];
@@ -2209,25 +2240,10 @@ namespace llaminar2
                         payload_buf[4] = qh[0];
                         payload_buf[5] = qh[1];
 
-                        // Compute averaged delta corrections per dual-scale half and embed as FP16
-                        // Lo half (groups 0,1): delta signs from qh[0] bits 3,7
-                        // Hi half (groups 2,3): delta signs from qh[1] bits 3,7
-                        constexpr float IQ1S_DELTA = 0.125f;
-                        const bool d0_neg = (qh[0] & 0x08) != 0;
-                        const bool d1_neg = (qh[0] & 0x80) != 0;
-                        const bool d2_neg = (qh[1] & 0x08) != 0;
-                        const bool d3_neg = (qh[1] & 0x80) != 0;
-
-                        // Average delta within each half: exact when signs match, 0 when different
-                        const float delta_lo = IQ1S_DELTA * 0.5f *
-                                               (static_cast<float>(d0_neg ? -1 : 1) + static_cast<float>(d1_neg ? -1 : 1));
-                        const float delta_hi = IQ1S_DELTA * 0.5f *
-                                               (static_cast<float>(d2_neg ? -1 : 1) + static_cast<float>(d3_neg ? -1 : 1));
-
-                        const uint16_t delta_lo_fp16 = fp32_to_fp16(dl1 * delta_lo);
-                        const uint16_t delta_hi_fp16 = fp32_to_fp16(dl2 * delta_hi);
-                        std::memcpy(payload_buf + 6, &delta_lo_fp16, 2);
-                        std::memcpy(payload_buf + 8, &delta_hi_fp16, 2);
+                        // Emin = 0: delta is baked into grid values, no asymmetric correction needed
+                        const uint16_t zero_fp16 = 0; // FP16 zero
+                        std::memcpy(payload_buf + 6, &zero_fp16, 2);
+                        std::memcpy(payload_buf + 8, &zero_fp16, 2);
 
                         // Embed scale_lo and scale_hi at end of payload (eliminates
                         // separate d_block_scales/d_block_mins address tracking in kernel)

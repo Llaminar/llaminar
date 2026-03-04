@@ -108,6 +108,42 @@ struct NVNNIGemmTraits {
     static constexpr bool loads_aux_from_global = needs_aux_compute && !has_embedded_scales;
     // Number of uint32 dwords to stage payload (ceil(payload_bytes / 4))
     static constexpr int payload_dwords = (payload_bytes + 3) / 4;
+
+    // ---- Per-format accumulation strategy for dual-scale (Pattern D) ----
+    //
+    // Two strategies exist:
+    //   FUSED:     Scale each dot4 inline (3 VALU/dot4: dot4→cvt→fma).
+    //              No inter-group dependency → better ILP.  Extra VALU hides
+    //              LDS read latency when the decode phase is heavy.
+    //   TWO_PHASE: Accumulate dot4 into int32 temp_acc, scale once per half.
+    //              Fewer VALU (1 dot4/group) → better when decode is light.
+    //
+    // Selection based on measured perf at N128/M32 (Focused_3B_FFN_Up):
+    //   Q6_K  (heavy 6-bit decode): FUSED  → 544μs vs TWO_PHASE 587μs (+8%)
+    //   Q3_K  (light v_perm decode): TWO_PHASE → 463μs vs FUSED 507μs (+9%)
+    //   IQ2_S (LDS grid lookup):     TWO_PHASE → 534μs vs FUSED 542μs (+1.5%)
+    //   IQ2_XS(LDS grid lookup):     TWO_PHASE → 535μs vs FUSED 543μs (+1.5%)
+    static constexpr bool prefer_fused_accum =
+        (FMT == NVNNI_GEMM_Q6_K);  // Heavy decode fills LDS latency gap
+
+    // ---- Per-pattern streaming dispatch for LM_Head shapes ----
+    //
+    // On N-heavy shapes (LM_Head N≥16384, K≤4096), cooperative vs streaming
+    // performance depends critically on decode complexity (3B_LM_Head M=128):
+    //
+    //   Pattern S (simple decode):    streaming wins (Q4_0 0.82x vs coop 0.74x)
+    //   Pattern D (dual-scale):       streaming wins (Q3_K 0.54x vs coop 0.44x)
+    //   Pattern A (asymmetric):       coop wins     (Q4_1 0.61x vs streaming 0.49x)
+    //   Pattern DA (dual-scale+asym): coop wins 2×  (Q2_K 0.34x vs streaming 0.15x)
+    //
+    // Root cause: Pattern A/DA decode is heavy enough that per-thread streaming
+    // causes register spilling.  Cooperative shares A-data through LDS,
+    // reducing per-thread register pressure by ~20-30%.
+    //
+    // Q2_K and IQ1_M see a 2× improvement with cooperative, from near-unusable
+    // 0.15x to tolerable 0.34x/0.29x.
+    static constexpr bool prefer_streaming =
+        !is_asymmetric && !is_dual_scale_asym;  // Pattern S + D → streaming; Pattern A + DA → cooperative
 };
 
 // ============================================================================
@@ -121,6 +157,7 @@ __device__ __constant__ uint64_t d_iq2s_grid_gemm[1024];
 __device__ __constant__ uint64_t d_iq2xs_grid_gemm[512];
 __device__ __constant__ uint64_t d_iq2xxs_grid_gemm[256];
 __device__ __constant__ uint64_t d_iq1s_grid_gemm[2048];
+__device__ __constant__ uint64_t d_iq1s_grid_8x_gemm[2048]; // grid values × 8 for IQ1_M delta baking
 
 // IQ grid lookup helpers
 template <NativeVNNIGemmFormat FMT>
@@ -141,6 +178,11 @@ __device__ __forceinline__ uint64_t iq2_grid_lookup_gemm(int idx)
 __device__ __forceinline__ uint64_t iq1_grid_lookup_gemm(int idx)
 {
     return d_iq1s_grid_gemm[idx];
+}
+
+__device__ __forceinline__ uint64_t iq1_grid_8x_lookup_gemm(int idx)
+{
+    return d_iq1s_grid_8x_gemm[idx];
 }
 
 // SWAR conditional negate: 4 unsigned bytes via 4 sign bits (same as GEMV)
@@ -439,25 +481,52 @@ __device__ __forceinline__ void decode_block(
                 packed_groups[l * 2 + 1] = static_cast<int32_t>(static_cast<uint32_t>(g >> 32));
             }
         }
-        else // IQ1_M
+        else // IQ1_M: use 8× grid with per-group delta baked in
         {
+            // Grid values are {-1,0,+1} × 8 = {-8,0,8} in the 8× table.
+            // Delta ±IQ1S_DELTA (±0.125) becomes ±1 after ×8 scaling.
+            // Baking delta into grid eliminates lossy per-half averaging.
+            // Scales are stored as dl/8 in packing to compensate.
+            //
+            // SWAR byte-parallel add/sub: must block cross-byte carries!
+            // Plain g±ONES fails when bytes are 0xFF (-1) or 0x00 (grid=0).
+            constexpr uint64_t MSB_8  = 0x8080808080808080ULL;
+            constexpr uint64_t ONES_8 = 0x0101010101010101ULL;
             const uint8_t* p = reinterpret_cast<const uint8_t*>(raw);
             const uint8_t qh0 = p[4], qh1 = p[5];
             const int idx0 = p[0] | ((qh0 & 0x07) << 8);
             const int idx1 = p[1] | (((qh0 >> 4) & 0x07) << 8);
             const int idx2 = p[2] | ((qh1 & 0x07) << 8);
             const int idx3 = p[3] | (((qh1 >> 4) & 0x07) << 8);
+            // Delta signs: qh bit 3 → group 0, bit 7 → group 1 (for qh0)
+            //              qh bit 3 → group 2, bit 7 → group 3 (for qh1)
             uint64_t g;
-            g = iq1_grid_lookup_gemm(idx0);
+
+            g = iq1_grid_8x_lookup_gemm(idx0);
+            g = (qh0 & 0x08)
+                ? (((g | MSB_8) - ONES_8) ^ ((~g) & MSB_8))   // byte-parallel sub 1
+                : (((g & ~MSB_8) + ONES_8) ^ (g & MSB_8));     // byte-parallel add 1
             packed_groups[0] = static_cast<int32_t>(static_cast<uint32_t>(g));
             packed_groups[1] = static_cast<int32_t>(static_cast<uint32_t>(g >> 32));
-            g = iq1_grid_lookup_gemm(idx1);
+
+            g = iq1_grid_8x_lookup_gemm(idx1);
+            g = (qh0 & 0x80)
+                ? (((g | MSB_8) - ONES_8) ^ ((~g) & MSB_8))
+                : (((g & ~MSB_8) + ONES_8) ^ (g & MSB_8));
             packed_groups[2] = static_cast<int32_t>(static_cast<uint32_t>(g));
             packed_groups[3] = static_cast<int32_t>(static_cast<uint32_t>(g >> 32));
-            g = iq1_grid_lookup_gemm(idx2);
+
+            g = iq1_grid_8x_lookup_gemm(idx2);
+            g = (qh1 & 0x08)
+                ? (((g | MSB_8) - ONES_8) ^ ((~g) & MSB_8))
+                : (((g & ~MSB_8) + ONES_8) ^ (g & MSB_8));
             packed_groups[4] = static_cast<int32_t>(static_cast<uint32_t>(g));
             packed_groups[5] = static_cast<int32_t>(static_cast<uint32_t>(g >> 32));
-            g = iq1_grid_lookup_gemm(idx3);
+
+            g = iq1_grid_8x_lookup_gemm(idx3);
+            g = (qh1 & 0x80)
+                ? (((g | MSB_8) - ONES_8) ^ ((~g) & MSB_8))
+                : (((g & ~MSB_8) + ONES_8) ^ (g & MSB_8));
             packed_groups[6] = static_cast<int32_t>(static_cast<uint32_t>(g));
             packed_groups[7] = static_cast<int32_t>(static_cast<uint32_t>(g >> 32));
         }
@@ -639,27 +708,26 @@ __device__ __forceinline__ void accumulate_block_gemm(
     {
         // Pattern D: dual-scale symmetric (Q6_K, Q3_K, IQ2_S, IQ2_XS)
         //
-        // Two accumulation strategies based on N_PER_THREAD:
+        // Per-format strategy dispatch based on decode complexity:
         //
-        // N_PER_THREAD >= 4 (N128/M32 tile): FUSED inline-scaled accumulation.
-        //   Eliminates temp_acc entirely by scaling each dot4 result into FP32
-        //   acc immediately.  Saves 16 VGPRs (128+scratch → 92+0 on gfx906).
-        //   Extra VALU: +6% from per-dot4 cvt+fma.  Net win due to scratch
-        //   elimination (+15-25% for heavy-scratch formats like Q6_K).
+        // FUSED (prefer_fused_accum=true): scale each dot4 inline into FP32.
+        //   3 VALU/dot4 (dot4→cvt→fma) with NO inter-group dependency.
+        //   The extra VALU fills LDS read latency when the decode phase
+        //   is heavy (Q6_K: nibble + 2-bit qh bit-scatter).
         //
-        // N_PER_THREAD < 4 (M16, N64/M32 tiles): TWO-PHASE accumulation.
-        //   temp_acc[M_PER_THREAD][N_PER_THREAD] fits within 128 VGPRs without
-        //   scratch (8 int32 at M16/N128, 8 at N64/M32).  Avoids the fused
-        //   approach's extra VALU overhead where it's not needed.
-        if constexpr (N_PER_THREAD >= 4)
+        // TWO-PHASE (prefer_fused_accum=false): accumulate dot4 into int32,
+        //   then scale+FMA once per half.  1 VALU/dot4 with unroll_count(2)
+        //   for ILP.  Better when decode is lightweight (Q3_K: v_perm,
+        //   IQ2_S/IQ2_XS: LDS grid lookup).
+        if constexpr (Traits::prefer_fused_accum && N_PER_THREAD >= 4)
         {
-            // ---- FUSED path (N128/M32): no temp_acc, scale per-dot4 ----
+            // ---- FUSED path (Q6_K N128/M32): no temp_acc, scale per-dot4 ----
             //
-            // Register pressure (N128/M32, M_PER_THREAD=4, N_PER_THREAD=4):
-            //   acc[4][4]=16 + scale[4]=4 + a_reg[4]+b_reg[4]=8 = 28 → 92 VGPRs
+            // Register pressure: acc[4][4]=16 + scale[4]=4 + a_reg[4]+b_reg[4]=8
+            // = 28 dedicated → 92 VGPRs total, 0 scratch, 2-wave.
             //
-            // Precision: dot4 result (±65024) exact in FP32.  Accumulating 4
-            // scaled FP32 vs scaling int32 sum once: ~3 ULP per phase, negligible.
+            // The unroll_count(2) enables the scheduler to overlap LDS loads
+            // from group g+1 with VALU from group g.
 
             // Lo half (groups 0-3): fused scale_lo into acc
             float scale_lo[N_PER_THREAD];
@@ -670,7 +738,7 @@ __device__ __forceinline__ void accumulate_block_gemm(
                 scale_lo[nn] = __half2float(
                     *reinterpret_cast<const __half*>(&s_buf[sn]));
             }
-            #pragma clang loop unroll(disable)
+            #pragma clang loop unroll_count(2)
             for (int g = 0; g < 4; ++g)
             {
                 const int kk = bp * 8 + g;
@@ -701,7 +769,7 @@ __device__ __forceinline__ void accumulate_block_gemm(
                 scale_hi[nn] = __half2float(
                     *reinterpret_cast<const __half*>(&aux_buf[sn]));
             }
-            #pragma clang loop unroll(disable)
+            #pragma clang loop unroll_count(2)
             for (int g = 4; g < 8; ++g)
             {
                 const int kk = bp * 8 + g;
@@ -725,7 +793,10 @@ __device__ __forceinline__ void accumulate_block_gemm(
         }
         else
         {
-            // ---- TWO-PHASE path (M16/N64): temp_acc fits in 128 VGPRs ----
+            // ---- TWO-PHASE path (Q3_K, IQ2_S, IQ2_XS; all tiles) ----
+            //
+            // Accumulate dot4 into int32 temp_acc per half, then scale once.
+            // unroll_count(2) for ILP across groups despite data dependency.
             int32_t temp_acc[M_PER_THREAD][N_PER_THREAD];
 
             // Lo half (groups 0-3)
@@ -734,7 +805,7 @@ __device__ __forceinline__ void accumulate_block_gemm(
                 #pragma unroll
                 for (int nn = 0; nn < N_PER_THREAD; ++nn)
                     temp_acc[mm][nn] = 0;
-            #pragma clang loop unroll(disable)
+            #pragma clang loop unroll_count(2)
             for (int g = 0; g < 4; ++g)
             {
                 const int kk = bp * 8 + g;
@@ -772,7 +843,7 @@ __device__ __forceinline__ void accumulate_block_gemm(
                 #pragma unroll
                 for (int nn = 0; nn < N_PER_THREAD; ++nn)
                     temp_acc[mm][nn] = 0;
-            #pragma clang loop unroll(disable)
+            #pragma clang loop unroll_count(2)
             for (int g = 4; g < 8; ++g)
             {
                 const int kk = bp * 8 + g;
@@ -1540,6 +1611,8 @@ void streaming_lm_head_kernel(
         if constexpr (Traits::is_dual_scale_asym)
         {
             // Pattern DA: two-phase accumulation (Q2_K, IQ1_M)
+            // Single-path with ternary bounds check — avoids m_safe code
+            // duplication that would push VGPR past 64 (losing 4-wave occupancy).
             const int kg_base = block * 8;
 
             // Lo half
@@ -1615,18 +1688,37 @@ void streaming_lm_head_kernel(
             #pragma unroll
             for (int mm = 0; mm < M_TILE; ++mm)
                 temp_acc[mm] = 0;
-            #pragma unroll
-            for (int kg = 0; kg < 4; ++kg)
+            if (m_safe)
             {
-                const int32_t b_val = packed[kg];
-                const int a_kg_idx = kg_base + kg;
                 #pragma unroll
-                for (int mm = 0; mm < M_TILE; ++mm)
+                for (int kg = 0; kg < 4; ++kg)
                 {
-                    const int gm = m_block + mm;
-                    const int32_t a_val = (m_safe || gm < M)
-                        ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
-                    temp_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, temp_acc[mm], false);
+                    const int32_t b_val = packed[kg];
+                    const int a_kg_idx = kg_base + kg;
+                    #pragma unroll
+                    for (int mm = 0; mm < M_TILE; ++mm)
+                    {
+                        const int32_t a_val = a_global[
+                            static_cast<int64_t>(m_block + mm) * a_row_stride + a_kg_idx];
+                        temp_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, temp_acc[mm], false);
+                    }
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int kg = 0; kg < 4; ++kg)
+                {
+                    const int32_t b_val = packed[kg];
+                    const int a_kg_idx = kg_base + kg;
+                    #pragma unroll
+                    for (int mm = 0; mm < M_TILE; ++mm)
+                    {
+                        const int gm = m_block + mm;
+                        const int32_t a_val = (gm < M)
+                            ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
+                        temp_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, temp_acc[mm], false);
+                    }
                 }
             }
             const float slo = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
@@ -1638,18 +1730,37 @@ void streaming_lm_head_kernel(
             #pragma unroll
             for (int mm = 0; mm < M_TILE; ++mm)
                 temp_acc[mm] = 0;
-            #pragma unroll
-            for (int kg = 4; kg < 8; ++kg)
+            if (m_safe)
             {
-                const int32_t b_val = packed[kg];
-                const int a_kg_idx = kg_base + kg;
                 #pragma unroll
-                for (int mm = 0; mm < M_TILE; ++mm)
+                for (int kg = 4; kg < 8; ++kg)
                 {
-                    const int gm = m_block + mm;
-                    const int32_t a_val = (m_safe || gm < M)
-                        ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
-                    temp_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, temp_acc[mm], false);
+                    const int32_t b_val = packed[kg];
+                    const int a_kg_idx = kg_base + kg;
+                    #pragma unroll
+                    for (int mm = 0; mm < M_TILE; ++mm)
+                    {
+                        const int32_t a_val = a_global[
+                            static_cast<int64_t>(m_block + mm) * a_row_stride + a_kg_idx];
+                        temp_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, temp_acc[mm], false);
+                    }
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int kg = 4; kg < 8; ++kg)
+                {
+                    const int32_t b_val = packed[kg];
+                    const int a_kg_idx = kg_base + kg;
+                    #pragma unroll
+                    for (int mm = 0; mm < M_TILE; ++mm)
+                    {
+                        const int gm = m_block + mm;
+                        const int32_t a_val = (gm < M)
+                            ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
+                        temp_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, temp_acc[mm], false);
+                    }
                 }
             }
             const float shi = __half2float(*reinterpret_cast<const __half*>(&aux_bits));
@@ -1667,20 +1778,41 @@ void streaming_lm_head_kernel(
                 block_acc[mm] = 0; sum_a[mm] = 0;
             }
             const int kg_base = block * 8;
-            #pragma unroll
-            for (int kg = 0; kg < 8; ++kg)
+            if (m_safe)
             {
-                const int32_t b_val = packed[kg];
-                const int a_kg_idx = kg_base + kg;
                 #pragma unroll
-                for (int mm = 0; mm < M_TILE; ++mm)
+                for (int kg = 0; kg < 8; ++kg)
                 {
-                    const int gm = m_block + mm;
-                    const int32_t a_val = (m_safe || gm < M)
-                        ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
-                    block_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, block_acc[mm], false);
-                    sum_a[mm] = __builtin_amdgcn_sdot4(
-                        a_val, static_cast<int32_t>(0x01010101), sum_a[mm], false);
+                    const int32_t b_val = packed[kg];
+                    const int a_kg_idx = kg_base + kg;
+                    #pragma unroll
+                    for (int mm = 0; mm < M_TILE; ++mm)
+                    {
+                        const int32_t a_val = a_global[
+                            static_cast<int64_t>(m_block + mm) * a_row_stride + a_kg_idx];
+                        block_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, block_acc[mm], false);
+                        sum_a[mm] = __builtin_amdgcn_sdot4(
+                            a_val, static_cast<int32_t>(0x01010101), sum_a[mm], false);
+                    }
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int kg = 0; kg < 8; ++kg)
+                {
+                    const int32_t b_val = packed[kg];
+                    const int a_kg_idx = kg_base + kg;
+                    #pragma unroll
+                    for (int mm = 0; mm < M_TILE; ++mm)
+                    {
+                        const int gm = m_block + mm;
+                        const int32_t a_val = (gm < M)
+                            ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
+                        block_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, block_acc[mm], false);
+                        sum_a[mm] = __builtin_amdgcn_sdot4(
+                            a_val, static_cast<int32_t>(0x01010101), sum_a[mm], false);
+                    }
                 }
             }
             const float bs = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
@@ -1894,15 +2026,20 @@ static bool launch_native_vnni_gemm(
     // =========================================================================
     // STREAMING DISPATCH: LM_Head-like shapes (massive N, moderate K)
     //
-    // For shapes where N >> K and N is very large, the cooperative-LDS kernel
-    // is compute-bound with ~50% time in barriers.  The streaming kernel
-    // eliminates ALL barriers and LDS, achieving 3-wave occupancy.
+    // For shapes where N >> K and N is very large, the streaming kernel
+    // eliminates ALL barriers and LDS, achieving 3-4 wave occupancy.
+    //
+    // However, this only benefits Pattern S and D formats (light decode).
+    // Pattern A and DA formats have heavy decode that causes register
+    // spilling in the streaming kernel — cooperative is 25-130% faster.
     //
     // Condition: N >= 16384 captures LM_Head (N=151936) and large FFN_Up
     // (e.g. 7B N=18944).  K <= 4096 is a safety check.
     // =========================================================================
-    if (N >= 16384 && K <= 4096) {
-        return launch_streaming(M16{});
+    if constexpr (NVNNIGemmTraits<FMT>::prefer_streaming) {
+        if (N >= 16384 && K <= 4096) {
+            return launch_streaming(M16{});
+        }
     }
 
     if (use_n128) {
@@ -1920,8 +2057,19 @@ static bool launch_native_vnni_gemm(
         //   - N64/M32 for Pattern D: doubles A-data bandwidth → -10% at M≥128
         //   - Fully unroll(disable): partial help (+8-19%) but scratch persists
         // The M32/2-wave+scratch path remains the best compromise.
+        // Force M16 for Pattern DA: ISA shows VGPR=127 so 3-wave is unreachable
+        // (needs ≤84 VGPRs).  Using 2-wave launch avoids compiler spilling to
+        // scratch in a futile attempt to hit 3-wave.
+        // N128/M32/2w is NOT viable: 200 bytes scratch for Pattern DA.
         if constexpr (NVNNIGemmTraits<FMT>::is_dual_scale_asym) {
-            return launch3(N128{}, M16{});
+            return launch(N128{}, M16{});
+        }
+
+        // Pattern A (asymmetric: Q4_1, Q5_1, IQ1_S): force M32/2-wave on N128.
+        // N128/M16/3w spills 40-72 bytes scratch to achieve 3-wave occupancy.
+        // N128/M32/2w is scratch-free (126-128 VGPRs) with better A-data reuse.
+        if constexpr (NVNNIGemmTraits<FMT>::is_asymmetric) {
+            return launch(N128{}, M32{});
         }
 
         // Hybrid N128 dispatch: M16/3-wave for small grids, M32/2-wave for large
@@ -1953,9 +2101,10 @@ static bool launch_native_vnni_gemm(
         }
     } else {
         // Dual-scale-asymmetric formats (Pattern DA): force M16 on N64 path.
-        // N64/M64 causes 652 bytes scratch spill for Pattern DA.
+        // N64/M16/3w: VGPR=84, 84B scratch (compiler spills to hit 3-wave).
+        // N64/M16/2w: VGPR=106, 0 scratch.  Use 2-wave to avoid scratch.
         if constexpr (NVNNIGemmTraits<FMT>::is_dual_scale_asym) {
-            return launch3(N64{}, M16{});
+            return launch(N64{}, M16{});
         }
 
         // N64 (K-heavy) dispatch with hybrid M16/3-wave for small-M shapes.
@@ -1987,11 +2136,18 @@ static bool launch_native_vnni_gemm(
             }
         }
 
-        // Dual-scale formats (Pattern D): cap tile at M32 on N64 path.
-        // N64/M64 causes 124 bytes scratch spill for Pattern D (M_PER_THREAD=4
-        // with two-phase still needs too many registers at THREADS_M=16).
+        // Cap M_TILE at 32 for Pattern A and Pattern D on N64 path.
+        //
+        // Pattern A (asymmetric: Q4_1, Q5_1, IQ1_S):
+        //   N64/M64 causes scratch spill (8-16B) and saturates VGPRs at 127-128.
+        //   N64/M32 is clean: 108-111 VGPRs, zero scratch, 2-wave.
+        //
+        // Pattern D (dual-scale: Q6_K, Q3_K, IQ2_S, IQ2_XS):
+        //   N64/M64 causes 124 bytes scratch spill for Pattern D (M_PER_THREAD=4
+        //   with two-phase still needs too many registers at THREADS_M=16).
         int effective_m_tile = m_tile;
-        if constexpr (NVNNIGemmTraits<FMT>::is_dual_scale) {
+        if constexpr (NVNNIGemmTraits<FMT>::is_dual_scale ||
+                       NVNNIGemmTraits<FMT>::is_asymmetric) {
             effective_m_tile = (effective_m_tile > 32) ? 32 : effective_m_tile;
         }
 
@@ -2093,5 +2249,25 @@ bool rocmInitIQGridTables_gemm(
     if (e != hipSuccess) { fprintf(stderr, "[rocmInitIQGridTables_gemm] iq2xxs failed: %s\n", hipGetErrorString(e)); return false; }
     e = hipMemcpyToSymbol(d_iq1s_grid_gemm, h_iq1s_grid, sizeof(d_iq1s_grid_gemm));
     if (e != hipSuccess) { fprintf(stderr, "[rocmInitIQGridTables_gemm] iq1s failed: %s\n", hipGetErrorString(e)); return false; }
+
+    // Build 8× grid for IQ1_M: grid values {-1,1,3} → {-8,8,24}
+    // Used for delta baking: (grid + delta) × 8 can represent ±IQ1S_DELTA as ±1 in int8
+    {
+        uint64_t h_iq1s_grid_8x[2048];
+        const uint64_t* src = static_cast<const uint64_t*>(h_iq1s_grid);
+        for (int i = 0; i < 2048; ++i) {
+            uint64_t packed = src[i];
+            uint64_t result = 0;
+            for (int j = 0; j < 8; ++j) {
+                int8_t val = static_cast<int8_t>((packed >> (j * 8)) & 0xFF);
+                int8_t val8x = static_cast<int8_t>(val * 8);
+                result |= (static_cast<uint64_t>(static_cast<uint8_t>(val8x)) << (j * 8));
+            }
+            h_iq1s_grid_8x[i] = result;
+        }
+        e = hipMemcpyToSymbol(d_iq1s_grid_8x_gemm, h_iq1s_grid_8x, sizeof(d_iq1s_grid_8x_gemm));
+        if (e != hipSuccess) { fprintf(stderr, "[rocmInitIQGridTables_gemm] iq1s_8x failed: %s\n", hipGetErrorString(e)); return false; }
+    }
+
     return true;
 }
