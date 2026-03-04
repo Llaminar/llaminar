@@ -362,6 +362,7 @@ namespace llaminar2
                 const uint8_t *d_payload,
                 const void *d_block_scales, // __half* (FP16 d)
                 const void *d_block_mins,   // __half* (FP16 m, nullable)
+                const void *d_block_emins,  // uint32_t* (packed FP16 emins, Q2_K only, else NULL)
                 float *d_output,
                 const float *d_scales_A,
                 int M, int N, int K,
@@ -377,6 +378,7 @@ namespace llaminar2
                 const uint8_t *d_payload,
                 const void *d_block_scales, // __half* (FP16 d)
                 const void *d_block_mins,   // __half* (FP16 m), NULL for symmetric formats
+                const void *d_block_emins,  // uint32_t* (packed FP16 emins, Q2_K only, else NULL)
                 float *d_C_fp32,
                 const float *d_scale_A,
                 float *d_partial_fp32, // [KB_MAX × N] partial buffer (nullable when KB=1)
@@ -581,6 +583,7 @@ namespace llaminar2
             uint8_t *d_weights_native_payload = nullptr; // [blocks_per_row × N × payload_bytes]
             void *d_weights_native_scales = nullptr;     // [blocks_per_row × N] __half*
             void *d_weights_native_mins = nullptr;       // [blocks_per_row × N] __half* (asymmetric only, else NULL)
+            void *d_weights_native_emins = nullptr;      // [blocks_per_row × N] uint32_t* (Q2_K only, packed {lo,hi} FP16 emins)
             uint8_t native_vnni_codebook_id = 0;
             uint32_t native_vnni_blocks_per_row = 0;
             bool has_native_vnni = false;
@@ -593,6 +596,7 @@ namespace llaminar2
             void *startup_h2d_pinned_native_payload = nullptr;
             void *startup_h2d_pinned_native_scales = nullptr;
             void *startup_h2d_pinned_native_mins = nullptr;
+            void *startup_h2d_pinned_native_emins = nullptr;
 
             // Work buffer pointers - obtained from workspace at execution time
             // These are NOT owned by the kernel - they point into workspace-managed memory
@@ -660,6 +664,10 @@ namespace llaminar2
                         rocmQuantGemm_freeDevice(d_weights_native_payload, rocm_device_id);
                     if (d_weights_native_scales)
                         rocmQuantGemm_freeDevice(d_weights_native_scales, rocm_device_id);
+                    if (d_weights_native_mins)
+                        rocmQuantGemm_freeDevice(d_weights_native_mins, rocm_device_id);
+                    if (d_weights_native_emins)
+                        rocmQuantGemm_freeDevice(d_weights_native_emins, rocm_device_id);
 #ifdef HAVE_ROCM
                     if (startup_repack_ready_event)
                     {
@@ -683,6 +691,8 @@ namespace llaminar2
                     free_pinned(startup_h2d_pinned_vnni);
                     free_pinned(startup_h2d_pinned_native_payload);
                     free_pinned(startup_h2d_pinned_native_scales);
+                    free_pinned(startup_h2d_pinned_native_mins);
+                    free_pinned(startup_h2d_pinned_native_emins);
 #endif
                 }
                 // Work buffers (including d_B_rowmajor_scratch) are NOT freed -
@@ -1417,15 +1427,15 @@ namespace llaminar2
                 max_abs_factor = 32.0f; // range [-32, +31]
                 break;
             case TensorType::Q3_K:
-                codebook_id = 9;      // Q3_K kernel — 3-bit symmetric with dual-scale blocks
-                payload_bytes = 16;   // 32×4-bit nibbles: pre-merged (low2 | hbit<<2) per 32-element block
+                codebook_id = 9;      // Q3_K kernel — 3-bit with BIT_SPREAD decode, dual-scale
+                payload_bytes = 12;   // 8B pre-transposed 2-bit + 4B grouped hbits per 32-element block
                 is_asymmetric = true; // Repurpose mins array for scale_hi (dual-scale)
                 is_superblock = true;
                 max_abs_factor = 4.0f; // range [-4, +3]
                 break;
             case TensorType::Q2_K:
-                codebook_id = 10;     // Q2_K kernel — 2-bit asymmetric with dual-scale + embedded mins
-                payload_bytes = 12;   // 8B packed 2-bit + 4B embedded FP16 mins per 32-element block
+                codebook_id = 10;     // Q2_K kernel — 2-bit asymmetric with dual-scale, emins in separate array
+                payload_bytes = 8;    // 8B packed 2-bit per 32-element block (emins stored in native_vnni_emins[])
                 is_asymmetric = true; // Repurpose mins array for scale_hi (dual-scale)
                 is_superblock = true;
                 max_abs_factor = 3.0f; // range [0, +3]
@@ -1467,14 +1477,14 @@ namespace llaminar2
                 break;
             case TensorType::IQ1_S:
                 codebook_id = 16;
-                payload_bytes = 10;   // 4 qs_lo + 2 qh_word + 2 scale_d + 2 block_m (embedded)
+                payload_bytes = 6;    // 4 qs_lo + 2 qh_word (scale/min in global arrays)
                 is_asymmetric = true; // delta correction via min = dl * delta
                 is_superblock = true;
                 max_abs_factor = 1.125f; // max |grid + delta| = |1 + 0.125|
                 break;
             case TensorType::IQ1_M:
                 codebook_id = 17;
-                payload_bytes = 14;   // 4 qs_lo + 2 qh + 4 delta_lo/hi + 2 scale_lo + 2 scale_hi (embedded)
+                payload_bytes = 6;    // 4 qs_lo + 2 qh (scales in global arrays, emins baked into grid)
                 is_asymmetric = true; // dual scale + embedded delta corrections
                 is_superblock = true;
                 max_abs_factor = 1.125f;
@@ -1558,6 +1568,8 @@ namespace llaminar2
             out.native_vnni_scales.resize(static_cast<size_t>(blocks_per_row) * N);
             if (is_asymmetric)
                 out.native_vnni_mins.resize(static_cast<size_t>(blocks_per_row) * N);
+            if (tensor->native_type() == TensorType::Q2_K)
+                out.native_vnni_emins.resize(static_cast<size_t>(blocks_per_row) * N);
             out.native_vnni_codebook_id = codebook_id;
             out.native_vnni_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
 
@@ -1833,9 +1845,10 @@ namespace llaminar2
                         // 3-bit: low 2 bits from qs[64] (interleaved), high bit from hmask[32]
                         // 16 sub-blocks of 16 → paired into 8×32 for dual-scale
                         //
-                        // Nibble-repack: Pre-merge (low2 | hbit<<2) into 4-bit nibbles.
-                        // Payload: 16 bytes (32 × 4-bit, packed 2 per byte: lo/hi nibble).
-                        // Decode cost: ~42 VALU (was 139 with separate q2+hbits layout).
+                        // 12B native layout: [8B pre-transposed 2-bit][4B grouped hbits]
+                        // - 2-bit: Q2_K-style pre-transpose (byte[j] holds 4 groups' low2)
+                        // - hbits: uint32 where bits [g*4..g*4+3] hold group g's 4 hbits
+                        // Decode: BIT_SPREAD (×0x00204081 & 0x01010101) scatters hbits to bytes
                         const int super_blocks_per_row = (K + 255) / 256;
                         const int sb_idx = b / 8;
                         const int sub_idx = b % 8;
@@ -1849,7 +1862,6 @@ namespace llaminar2
                         //   shift   = ((i%128)/32) * 2          (which 2-bit field in that byte)
                         //   low 2 bits: qs[qs_byte] >> shift & 3
                         //   high bit:   hmask[i%32] >> (i/32) & 1
-                        // Merged 3-bit value [0..7] = low2 | (hbit << 2)
                         const int base = sub_idx * 32;
                         uint8_t raw3[32];
                         for (int e = 0; e < 32; ++e)
@@ -1862,15 +1874,32 @@ namespace llaminar2
                             raw3[e] = static_cast<uint8_t>(low2 | (hbit << 2));
                         }
 
-                        // Pack as 4-bit nibbles: byte[g] = raw3[g] | (raw3[g+16] << 4)
-                        // Groups 0-3 (elements 0-15, scale_lo) in low nibbles
-                        // Groups 4-7 (elements 16-31, scale_hi) in high nibbles
-                        uint8_t payload_buf[16];
-                        for (int g = 0; g < 16; ++g)
-                            payload_buf[g] = raw3[g] | (raw3[g + 16] << 4);
+                        // Part 1: 8B pre-transposed 2-bit (Q2_K style)
+                        // byte[h*4+j] holds low2 of elements {hbase+j, hbase+j+4, hbase+j+8, hbase+j+12}
+                        // packed as 2-bit fields at positions {0,2,4,6}
+                        uint8_t payload_buf[12];
+                        for (int h = 0; h < 2; ++h)
+                        {
+                            const int hbase = h * 16;
+                            for (int j = 0; j < 4; ++j)
+                            {
+                                payload_buf[h * 4 + j] = static_cast<uint8_t>(
+                                    (raw3[hbase + j] & 3) |
+                                    ((raw3[hbase + j + 4] & 3) << 2) |
+                                    ((raw3[hbase + j + 8] & 3) << 4) |
+                                    ((raw3[hbase + j + 12] & 3) << 6));
+                            }
+                        }
+
+                        // Part 2: 4B grouped hbits — bit e = high bit of element e
+                        // Groups of 4 consecutive hbits sit at nibble boundaries for BIT_SPREAD decode
+                        uint32_t hbits_u32 = 0;
+                        for (int e = 0; e < 32; ++e)
+                            hbits_u32 |= static_cast<uint32_t>((raw3[e] >> 2) & 1) << e;
+                        std::memcpy(payload_buf + 8, &hbits_u32, 4);
 
                         uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload_buf, 16);
+                        std::memcpy(dst, payload_buf, 12);
 
                         // Unpack 16 × 6-bit scales from scales[12] and compute dual scales
                         int8_t unpacked_scales[16];
@@ -1917,7 +1946,6 @@ namespace llaminar2
                         //   shift   = ((i%128)/32) * 2
                         //   value   = (qs[qs_byte] >> shift) & 3
                         const int base_elem = sub_idx * 32;
-                        uint8_t payload_buf[12];
                         uint8_t raw2[32];
                         for (int e = 0; e < 32; ++e)
                         {
@@ -1933,6 +1961,7 @@ namespace llaminar2
                         //
                         // half 0: payload[j] = e[j] | e[j+4]<<2 | e[j+8]<<4 | e[j+12]<<6
                         // half 1: payload[4+j] = e[16+j] | e[16+j+4]<<2 | ...
+                        uint8_t payload_buf[8];
                         for (int half = 0; half < 2; ++half)
                         {
                             const int hbase = half * 16;
@@ -1954,16 +1983,17 @@ namespace llaminar2
                         scale_fp16 = fp32_to_fp16(d_val * static_cast<float>(blk->scales[sc_lo_idx] & 0xF));
                         min_fp16 = fp32_to_fp16(d_val * static_cast<float>(blk->scales[sc_hi_idx] & 0xF));
 
-                        // Embed FP16 mins into payload[8..11]: -dmin*(sc>>4) for each half
+                        // Store FP16 emins in separate array (not embedded in payload)
+                        // Packed as uint32: {emb_min_lo_fp16, emb_min_hi_fp16}
                         const uint16_t emb_min_lo = fp32_to_fp16(
                             -dmin * static_cast<float>(blk->scales[sc_lo_idx] >> 4));
                         const uint16_t emb_min_hi = fp32_to_fp16(
                             -dmin * static_cast<float>(blk->scales[sc_hi_idx] >> 4));
-                        std::memcpy(payload_buf + 8, &emb_min_lo, 2);
-                        std::memcpy(payload_buf + 10, &emb_min_hi, 2);
+                        out.native_vnni_emins[linear] =
+                            static_cast<uint32_t>(emb_min_lo) | (static_cast<uint32_t>(emb_min_hi) << 16);
 
                         uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload_buf, 12);
+                        std::memcpy(dst, payload_buf, 8);
 
                         out.native_vnni_scales[linear] = scale_fp16;
                         out.native_vnni_mins[linear] = min_fp16;
@@ -2161,7 +2191,7 @@ namespace llaminar2
                         uint16_t qh_word;
                         std::memcpy(&qh_word, &blk->qh[sub_idx], sizeof(uint16_t));
 
-                        uint8_t payload_buf[10];
+                        uint8_t payload_buf[6];
                         payload_buf[0] = qs[0];
                         payload_buf[1] = qs[1];
                         payload_buf[2] = qs[2];
@@ -2180,13 +2210,9 @@ namespace llaminar2
                         const float delta = (qh_word & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
                         min_fp16 = fp32_to_fp16(dl * delta);
 
-                        // Embed scale_d and block_m at end of payload (eliminates
-                        // separate d_block_scales/d_block_mins address tracking in kernel)
-                        std::memcpy(payload_buf + 6, &scale_fp16, 2);
-                        std::memcpy(payload_buf + 8, &min_fp16, 2);
-
+                        // Scale and min stored in global arrays (not embedded in payload)
                         uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload_buf, 10);
+                        std::memcpy(dst, payload_buf, 6);
                         out.native_vnni_scales[linear] = scale_fp16;
                         out.native_vnni_mins[linear] = min_fp16;
                         continue;
@@ -2232,7 +2258,7 @@ namespace llaminar2
                         scale_fp16 = fp32_to_fp16(dl1 * 0.125f);
                         min_fp16 = fp32_to_fp16(dl2 * 0.125f);
 
-                        uint8_t payload_buf[14];
+                        uint8_t payload_buf[6];
                         payload_buf[0] = qs[0];
                         payload_buf[1] = qs[1];
                         payload_buf[2] = qs[2];
@@ -2240,18 +2266,10 @@ namespace llaminar2
                         payload_buf[4] = qh[0];
                         payload_buf[5] = qh[1];
 
-                        // Emin = 0: delta is baked into grid values, no asymmetric correction needed
-                        const uint16_t zero_fp16 = 0; // FP16 zero
-                        std::memcpy(payload_buf + 6, &zero_fp16, 2);
-                        std::memcpy(payload_buf + 8, &zero_fp16, 2);
-
-                        // Embed scale_lo and scale_hi at end of payload (eliminates
-                        // separate d_block_scales/d_block_mins address tracking in kernel)
-                        std::memcpy(payload_buf + 10, &scale_fp16, 2);
-                        std::memcpy(payload_buf + 12, &min_fp16, 2);
-
+                        // Scale and min stored in global arrays (not embedded in payload).
+                        // Emin = 0: delta is baked into grid values, no asymmetric correction needed.
                         uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload_buf, 14);
+                        std::memcpy(dst, payload_buf, 6);
                         out.native_vnni_scales[linear] = scale_fp16;
                         out.native_vnni_mins[linear] = min_fp16;
                         continue;
@@ -3502,6 +3520,7 @@ namespace llaminar2
                                 impl_->d_weights_native_payload,
                                 impl_->d_weights_native_scales,
                                 impl_->d_weights_native_mins,
+                                impl_->d_weights_native_emins,
                                 d_gemv_output,
                                 impl_->d_scales_A,
                                 impl_->d_scatter_partial,
@@ -4013,6 +4032,7 @@ namespace llaminar2
                                 impl_->d_weights_native_payload,
                                 impl_->d_weights_native_scales,
                                 impl_->d_weights_native_mins,
+                                impl_->d_weights_native_emins,
                                 d_prefill_output,
                                 d_scales_A,
                                 m, n, k,
@@ -4878,6 +4898,7 @@ namespace llaminar2
                                 rocm_kernel->impl_->d_weights_native_payload,
                                 rocm_kernel->impl_->d_weights_native_scales,
                                 rocm_kernel->impl_->d_weights_native_mins,
+                                rocm_kernel->impl_->d_weights_native_emins,
                                 d_output,
                                 impl_->d_scales_A,
                                 impl_->d_scatter_partial,
@@ -5611,6 +5632,49 @@ namespace llaminar2
                                     }
                                 }
                             }
+
+                            // Allocate uint32 emins buffer (Q2_K only: packed {emin_lo, emin_hi} FP16)
+                            if (upload.d_native_vnni_payload && !packed_->native_vnni_emins.empty())
+                            {
+                                const size_t emins_bytes = packed_->native_vnni_emins.size() * sizeof(uint32_t);
+                                void *d_emins_tmp = nullptr;
+#ifdef HAVE_ROCM
+                                hipError_t alloc_err = hipMalloc(&d_emins_tmp, emins_bytes);
+                                if (alloc_err != hipSuccess)
+                                {
+                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI emins: "
+                                              << hipGetErrorString(alloc_err));
+                                    d_emins_tmp = nullptr;
+                                }
+#endif
+                                upload.d_native_vnni_emins = d_emins_tmp;
+                                if (d_emins_tmp)
+                                {
+                                    err = startupMemcpyAsyncOrSync(
+                                        d_emins_tmp,
+                                        packed_->native_vnni_emins.data(),
+                                        emins_bytes,
+                                        async_upload_enabled,
+                                        upload.startup_h2d_stream,
+                                        &upload.startup_h2d_pinned_native_emins,
+                                        "ROCmQuantisedGemmKernel::ensureWeightsConverted",
+                                        "native_vnni_emins");
+                                    if (err != hipSuccess)
+                                    {
+#ifdef HAVE_ROCM
+                                        hipFree(d_emins_tmp);
+#endif
+                                        upload.d_native_vnni_emins = nullptr;
+                                        LOG_WARN("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI emins: "
+                                                 << hipGetErrorString(err));
+                                    }
+                                    else
+                                    {
+                                        LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded native-VNNI emins="
+                                                  << (emins_bytes / 1024) << " KB");
+                                    }
+                                }
+                            }
                         }
 
                         if (packed_->int8_data_vnni.empty())
@@ -5686,6 +5750,7 @@ namespace llaminar2
                     packed_->d_native_vnni_payload = upload.d_native_vnni_payload;
                     packed_->d_native_vnni_scales = upload.d_native_vnni_scales;
                     packed_->d_native_vnni_mins = upload.d_native_vnni_mins;
+                    packed_->d_native_vnni_emins = upload.d_native_vnni_emins;
                     packed_->startup_repack_ready_event = upload.startup_repack_ready_event;
                     packed_->startup_repack_event_pending = upload.startup_repack_event_pending;
                     packed_->startup_commit_ready_event = upload.startup_commit_ready_event;
@@ -5700,6 +5765,7 @@ namespace llaminar2
                     impl_->d_weights_native_payload = upload.d_native_vnni_payload;
                     impl_->d_weights_native_scales = upload.d_native_vnni_scales;
                     impl_->d_weights_native_mins = upload.d_native_vnni_mins;
+                    impl_->d_weights_native_emins = upload.d_native_vnni_emins;
                     impl_->native_vnni_codebook_id = packed_->native_vnni_codebook_id;
                     impl_->native_vnni_blocks_per_row = packed_->native_vnni_blocks_per_row;
                     impl_->has_native_vnni = (upload.d_native_vnni_payload != nullptr && upload.d_native_vnni_scales != nullptr);
@@ -5712,6 +5778,7 @@ namespace llaminar2
                     impl_->startup_h2d_pinned_native_payload = upload.startup_h2d_pinned_native_payload;
                     impl_->startup_h2d_pinned_native_scales = upload.startup_h2d_pinned_native_scales;
                     impl_->startup_h2d_pinned_native_mins = upload.startup_h2d_pinned_native_mins;
+                    impl_->startup_h2d_pinned_native_emins = upload.startup_h2d_pinned_native_emins;
                 }
                 weights_converted_ = true;
 
@@ -5996,6 +6063,7 @@ namespace llaminar2
                                 impl_->d_weights_native_payload,
                                 impl_->d_weights_native_scales,
                                 impl_->d_weights_native_mins,
+                                impl_->d_weights_native_emins,
                                 d_C,
                                 impl_->d_scales_A,
                                 impl_->d_scatter_partial,
@@ -6116,6 +6184,7 @@ namespace llaminar2
                             impl_->d_weights_native_payload,
                             impl_->d_weights_native_scales,
                             impl_->d_weights_native_mins,
+                            impl_->d_weights_native_emins,
                             d_C,
                             impl_->d_scales_A,
                             m, n, k,
@@ -6221,6 +6290,7 @@ namespace llaminar2
                                 impl_->d_weights_native_payload,
                                 impl_->d_weights_native_scales,
                                 impl_->d_weights_native_mins,
+                                impl_->d_weights_native_emins,
                                 d_C,
                                 impl_->d_scales_A,
                                 impl_->d_scatter_partial,

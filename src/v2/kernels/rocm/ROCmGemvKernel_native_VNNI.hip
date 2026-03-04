@@ -106,25 +106,22 @@ struct NVNNITraits {
                                         || FMT == NVNNI_IQ1_M);
     // Dual-scale + asymmetric: embedded FP16 mins in payload for split sum_a correction
     static constexpr bool is_dual_scale_asym = (FMT == NVNNI_Q2_K || FMT == NVNNI_IQ1_M);
-    // Offset of embedded FP16 min_lo/min_hi within payload (only for dual_scale_asym)
-    static constexpr int embedded_min_offset = (FMT == NVNNI_IQ1_M) ? 6 : 8;
-    // IQ1 embedded scales: scale_d/scale_lo + block_m/scale_hi packed as uint32_t at this offset.
-    // Eliminates separate d_block_scales/d_block_mins pointer arithmetic (−6 VALU/iter).
-    static constexpr bool has_embedded_scales = (FMT == NVNNI_IQ1_S || FMT == NVNNI_IQ1_M);
-    static constexpr int  embedded_scale_offset =
-        (FMT == NVNNI_IQ1_S) ? 6 :    // after qs[4]+qh[2]
-        (FMT == NVNNI_IQ1_M) ? 10 :   // after qs[4]+qh[2]+delta_lo[2]+delta_hi[2]
-        -1;
+    // Q2_K: emins in separate global array; IQ1_M: emins = 0 (baked into grid)
+    static constexpr bool needs_emin_array = (FMT == NVNNI_Q2_K);
+    // All scales/mins now in global arrays — no embedded data in payload
+    static constexpr bool has_embedded_scales = false;
+    static constexpr int  embedded_scale_offset = -1;
+    static constexpr int  embedded_min_offset = -1;
     static constexpr bool is_5bit       = (FMT == NVNNI_Q5_0 || FMT == NVNNI_Q5_1);
     static constexpr bool is_6bit       = (FMT == NVNNI_Q6_K);
     static constexpr bool is_3bit       = (FMT == NVNNI_Q3_K);
     static constexpr bool is_2bit       = (FMT == NVNNI_Q2_K);
     static constexpr bool uses_lut      = (FMT == NVNNI_IQ4_NL);
     static constexpr int  payload_bytes =
-        is_iq1_grid ? ((FMT == NVNNI_IQ1_M) ? 14 : 10) :
+        is_iq1_grid ? 6 :                            // IQ1_S(6), IQ1_M(6): qs[4]+qh[2] only
         is_iq3_grid ? (has_qh ? 13 : 12) :
         is_iq2_grid ? (has_qh ? 9 : 8) :
-        is_6bit ? 24 : is_5bit ? 20 : is_3bit ? 16 : is_2bit ? 12 : 16;
+        is_6bit ? 24 : is_5bit ? 20 : is_3bit ? 12 : is_2bit ? 8 : 16;
     // Centering offset for symmetric formats; asymmetric formats don't center
     static constexpr int center_4bit = (FMT == NVNNI_Q4_0) ? 8 : 0;
     static constexpr int center_5bit = (FMT == NVNNI_Q5_0) ? 16 : 0;
@@ -276,13 +273,8 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
             const size_t linear = b_offset_N + static_cast<size_t>(n);
             const uint8_t* payload = d_payload + linear * Traits::payload_bytes;
 
-            // IQ1: scale/min embedded at end of payload → single pointer,
-            // eliminates separate d_block_scales/d_block_mins address tracking.
-            uint16_t scale_bits;
-            if constexpr (Traits::has_embedded_scales)
-                scale_bits = *reinterpret_cast<const uint16_t*>(payload + Traits::embedded_scale_offset);
-            else
-                scale_bits = d_block_scales[linear];
+            // Scale always from global array
+            uint16_t scale_bits = d_block_scales[linear];
 
             int32_t packed_groups[8];
 
@@ -472,11 +464,7 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
 
                 const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-                uint16_t hi_bits;
-                if constexpr (Traits::has_embedded_scales)
-                    hi_bits = *reinterpret_cast<const uint16_t*>(payload + Traits::embedded_scale_offset + 2);
-                else
-                    hi_bits = d_block_mins[linear];
+                const uint16_t hi_bits = d_block_mins[linear];
                 const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&hi_bits));
                 f_acc[c] += static_cast<float>(acc_lo) * scale_lo
                           + static_cast<float>(acc_hi) * scale_hi;
@@ -492,10 +480,9 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     for (int g = 4; g < 8; ++g)
                         sum_a_hi = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_hi, false);
 
-                    const float min_lo = __half2float(*reinterpret_cast<const __half*>(
-                        payload + Traits::embedded_min_offset));
-                    const float min_hi = __half2float(*reinterpret_cast<const __half*>(
-                        payload + Traits::embedded_min_offset + 2));
+                    // IQ1_M: emins always zero (delta baked into grid values)
+                    constexpr float min_lo = 0.0f;
+                    constexpr float min_hi = 0.0f;
                     f_acc[c] += static_cast<float>(sum_a_lo) * min_lo
                               + static_cast<float>(sum_a_hi) * min_hi;
                 }
@@ -512,11 +499,7 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
 
                 if constexpr (Traits::is_asymmetric)
                 {
-                    uint16_t min_bits;
-                    if constexpr (Traits::has_embedded_scales)
-                        min_bits = *reinterpret_cast<const uint16_t*>(payload + Traits::embedded_scale_offset + 2);
-                    else
-                        min_bits = d_block_mins[linear];
+                    const uint16_t min_bits = d_block_mins[linear];
                     const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
                     f_acc[c] += static_cast<float>(sum_a) * block_m;
                 }
@@ -547,6 +530,7 @@ __global__ void gemv_native_vnni_kernel_t(
     const uint8_t*   __restrict__ d_payload,      // [blocks_per_row × N × payload_bytes] payload
     const uint16_t*  __restrict__ d_block_scales,  // [blocks_per_row × N] FP16 scale (d)
     const uint16_t*  __restrict__ d_block_mins,    // [blocks_per_row × N] FP16 min (m), NULL for symmetric
+    const uint32_t*  __restrict__ d_block_emins,   // [blocks_per_row × N] packed {lo,hi} emins (Q2_K only, else nullptr)
     float*           __restrict__ d_C_fp32,        // [N] output (FP32), used when kblocks=1
     float*           __restrict__ d_partial_fp32,  // [KB × N] partials, used when kblocks>1
     const float*     __restrict__ d_scale_A,       // [1] activation scale
@@ -796,48 +780,47 @@ __global__ void gemv_native_vnni_kernel_t(
                     }
                     else if constexpr (Traits::is_3bit)
                     {
-                        // Q3_K: 3-bit nibble-repack decode via SWAR nibble extraction + codebook
+                        // Q3_K: native 12B layout — [8B pre-transposed 2-bit][4B grouped hbits]
                         //
-                        // Payload layout (nibble-repacked during CPU packing):
-                        //   [0..15]: 32 × 4-bit nibbles, each holding pre-merged (low2 | hbit<<2)
-                        //            value range [0..7], packed 2 per byte (lo/hi nibble)
+                        // Decode: Q2_K-style shift+mask for low2, BIT_SPREAD scatter for hbits,
+                        //         XOR-SUB-XOR centering to [-4..+3]
                         //
-                        // Decode: extract nibbles → v_perm codebook → signed INT8 [-4..+3]
-                        //
-                        // Previous ISA cost:  139 VALU (SWAR 2-bit + transpose + hbit deposit + codebook)
-                        // New ISA cost:       ~42 VALU (nibble extraction + codebook)
-                        // Payload increase:   12 → 16 bytes (+33%), acceptable at 24% BW utilisation
-                        //
-                        // 3-bit codebook: {-4,-3,-2,-1,0,1,2,3} = {0xFC,0xFD,0xFE,0xFF,0x00,0x01,0x02,0x03}
-                        // Only 8 entries → single v_perm call (selector bits [2:0] = value)
-                        // NOTE: v_perm args reversed on HIP: pass (B,A) so sel 0-3 → A, sel 4-7 → B
-                        constexpr uint32_t Q3_CB_A = 0xFFFEFDFCu;  // indices 0-3: {-4,-3,-2,-1}
-                        constexpr uint32_t Q3_CB_B = 0x03020100u;  // indices 4-7: {0,1,2,3}
+                        // Payload layout (pre-transposed during CPU packing):
+                        //   [0..3]:  half 0 — byte[j] = e[j]&3 | (e[j+4]&3)<<2 | (e[j+8]&3)<<4 | (e[j+12]&3)<<6
+                        //   [4..7]:  half 1 — same pattern for elements 16-31
+                        //   [8..11]: grouped hbits — group g's 4 hbits at bits [g*4..g*4+3] of uint32
+                        constexpr uint32_t BIT_SPREAD = 0x00204081u;
+                        const uint32_t hbit_word = *reinterpret_cast<const uint32_t*>(payload + 8);
 
                         #pragma unroll
-                        for (int g = 0; g < 4; ++g)
+                        for (int half = 0; half < 2; ++half)
                         {
-                            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
-
-                            // Low nibbles → groups 0-3 (elements [4g..4g+3])
-                            const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
-                            packed_groups[g] = static_cast<int32_t>(
-                                __builtin_amdgcn_perm(Q3_CB_B, Q3_CB_A, lo_nibs));
-
-                            // High nibbles → groups 4-7 (elements [4g+16..4g+19])
-                            const uint32_t hi_nibs = (raw >> 4) & 0x0F0F0F0Fu;
-                            packed_groups[g + 4] = static_cast<int32_t>(
-                                __builtin_amdgcn_perm(Q3_CB_B, Q3_CB_A, hi_nibs));
+                            const uint32_t r = *reinterpret_cast<const uint32_t*>(payload + half * 4);
+                            #pragma unroll
+                            for (int g = 0; g < 4; ++g)
+                            {
+                                // Extract 2-bit values (Q2_K-style pre-transposed)
+                                const uint32_t low2_4 = (r >> (g * 2)) & 0x03030303u;
+                                // Extract and scatter hbit for this group
+                                const uint32_t hb4 = (hbit_word >> ((half * 4 + g) * 4)) & 0xFu;
+                                const uint32_t hb = ((hb4 * BIT_SPREAD) & 0x01010101u) << 2;
+                                // Merge: 3-bit value = low2 | (hbit << 2), range [0..7]
+                                uint32_t val = low2_4 | hb;
+                                // Center: [0..7] → [-4..+3] via XOR-SUB-XOR bias trick
+                                val = (val ^ 0x80808080u) - 0x04040404u;
+                                val ^= 0x80808080u;
+                                packed_groups[half * 4 + g] = static_cast<int32_t>(val);
+                            }
                         }
                     }
                     else if constexpr (Traits::is_2bit)
                     {
                         // Q2_K: Pre-transposed 2-bit decode — zero-transpose field extraction
                         //
-                        // Payload layout (pre-transposed during CPU packing):
+                        // Payload layout (pre-transposed during CPU packing, 8B native):
                         //   [0..3]:  half 0 — byte[j] = e[j] | e[j+4]<<2 | e[j+8]<<4 | e[j+12]<<6
                         //   [4..7]:  half 1 — same pattern for elements 16-31
-                        //   [8..11]: embedded FP16 mins: min_lo (2B) + min_hi (2B)
+                        //   (emins now in separate d_block_emins array)
                         //
                         // Field extraction directly produces group-order packed INT8:
                         //   groups[bg]     = raw & 0x03030303  → {e[0], e[1], e[2], e[3]}
@@ -1093,8 +1076,9 @@ __global__ void gemv_native_vnni_kernel_t(
                         f_acc[c] += static_cast<float>(acc_lo) * scale_lo
                                   + static_cast<float>(acc_hi) * scale_hi;
 
-                        // Q2_K/IQ1_M: dual-scale + embedded mins correction
-                        // Payload offset varies: Q2_K at byte 8, IQ1_M at byte 6
+                        // Q2_K/IQ1_M: dual-scale + emin correction
+                        // Q2_K: emins from separate d_block_emins array
+                        // IQ1_M: emins = 0 (baked into grid values)
                         if constexpr (Traits::is_dual_scale_asym)
                         {
                             constexpr int32_t ones = 0x01010101;
@@ -1106,8 +1090,17 @@ __global__ void gemv_native_vnni_kernel_t(
                             for (int g = 4; g < 8; ++g)
                                 sum_a_hi = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_hi, false);
 
-                            const float min_lo = __half2float(*reinterpret_cast<const __half*>(payload + Traits::embedded_min_offset));
-                            const float min_hi = __half2float(*reinterpret_cast<const __half*>(payload + Traits::embedded_min_offset + 2));
+                            float min_lo, min_hi;
+                            if constexpr (Traits::needs_emin_array) {
+                                const uint32_t emin_packed = d_block_emins[linear];
+                                const uint16_t emin_lo_bits = static_cast<uint16_t>(emin_packed);
+                                const uint16_t emin_hi_bits = static_cast<uint16_t>(emin_packed >> 16);
+                                min_lo = __half2float(*reinterpret_cast<const __half*>(&emin_lo_bits));
+                                min_hi = __half2float(*reinterpret_cast<const __half*>(&emin_hi_bits));
+                            } else {
+                                min_lo = 0.0f;
+                                min_hi = 0.0f;
+                            }
                             f_acc[c] += static_cast<float>(sum_a_lo) * min_lo
                                       + static_cast<float>(sum_a_hi) * min_hi;
                         }
@@ -1218,6 +1211,7 @@ __global__ void gemv_iq_lds_kernel_t(
     const uint8_t*   __restrict__ d_payload,
     const uint16_t*  __restrict__ d_block_scales,
     const uint16_t*  __restrict__ d_block_mins,
+    const uint32_t*  __restrict__ d_block_emins,
     float*           __restrict__ d_C_fp32,
     float*           __restrict__ d_partial_fp32,
     const float*     __restrict__ d_scale_A,
@@ -1313,6 +1307,7 @@ bool rocmGemv_native_vnni_fp32(
     const uint8_t* d_payload,
     const void* d_block_scales,  // __half* (FP16 scale d)
     const void* d_block_mins,    // __half* (FP16 min m), NULL for symmetric formats
+    const void* d_block_emins,   // uint32_t* packed {lo,hi} emins (Q2_K only, else nullptr)
     float* d_C_fp32,
     const float* d_scale_A,
     float* d_partial_fp32,       // [KB_MAX × N] partial buffer (nullable when KB=1)
@@ -1335,6 +1330,7 @@ bool rocmGemv_native_vnni_fp32(
     const int blocks_per_row = K / 32;
     const uint16_t* d_scales_u16 = static_cast<const uint16_t*>(d_block_scales);
     const uint16_t* d_mins_u16   = static_cast<const uint16_t*>(d_block_mins);
+    const uint32_t* d_emins_u32  = static_cast<const uint32_t*>(d_block_emins);
 
     // =========================================================================
     // IQ grid formats: LDS-cached grid kernel with 256-thread workgroups
@@ -1442,13 +1438,13 @@ bool rocmGemv_native_vnni_fp32(
                 hipLaunchKernelGGL(                                                           \
                     HIP_KERNEL_NAME(gemv_iq_lds_kernel_t<IQ_TN, FMT_TAG>),                   \
                     dim3(grid_n, 1), block, 0, static_cast<hipStream_t>(stream),              \
-                    d_A_int8, d_payload, d_scales_u16, d_mins_u16,                            \
+                    d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,               \
                     d_C_fp32, d_partial_fp32, d_scale_A, N, K, 1);                            \
             } else {                                                                          \
                 hipLaunchKernelGGL(                                                           \
                     HIP_KERNEL_NAME(gemv_iq_lds_kernel_t<IQ_TN, FMT_TAG>),                   \
                     dim3(grid_n, kb), block, 0, static_cast<hipStream_t>(stream),             \
-                    d_A_int8, d_payload, d_scales_u16, d_mins_u16,                            \
+                    d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,               \
                     d_C_fp32, d_partial_fp32, d_scale_A, N, K, kb);                           \
                 hipLaunchKernelGGL(                                                           \
                     HIP_KERNEL_NAME(gemv_native_vnni_reduce_kernel_t<IQ_TN, 1>),              \
@@ -1515,13 +1511,13 @@ bool rocmGemv_native_vnni_fp32(
                 hipLaunchKernelGGL(                                                           \
                     HIP_KERNEL_NAME(gemv_native_vnni_kernel_t<TN, CPT, FMT_TAG>),            \
                     dim3(grid_n, 1), block, 0, static_cast<hipStream_t>(stream),             \
-                    d_A_int8, d_payload, d_scales_u16, d_mins_u16,                           \
+                    d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,              \
                     d_C_fp32, d_partial_fp32, d_scale_A, N, K, 1);                           \
             } else {                                                                          \
                 hipLaunchKernelGGL(                                                           \
                     HIP_KERNEL_NAME(gemv_native_vnni_kernel_t<TN, CPT, FMT_TAG>),            \
                     dim3(grid_n, kb), block, 0, static_cast<hipStream_t>(stream),            \
-                    d_A_int8, d_payload, d_scales_u16, d_mins_u16,                           \
+                    d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,              \
                     d_C_fp32, d_partial_fp32, d_scale_A, N, K, kb);                          \
                 hipLaunchKernelGGL(                                                           \
                     HIP_KERNEL_NAME(gemv_native_vnni_reduce_kernel_t<TN, CPT>),              \

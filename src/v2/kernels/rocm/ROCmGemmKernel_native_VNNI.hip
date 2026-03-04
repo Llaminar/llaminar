@@ -86,26 +86,29 @@ struct NVNNIGemmTraits {
                                         || FMT == NVNNI_GEMM_IQ2_S || FMT == NVNNI_GEMM_IQ2_XS
                                         || FMT == NVNNI_GEMM_IQ1_M);
     static constexpr bool is_dual_scale_asym = (FMT == NVNNI_GEMM_Q2_K || FMT == NVNNI_GEMM_IQ1_M);
-    static constexpr int embedded_min_offset = (FMT == NVNNI_GEMM_IQ1_M) ? 6 : 8;
-    static constexpr bool has_embedded_scales = (FMT == NVNNI_GEMM_IQ1_S || FMT == NVNNI_GEMM_IQ1_M);
-    static constexpr int  embedded_scale_offset =
-        (FMT == NVNNI_GEMM_IQ1_S) ? 6 : (FMT == NVNNI_GEMM_IQ1_M) ? 10 : -1;
+    // All scales/mins are in global arrays (not embedded in payload).
+    static constexpr bool has_embedded_scales = false;
+    static constexpr int  embedded_scale_offset = -1;
+    static constexpr int  embedded_min_offset = -1;
+    // Q2_K needs a separate emin array (per-sub-block FP16 min pairs).
+    // IQ1_M emins are always zero (delta baked into 8× grid values).
+    static constexpr bool needs_emin_array = (FMT == NVNNI_GEMM_Q2_K);
     static constexpr bool is_5bit   = (FMT == NVNNI_GEMM_Q5_0 || FMT == NVNNI_GEMM_Q5_1);
     static constexpr bool is_6bit   = (FMT == NVNNI_GEMM_Q6_K);
     static constexpr bool is_3bit   = (FMT == NVNNI_GEMM_Q3_K);
     static constexpr bool is_2bit   = (FMT == NVNNI_GEMM_Q2_K);
     static constexpr bool uses_lut  = (FMT == NVNNI_GEMM_IQ4_NL);
     static constexpr int  payload_bytes =
-        is_iq1_grid ? ((FMT == NVNNI_GEMM_IQ1_M) ? 14 : 10) :
+        is_iq1_grid ? 6 :                          // IQ1_S/IQ1_M: qs[4]+qh[2], native size
         is_iq3_grid ? (has_qh ? 13 : 12) :
         is_iq2_grid ? (has_qh ? 9 : 8) :
-        is_6bit ? 24 : is_5bit ? 20 : is_3bit ? 16 : is_2bit ? 12 : 16;
+        is_6bit ? 24 : is_5bit ? 20 : is_3bit ? 12 : is_2bit ? 8 : 16;
     static constexpr int center_4bit = (FMT == NVNNI_GEMM_Q4_0) ? 8 : 0;
     static constexpr int center_5bit = (FMT == NVNNI_GEMM_Q5_0) ? 16 : 0;
     // Does the compute phase need an auxiliary scale/min?
     static constexpr bool needs_aux_compute = is_dual_scale || is_asymmetric;
-    // Is the auxiliary value loaded from d_block_mins (vs embedded in payload)?
-    static constexpr bool loads_aux_from_global = needs_aux_compute && !has_embedded_scales;
+    // Aux value always loaded from d_block_mins (no embedded scales anymore).
+    static constexpr bool loads_aux_from_global = needs_aux_compute;
     // Number of uint32 dwords to stage payload (ceil(payload_bytes / 4))
     static constexpr int payload_dwords = (payload_bytes + 3) / 4;
 
@@ -157,7 +160,7 @@ __device__ __constant__ uint64_t d_iq2s_grid_gemm[1024];
 __device__ __constant__ uint64_t d_iq2xs_grid_gemm[512];
 __device__ __constant__ uint64_t d_iq2xxs_grid_gemm[256];
 __device__ __constant__ uint64_t d_iq1s_grid_gemm[2048];
-__device__ __constant__ uint64_t d_iq1s_grid_8x_gemm[2048]; // grid values × 8 for IQ1_M delta baking
+__device__ __constant__ uint64_t d_iq1m_grid_base_gemm[2048]; // grid×8 (base values, ±1 applied branchlessly)
 
 // IQ grid lookup helpers
 template <NativeVNNIGemmFormat FMT>
@@ -180,9 +183,9 @@ __device__ __forceinline__ uint64_t iq1_grid_lookup_gemm(int idx)
     return d_iq1s_grid_gemm[idx];
 }
 
-__device__ __forceinline__ uint64_t iq1_grid_8x_lookup_gemm(int idx)
+__device__ __forceinline__ uint64_t iq1m_grid_base_lookup_gemm(int idx)
 {
-    return d_iq1s_grid_8x_gemm[idx];
+    return d_iq1m_grid_base_gemm[idx];
 }
 
 // SWAR conditional negate: 4 unsigned bytes via 4 sign bits (same as GEMV)
@@ -305,6 +308,16 @@ __device__ __forceinline__ void decode_block(
     else if constexpr (Traits::is_5bit)
     {
         // Q5_0 / Q5_1: nibble + high-bit from qh dword at payload[16..19]
+        //
+        // Each qh nibble holds 4 individual high-bits for 4 elements.
+        // We need to scatter bit i to bit 4 of byte i.  The multiply-mask
+        // trick: (nibble * 0x00204081) & 0x01010101 isolates each bit into
+        // its target byte's bit 0, then << 4 moves it to bit 4.
+        //
+        // This replaces the 11-op per-instance (4 AND + 4 SHIFT + 3 OR)
+        // scatter with 3 ops (MUL + AND + SHIFT), saving 64 VALU per block.
+        constexpr uint32_t BIT_SPREAD = 0x00204081u;
+        constexpr uint32_t BYTE_MASK  = 0x01010101u;
         const uint32_t qh_bits = raw[4]; // 5th dword
         #pragma unroll
         for (int g = 0; g < 4; ++g)
@@ -312,11 +325,9 @@ __device__ __forceinline__ void decode_block(
             const uint32_t lo_nibs = raw[g] & 0x0F0F0F0Fu;
             const uint32_t hi_nibs = (raw[g] >> 4) & 0x0F0F0F0Fu;
             const uint32_t hb4_lo = (qh_bits >> (g * 4)) & 0xFu;
-            const uint32_t hb_lo = ((hb4_lo & 1u) << 4) | ((hb4_lo & 2u) << 11)
-                                 | ((hb4_lo & 4u) << 18) | ((hb4_lo & 8u) << 25);
+            const uint32_t hb_lo = ((hb4_lo * BIT_SPREAD) & BYTE_MASK) << 4;
             const uint32_t hb4_hi = (qh_bits >> (g * 4 + 16)) & 0xFu;
-            const uint32_t hb_hi = ((hb4_hi & 1u) << 4) | ((hb4_hi & 2u) << 11)
-                                 | ((hb4_hi & 4u) << 18) | ((hb4_hi & 8u) << 25);
+            const uint32_t hb_hi = ((hb4_hi * BIT_SPREAD) & BYTE_MASK) << 4;
             if constexpr (Traits::center_5bit == 16)
             {
                 // Q5_0: centered — XOR-SUB-XOR subtract 16
@@ -338,6 +349,21 @@ __device__ __forceinline__ void decode_block(
     else if constexpr (Traits::is_6bit)
     {
         // Q6_K: 24B → nibble + 2-bit qh − 32
+        //
+        // 2-bit scatter via two-pass multiply-mask (5 ops instead of 11):
+        //   qh byte [ab][cd][ef][gh] → byte3[5:4]=ab, byte2[5:4]=cd,
+        //                               byte1[5:4]=ef, byte0[5:4]=gh
+        //
+        //   Pass 1 (even pairs 0,2): (qh * 0x00010010) & 0x00300030
+        //   Pass 2 (odd pairs 1,3):  (qh * 0x00400400) & 0x30003000
+        //   Result = pass1 | pass2
+        //
+        // No carry contamination because pairs are spaced 4+ bits apart
+        // within each pass.  Verified for all 256 possible qh values.
+        constexpr uint32_t QH_MUL_EVEN = 0x00010010u;
+        constexpr uint32_t QH_MASK_EVEN = 0x00300030u;
+        constexpr uint32_t QH_MUL_ODD  = 0x00400400u;
+        constexpr uint32_t QH_MASK_ODD  = 0x30003000u;
         const uint8_t* qh_p = reinterpret_cast<const uint8_t*>(raw) + 16;
         #pragma unroll
         for (int g = 0; g < 4; ++g)
@@ -345,10 +371,10 @@ __device__ __forceinline__ void decode_block(
             const uint32_t lo_nibs = raw[g] & 0x0F0F0F0Fu;
             const uint32_t hi_nibs = (raw[g] >> 4) & 0x0F0F0F0Fu;
             const uint32_t h_lo = qh_p[g], h_hi = qh_p[g + 4];
-            const uint32_t hb_lo = ((h_lo & 0x03u) << 4)  | ((h_lo & 0x0Cu) << 10)
-                                 | ((h_lo & 0x30u) << 16) | ((h_lo & 0xC0u) << 22);
-            const uint32_t hb_hi = ((h_hi & 0x03u) << 4)  | ((h_hi & 0x0Cu) << 10)
-                                 | ((h_hi & 0x30u) << 16) | ((h_hi & 0xC0u) << 22);
+            const uint32_t hb_lo = ((h_lo * QH_MUL_EVEN) & QH_MASK_EVEN)
+                                 | ((h_lo * QH_MUL_ODD) & QH_MASK_ODD);
+            const uint32_t hb_hi = ((h_hi * QH_MUL_EVEN) & QH_MASK_EVEN)
+                                 | ((h_hi * QH_MUL_ODD) & QH_MASK_ODD);
             uint32_t vlo = (lo_nibs | hb_lo) ^ 0x80808080u;
             vlo -= 0x20202020u; vlo ^= 0x80808080u;
             packed_groups[g] = static_cast<int32_t>(vlo);
@@ -359,22 +385,46 @@ __device__ __forceinline__ void decode_block(
     }
     else if constexpr (Traits::is_3bit)
     {
-        // Q3_K: nibble-repacked → v_perm 8-entry codebook
-        constexpr uint32_t Q3_CB_A = 0xFFFEFDFCu; // {-4,-3,-2,-1}
-        constexpr uint32_t Q3_CB_B = 0x03020100u;  // {0,1,2,3}
+        // Q3_K: native 12B layout — [8B pre-transposed 2-bit][4B grouped hbits]
+        //
+        // Payload layout (native-size, packed during CPU packing):
+        //   raw[0]: half 0 — 2-bit pre-transposed (Q2_K-style), groups 0-3
+        //   raw[1]: half 1 — 2-bit pre-transposed (Q2_K-style), groups 4-7
+        //   raw[2]: hbits word — group g's 4 hbits at bits [g*4..g*4+3]
+        //
+        // Decode: Q2_K-style shift+mask for low2, BIT_SPREAD multiply-scatter
+        // for hbits, XOR-SUB-XOR centering [0..7] → [-4..+3].
+        //
+        // BIT_SPREAD = 0x00204081: scatters 4 bits from a nibble into 4 separate
+        // bytes' bit 0.  (hb4 * BIT_SPREAD) & 0x01010101 puts bit k into byte k.
+        // Verified for all 16 possible hb4 values (0x0..0xF).
+        constexpr uint32_t BIT_SPREAD = 0x00204081u;
+        const uint32_t hbit_word = raw[2];
         #pragma unroll
-        for (int g = 0; g < 4; ++g)
+        for (int half = 0; half < 2; ++half)
         {
-            packed_groups[g]     = static_cast<int32_t>(
-                __builtin_amdgcn_perm(Q3_CB_B, Q3_CB_A, raw[g] & 0x0F0F0F0Fu));
-            packed_groups[g + 4] = static_cast<int32_t>(
-                __builtin_amdgcn_perm(Q3_CB_B, Q3_CB_A, (raw[g] >> 4) & 0x0F0F0F0Fu));
+            const uint32_t r = raw[half];
+            #pragma unroll
+            for (int g = 0; g < 4; ++g)
+            {
+                // Extract 2-bit values (Q2_K-style pre-transposed)
+                const uint32_t low2_4 = (r >> (g * 2)) & 0x03030303u;
+                // Extract and scatter hbit for this group
+                const uint32_t hb4 = (hbit_word >> ((half * 4 + g) * 4)) & 0xFu;
+                const uint32_t hb = ((hb4 * BIT_SPREAD) & 0x01010101u) << 2;
+                // Merge: 3-bit value = low2 | (hbit << 2), range [0..7]
+                // Center: [0..7] → [-4..+3] via XOR-SUB-XOR bias trick
+                uint32_t val = (low2_4 | hb) ^ 0x80808080u;
+                val -= 0x04040404u;
+                val ^= 0x80808080u;
+                packed_groups[half * 4 + g] = static_cast<int32_t>(val);
+            }
         }
     }
     else if constexpr (Traits::is_2bit)
     {
-        // Q2_K: pre-transposed 2-bit extraction from 12B payload
-        // [0..3] half0, [4..7] half1, [8..11] embedded mins
+        // Q2_K: pre-transposed 2-bit extraction from 8B payload
+        // [0..3] half0, [4..7] half1  (emins in separate d_block_emins array)
         #pragma unroll
         for (int half = 0; half < 2; ++half)
         {
@@ -481,54 +531,48 @@ __device__ __forceinline__ void decode_block(
                 packed_groups[l * 2 + 1] = static_cast<int32_t>(static_cast<uint32_t>(g >> 32));
             }
         }
-        else // IQ1_M: use 8× grid with per-group delta baked in
+        else // IQ1_M: single-table branchless decode
         {
-            // Grid values are {-1,0,+1} × 8 = {-8,0,8} in the 8× table.
-            // Delta ±IQ1S_DELTA (±0.125) becomes ±1 after ×8 scaling.
-            // Baking delta into grid eliminates lossy per-half averaging.
-            // Scales are stored as dl/8 in packing to compensate.
+            // Single base table (grid×8) + SWAR byte-wise ±1 adjustment.
+            // Eliminates branch divergence: 4 unconditional lookups from one 16KB table
+            // (fits entirely in L1 TC) instead of 8 serialized-divergent lookups from
+            // two 16KB tables (thrashes L1 TC).  Scales stored as dl/8 to compensate.
             //
-            // SWAR byte-parallel add/sub: must block cross-byte carries!
-            // Plain g±ONES fails when bytes are 0xFF (-1) or 0x00 (grid=0).
-            constexpr uint64_t MSB_8  = 0x8080808080808080ULL;
-            constexpr uint64_t ONES_8 = 0x0101010101010101ULL;
+            // SWAR trick for byte-wise subtraction (no inter-byte borrow):
+            //   neg = ((base | 0x80808080) - 0x01010101) ^ (~base & 0x80808080)
+            // Pos is simpler: base | 0x01010101 (safe since base bytes are multiples of 8).
             const uint8_t* p = reinterpret_cast<const uint8_t*>(raw);
             const uint8_t qh0 = p[4], qh1 = p[5];
             const int idx0 = p[0] | ((qh0 & 0x07) << 8);
             const int idx1 = p[1] | (((qh0 >> 4) & 0x07) << 8);
             const int idx2 = p[2] | ((qh1 & 0x07) << 8);
             const int idx3 = p[3] | (((qh1 >> 4) & 0x07) << 8);
-            // Delta signs: qh bit 3 → group 0, bit 7 → group 1 (for qh0)
-            //              qh bit 3 → group 2, bit 7 → group 3 (for qh1)
-            uint64_t g;
 
-            g = iq1_grid_8x_lookup_gemm(idx0);
-            g = (qh0 & 0x08)
-                ? (((g | MSB_8) - ONES_8) ^ ((~g) & MSB_8))   // byte-parallel sub 1
-                : (((g & ~MSB_8) + ONES_8) ^ (g & MSB_8));     // byte-parallel add 1
-            packed_groups[0] = static_cast<int32_t>(static_cast<uint32_t>(g));
-            packed_groups[1] = static_cast<int32_t>(static_cast<uint32_t>(g >> 32));
+            // 4 unconditional lookups — no branch divergence, single table
+            const uint64_t g0 = iq1m_grid_base_lookup_gemm(idx0);
+            const uint64_t g1 = iq1m_grid_base_lookup_gemm(idx1);
+            const uint64_t g2 = iq1m_grid_base_lookup_gemm(idx2);
+            const uint64_t g3 = iq1m_grid_base_lookup_gemm(idx3);
 
-            g = iq1_grid_8x_lookup_gemm(idx1);
-            g = (qh0 & 0x80)
-                ? (((g | MSB_8) - ONES_8) ^ ((~g) & MSB_8))
-                : (((g & ~MSB_8) + ONES_8) ^ (g & MSB_8));
-            packed_groups[2] = static_cast<int32_t>(static_cast<uint32_t>(g));
-            packed_groups[3] = static_cast<int32_t>(static_cast<uint32_t>(g >> 32));
+            // Branchless ±1 per 32-bit half via SWAR byte arithmetic
+            constexpr uint32_t ONES = 0x01010101u;
+            constexpr uint32_t MSB  = 0x80808080u;
 
-            g = iq1_grid_8x_lookup_gemm(idx2);
-            g = (qh1 & 0x08)
-                ? (((g | MSB_8) - ONES_8) ^ ((~g) & MSB_8))
-                : (((g & ~MSB_8) + ONES_8) ^ (g & MSB_8));
-            packed_groups[4] = static_cast<int32_t>(static_cast<uint32_t>(g));
-            packed_groups[5] = static_cast<int32_t>(static_cast<uint32_t>(g >> 32));
-
-            g = iq1_grid_8x_lookup_gemm(idx3);
-            g = (qh1 & 0x80)
-                ? (((g | MSB_8) - ONES_8) ^ ((~g) & MSB_8))
-                : (((g & ~MSB_8) + ONES_8) ^ (g & MSB_8));
-            packed_groups[6] = static_cast<int32_t>(static_cast<uint32_t>(g));
-            packed_groups[7] = static_cast<int32_t>(static_cast<uint32_t>(g >> 32));
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint64_t gi = (i == 0) ? g0 : (i == 1) ? g1 : (i == 2) ? g2 : g3;
+                const bool is_neg = (i < 2) ? (qh0 & (i == 0 ? 0x08 : 0x80))
+                                            : (qh1 & (i == 2 ? 0x08 : 0x80));
+                const uint32_t lo = static_cast<uint32_t>(gi);
+                const uint32_t hi = static_cast<uint32_t>(gi >> 32);
+                if (is_neg) {
+                    packed_groups[i*2]   = static_cast<int32_t>(((lo | MSB) - ONES) ^ (~lo & MSB));
+                    packed_groups[i*2+1] = static_cast<int32_t>(((hi | MSB) - ONES) ^ (~hi & MSB));
+                } else {
+                    packed_groups[i*2]   = static_cast<int32_t>(lo | ONES);
+                    packed_groups[i*2+1] = static_cast<int32_t>(hi | ONES);
+                }
+            }
         }
     }
 }
@@ -980,6 +1024,7 @@ void native_vnni_gemm_kernel(
     const uint8_t*   __restrict__ d_payload,      // [blocks_per_row × N × PB] native-VNNI payload
     const uint16_t*  __restrict__ d_block_scales, // [blocks_per_row × N] FP16 per-block scales
     const uint16_t*  __restrict__ d_block_mins,   // [blocks_per_row × N] FP16 per-block min/aux
+    const uint32_t*  __restrict__ d_block_emins,  // [blocks_per_row × N] packed FP16 emin pair (Q2_K only, else NULL)
     float*           __restrict__ d_output,       // [M × N] FP32 output, row-major
     const float*     __restrict__ d_scales_A,     // [M] per-row activation scales
     int M, int N, int K)
@@ -1163,22 +1208,18 @@ void native_vnni_gemm_kernel(
             {
                 const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
                 load_payload<PB>(d_payload + linear * PB, b_payload_dw);
-                const uint8_t* pbytes = reinterpret_cast<const uint8_t*>(b_payload_dw);
-                if constexpr (Traits::has_embedded_scales)
-                    b_scale_staging = *reinterpret_cast<const uint16_t*>(pbytes + Traits::embedded_scale_offset);
-                else
-                    b_scale_staging = d_block_scales[linear];
-                if constexpr (Traits::loads_aux_from_global)
+                b_scale_staging = d_block_scales[linear];
+                if constexpr (Traits::needs_aux_compute)
                     b_aux_staging = d_block_mins[linear];
-                else if constexpr (Traits::needs_aux_compute && Traits::has_embedded_scales) {
-                    if constexpr (FMT == NVNNI_GEMM_IQ1_S)
-                        b_aux_staging = *reinterpret_cast<const uint16_t*>(pbytes + 8);
-                    else if constexpr (FMT == NVNNI_GEMM_IQ1_M)
-                        b_aux_staging = *reinterpret_cast<const uint16_t*>(pbytes + 12);
-                }
                 if constexpr (Traits::is_dual_scale_asym) {
-                    b_emin_lo_staging = *reinterpret_cast<const uint16_t*>(pbytes + Traits::embedded_min_offset);
-                    b_emin_hi_staging = *reinterpret_cast<const uint16_t*>(pbytes + Traits::embedded_min_offset + 2);
+                    if constexpr (Traits::needs_emin_array) {
+                        const uint32_t emin_packed = d_block_emins[linear];
+                        b_emin_lo_staging = static_cast<uint16_t>(emin_packed);
+                        b_emin_hi_staging = static_cast<uint16_t>(emin_packed >> 16);
+                    } else {
+                        b_emin_lo_staging = 0;
+                        b_emin_hi_staging = 0;
+                    }
                 }
             }
         }
@@ -1252,22 +1293,18 @@ void native_vnni_gemm_kernel(
             const int block_global = tile_block_base + b_load_block;
             const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
             load_payload<PB>(d_payload + linear * PB, b_payload_dw);
-            const uint8_t* pbytes = reinterpret_cast<const uint8_t*>(b_payload_dw);
-            if constexpr (Traits::has_embedded_scales)
-                b_scale_staging = *reinterpret_cast<const uint16_t*>(pbytes + Traits::embedded_scale_offset);
-            else
-                b_scale_staging = d_block_scales[linear];
-            if constexpr (Traits::loads_aux_from_global)
+            b_scale_staging = d_block_scales[linear];
+            if constexpr (Traits::needs_aux_compute)
                 b_aux_staging = d_block_mins[linear];
-            else if constexpr (Traits::needs_aux_compute && Traits::has_embedded_scales) {
-                if constexpr (FMT == NVNNI_GEMM_IQ1_S)
-                    b_aux_staging = *reinterpret_cast<const uint16_t*>(pbytes + 8);
-                else if constexpr (FMT == NVNNI_GEMM_IQ1_M)
-                    b_aux_staging = *reinterpret_cast<const uint16_t*>(pbytes + 12);
-            }
             if constexpr (Traits::is_dual_scale_asym) {
-                b_emin_lo_staging = *reinterpret_cast<const uint16_t*>(pbytes + Traits::embedded_min_offset);
-                b_emin_hi_staging = *reinterpret_cast<const uint16_t*>(pbytes + Traits::embedded_min_offset + 2);
+                if constexpr (Traits::needs_emin_array) {
+                    const uint32_t emin_packed = d_block_emins[linear];
+                    b_emin_lo_staging = static_cast<uint16_t>(emin_packed);
+                    b_emin_hi_staging = static_cast<uint16_t>(emin_packed >> 16);
+                } else {
+                    b_emin_lo_staging = 0;
+                    b_emin_hi_staging = 0;
+                }
             }
         }
 
@@ -1369,22 +1406,18 @@ void native_vnni_gemm_kernel(
             {
                 const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
                 load_payload<PB>(d_payload + linear * PB, b_payload_dw);
-                const uint8_t* pbytes = reinterpret_cast<const uint8_t*>(b_payload_dw);
-                if constexpr (Traits::has_embedded_scales)
-                    b_scale_staging = *reinterpret_cast<const uint16_t*>(pbytes + Traits::embedded_scale_offset);
-                else
-                    b_scale_staging = d_block_scales[linear];
-                if constexpr (Traits::loads_aux_from_global)
+                b_scale_staging = d_block_scales[linear];
+                if constexpr (Traits::needs_aux_compute)
                     b_aux_staging = d_block_mins[linear];
-                else if constexpr (Traits::needs_aux_compute && Traits::has_embedded_scales) {
-                    if constexpr (FMT == NVNNI_GEMM_IQ1_S)
-                        b_aux_staging = *reinterpret_cast<const uint16_t*>(pbytes + 8);
-                    else if constexpr (FMT == NVNNI_GEMM_IQ1_M)
-                        b_aux_staging = *reinterpret_cast<const uint16_t*>(pbytes + 12);
-                }
                 if constexpr (Traits::is_dual_scale_asym) {
-                    b_emin_lo_staging = *reinterpret_cast<const uint16_t*>(pbytes + Traits::embedded_min_offset);
-                    b_emin_hi_staging = *reinterpret_cast<const uint16_t*>(pbytes + Traits::embedded_min_offset + 2);
+                    if constexpr (Traits::needs_emin_array) {
+                        const uint32_t emin_packed = d_block_emins[linear];
+                        b_emin_lo_staging = static_cast<uint16_t>(emin_packed);
+                        b_emin_hi_staging = static_cast<uint16_t>(emin_packed >> 16);
+                    } else {
+                        b_emin_lo_staging = 0;
+                        b_emin_hi_staging = 0;
+                    }
                 }
             }
         }
@@ -1540,12 +1573,13 @@ void streaming_lm_head_kernel(
     const uint8_t*   __restrict__ d_payload,      // [blocks_per_row × N × PB] payload
     const uint16_t*  __restrict__ d_block_scales, // [blocks_per_row × N] FP16 scales
     const uint16_t*  __restrict__ d_block_mins,   // [blocks_per_row × N] FP16 min/aux
+    const uint32_t*  __restrict__ d_block_emins,  // [blocks_per_row × N] packed {lo,hi} emins (Q2_K only, else nullptr)
     float*           __restrict__ d_output,       // [M × N] FP32 output
     const float*     __restrict__ d_scales_A,     // [M] per-row activation scales
     int M, int N, int K)
 {
-    static_assert(M_TILE == 16 || M_TILE == 32,
-                  "Streaming LM_Head kernel supports M_TILE 16 or 32");
+    static_assert(M_TILE == 8 || M_TILE == 16 || M_TILE == 32,
+                  "Streaming LM_Head kernel supports M_TILE 8, 16, or 32");
 
     using Traits = NVNNIGemmTraits<FMT>;
     constexpr int PB = Traits::payload_bytes;
@@ -1554,21 +1588,57 @@ void streaming_lm_head_kernel(
     const int n_col   = blockIdx.x * 256 + threadIdx.x;
     const int m_block = blockIdx.y * M_TILE;
 
-    if (n_col >= N) return;
-
     // Reinterpret A as int32 (4 packed INT8 per int32 k-group)
     const int32_t* a_global = reinterpret_cast<const int32_t*>(d_A_int8);
     const int a_row_stride  = K / 4;   // k-groups per row
     const int blocks_per_row = K / 32;  // quantized blocks per row
+
+    // Bounds: if entire M_TILE is within [0, M), skip per-element checks
+    const bool m_safe = (m_block + M_TILE <= M);
+
+    // =========================================================================
+    // Pattern A: cooperative sum_a pre-compute into LDS
+    //
+    // Instead of each thread computing sum_a independently (128 sdot4 per block
+    // per thread — 99.6% redundant across the 256 threads in a WG), pre-compute
+    // sum_a cooperatively: 256 threads share M_TILE × blocks_per_row work items.
+    // This eliminates sum_a from the hot inner loop, reducing per-block VALU by
+    // 45% and dropping VGPRs from ~70 (3-wave) to ~54 (4-wave).
+    //
+    // LDS: M_TILE × blocks_per_row × 4 bytes (e.g., 16 × 64 × 4 = 4 KB)
+    // =========================================================================
+    extern __shared__ int32_t sum_a_shared[];
+
+    if constexpr (Traits::is_asymmetric)
+    {
+        const int total_items = M_TILE * blocks_per_row;
+        for (int item = threadIdx.x; item < total_items; item += 256)
+        {
+            const int mm    = item / blocks_per_row;
+            const int block = item % blocks_per_row;
+            const int gm    = m_block + mm;
+            int32_t s = 0;
+            if (m_safe || gm < M) {
+                #pragma unroll
+                for (int kg = 0; kg < 8; ++kg)
+                    s = __builtin_amdgcn_sdot4(
+                        a_global[static_cast<int64_t>(gm) * a_row_stride + block * 8 + kg],
+                        static_cast<int32_t>(0x01010101), s, false);
+            }
+            sum_a_shared[item] = s;
+        }
+        __syncthreads();
+    }
+
+    // Now safe to exit early for out-of-bounds N-columns
+    // (Pattern A pre-compute must complete for ALL threads before barrier)
+    if (n_col >= N) return;
 
     // FP32 accumulators — accumulated across all K-blocks
     float acc[M_TILE];
     #pragma unroll
     for (int mm = 0; mm < M_TILE; ++mm)
         acc[mm] = 0.0f;
-
-    // Bounds: if entire M_TILE is within [0, M), skip per-element checks
-    const bool m_safe = (m_block + M_TILE <= M);
 
     // =========================================================================
     // Main loop: stream through K-blocks with zero barriers
@@ -1579,28 +1649,20 @@ void streaming_lm_head_kernel(
         const size_t linear = static_cast<size_t>(block) * N + n_col;
         uint32_t b_payload_dw[Traits::payload_dwords];
         load_payload<PB>(d_payload + linear * PB, b_payload_dw);
-        const uint8_t* pbytes = reinterpret_cast<const uint8_t*>(b_payload_dw);
 
-        uint16_t scale_bits;
-        if constexpr (Traits::has_embedded_scales)
-            scale_bits = *reinterpret_cast<const uint16_t*>(pbytes + Traits::embedded_scale_offset);
-        else
-            scale_bits = d_block_scales[linear];
+        uint16_t scale_bits = d_block_scales[linear];
 
         uint16_t aux_bits = 0;
-        if constexpr (Traits::loads_aux_from_global)
+        if constexpr (Traits::needs_aux_compute)
             aux_bits = d_block_mins[linear];
-        else if constexpr (Traits::needs_aux_compute && Traits::has_embedded_scales) {
-            if constexpr (FMT == NVNNI_GEMM_IQ1_S)
-                aux_bits = *reinterpret_cast<const uint16_t*>(pbytes + 8);
-            else if constexpr (FMT == NVNNI_GEMM_IQ1_M)
-                aux_bits = *reinterpret_cast<const uint16_t*>(pbytes + 12);
-        }
 
         uint16_t emin_lo_bits = 0, emin_hi_bits = 0;
         if constexpr (Traits::is_dual_scale_asym) {
-            emin_lo_bits = *reinterpret_cast<const uint16_t*>(pbytes + Traits::embedded_min_offset);
-            emin_hi_bits = *reinterpret_cast<const uint16_t*>(pbytes + Traits::embedded_min_offset + 2);
+            if constexpr (Traits::needs_emin_array) {
+                const uint32_t emin_packed = d_block_emins[linear];
+                emin_lo_bits = static_cast<uint16_t>(emin_packed);
+                emin_hi_bits = static_cast<uint16_t>(emin_packed >> 16);
+            }
         }
 
         // --- 2. Decode B → 8 INT32 packed groups ---
@@ -1771,12 +1833,14 @@ void streaming_lm_head_kernel(
         else if constexpr (Traits::is_asymmetric)
         {
             // Pattern A: asymmetric single-scale (Q4_1, Q5_1, IQ1_S)
-            int32_t block_acc[M_TILE], sum_a[M_TILE];
+            //
+            // sum_a is pre-computed in LDS (cooperative phase above).
+            // This eliminates M_TILE × 8 redundant sdot4 per block per thread
+            // and drops the VGPR count from ~70 (3-wave) to ~54 (4-wave).
+            int32_t block_acc[M_TILE];
             #pragma unroll
             for (int mm = 0; mm < M_TILE; ++mm)
-            {
-                block_acc[mm] = 0; sum_a[mm] = 0;
-            }
+                block_acc[mm] = 0;
             const int kg_base = block * 8;
             if (m_safe)
             {
@@ -1791,8 +1855,6 @@ void streaming_lm_head_kernel(
                         const int32_t a_val = a_global[
                             static_cast<int64_t>(m_block + mm) * a_row_stride + a_kg_idx];
                         block_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, block_acc[mm], false);
-                        sum_a[mm] = __builtin_amdgcn_sdot4(
-                            a_val, static_cast<int32_t>(0x01010101), sum_a[mm], false);
                     }
                 }
             }
@@ -1810,8 +1872,6 @@ void streaming_lm_head_kernel(
                         const int32_t a_val = (gm < M)
                             ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
                         block_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, block_acc[mm], false);
-                        sum_a[mm] = __builtin_amdgcn_sdot4(
-                            a_val, static_cast<int32_t>(0x01010101), sum_a[mm], false);
                     }
                 }
             }
@@ -1821,7 +1881,8 @@ void streaming_lm_head_kernel(
             for (int mm = 0; mm < M_TILE; ++mm)
             {
                 acc[mm] = __fmaf_rn(static_cast<float>(block_acc[mm]), bs, acc[mm]);
-                acc[mm] = __fmaf_rn(static_cast<float>(sum_a[mm]), bm, acc[mm]);
+                acc[mm] = __fmaf_rn(static_cast<float>(sum_a_shared[mm * blocks_per_row + block]),
+                                    bm, acc[mm]);
             }
         }
         else
@@ -1926,6 +1987,7 @@ static bool launch_native_vnni_gemm(
     const uint8_t* d_payload,
     const uint16_t* d_block_scales,
     const uint16_t* d_block_mins,
+    const uint32_t* d_block_emins,
     float* d_output,
     const float* d_scales_A,
     int M, int N, int K,
@@ -1946,7 +2008,7 @@ static bool launch_native_vnni_gemm(
 
         native_vnni_gemm_kernel<NT, BPT, MT, FMT>
             <<<grid, block, 0, hip_stream>>>(
-                d_A_int8, d_payload, d_block_scales, d_block_mins,
+                d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
                 d_output, d_scales_A, M, N, K);
 
         return hipGetLastError() == hipSuccess;
@@ -1962,13 +2024,14 @@ static bool launch_native_vnni_gemm(
 
         native_vnni_gemm_kernel<NT, BPT, MT, FMT, 3>
             <<<grid, block, 0, hip_stream>>>(
-                d_A_int8, d_payload, d_block_scales, d_block_mins,
+                d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
                 d_output, d_scales_A, M, N, K);
 
         return hipGetLastError() == hipSuccess;
     };
 
     // Streaming LM_Head variant: zero barriers, zero LDS, 3-wave occupancy
+    // (Pattern A uses small LDS for sum_a precompute → 4-wave achievable)
     auto launch_streaming = [&](auto m_tile_tag) -> bool
     {
         constexpr int MT = decltype(m_tile_tag)::value;
@@ -1976,9 +2039,15 @@ static bool launch_native_vnni_gemm(
         dim3 grid((N + N_PER_WG - 1) / N_PER_WG, (M + MT - 1) / MT, 1);
         dim3 block(256, 1, 1);
 
+        // Pattern A needs LDS for cooperative sum_a precompute
+        const int bpr = K / 32;
+        const size_t shared_bytes = NVNNIGemmTraits<FMT>::is_asymmetric
+            ? (MT * bpr * sizeof(int32_t))
+            : 0;
+
         streaming_lm_head_kernel<MT, FMT>
-            <<<grid, block, 0, hip_stream>>>(
-                d_A_int8, d_payload, d_block_scales, d_block_mins,
+            <<<grid, block, shared_bytes, hip_stream>>>(
+                d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
                 d_output, d_scales_A, M, N, K);
 
         return hipGetLastError() == hipSuccess;
@@ -2022,6 +2091,7 @@ static bool launch_native_vnni_gemm(
     using M16  = std::integral_constant<int, 16>;
     using M32  = std::integral_constant<int, 32>;
     using M64  = std::integral_constant<int, 64>;
+    using M8   = std::integral_constant<int, 8>;
 
     // =========================================================================
     // STREAMING DISPATCH: LM_Head-like shapes (massive N, moderate K)
@@ -2033,34 +2103,61 @@ static bool launch_native_vnni_gemm(
     // Pattern A and DA formats have heavy decode that causes register
     // spilling in the streaming kernel — cooperative is 25-130% faster.
     //
-    // Condition: N >= 16384 captures LM_Head (N=151936) and large FFN_Up
-    // (e.g. 7B N=18944).  K <= 4096 is a safety check.
+    // N threshold is format-dependent:
+    //   Pattern D (is_dual_scale): N >= 8192.  The cooperative kernel suffers
+    //     72-132 bytes scratch at N128/M32 due to temp_acc[4][4] + scale arrays
+    //     + LDS pipeline staging.  The streaming kernel uses temp_acc[M_TILE]
+    //     (1D array) → 4-wave occupancy, zero scratch.  Tested: streaming wins
+    //     by 15-30% at N=11008 (3B_FFN_Up) for Q3_K, Q6_K, IQ2_S, IQ2_XS.
+    //   Pattern S: N >= 16384.  Cooperative is scratch-free at N128/M32 so only
+    //     massive-N shapes (LM_Head) benefit from streaming's barrier-free design.
+    //
+    // K <= 4096 is a safety check (streaming loads A per-thread, not via LDS).
     // =========================================================================
     if constexpr (NVNNIGemmTraits<FMT>::prefer_streaming) {
-        if (N >= 16384 && K <= 4096) {
+        constexpr int streaming_n_threshold =
+            NVNNIGemmTraits<FMT>::is_dual_scale ? 8192 : 16384;
+        if (N >= streaming_n_threshold && K <= 4096) {
+            // Pattern D uses M8: temp_acc[8] = 8 VGPRs → 4-wave potential.
+            // A-data per thread = 8×K/4×4 = 2K bytes ≤ 16KB → fits L1 cache.
+            // At K=2048: 8×512×4 = 16KB (exactly L1 size), all A-loads are L1 hits.
+            // Pattern S keeps M16 (lighter accumulation, 3-wave sufficient).
+            if constexpr (NVNNIGemmTraits<FMT>::is_dual_scale) {
+                return launch_streaming(M8{});
+            } else {
+                return launch_streaming(M16{});
+            }
+        }
+    }
+
+    // NOTE: Pattern DA (Q2_K, IQ1_M) must NOT use streaming — tested at N=11008
+    // and it was 2-3× slower (Q2_K: 1390μs vs 565μs cooperative).  The Pattern DA
+    // Pattern DA decode + accumulation (temp_acc + temp_sum + emin per half) is
+    // too register-heavy for streaming's per-thread A-loading model.
+
+    // Pattern A streaming with cooperative sum_a precompute:
+    // Only for formats where streaming is proven faster than cooperative.
+    // - IQ1_S: +18% (heavy grid decode benefits hugely from 4-wave occupancy)
+    // - Q4_1:  +2.5% (light decode, small but consistent improvement)
+    // NOT Q5_1: -16% regression (heavy 5-bit qh decode + 20B payload → VGPRs
+    //           push past 4-wave threshold, and extra HBM for larger payload)
+    if constexpr (FMT == NVNNI_GEMM_Q4_1 || FMT == NVNNI_GEMM_IQ1_S) {
+        if (N >= 8192 && K <= 4096) {
             return launch_streaming(M16{});
         }
     }
 
     if (use_n128) {
-        // Dual-scale-asymmetric formats (Pattern DA: Q2_K, IQ1_M) suffer from
-        // catastrophic register pressure at the N128/M32 tile.  Even with
-        // two-phase accumulation, Pattern DA needs temp_acc + temp_sum +
-        // embedded min values + pipeline staging → 128 VGPRs + 680 bytes scratch.
+        // Dual-scale-asymmetric formats (Pattern DA: Q2_K, IQ1_M):
+        // N128/M16/2-wave is the best tile for Pattern DA.
         //
-        // Force M16 for Pattern DA: achieves 2-wave with zero scratch.
-        //
-        // NOTE: Pattern D formats (Q6_K, Q3_K, IQ2_S, IQ2_XS) have scratch
-        // spilling at N128/M32 (72-132 bytes) that can't be eliminated without
-        // sacrificing tile efficiency.  Tried alternatives (all regressed):
-        //   - N128/M16 for Pattern D: M16 tile loses 2× A-data reuse → -15%
-        //   - N64/M32 for Pattern D: doubles A-data bandwidth → -10% at M≥128
-        //   - Fully unroll(disable): partial help (+8-19%) but scratch persists
-        // The M32/2-wave+scratch path remains the best compromise.
-        // Force M16 for Pattern DA: ISA shows VGPR=127 so 3-wave is unreachable
-        // (needs ≤84 VGPRs).  Using 2-wave launch avoids compiler spilling to
-        // scratch in a futile attempt to hit 3-wave.
-        // N128/M32/2w is NOT viable: 200 bytes scratch for Pattern DA.
+        // Tested alternatives (all regressed):
+        //   - N128/M32/2w: +200 bytes scratch from temp_acc+temp_sum+emin staging
+        //   - N64/M16/3w:  +55% slower! N_PER_THREAD 2→1 kills ILP in the heavy
+        //                  DA accumulation (sdot4 interleaving across N-columns)
+        //   - Streaming:   +95% slower! Per-thread A-loading + DA register pressure
+        //   - Split-emin:  Went to 1-wave! 4 separate loops = too much code for RA
+        //   - launch3 (3w hint): compiler still achieves 2w only, no perf change
         if constexpr (NVNNIGemmTraits<FMT>::is_dual_scale_asym) {
             return launch(N128{}, M16{});
         }
@@ -2068,6 +2165,8 @@ static bool launch_native_vnni_gemm(
         // Pattern A (asymmetric: Q4_1, Q5_1, IQ1_S): force M32/2-wave on N128.
         // N128/M16/3w spills 40-72 bytes scratch to achieve 3-wave occupancy.
         // N128/M32/2w is scratch-free (126-128 VGPRs) with better A-data reuse.
+        // Tested hybrid M16/M32: no improvement at M=32 (142→143μs for Q4_1),
+        // minor regression at M=32 for Q5_1 (147→151μs).  Scratch cost ≈ 3-wave gain.
         if constexpr (NVNNIGemmTraits<FMT>::is_asymmetric) {
             return launch(N128{}, M32{});
         }
@@ -2173,6 +2272,7 @@ bool rocmGemm_native_vnni_fp32(
     const uint8_t* d_payload,      // [blocks_per_row × N × PB] native-VNNI payload
     const void*    d_block_scales, // [blocks_per_row × N] __half per-block scales
     const void*    d_block_mins,   // [blocks_per_row × N] __half per-block mins/aux (nullable)
+    const void*    d_block_emins,  // [blocks_per_row × N] packed {lo,hi} emins (Q2_K only, nullable)
     float*         d_output,       // [M × N] FP32 output
     const float*   d_scales_A,     // [M] per-row activation scales
     int M, int N, int K,
@@ -2186,10 +2286,11 @@ bool rocmGemm_native_vnni_fp32(
 
     const auto* scales = reinterpret_cast<const uint16_t*>(d_block_scales);
     const auto* mins   = reinterpret_cast<const uint16_t*>(d_block_mins);
+    const auto* emins  = reinterpret_cast<const uint32_t*>(d_block_emins);
 
     #define LAUNCH_GEMM(FMT) \
         return launch_native_vnni_gemm<FMT>( \
-            d_A_int8, d_payload, scales, mins, d_output, d_scales_A, \
+            d_A_int8, d_payload, scales, mins, emins, d_output, d_scales_A, \
             M, N, K, device_id, stream)
 
     switch (codebook_id)
@@ -2250,23 +2351,25 @@ bool rocmInitIQGridTables_gemm(
     e = hipMemcpyToSymbol(d_iq1s_grid_gemm, h_iq1s_grid, sizeof(d_iq1s_grid_gemm));
     if (e != hipSuccess) { fprintf(stderr, "[rocmInitIQGridTables_gemm] iq1s failed: %s\n", hipGetErrorString(e)); return false; }
 
-    // Build 8× grid for IQ1_M: grid values {-1,1,3} → {-8,8,24}
-    // Used for delta baking: (grid + delta) × 8 can represent ±IQ1S_DELTA as ±1 in int8
+    // Build IQ1_M base grid table: grid[i]*8 per byte.
+    // Original grid values {-1,0,+1} become {-8,0,+8} as INT8.
+    // The ±1 delta is applied branchlessly at decode time via SWAR arithmetic.
+    // Single table (16KB) fits entirely in L1 texture cache vs two tables (32KB).
     {
-        uint64_t h_iq1s_grid_8x[2048];
+        uint64_t h_grid_base[2048];
         const uint64_t* src = static_cast<const uint64_t*>(h_iq1s_grid);
         for (int i = 0; i < 2048; ++i) {
             uint64_t packed = src[i];
-            uint64_t result = 0;
+            uint64_t rb = 0;
             for (int j = 0; j < 8; ++j) {
                 int8_t val = static_cast<int8_t>((packed >> (j * 8)) & 0xFF);
-                int8_t val8x = static_cast<int8_t>(val * 8);
-                result |= (static_cast<uint64_t>(static_cast<uint8_t>(val8x)) << (j * 8));
+                int8_t vb = static_cast<int8_t>(val * 8);  // base = grid×8
+                rb |= (static_cast<uint64_t>(static_cast<uint8_t>(vb)) << (j * 8));
             }
-            h_iq1s_grid_8x[i] = result;
+            h_grid_base[i] = rb;
         }
-        e = hipMemcpyToSymbol(d_iq1s_grid_8x_gemm, h_iq1s_grid_8x, sizeof(d_iq1s_grid_8x_gemm));
-        if (e != hipSuccess) { fprintf(stderr, "[rocmInitIQGridTables_gemm] iq1s_8x failed: %s\n", hipGetErrorString(e)); return false; }
+        e = hipMemcpyToSymbol(d_iq1m_grid_base_gemm, h_grid_base, sizeof(d_iq1m_grid_base_gemm));
+        if (e != hipSuccess) { fprintf(stderr, "[rocmInitIQGridTables_gemm] iq1m_base failed: %s\n", hipGetErrorString(e)); return false; }
     }
 
     return true;
