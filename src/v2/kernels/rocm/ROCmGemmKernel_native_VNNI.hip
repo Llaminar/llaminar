@@ -110,6 +110,11 @@ struct NVNNIGemmTraits {
     static constexpr bool needs_aux_compute = is_dual_scale || is_asymmetric;
     // Aux value always loaded from d_block_mins (no embedded scales anymore).
     static constexpr bool loads_aux_from_global = needs_aux_compute;
+    // Cooperative sum_a precompute: Pattern DA needs per-half sums for emin
+    // correction, Pattern A needs full-block sums for min correction.  Both
+    // benefit from cooperative A-load phase computation instead of inline
+    // per-thread accumulation (eliminates M_PER_THREAD×8 sdot4/block + 4 VGPRs).
+    static constexpr bool needs_cooperative_sum_a = is_dual_scale_asym || is_asymmetric;
     // Number of uint32 dwords to stage payload (ceil(payload_bytes / 4))
     static constexpr int payload_dwords = (payload_bytes + 3) / 4;
 
@@ -918,16 +923,17 @@ __device__ __forceinline__ void accumulate_block_gemm(
     else if constexpr (Traits::is_asymmetric)
     {
         // Pattern A: asymmetric single-scale (Q4_1, Q5_1, IQ1_S)
+        //
+        // sum_a is pre-computed cooperatively during A-load and stored in
+        // sum_a_buf (same layout as Pattern DA: per-half sums at bhi*M_TILE).
+        // This eliminates M_PER_THREAD × 8 sdot4/block from the inner loop
+        // and removes 4 VGPRs (sum_a[] array no longer live across groups).
         int32_t block_acc[M_PER_THREAD][N_PER_THREAD];
-        int32_t sum_a[M_PER_THREAD];
         #pragma unroll
         for (int mm = 0; mm < M_PER_THREAD; ++mm)
-        {
-            sum_a[mm] = 0;
             #pragma unroll
             for (int nn = 0; nn < N_PER_THREAD; ++nn)
                 block_acc[mm][nn] = 0;
-        }
         #pragma clang loop unroll_count(4)
         for (int g = 0; g < 8; ++g)
         {
@@ -935,11 +941,7 @@ __device__ __forceinline__ void accumulate_block_gemm(
             int32_t a_reg[M_PER_THREAD];
             #pragma unroll
             for (int mm = 0; mm < M_PER_THREAD; ++mm)
-            {
                 a_reg[mm] = a_buf[kk * M_TILE + m_base + mm];
-                sum_a[mm] = __builtin_amdgcn_sdot4(
-                    a_reg[mm], static_cast<int32_t>(0x01010101), sum_a[mm], false);
-            }
             int32_t b_reg[N_PER_THREAD];
             #pragma unroll
             for (int nn = 0; nn < N_PER_THREAD; ++nn)
@@ -952,6 +954,12 @@ __device__ __forceinline__ void accumulate_block_gemm(
                         a_reg[mm], b_reg[nn], block_acc[mm][nn], false);
         }
         // FMA: acc += block_acc * scale + sum_a * aux(min)
+        // Read cooperative sum_a from LDS (lo + hi halves = full block sum)
+        int32_t sum_a[M_PER_THREAD];
+        #pragma unroll
+        for (int mm = 0; mm < M_PER_THREAD; ++mm)
+            sum_a[mm] = sum_a_buf[(bp * 2) * M_TILE + m_base + mm]
+                      + sum_a_buf[(bp * 2 + 1) * M_TILE + m_base + mm];
         #pragma unroll
         for (int nn = 0; nn < N_PER_THREAD; ++nn)
         {
@@ -1063,12 +1071,14 @@ void native_vnni_gemm_kernel(
     __shared__ uint16_t aux_lds[2][Traits::needs_aux_compute ? BPT * N_TILE : 1];  // Aux scale/min
     __shared__ uint16_t emin_lo_lds[2][Traits::is_dual_scale_asym ? BPT * N_TILE : 1]; // Embedded min lo
     __shared__ uint16_t emin_hi_lds[2][Traits::is_dual_scale_asym ? BPT * N_TILE : 1]; // Embedded min hi
-    // Precomputed activation sums for Pattern DA emin correction (Q2_K).
+    // Precomputed activation sums for cooperative sum_a (Pattern DA + Pattern A).
     // Computed cooperatively during A-load: each A-load thread covers exactly
     // one block-half for one M-row (4 sdot4 per thread vs 32 sdot4/block in
     // the old per-thread approach → 64× fewer sdot4 total + 4 fewer VGPRs).
     // Layout: [block_half_idx * M_TILE + mi], block_half_idx = bp*2 + {0=lo,1=hi}
-    __shared__ int32_t sum_a_lds[2][Traits::is_dual_scale_asym ? BPT * 2 * M_TILE : 1];
+    // Pattern DA reads halves separately (lo/hi emin correction).
+    // Pattern A reads and sums both halves (full-block min correction).
+    __shared__ int32_t sum_a_lds[2][Traits::needs_cooperative_sum_a ? BPT * 2 * M_TILE : 1];
 
     // FP32 accumulators — accumulate across all K-blocks
     float acc[M_PER_THREAD][N_PER_THREAD];
@@ -1236,7 +1246,7 @@ void native_vnni_gemm_kernel(
         a_lds[0][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
         a_lds[0][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
         a_lds[0][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
-        if constexpr (Traits::is_dual_scale_asym) {
+        if constexpr (Traits::needs_cooperative_sum_a) {
             // Cooperative sum_a: this thread's 4 k-groups = 1 block-half
             const int bhi = a_kg / 4;
             int32_t sa = __builtin_amdgcn_sdot4(
@@ -1345,7 +1355,7 @@ void native_vnni_gemm_kernel(
             a_lds[nxt_buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
             a_lds[nxt_buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
             a_lds[nxt_buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
-            if constexpr (Traits::is_dual_scale_asym) {
+            if constexpr (Traits::needs_cooperative_sum_a) {
                 const int bhi = a_kg / 4;
                 int32_t sa = __builtin_amdgcn_sdot4(
                     static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0, false);
@@ -1472,7 +1482,7 @@ void native_vnni_gemm_kernel(
             a_lds[nxt_buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
             a_lds[nxt_buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
             a_lds[nxt_buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
-            if constexpr (Traits::is_dual_scale_asym) {
+            if constexpr (Traits::needs_cooperative_sum_a) {
                 const int bhi = a_kg / 4;
                 int32_t sa = __builtin_amdgcn_sdot4(
                     static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0, false);
