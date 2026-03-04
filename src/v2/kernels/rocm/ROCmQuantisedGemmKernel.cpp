@@ -111,6 +111,13 @@ extern "C" bool rocmInitIQGridTables(
     const void *h_iq2s_grid, const void *h_iq2xs_grid,
     const void *h_iq2xxs_grid, const void *h_iq1s_grid);
 
+// IQ grid table initialization for GEMM TU (implemented in ROCmGemmKernel_native_VNNI.hip)
+extern "C" bool rocmInitIQGridTables_gemm(
+    int device_id,
+    const void *h_iq3s_grid, const void *h_iq3xxs_grid,
+    const void *h_iq2s_grid, const void *h_iq2xs_grid,
+    const void *h_iq2xxs_grid, const void *h_iq1s_grid);
+
 // --------------------------------------------------------------------------
 // Q4_K helper: extract 6-bit scale and min from packed scales[12] array.
 // Matches llama.cpp get_scale_min_k4(). Sub-block index j in [0..7].
@@ -345,7 +352,7 @@ namespace llaminar2
                 int device_id, void *stream);
 
             // Native-VNNI GEMM: lossless decode with FP16 per-block scales (M>1 prefill).
-            // Supports Q4_0 and IQ4_NL via codebook_id.
+            // Supports all native-VNNI formats via codebook_id.
             // Output is FP32 with scale_A applied inline — no separate epilogue needed.
             // Halved HBM bandwidth vs INT8 GEMM (4.5 bpw vs 8 bpw for Q4_0/IQ4_NL).
             // Defined in ROCmGemmKernel_native_VNNI.hip
@@ -353,6 +360,7 @@ namespace llaminar2
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
                 const void *d_block_scales, // __half* (FP16 d)
+                const void *d_block_mins,   // __half* (FP16 m, nullable)
                 float *d_output,
                 const float *d_scales_A,
                 int M, int N, int K,
@@ -1491,7 +1499,19 @@ namespace llaminar2
                             llaminar2::iq2xxs_grid,
                             llaminar2::iq1s_grid))
                     {
-                        LOG_ERROR("[packNativeVNNI] Failed to initialize IQ grid tables");
+                        LOG_ERROR("[packNativeVNNI] Failed to initialize IQ grid tables (GEMV)");
+                        return false;
+                    }
+                    if (!rocmInitIQGridTables_gemm(
+                            0, // device_id (TODO: multi-GPU)
+                            llaminar2::iq3s_grid,
+                            llaminar2::iq3xxs_grid,
+                            llaminar2::iq2s_grid,
+                            llaminar2::iq2xs_grid,
+                            llaminar2::iq2xxs_grid,
+                            llaminar2::iq1s_grid))
+                    {
+                        LOG_ERROR("[packNativeVNNI] Failed to initialize IQ grid tables (GEMM)");
                         return false;
                     }
                     iq_grids_initialized = true;
@@ -1584,7 +1604,7 @@ namespace llaminar2
                         // IQ4_XS: 256-element super-block → 8 sub-blocks of 32 elements
                         // Each sub-block uses the IQ4_NL LUT (same codebook).
                         // We precompute the combined scale: d * (ls - 32) → FP16
-                        const int super_blocks_per_row = K / 256;
+                        const int super_blocks_per_row = (K + 255) / 256;
                         const int sb_idx = b / 8;  // super-block index in this row
                         const int sub_idx = b % 8; // sub-block within super-block
                         const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
@@ -1604,7 +1624,7 @@ namespace llaminar2
                         // Asymmetric: value = d*sc*nibble - dmin*m
                         // Precompute combined scale d*sc → FP16 and combined min -dmin*m → FP16
                         // This maps to Q4_1 kernel (unsigned nibble [0,15] + min correction)
-                        const int super_blocks_per_row = K / 256;
+                        const int super_blocks_per_row = (K + 255) / 256;
                         const int sb_idx = b / 8;  // super-block index in this row
                         const int sub_idx = b % 8; // sub-block within super-block (0-7)
                         const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
@@ -1660,7 +1680,7 @@ namespace llaminar2
                         // Asymmetric: value = d*sc*(nibble + qh_bit*16) - dmin*m
                         // Reuses Q5_1 kernel: 5-bit unsigned [0,31] + min correction
                         // Same scales[12] as Q4_K, same qs[128] layout, plus qh[32] for 5th bits
-                        const int super_blocks_per_row = K / 256;
+                        const int super_blocks_per_row = (K + 255) / 256;
                         const int sb_idx = b / 8;
                         const int sub_idx = b % 8;
                         const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
@@ -1721,7 +1741,7 @@ namespace llaminar2
                         //   scale_lo = d * scales[2*sub_idx]  (elements 0-15)
                         //   scale_hi = d * scales[2*sub_idx+1] (elements 16-31)
                         // scale_hi stored in mins array (repurposed for dual-scale)
-                        const int super_blocks_per_row = K / 256;
+                        const int super_blocks_per_row = (K + 255) / 256;
                         const int sb_idx = b / 8;  // super-block index in this row
                         const int sub_idx = b % 8; // block within super-block (0-7)
                         const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
@@ -1792,31 +1812,35 @@ namespace llaminar2
                         // Nibble-repack: Pre-merge (low2 | hbit<<2) into 4-bit nibbles.
                         // Payload: 16 bytes (32 × 4-bit, packed 2 per byte: lo/hi nibble).
                         // Decode cost: ~42 VALU (was 139 with separate q2+hbits layout).
-                        const int super_blocks_per_row = K / 256;
+                        const int super_blocks_per_row = (K + 255) / 256;
                         const int sb_idx = b / 8;
                         const int sub_idx = b % 8;
                         const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
                         const auto *blk = reinterpret_cast<const Q3_KBlock *>(
                             raw_bytes + abs_sb * sizeof(Q3_KBlock));
 
-                        // Block sub_idx maps to: chunk = sub_idx/4, group = sub_idx%4
-                        const int chunk = sub_idx / 4;
-                        const int group = sub_idx % 4;
-                        const int shift = group * 2;
-                        const int hmask_bit_pos = 4 * chunk + group;
-
-                        // Extract 32 pre-merged 3-bit values [0..7]
+                        // Extract 32 CONTIGUOUS output elements starting at sub_idx*32.
+                        // Q3_K element i (0-255) in the super-block:
+                        //   qs_byte = (i/128)*32 + (i%32)      (interleaved: each byte holds 4 groups)
+                        //   shift   = ((i%128)/32) * 2          (which 2-bit field in that byte)
+                        //   low 2 bits: qs[qs_byte] >> shift & 3
+                        //   high bit:   hmask[i%32] >> (i/32) & 1
+                        // Merged 3-bit value [0..7] = low2 | (hbit << 2)
+                        const int base = sub_idx * 32;
                         uint8_t raw3[32];
                         for (int e = 0; e < 32; ++e)
                         {
-                            const int low2 = (blk->qs[chunk * 32 + e] >> shift) & 3;
-                            const int hbit = (blk->hmask[e] >> hmask_bit_pos) & 1;
+                            const int i = base + e;
+                            const int qs_byte = (i / 128) * 32 + (i % 32);
+                            const int shift = ((i % 128) / 32) * 2;
+                            const int low2 = (blk->qs[qs_byte] >> shift) & 3;
+                            const int hbit = (blk->hmask[i % 32] >> (i / 32)) & 1;
                             raw3[e] = static_cast<uint8_t>(low2 | (hbit << 2));
                         }
 
                         // Pack as 4-bit nibbles: byte[g] = raw3[g] | (raw3[g+16] << 4)
-                        // Groups 0-3 (elements 0-15) in low nibbles
-                        // Groups 4-7 (elements 16-31) in high nibbles
+                        // Groups 0-3 (elements 0-15, scale_lo) in low nibbles
+                        // Groups 4-7 (elements 16-31, scale_hi) in high nibbles
                         uint8_t payload_buf[16];
                         for (int g = 0; g < 16; ++g)
                             payload_buf[g] = raw3[g] | (raw3[g + 16] << 4);
@@ -1839,10 +1863,11 @@ namespace llaminar2
                             std::memcpy(unpacked_scales, aux, 16);
                         }
 
-                        // Scale indices: lo = chunk*8 + group, hi = lo + 4
+                        // Contiguous dual scales: elements [base..base+15] → scale[sub_idx*2]
+                        //                         elements [base+16..base+31] → scale[sub_idx*2+1]
                         const float d = fp16_to_fp32(blk->d);
-                        const int sc_lo_idx = chunk * 8 + group;
-                        const int sc_hi_idx = sc_lo_idx + 4;
+                        const int sc_lo_idx = sub_idx * 2;
+                        const int sc_hi_idx = sub_idx * 2 + 1;
                         scale_fp16 = fp32_to_fp16(d * static_cast<float>(unpacked_scales[sc_lo_idx] - 32));
                         min_fp16 = fp32_to_fp16(d * static_cast<float>(unpacked_scales[sc_hi_idx] - 32));
 
@@ -1855,23 +1880,28 @@ namespace llaminar2
                         // Q2_K: 256-element super-block → 8 dual-scale+min blocks of 32 elements
                         // Asymmetric: value = d * (sc&0xF) * q2 - dmin * (sc>>4)
                         // 2-bit values from qs[64] (interleaved), 4-bit packed scale+min in scales[16]
-                        const int super_blocks_per_row = K / 256;
+                        const int super_blocks_per_row = (K + 255) / 256;
                         const int sb_idx = b / 8;
                         const int sub_idx = b % 8;
                         const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
                         const auto *blk = reinterpret_cast<const Q2_KBlock *>(
                             raw_bytes + abs_sb * sizeof(Q2_KBlock));
 
-                        // Block sub_idx maps to: chunk = sub_idx/4, group = sub_idx%4
-                        const int chunk = sub_idx / 4;
-                        const int group = sub_idx % 4;
-                        const int shift = group * 2;
-
-                        // Extract 32 2-bit values
+                        // Extract 32 CONTIGUOUS output 2-bit values starting at sub_idx*32.
+                        // Q2_K element i (0-255): same interleaved layout as Q3_K
+                        //   qs_byte = (i/128)*32 + (i%32)
+                        //   shift   = ((i%128)/32) * 2
+                        //   value   = (qs[qs_byte] >> shift) & 3
+                        const int base_elem = sub_idx * 32;
                         uint8_t payload_buf[12];
                         uint8_t raw2[32];
                         for (int e = 0; e < 32; ++e)
-                            raw2[e] = (blk->qs[chunk * 32 + e] >> shift) & 3;
+                        {
+                            const int i = base_elem + e;
+                            const int qs_byte = (i / 128) * 32 + (i % 32);
+                            const int shift = ((i % 128) / 32) * 2;
+                            raw2[e] = (blk->qs[qs_byte] >> shift) & 3;
+                        }
 
                         // Pre-transposed packing: byte[j] of each half holds one element
                         // from each of 4 groups at fields 0,1,2,3.  GPU decode becomes
@@ -1881,17 +1911,18 @@ namespace llaminar2
                         // half 1: payload[4+j] = e[16+j] | e[16+j+4]<<2 | ...
                         for (int half = 0; half < 2; ++half)
                         {
-                            const int base = half * 16;
+                            const int hbase = half * 16;
                             for (int j = 0; j < 4; ++j)
                             {
                                 payload_buf[half * 4 + j] = static_cast<uint8_t>(
-                                    raw2[base + j] | (raw2[base + j + 4] << 2) | (raw2[base + j + 8] << 4) | (raw2[base + j + 12] << 6));
+                                    raw2[hbase + j] | (raw2[hbase + j + 4] << 2) | (raw2[hbase + j + 8] << 4) | (raw2[hbase + j + 12] << 6));
                             }
                         }
 
-                        // Scale indices for Q2_K: lo = 8*chunk + 2*group, hi = lo + 1
-                        const int sc_lo_idx = 8 * chunk + 2 * group;
-                        const int sc_hi_idx = sc_lo_idx + 1;
+                        // Contiguous dual scales: elements [base..base+15] → scales[sub_idx*2]
+                        //                         elements [base+16..base+31] → scales[sub_idx*2+1]
+                        const int sc_lo_idx = sub_idx * 2;
+                        const int sc_hi_idx = sub_idx * 2 + 1;
                         const float d_val = fp16_to_fp32(blk->d);
                         const float dmin = fp16_to_fp32(blk->dmin);
 
@@ -1924,7 +1955,7 @@ namespace llaminar2
                     {
                         // IQ3_S: 9-bit grid index → iq3s_grid[512], direct sign bytes
                         // Payload: [qs×8][qh×1][signs×4] = 13 bytes
-                        const int super_blocks_per_row = K / 256;
+                        const int super_blocks_per_row = (K + 255) / 256;
                         const int sb_idx = b / 8;
                         const int sub_idx = b % 8;
                         const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
@@ -1954,7 +1985,7 @@ namespace llaminar2
                     {
                         // IQ3_XXS: 8-bit grid index → iq3xxs_grid[256], indirect signs
                         // Payload: [qs×8][signs×4] = 12 bytes
-                        const int super_blocks_per_row = K / 256;
+                        const int super_blocks_per_row = (K + 255) / 256;
                         const int sb_idx = b / 8;
                         const int sub_idx = b % 8;
                         const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
@@ -1989,7 +2020,7 @@ namespace llaminar2
                     {
                         // IQ2_S: 10-bit grid index → iq2s_grid[1024], direct sign bytes, dual scale
                         // Payload: [qs×4][qh×1][signs×4] = 9 bytes
-                        const int super_blocks_per_row = K / 256;
+                        const int super_blocks_per_row = (K + 255) / 256;
                         const int sb_idx = b / 8;
                         const int sub_idx = b % 8;
                         const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
@@ -2020,7 +2051,7 @@ namespace llaminar2
                     {
                         // IQ2_XS: 9-bit grid index → iq2xs_grid[512], indirect signs, dual scale
                         // Payload: [qs×4][qh×1][signs×4] = 9 bytes
-                        const int super_blocks_per_row = K / 256;
+                        const int super_blocks_per_row = (K + 255) / 256;
                         const int sb_idx = b / 8;
                         const int sub_idx = b % 8;
                         const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
@@ -2055,7 +2086,7 @@ namespace llaminar2
                     {
                         // IQ2_XXS: 8-bit grid index → iq2xxs_grid[256], indirect signs
                         // Payload: [qs×4][signs×4] = 8 bytes
-                        const int super_blocks_per_row = K / 256;
+                        const int super_blocks_per_row = (K + 255) / 256;
                         const int sb_idx = b / 8;
                         const int sub_idx = b % 8;
                         const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
@@ -2095,7 +2126,7 @@ namespace llaminar2
                         // IQ1_S: 11-bit grid index → iq1s_grid[2048], signed values {-1,0,+1}
                         // Payload: [qs×4][qh_word×2] = 6 bytes
                         // Delta correction via asymmetric min: min = dl * delta
-                        const int super_blocks_per_row = K / 256;
+                        const int super_blocks_per_row = (K + 255) / 256;
                         const int sb_idx = b / 8;
                         const int sub_idx = b % 8;
                         const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
@@ -2141,7 +2172,7 @@ namespace llaminar2
                     {
                         // IQ1_M: 11-bit grid index → iq1s_grid[2048], dual-scale + embedded delta
                         // Payload: [qs×4][qh×2][delta_lo_fp16][delta_hi_fp16] = 10 bytes
-                        const int super_blocks_per_row = K / 256;
+                        const int super_blocks_per_row = (K + 255) / 256;
                         const int sb_idx = b / 8;
                         const int sub_idx = b % 8;
                         const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
@@ -3960,12 +3991,12 @@ namespace llaminar2
                 if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f && !d_prefill_bias)
                 {
                     const uint8_t cb_id = impl_->native_vnni_codebook_id;
-                    if (cb_id == 0 || cb_id == 4)
                     {
                         if (rocmGemm_native_vnni_fp32(
                                 d_A_int8,
                                 impl_->d_weights_native_payload,
                                 impl_->d_weights_native_scales,
+                                impl_->d_weights_native_mins,
                                 d_prefill_output,
                                 d_scales_A,
                                 m, n, k,
@@ -6063,13 +6094,12 @@ namespace llaminar2
             if (m > 1 && impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
             {
                 const uint8_t cb_id = impl_->native_vnni_codebook_id;
-                // Currently supports Q4_0 (0) and IQ4_NL (4)
-                if (cb_id == 0 || cb_id == 4)
                 {
                     if (rocmGemm_native_vnni_fp32(
                             impl_->d_A_int8,
                             impl_->d_weights_native_payload,
                             impl_->d_weights_native_scales,
+                            impl_->d_weights_native_mins,
                             d_C,
                             impl_->d_scales_A,
                             m, n, k,

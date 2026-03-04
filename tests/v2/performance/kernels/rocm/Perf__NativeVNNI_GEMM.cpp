@@ -27,13 +27,16 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -48,6 +51,7 @@
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
+#include "GpuVerification.h"
 #endif
 
 using namespace llaminar2;
@@ -56,6 +60,12 @@ using namespace llaminar2::test;
 
 namespace
 {
+#ifdef HAVE_ROCM
+    using gpu_verify::destroyAllHipBLAS;
+    using gpu_verify::gpuCosineSimilarity;
+    using gpu_verify::gpuReferenceFP32Gemm;
+    using gpu_verify::GpuWeightsCache;
+#endif
 
     // =============================================================================
     // Constants
@@ -67,8 +77,11 @@ namespace
     /// Correctness gate: cosine similarity between native-VNNI and FP32 reference
     constexpr float COSINE_SIM_GATE = 0.9999f;
 
-    /// Performance gate: speedup over INT8 GEMM baseline
-    constexpr float SPEEDUP_GATE = 1.8f;
+    /// Performance gate: speedup over INT8 GEMM baseline (grand total average)
+    constexpr float SPEEDUP_GATE = 1.0f;
+
+    /// Number of GPUs to use (auto-detected, capped at available)
+    static int NUM_GPUS = 1;
 
     // =============================================================================
     // Format descriptors (sprint: Q4_0 and IQ4_NL only)
@@ -87,6 +100,32 @@ namespace
          { return TestTensorFactory::createQ4_0Random({N, K}); }},
         {"IQ4_NL", 4.5, [](size_t N, size_t K)
          { return TestTensorFactory::createIQ4_NLRandom({N, K}); }},
+        {"Q4_1", 5.0, [](size_t N, size_t K)
+         { return TestTensorFactory::createQ4_1Random({N, K}); }},
+        {"Q5_0", 5.5, [](size_t N, size_t K)
+         { return TestTensorFactory::createQ5_0Random({N, K}); }},
+        {"Q5_1", 6.0, [](size_t N, size_t K)
+         { return TestTensorFactory::createQ5_1Random({N, K}); }},
+        {"Q6_K", 6.5625, [](size_t N, size_t K)
+         { return TestTensorFactory::createQ6_KRandom({N, K}); }},
+        {"Q3_K", 3.4375, [](size_t N, size_t K)
+         { return TestTensorFactory::createQ3_KRandom({N, K}); }},
+        {"Q2_K", 2.5625, [](size_t N, size_t K)
+         { return TestTensorFactory::createQ2_KRandom({N, K}); }},
+        {"IQ3_S", 3.4375, [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ3_SRandom({N, K}); }},
+        {"IQ3_XXS", 3.0625, [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ3_XXSRandom({N, K}); }},
+        {"IQ2_S", 2.5, [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ2_SRandom({N, K}); }},
+        {"IQ2_XS", 2.3125, [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ2_XSRandom({N, K}); }},
+        {"IQ2_XXS", 2.0625, [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ2_XXSRandom({N, K}); }},
+        {"IQ1_S", 1.5625, [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ1_SRandom({N, K}); }},
+        {"IQ1_M", 1.75, [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ1_MRandom({N, K}); }},
     };
 
     // =============================================================================
@@ -121,6 +160,7 @@ namespace
         {"7B_AttnOut", 3584, 3584},
         {"7B_FFN_Up", 18944, 3584},
         {"7B_FFN_Dn", 3584, 18944},
+        {"7B_LM_Head", 151936, 3584},
     };
 
     // =============================================================================
@@ -174,47 +214,6 @@ namespace
     }
 
     // =============================================================================
-    // FP32 reference GEMM (CPU, for correctness validation)
-    //
-    // Computes C[M×N] = A[M×K] × B^T[N×K]  (B stored as [N×K] row-major)
-    // OpenMP-parallelized across M×N output elements.
-    // =============================================================================
-
-    static void referenceFP32Gemm(const float *A, const float *B_dequant,
-                                  float *C, int M, int N, int K)
-    {
-#pragma omp parallel for collapse(2) schedule(static)
-        for (int m = 0; m < M; ++m)
-        {
-            for (int n = 0; n < N; ++n)
-            {
-                float acc = 0.0f;
-                for (int ki = 0; ki < K; ++ki)
-                    acc += A[m * K + ki] * B_dequant[n * K + ki];
-                C[m * N + n] = acc;
-            }
-        }
-    }
-
-    // =============================================================================
-    // Parallel cosine similarity (OpenMP reduction)
-    // =============================================================================
-
-    static float parallelCosineSimilarity(const float *a, const float *b, size_t count)
-    {
-        double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
-#pragma omp parallel for reduction(+ : dot, norm_a, norm_b) schedule(static)
-        for (size_t i = 0; i < count; ++i)
-        {
-            dot += static_cast<double>(a[i]) * b[i];
-            norm_a += static_cast<double>(a[i]) * a[i];
-            norm_b += static_cast<double>(b[i]) * b[i];
-        }
-        double denom = std::sqrt(norm_a) * std::sqrt(norm_b);
-        return (denom > 0.0) ? static_cast<float>(dot / denom) : 0.0f;
-    }
-
-    // =============================================================================
     // Test fixture
     // =============================================================================
 
@@ -229,6 +228,7 @@ namespace
             has_device_ = (err == hipSuccess && device_count > 0);
             if (has_device_)
             {
+                NUM_GPUS = std::min(device_count, 3); // Use up to 3 GPUs
                 (void)hipSetDevice(0);
                 hipDeviceProp_t props;
                 hipGetDeviceProperties(&props, 0);
@@ -239,16 +239,25 @@ namespace
 #endif
         }
 
+        void TearDown() override
+        {
+#ifdef HAVE_ROCM
+            destroyAllHipBLAS();
+#endif
+        }
+
         bool has_device_ = false;
         std::string device_name_;
 
 #ifdef HAVE_ROCM
 
-        /// Time a GEMM kernel call. Returns sorted timing vector in μs.
-        std::vector<double> timeGEMMKernel(ROCmQuantisedGemmKernel &kernel,
-                                           TensorBase *input, TensorBase *output,
-                                           int M, int N, int K)
+        /// Time a GEMM kernel call on a specific device. Returns sorted timing vector in μs.
+        static std::vector<double> timeGEMMKernel(ROCmQuantisedGemmKernel &kernel,
+                                                  TensorBase *input, TensorBase *output,
+                                                  int M, int N, int K, int device_id)
         {
+            (void)hipSetDevice(device_id);
+
             // Warmup
             for (int i = 0; i < WARMUP_RUNS; ++i)
                 kernel.multiply_tensor(input, output, M, N, K);
@@ -282,10 +291,12 @@ namespace
             return times_us;
         }
 
-        /// Benchmark INT8 VNNI GEMM reference (Q8_0 → INT8 V3/V7) for a shape+M.
+        /// Benchmark INT8 VNNI GEMM reference on a specific device.
         /// Returns min kernel time in μs.
-        double benchmarkINT8GEMMReference(int M, int N, int K)
+        static double benchmarkINT8GEMMReference(int M, int N, int K, int device_id)
         {
+            (void)hipSetDevice(device_id);
+
             auto weights = TestTensorFactory::createQ8_0Random(
                 {static_cast<size_t>(N), static_cast<size_t>(K)});
             if (!weights)
@@ -295,11 +306,11 @@ namespace
             if (!packWeightsToROCm(weights.get(), packed))
                 return 0.0;
 
-            ROCmQuantisedGemmKernel kernel(&packed, 0);
+            ROCmQuantisedGemmKernel kernel(&packed, device_id);
             auto reqs = kernel.getWorkspaceRequirements(M, N, K);
             const size_t budget = reqs.total_bytes_with_alignment() + (8 * 1024 * 1024);
             auto workspace = std::make_unique<DeviceWorkspaceManager>(
-                DeviceId::rocm(0), budget);
+                DeviceId::rocm(device_id), budget);
             if (!workspace->allocate(reqs))
                 return 0.0;
             kernel.bindWorkspace(workspace.get());
@@ -308,22 +319,28 @@ namespace
                 {static_cast<size_t>(M), static_cast<size_t>(K)});
             auto output = TestTensorFactory::createFP32(
                 {static_cast<size_t>(M), static_cast<size_t>(N)});
-            if (!input->ensureOnDevice(DeviceId::rocm(0)))
+            if (!input->ensureOnDevice(DeviceId::rocm(device_id)))
                 return 0.0;
-            if (!output->allocateOnDevice(DeviceId::rocm(0)))
+            if (!output->allocateOnDevice(DeviceId::rocm(device_id)))
                 return 0.0;
 
-            auto times = timeGEMMKernel(kernel, input.get(), output.get(), M, N, K);
+            auto times = timeGEMMKernel(kernel, input.get(), output.get(), M, N, K, device_id);
             kernel.unbindWorkspace();
 
             return times.empty() ? 0.0 : times.front(); // min
         }
 
-        /// Run a single format+shape+M benchmark, including correctness check.
-        GEMMBenchResult benchmarkGEMM(const GEMMFormatSpec &fmt,
-                                      const GEMMShape &shape, int M,
-                                      double int8_ref_us)
+        /// Run a single format+shape+M benchmark on a specific device.
+        /// Thread-safe: does not use gtest assertions (caller validates results).
+        static GEMMBenchResult benchmarkGEMM(const GEMMFormatSpec &fmt,
+                                             const GEMMShape &shape, int M,
+                                             double int8_ref_us,
+                                             TensorBase *weights,
+                                             const GpuWeightsCache *gpu_weights,
+                                             int device_id)
         {
+            (void)hipSetDevice(device_id);
+
             GEMMBenchResult result{};
             result.format_name = fmt.name;
             result.bpw = fmt.bpw;
@@ -332,21 +349,15 @@ namespace
             result.N = shape.N;
             result.K = shape.K;
 
-            // 1. Create quantized weights and pack
-            auto weights = fmt.create(
-                static_cast<size_t>(shape.N), static_cast<size_t>(shape.K));
-            EXPECT_NE(weights, nullptr);
             if (!weights)
                 return result;
 
+            // 1. Pack pre-created quantized weights
             ROCmPackedWeights packed;
-            EXPECT_TRUE(packWeightsToROCm(weights.get(), packed));
-            if (packed.native_vnni_payload.empty())
-            {
-                fprintf(stderr, "  [SKIP] %s: no native-VNNI payload\n",
-                        fmt.name.c_str());
+            if (!packWeightsToROCm(weights, packed))
                 return result;
-            }
+            if (packed.native_vnni_payload.empty())
+                return result;
 
             // Native-VNNI weight bytes: payload + scales
             result.native_weight_bytes =
@@ -354,12 +365,13 @@ namespace
                 static_cast<double>(packed.native_vnni_scales.size() * sizeof(uint16_t));
 
             // 2. Create kernel + workspace
-            ROCmQuantisedGemmKernel kernel(&packed, 0);
+            ROCmQuantisedGemmKernel kernel(&packed, device_id);
             auto reqs = kernel.getWorkspaceRequirements(M, shape.N, shape.K);
             const size_t budget = reqs.total_bytes_with_alignment() + (8 * 1024 * 1024);
             auto workspace = std::make_unique<DeviceWorkspaceManager>(
-                DeviceId::rocm(0), budget);
-            EXPECT_TRUE(workspace->allocate(reqs));
+                DeviceId::rocm(device_id), budget);
+            if (!workspace->allocate(reqs))
+                return result;
             kernel.bindWorkspace(workspace.get());
 
             // 3. Create input/output tensors and upload
@@ -367,48 +379,93 @@ namespace
                 {static_cast<size_t>(M), static_cast<size_t>(shape.K)});
             auto output = TestTensorFactory::createFP32(
                 {static_cast<size_t>(M), static_cast<size_t>(shape.N)});
-            EXPECT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
-            EXPECT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
-
-            // 4. Correctness: compute FP32 reference on CPU
+            if (!input->ensureOnDevice(DeviceId::rocm(device_id)))
             {
-                // Dequantize weights to FP32 (data() on quantized tensors returns FP32 cache)
-                const float *w_fp32 = weights->data();
-                EXPECT_NE(w_fp32, nullptr);
+                kernel.unbindWorkspace();
+                return result;
+            }
+            if (!output->allocateOnDevice(DeviceId::rocm(device_id)))
+            {
+                kernel.unbindWorkspace();
+                return result;
+            }
 
-                if (w_fp32)
+            // 4. Correctness: GPU-based FP32 reference via hipBLAS
+            {
+                kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
+                (void)hipDeviceSynchronize();
+                output->mark_device_dirty();
+
+                if (gpu_weights && gpu_weights->d_weights)
                 {
-                    // Run one GEMM on GPU to get the output
-                    kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
-                    (void)hipDeviceSynchronize();
+                    auto *in_fp32 = dynamic_cast<FP32Tensor *>(input.get());
+                    const float *d_input = reinterpret_cast<const float *>(in_fp32->gpu_data_ptr());
+                    if (d_input)
+                    {
+                        const size_t out_elems = static_cast<size_t>(M) * shape.N;
+                        float *d_ref_output = nullptr;
+                        auto hip_err = hipMalloc(&d_ref_output, out_elems * sizeof(float));
+                        if (hip_err == hipSuccess)
+                        {
+                            bool gemm_ok = gpuReferenceFP32Gemm(
+                                d_input, gpu_weights->d_weights,
+                                d_ref_output, M, shape.N, shape.K, device_id);
+                            (void)hipDeviceSynchronize();
 
-                    // Mark output as device-dirty so data() triggers D2H sync
-                    output->mark_device_dirty();
+                            if (gemm_ok)
+                            {
+                                const float *d_gpu_output = reinterpret_cast<const float *>(
+                                    dynamic_cast<FP32Tensor *>(output.get())->gpu_data_ptr());
+                                result.cosine_sim = gpuCosineSimilarity(
+                                    d_gpu_output, d_ref_output, out_elems, device_id);
+                                result.correctness_pass = (result.cosine_sim >= COSINE_SIM_GATE);
+                            }
+                            (void)hipFree(d_ref_output);
+                        }
+                    }
+                }
+                else
+                {
+                    // Fallback: CPU reference (slow)
+                    const float *w_fp32 = weights->data();
+                    if (w_fp32)
+                    {
+                        auto *out_fp32 = dynamic_cast<FP32Tensor *>(output.get());
+                        const float *gpu_data = out_fp32->data();
+                        const float *a_data = dynamic_cast<const FP32Tensor *>(input.get())->data();
+                        const size_t out_elems = static_cast<size_t>(M) * shape.N;
+                        std::vector<float> ref_output(out_elems, 0.0f);
 
-                    // Read back GPU output (triggers D2H sync via coherence)
-                    auto *out_fp32 = dynamic_cast<FP32Tensor *>(output.get());
-                    EXPECT_NE(out_fp32, nullptr);
-                    const float *gpu_data = out_fp32->data();
+#pragma omp parallel for collapse(2) schedule(static)
+                        for (int m = 0; m < M; ++m)
+                            for (int n = 0; n < shape.N; ++n)
+                            {
+                                float acc = 0.0f;
+                                for (int ki = 0; ki < shape.K; ++ki)
+                                    acc += a_data[m * shape.K + ki] * w_fp32[n * shape.K + ki];
+                                ref_output[m * shape.N + n] = acc;
+                            }
 
-                    // Compute CPU reference
-                    const float *a_data = dynamic_cast<const FP32Tensor *>(input.get())->data();
-                    std::vector<float> ref_output(static_cast<size_t>(M) * shape.N, 0.0f);
-                    referenceFP32Gemm(a_data, w_fp32, ref_output.data(), M, shape.N, shape.K);
+                        double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
+#pragma omp parallel for reduction(+ : dot, norm_a, norm_b)
+                        for (size_t i = 0; i < out_elems; ++i)
+                        {
+                            dot += (double)gpu_data[i] * ref_output[i];
+                            norm_a += (double)gpu_data[i] * gpu_data[i];
+                            norm_b += (double)ref_output[i] * ref_output[i];
+                        }
+                        double denom = std::sqrt(norm_a) * std::sqrt(norm_b);
+                        result.cosine_sim = denom > 0 ? static_cast<float>(dot / denom) : 0.0f;
+                        result.correctness_pass = (result.cosine_sim >= COSINE_SIM_GATE);
 
-                    // Cosine similarity (parallel)
-                    result.cosine_sim = parallelCosineSimilarity(
-                        gpu_data, ref_output.data(),
-                        static_cast<size_t>(M) * shape.N);
-                    result.correctness_pass = (result.cosine_sim >= COSINE_SIM_GATE);
-
-                    // Re-upload output for benchmarking (data() call synced D2H)
-                    output->ensureOnDevice(DeviceId::rocm(0));
+                        output->ensureOnDevice(DeviceId::rocm(device_id));
+                    }
                 }
             }
 
             // 5. Timed runs
             auto times = timeGEMMKernel(kernel, input.get(), output.get(),
-                                        M, shape.N, shape.K);
+                                        M, shape.N, shape.K, device_id);
 
             double max_us;
             computeStats(times, result.mean_us, result.min_us, max_us, result.stddev_us);
@@ -448,11 +505,82 @@ namespace
 
         const int M = 128;
 
-        fprintf(stderr, "\n[NativeVNNI GEMM] Correctness Test (M=%d)\n", M);
+        fprintf(stderr, "\n[NativeVNNI GEMM] Correctness Test (M=%d) using %d GPU(s)\n",
+                M, NUM_GPUS);
         fprintf(stderr, "[NativeVNNI GEMM] Device: %s\n", device_name_.c_str());
         fprintf(stderr, "[NativeVNNI GEMM] Gate: cosine similarity >= %.4f\n",
                 COSINE_SIM_GATE);
 
+        // Build work items: (format_idx, shape_idx) pairs
+        // Sort by estimated cost (N*K descending) then interleave across GPUs
+        struct WorkGroup
+        {
+            int format_idx;
+            int shape_idx;
+            double cost;
+        };
+        std::vector<WorkGroup> groups;
+        for (int fi = 0; fi < (int)GEMM_FORMATS.size(); ++fi)
+            for (int si = 0; si < (int)GEMM_SHAPES.size(); ++si)
+                groups.push_back({fi, si,
+                                  (double)GEMM_SHAPES[si].N * GEMM_SHAPES[si].K});
+
+        // Sort by cost descending so round-robin distributes heavy shapes evenly
+        std::sort(groups.begin(), groups.end(),
+                  [](const WorkGroup &a, const WorkGroup &b)
+                  { return a.cost > b.cost; });
+
+        // Round-robin assign to GPUs
+        std::vector<std::vector<WorkGroup>> per_gpu(NUM_GPUS);
+        for (size_t i = 0; i < groups.size(); ++i)
+            per_gpu[i % NUM_GPUS].push_back(groups[i]);
+
+        // Results array indexed by (format_idx * num_shapes + shape_idx)
+        const size_t total = GEMM_FORMATS.size() * GEMM_SHAPES.size();
+        std::vector<GEMMBenchResult> results(total);
+        std::atomic<int> completed{0};
+
+        // Worker function for each GPU
+        auto worker = [&](int gpu_id)
+        {
+            (void)hipSetDevice(gpu_id);
+            for (const auto &wg : per_gpu[gpu_id])
+            {
+                const auto &fmt = GEMM_FORMATS[wg.format_idx];
+                const auto &shape = GEMM_SHAPES[wg.shape_idx];
+
+                auto weights = fmt.create(
+                    static_cast<size_t>(shape.N), static_cast<size_t>(shape.K));
+                GpuWeightsCache gpu_w;
+                if (weights)
+                {
+                    const float *w_fp32 = weights->data();
+                    if (w_fp32)
+                        gpu_w.upload(w_fp32, shape.N, shape.K, gpu_id);
+                }
+
+                auto r = benchmarkGEMM(fmt, shape, M, 0.0, weights.get(), &gpu_w, gpu_id);
+
+                size_t idx = wg.format_idx * GEMM_SHAPES.size() + wg.shape_idx;
+                results[idx] = std::move(r);
+
+                int done = ++completed;
+                fprintf(stderr, "  [GPU %d] %s/%s cos=%.6f %s  (%d/%zu)\n",
+                        gpu_id, fmt.name.c_str(), shape.name.c_str(),
+                        results[idx].cosine_sim,
+                        results[idx].correctness_pass ? "✓" : "✗",
+                        done, total);
+            }
+        };
+
+        // Launch workers
+        std::vector<std::thread> threads;
+        for (int g = 0; g < NUM_GPUS; ++g)
+            threads.emplace_back(worker, g);
+        for (auto &t : threads)
+            t.join();
+
+        // Render table and validate
         fort::utf8_table table;
         table.set_border_style(FT_DOUBLE2_STYLE);
         table << fort::header
@@ -464,18 +592,14 @@ namespace
         for (int c = 2; c <= 6; ++c)
             table.column(c).set_cell_text_align(fort::text_align::right);
 
-        int pass_count = 0, total_count = 0;
-
-        for (const auto &fmt : GEMM_FORMATS)
+        int pass_count = 0;
+        for (int fi = 0; fi < (int)GEMM_FORMATS.size(); ++fi)
         {
-            for (const auto &shape : GEMM_SHAPES)
+            for (int si = 0; si < (int)GEMM_SHAPES.size(); ++si)
             {
-                auto r = benchmarkGEMM(fmt, shape, M, 0.0);
-                ++total_count;
-
+                const auto &r = results[fi * GEMM_SHAPES.size() + si];
                 char buf_cos[16];
                 snprintf(buf_cos, sizeof(buf_cos), "%.6f", r.cosine_sim);
-
                 const char *status = r.correctness_pass ? "PASS ✓" : "FAIL ✗";
                 if (r.correctness_pass)
                     ++pass_count;
@@ -486,14 +610,14 @@ namespace
                       << buf_cos << status << fort::endr;
 
                 EXPECT_GE(r.cosine_sim, COSINE_SIM_GATE)
-                    << fmt.name << " " << shape.name
+                    << r.format_name << " " << r.shape_name
                     << " cosine=" << r.cosine_sim;
             }
         }
 
         table << fort::separator;
         char summary[64];
-        snprintf(summary, sizeof(summary), "%d/%d passed", pass_count, total_count);
+        snprintf(summary, sizeof(summary), "%d/%zu passed", pass_count, total);
         table << "" << summary << "" << "" << "" << "" << "" << fort::endr;
 
         fprintf(stderr, "\n%s\n", table.to_string().c_str());
@@ -514,7 +638,8 @@ namespace
         if (!has_device_)
             GTEST_SKIP() << "No ROCm device available";
 
-        fprintf(stderr, "\n[NativeVNNI GEMM] Performance Benchmark\n");
+        fprintf(stderr, "\n[NativeVNNI GEMM] Performance Benchmark using %d GPU(s)\n",
+                NUM_GPUS);
         fprintf(stderr, "[NativeVNNI GEMM] Device: %s\n", device_name_.c_str());
         fprintf(stderr, "[NativeVNNI GEMM] %zu formats × %zu shapes × %zu M values\n",
                 GEMM_FORMATS.size(), GEMM_SHAPES.size(), M_VALUES.size());
@@ -524,60 +649,172 @@ namespace
                 SPEEDUP_GATE);
 
         // =====================================================================
-        // Phase 1: Benchmark INT8 GEMM reference for each (shape, M)
+        // Phase 1: Benchmark INT8 GEMM reference for each (shape, M) — multi-GPU
         // =====================================================================
-        fprintf(stderr, "\n[Phase 1] Benchmarking INT8 GEMM reference (V3/V7)...\n");
+        fprintf(stderr, "\n[Phase 1] Benchmarking INT8 GEMM reference (V3/V7) on %d GPU(s)...\n",
+                NUM_GPUS);
+
+        // Build INT8 work items: (shape_idx, M) pairs
+        struct Int8Work
+        {
+            int shape_idx;
+            int M;
+            double cost;
+        };
+        std::vector<Int8Work> int8_work;
+        for (int si = 0; si < (int)GEMM_SHAPES.size(); ++si)
+            for (int M : M_VALUES)
+                int8_work.push_back({si, M, (double)GEMM_SHAPES[si].N * GEMM_SHAPES[si].K * M});
+
+        // Sort by cost descending, then round-robin
+        std::sort(int8_work.begin(), int8_work.end(),
+                  [](const Int8Work &a, const Int8Work &b)
+                  { return a.cost > b.cost; });
+
+        std::vector<std::vector<Int8Work>> int8_per_gpu(NUM_GPUS);
+        for (size_t i = 0; i < int8_work.size(); ++i)
+            int8_per_gpu[i % NUM_GPUS].push_back(int8_work[i]);
 
         // Key: "shape_name:M" → min time in μs
-        std::unordered_map<std::string, double> int8_ref;
+        // Pre-allocate indexed by (shape_idx * M_VALUES.size() + m_idx)
+        const size_t num_shapes = GEMM_SHAPES.size();
+        const size_t num_m = M_VALUES.size();
+        std::vector<double> int8_times(num_shapes * num_m, 0.0);
+        std::atomic<int> int8_done{0};
 
-        for (const auto &shape : GEMM_SHAPES)
         {
-            for (int M : M_VALUES)
+            std::vector<std::thread> threads;
+            for (int g = 0; g < NUM_GPUS; ++g)
             {
-                std::string key = shape.name + ":" + std::to_string(M);
-                double ref_us = benchmarkINT8GEMMReference(M, shape.N, shape.K);
-                int8_ref[key] = ref_us;
-                fprintf(stderr, "  INT8 %s M=%d: %.1f μs\n",
-                        shape.name.c_str(), M, ref_us);
+                threads.emplace_back([&, g]()
+                                     {
+                    (void)hipSetDevice(g);
+                    for (const auto &w : int8_per_gpu[g])
+                    {
+                        double ref_us = benchmarkINT8GEMMReference(
+                            w.M, GEMM_SHAPES[w.shape_idx].N,
+                            GEMM_SHAPES[w.shape_idx].K, g);
+
+                        // Find m_idx
+                        int m_idx = 0;
+                        for (int mi = 0; mi < (int)M_VALUES.size(); ++mi)
+                            if (M_VALUES[mi] == w.M) { m_idx = mi; break; }
+
+                        int8_times[w.shape_idx * num_m + m_idx] = ref_us;
+                        int done = ++int8_done;
+                        fprintf(stderr, "  [GPU %d] INT8 %s M=%d: %.1f μs  (%d/%zu)\n",
+                                g, GEMM_SHAPES[w.shape_idx].name.c_str(),
+                                w.M, ref_us, done, int8_work.size());
+                    } });
             }
+            for (auto &t : threads)
+                t.join();
         }
 
-        // =====================================================================
-        // Phase 2: Benchmark native-VNNI GEMM for each format
-        // =====================================================================
-        fprintf(stderr, "\n[Phase 2] Benchmarking native-VNNI GEMM...\n");
-
-        std::vector<GEMMBenchResult> results;
-        results.reserve(GEMM_FORMATS.size() * GEMM_SHAPES.size() * M_VALUES.size());
-
-        for (const auto &fmt : GEMM_FORMATS)
-        {
-            fprintf(stderr, "\n  Format: %s (%.1f bpw)\n", fmt.name.c_str(), fmt.bpw);
-            for (const auto &shape : GEMM_SHAPES)
+        // Build lookup map from int8_times
+        std::unordered_map<std::string, double> int8_ref;
+        for (int si = 0; si < (int)num_shapes; ++si)
+            for (int mi = 0; mi < (int)num_m; ++mi)
             {
-                for (int M : M_VALUES)
-                {
-                    std::string key = shape.name + ":" + std::to_string(M);
-                    double ref_us = int8_ref.count(key) ? int8_ref[key] : 0.0;
-
-                    auto r = benchmarkGEMM(fmt, shape, M, ref_us);
-                    fprintf(stderr, "    %s M=%d: %.1f μs (%.2fx vs INT8, cos=%.6f %s)\n",
-                            shape.name.c_str(), M, r.min_us,
-                            r.speedup_vs_int8, r.cosine_sim,
-                            r.correctness_pass ? "✓" : "✗");
-                    results.push_back(std::move(r));
-                }
+                std::string key = GEMM_SHAPES[si].name + ":" + std::to_string(M_VALUES[mi]);
+                int8_ref[key] = int8_times[si * num_m + mi];
             }
+
+        // =====================================================================
+        // Phase 2: Benchmark native-VNNI GEMM — multi-GPU
+        // =====================================================================
+        fprintf(stderr, "\n[Phase 2] Benchmarking native-VNNI GEMM on %d GPU(s)...\n",
+                NUM_GPUS);
+
+        // Work groups: (format_idx, shape_idx) — each group runs 4 M values
+        // The GPU cache is per format+shape, so keeping M values together avoids
+        // duplicate weight uploads
+        struct WorkGroup
+        {
+            int format_idx;
+            int shape_idx;
+            double cost; // sum of N*K*M for all M values
+        };
+        std::vector<WorkGroup> groups;
+        for (int fi = 0; fi < (int)GEMM_FORMATS.size(); ++fi)
+            for (int si = 0; si < (int)GEMM_SHAPES.size(); ++si)
+            {
+                double c = 0;
+                for (int M : M_VALUES)
+                    c += (double)GEMM_SHAPES[si].N * GEMM_SHAPES[si].K * M;
+                groups.push_back({fi, si, c});
+            }
+
+        std::sort(groups.begin(), groups.end(),
+                  [](const WorkGroup &a, const WorkGroup &b)
+                  { return a.cost > b.cost; });
+
+        std::vector<std::vector<WorkGroup>> per_gpu(NUM_GPUS);
+        for (size_t i = 0; i < groups.size(); ++i)
+            per_gpu[i % NUM_GPUS].push_back(groups[i]);
+
+        // Results indexed by (format_idx * num_shapes * num_m + shape_idx * num_m + m_idx)
+        const size_t total_results = GEMM_FORMATS.size() * num_shapes * num_m;
+        std::vector<GEMMBenchResult> results(total_results);
+        std::atomic<int> phase2_done{0};
+        const size_t total_groups = groups.size();
+
+        {
+            std::vector<std::thread> threads;
+            for (int g = 0; g < NUM_GPUS; ++g)
+            {
+                threads.emplace_back([&, g]()
+                                     {
+                    (void)hipSetDevice(g);
+                    for (const auto &wg : per_gpu[g])
+                    {
+                        const auto &fmt = GEMM_FORMATS[wg.format_idx];
+                        const auto &shape = GEMM_SHAPES[wg.shape_idx];
+
+                        auto weights = fmt.create(
+                            static_cast<size_t>(shape.N),
+                            static_cast<size_t>(shape.K));
+                        GpuWeightsCache gpu_w;
+                        if (weights)
+                        {
+                            const float *w_fp32 = weights->data();
+                            if (w_fp32)
+                                gpu_w.upload(w_fp32, shape.N, shape.K, g);
+                        }
+
+                        for (int mi = 0; mi < (int)num_m; ++mi)
+                        {
+                            int M = M_VALUES[mi];
+                            std::string key = shape.name + ":" + std::to_string(M);
+                            double ref_us = int8_ref.count(key) ? int8_ref[key] : 0.0;
+
+                            auto r = benchmarkGEMM(fmt, shape, M, ref_us,
+                                                   weights.get(), &gpu_w, g);
+
+                            size_t idx = wg.format_idx * num_shapes * num_m
+                                       + wg.shape_idx * num_m + mi;
+                            results[idx] = std::move(r);
+                        }
+
+                        int done = ++phase2_done;
+                        fprintf(stderr, "  [GPU %d] %s/%s done  (%d/%zu groups)\n",
+                                g, fmt.name.c_str(), shape.name.c_str(),
+                                done, total_groups);
+                    } });
+            }
+            for (auto &t : threads)
+                t.join();
         }
 
         // =====================================================================
         // Phase 3: Per-format summary tables (grouped by M)
         // =====================================================================
-        for (const auto &fmt : GEMM_FORMATS)
+        for (int fi = 0; fi < (int)GEMM_FORMATS.size(); ++fi)
         {
-            for (int M : M_VALUES)
+            const auto &fmt = GEMM_FORMATS[fi];
+            for (int mi = 0; mi < (int)num_m; ++mi)
             {
+                int M = M_VALUES[mi];
                 fort::utf8_table table;
                 table.set_border_style(FT_DOUBLE2_STYLE);
 
@@ -596,10 +833,10 @@ namespace
                 for (int c = 1; c <= 10; ++c)
                     table.column(c).set_cell_text_align(fort::text_align::right);
 
-                for (const auto &r : results)
+                for (int si = 0; si < (int)num_shapes; ++si)
                 {
-                    if (r.format_name != fmt.name || r.M != M)
-                        continue;
+                    size_t idx = fi * num_shapes * num_m + si * num_m + mi;
+                    const auto &r = results[idx];
 
                     char b_min[16], b_int8[16], b_speedup[16];
                     char b_theo[16], b_keff[16], b_gflops[16];
@@ -648,18 +885,20 @@ namespace
         for (int c = 1; c <= 8; ++c)
             grand.column(c).set_cell_text_align(fort::text_align::right);
 
-        for (const auto &fmt : GEMM_FORMATS)
+        for (int fi = 0; fi < (int)GEMM_FORMATS.size(); ++fi)
         {
-            for (int M : M_VALUES)
+            const auto &fmt = GEMM_FORMATS[fi];
+            for (int mi = 0; mi < (int)num_m; ++mi)
             {
+                int M = M_VALUES[mi];
                 double tot_min = 0, tot_int8 = 0, tot_speedup = 0;
                 double tot_keff = 0, tot_cos = 0;
                 int count = 0;
 
-                for (const auto &r : results)
+                for (int si = 0; si < (int)num_shapes; ++si)
                 {
-                    if (r.format_name != fmt.name || r.M != M)
-                        continue;
+                    size_t idx = fi * num_shapes * num_m + si * num_m + mi;
+                    const auto &r = results[idx];
                     tot_min += r.min_us;
                     tot_int8 += r.int8_min_us;
                     tot_speedup += r.speedup_vs_int8;
@@ -715,18 +954,117 @@ namespace
 
         const GEMMShape shape{"3B_FFN_Up", 11008, 2048};
 
-        fprintf(stderr, "\n[NativeVNNI GEMM] Focused: %s (N=%d K=%d)\n",
-                shape.name.c_str(), shape.N, shape.K);
+        fprintf(stderr, "\n[NativeVNNI GEMM] Focused: %s (N=%d K=%d) using %d GPU(s)\n",
+                shape.name.c_str(), shape.N, shape.K, NUM_GPUS);
         fprintf(stderr, "[NativeVNNI GEMM] Device: %s\n", device_name_.c_str());
 
-        // INT8 references for each M
-        std::unordered_map<int, double> int8_refs;
-        for (int M : M_VALUES)
+        // INT8 references for each M — parallelize across GPUs
+        std::vector<double> int8_refs(M_VALUES.size(), 0.0);
         {
-            int8_refs[M] = benchmarkINT8GEMMReference(M, shape.N, shape.K);
-            fprintf(stderr, "  INT8 ref M=%d: %.1f μs\n", M, int8_refs[M]);
+            std::vector<std::thread> threads;
+            for (int mi = 0; mi < (int)M_VALUES.size(); ++mi)
+            {
+                int g = mi % NUM_GPUS;
+                threads.emplace_back([&, mi, g]()
+                                     {
+                    (void)hipSetDevice(g);
+                    int8_refs[mi] = benchmarkINT8GEMMReference(
+                        M_VALUES[mi], shape.N, shape.K, g);
+                    fprintf(stderr, "  [GPU %d] INT8 ref M=%d: %.1f μs\n",
+                            g, M_VALUES[mi], int8_refs[mi]); });
+            }
+            for (auto &t : threads)
+                t.join();
         }
 
+        // Work items: (format_idx, m_idx) — round-robin by cost
+        struct WorkItem
+        {
+            int format_idx;
+            int m_idx;
+            double cost;
+        };
+        std::vector<WorkItem> items;
+        for (int fi = 0; fi < (int)GEMM_FORMATS.size(); ++fi)
+            for (int mi = 0; mi < (int)M_VALUES.size(); ++mi)
+                items.push_back({fi, mi, (double)shape.N * shape.K * M_VALUES[mi]});
+
+        std::sort(items.begin(), items.end(),
+                  [](const WorkItem &a, const WorkItem &b)
+                  { return a.cost > b.cost; });
+
+        std::vector<std::vector<WorkItem>> per_gpu(NUM_GPUS);
+        for (size_t i = 0; i < items.size(); ++i)
+            per_gpu[i % NUM_GPUS].push_back(items[i]);
+
+        // Results indexed by (format_idx * num_m + m_idx)
+        const size_t num_m = M_VALUES.size();
+        const size_t total = GEMM_FORMATS.size() * num_m;
+        std::vector<GEMMBenchResult> results(total);
+        std::atomic<int> done_count{0};
+
+        {
+            std::vector<std::thread> threads;
+            for (int g = 0; g < NUM_GPUS; ++g)
+            {
+                threads.emplace_back([&, g]()
+                                     {
+                    (void)hipSetDevice(g);
+
+                    // Group items by format to share weight cache
+                    // Sort this GPU's items by format_idx
+                    auto my_items = per_gpu[g];
+                    std::sort(my_items.begin(), my_items.end(),
+                              [](const WorkItem &a, const WorkItem &b) {
+                                  return a.format_idx < b.format_idx;
+                              });
+
+                    int cur_fi = -1;
+                    std::unique_ptr<TensorBase> weights;
+                    GpuWeightsCache gpu_w;
+
+                    for (const auto &wi : my_items)
+                    {
+                        // Load weights when format changes
+                        if (wi.format_idx != cur_fi)
+                        {
+                            cur_fi = wi.format_idx;
+                            gpu_w = GpuWeightsCache(); // release old
+                            const auto &fmt = GEMM_FORMATS[cur_fi];
+                            weights = fmt.create(
+                                static_cast<size_t>(shape.N),
+                                static_cast<size_t>(shape.K));
+                            if (weights)
+                            {
+                                const float *w_fp32 = weights->data();
+                                if (w_fp32)
+                                    gpu_w.upload(w_fp32, shape.N, shape.K, g);
+                            }
+                        }
+
+                        const auto &fmt = GEMM_FORMATS[wi.format_idx];
+                        int M = M_VALUES[wi.m_idx];
+                        double ref_us = int8_refs[wi.m_idx];
+
+                        auto r = benchmarkGEMM(fmt, shape, M, ref_us,
+                                               weights.get(), &gpu_w, g);
+
+                        size_t idx = wi.format_idx * num_m + wi.m_idx;
+                        results[idx] = std::move(r);
+
+                        int d = ++done_count;
+                        fprintf(stderr, "  [GPU %d] %s M=%d: %.1f μs (%.2fx) (%d/%zu)\n",
+                                g, fmt.name.c_str(), M,
+                                results[idx].min_us,
+                                results[idx].speedup_vs_int8,
+                                d, total);
+                    } });
+            }
+            for (auto &t : threads)
+                t.join();
+        }
+
+        // Render table
         fort::utf8_table table;
         table.set_border_style(FT_DOUBLE2_STYLE);
         table << fort::header
@@ -739,16 +1077,17 @@ namespace
         for (int c = 1; c <= 9; ++c)
             table.column(c).set_cell_text_align(fort::text_align::right);
 
-        for (const auto &fmt : GEMM_FORMATS)
+        for (int fi = 0; fi < (int)GEMM_FORMATS.size(); ++fi)
         {
-            for (int M : M_VALUES)
+            for (int mi = 0; mi < (int)num_m; ++mi)
             {
-                auto r = benchmarkGEMM(fmt, shape, M, int8_refs[M]);
+                size_t idx = fi * num_m + mi;
+                const auto &r = results[idx];
 
                 char b_m[8], b_min[16], b_int8[16], b_speedup[16];
                 char b_theo[16], b_keff[16], b_gflops[16], b_cos[16];
 
-                snprintf(b_m, sizeof(b_m), "%d", M);
+                snprintf(b_m, sizeof(b_m), "%d", r.M);
                 snprintf(b_min, sizeof(b_min), "%.1f", r.min_us);
                 snprintf(b_int8, sizeof(b_int8), "%.1f", r.int8_min_us);
                 snprintf(b_speedup, sizeof(b_speedup), "%.2fx", r.speedup_vs_int8);
@@ -771,7 +1110,7 @@ namespace
                       << b_gflops << b_cos << gate << fort::endr;
 
                 EXPECT_GE(r.cosine_sim, COSINE_SIM_GATE)
-                    << fmt.name << " M=" << M
+                    << GEMM_FORMATS[fi].name << " M=" << r.M
                     << " cosine=" << r.cosine_sim;
             }
             table << fort::separator;

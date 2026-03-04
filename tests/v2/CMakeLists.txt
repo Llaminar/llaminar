@@ -7967,6 +7967,24 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added native-VNNI GEMV integration tests (16 formats)")
 
+    # Integration Test: Native-VNNI GEMM — ALL dispatch paths
+    # Exercises every kernel variant (streaming, N128, N64, M16/M32/M64, 2/3-wave)
+    # against CPU FP32 reference for Q4_0 and IQ4_NL across multiple M values and shapes.
+    add_executable(v2_integration_native_vnni_gemm
+        integration/kernels/rocm/Test__NativeVNNI_GEMM.cpp
+    )
+    target_link_libraries(v2_integration_native_vnni_gemm
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_NativeVNNI_GEMM
+        COMMAND $<TARGET_FILE:v2_integration_native_vnni_gemm>
+        LABELS "V2;Integration;ROCm;GEMM;NativeVNNI;Quantized;gfx906;Accuracy"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added native-VNNI GEMM integration tests (all dispatch paths)")
+
     # Performance Test: ROCm Quantised GEMM Kernel Benchmarks
     # Measures throughput and accuracy for Qwen model dimensions (0.5B, 7B, 14B, 32B)
     add_executable(v2_perf_rocm_quantised_gemm_kernel 
@@ -8062,14 +8080,17 @@ if(HAVE_ROCM)
     # Performance Test: Native-VNNI GEMM (Q4_0 + IQ4_NL, M>1 prefill)
     # Benchmarks native-VNNI GEMM kernel against INT8 V3/V7 baseline.
     # Reports speedup, correctness (cosine similarity), and GFLOPS.
+    # GpuVerification.hip has the GPU cosine kernel (compiled by HIP compiler).
     add_executable(v2_perf_native_vnni_gemm
         performance/kernels/rocm/Perf__NativeVNNI_GEMM.cpp
+        performance/kernels/rocm/GpuVerification.hip
     )
     target_link_libraries(v2_perf_native_vnni_gemm
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
         OpenMP::OpenMP_CXX
+        roc::hipblas
     )
     target_compile_options(v2_perf_native_vnni_gemm PRIVATE -fopenmp)
     target_link_options(v2_perf_native_vnni_gemm PRIVATE -fopenmp)
