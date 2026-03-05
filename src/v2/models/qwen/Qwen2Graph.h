@@ -309,6 +309,10 @@ namespace llaminar2
         TensorBase *k_bias = nullptr; ///< Key bias [n_kv_heads * head_dim]
         TensorBase *v_bias = nullptr; ///< Value bias [n_kv_heads * head_dim]
 
+        // QK norm weights (Qwen3: per-head RMSNorm before RoPE)
+        TensorBase *q_norm = nullptr; ///< Q norm gamma [head_dim]
+        TensorBase *k_norm = nullptr; ///< K norm gamma [head_dim]
+
         // FFN weights
         TensorBase *gate_proj = nullptr; ///< FFN gate projection
         TensorBase *up_proj = nullptr;   ///< FFN up projection

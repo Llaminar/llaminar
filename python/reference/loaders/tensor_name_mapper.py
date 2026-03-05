@@ -37,7 +37,7 @@ import re
 from typing import Dict, Optional, Tuple
 
 
-# Qwen2 GGUF -> HuggingFace mapping
+# Qwen2/Qwen3 GGUF -> HuggingFace mapping
 QWEN2_TENSOR_MAP = {
     # Embedding and output
     'token_embd.weight': 'model.embed_tokens.weight',
@@ -54,6 +54,10 @@ QWEN2_TENSOR_MAP = {
     'blk.{}.attn_v.weight': 'model.layers.{}.self_attn.v_proj.weight',
     'blk.{}.attn_v.bias': 'model.layers.{}.self_attn.v_proj.bias',
     'blk.{}.attn_output.weight': 'model.layers.{}.self_attn.o_proj.weight',
+    
+    # QK RMSNorm (Qwen3: per-head normalization before RoPE)
+    'blk.{}.attn_q_norm.weight': 'model.layers.{}.self_attn.q_norm.weight',
+    'blk.{}.attn_k_norm.weight': 'model.layers.{}.self_attn.k_norm.weight',
     
     # FFN (MLP)
     'blk.{}.ffn_norm.weight': 'model.layers.{}.post_attention_layernorm.weight',

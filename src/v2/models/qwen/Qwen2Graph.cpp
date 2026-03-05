@@ -26,6 +26,7 @@
 #include "../../collective/BackendRouter.h"
 #include "../../execution/compute_stages/stages/TPAllreduceStage.h"
 #include "../../execution/compute_stages/stages/LocalPPTransferStage.h"
+#include "../../execution/compute_stages/stages/QKNormStage.h"
 #include "../../config/PipelineConfig.h"
 #include <algorithm>
 #include <chrono>
@@ -1614,6 +1615,54 @@ namespace llaminar2
         // Check if we're in Hybrid mode with required buffers available
         bool use_hybrid_mode = isHybridModeActive(inference_mode, buffers);
 
+        // Stage 2.5: Per-head QK RMSNorm (Qwen3)
+        // Applied to Q and K projections independently before RoPE.
+        // Each head is normalized separately with gamma of shape [head_dim].
+        if (layer.q_norm && layer.k_norm)
+        {
+            LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " using QK norm (Qwen3)");
+
+            // Q norm: normalize each Q head independently
+            QKNormStage::Params q_norm_params;
+            q_norm_params.input = buffers.Q;
+            q_norm_params.output = buffers.Q; // In-place
+            q_norm_params.gamma = layer.q_norm;
+            q_norm_params.n_heads = local_n_heads;
+            q_norm_params.head_dim = config_.head_dim;
+            q_norm_params.eps = config_.rms_norm_eps;
+            q_norm_params.seq_len = total_tokens;
+            q_norm_params.device_id = device;
+
+            graph.addNode(prefix + "q_norm",
+                          ComputeStageFactory::createQKNorm(q_norm_params),
+                          device);
+
+            if (env.execution.exec_gemm && layer.wq)
+            {
+                graph.addDependency(prefix + "q_norm", prefix + "qkv_proj");
+            }
+
+            // K norm: normalize each K head independently
+            QKNormStage::Params k_norm_params;
+            k_norm_params.input = buffers.K;
+            k_norm_params.output = buffers.K; // In-place
+            k_norm_params.gamma = layer.k_norm;
+            k_norm_params.n_heads = local_n_kv_heads;
+            k_norm_params.head_dim = config_.head_dim;
+            k_norm_params.eps = config_.rms_norm_eps;
+            k_norm_params.seq_len = total_tokens;
+            k_norm_params.device_id = device;
+
+            graph.addNode(prefix + "k_norm",
+                          ComputeStageFactory::createQKNorm(k_norm_params),
+                          device);
+
+            if (env.execution.exec_gemm && layer.wk)
+            {
+                graph.addDependency(prefix + "k_norm", prefix + "qkv_proj");
+            }
+        }
+
         // Stage 3: RoPE on Q and K
         if (env.execution.exec_rope)
         {
@@ -1662,7 +1711,16 @@ namespace llaminar2
 
             if (env.execution.exec_gemm)
             {
-                graph.addDependency(prefix + "rope", prefix + "qkv_proj");
+                // If QK norms are present, RoPE depends on norms (which depend on qkv_proj)
+                if (layer.q_norm && layer.k_norm)
+                {
+                    graph.addDependency(prefix + "rope", prefix + "q_norm");
+                    graph.addDependency(prefix + "rope", prefix + "k_norm");
+                }
+                else
+                {
+                    graph.addDependency(prefix + "rope", prefix + "qkv_proj");
+                }
             }
         }
 

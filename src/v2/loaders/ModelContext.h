@@ -212,6 +212,7 @@ namespace llaminar2
         int vocabSize() const override { return static_cast<int>(loader_.vocabSize()); }
         int contextLength() const override { return static_cast<int>(loader_.contextLength()); }
         int feedForwardLength() const override { return static_cast<int>(loader_.feedForwardLength()); }
+        int keyLength() const override { return static_cast<int>(loader_.keyLength()); }
 
         /**
          * @brief Get weight placement map (Phase 6: Multi-GPU support)

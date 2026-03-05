@@ -7,6 +7,7 @@
 
 #include "SchemaFactoryRegistry.h"
 #include "../../../models/qwen/Qwen2Schema.h"
+#include "../../../models/qwen3/Qwen3Schema.h"
 
 namespace llaminar2
 {
@@ -24,6 +25,11 @@ namespace llaminar2
             return std::make_unique<Qwen2SchemaFactory>();
         }
 
+        if (arch_lower == "qwen3")
+        {
+            return std::make_unique<Qwen3SchemaFactory>();
+        }
+
         // Add more architectures here as they are implemented:
         // else if (arch_lower == "llama") {
         //     return std::make_unique<LlamaSchemaFactory>();
@@ -34,7 +40,7 @@ namespace llaminar2
 
         throw std::runtime_error(
             "SchemaFactoryRegistry: Unsupported architecture '" + architecture + "'. "
-                                                                                 "Supported architectures: qwen2. "
+                                                                                 "Supported architectures: qwen2, qwen3. "
                                                                                  "To add support for a new architecture, create a FooSchemaFactory "
                                                                                  "class and register it in SchemaFactoryRegistry::getFactory().");
     }
@@ -52,7 +58,7 @@ namespace llaminar2
                        [](unsigned char c)
                        { return std::tolower(c); });
 
-        return arch_lower == "qwen2";
+        return arch_lower == "qwen2" || arch_lower == "qwen3";
         // Add more architectures as they are implemented:
         // || arch_lower == "llama"
         // || arch_lower == "deepseek"
@@ -60,7 +66,7 @@ namespace llaminar2
 
     std::vector<std::string> SchemaFactoryRegistry::supportedArchitectures()
     {
-        return {"qwen2"};
+        return {"qwen2", "qwen3"};
         // Add more as implemented:
         // return {"qwen2", "llama", "deepseek"};
     }

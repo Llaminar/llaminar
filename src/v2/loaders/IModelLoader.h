@@ -257,6 +257,17 @@ namespace llaminar2
         virtual uint64_t feedForwardLength() const = 0;
 
         /**
+         * @brief Get attention head dimension (key_length from GGUF)
+         *
+         * For models where head_dim != d_model / n_heads (e.g., Qwen3 with head_dim=128
+         * but d_model=1024, n_heads=16). Returns 0 if not explicitly set in metadata,
+         * in which case the caller should fall back to d_model / n_heads.
+         *
+         * @return Head dimension, or 0 if not explicitly set
+         */
+        virtual uint64_t keyLength() const = 0;
+
+        /**
          * @brief Get RoPE base frequency (theta)
          */
         virtual float ropeTheta() const = 0;

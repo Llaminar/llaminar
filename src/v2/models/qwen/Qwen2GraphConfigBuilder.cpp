@@ -27,7 +27,8 @@ namespace llaminar2
     std::unique_ptr<IGraphConfigBuilder> createGraphConfigBuilder(const std::string &model_type)
     {
         // Currently only Qwen2 is supported
-        if (model_type == "qwen2" || model_type == "Qwen2")
+        if (model_type == "qwen2" || model_type == "Qwen2" ||
+            model_type == "qwen3" || model_type == "Qwen3")
         {
             return createQwen2GraphConfigBuilder();
         }

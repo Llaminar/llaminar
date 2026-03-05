@@ -134,6 +134,8 @@ class Qwen2PipelineCapture:
                 # Load tokenizer from HuggingFace (infer from config)
                 if config.model_type == 'qwen2':
                     tokenizer_name = 'Qwen/Qwen2.5-0.5B-Instruct'  # Use official tokenizer
+                elif config.model_type == 'qwen3':
+                    tokenizer_name = 'Qwen/Qwen3-0.6B'  # Use official Qwen3 tokenizer
                 else:
                     tokenizer_name = 'meta-llama/Llama-2-7b-hf'  # Fallback
                 
@@ -146,7 +148,7 @@ class Qwen2PipelineCapture:
                     print(f"  n_heads: {config.num_attention_heads}")
                     print(f"  n_kv_heads: {config.num_key_value_heads}")
                     print(f"  d_model: {config.hidden_size}")
-                    print(f"  d_head: {config.hidden_size // config.num_attention_heads}")
+                    print(f"  d_head: {self._get_head_dim(config)}")
                     print(f"  d_ff: {config.intermediate_size}")
                     print(f"  vocab_size: {config.vocab_size}")
                     print(f"  Tokenizer: {tokenizer_name}")
@@ -171,10 +173,18 @@ class Qwen2PipelineCapture:
                     print(f"  n_heads: {config.num_attention_heads}")
                     print(f"  n_kv_heads: {config.num_key_value_heads}")
                     print(f"  d_model: {config.hidden_size}")
-                    print(f"  d_head: {config.hidden_size // config.num_attention_heads}")
+                    print(f"  d_head: {self._get_head_dim(config)}")
                     print(f"  d_ff: {config.intermediate_size}")
                     print(f"  vocab_size: {config.vocab_size}")
     
+    @staticmethod
+    def _get_head_dim(config) -> int:
+        """Get the head dimension, respecting config.head_dim if present (Qwen3 uses head_dim != hidden_size/n_heads)."""
+        head_dim = getattr(config, 'head_dim', None)
+        if head_dim is not None:
+            return head_dim
+        return config.hidden_size // config.num_attention_heads
+
     def _should_capture_layer(self, layer_idx: int) -> bool:
         """Check if we should capture this layer."""
         if self.capture_layers is None:
@@ -257,8 +267,15 @@ class Qwen2PipelineCapture:
         dummy_hidden = torch.zeros(bsz, seq_len, self.model.config.hidden_size)
         cos, sin = self.model.model.rotary_emb(dummy_hidden, position_ids)
         
-        # Apply rotary embeddings (Qwen2-specific)
-        from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+        # Apply rotary embeddings (try Qwen3 first, fall back to Qwen2)
+        model_type = getattr(self.model.config, 'model_type', 'qwen2')
+        if model_type == 'qwen3':
+            try:
+                from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
+            except ImportError:
+                from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+        else:
+            from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
         q_rope, k_rope = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
         
         return q_rope, k_rope
@@ -328,7 +345,7 @@ class Qwen2PipelineCapture:
         bsz, seq_len, d_model = hidden.shape
         n_heads = config.num_attention_heads
         n_kv_heads = config.num_key_value_heads
-        d_head = d_model // n_heads
+        d_head = self._get_head_dim(config)
         
         # 1. Pre-attention RMSNorm
         hidden_norm = self._apply_rmsnorm(hidden, layer.input_layernorm.weight)
@@ -336,9 +353,12 @@ class Qwen2PipelineCapture:
             self._save_snapshot('ATTENTION_NORM', hidden_norm, layer_idx)
         
         # 2. Q/K/V projections
-        q_proj = F.linear(hidden_norm, layer.self_attn.q_proj.weight, layer.self_attn.q_proj.bias)
-        k_proj = F.linear(hidden_norm, layer.self_attn.k_proj.weight, layer.self_attn.k_proj.bias)
-        v_proj = F.linear(hidden_norm, layer.self_attn.v_proj.weight, layer.self_attn.v_proj.bias)
+        q_bias = getattr(layer.self_attn.q_proj, 'bias', None)
+        k_bias = getattr(layer.self_attn.k_proj, 'bias', None)
+        v_bias = getattr(layer.self_attn.v_proj, 'bias', None)
+        q_proj = F.linear(hidden_norm, layer.self_attn.q_proj.weight, q_bias)
+        k_proj = F.linear(hidden_norm, layer.self_attn.k_proj.weight, k_bias)
+        v_proj = F.linear(hidden_norm, layer.self_attn.v_proj.weight, v_bias)
         
         if capture:
             self._save_snapshot('Q_PROJECTION', q_proj, layer_idx)
@@ -349,6 +369,16 @@ class Qwen2PipelineCapture:
         q = q_proj.view(bsz, seq_len, n_heads, d_head).transpose(1, 2)  # [batch, n_heads, seq_len, d_head]
         k = k_proj.view(bsz, seq_len, n_kv_heads, d_head).transpose(1, 2)  # [batch, n_kv_heads, seq_len, d_head]
         v = v_proj.view(bsz, seq_len, n_kv_heads, d_head).transpose(1, 2)
+        
+        # 3.5. QK RMSNorm (Qwen3 only: per-head normalization before RoPE)
+        if hasattr(layer.self_attn, 'q_norm') and layer.self_attn.q_norm is not None:
+            q = layer.self_attn.q_norm(q)
+            k = layer.self_attn.k_norm(k)
+            if capture:
+                q_norm_flat = q.transpose(1, 2).reshape(bsz, seq_len, n_heads * d_head)
+                k_norm_flat = k.transpose(1, 2).reshape(bsz, seq_len, n_kv_heads * d_head)
+                self._save_snapshot('Q_NORM', q_norm_flat, layer_idx)
+                self._save_snapshot('K_NORM', k_norm_flat, layer_idx)
         
         # 4. Apply RoPE
         q_rope, k_rope = self._apply_rope(q, k, position_ids, layer_idx)
@@ -383,7 +413,7 @@ class Qwen2PipelineCapture:
         
         # 9. Output projection
         attn_context_flat = attn_context.transpose(1, 2).reshape(bsz, seq_len, n_heads * d_head)
-        attn_output = F.linear(attn_context_flat, layer.self_attn.o_proj.weight, layer.self_attn.o_proj.bias)
+        attn_output = F.linear(attn_context_flat, layer.self_attn.o_proj.weight, getattr(layer.self_attn.o_proj, 'bias', None))
         if capture:
             self._save_snapshot('ATTENTION_OUTPUT', attn_output, layer_idx)
         
@@ -586,7 +616,7 @@ class Qwen2PipelineCapture:
             n_layers = self.model.config.num_hidden_layers
             n_heads = self.model.config.num_attention_heads
             n_kv_heads = self.model.config.num_key_value_heads
-            d_head = self.model.config.hidden_size // n_heads
+            d_head = self._get_head_dim(self.model.config)
             
             new_past_key_values = []
             
@@ -600,9 +630,12 @@ class Qwen2PipelineCapture:
                     self._save_snapshot(f'{snapshot_prefix}_layer{layer_idx}_ATTENTION_NORM', hidden_norm)
                 
                 # Q/K/V projections (for single token)
-                q_proj = F.linear(hidden_norm, layer.self_attn.q_proj.weight, layer.self_attn.q_proj.bias)
-                k_proj = F.linear(hidden_norm, layer.self_attn.k_proj.weight, layer.self_attn.k_proj.bias)
-                v_proj = F.linear(hidden_norm, layer.self_attn.v_proj.weight, layer.self_attn.v_proj.bias)
+                q_bias = getattr(layer.self_attn.q_proj, 'bias', None)
+                k_bias = getattr(layer.self_attn.k_proj, 'bias', None)
+                v_bias = getattr(layer.self_attn.v_proj, 'bias', None)
+                q_proj = F.linear(hidden_norm, layer.self_attn.q_proj.weight, q_bias)
+                k_proj = F.linear(hidden_norm, layer.self_attn.k_proj.weight, k_bias)
+                v_proj = F.linear(hidden_norm, layer.self_attn.v_proj.weight, v_bias)
                 
                 if should_capture:
                     self._save_snapshot(f'{snapshot_prefix}_layer{layer_idx}_Q_PROJECTION', q_proj)
@@ -613,6 +646,16 @@ class Qwen2PipelineCapture:
                 q = q_proj.view(bsz, seq_len, n_heads, d_head).transpose(1, 2)
                 k = k_proj.view(bsz, seq_len, n_kv_heads, d_head).transpose(1, 2)
                 v = v_proj.view(bsz, seq_len, n_kv_heads, d_head).transpose(1, 2)
+                
+                # QK RMSNorm (Qwen3 only)
+                if hasattr(layer.self_attn, 'q_norm') and layer.self_attn.q_norm is not None:
+                    q = layer.self_attn.q_norm(q)
+                    k = layer.self_attn.k_norm(k)
+                    if should_capture:
+                        q_norm_flat = q.transpose(1, 2).reshape(bsz, seq_len, n_heads * d_head)
+                        k_norm_flat = k.transpose(1, 2).reshape(bsz, seq_len, n_kv_heads * d_head)
+                        self._save_snapshot(f'{snapshot_prefix}_layer{layer_idx}_Q_NORM', q_norm_flat)
+                        self._save_snapshot(f'{snapshot_prefix}_layer{layer_idx}_K_NORM', k_norm_flat)
                 
                 # Apply RoPE
                 q_rope, k_rope = self._apply_rope(q, k, position_ids, layer_idx)
@@ -733,7 +776,7 @@ class Qwen2PipelineCapture:
             n_layers = self.model.config.num_hidden_layers
             n_heads = self.model.config.num_attention_heads
             n_kv_heads = self.model.config.num_key_value_heads
-            d_head = self.model.config.hidden_size // n_heads
+            d_head = self._get_head_dim(self.model.config)
             
             past_key_values = []
             
@@ -748,9 +791,12 @@ class Qwen2PipelineCapture:
                     self._save_snapshot('ATTENTION_NORM', hidden_norm, layer_idx)
                 
                 # Q/K/V projections
-                q_proj = F.linear(hidden_norm, layer.self_attn.q_proj.weight, layer.self_attn.q_proj.bias)
-                k_proj = F.linear(hidden_norm, layer.self_attn.k_proj.weight, layer.self_attn.k_proj.bias)
-                v_proj = F.linear(hidden_norm, layer.self_attn.v_proj.weight, layer.self_attn.v_proj.bias)
+                q_bias = getattr(layer.self_attn.q_proj, 'bias', None)
+                k_bias = getattr(layer.self_attn.k_proj, 'bias', None)
+                v_bias = getattr(layer.self_attn.v_proj, 'bias', None)
+                q_proj = F.linear(hidden_norm, layer.self_attn.q_proj.weight, q_bias)
+                k_proj = F.linear(hidden_norm, layer.self_attn.k_proj.weight, k_bias)
+                v_proj = F.linear(hidden_norm, layer.self_attn.v_proj.weight, v_bias)
                 
                 if should_capture:
                     self._save_snapshot('Q_PROJECTION', q_proj, layer_idx)
@@ -761,6 +807,16 @@ class Qwen2PipelineCapture:
                 q = q_proj.view(bsz, prefill_seq_len, n_heads, d_head).transpose(1, 2)
                 k = k_proj.view(bsz, prefill_seq_len, n_kv_heads, d_head).transpose(1, 2)
                 v = v_proj.view(bsz, prefill_seq_len, n_kv_heads, d_head).transpose(1, 2)
+                
+                # QK RMSNorm (Qwen3 only)
+                if hasattr(layer.self_attn, 'q_norm') and layer.self_attn.q_norm is not None:
+                    q = layer.self_attn.q_norm(q)
+                    k = layer.self_attn.k_norm(k)
+                    if should_capture:
+                        q_norm_flat = q.transpose(1, 2).reshape(bsz, prefill_seq_len, n_heads * d_head)
+                        k_norm_flat = k.transpose(1, 2).reshape(bsz, prefill_seq_len, n_kv_heads * d_head)
+                        self._save_snapshot('Q_NORM', q_norm_flat, layer_idx)
+                        self._save_snapshot('K_NORM', k_norm_flat, layer_idx)
                 
                 # Apply RoPE
                 q_rope, k_rope = self._apply_rope(q, k, position_ids, layer_idx)
@@ -892,7 +948,7 @@ class Qwen2PipelineCapture:
             f.write(f"n_heads: {config.num_attention_heads}\n")
             f.write(f"n_kv_heads: {config.num_key_value_heads}\n")
             f.write(f"d_model: {config.hidden_size}\n")
-            f.write(f"d_head: {config.hidden_size // config.num_attention_heads}\n")
+            f.write(f"d_head: {self._get_head_dim(config)}\n")
             f.write(f"d_ff: {config.intermediate_size}\n")
             f.write(f"vocab_size: {config.vocab_size}\n")
             f.write(f"num_snapshots: {len(self.captures)}\n")

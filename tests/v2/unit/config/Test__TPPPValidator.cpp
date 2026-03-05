@@ -50,6 +50,7 @@ namespace llaminar2::test
         int vocabSize() const override { return vocab_size_; }
         int contextLength() const override { return 32768; }
         int feedForwardLength() const override { return ffn_hidden_; }
+        int keyLength() const override { return 0; }
     };
 
     // =========================================================================

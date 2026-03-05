@@ -39,11 +39,20 @@ except ImportError:
 try:
     from transformers import PretrainedConfig, Qwen2Config, LlamaConfig
     HAS_TRANSFORMERS = True
+    # Qwen3Config may not exist in older transformers versions
+    try:
+        from transformers import Qwen3Config
+        HAS_QWEN3_CONFIG = True
+    except ImportError:
+        Qwen3Config = None
+        HAS_QWEN3_CONFIG = False
 except ImportError:
     HAS_TRANSFORMERS = False
     PretrainedConfig = None
     Qwen2Config = None
+    Qwen3Config = None
     LlamaConfig = None
+    HAS_QWEN3_CONFIG = False
 
 from .gguf_parser import GGUFParser, GGUFTensorInfo
 from . import dequantize
@@ -135,6 +144,13 @@ class GGUFLoader:
             if as_transformers_config and HAS_TRANSFORMERS:
                 if model_type == 'qwen2':
                     return Qwen2Config(**config_dict)
+                elif model_type == 'qwen3':
+                    if HAS_QWEN3_CONFIG:
+                        return Qwen3Config(**config_dict)
+                    else:
+                        # Fall back to Qwen2Config for older transformers
+                        config_dict['model_type'] = 'qwen2'
+                        return Qwen2Config(**config_dict)
                 elif model_type in ('llama', 'llama2', 'llama3'):
                     return LlamaConfig(**config_dict)
                 else:

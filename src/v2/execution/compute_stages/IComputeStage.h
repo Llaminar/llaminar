@@ -316,6 +316,9 @@ namespace llaminar2
 
         // Quantization
         QUANTIZE_Q16_1,
+
+        // Per-head normalization (Qwen3)
+        QK_NORM,
     };
 
     /**
@@ -823,7 +826,7 @@ namespace llaminar2
             }
 
             LOG_ERROR("[" << (stage_name ? stage_name : "ComputeStage")
-                           << "] Missing required pointer(s): " << missing);
+                          << "] Missing required pointer(s): " << missing);
             return false;
         }
 

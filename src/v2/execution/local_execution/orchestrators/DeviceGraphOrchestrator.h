@@ -1810,6 +1810,8 @@ namespace llaminar2
             // Stage name mappings (graph → pipeline)
             static const std::unordered_map<std::string, std::string> suffix_map = {
                 {"_attn_norm", "_ATTENTION_NORM"},
+                {"_q_norm", "_Q_NORM"}, // Qwen3 per-head QK RMSNorm
+                {"_k_norm", "_K_NORM"}, // Qwen3 per-head QK RMSNorm
                 {"_q_proj", "_Q_PROJECTION"},
                 {"_k_proj", "_K_PROJECTION"},
                 {"_v_proj", "_V_PROJECTION"},

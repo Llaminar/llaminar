@@ -132,6 +132,7 @@ namespace llaminar2::test
         int vocabSize() const override;
         int contextLength() const override;
         int feedForwardLength() const override;
+        int keyLength() const override;
 
         std::shared_ptr<TensorBase> getWeightForDevice(
             const std::string &name,
@@ -459,6 +460,11 @@ namespace llaminar2::test
     inline int MockModelContext::feedForwardLength() const
     {
         return static_cast<int>(mock_loader_->feedForwardLength());
+    }
+
+    inline int MockModelContext::keyLength() const
+    {
+        return static_cast<int>(mock_loader_->keyLength());
     }
 
     inline std::shared_ptr<TensorBase> MockModelContext::getWeightForDevice(

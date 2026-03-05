@@ -1145,6 +1145,7 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/FusedQKVGEMMStage.cpp
     execution/compute_stages/stages/FusedGateUpGEMMStage.cpp
     execution/compute_stages/stages/RMSNormStage.cpp
+    execution/compute_stages/stages/QKNormStage.cpp
     execution/compute_stages/stages/RoPEStage.cpp
     execution/compute_stages/stages/SwiGLUStage.cpp
     execution/compute_stages/stages/ResidualAddStage.cpp

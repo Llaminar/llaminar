@@ -4270,6 +4270,31 @@ if(ZLIB_FOUND)
     )
 
     # =========================================================================
+    # Qwen3 Parity Test Matrix (integration/parity/qwen3/)
+    # =========================================================================
+    # Qwen3 architecture: per-head QK RMSNorm, no QKV biases.
+    # Uses Qwen3-0.6B-Q8_0.gguf model.
+    # =========================================================================
+
+    # ---- Single-Device Parity (CPU, CUDA, ROCm) ----
+    add_executable(v2_integration_parity_qwen3_single_device
+        integration/parity/qwen3/Test__Qwen3_SingleDevice_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen3_single_device
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen3_single_device PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_v2_test(V2_Integration_Parity_Qwen3_SingleDevice
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen3_single_device>
+        LABELS "V2;Integration;Parity;Qwen3;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
+        MPI_PROCS 1
+    )
+
+    # =========================================================================
     # Test: LocalPP Layer-Partitioned Weights
     # Verifies PP stages only load their assigned layer weights (memory efficiency)
     # =========================================================================
@@ -5057,6 +5082,25 @@ target_link_libraries(v2_integration_multi_device_orchestrator_pp llaminar2_core
 add_v2_test(V2_Integration_MultiDeviceOrchestrator_PP
     COMMAND $<TARGET_FILE:v2_integration_multi_device_orchestrator_pp>
     LABELS "V2;Integration;LocalPP;MultiDevice;IMultiDeviceOrchestrator;PipelineParallelism"
+    MPI_PROCS 1
+)
+
+# Test: EagerWeightValidator (schema-aware weight validation for model loading)
+# Tests that missing optional weights (e.g., QKV biases in Qwen3) are skipped
+# silently, while missing required weights cause a fatal validation failure.
+add_executable(v2_unit_eager_weight_validator unit/execution/factory/Test__EagerWeightValidator.cpp)
+target_include_directories(v2_unit_eager_weight_validator PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_unit_eager_weight_validator
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+    GTest::gmock
+)
+add_v2_test(V2_Unit_EagerWeightValidator
+    COMMAND $<TARGET_FILE:v2_unit_eager_weight_validator>
+    LABELS "V2;Unit;EagerWeightValidator;WeightLoading;Factory;Internal"
     MPI_PROCS 1
 )
 

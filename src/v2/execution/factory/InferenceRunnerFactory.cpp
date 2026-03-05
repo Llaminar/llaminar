@@ -6,6 +6,7 @@
  */
 
 #include "InferenceRunnerFactory.h"
+#include "EagerWeightValidator.h"
 #include "../../backends/DeviceId.h"
 #include "../../backends/BackendManager.h"
 #include "../local_execution/collective/CollectiveContext.h"
@@ -197,7 +198,11 @@ namespace llaminar2
         graph_config.n_layers = static_cast<int>(model.block_count);
         graph_config.n_heads = static_cast<int>(model.head_count);
         graph_config.n_kv_heads = static_cast<int>(model.head_count_kv);
-        graph_config.head_dim = graph_config.d_model / graph_config.n_heads;
+        // Use explicit head_dim from GGUF (attention.key_length) if available,
+        // otherwise fall back to d_model / n_heads (works for Qwen2, LLaMA, etc.)
+        graph_config.head_dim = model.key_length > 0
+                                    ? static_cast<int>(model.key_length)
+                                    : graph_config.d_model / graph_config.n_heads;
         graph_config.d_ff = 0; // Will need to compute from intermediate_size metadata
         graph_config.max_seq_len = config.max_seq_len;
         graph_config.rope_theta = model.rope_theta;
@@ -254,6 +259,21 @@ namespace llaminar2
         else if (model.hasMetadata("qwen2.feed_forward_length"))
         {
             auto it = model.metadata.find("qwen2.feed_forward_length");
+            if (it != model.metadata.end())
+            {
+                if (it->second.type == GGUFValueType::UINT64)
+                {
+                    graph_config.d_ff = static_cast<int>(it->second.asUInt64());
+                }
+                else if (it->second.type == GGUFValueType::UINT32)
+                {
+                    graph_config.d_ff = static_cast<int>(it->second.asUInt32());
+                }
+            }
+        }
+        else if (model.hasMetadata("qwen3.feed_forward_length"))
+        {
+            auto it = model.metadata.find("qwen3.feed_forward_length");
             if (it != model.metadata.end())
             {
                 if (it->second.type == GGUFValueType::UINT64)
@@ -731,6 +751,13 @@ namespace llaminar2
         auto final_norm = weight_mgr->getWeightForDevice("output_norm.weight");
         auto lm_head = weight_mgr->getWeightForDevice("output.weight");
 
+        // Tied embeddings: if output.weight is missing, reuse token_embd.weight
+        if (!lm_head && embedding)
+        {
+            LOG_INFO("[InferenceRunner] output.weight not found, using tied embeddings (token_embd.weight)");
+            lm_head = embedding;
+        }
+
         if (!embedding || !final_norm || !lm_head)
         {
             LOG_ERROR("[InferenceRunner] Missing global weights");
@@ -754,37 +781,28 @@ namespace llaminar2
         LOG_DEBUG("[InferenceRunner] Eagerly loading " << n_layers << " layers of weights...");
         WeightLoadingProfiler::begin(WeightLoadPhase::TENSOR_LOAD);
         ScopedWeightLoadDetailTimer eager_layer_timer("weights.eager_layer_cache_load");
-        std::vector<std::pair<std::string, bool>> weights_to_load;
-        weights_to_load.reserve(static_cast<size_t>(n_layers) * 12);
 
-        for (int layer_idx = 0; layer_idx < n_layers; ++layer_idx)
+        // Validate all layer weights against schema before loading.
+        // Missing required weights are fatal; missing optional weights are skipped.
+        auto validation = validateLayerWeights(
+            *schema_factory, n_layers,
+            [&](const std::string &name)
+            { return model_ctx->hasTensor(name); });
+
+        if (!validation.success)
         {
-            std::string prefix = "blk." + std::to_string(layer_idx) + ".";
-
-            // All possible layer weights (schema determines which are required)
-            const std::vector<std::string> layer_weights = {
-                // Attention weights (required)
-                prefix + "attn_q.weight",
-                prefix + "attn_k.weight",
-                prefix + "attn_v.weight",
-                prefix + "attn_output.weight",
-                prefix + "attn_norm.weight",
-                // Attention biases (optional per schema)
-                prefix + "attn_q.bias",
-                prefix + "attn_k.bias",
-                prefix + "attn_v.bias",
-                // FFN weights (required)
-                prefix + "ffn_gate.weight",
-                prefix + "ffn_up.weight",
-                prefix + "ffn_down.weight",
-                prefix + "ffn_norm.weight"};
-
-            for (const auto &weight_name : layer_weights)
-            {
-                bool is_optional = schema_factory->isWeightOptional(weight_name);
-                weights_to_load.emplace_back(weight_name, is_optional);
-            }
+            LOG_ERROR("[InferenceRunner] " << validation.error_message());
+            WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
+            return false;
         }
+        if (!validation.missing_optional.empty())
+        {
+            LOG_DEBUG("[InferenceRunner] Skipping " << validation.missing_optional.size()
+                                                    << " optional weights not present in model");
+        }
+
+        // Use validated weight list (only weights that exist in the model)
+        auto &weights_to_load = validation.weights_to_load;
 
         const unsigned hw_threads = std::max(1u, std::thread::hardware_concurrency());
         const unsigned target_workers = std::min<unsigned>(8u, hw_threads);
@@ -968,6 +986,12 @@ namespace llaminar2
             layer.k_bias = k_bias ? k_bias.get() : nullptr;
             layer.v_bias = v_bias ? v_bias.get() : nullptr;
 
+            // QK norm weights (Qwen3: per-head RMSNorm, may be null for Qwen2)
+            auto q_norm = weight_mgr->getWeightForDevice(prefix + "attn_q_norm.weight");
+            auto k_norm = weight_mgr->getWeightForDevice(prefix + "attn_k_norm.weight");
+            layer.q_norm = q_norm ? q_norm.get() : nullptr;
+            layer.k_norm = k_norm ? k_norm.get() : nullptr;
+
             // FFN weights - all required
             auto gate_proj = weight_mgr->getWeightForDevice(prefix + "ffn_gate.weight");
             auto up_proj = weight_mgr->getWeightForDevice(prefix + "ffn_up.weight");
@@ -1076,6 +1100,16 @@ namespace llaminar2
         {
             auto final_norm = weight_mgr->getWeightForDevice("output_norm.weight");
             auto lm_head = weight_mgr->getWeightForDevice("output.weight");
+            // Tied embeddings fallback
+            if (!lm_head)
+            {
+                auto embedding_fallback = weight_mgr->getWeightForDevice("token_embd.weight");
+                if (embedding_fallback)
+                {
+                    LOG_INFO("[PPStageRunner] output.weight not found, using tied embeddings");
+                    lm_head = embedding_fallback;
+                }
+            }
             if (!final_norm || !lm_head)
             {
                 LOG_ERROR("[PPStageRunner] Stage has_lm_head=true but output_norm/output weights missing");
@@ -1104,44 +1138,33 @@ namespace llaminar2
                                                              << ") of weights...");
         ScopedWeightLoadDetailTimer pp_eager_layer_timer("weights.pp.eager_layer_cache_load");
 
-        for (int layer_idx = first_layer; layer_idx < last_layer; ++layer_idx)
+        // Validate layer weights against schema before loading.
+        auto pp_validation = validateLayerWeights(
+            *schema_factory, model_ctx->blockCount(),
+            [&](const std::string &name)
+            { return model_ctx->hasTensor(name); },
+            first_layer, last_layer);
+
+        if (!pp_validation.success)
         {
-            std::string prefix = "blk." + std::to_string(layer_idx) + ".";
+            LOG_ERROR("[PPStageRunner] " << pp_validation.error_message());
+            return false;
+        }
 
-            // All possible layer weights (schema determines which are required)
-            const std::vector<std::string> layer_weights = {
-                // Attention weights (required)
-                prefix + "attn_q.weight",
-                prefix + "attn_k.weight",
-                prefix + "attn_v.weight",
-                prefix + "attn_output.weight",
-                prefix + "attn_norm.weight",
-                // Attention biases (optional per schema)
-                prefix + "attn_q.bias",
-                prefix + "attn_k.bias",
-                prefix + "attn_v.bias",
-                // FFN weights (required)
-                prefix + "ffn_gate.weight",
-                prefix + "ffn_up.weight",
-                prefix + "ffn_down.weight",
-                prefix + "ffn_norm.weight"};
+        for (const auto &[weight_name, is_optional] : pp_validation.weights_to_load)
+        {
+            auto weight = weight_mgr->getWeightForDevice(weight_name);
 
-            for (const auto &weight_name : layer_weights)
+            if (!weight)
             {
-                auto weight = weight_mgr->getWeightForDevice(weight_name);
-                bool is_optional = schema_factory->isWeightOptional(weight_name);
-
-                if (!weight)
+                if (is_optional)
                 {
-                    if (is_optional)
-                    {
-                        LOG_TRACE("[PPStageRunner] Optional weight not present: " << weight_name);
-                    }
-                    else
-                    {
-                        LOG_ERROR("[PPStageRunner] Failed to load required weight: " << weight_name);
-                        return false;
-                    }
+                    LOG_TRACE("[PPStageRunner] Optional weight not present: " << weight_name);
+                }
+                else
+                {
+                    LOG_ERROR("[PPStageRunner] Failed to load required weight: " << weight_name);
+                    return false;
                 }
             }
         }
@@ -1258,6 +1281,12 @@ namespace llaminar2
             layer.k_bias = k_bias ? k_bias.get() : nullptr;
             layer.v_bias = v_bias ? v_bias.get() : nullptr;
 
+            // QK norm weights (Qwen3: per-head RMSNorm, may be null for Qwen2)
+            auto q_norm = weight_mgr->getWeightForDevice(prefix + "attn_q_norm.weight");
+            auto k_norm = weight_mgr->getWeightForDevice(prefix + "attn_k_norm.weight");
+            layer.q_norm = q_norm ? q_norm.get() : nullptr;
+            layer.k_norm = k_norm ? k_norm.get() : nullptr;
+
             // FFN weights - all required
             auto gate_proj = weight_mgr->getWeightForDevice(prefix + "ffn_gate.weight");
             auto up_proj = weight_mgr->getWeightForDevice(prefix + "ffn_up.weight");
@@ -1326,6 +1355,13 @@ namespace llaminar2
         auto final_norm = model_ctx->getWeightForDevice("output_norm.weight", lm_head_device);
         auto lm_head = model_ctx->getWeightForDevice("output.weight", lm_head_device);
 
+        // Tied embeddings: if output.weight is missing, reuse token_embd.weight
+        if (!lm_head && embedding)
+        {
+            LOG_INFO("[UnifiedPipeline] output.weight not found, using tied embeddings (token_embd.weight)");
+            lm_head = embedding;
+        }
+
         if (!embedding || !final_norm || !lm_head)
         {
             LOG_ERROR("[UnifiedPipeline] Missing global weights");
@@ -1364,6 +1400,12 @@ namespace llaminar2
             layer.q_bias = q_bias ? q_bias.get() : nullptr;
             layer.k_bias = k_bias ? k_bias.get() : nullptr;
             layer.v_bias = v_bias ? v_bias.get() : nullptr;
+
+            // QK norm weights (Qwen3: per-head RMSNorm, may be null for Qwen2)
+            auto q_norm = model_ctx_ptr->getWeightForDevice(prefix + "attn_q_norm.weight", layer_device);
+            auto k_norm = model_ctx_ptr->getWeightForDevice(prefix + "attn_k_norm.weight", layer_device);
+            layer.q_norm = q_norm ? q_norm.get() : nullptr;
+            layer.k_norm = k_norm ? k_norm.get() : nullptr;
 
             // FFN weights
             layer.gate_proj = model_ctx_ptr->getWeightForDevice(prefix + "ffn_gate.weight", layer_device).get();
@@ -1412,9 +1454,9 @@ namespace llaminar2
         // Validate architecture
         // =====================================================================
         std::string architecture = model_ctx->architecture();
-        if (architecture != "qwen2")
+        if (architecture != "qwen2" && architecture != "qwen3")
         {
-            LOG_ERROR("[UnifiedPipeline] Only qwen2 architecture supported, got: " << architecture);
+            LOG_ERROR("[UnifiedPipeline] Only qwen2/qwen3 architecture supported, got: " << architecture);
             return nullptr;
         }
 
@@ -1433,7 +1475,9 @@ namespace llaminar2
         graph_config.d_model = loader->embeddingLength();
         graph_config.n_heads = loader->headCount();
         graph_config.n_kv_heads = loader->headCountKV();
-        graph_config.head_dim = graph_config.d_model / graph_config.n_heads;
+        graph_config.head_dim = loader->keyLength() > 0
+                                    ? static_cast<int>(loader->keyLength())
+                                    : graph_config.d_model / graph_config.n_heads;
         graph_config.d_ff = loader->feedForwardLength();
         graph_config.vocab_size = loader->vocabSize();
         graph_config.rms_norm_eps = loader->rmsNormEps();
@@ -1571,7 +1615,9 @@ namespace llaminar2
         graph_config.n_layers = static_cast<int>(model.block_count);
         graph_config.n_heads = static_cast<int>(model.head_count);
         graph_config.n_kv_heads = static_cast<int>(model.head_count_kv);
-        graph_config.head_dim = graph_config.d_model / graph_config.n_heads;
+        graph_config.head_dim = model.key_length > 0
+                                    ? static_cast<int>(model.key_length)
+                                    : graph_config.d_model / graph_config.n_heads;
         graph_config.d_ff = 0;
         graph_config.max_seq_len = config.max_seq_len;
         graph_config.rope_theta = model.rope_theta;
@@ -1768,9 +1814,9 @@ namespace llaminar2
 
         // Currently only Qwen2 is supported
         std::string architecture = model_ctx->architecture();
-        if (architecture != "qwen2")
+        if (architecture != "qwen2" && architecture != "qwen3")
         {
-            LOG_ERROR("[InferenceRunner] Only qwen2 architecture is supported, got: " << architecture);
+            LOG_ERROR("[InferenceRunner] Only qwen2/qwen3 architecture is supported, got: " << architecture);
             return nullptr;
         }
 
@@ -1781,7 +1827,9 @@ namespace llaminar2
         graph_config.n_layers = model_ctx->blockCount();
         graph_config.n_heads = model_ctx->headCount();
         graph_config.n_kv_heads = model_ctx->headCountKV();
-        graph_config.head_dim = graph_config.d_model / graph_config.n_heads;
+        graph_config.head_dim = model_ctx->keyLength() > 0
+                                    ? model_ctx->keyLength()
+                                    : graph_config.d_model / graph_config.n_heads;
         graph_config.max_seq_len = config.max_seq_len;
         graph_config.default_device = device;
         graph_config.activation_precision = config.activation_precision;
@@ -1948,6 +1996,13 @@ namespace llaminar2
         auto final_norm = model_ctx->getWeightForDevice("output_norm.weight", device);
         auto lm_head = model_ctx->getWeightForDevice("output.weight", device);
 
+        // Tied embeddings: if output.weight is missing, reuse token_embd.weight
+        if (!lm_head && embedding)
+        {
+            LOG_INFO("[InferenceRunner] output.weight not found, using tied embeddings (token_embd.weight)");
+            lm_head = embedding;
+        }
+
         if (!embedding || !final_norm || !lm_head)
         {
             LOG_ERROR("[InferenceRunner] Missing global weights from IModelContext");
@@ -1979,6 +2034,12 @@ namespace llaminar2
             layer.q_bias = q_bias ? q_bias.get() : nullptr;
             layer.k_bias = k_bias ? k_bias.get() : nullptr;
             layer.v_bias = v_bias ? v_bias.get() : nullptr;
+
+            // QK norm weights (Qwen3: per-head RMSNorm, may be null for Qwen2)
+            auto q_norm = model_ctx->getWeightForDevice(prefix + "attn_q_norm.weight", device);
+            auto k_norm = model_ctx->getWeightForDevice(prefix + "attn_k_norm.weight", device);
+            layer.q_norm = q_norm ? q_norm.get() : nullptr;
+            layer.k_norm = k_norm ? k_norm.get() : nullptr;
 
             // FFN weights
             layer.gate_proj = model_ctx->getWeightForDevice(prefix + "ffn_gate.weight", device).get();

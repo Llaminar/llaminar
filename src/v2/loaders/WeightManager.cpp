@@ -256,8 +256,10 @@ namespace llaminar2
         auto tensor = loader_.loadTensor(name, device, weight_precision_);
         if (!tensor)
         {
+            // LOG_DEBUG, not LOG_ERROR: returning nullptr is a valid result for optional weights.
+            // The caller (InferenceRunnerFactory) decides severity based on schema context.
             int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
-            LOG_ERROR("[WeightManager] Rank " << rank << " failed to load: " << name);
+            LOG_DEBUG("[WeightManager] Rank " << rank << " weight not found: " << name);
             return nullptr;
         }
 
@@ -1548,7 +1550,9 @@ namespace llaminar2
         auto original = ensureWeightLoaded();
         if (!original)
         {
-            LOG_ERROR("[WeightManager] getWeightForDevice: failed to load weight: " << name);
+            // LOG_DEBUG, not LOG_ERROR: returning nullptr is valid for optional weights.
+            // The caller decides severity based on schema context.
+            LOG_DEBUG("[WeightManager] getWeightForDevice: weight not found: " << name);
             return nullptr;
         }
 

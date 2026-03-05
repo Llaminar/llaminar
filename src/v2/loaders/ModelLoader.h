@@ -167,6 +167,8 @@ namespace llaminar2
         uint64_t block_count = 0;      // num_hidden_layers
         uint64_t head_count = 0;       // num_attention_heads
         uint64_t head_count_kv = 0;    // num_key_value_heads (GQA)
+        uint64_t key_length = 0;       // attention.key_length (head_dim); 0 = use d_model/n_heads
+        uint64_t value_length = 0;     // attention.value_length; 0 = use key_length
         uint64_t vocab_size = 0;       // vocabulary size
         float rope_theta = 10000.0f;   // RoPE base frequency
         float rms_norm_eps = 1e-6f;    // RMSNorm epsilon (default 1e-6 for Qwen2/LLaMA)
@@ -379,6 +381,7 @@ namespace llaminar2
         uint64_t vocabSize() const override { return model_.vocab_size; }
         uint64_t contextLength() const override { return model_.context_length; }
         uint64_t feedForwardLength() const override { return getUInt64("feed_forward_length", 0); }
+        uint64_t keyLength() const override { return model_.key_length; }
         float ropeTheta() const override { return model_.rope_theta; }
         float rmsNormEps() const override { return model_.rms_norm_eps; }
 

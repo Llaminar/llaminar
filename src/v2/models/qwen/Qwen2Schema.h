@@ -389,13 +389,20 @@ namespace llaminar2
          */
         bool isWeightOptional(const std::string &gguf_weight_name) const override
         {
-            // QKV biases are the only optional weights in Qwen2
+            // QKV biases are optional in Qwen2 (present in some variants)
             // Pattern: blk.N.attn_q.bias, blk.N.attn_k.bias, blk.N.attn_v.bias
             if (gguf_weight_name.find("attn_q.bias") != std::string::npos ||
                 gguf_weight_name.find("attn_k.bias") != std::string::npos ||
                 gguf_weight_name.find("attn_v.bias") != std::string::npos)
             {
                 return true; // Optional
+            }
+
+            // QK norm weights: Qwen3-specific, not present in Qwen2
+            if (gguf_weight_name.find("attn_q_norm.weight") != std::string::npos ||
+                gguf_weight_name.find("attn_k_norm.weight") != std::string::npos)
+            {
+                return true;
             }
 
             // All other weights are required

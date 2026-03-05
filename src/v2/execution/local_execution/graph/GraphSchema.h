@@ -83,6 +83,9 @@ namespace llaminar2
         // Quantization
         Quantize,
         Dequantize,
+
+        // Per-head normalization (Qwen3)
+        QKNorm,
     };
 
     /**

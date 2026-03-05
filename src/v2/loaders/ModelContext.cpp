@@ -82,6 +82,7 @@ namespace llaminar2
         uint64_t vocabSize() const override { return loader_.vocabSize(); }
         uint64_t contextLength() const override { return loader_.contextLength(); }
         uint64_t feedForwardLength() const override { return loader_.feedForwardLength(); }
+        uint64_t keyLength() const override { return loader_.keyLength(); }
         float ropeTheta() const override { return loader_.ropeTheta(); }
         float rmsNormEps() const override { return loader_.rmsNormEps(); }
 

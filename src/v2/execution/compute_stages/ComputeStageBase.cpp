@@ -100,6 +100,8 @@ namespace llaminar2
             return "LM_HEAD";
         case ComputeStageType::FINAL_NORM:
             return "FINAL_NORM";
+        case ComputeStageType::QK_NORM:
+            return "QK_NORM";
         default:
             return "UNKNOWN";
         }

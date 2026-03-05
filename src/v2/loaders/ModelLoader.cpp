@@ -578,7 +578,10 @@ namespace llaminar2
         const GGUFTensorInfo *info = model_.findTensor(tensor_name);
         if (!info)
         {
-            LOG_ERROR("[ModelLoader] Tensor not found: " << tensor_name);
+            // LOG_DEBUG, not LOG_ERROR: returning nullptr is a valid result.
+            // The caller (WeightManager/InferenceRunnerFactory) decides severity
+            // based on whether the schema declares this weight as required or optional.
+            LOG_DEBUG("[ModelLoader] Tensor not found: " << tensor_name);
             return nullptr;
         }
 
@@ -2317,6 +2320,10 @@ namespace llaminar2
         model_.head_count = get_uint(arch_prefix + "attention.head_count");
         model_.head_count_kv = get_uint(arch_prefix + "attention.head_count_kv");
 
+        // Optional: explicit head dimension (Qwen3, Llama3 etc. may have head_dim != d_model/n_heads)
+        model_.key_length = get_uint(arch_prefix + "attention.key_length");
+        model_.value_length = get_uint(arch_prefix + "attention.value_length");
+
         // RoPE theta
         float theta = get_float(arch_prefix + "rope.freq_base");
         if (theta > 0.0f)
@@ -2358,6 +2365,8 @@ namespace llaminar2
         LOG_DEBUG("  block_count: " << model_.block_count);
         LOG_DEBUG("  head_count: " << model_.head_count);
         LOG_DEBUG("  head_count_kv: " << model_.head_count_kv);
+        LOG_DEBUG("  key_length: " << model_.key_length << (model_.key_length > 0 ? "" : " (will use d_model/n_heads)"));
+        LOG_DEBUG("  value_length: " << model_.value_length << (model_.value_length > 0 ? "" : " (will use key_length)"));
         LOG_DEBUG("  vocab_size: " << model_.vocab_size);
         LOG_DEBUG("  rope_theta: " << model_.rope_theta);
         LOG_DEBUG("  rms_norm_eps: " << model_.rms_norm_eps);

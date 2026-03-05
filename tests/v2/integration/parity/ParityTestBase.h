@@ -2292,6 +2292,7 @@ namespace llaminar2::test::parity
             // Stages to compare per layer
             std::vector<std::string> per_layer_stages = {
                 "ATTENTION_NORM", "Q_PROJECTION", "K_PROJECTION", "V_PROJECTION",
+                "Q_NORM", "K_NORM", // Qwen3 per-head QK RMSNorm (skipped if not available)
                 "Q_ROPE", "K_ROPE",
                 "ATTENTION_CONTEXT", "ATTENTION_OUTPUT", "ATTENTION_RESIDUAL",
                 "FFN_NORM", "FFN_GATE", "FFN_UP", "FFN_SWIGLU", "FFN_DOWN", "FFN_RESIDUAL"};
@@ -2377,6 +2378,11 @@ namespace llaminar2::test::parity
                     auto result = compareTensors(llaminar_data, pytorch_data, llaminar_size, stage);
                     stats.stages_compared++;
                     sum_cosine += result.cosine_similarity;
+
+                    // Per-stage cosine logging for diagnostics
+                    LOG_INFO("[Parity] Layer " << layer_idx << " " << stage
+                                               << " cosine=" << std::fixed << std::setprecision(6) << result.cosine_similarity
+                                               << " size=" << llaminar_size);
 
                     if (result.cosine_similarity < stats.min_cosine_sim)
                     {

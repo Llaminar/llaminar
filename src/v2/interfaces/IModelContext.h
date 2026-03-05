@@ -143,6 +143,13 @@ namespace llaminar2
          */
         virtual int feedForwardLength() const = 0;
 
+        /**
+         * @brief Get attention head dimension (key_length from GGUF)
+         *
+         * Returns 0 if not explicitly set; caller should fall back to d_model / n_heads.
+         */
+        virtual int keyLength() const = 0;
+
         // =========================================================================
         // Weight Access (Delegates to WeightManager)
         // =========================================================================

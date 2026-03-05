@@ -20,7 +20,7 @@
 #include "stages/MoEStages.h"
 #include "stages/ReceiveActivationsStage.h"
 #include "stages/ResidualAddStage.h"
-#include "stages/RMSNormStage.h"
+#include "stages/RMSNormStage.h"\n #include "stages/QKNormStage.h"
 #include "stages/RoPEStage.h"
 #include "stages/SendActivationsStage.h"
 #include "stages/SwiGLUStage.h"
@@ -61,6 +61,12 @@ namespace llaminar2
     {
         // Unified: RMSNormStage uses KernelFactory at execute-time for device dispatch
         return std::make_unique<RMSNormStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createQKNorm(
+        const QKNormStage::Params &params)
+    {
+        return std::make_unique<QKNormStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createRoPE(

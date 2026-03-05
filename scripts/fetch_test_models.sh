@@ -35,6 +35,13 @@ LARGE_7B_IQ_MODELS=(
   "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-IQ2_M.gguf"     # IQ2_S format
 )
 
+# Qwen3 models for Qwen3 architecture testing.
+# Always fetched when available – essential for parity tests.
+QWEN3_MODELS=(
+  "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf"
+  "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"
+)
+
 # Experimental / legacy variants that produced 404s during CI runs.
 # Enable by setting LLAMINAR_FETCH_EXPERIMENTAL=1 to probe for them.
 EXPERIMENTAL_MODELS=(
@@ -103,6 +110,39 @@ for f in "${MODELS[@]}"; do
     echo "[fetch_test_models][WARN] Failed to fetch $f after preflight success (possible transient)" >&2
     rm -f "$MODEL_DIR/$f.part"
     missing+=("$f")
+  fi
+done
+
+# Qwen3 models (always attempted - small and essential for parity tests)
+echo "[fetch_test_models] Checking Qwen3 models" >&2
+for url in "${QWEN3_MODELS[@]}"; do
+  fname=$(basename "$url")
+  if [[ -s "$MODEL_DIR/$fname" ]]; then
+    echo "[fetch_test_models] Found existing Qwen3 model $fname (skip)"
+    skipped_existing+=("$fname")
+    continue
+  fi
+  if [[ -n "${LLAMINAR_SKIP_MODEL_DOWNLOAD:-}" ]]; then
+    echo "[fetch_test_models] Skipping Qwen3 download for $fname due to LLAMINAR_SKIP_MODEL_DOWNLOAD"
+    continue
+  fi
+  attempted+=("$fname")
+  if ! preflight_check "$url"; then
+    echo "[fetch_test_models][WARN] Qwen3 preflight failed (404?) $fname" >&2
+    missing+=("$fname")
+    continue
+  fi
+  echo "[fetch_test_models] Downloading Qwen3 model $fname from $url" >&2
+  if curl -L --fail --retry 3 --retry-delay 3 -o "$MODEL_DIR/$fname.part" "$url" 2>&1; then
+    mv "$MODEL_DIR/$fname.part" "$MODEL_DIR/$fname"
+    size=$(du -h "$MODEL_DIR/$fname" | cut -f1)
+    echo "[fetch_test_models] Downloaded Qwen3 model $fname ($size)" >&2
+    downloaded+=("$fname:$size")
+    have_any=1
+  else
+    echo "[fetch_test_models][ERROR] Failed to download Qwen3 model $fname" >&2
+    rm -f "$MODEL_DIR/$fname.part"
+    missing+=("$fname")
   fi
 done
 

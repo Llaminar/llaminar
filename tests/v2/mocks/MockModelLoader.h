@@ -158,6 +158,7 @@ namespace llaminar2::test
         uint64_t vocabSize() const override { return vocab_size_; }
         uint64_t contextLength() const override { return context_length_; }
         uint64_t feedForwardLength() const override { return feed_forward_length_; }
+        uint64_t keyLength() const override { return key_length_; }
         float ropeTheta() const override { return rope_theta_; }
         float rmsNormEps() const override { return rms_norm_eps_; }
 
@@ -174,6 +175,7 @@ namespace llaminar2::test
         void setVocabSize(uint64_t size) { vocab_size_ = size; }
         void setContextLength(uint64_t length) { context_length_ = length; }
         void setFeedForwardLength(uint64_t length) { feed_forward_length_ = length; }
+        void setKeyLength(uint64_t length) { key_length_ = length; }
         void setRopeTheta(float theta) { rope_theta_ = theta; }
         void setRmsNormEps(float eps) { rms_norm_eps_ = eps; }
         void setIntParam(const std::string &key, int value) { int_params_[key] = value; }
@@ -268,6 +270,7 @@ namespace llaminar2::test
         uint64_t vocab_size_ = 32000;
         uint64_t context_length_ = 2048;
         uint64_t feed_forward_length_ = 512; // Default to 4×embedding_length for minimal preset
+        uint64_t key_length_ = 0;            // 0 = use d_model/n_heads (default)
         float rope_theta_ = 10000.0f;
         float rms_norm_eps_ = 1e-6f;
 
@@ -324,6 +327,7 @@ namespace llaminar2::test
         MockModelLoaderBuilder &setVocabSize(uint64_t size);
         MockModelLoaderBuilder &setContextLength(uint64_t length);
         MockModelLoaderBuilder &setFeedForwardLength(uint64_t length);
+        MockModelLoaderBuilder &setKeyLength(uint64_t length);
         MockModelLoaderBuilder &setRopeTheta(float theta);
         MockModelLoaderBuilder &setRmsNormEps(float eps);
 
@@ -983,6 +987,12 @@ namespace llaminar2::test
     inline MockModelLoaderBuilder &MockModelLoaderBuilder::setFeedForwardLength(uint64_t length)
     {
         mock_->setFeedForwardLength(length);
+        return *this;
+    }
+
+    inline MockModelLoaderBuilder &MockModelLoaderBuilder::setKeyLength(uint64_t length)
+    {
+        mock_->setKeyLength(length);
         return *this;
     }
 

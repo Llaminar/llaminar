@@ -107,6 +107,7 @@ class QwenReferenceModel(AbstractReferenceModel):
         
         Uses GGUFLoader to extract config and state dict, then creates
         a transformers model and loads the weights.
+        Supports both Qwen2 and Qwen3 architectures.
         
         Args:
             gguf_path: Path to GGUF file
@@ -115,6 +116,13 @@ class QwenReferenceModel(AbstractReferenceModel):
         """
         from .loaders import GGUFLoader
         from transformers import Qwen2Config, Qwen2ForCausalLM
+        
+        # Try importing Qwen3 classes (may not be available in older transformers)
+        try:
+            from transformers import Qwen3Config, Qwen3ForCausalLM
+            HAS_QWEN3 = True
+        except ImportError:
+            HAS_QWEN3 = False
         
         print(f"Loading GGUF file: {gguf_path}")
         
@@ -129,18 +137,26 @@ class QwenReferenceModel(AbstractReferenceModel):
         if self.verbose:
             print(f"Config extracted: {list(config_dict.keys())}")
         
-        # Create Qwen2Config from dict
-        self.hf_config = Qwen2Config(**config_dict)
+        # Detect model type and create appropriate config/model
+        model_type = config_dict.get('model_type', 'qwen2')
         
-        # Set dtype if specified
-        if torch_dtype:
-            self.hf_config.torch_dtype = torch_dtype
-        
-        # Create model from config
-        print(f"Creating Qwen2 model from config...")
-        # Use eager attention to enable attention weight capture
-        self.hf_config._attn_implementation = 'eager'
-        self.hf_model = Qwen2ForCausalLM(self.hf_config)
+        if model_type == 'qwen3' and HAS_QWEN3:
+            print(f"Detected Qwen3 architecture")
+            self.hf_config = Qwen3Config(**config_dict)
+            if torch_dtype:
+                self.hf_config.torch_dtype = torch_dtype
+            self.hf_config._attn_implementation = 'eager'
+            self.hf_model = Qwen3ForCausalLM(self.hf_config)
+        else:
+            if model_type == 'qwen3':
+                print(f"WARNING: Qwen3 detected but Qwen3ForCausalLM not available, falling back to Qwen2")
+                config_dict['model_type'] = 'qwen2'
+            print(f"Using Qwen2 architecture")
+            self.hf_config = Qwen2Config(**config_dict)
+            if torch_dtype:
+                self.hf_config.torch_dtype = torch_dtype
+            self.hf_config._attn_implementation = 'eager'
+            self.hf_model = Qwen2ForCausalLM(self.hf_config)
         
         # Load state dict
         print(f"Loading {len(state_dict)} tensors into model...")

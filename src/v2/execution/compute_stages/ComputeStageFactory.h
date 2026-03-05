@@ -29,6 +29,7 @@
 #include "stages/SendActivationsStage.h"
 #include "stages/ReceiveActivationsStage.h"
 #include "stages/MoEStages.h"
+#include "stages/QKNormStage.h"
 
 namespace llaminar2
 {
@@ -83,6 +84,12 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createRMSNorm(
             const RMSNormStage::Params &params);
+
+        /**
+         * @brief Create a per-head QK RMSNorm stage (Qwen3)
+         */
+        static std::unique_ptr<IComputeStage> createQKNorm(
+            const QKNormStage::Params &params);
 
         /**
          * @brief Create a RoPE stage
