@@ -1393,12 +1393,25 @@ bool rocmGemv_native_vnni_fp32(
         const int grid_n = grid_n_lds;     // Already computed above
 
         // LDS-aware KB heuristic: max waves/CU depends on grid table LDS size
+        // and decode VALU cost.
+        //
+        // O8: Reduced occupancy for IQ2 formats.
+        //
+        // IQ2 decode has 127 VALU/block — the highest of any format — due to
+        // 8× iq_apply_signs_4 (3 VALU each) + sign expansion (16 VALU).
+        // At 32 waves/CU (8 per SIMD), the VALU round-robin takes 1016 cycles
+        // between load phases, leaving the memory pipeline idle ~80% of the
+        // time.  Reducing to 16 waves (4/SIMD) halves the VALU round to 508
+        // cycles, improving memory utilization from ~19% to ~38%.
+        //
+        // This doesn't affect IQ1 (already at 16 waves from LDS size) or IQ3
+        // (which has ~80 VALU/block — half of IQ2 — so 40 waves is balanced).
         int max_waves_per_cu;
         if (codebook_id >= 16)       // IQ1_S, IQ1_M (16KB LDS)
             max_waves_per_cu = 16;
-        else if (codebook_id == 13)  // IQ2_S (8KB LDS)
-            max_waves_per_cu = 32;
-        else                         // IQ3, IQ2_XS, IQ2_XXS (≤4KB LDS)
+        else if (codebook_id >= 13 && codebook_id <= 15)  // IQ2_S, IQ2_XS, IQ2_XXS
+            max_waves_per_cu = 16;
+        else                         // IQ3_S, IQ3_XXS (≤2KB LDS, ~80 VALU/block)
             max_waves_per_cu = 40;
 
         // Each 256-thread block contains 4 wavefronts (wavefront64).
