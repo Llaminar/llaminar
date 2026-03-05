@@ -83,15 +83,12 @@ namespace
     constexpr int BENCH_RUNS = 20;
 
     /// Correctness gate: cosine similarity between native-VNNI and FP32 reference.
-    /// IQ1_M uses a relaxed threshold because its {-1,0,+1} quantization is
-    /// inherently lossy — observed cosine is 0.983-0.987, which is correct
-    /// behavior for a 1.9 BPW format.
-    constexpr float COSINE_SIM_GATE = 0.99f;
-    constexpr float COSINE_SIM_GATE_IQ1_M = 0.98f;
+    /// All formats must meet this threshold — lower cosine indicates a decode bug.
+    constexpr float COSINE_SIM_GATE = 0.9999f;
 
-    inline float cosine_gate_for(const std::string &format_name)
+    inline float cosine_gate_for([[maybe_unused]] const std::string &format_name)
     {
-        return (format_name == "IQ1_M") ? COSINE_SIM_GATE_IQ1_M : COSINE_SIM_GATE;
+        return COSINE_SIM_GATE;
     }
 
     /// Number of GPUs to use (auto-detected, capped at available)
@@ -846,8 +843,8 @@ namespace
         fprintf(stderr, "Speedup = INT8_time / format_time (>1x = faster than INT8)\n");
         fprintf(stderr, "Theoretical = 8.0/BPW (ideal speedup from bandwidth savings alone)\n");
         fprintf(stderr, "Kern Eff = Speedup/Theoretical × 100%% (how close to bandwidth-optimal)\n");
-        fprintf(stderr, "Cosine = GPU output vs HipBLAS FP32 reference (gate: >= %.2f, IQ1_M: >= %.2f)\n",
-                COSINE_SIM_GATE, COSINE_SIM_GATE_IQ1_M);
+        fprintf(stderr, "Cosine = GPU output vs HipBLAS FP32 reference (gate: >= %.4f for all formats)\n",
+                COSINE_SIM_GATE);
 
         // Validate correctness (per-format gate)
         for (const auto &r : results)

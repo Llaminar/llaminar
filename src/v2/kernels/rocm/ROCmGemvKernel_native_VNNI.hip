@@ -105,7 +105,7 @@ struct NVNNITraits {
                                         || FMT == NVNNI_IQ2_S || FMT == NVNNI_IQ2_XS
                                         || FMT == NVNNI_IQ1_M);
     // Dual-scale + asymmetric: split sum_a correction with per-sub-block emins
-    // IQ1_M uses Pattern D (not DA): emins are always zero (baked into grid values)
+    // IQ1_M uses Pattern D (not DA): has ±IQ1S_DELTA per-group correction (handled separately)
     static constexpr bool is_dual_scale_asym = (FMT == NVNNI_Q2_K);
     // Q2_K: emins in separate global array
     static constexpr bool needs_emin_array = (FMT == NVNNI_Q2_K);
@@ -481,11 +481,42 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     for (int g = 4; g < 8; ++g)
                         sum_a_hi = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_hi, false);
 
-                    // IQ1_M: emins always zero (delta baked into grid values)
+                    // Q2_K: per-sub-block emin correction
                     constexpr float min_lo = 0.0f;
                     constexpr float min_hi = 0.0f;
                     f_acc[c] += static_cast<float>(sum_a_lo) * min_lo
                               + static_cast<float>(sum_a_hi) * min_hi;
+                }
+
+                // IQ1_M: ±IQ1S_DELTA per 8-element group correction.
+                // True weight[j] = dl * (grid[j] + delta), but the sdot4 above
+                // only accumulates dl * dot(a, grid).  We add the missing
+                // dl * delta * sum_a_per_group for each of the 4 groups.
+                // Delta signs: qh0 bit 3 (group 0), qh0 bit 7 (group 1),
+                //              qh1 bit 3 (group 2), qh1 bit 7 (group 3).
+                if constexpr (FMT == NVNNI_IQ1_M)
+                {
+                    constexpr float IQ1S_DELTA = 0.125f;
+                    constexpr int32_t ones = 0x01010101;
+                    const uint8_t qh0 = payload[4], qh1 = payload[5];
+
+                    // Per-group sum of activation bytes (8 int8 elements per group)
+                    int32_t sa_g0 = __builtin_amdgcn_sdot4(a4[1], ones,
+                                    __builtin_amdgcn_sdot4(a4[0], ones, 0, false), false);
+                    int32_t sa_g1 = __builtin_amdgcn_sdot4(a4[3], ones,
+                                    __builtin_amdgcn_sdot4(a4[2], ones, 0, false), false);
+                    int32_t sa_g2 = __builtin_amdgcn_sdot4(a4[5], ones,
+                                    __builtin_amdgcn_sdot4(a4[4], ones, 0, false), false);
+                    int32_t sa_g3 = __builtin_amdgcn_sdot4(a4[7], ones,
+                                    __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
+
+                    const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+                    const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+                    const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+                    const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+                    f_acc[c] += (d0 * static_cast<float>(sa_g0) + d1 * static_cast<float>(sa_g1)) * scale_lo
+                              + (d2 * static_cast<float>(sa_g2) + d3 * static_cast<float>(sa_g3)) * scale_hi;
                 }
             }
             else
@@ -1077,9 +1108,9 @@ __global__ void gemv_native_vnni_kernel_t(
                         f_acc[c] += static_cast<float>(acc_lo) * scale_lo
                                   + static_cast<float>(acc_hi) * scale_hi;
 
-                        // Q2_K/IQ1_M: dual-scale + emin correction
+                        // Q2_K/IQ1_M: dual-scale + emin/delta correction
                         // Q2_K: emins from separate d_block_emins array
-                        // IQ1_M: emins = 0 (baked into grid values)
+                        // IQ1_M: has ±IQ1S_DELTA per-group correction (handled below)
                         if constexpr (Traits::is_dual_scale_asym)
                         {
                             constexpr int32_t ones = 0x01010101;
@@ -1104,6 +1135,34 @@ __global__ void gemv_native_vnni_kernel_t(
                             }
                             f_acc[c] += static_cast<float>(sum_a_lo) * min_lo
                                       + static_cast<float>(sum_a_hi) * min_hi;
+                        }
+
+                        // IQ1_M: ±IQ1S_DELTA per 8-element group correction.
+                        // True weight[j] = dl * (grid[j] + delta), but the sdot4 above
+                        // only accumulates dl * dot(a, grid).  We add the missing
+                        // dl * delta * sum_a_per_group for each of the 4 groups.
+                        if constexpr (FMT == NVNNI_IQ1_M)
+                        {
+                            constexpr float IQ1S_DELTA = 0.125f;
+                            constexpr int32_t ones = 0x01010101;
+                            const uint8_t qh0 = payload[4], qh1 = payload[5];
+
+                            int32_t sa_g0 = __builtin_amdgcn_sdot4(a4[1], ones,
+                                            __builtin_amdgcn_sdot4(a4[0], ones, 0, false), false);
+                            int32_t sa_g1 = __builtin_amdgcn_sdot4(a4[3], ones,
+                                            __builtin_amdgcn_sdot4(a4[2], ones, 0, false), false);
+                            int32_t sa_g2 = __builtin_amdgcn_sdot4(a4[5], ones,
+                                            __builtin_amdgcn_sdot4(a4[4], ones, 0, false), false);
+                            int32_t sa_g3 = __builtin_amdgcn_sdot4(a4[7], ones,
+                                            __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
+
+                            const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+                            const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+                            const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+                            const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+                            f_acc[c] += (d0 * static_cast<float>(sa_g0) + d1 * static_cast<float>(sa_g1)) * scale_lo
+                                      + (d2 * static_cast<float>(sa_g2) + d3 * static_cast<float>(sa_g3)) * scale_hi;
                         }
                     }
                     else
