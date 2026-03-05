@@ -1397,21 +1397,28 @@ bool rocmGemv_native_vnni_fp32(
         //
         // O8: Reduced occupancy for IQ2 formats.
         //
-        // IQ2 decode has 127 VALU/block — the highest of any format — due to
-        // 8× iq_apply_signs_4 (3 VALU each) + sign expansion (16 VALU).
-        // At 32 waves/CU (8 per SIMD), the VALU round-robin takes 1016 cycles
-        // between load phases, leaving the memory pipeline idle ~80% of the
-        // time.  Reducing to 16 waves (4/SIMD) halves the VALU round to 508
-        // cycles, improving memory utilization from ~19% to ~38%.
+        // On gfx906, the wavefront scheduler round-robins ALL waves on a SIMD
+        // before returning to the first.  When the inner loop has many VALU
+        // instructions per block, high occupancy creates a long VALU round
+        // that starves the memory pipeline.
         //
-        // This doesn't affect IQ1 (already at 16 waves from LDS size) or IQ3
-        // (which has ~80 VALU/block — half of IQ2 — so 40 waves is balanced).
+        // IQ2 decode has 127 VALU/block.  At 8 waves/SIMD the round takes
+        // 1016 cycles, leaving memory idle ~80%.  Reducing to 4/SIMD (16
+        // waves/CU) halves the round to 508 cycles.
+        //
+        // IQ3 has 94 VALU/block (ISA-verified), giving a 940-cycle round at
+        // 10 waves/SIMD.  Despite this, 40 waves remains optimal because IQ3
+        // has fewer memory bytes per block (15B vs ~25B for IQ2), and the 8
+        // ds_read_b32 per block benefit from occupancy-based LDS latency
+        // hiding.  Tested at 20 waves (O9 experiment) — no improvement.
+        //
+        // IQ1 is already at 16 waves from LDS size (16KB/WG).
         int max_waves_per_cu;
         if (codebook_id >= 16)       // IQ1_S, IQ1_M (16KB LDS)
             max_waves_per_cu = 16;
         else if (codebook_id >= 13 && codebook_id <= 15)  // IQ2_S, IQ2_XS, IQ2_XXS
             max_waves_per_cu = 16;
-        else                         // IQ3_S, IQ3_XXS (≤2KB LDS, ~80 VALU/block)
+        else                         // IQ3_S, IQ3_XXS (≤2KB LDS, 94 VALU/block)
             max_waves_per_cu = 40;
 
         // Each 256-thread block contains 4 wavefronts (wavefront64).
