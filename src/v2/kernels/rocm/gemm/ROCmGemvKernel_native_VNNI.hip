@@ -259,7 +259,8 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
     int n_base, int N, size_t b_offset_N,
     float* f_acc,
     [[maybe_unused]] const uint32_t* lds32 = nullptr,
-    [[maybe_unused]] const uint64_t* lds64 = nullptr)
+    [[maybe_unused]] const uint64_t* lds64 = nullptr,
+    float scale_ab = 1.0f)
 {
     using Traits = NVNNITraits<FMT>;
     static_assert(Traits::is_iq_grid || Traits::is_iq1_grid,
@@ -467,8 +468,8 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                 const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
                 const uint16_t hi_bits = d_block_mins[linear];
                 const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&hi_bits));
-                f_acc[c] += static_cast<float>(acc_lo) * scale_lo
-                          + static_cast<float>(acc_hi) * scale_hi;
+                f_acc[c] += (static_cast<float>(acc_lo) * scale_lo
+                          + static_cast<float>(acc_hi) * scale_hi) * scale_ab;
 
                 if constexpr (Traits::is_dual_scale_asym)
                 {
@@ -484,8 +485,8 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     // Q2_K: per-sub-block emin correction
                     constexpr float min_lo = 0.0f;
                     constexpr float min_hi = 0.0f;
-                    f_acc[c] += static_cast<float>(sum_a_lo) * min_lo
-                              + static_cast<float>(sum_a_hi) * min_hi;
+                    f_acc[c] += (static_cast<float>(sum_a_lo) * min_lo
+                              + static_cast<float>(sum_a_hi) * min_hi) * scale_ab;
                 }
 
                 // IQ1_M: ±IQ1S_DELTA per 8-element group correction.
@@ -515,8 +516,8 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
                     const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
 
-                    f_acc[c] += (d0 * static_cast<float>(sa_g0) + d1 * static_cast<float>(sa_g1)) * scale_lo
-                              + (d2 * static_cast<float>(sa_g2) + d3 * static_cast<float>(sa_g3)) * scale_hi;
+                    f_acc[c] += ((d0 * static_cast<float>(sa_g0) + d1 * static_cast<float>(sa_g1)) * scale_lo
+                              + (d2 * static_cast<float>(sa_g2) + d3 * static_cast<float>(sa_g3)) * scale_hi) * scale_ab;
                 }
             }
             else
@@ -527,13 +528,13 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
 
                 const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-                f_acc[c] += static_cast<float>(block_acc) * block_d;
+                f_acc[c] += static_cast<float>(block_acc) * block_d * scale_ab;
 
                 if constexpr (Traits::is_asymmetric)
                 {
                     const uint16_t min_bits = d_block_mins[linear];
                     const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
-                    f_acc[c] += static_cast<float>(sum_a) * block_m;
+                    f_acc[c] += static_cast<float>(sum_a) * block_m * scale_ab;
                 }
             }
         }
@@ -565,7 +566,8 @@ __global__ void gemv_native_vnni_kernel_t(
     const uint32_t*  __restrict__ d_block_emins,   // [blocks_per_row × N] packed {lo,hi} emins (Q2_K only, else nullptr)
     float*           __restrict__ d_C_fp32,        // [N] output (FP32), used when kblocks=1
     float*           __restrict__ d_partial_fp32,  // [KB × N] partials, used when kblocks>1
-    const float*     __restrict__ d_scale_A,       // [1] activation scale
+    const float*     __restrict__ d_scale_A,       // [1] row-wise activation scale (used when d_scale_A_blockwise==nullptr)
+    const float*     __restrict__ d_scale_A_blockwise, // [blocks_per_row] per-block activation scales (nullptr for row-wise)
     int N, int K, int kblocks)
 {
     using Traits = NVNNITraits<FMT>;
@@ -626,12 +628,16 @@ __global__ void gemv_native_vnni_kernel_t(
 
                 // Decode + accumulate both blocks (compiler sees both sets of
                 // grid loads and can schedule them for maximum overlap)
+                const float scale_ab_0 = d_scale_A_blockwise ? d_scale_A_blockwise[b] : 1.0f;
+                const float scale_ab_1 = d_scale_A_blockwise ? d_scale_A_blockwise[b + 1] : 1.0f;
                 iq_decode_accumulate_block<CPT, FMT, false>(
                     a4_0, sum_a_0, d_payload, d_block_scales, d_block_mins,
-                    n_base, N, static_cast<size_t>(b) * static_cast<size_t>(N), f_acc);
+                    n_base, N, static_cast<size_t>(b) * static_cast<size_t>(N), f_acc,
+                    nullptr, nullptr, scale_ab_0);
                 iq_decode_accumulate_block<CPT, FMT, false>(
                     a4_1, sum_a_1, d_payload, d_block_scales, d_block_mins,
-                    n_base, N, static_cast<size_t>(b + 1) * static_cast<size_t>(N), f_acc);
+                    n_base, N, static_cast<size_t>(b + 1) * static_cast<size_t>(N), f_acc,
+                    nullptr, nullptr, scale_ab_1);
             }
             // Handle odd remainder block
             if (b < b_end)
@@ -647,7 +653,8 @@ __global__ void gemv_native_vnni_kernel_t(
                 }
                 iq_decode_accumulate_block<CPT, FMT, false>(
                     a4, sum_a, d_payload, d_block_scales, d_block_mins,
-                    n_base, N, static_cast<size_t>(b) * static_cast<size_t>(N), f_acc);
+                    n_base, N, static_cast<size_t>(b) * static_cast<size_t>(N), f_acc,
+                    nullptr, nullptr, d_scale_A_blockwise ? d_scale_A_blockwise[b] : 1.0f);
             }
         }
         else
@@ -655,6 +662,9 @@ __global__ void gemv_native_vnni_kernel_t(
         // ---- Original single-block loop for non-IQ formats ----
         for (int b = b_start; b < b_end; ++b)
         {
+            // Per-block activation scale (blockwise) or 1.0 (row-wise)
+            const float scale_ab = d_scale_A_blockwise ? d_scale_A_blockwise[b] : 1.0f;
+
             // A pointer for this block's 32 INT8 activation values
             const int32_t* a4 = reinterpret_cast<const int32_t*>(d_A_int8 + b * 32);
 
@@ -1105,8 +1115,8 @@ __global__ void gemv_native_vnni_kernel_t(
                         const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
                         const uint16_t hi_bits = d_block_mins[linear];
                         const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&hi_bits));
-                        f_acc[c] += static_cast<float>(acc_lo) * scale_lo
-                                  + static_cast<float>(acc_hi) * scale_hi;
+                        f_acc[c] += (static_cast<float>(acc_lo) * scale_lo
+                                  + static_cast<float>(acc_hi) * scale_hi) * scale_ab;
 
                         // Q2_K/IQ1_M: dual-scale + emin/delta correction
                         // Q2_K: emins from separate d_block_emins array
@@ -1133,8 +1143,8 @@ __global__ void gemv_native_vnni_kernel_t(
                                 min_lo = 0.0f;
                                 min_hi = 0.0f;
                             }
-                            f_acc[c] += static_cast<float>(sum_a_lo) * min_lo
-                                      + static_cast<float>(sum_a_hi) * min_hi;
+                            f_acc[c] += (static_cast<float>(sum_a_lo) * min_lo
+                                      + static_cast<float>(sum_a_hi) * min_hi) * scale_ab;
                         }
 
                         // IQ1_M: ±IQ1S_DELTA per 8-element group correction.
@@ -1161,8 +1171,8 @@ __global__ void gemv_native_vnni_kernel_t(
                             const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
                             const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
 
-                            f_acc[c] += (d0 * static_cast<float>(sa_g0) + d1 * static_cast<float>(sa_g1)) * scale_lo
-                                      + (d2 * static_cast<float>(sa_g2) + d3 * static_cast<float>(sa_g3)) * scale_hi;
+                            f_acc[c] += ((d0 * static_cast<float>(sa_g0) + d1 * static_cast<float>(sa_g1)) * scale_lo
+                                      + (d2 * static_cast<float>(sa_g2) + d3 * static_cast<float>(sa_g3)) * scale_hi) * scale_ab;
                         }
                     }
                     else
@@ -1174,7 +1184,7 @@ __global__ void gemv_native_vnni_kernel_t(
                             block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
 
                         const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-                        f_acc[c] += static_cast<float>(block_acc) * block_d;
+                        f_acc[c] += static_cast<float>(block_acc) * block_d * scale_ab;
 
                         // Asymmetric min correction: f_acc += sum_a * block_m
                         // Derives from: value = d*q + m  →  Σ a_i*value_i = d*Σ(a_i*q_i) + m*Σ(a_i)
@@ -1182,7 +1192,7 @@ __global__ void gemv_native_vnni_kernel_t(
                         {
                             const uint16_t min_bits = d_block_mins[linear];
                             const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
-                            f_acc[c] += static_cast<float>(sum_a) * block_m;
+                            f_acc[c] += static_cast<float>(sum_a) * block_m * scale_ab;
                         }
                     }
                 }
@@ -1191,7 +1201,9 @@ __global__ void gemv_native_vnni_kernel_t(
         } // close else (non-IQ formats)
 
         // Apply activation scale and write output
-        const float scale_a = d_scale_A[0];
+        // When blockwise scales are active, per-block scales were already fused
+        // into the accumulation loop above, so scale_a = 1.0.
+        const float scale_a = d_scale_A_blockwise ? 1.0f : d_scale_A[0];
         #pragma unroll
         for (int c = 0; c < CPT; ++c)
         {
@@ -1275,6 +1287,7 @@ __global__ void gemv_iq_lds_kernel_t(
     float*           __restrict__ d_C_fp32,
     float*           __restrict__ d_partial_fp32,
     const float*     __restrict__ d_scale_A,
+    const float*     __restrict__ d_scale_A_blockwise,
     int N, int K, int kblocks)
 {
     using Traits = NVNNITraits<FMT>;
@@ -1325,6 +1338,7 @@ __global__ void gemv_iq_lds_kernel_t(
         for (int b = b_start; b < b_end; ++b)
         {
             const int32_t* a4 = reinterpret_cast<const int32_t*>(d_A_int8 + b * 32);
+            const float scale_ab = d_scale_A_blockwise ? d_scale_A_blockwise[b] : 1.0f;
 
             int32_t sum_a = 0;
             if constexpr (Traits::is_asymmetric)
@@ -1338,11 +1352,11 @@ __global__ void gemv_iq_lds_kernel_t(
             iq_decode_accumulate_block<1, FMT, true>(
                 a4, sum_a, d_payload, d_block_scales, d_block_mins,
                 n, N, static_cast<size_t>(b) * static_cast<size_t>(N), &f_acc,
-                lds32, lds64);
+                lds32, lds64, scale_ab);
         }
 
         // ---- Apply activation scale and write output ----
-        const float result = f_acc * d_scale_A[0];
+        const float result = f_acc * (d_scale_A_blockwise ? 1.0f : d_scale_A[0]);
         if (kblocks == 1)
             d_C_fp32[n] = result;
         else
@@ -1373,7 +1387,8 @@ bool rocmGemv_native_vnni_fp32(
     float* d_partial_fp32,       // [KB_MAX × N] partial buffer (nullable when KB=1)
     int N, int K,
     uint8_t codebook_id,
-    int device_id, void* stream)
+    int device_id, void* stream,
+    const float* d_scale_A_blockwise)
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
@@ -1519,13 +1534,13 @@ bool rocmGemv_native_vnni_fp32(
                     HIP_KERNEL_NAME(gemv_iq_lds_kernel_t<IQ_TN, FMT_TAG>),                   \
                     dim3(grid_n, 1), block, 0, static_cast<hipStream_t>(stream),              \
                     d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,               \
-                    d_C_fp32, d_partial_fp32, d_scale_A, N, K, 1);                            \
+                    d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, 1);       \
             } else {                                                                          \
                 hipLaunchKernelGGL(                                                           \
                     HIP_KERNEL_NAME(gemv_iq_lds_kernel_t<IQ_TN, FMT_TAG>),                   \
                     dim3(grid_n, kb), block, 0, static_cast<hipStream_t>(stream),             \
                     d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,               \
-                    d_C_fp32, d_partial_fp32, d_scale_A, N, K, kb);                           \
+                    d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, kb);      \
                 hipLaunchKernelGGL(                                                           \
                     HIP_KERNEL_NAME(gemv_native_vnni_reduce_kernel_t<IQ_TN, 1>),              \
                     dim3(grid_n), block, 0, static_cast<hipStream_t>(stream),                 \
@@ -1592,13 +1607,13 @@ bool rocmGemv_native_vnni_fp32(
                     HIP_KERNEL_NAME(gemv_native_vnni_kernel_t<TN, CPT, FMT_TAG>),            \
                     dim3(grid_n, 1), block, 0, static_cast<hipStream_t>(stream),             \
                     d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,              \
-                    d_C_fp32, d_partial_fp32, d_scale_A, N, K, 1);                           \
+                    d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, 1);      \
             } else {                                                                          \
                 hipLaunchKernelGGL(                                                           \
                     HIP_KERNEL_NAME(gemv_native_vnni_kernel_t<TN, CPT, FMT_TAG>),            \
                     dim3(grid_n, kb), block, 0, static_cast<hipStream_t>(stream),            \
                     d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,              \
-                    d_C_fp32, d_partial_fp32, d_scale_A, N, K, kb);                          \
+                    d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, kb);     \
                 hipLaunchKernelGGL(                                                           \
                     HIP_KERNEL_NAME(gemv_native_vnni_reduce_kernel_t<TN, CPT>),              \
                     dim3(grid_n), block, 0, static_cast<hipStream_t>(stream),                \

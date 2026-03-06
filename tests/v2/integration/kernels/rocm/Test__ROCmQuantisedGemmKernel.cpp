@@ -21,11 +21,19 @@
 
 #include <gtest/gtest.h>
 #include <cmath>
+#include <cstdlib>
 #include <numeric>
 
+#include "execution/compute_stages/stages/FusedQKVGEMMStage.h"
+#include "execution/compute_stages/stages/GEMMStage.h"
+#include "execution/compute_stages/stages/QKNormStage.h"
+#include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/local_execution/coherence/GpuCoherence.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/KernelFactory.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "loaders/ModelContext.h"
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "../../../utils/TestTensorFactory.h"
@@ -100,6 +108,13 @@ extern "C"
         const float *d_C_existing, // For beta != 0 (nullable)
         const float *d_bias,       // [N] optional bias (nullable)
         int rocm_device_id, void *stream);
+
+    // In-place bias addition epilogue
+    bool rocmQuantGemm_biasAdd(
+        float *d_output,
+        const float *d_bias,
+        int M, int N,
+        int rocm_device_id, void *stream);
 }
 #endif
 
@@ -110,6 +125,236 @@ namespace llaminar2
         namespace integration_test
         {
             using namespace llaminar2::test;
+
+            namespace
+            {
+                const std::string TEST_MODEL_PATH = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
+
+                class ScopedEnvOverride
+                {
+                public:
+                    ScopedEnvOverride(const char *name, const char *value)
+                        : name_(name)
+                    {
+                        const char *original = std::getenv(name_);
+                        if (original)
+                        {
+                            had_original_ = true;
+                            original_value_ = original;
+                        }
+                        ::setenv(name_, value, 1);
+                        mutableDebugEnv().reload();
+                    }
+
+                    ~ScopedEnvOverride()
+                    {
+                        if (had_original_)
+                        {
+                            ::setenv(name_, original_value_.c_str(), 1);
+                        }
+                        else
+                        {
+                            ::unsetenv(name_);
+                        }
+                        mutableDebugEnv().reload();
+                    }
+
+                    ScopedEnvOverride(const ScopedEnvOverride &) = delete;
+                    ScopedEnvOverride &operator=(const ScopedEnvOverride &) = delete;
+
+                private:
+                    const char *name_;
+                    bool had_original_ = false;
+                    std::string original_value_;
+                };
+
+                struct NativeWeightReference
+                {
+                    std::vector<int8_t> unpacked_blocks;
+                    std::vector<float> block_scales;
+                    std::vector<float> block_mins;
+                    int blocks_per_row = 0;
+                };
+
+                NativeWeightReference buildNativeWeightReference(const IINT8Unpackable &weight, int N, int K)
+                {
+                    NativeWeightReference reference;
+                    reference.blocks_per_row = K / 32;
+                    reference.unpacked_blocks.resize(static_cast<size_t>(N) * reference.blocks_per_row * 32);
+                    reference.block_scales.resize(static_cast<size_t>(N) * reference.blocks_per_row);
+                    reference.block_mins.resize(static_cast<size_t>(N) * reference.blocks_per_row);
+
+#pragma omp parallel for schedule(static)
+                    for (int n = 0; n < N; ++n)
+                    {
+                        for (int block = 0; block < reference.blocks_per_row; ++block)
+                        {
+                            const size_t linear = static_cast<size_t>(n) * reference.blocks_per_row + block;
+                            weight.unpack_block_to_int8(
+                                static_cast<size_t>(n),
+                                static_cast<size_t>(block),
+                                &reference.unpacked_blocks[linear * 32]);
+                            reference.block_scales[linear] = weight.get_block_scale(
+                                static_cast<size_t>(n),
+                                static_cast<size_t>(block));
+                            reference.block_mins[linear] = weight.get_block_min(
+                                static_cast<size_t>(n),
+                                static_cast<size_t>(block));
+                        }
+                    }
+
+                    return reference;
+                }
+
+                std::vector<float> computeNativeReferenceFromQuantizedActivations(
+                    const std::vector<int8_t> &activations_int8,
+                    const std::vector<float> &scales_a,
+                    const NativeWeightReference &weights,
+                    int M, int N, int K)
+                {
+                    const int blocks_per_row = weights.blocks_per_row;
+                    std::vector<int32_t> activation_block_sums(static_cast<size_t>(M) * blocks_per_row);
+                    std::vector<float> output(static_cast<size_t>(M) * N, 0.0f);
+
+#pragma omp parallel for schedule(static)
+                    for (int m = 0; m < M; ++m)
+                    {
+                        for (int block = 0; block < blocks_per_row; ++block)
+                        {
+                            int32_t sum = 0;
+                            const int8_t *a_block = &activations_int8[static_cast<size_t>(m) * K + block * 32];
+                            for (int i = 0; i < 32; ++i)
+                            {
+                                sum += static_cast<int32_t>(a_block[i]);
+                            }
+                            activation_block_sums[static_cast<size_t>(m) * blocks_per_row + block] = sum;
+                        }
+                    }
+
+#pragma omp parallel for schedule(static)
+                    for (int m = 0; m < M; ++m)
+                    {
+                        for (int n = 0; n < N; ++n)
+                        {
+                            float accum = 0.0f;
+                            const float scale_a = scales_a[static_cast<size_t>(m)];
+                            for (int block = 0; block < blocks_per_row; ++block)
+                            {
+                                const size_t linear = static_cast<size_t>(n) * blocks_per_row + block;
+                                const int8_t *a_block = &activations_int8[static_cast<size_t>(m) * K + block * 32];
+                                const int8_t *b_block = &weights.unpacked_blocks[linear * 32];
+                                int32_t dot = 0;
+                                for (int i = 0; i < 32; ++i)
+                                {
+                                    dot += static_cast<int32_t>(a_block[i]) * static_cast<int32_t>(b_block[i]);
+                                }
+
+                                const float scale_b = weights.block_scales[linear];
+                                const float min_b = weights.block_mins[linear];
+                                const int32_t sum_a = activation_block_sums[static_cast<size_t>(m) * blocks_per_row + block];
+                                accum += scale_a * (static_cast<float>(dot) * scale_b + static_cast<float>(sum_a) * min_b);
+                            }
+                            output[static_cast<size_t>(m) * N + n] = accum;
+                        }
+                    }
+
+                    return output;
+                }
+
+                void quantizeActivationsPerBlock32(
+                    const std::vector<float> &input,
+                    int M,
+                    int K,
+                    std::vector<int8_t> &activations_int8,
+                    std::vector<float> &scales_a)
+                {
+                    const int blocks_per_row = K / 32;
+                    activations_int8.resize(static_cast<size_t>(M) * K);
+                    scales_a.resize(static_cast<size_t>(M) * blocks_per_row);
+
+#pragma omp parallel for schedule(static)
+                    for (int m = 0; m < M; ++m)
+                    {
+                        for (int block = 0; block < blocks_per_row; ++block)
+                        {
+                            const float *src = &input[static_cast<size_t>(m) * K + block * 32];
+                            float max_abs = 0.0f;
+                            for (int i = 0; i < 32; ++i)
+                            {
+                                max_abs = std::max(max_abs, std::abs(src[i]));
+                            }
+
+                            const float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+                            scales_a[static_cast<size_t>(m) * blocks_per_row + block] = scale;
+                            const float inv_scale = 1.0f / scale;
+
+                            int8_t *dst = &activations_int8[static_cast<size_t>(m) * K + block * 32];
+                            for (int i = 0; i < 32; ++i)
+                            {
+                                const float value = src[i] * inv_scale;
+                                int32_t q = static_cast<int32_t>(value + (value >= 0.0f ? 0.5f : -0.5f));
+                                q = std::clamp(q, -127, 127);
+                                dst[i] = static_cast<int8_t>(q);
+                            }
+                        }
+                    }
+                }
+
+                std::vector<float> computeNativeReferenceFromBlockwiseQuantizedActivations(
+                    const std::vector<int8_t> &activations_int8,
+                    const std::vector<float> &scales_a,
+                    const NativeWeightReference &weights,
+                    int M, int N, int K)
+                {
+                    const int blocks_per_row = weights.blocks_per_row;
+                    std::vector<int32_t> activation_block_sums(static_cast<size_t>(M) * blocks_per_row);
+                    std::vector<float> output(static_cast<size_t>(M) * N, 0.0f);
+
+#pragma omp parallel for schedule(static)
+                    for (int m = 0; m < M; ++m)
+                    {
+                        for (int block = 0; block < blocks_per_row; ++block)
+                        {
+                            int32_t sum = 0;
+                            const int8_t *a_block = &activations_int8[static_cast<size_t>(m) * K + block * 32];
+                            for (int i = 0; i < 32; ++i)
+                            {
+                                sum += static_cast<int32_t>(a_block[i]);
+                            }
+                            activation_block_sums[static_cast<size_t>(m) * blocks_per_row + block] = sum;
+                        }
+                    }
+
+#pragma omp parallel for schedule(static)
+                    for (int m = 0; m < M; ++m)
+                    {
+                        for (int n = 0; n < N; ++n)
+                        {
+                            float accum = 0.0f;
+                            for (int block = 0; block < blocks_per_row; ++block)
+                            {
+                                const size_t linear = static_cast<size_t>(n) * blocks_per_row + block;
+                                const int8_t *a_block = &activations_int8[static_cast<size_t>(m) * K + block * 32];
+                                const int8_t *b_block = &weights.unpacked_blocks[linear * 32];
+                                int32_t dot = 0;
+                                for (int i = 0; i < 32; ++i)
+                                {
+                                    dot += static_cast<int32_t>(a_block[i]) * static_cast<int32_t>(b_block[i]);
+                                }
+
+                                const float scale_a = scales_a[static_cast<size_t>(m) * blocks_per_row + block];
+                                const float scale_b = weights.block_scales[linear];
+                                const float min_b = weights.block_mins[linear];
+                                const int32_t sum_a = activation_block_sums[static_cast<size_t>(m) * blocks_per_row + block];
+                                accum += scale_a * (static_cast<float>(dot) * scale_b + static_cast<float>(sum_a) * min_b);
+                            }
+                            output[static_cast<size_t>(m) * N + n] = accum;
+                        }
+                    }
+
+                    return output;
+                }
+            }
 
             // =====================================================================
             // Test fixture
@@ -152,6 +397,16 @@ namespace llaminar2
                         data[i] = static_cast<float>(i % 256) / 128.0f - 1.0f;
                     }
                     return data;
+                }
+
+                std::shared_ptr<ModelContext> loadModel() const
+                {
+                    std::ifstream file(TEST_MODEL_PATH);
+                    if (!file.good())
+                    {
+                        return nullptr;
+                    }
+                    return ModelContext::create(TEST_MODEL_PATH);
                 }
 
                 bool has_rocm_device_ = false;
@@ -1694,6 +1949,1330 @@ namespace llaminar2
             }
 
             /**
+             * @test Fused QKV stage parity for Qwen2-style biased projections on ROCm
+             *
+             * Uses realistic Qwen2.5-0.5B projection shapes:
+             * - input hidden size: 896
+             * - Q output: 896
+             * - K/V output: 128 each (GQA)
+             * - prefill tokens: 64
+             *
+             * This specifically exercises the fused multi-projection ROCm path with
+             * optional Q/K/V biases, which is the closest isolated stage match to the
+             * remaining Qwen2 ROCm parity failures.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedQKVStage_Qwen05B_BiasParity)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                constexpr int M = 64;
+                constexpr int K = 896;
+                constexpr int N_Q = 896;
+                constexpr int N_K = 128;
+                constexpr int N_V = 128;
+                constexpr float COSINE_THRESHOLD = 0.995f;
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)}, -0.5f, 0.5f, 123);
+                auto wq = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N_Q), static_cast<size_t>(K)}, 1001);
+                auto wk = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N_K), static_cast<size_t>(K)}, 1002);
+                auto wv = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N_V), static_cast<size_t>(K)}, 1003);
+
+                auto bias_q = TestTensorFactory::createFP32Random({static_cast<size_t>(N_Q)}, -0.05f, 0.05f, 2001);
+                auto bias_k = TestTensorFactory::createFP32Random({static_cast<size_t>(N_K)}, -0.05f, 0.05f, 2002);
+                auto bias_v = TestTensorFactory::createFP32Random({static_cast<size_t>(N_V)}, -0.05f, 0.05f, 2003);
+
+                auto cpu_q = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_Q)}, DeviceId::cpu());
+                auto cpu_k = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_K)}, DeviceId::cpu());
+                auto cpu_v = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_V)}, DeviceId::cpu());
+
+                auto rocm_q = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_Q)}, DeviceId::rocm(0));
+                auto rocm_k = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_K)}, DeviceId::rocm(0));
+                auto rocm_v = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_V)}, DeviceId::rocm(0));
+
+                FusedQKVGEMMStage::Params cpu_params{
+                    .device_id = DeviceId::cpu(),
+                    .input = input.get(),
+                    .m = M,
+                    .k = K,
+                    .wq = wq.get(),
+                    .output_q = cpu_q.get(),
+                    .n_q = N_Q,
+                    .bias_q = bias_q.get(),
+                    .wk = wk.get(),
+                    .output_k = cpu_k.get(),
+                    .n_k = N_K,
+                    .bias_k = bias_k.get(),
+                    .wv = wv.get(),
+                    .output_v = cpu_v.get(),
+                    .n_v = N_V,
+                    .bias_v = bias_v.get()};
+
+                FusedQKVGEMMStage::Params rocm_params{
+                    .device_id = DeviceId::rocm(0),
+                    .input = input.get(),
+                    .m = M,
+                    .k = K,
+                    .wq = wq.get(),
+                    .output_q = rocm_q.get(),
+                    .n_q = N_Q,
+                    .bias_q = bias_q.get(),
+                    .wk = wk.get(),
+                    .output_k = rocm_k.get(),
+                    .n_k = N_K,
+                    .bias_k = bias_k.get(),
+                    .wv = wv.get(),
+                    .output_v = rocm_v.get(),
+                    .n_v = N_V,
+                    .bias_v = bias_v.get()};
+
+                FusedQKVGEMMStage cpu_stage(cpu_params);
+                FusedQKVGEMMStage rocm_stage(rocm_params);
+
+                CPUDeviceContext cpu_ctx(DeviceId::cpu(), 4);
+                ROCmDeviceContext rocm_ctx(DeviceId::rocm(0), 0);
+
+                ASSERT_TRUE(cpu_stage.execute(&cpu_ctx)) << "CPU fused QKV execution failed";
+
+                auto reqs = rocm_stage.getWorkspaceRequirements(M, N_Q, K);
+                DeviceWorkspaceManager workspace(DeviceId::rocm(0), 128 * 1024 * 1024);
+                ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate ROCm fused QKV workspace";
+                rocm_stage.bindWorkspace(&workspace);
+
+                const bool rocm_ok = with_gpu_coherence(
+                    DeviceId::rocm(0),
+                    {input.get(), wq.get(), wk.get(), wv.get(), bias_q.get(), bias_k.get(), bias_v.get()},
+                    {rocm_q.get(), rocm_k.get(), rocm_v.get()},
+                    [&]() {
+                        return rocm_stage.execute(&rocm_ctx);
+                    });
+
+                rocm_stage.unbindWorkspace();
+
+                ASSERT_TRUE(rocm_ok) << "ROCm fused QKV execution failed";
+
+                const float q_cos = cosineSimilarity(
+                    std::vector<float>(cpu_q->data(), cpu_q->data() + static_cast<size_t>(M * N_Q)),
+                    std::vector<float>(rocm_q->data(), rocm_q->data() + static_cast<size_t>(M * N_Q)));
+                const float k_cos = cosineSimilarity(
+                    std::vector<float>(cpu_k->data(), cpu_k->data() + static_cast<size_t>(M * N_K)),
+                    std::vector<float>(rocm_k->data(), rocm_k->data() + static_cast<size_t>(M * N_K)));
+                const float v_cos = cosineSimilarity(
+                    std::vector<float>(cpu_v->data(), cpu_v->data() + static_cast<size_t>(M * N_V)),
+                    std::vector<float>(rocm_v->data(), rocm_v->data() + static_cast<size_t>(M * N_V)));
+
+                LOG_INFO("[Integration] ROCm fused QKV parity: Q=" << q_cos
+                                                                    << " K=" << k_cos
+                                                                    << " V=" << v_cos);
+
+                EXPECT_GT(q_cos, COSINE_THRESHOLD) << "Q projection cosine too low";
+                EXPECT_GT(k_cos, COSINE_THRESHOLD) << "K projection cosine too low";
+                EXPECT_GT(v_cos, COSINE_THRESHOLD) << "V projection cosine too low";
+            }
+
+            /**
+             * @test Fused QKV stage parity using real loaded Qwen2 late-layer weights and biases
+             *
+             * This validates the exact tensor materialization path used by the runner, not just
+             * the fused ROCm kernel math. It targets a late layer because the remaining parity
+             * drift first becomes obvious near layer 21 in the full model path.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedQKVStage_RealQwen2Layer21BiasParity)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                auto model_ctx = loadModel();
+                if (!model_ctx)
+                {
+                    GTEST_SKIP() << "Test model not found: " << TEST_MODEL_PATH;
+                }
+
+                constexpr int layer_idx = 21;
+                constexpr int M = 64;
+                constexpr int K = 896;
+                constexpr float COSINE_THRESHOLD = 0.995f;
+
+                const std::string prefix = "blk." + std::to_string(layer_idx) + ".";
+
+                auto cpu_wq = model_ctx->getWeightForDevice(prefix + "attn_q.weight", DeviceId::cpu());
+                auto cpu_wk = model_ctx->getWeightForDevice(prefix + "attn_k.weight", DeviceId::cpu());
+                auto cpu_wv = model_ctx->getWeightForDevice(prefix + "attn_v.weight", DeviceId::cpu());
+                auto cpu_bias_q = model_ctx->getWeightForDevice(prefix + "attn_q.bias", DeviceId::cpu());
+                auto cpu_bias_k = model_ctx->getWeightForDevice(prefix + "attn_k.bias", DeviceId::cpu());
+                auto cpu_bias_v = model_ctx->getWeightForDevice(prefix + "attn_v.bias", DeviceId::cpu());
+
+                auto rocm_wq = model_ctx->getWeightForDevice(prefix + "attn_q.weight", DeviceId::rocm(0));
+                auto rocm_wk = model_ctx->getWeightForDevice(prefix + "attn_k.weight", DeviceId::rocm(0));
+                auto rocm_wv = model_ctx->getWeightForDevice(prefix + "attn_v.weight", DeviceId::rocm(0));
+                auto rocm_bias_q = model_ctx->getWeightForDevice(prefix + "attn_q.bias", DeviceId::rocm(0));
+                auto rocm_bias_k = model_ctx->getWeightForDevice(prefix + "attn_k.bias", DeviceId::rocm(0));
+                auto rocm_bias_v = model_ctx->getWeightForDevice(prefix + "attn_v.bias", DeviceId::rocm(0));
+
+                ASSERT_TRUE(cpu_wq && cpu_wk && cpu_wv);
+                ASSERT_TRUE(rocm_wq && rocm_wk && rocm_wv);
+                ASSERT_TRUE(cpu_bias_q && cpu_bias_k && cpu_bias_v);
+                ASSERT_TRUE(rocm_bias_q && rocm_bias_k && rocm_bias_v);
+
+                ASSERT_EQ(cpu_bias_q->native_type(), TensorType::FP32);
+                ASSERT_EQ(cpu_bias_k->native_type(), TensorType::FP32);
+                ASSERT_EQ(cpu_bias_v->native_type(), TensorType::FP32);
+                ASSERT_EQ(rocm_bias_q->native_type(), TensorType::FP32);
+                ASSERT_EQ(rocm_bias_k->native_type(), TensorType::FP32);
+                ASSERT_EQ(rocm_bias_v->native_type(), TensorType::FP32);
+
+                const int N_Q = static_cast<int>(cpu_wq->shape()[0]);
+                const int N_K = static_cast<int>(cpu_wk->shape()[0]);
+                const int N_V = static_cast<int>(cpu_wv->shape()[0]);
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)}, -0.5f, 0.5f, 321);
+                auto cpu_q = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_Q)}, DeviceId::cpu());
+                auto cpu_k = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_K)}, DeviceId::cpu());
+                auto cpu_v = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_V)}, DeviceId::cpu());
+
+                auto rocm_q = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_Q)}, DeviceId::rocm(0));
+                auto rocm_k = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_K)}, DeviceId::rocm(0));
+                auto rocm_v = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_V)}, DeviceId::rocm(0));
+
+                FusedQKVGEMMStage::Params cpu_params{
+                    .device_id = DeviceId::cpu(),
+                    .input = input.get(),
+                    .m = M,
+                    .k = K,
+                    .wq = cpu_wq.get(),
+                    .output_q = cpu_q.get(),
+                    .n_q = N_Q,
+                    .bias_q = cpu_bias_q.get(),
+                    .wk = cpu_wk.get(),
+                    .output_k = cpu_k.get(),
+                    .n_k = N_K,
+                    .bias_k = cpu_bias_k.get(),
+                    .wv = cpu_wv.get(),
+                    .output_v = cpu_v.get(),
+                    .n_v = N_V,
+                    .bias_v = cpu_bias_v.get()};
+
+                FusedQKVGEMMStage::Params rocm_params{
+                    .device_id = DeviceId::rocm(0),
+                    .input = input.get(),
+                    .m = M,
+                    .k = K,
+                    .wq = rocm_wq.get(),
+                    .output_q = rocm_q.get(),
+                    .n_q = N_Q,
+                    .bias_q = rocm_bias_q.get(),
+                    .wk = rocm_wk.get(),
+                    .output_k = rocm_k.get(),
+                    .n_k = N_K,
+                    .bias_k = rocm_bias_k.get(),
+                    .wv = rocm_wv.get(),
+                    .output_v = rocm_v.get(),
+                    .n_v = N_V,
+                    .bias_v = rocm_bias_v.get()};
+
+                FusedQKVGEMMStage cpu_stage(cpu_params);
+                FusedQKVGEMMStage rocm_stage(rocm_params);
+
+                CPUDeviceContext cpu_ctx(DeviceId::cpu(), 4);
+                ROCmDeviceContext rocm_ctx(DeviceId::rocm(0), 0);
+
+                ASSERT_TRUE(cpu_stage.execute(&cpu_ctx)) << "CPU fused QKV execution failed for real model weights";
+
+                auto reqs = rocm_stage.getWorkspaceRequirements(M, N_Q, K);
+                DeviceWorkspaceManager workspace(DeviceId::rocm(0), 128 * 1024 * 1024);
+                ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate ROCm fused QKV workspace";
+                rocm_stage.bindWorkspace(&workspace);
+
+                const std::initializer_list<TensorBase *> rocm_inputs = {
+                    input.get(),
+                    rocm_wq.get(),
+                    rocm_wk.get(),
+                    rocm_wv.get(),
+                    rocm_bias_q.get(),
+                    rocm_bias_k.get(),
+                    rocm_bias_v.get()};
+                const std::initializer_list<TensorBase *> rocm_outputs = {
+                    rocm_q.get(),
+                    rocm_k.get(),
+                    rocm_v.get()};
+
+                const bool rocm_ok = with_gpu_coherence(
+                    DeviceId::rocm(0),
+                    rocm_inputs,
+                    rocm_outputs,
+                    [&]() {
+                        return rocm_stage.execute(&rocm_ctx);
+                    });
+
+                rocm_stage.unbindWorkspace();
+
+                ASSERT_TRUE(rocm_ok) << "ROCm fused QKV execution failed for real model weights";
+
+                const float q_cos = cosineSimilarity(
+                    std::vector<float>(cpu_q->data(), cpu_q->data() + static_cast<size_t>(M * N_Q)),
+                    std::vector<float>(rocm_q->data(), rocm_q->data() + static_cast<size_t>(M * N_Q)));
+                const float k_cos = cosineSimilarity(
+                    std::vector<float>(cpu_k->data(), cpu_k->data() + static_cast<size_t>(M * N_K)),
+                    std::vector<float>(rocm_k->data(), rocm_k->data() + static_cast<size_t>(M * N_K)));
+                const float v_cos = cosineSimilarity(
+                    std::vector<float>(cpu_v->data(), cpu_v->data() + static_cast<size_t>(M * N_V)),
+                    std::vector<float>(rocm_v->data(), rocm_v->data() + static_cast<size_t>(M * N_V)));
+
+                LOG_INFO("[Integration] Real Qwen2 layer " << layer_idx << " fused QKV parity: Q=" << q_cos
+                                                            << " K=" << k_cos
+                                                            << " V=" << v_cos
+                                                            << " q_bias_type=" << static_cast<int>(cpu_bias_q->native_type())
+                                                            << " k_bias_type=" << static_cast<int>(cpu_bias_k->native_type())
+                                                            << " v_bias_type=" << static_cast<int>(cpu_bias_v->native_type()));
+
+                EXPECT_GT(q_cos, COSINE_THRESHOLD) << "Q projection cosine too low for real model layer";
+                EXPECT_GT(k_cos, COSINE_THRESHOLD) << "K projection cosine too low for real model layer";
+                EXPECT_GT(v_cos, COSINE_THRESHOLD) << "V projection cosine too low for real model layer";
+            }
+
+            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedQKVStage_RealQwen2Layer3SnapshotInputParity)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                std::ifstream model_file(TEST_MODEL_PATH);
+                if (!model_file.good())
+                {
+                    GTEST_SKIP() << "Test model not found: " << TEST_MODEL_PATH;
+                }
+
+                auto stage_ctx = ModelContext::createForPPStage(TEST_MODEL_PATH, 0, 4, true, false);
+                ASSERT_NE(stage_ctx, nullptr);
+
+                FactoryPPStageConfig config;
+                config.first_layer = 0;
+                config.last_layer = 4;
+                config.has_embedding = true;
+                config.has_lm_head = false;
+                ASSERT_TRUE(config.isValid());
+
+                auto cpu_runner = createPPStageRunner(stage_ctx, DeviceId::cpu(), config);
+                ASSERT_NE(cpu_runner, nullptr);
+                cpu_runner->enableSnapshotCapture();
+
+                constexpr int layer_idx = 3;
+                constexpr int M = 64;
+                constexpr int K = 896;
+                constexpr float COSINE_THRESHOLD = 0.995f;
+
+                std::vector<int> tokens(M);
+                for (int i = 0; i < M; ++i)
+                {
+                    tokens[i] = i % 1024;
+                }
+                ASSERT_TRUE(cpu_runner->forward(tokens.data(), M));
+
+                size_t input_size = 0;
+                const float *input_snapshot = cpu_runner->getSnapshot("layer3_ATTENTION_NORM", input_size);
+                ASSERT_NE(input_snapshot, nullptr);
+                ASSERT_EQ(input_size, static_cast<size_t>(M * K));
+
+                auto model_ctx = loadModel();
+                ASSERT_NE(model_ctx, nullptr);
+
+                const std::string prefix = "blk." + std::to_string(layer_idx) + ".";
+
+                auto cpu_wq = model_ctx->getWeightForDevice(prefix + "attn_q.weight", DeviceId::cpu());
+                auto cpu_wk = model_ctx->getWeightForDevice(prefix + "attn_k.weight", DeviceId::cpu());
+                auto cpu_wv = model_ctx->getWeightForDevice(prefix + "attn_v.weight", DeviceId::cpu());
+                auto cpu_bias_q = model_ctx->getWeightForDevice(prefix + "attn_q.bias", DeviceId::cpu());
+                auto cpu_bias_k = model_ctx->getWeightForDevice(prefix + "attn_k.bias", DeviceId::cpu());
+                auto cpu_bias_v = model_ctx->getWeightForDevice(prefix + "attn_v.bias", DeviceId::cpu());
+
+                auto rocm_wq = model_ctx->getWeightForDevice(prefix + "attn_q.weight", DeviceId::rocm(0));
+                auto rocm_wk = model_ctx->getWeightForDevice(prefix + "attn_k.weight", DeviceId::rocm(0));
+                auto rocm_wv = model_ctx->getWeightForDevice(prefix + "attn_v.weight", DeviceId::rocm(0));
+                auto rocm_bias_q = model_ctx->getWeightForDevice(prefix + "attn_q.bias", DeviceId::rocm(0));
+                auto rocm_bias_k = model_ctx->getWeightForDevice(prefix + "attn_k.bias", DeviceId::rocm(0));
+                auto rocm_bias_v = model_ctx->getWeightForDevice(prefix + "attn_v.bias", DeviceId::rocm(0));
+
+                ASSERT_TRUE(cpu_wq && cpu_wk && cpu_wv);
+                ASSERT_TRUE(cpu_bias_q && cpu_bias_k && cpu_bias_v);
+                ASSERT_TRUE(rocm_wq && rocm_wk && rocm_wv);
+                ASSERT_TRUE(rocm_bias_q && rocm_bias_k && rocm_bias_v);
+
+                const int N_Q = static_cast<int>(cpu_wq->shape()[0]);
+                const int N_K = static_cast<int>(cpu_wk->shape()[0]);
+                const int N_V = static_cast<int>(cpu_wv->shape()[0]);
+
+                auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)}, DeviceId::cpu());
+                std::copy(input_snapshot, input_snapshot + input_size, input->mutable_data());
+
+                auto cpu_q = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_Q)}, DeviceId::cpu());
+                auto cpu_k = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_K)}, DeviceId::cpu());
+                auto cpu_v = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_V)}, DeviceId::cpu());
+
+                auto rocm_q = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_Q)}, DeviceId::rocm(0));
+                auto rocm_k = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_K)}, DeviceId::rocm(0));
+                auto rocm_v = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_V)}, DeviceId::rocm(0));
+
+                FusedQKVGEMMStage::Params cpu_params{
+                    .device_id = DeviceId::cpu(),
+                    .input = input.get(),
+                    .m = M,
+                    .k = K,
+                    .wq = cpu_wq.get(),
+                    .output_q = cpu_q.get(),
+                    .n_q = N_Q,
+                    .bias_q = cpu_bias_q.get(),
+                    .wk = cpu_wk.get(),
+                    .output_k = cpu_k.get(),
+                    .n_k = N_K,
+                    .bias_k = cpu_bias_k.get(),
+                    .wv = cpu_wv.get(),
+                    .output_v = cpu_v.get(),
+                    .n_v = N_V,
+                    .bias_v = cpu_bias_v.get()};
+
+                FusedQKVGEMMStage::Params rocm_params{
+                    .device_id = DeviceId::rocm(0),
+                    .input = input.get(),
+                    .m = M,
+                    .k = K,
+                    .wq = rocm_wq.get(),
+                    .output_q = rocm_q.get(),
+                    .n_q = N_Q,
+                    .bias_q = rocm_bias_q.get(),
+                    .wk = rocm_wk.get(),
+                    .output_k = rocm_k.get(),
+                    .n_k = N_K,
+                    .bias_k = rocm_bias_k.get(),
+                    .wv = rocm_wv.get(),
+                    .output_v = rocm_v.get(),
+                    .n_v = N_V,
+                    .bias_v = rocm_bias_v.get()};
+
+                FusedQKVGEMMStage cpu_stage(cpu_params);
+                FusedQKVGEMMStage rocm_stage(rocm_params);
+                CPUDeviceContext cpu_ctx(DeviceId::cpu(), 4);
+                ROCmDeviceContext rocm_ctx(DeviceId::rocm(0), 0);
+
+                ASSERT_TRUE(cpu_stage.execute(&cpu_ctx)) << "CPU fused QKV execution failed for layer-3 snapshot input";
+
+                auto reqs = rocm_stage.getWorkspaceRequirements(M, N_Q, K);
+                DeviceWorkspaceManager workspace(DeviceId::rocm(0), 128 * 1024 * 1024);
+                ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate ROCm fused QKV workspace";
+                rocm_stage.bindWorkspace(&workspace);
+
+                const std::initializer_list<TensorBase *> rocm_inputs = {
+                    input.get(),
+                    rocm_wq.get(),
+                    rocm_wk.get(),
+                    rocm_wv.get(),
+                    rocm_bias_q.get(),
+                    rocm_bias_k.get(),
+                    rocm_bias_v.get()};
+                const std::initializer_list<TensorBase *> rocm_outputs = {
+                    rocm_q.get(),
+                    rocm_k.get(),
+                    rocm_v.get()};
+
+                const bool rocm_ok = with_gpu_coherence(
+                    DeviceId::rocm(0),
+                    rocm_inputs,
+                    rocm_outputs,
+                    [&]() {
+                        return rocm_stage.execute(&rocm_ctx);
+                    });
+
+                rocm_stage.unbindWorkspace();
+
+                ASSERT_TRUE(rocm_ok) << "ROCm fused QKV execution failed for layer-3 snapshot input";
+
+                const float q_cos = cosineSimilarity(
+                    std::vector<float>(cpu_q->data(), cpu_q->data() + static_cast<size_t>(M * N_Q)),
+                    std::vector<float>(rocm_q->data(), rocm_q->data() + static_cast<size_t>(M * N_Q)));
+                const float k_cos = cosineSimilarity(
+                    std::vector<float>(cpu_k->data(), cpu_k->data() + static_cast<size_t>(M * N_K)),
+                    std::vector<float>(rocm_k->data(), rocm_k->data() + static_cast<size_t>(M * N_K)));
+                const float v_cos = cosineSimilarity(
+                    std::vector<float>(cpu_v->data(), cpu_v->data() + static_cast<size_t>(M * N_V)),
+                    std::vector<float>(rocm_v->data(), rocm_v->data() + static_cast<size_t>(M * N_V)));
+
+                LOG_INFO("[Integration] Real Qwen2 layer 3 fused QKV parity on snapshot ATTENTION_NORM input: Q=" << q_cos
+                                                                                                                    << " K=" << k_cos
+                                                                                                                    << " V=" << v_cos);
+
+                EXPECT_GT(q_cos, COSINE_THRESHOLD) << "Q projection cosine too low for layer-3 snapshot input";
+                EXPECT_GT(k_cos, COSINE_THRESHOLD) << "K projection cosine too low for layer-3 snapshot input";
+                EXPECT_GT(v_cos, COSINE_THRESHOLD) << "V projection cosine too low for layer-3 snapshot input";
+            }
+
+            TEST_F(ROCmQuantisedGemmIntegrationTest, QKNormStage_RealQwen2Layer3SnapshotInputParity)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                std::ifstream model_file(TEST_MODEL_PATH);
+                if (!model_file.good())
+                {
+                    GTEST_SKIP() << "Test model not found: " << TEST_MODEL_PATH;
+                }
+
+                auto stage_ctx = ModelContext::createForPPStage(TEST_MODEL_PATH, 0, 4, true, false);
+                ASSERT_NE(stage_ctx, nullptr);
+
+                FactoryPPStageConfig config;
+                config.first_layer = 0;
+                config.last_layer = 4;
+                config.has_embedding = true;
+                config.has_lm_head = false;
+                ASSERT_TRUE(config.isValid());
+
+                auto cpu_runner = createPPStageRunner(stage_ctx, DeviceId::cpu(), config);
+                ASSERT_NE(cpu_runner, nullptr);
+                cpu_runner->enableSnapshotCapture();
+
+                constexpr int layer_idx = 3;
+                constexpr int M = 64;
+                constexpr int K = 896;
+                constexpr int N_Q_HEADS = 14;
+                constexpr int N_KV_HEADS = 2;
+                constexpr int HEAD_DIM = 64;
+                constexpr float COSINE_THRESHOLD = 0.995f;
+
+                std::vector<int> tokens(M);
+                for (int i = 0; i < M; ++i)
+                {
+                    tokens[i] = i % 1024;
+                }
+                ASSERT_TRUE(cpu_runner->forward(tokens.data(), M));
+
+                size_t input_size = 0;
+                const float *input_snapshot = cpu_runner->getSnapshot("layer3_ATTENTION_NORM", input_size);
+                ASSERT_NE(input_snapshot, nullptr);
+                ASSERT_EQ(input_size, static_cast<size_t>(M * K));
+
+                auto model_ctx = loadModel();
+                ASSERT_NE(model_ctx, nullptr);
+
+                const std::string prefix = "blk." + std::to_string(layer_idx) + ".";
+
+                auto cpu_wq = model_ctx->getWeightForDevice(prefix + "attn_q.weight", DeviceId::cpu());
+                auto cpu_wk = model_ctx->getWeightForDevice(prefix + "attn_k.weight", DeviceId::cpu());
+                auto cpu_wv = model_ctx->getWeightForDevice(prefix + "attn_v.weight", DeviceId::cpu());
+                auto cpu_bias_q = model_ctx->getWeightForDevice(prefix + "attn_q.bias", DeviceId::cpu());
+                auto cpu_bias_k = model_ctx->getWeightForDevice(prefix + "attn_k.bias", DeviceId::cpu());
+                auto cpu_bias_v = model_ctx->getWeightForDevice(prefix + "attn_v.bias", DeviceId::cpu());
+                auto cpu_q_norm = model_ctx->getWeightForDevice(prefix + "attn_q_norm.weight", DeviceId::cpu());
+                auto cpu_k_norm = model_ctx->getWeightForDevice(prefix + "attn_k_norm.weight", DeviceId::cpu());
+
+                auto rocm_wq = model_ctx->getWeightForDevice(prefix + "attn_q.weight", DeviceId::rocm(0));
+                auto rocm_wk = model_ctx->getWeightForDevice(prefix + "attn_k.weight", DeviceId::rocm(0));
+                auto rocm_wv = model_ctx->getWeightForDevice(prefix + "attn_v.weight", DeviceId::rocm(0));
+                auto rocm_bias_q = model_ctx->getWeightForDevice(prefix + "attn_q.bias", DeviceId::rocm(0));
+                auto rocm_bias_k = model_ctx->getWeightForDevice(prefix + "attn_k.bias", DeviceId::rocm(0));
+                auto rocm_bias_v = model_ctx->getWeightForDevice(prefix + "attn_v.bias", DeviceId::rocm(0));
+                auto rocm_q_norm = model_ctx->getWeightForDevice(prefix + "attn_q_norm.weight", DeviceId::rocm(0));
+                auto rocm_k_norm = model_ctx->getWeightForDevice(prefix + "attn_k_norm.weight", DeviceId::rocm(0));
+
+                if (!(cpu_q_norm && cpu_k_norm && rocm_q_norm && rocm_k_norm))
+                {
+                    GTEST_SKIP() << "Model does not provide attn_q_norm/attn_k_norm weights for layer 3";
+                }
+
+                ASSERT_TRUE(cpu_wq && cpu_wk && cpu_wv && cpu_bias_q && cpu_bias_k && cpu_bias_v);
+                ASSERT_TRUE(rocm_wq && rocm_wk && rocm_wv && rocm_bias_q && rocm_bias_k && rocm_bias_v);
+
+                auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)}, DeviceId::cpu());
+                std::copy(input_snapshot, input_snapshot + input_size, input->mutable_data());
+
+                auto cpu_q = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_Q_HEADS * HEAD_DIM)}, DeviceId::cpu());
+                auto cpu_k = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_KV_HEADS * HEAD_DIM)}, DeviceId::cpu());
+                auto cpu_v = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_KV_HEADS * HEAD_DIM)}, DeviceId::cpu());
+                auto rocm_q = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_Q_HEADS * HEAD_DIM)}, DeviceId::rocm(0));
+                auto rocm_k = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_KV_HEADS * HEAD_DIM)}, DeviceId::rocm(0));
+                auto rocm_v = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_KV_HEADS * HEAD_DIM)}, DeviceId::rocm(0));
+
+                FusedQKVGEMMStage::Params cpu_qk_proj{
+                    .device_id = DeviceId::cpu(),
+                    .input = input.get(),
+                    .m = M,
+                    .k = K,
+                    .wq = cpu_wq.get(),
+                    .output_q = cpu_q.get(),
+                    .n_q = N_Q_HEADS * HEAD_DIM,
+                    .bias_q = cpu_bias_q.get(),
+                    .wk = cpu_wk.get(),
+                    .output_k = cpu_k.get(),
+                    .n_k = N_KV_HEADS * HEAD_DIM,
+                    .bias_k = cpu_bias_k.get(),
+                    .wv = cpu_wv.get(),
+                    .output_v = cpu_v.get(),
+                    .n_v = N_KV_HEADS * HEAD_DIM,
+                    .bias_v = cpu_bias_v.get()};
+
+                FusedQKVGEMMStage::Params rocm_qk_proj{
+                    .device_id = DeviceId::rocm(0),
+                    .input = input.get(),
+                    .m = M,
+                    .k = K,
+                    .wq = rocm_wq.get(),
+                    .output_q = rocm_q.get(),
+                    .n_q = N_Q_HEADS * HEAD_DIM,
+                    .bias_q = rocm_bias_q.get(),
+                    .wk = rocm_wk.get(),
+                    .output_k = rocm_k.get(),
+                    .n_k = N_KV_HEADS * HEAD_DIM,
+                    .bias_k = rocm_bias_k.get(),
+                    .wv = rocm_wv.get(),
+                    .output_v = rocm_v.get(),
+                    .n_v = N_KV_HEADS * HEAD_DIM,
+                    .bias_v = rocm_bias_v.get()};
+
+                FusedQKVGEMMStage cpu_proj_stage(cpu_qk_proj);
+                FusedQKVGEMMStage rocm_proj_stage(rocm_qk_proj);
+                CPUDeviceContext cpu_ctx(DeviceId::cpu(), 4);
+                ROCmDeviceContext rocm_ctx(DeviceId::rocm(0), 0);
+
+                ASSERT_TRUE(cpu_proj_stage.execute(&cpu_ctx)) << "CPU Q/K projection failed for layer-3 snapshot input";
+
+                auto proj_reqs = rocm_proj_stage.getWorkspaceRequirements(M, N_Q_HEADS * HEAD_DIM, K);
+                DeviceWorkspaceManager proj_workspace(DeviceId::rocm(0), 128 * 1024 * 1024);
+                ASSERT_TRUE(proj_workspace.allocate(proj_reqs));
+                rocm_proj_stage.bindWorkspace(&proj_workspace);
+
+                const std::initializer_list<TensorBase *> proj_inputs = {
+                    input.get(), rocm_wq.get(), rocm_wk.get(), rocm_wv.get(), rocm_bias_q.get(), rocm_bias_k.get(), rocm_bias_v.get()};
+                const std::initializer_list<TensorBase *> proj_outputs = {rocm_q.get(), rocm_k.get(), rocm_v.get()};
+                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), proj_inputs, proj_outputs, [&]() {
+                    return rocm_proj_stage.execute(&rocm_ctx);
+                })) << "ROCm Q/K projection failed for layer-3 snapshot input";
+                rocm_proj_stage.unbindWorkspace();
+
+                QKNormStage::Params cpu_q_norm_params{
+                    .device_id = DeviceId::cpu(),
+                    .input = cpu_q.get(),
+                    .output = cpu_q.get(),
+                    .gamma = cpu_q_norm.get(),
+                    .n_heads = N_Q_HEADS,
+                    .head_dim = HEAD_DIM,
+                    .eps = 1e-6f,
+                    .seq_len = M};
+                QKNormStage::Params rocm_q_norm_params{
+                    .device_id = DeviceId::rocm(0),
+                    .input = rocm_q.get(),
+                    .output = rocm_q.get(),
+                    .gamma = rocm_q_norm.get(),
+                    .n_heads = N_Q_HEADS,
+                    .head_dim = HEAD_DIM,
+                    .eps = 1e-6f,
+                    .seq_len = M};
+
+                QKNormStage::Params cpu_k_norm_params{
+                    .device_id = DeviceId::cpu(),
+                    .input = cpu_k.get(),
+                    .output = cpu_k.get(),
+                    .gamma = cpu_k_norm.get(),
+                    .n_heads = N_KV_HEADS,
+                    .head_dim = HEAD_DIM,
+                    .eps = 1e-6f,
+                    .seq_len = M};
+                QKNormStage::Params rocm_k_norm_params{
+                    .device_id = DeviceId::rocm(0),
+                    .input = rocm_k.get(),
+                    .output = rocm_k.get(),
+                    .gamma = rocm_k_norm.get(),
+                    .n_heads = N_KV_HEADS,
+                    .head_dim = HEAD_DIM,
+                    .eps = 1e-6f,
+                    .seq_len = M};
+
+                QKNormStage cpu_q_norm_stage(cpu_q_norm_params);
+                QKNormStage rocm_q_norm_stage(rocm_q_norm_params);
+                QKNormStage cpu_k_norm_stage(cpu_k_norm_params);
+                QKNormStage rocm_k_norm_stage(rocm_k_norm_params);
+
+                ASSERT_TRUE(cpu_q_norm_stage.execute(&cpu_ctx)) << "CPU Q norm failed for layer-3 snapshot input";
+                ASSERT_TRUE(cpu_k_norm_stage.execute(&cpu_ctx)) << "CPU K norm failed for layer-3 snapshot input";
+
+                const std::initializer_list<TensorBase *> qnorm_inputs = {rocm_q.get(), rocm_q_norm.get()};
+                const std::initializer_list<TensorBase *> qnorm_outputs = {rocm_q.get()};
+                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), qnorm_inputs, qnorm_outputs, [&]() {
+                    return rocm_q_norm_stage.execute(&rocm_ctx);
+                })) << "ROCm Q norm failed for layer-3 snapshot input";
+
+                const std::initializer_list<TensorBase *> knorm_inputs = {rocm_k.get(), rocm_k_norm.get()};
+                const std::initializer_list<TensorBase *> knorm_outputs = {rocm_k.get()};
+                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), knorm_inputs, knorm_outputs, [&]() {
+                    return rocm_k_norm_stage.execute(&rocm_ctx);
+                })) << "ROCm K norm failed for layer-3 snapshot input";
+
+                const float q_cos = cosineSimilarity(
+                    std::vector<float>(cpu_q->data(), cpu_q->data() + cpu_q->numel()),
+                    std::vector<float>(rocm_q->data(), rocm_q->data() + rocm_q->numel()));
+                const float k_cos = cosineSimilarity(
+                    std::vector<float>(cpu_k->data(), cpu_k->data() + cpu_k->numel()),
+                    std::vector<float>(rocm_k->data(), rocm_k->data() + rocm_k->numel()));
+
+                LOG_INFO("[Integration] Real Qwen2 layer 3 QKNorm parity on snapshot ATTENTION_NORM input: Q=" << q_cos
+                                                                                                                  << " K=" << k_cos);
+
+                EXPECT_GT(q_cos, COSINE_THRESHOLD) << "QKNorm Q cosine too low for layer-3 snapshot input";
+                EXPECT_GT(k_cos, COSINE_THRESHOLD) << "QKNorm K cosine too low for layer-3 snapshot input";
+            }
+
+            TEST_F(ROCmQuantisedGemmIntegrationTest, QKNormStage_RealQwen2Layer21Parity)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                auto model_ctx = loadModel();
+                if (!model_ctx)
+                {
+                    GTEST_SKIP() << "Test model not found: " << TEST_MODEL_PATH;
+                }
+
+                constexpr int layer_idx = 21;
+                constexpr int M = 64;
+                constexpr int K = 896;
+                constexpr int N_Q_HEADS = 14;
+                constexpr int N_KV_HEADS = 2;
+                constexpr int HEAD_DIM = 64;
+                constexpr float COSINE_THRESHOLD = 0.995f;
+
+                const std::string prefix = "blk." + std::to_string(layer_idx) + ".";
+
+                auto cpu_wq = model_ctx->getWeightForDevice(prefix + "attn_q.weight", DeviceId::cpu());
+                auto cpu_wk = model_ctx->getWeightForDevice(prefix + "attn_k.weight", DeviceId::cpu());
+                auto cpu_wv = model_ctx->getWeightForDevice(prefix + "attn_v.weight", DeviceId::cpu());
+                auto cpu_bias_q = model_ctx->getWeightForDevice(prefix + "attn_q.bias", DeviceId::cpu());
+                auto cpu_bias_k = model_ctx->getWeightForDevice(prefix + "attn_k.bias", DeviceId::cpu());
+                auto cpu_bias_v = model_ctx->getWeightForDevice(prefix + "attn_v.bias", DeviceId::cpu());
+                auto cpu_q_norm = model_ctx->getWeightForDevice(prefix + "attn_q_norm.weight", DeviceId::cpu());
+                auto cpu_k_norm = model_ctx->getWeightForDevice(prefix + "attn_k_norm.weight", DeviceId::cpu());
+
+                auto rocm_wq = model_ctx->getWeightForDevice(prefix + "attn_q.weight", DeviceId::rocm(0));
+                auto rocm_wk = model_ctx->getWeightForDevice(prefix + "attn_k.weight", DeviceId::rocm(0));
+                auto rocm_wv = model_ctx->getWeightForDevice(prefix + "attn_v.weight", DeviceId::rocm(0));
+                auto rocm_bias_q = model_ctx->getWeightForDevice(prefix + "attn_q.bias", DeviceId::rocm(0));
+                auto rocm_bias_k = model_ctx->getWeightForDevice(prefix + "attn_k.bias", DeviceId::rocm(0));
+                auto rocm_bias_v = model_ctx->getWeightForDevice(prefix + "attn_v.bias", DeviceId::rocm(0));
+                auto rocm_q_norm = model_ctx->getWeightForDevice(prefix + "attn_q_norm.weight", DeviceId::rocm(0));
+                auto rocm_k_norm = model_ctx->getWeightForDevice(prefix + "attn_k_norm.weight", DeviceId::rocm(0));
+
+                if (!(cpu_q_norm && cpu_k_norm && rocm_q_norm && rocm_k_norm))
+                {
+                    GTEST_SKIP() << "Model does not provide attn_q_norm/attn_k_norm weights for layer 21";
+                }
+
+                ASSERT_TRUE(cpu_wq && cpu_wk && cpu_wv && cpu_bias_q && cpu_bias_k && cpu_bias_v);
+                ASSERT_TRUE(rocm_wq && rocm_wk && rocm_wv && rocm_bias_q && rocm_bias_k && rocm_bias_v);
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)}, -0.5f, 0.5f, 654);
+                auto cpu_q = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_Q_HEADS * HEAD_DIM)}, DeviceId::cpu());
+                auto cpu_k = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_KV_HEADS * HEAD_DIM)}, DeviceId::cpu());
+                auto cpu_v = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_KV_HEADS * HEAD_DIM)}, DeviceId::cpu());
+                auto rocm_q = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_Q_HEADS * HEAD_DIM)}, DeviceId::rocm(0));
+                auto rocm_k = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_KV_HEADS * HEAD_DIM)}, DeviceId::rocm(0));
+                auto rocm_v = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_KV_HEADS * HEAD_DIM)}, DeviceId::rocm(0));
+
+                FusedQKVGEMMStage::Params cpu_qk_proj{
+                    .device_id = DeviceId::cpu(),
+                    .input = input.get(),
+                    .m = M,
+                    .k = K,
+                    .wq = cpu_wq.get(),
+                    .output_q = cpu_q.get(),
+                    .n_q = N_Q_HEADS * HEAD_DIM,
+                    .bias_q = cpu_bias_q.get(),
+                    .wk = cpu_wk.get(),
+                    .output_k = cpu_k.get(),
+                    .n_k = N_KV_HEADS * HEAD_DIM,
+                    .bias_k = cpu_bias_k.get(),
+                    .wv = cpu_wv.get(),
+                    .output_v = cpu_v.get(),
+                    .n_v = N_KV_HEADS * HEAD_DIM,
+                    .bias_v = cpu_bias_v.get()};
+
+                FusedQKVGEMMStage::Params rocm_qk_proj{
+                    .device_id = DeviceId::rocm(0),
+                    .input = input.get(),
+                    .m = M,
+                    .k = K,
+                    .wq = rocm_wq.get(),
+                    .output_q = rocm_q.get(),
+                    .n_q = N_Q_HEADS * HEAD_DIM,
+                    .bias_q = rocm_bias_q.get(),
+                    .wk = rocm_wk.get(),
+                    .output_k = rocm_k.get(),
+                    .n_k = N_KV_HEADS * HEAD_DIM,
+                    .bias_k = rocm_bias_k.get(),
+                    .wv = rocm_wv.get(),
+                    .output_v = rocm_v.get(),
+                    .n_v = N_KV_HEADS * HEAD_DIM,
+                    .bias_v = rocm_bias_v.get()};
+
+                FusedQKVGEMMStage cpu_proj_stage(cpu_qk_proj);
+                FusedQKVGEMMStage rocm_proj_stage(rocm_qk_proj);
+                CPUDeviceContext cpu_ctx(DeviceId::cpu(), 4);
+                ROCmDeviceContext rocm_ctx(DeviceId::rocm(0), 0);
+
+                ASSERT_TRUE(cpu_proj_stage.execute(&cpu_ctx)) << "CPU Q/K projection failed";
+
+                auto proj_reqs = rocm_proj_stage.getWorkspaceRequirements(M, N_Q_HEADS * HEAD_DIM, K);
+                DeviceWorkspaceManager proj_workspace(DeviceId::rocm(0), 128 * 1024 * 1024);
+                ASSERT_TRUE(proj_workspace.allocate(proj_reqs));
+                rocm_proj_stage.bindWorkspace(&proj_workspace);
+
+                const std::initializer_list<TensorBase *> proj_inputs = {
+                    input.get(), rocm_wq.get(), rocm_wk.get(), rocm_wv.get(), rocm_bias_q.get(), rocm_bias_k.get(), rocm_bias_v.get()};
+                const std::initializer_list<TensorBase *> proj_outputs = {rocm_q.get(), rocm_k.get(), rocm_v.get()};
+                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), proj_inputs, proj_outputs, [&]() {
+                    return rocm_proj_stage.execute(&rocm_ctx);
+                })) << "ROCm Q/K projection failed";
+                rocm_proj_stage.unbindWorkspace();
+
+                QKNormStage::Params cpu_q_norm_params{
+                    .device_id = DeviceId::cpu(),
+                    .input = cpu_q.get(),
+                    .output = cpu_q.get(),
+                    .gamma = cpu_q_norm.get(),
+                    .n_heads = N_Q_HEADS,
+                    .head_dim = HEAD_DIM,
+                    .eps = 1e-6f,
+                    .seq_len = M};
+                QKNormStage::Params rocm_q_norm_params{
+                    .device_id = DeviceId::rocm(0),
+                    .input = rocm_q.get(),
+                    .output = rocm_q.get(),
+                    .gamma = rocm_q_norm.get(),
+                    .n_heads = N_Q_HEADS,
+                    .head_dim = HEAD_DIM,
+                    .eps = 1e-6f,
+                    .seq_len = M};
+
+                QKNormStage::Params cpu_k_norm_params{
+                    .device_id = DeviceId::cpu(),
+                    .input = cpu_k.get(),
+                    .output = cpu_k.get(),
+                    .gamma = cpu_k_norm.get(),
+                    .n_heads = N_KV_HEADS,
+                    .head_dim = HEAD_DIM,
+                    .eps = 1e-6f,
+                    .seq_len = M};
+                QKNormStage::Params rocm_k_norm_params{
+                    .device_id = DeviceId::rocm(0),
+                    .input = rocm_k.get(),
+                    .output = rocm_k.get(),
+                    .gamma = rocm_k_norm.get(),
+                    .n_heads = N_KV_HEADS,
+                    .head_dim = HEAD_DIM,
+                    .eps = 1e-6f,
+                    .seq_len = M};
+
+                QKNormStage cpu_q_norm_stage(cpu_q_norm_params);
+                QKNormStage rocm_q_norm_stage(rocm_q_norm_params);
+                QKNormStage cpu_k_norm_stage(cpu_k_norm_params);
+                QKNormStage rocm_k_norm_stage(rocm_k_norm_params);
+
+                ASSERT_TRUE(cpu_q_norm_stage.execute(&cpu_ctx)) << "CPU Q norm failed";
+                ASSERT_TRUE(cpu_k_norm_stage.execute(&cpu_ctx)) << "CPU K norm failed";
+
+                const std::initializer_list<TensorBase *> qnorm_inputs = {rocm_q.get(), rocm_q_norm.get()};
+                const std::initializer_list<TensorBase *> qnorm_outputs = {rocm_q.get()};
+                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), qnorm_inputs, qnorm_outputs, [&]() {
+                    return rocm_q_norm_stage.execute(&rocm_ctx);
+                })) << "ROCm Q norm failed";
+
+                const std::initializer_list<TensorBase *> knorm_inputs = {rocm_k.get(), rocm_k_norm.get()};
+                const std::initializer_list<TensorBase *> knorm_outputs = {rocm_k.get()};
+                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), knorm_inputs, knorm_outputs, [&]() {
+                    return rocm_k_norm_stage.execute(&rocm_ctx);
+                })) << "ROCm K norm failed";
+
+                const float q_cos = cosineSimilarity(
+                    std::vector<float>(cpu_q->data(), cpu_q->data() + cpu_q->numel()),
+                    std::vector<float>(rocm_q->data(), rocm_q->data() + rocm_q->numel()));
+                const float k_cos = cosineSimilarity(
+                    std::vector<float>(cpu_k->data(), cpu_k->data() + cpu_k->numel()),
+                    std::vector<float>(rocm_k->data(), rocm_k->data() + rocm_k->numel()));
+
+                LOG_INFO("[Integration] Real Qwen2 layer 21 QKNorm parity: Q=" << q_cos << " K=" << k_cos);
+
+                EXPECT_GT(q_cos, COSINE_THRESHOLD) << "QKNorm Q cosine too low";
+                EXPECT_GT(k_cos, COSINE_THRESHOLD) << "QKNorm K cosine too low";
+            }
+
+            TEST_F(ROCmQuantisedGemmIntegrationTest, DownProjStage_RealQwen2Layer0SnapshotInputParity)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                std::ifstream model_file(TEST_MODEL_PATH);
+                if (!model_file.good())
+                {
+                    GTEST_SKIP() << "Test model not found: " << TEST_MODEL_PATH;
+                }
+
+                auto stage_ctx = ModelContext::createForPPStage(TEST_MODEL_PATH, 0, 1, true, false);
+                ASSERT_NE(stage_ctx, nullptr);
+
+                FactoryPPStageConfig config;
+                config.first_layer = 0;
+                config.last_layer = 1;
+                config.has_embedding = true;
+                config.has_lm_head = false;
+                ASSERT_TRUE(config.isValid());
+
+                auto cpu_runner = createPPStageRunner(stage_ctx, DeviceId::cpu(), config);
+                ASSERT_NE(cpu_runner, nullptr);
+                cpu_runner->enableSnapshotCapture();
+
+                constexpr int layer_idx = 0;
+                constexpr int M = 64;
+                constexpr int K = 4864;
+                constexpr int N = 896;
+                constexpr float COSINE_THRESHOLD = 0.999f;
+
+                std::vector<int> tokens(M);
+                for (int i = 0; i < M; ++i)
+                {
+                    tokens[i] = i % 1024;
+                }
+                ASSERT_TRUE(cpu_runner->forward(tokens.data(), M));
+
+                size_t input_size = 0;
+                const float *input_snapshot = cpu_runner->getSnapshot("layer0_FFN_SWIGLU", input_size);
+                ASSERT_NE(input_snapshot, nullptr);
+                ASSERT_EQ(input_size, static_cast<size_t>(M * K));
+
+                auto model_ctx = loadModel();
+                ASSERT_NE(model_ctx, nullptr);
+
+                auto cpu_weight = model_ctx->getWeightForDevice("blk.0.ffn_down.weight", DeviceId::cpu());
+                auto rocm_weight = model_ctx->getWeightForDevice("blk.0.ffn_down.weight", DeviceId::rocm(0));
+                ASSERT_TRUE(cpu_weight);
+                ASSERT_TRUE(rocm_weight);
+
+                auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)}, DeviceId::cpu());
+                std::copy(input_snapshot, input_snapshot + input_size, input->mutable_data());
+
+                auto cpu_output = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)}, DeviceId::cpu());
+                auto rocm_output = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)}, DeviceId::rocm(0));
+
+                GEMMStage::Params cpu_params{
+                    .device_id = DeviceId::cpu(),
+                    .A = input.get(),
+                    .B = cpu_weight.get(),
+                    .C = cpu_output.get(),
+                    .m = M,
+                    .n = N,
+                    .k = K,
+                    .alpha = 1.0f,
+                    .beta = 0.0f,
+                    .transpose_B = false,
+                    .gemm_context = GemmContext::FFN};
+
+                GEMMStage::Params rocm_params{
+                    .device_id = DeviceId::rocm(0),
+                    .A = input.get(),
+                    .B = rocm_weight.get(),
+                    .C = rocm_output.get(),
+                    .m = M,
+                    .n = N,
+                    .k = K,
+                    .alpha = 1.0f,
+                    .beta = 0.0f,
+                    .transpose_B = false,
+                    .gemm_context = GemmContext::FFN};
+
+                GEMMStage cpu_stage(cpu_params);
+                GEMMStage rocm_stage(rocm_params);
+                CPUDeviceContext cpu_ctx(DeviceId::cpu(), 4);
+                ROCmDeviceContext rocm_ctx(DeviceId::rocm(0), 0);
+
+                ASSERT_TRUE(cpu_stage.execute(&cpu_ctx)) << "CPU down_proj execution failed for layer-0 snapshot input";
+
+                auto reqs = rocm_stage.getWorkspaceRequirements(M, N, K);
+                DeviceWorkspaceManager workspace(DeviceId::rocm(0), 128 * 1024 * 1024);
+                ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate ROCm down_proj workspace";
+                rocm_stage.bindWorkspace(&workspace);
+
+                const std::initializer_list<TensorBase *> rocm_inputs = {
+                    input.get(),
+                    rocm_weight.get()};
+                const std::initializer_list<TensorBase *> rocm_outputs = {
+                    rocm_output.get()};
+
+                const bool rocm_ok = with_gpu_coherence(
+                    DeviceId::rocm(0),
+                    rocm_inputs,
+                    rocm_outputs,
+                    [&]() {
+                        return rocm_stage.execute(&rocm_ctx);
+                    });
+
+                rocm_stage.unbindWorkspace();
+
+                ASSERT_TRUE(rocm_ok) << "ROCm down_proj execution failed for layer-0 snapshot input";
+
+                const float cosine = cosineSimilarity(
+                    std::vector<float>(cpu_output->data(), cpu_output->data() + static_cast<size_t>(M * N)),
+                    std::vector<float>(rocm_output->data(), rocm_output->data() + static_cast<size_t>(M * N)));
+
+                LOG_INFO("[Integration] Real Qwen2 layer 0 down_proj parity on snapshot FFN_SWIGLU input: cosine=" << cosine);
+
+                EXPECT_GT(cosine, COSINE_THRESHOLD)
+                    << "down_proj cosine too low for layer-0 FFN_SWIGLU snapshot input";
+            }
+
+            TEST_F(ROCmQuantisedGemmIntegrationTest, DownProjStage_RealQwen2Layer0SnapshotInputParity_ForceCK)
+            {
+                // CK (Composable Kernel) path requires INT8-VNNI format weights for row-major
+                // repack. Q4_0 models are packed as native-VNNI only, so CK has no weights to
+                // consume. Skip until a Q8_0 test model is used or CK gains native-VNNI support.
+                GTEST_SKIP() << "CK path requires INT8-VNNI weights; Q4_0 test model is native-VNNI only";
+
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                std::ifstream model_file(TEST_MODEL_PATH);
+                if (!model_file.good())
+                {
+                    GTEST_SKIP() << "Test model not found: " << TEST_MODEL_PATH;
+                }
+
+                auto stage_ctx = ModelContext::createForPPStage(TEST_MODEL_PATH, 0, 1, true, false);
+                ASSERT_NE(stage_ctx, nullptr);
+
+                FactoryPPStageConfig config;
+                config.first_layer = 0;
+                config.last_layer = 1;
+                config.has_embedding = true;
+                config.has_lm_head = false;
+                ASSERT_TRUE(config.isValid());
+
+                auto cpu_runner = createPPStageRunner(stage_ctx, DeviceId::cpu(), config);
+                ASSERT_NE(cpu_runner, nullptr);
+                cpu_runner->enableSnapshotCapture();
+
+                constexpr int layer_idx = 0;
+                (void)layer_idx;
+                constexpr int M = 64;
+                constexpr int K = 4864;
+                constexpr int N = 896;
+                constexpr float COSINE_THRESHOLD = 0.999f;
+
+                std::vector<int> tokens(M);
+                for (int i = 0; i < M; ++i)
+                {
+                    tokens[i] = i % 1024;
+                }
+                ASSERT_TRUE(cpu_runner->forward(tokens.data(), M));
+
+                size_t input_size = 0;
+                const float *input_snapshot = cpu_runner->getSnapshot("layer0_FFN_SWIGLU", input_size);
+                ASSERT_NE(input_snapshot, nullptr);
+                ASSERT_EQ(input_size, static_cast<size_t>(M * K));
+
+                auto model_ctx = loadModel();
+                ASSERT_NE(model_ctx, nullptr);
+
+                auto cpu_weight = model_ctx->getWeightForDevice("blk.0.ffn_down.weight", DeviceId::cpu());
+                auto rocm_weight = model_ctx->getWeightForDevice("blk.0.ffn_down.weight", DeviceId::rocm(0));
+                ASSERT_TRUE(cpu_weight);
+                ASSERT_TRUE(rocm_weight);
+
+                auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)}, DeviceId::cpu());
+                std::copy(input_snapshot, input_snapshot + input_size, input->mutable_data());
+
+                auto cpu_output = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)}, DeviceId::cpu());
+                auto rocm_output = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)}, DeviceId::rocm(0));
+
+                GEMMStage::Params cpu_params{
+                    .device_id = DeviceId::cpu(),
+                    .A = input.get(),
+                    .B = cpu_weight.get(),
+                    .C = cpu_output.get(),
+                    .m = M,
+                    .n = N,
+                    .k = K,
+                    .alpha = 1.0f,
+                    .beta = 0.0f,
+                    .transpose_B = false,
+                    .gemm_context = GemmContext::FFN};
+
+                GEMMStage::Params rocm_params{
+                    .device_id = DeviceId::rocm(0),
+                    .A = input.get(),
+                    .B = rocm_weight.get(),
+                    .C = rocm_output.get(),
+                    .m = M,
+                    .n = N,
+                    .k = K,
+                    .alpha = 1.0f,
+                    .beta = 0.0f,
+                    .transpose_B = false,
+                    .gemm_context = GemmContext::FFN};
+
+                GEMMStage cpu_stage(cpu_params);
+                GEMMStage rocm_stage(rocm_params);
+                CPUDeviceContext cpu_ctx(DeviceId::cpu(), 4);
+                ROCmDeviceContext rocm_ctx(DeviceId::rocm(0), 0);
+
+                ASSERT_TRUE(cpu_stage.execute(&cpu_ctx)) << "CPU down_proj execution failed for layer-0 snapshot input";
+
+                auto reqs = rocm_stage.getWorkspaceRequirements(M, N, K);
+                DeviceWorkspaceManager workspace(DeviceId::rocm(0), 128 * 1024 * 1024);
+                ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate ROCm down_proj workspace";
+                rocm_stage.bindWorkspace(&workspace);
+
+                const std::initializer_list<TensorBase *> rocm_inputs = {
+                    input.get(),
+                    rocm_weight.get()};
+                const std::initializer_list<TensorBase *> rocm_outputs = {
+                    rocm_output.get()};
+
+                const bool rocm_ok = [&]() {
+                    ScopedEnvOverride force_ck("LLAMINAR_ROCM_FORCE_CK", "1");
+                    return with_gpu_coherence(
+                        DeviceId::rocm(0),
+                        rocm_inputs,
+                        rocm_outputs,
+                        [&]() {
+                            return rocm_stage.execute(&rocm_ctx);
+                        });
+                }();
+
+                rocm_stage.unbindWorkspace();
+
+                ASSERT_TRUE(rocm_ok) << "ROCm down_proj execution failed for layer-0 snapshot input with CK forced";
+
+                const float cosine = cosineSimilarity(
+                    std::vector<float>(cpu_output->data(), cpu_output->data() + static_cast<size_t>(M * N)),
+                    std::vector<float>(rocm_output->data(), rocm_output->data() + static_cast<size_t>(M * N)));
+
+                LOG_INFO("[Integration] Real Qwen2 layer 0 down_proj parity on snapshot FFN_SWIGLU input with CK forced: cosine=" << cosine);
+
+                EXPECT_GT(cosine, COSINE_THRESHOLD)
+                    << "down_proj cosine too low for layer-0 FFN_SWIGLU snapshot input with CK forced";
+            }
+
+            TEST_F(ROCmQuantisedGemmIntegrationTest, DownProjStage_RealQwen2Layer0QuantizedActivationReference)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                std::ifstream model_file(TEST_MODEL_PATH);
+                if (!model_file.good())
+                {
+                    GTEST_SKIP() << "Test model not found: " << TEST_MODEL_PATH;
+                }
+
+                auto stage_ctx = ModelContext::createForPPStage(TEST_MODEL_PATH, 0, 1, true, false);
+                ASSERT_NE(stage_ctx, nullptr);
+
+                FactoryPPStageConfig config;
+                config.first_layer = 0;
+                config.last_layer = 1;
+                config.has_embedding = true;
+                config.has_lm_head = false;
+                ASSERT_TRUE(config.isValid());
+
+                auto cpu_runner = createPPStageRunner(stage_ctx, DeviceId::cpu(), config);
+                ASSERT_NE(cpu_runner, nullptr);
+                cpu_runner->enableSnapshotCapture();
+
+                constexpr int M = 64;
+                constexpr int K = 4864;
+                constexpr int N = 896;
+                constexpr float ROCM_TO_QUANTIZED_REF_THRESHOLD = 0.99999f;
+
+                std::vector<int> tokens(M);
+                for (int i = 0; i < M; ++i)
+                {
+                    tokens[i] = i % 1024;
+                }
+                ASSERT_TRUE(cpu_runner->forward(tokens.data(), M));
+
+                size_t input_size = 0;
+                const float *input_snapshot = cpu_runner->getSnapshot("layer0_FFN_SWIGLU", input_size);
+                ASSERT_NE(input_snapshot, nullptr);
+                ASSERT_EQ(input_size, static_cast<size_t>(M * K));
+
+                auto model_ctx = loadModel();
+                ASSERT_NE(model_ctx, nullptr);
+
+                auto cpu_weight = model_ctx->getWeightForDevice("blk.0.ffn_down.weight", DeviceId::cpu());
+                auto rocm_weight = model_ctx->getWeightForDevice("blk.0.ffn_down.weight", DeviceId::rocm(0));
+                ASSERT_TRUE(cpu_weight);
+                ASSERT_TRUE(rocm_weight);
+
+                auto *unpackable = dynamic_cast<const IINT8Unpackable *>(cpu_weight.get());
+                ASSERT_NE(unpackable, nullptr) << "CPU down_proj weight must implement IINT8Unpackable";
+
+                std::vector<float> input_host(input_snapshot, input_snapshot + input_size);
+
+                float *d_input = nullptr;
+                int8_t *d_input_q = nullptr;
+                float *d_scales_a = nullptr;
+                int32_t *d_acc = nullptr;
+                int work_buffer_m = 0;
+
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_input, static_cast<size_t>(M) * K, 0));
+                ASSERT_TRUE(rocmQuantGemm_ensureWorkBuffers(
+                    &d_input_q,
+                    &d_scales_a,
+                    &d_acc,
+                    &work_buffer_m,
+                    M,
+                    K,
+                    N,
+                    0));
+                ASSERT_TRUE(rocmQuantGemm_copyHostToDevice(d_input, input_host.data(), static_cast<size_t>(M) * K, 0));
+                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(d_input, d_input_q, d_scales_a, M, K, 0, nullptr));
+
+                std::vector<int8_t> activations_int8(static_cast<size_t>(M) * K);
+                std::vector<float> scales_a(static_cast<size_t>(M));
+                ASSERT_EQ(hipMemcpy(
+                              activations_int8.data(),
+                              d_input_q,
+                              activations_int8.size() * sizeof(int8_t),
+                              hipMemcpyDeviceToHost),
+                          hipSuccess);
+                ASSERT_EQ(hipMemcpy(
+                              scales_a.data(),
+                              d_scales_a,
+                              scales_a.size() * sizeof(float),
+                              hipMemcpyDeviceToHost),
+                          hipSuccess);
+
+                rocmQuantGemm_freeDevice(d_input, 0);
+                rocmQuantGemm_freeDevice(d_input_q, 0);
+                rocmQuantGemm_freeDevice(d_scales_a, 0);
+                rocmQuantGemm_freeDevice(d_acc, 0);
+
+                const NativeWeightReference weight_reference = buildNativeWeightReference(*unpackable, N, K);
+                const std::vector<float> quantized_reference = computeNativeReferenceFromQuantizedActivations(
+                    activations_int8,
+                    scales_a,
+                    weight_reference,
+                    M,
+                    N,
+                    K);
+
+                std::vector<int8_t> activations_int8_blockwise;
+                std::vector<float> scales_a_blockwise;
+                quantizeActivationsPerBlock32(
+                    input_host,
+                    M,
+                    K,
+                    activations_int8_blockwise,
+                    scales_a_blockwise);
+                const std::vector<float> blockwise_quantized_reference = computeNativeReferenceFromBlockwiseQuantizedActivations(
+                    activations_int8_blockwise,
+                    scales_a_blockwise,
+                    weight_reference,
+                    M,
+                    N,
+                    K);
+
+                auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)}, DeviceId::cpu());
+                std::copy(input_snapshot, input_snapshot + input_size, input->mutable_data());
+
+                auto cpu_output = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)}, DeviceId::cpu());
+                auto rocm_output = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)}, DeviceId::rocm(0));
+
+                GEMMStage::Params cpu_params{
+                    .device_id = DeviceId::cpu(),
+                    .A = input.get(),
+                    .B = cpu_weight.get(),
+                    .C = cpu_output.get(),
+                    .m = M,
+                    .n = N,
+                    .k = K,
+                    .alpha = 1.0f,
+                    .beta = 0.0f,
+                    .transpose_B = false,
+                    .gemm_context = GemmContext::FFN};
+
+                GEMMStage::Params rocm_params{
+                    .device_id = DeviceId::rocm(0),
+                    .A = input.get(),
+                    .B = rocm_weight.get(),
+                    .C = rocm_output.get(),
+                    .m = M,
+                    .n = N,
+                    .k = K,
+                    .alpha = 1.0f,
+                    .beta = 0.0f,
+                    .transpose_B = false,
+                    .gemm_context = GemmContext::FFN};
+
+                GEMMStage cpu_stage(cpu_params);
+                GEMMStage rocm_stage(rocm_params);
+                CPUDeviceContext cpu_ctx(DeviceId::cpu(), 4);
+                ROCmDeviceContext rocm_ctx(DeviceId::rocm(0), 0);
+
+                ASSERT_TRUE(cpu_stage.execute(&cpu_ctx)) << "CPU down_proj execution failed for quantized-reference test";
+
+                auto reqs = rocm_stage.getWorkspaceRequirements(M, N, K);
+                DeviceWorkspaceManager workspace(DeviceId::rocm(0), 128 * 1024 * 1024);
+                ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate ROCm down_proj workspace";
+                rocm_stage.bindWorkspace(&workspace);
+
+                const std::initializer_list<TensorBase *> rocm_inputs = {input.get(), rocm_weight.get()};
+                const std::initializer_list<TensorBase *> rocm_outputs = {rocm_output.get()};
+                const bool rocm_ok = with_gpu_coherence(
+                    DeviceId::rocm(0),
+                    rocm_inputs,
+                    rocm_outputs,
+                    [&]() {
+                        return rocm_stage.execute(&rocm_ctx);
+                    });
+                rocm_stage.unbindWorkspace();
+
+                ASSERT_TRUE(rocm_ok) << "ROCm down_proj execution failed for quantized-reference test";
+
+                const std::vector<float> cpu_values(
+                    cpu_output->data(),
+                    cpu_output->data() + static_cast<size_t>(M * N));
+                const std::vector<float> rocm_values(
+                    rocm_output->data(),
+                    rocm_output->data() + static_cast<size_t>(M * N));
+
+                const float rocm_vs_quantized_ref = cosineSimilarity(rocm_values, quantized_reference);
+                const float rocm_vs_blockwise_quantized_ref = cosineSimilarity(rocm_values, blockwise_quantized_reference);
+                const float cpu_vs_quantized_ref = cosineSimilarity(cpu_values, quantized_reference);
+                const float cpu_vs_blockwise_quantized_ref = cosineSimilarity(cpu_values, blockwise_quantized_reference);
+                const float cpu_vs_rocm = cosineSimilarity(cpu_values, rocm_values);
+
+                LOG_INFO("[Integration] Real Qwen2 layer 0 down_proj quantized-reference: rocm_vs_quantized_ref="
+                         << rocm_vs_quantized_ref
+                         << " rocm_vs_blockwise_quantized_ref=" << rocm_vs_blockwise_quantized_ref
+                         << " cpu_vs_quantized_ref=" << cpu_vs_quantized_ref
+                         << " cpu_vs_blockwise_quantized_ref=" << cpu_vs_blockwise_quantized_ref
+                         << " cpu_vs_rocm=" << cpu_vs_rocm);
+
+                // Blockwise activation quantization reduces quantization error vs row-wise,
+                // so ROCm (which uses blockwise) should match the blockwise reference tightly.
+                EXPECT_GT(rocm_vs_blockwise_quantized_ref, ROCM_TO_QUANTIZED_REF_THRESHOLD)
+                    << "ROCm down_proj diverges from blockwise quantized-activation native reference";
+            }
+
+            /**
              * @test Multiple batch sizes (prefill and decode patterns)
              */
             TEST_F(ROCmQuantisedGemmIntegrationTest, PrefillAndDecodeBatchSizes)
@@ -1753,6 +3332,61 @@ namespace llaminar2
             // =============================================================================
             // Full Pipeline Tests - Scaling with Bias
             // =============================================================================
+
+            TEST_F(ROCmQuantisedGemmIntegrationTest, BiasAdd_RowMajorBroadcast)
+            {
+                if (!has_rocm_device_)
+                {
+                    GTEST_SKIP() << "No ROCm device available";
+                }
+
+                const int M = 9;
+                const int N = 64;
+
+                float *d_output = nullptr;
+                float *d_bias = nullptr;
+
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_output, M * N, 0));
+                ASSERT_TRUE(rocmQuantGemm_allocFloat(&d_bias, N, 0));
+
+                std::vector<float> h_output(M * N);
+                std::vector<float> h_bias(N);
+
+                for (int row = 0; row < M; ++row)
+                {
+                    for (int col = 0; col < N; ++col)
+                    {
+                        h_output[static_cast<size_t>(row) * N + col] = static_cast<float>(row * 100 + col);
+                    }
+                }
+
+                for (int col = 0; col < N; ++col)
+                {
+                    h_bias[col] = 0.25f * static_cast<float>((col % 7) - 3);
+                }
+
+                hipMemcpy(d_output, h_output.data(), h_output.size() * sizeof(float), hipMemcpyHostToDevice);
+                hipMemcpy(d_bias, h_bias.data(), h_bias.size() * sizeof(float), hipMemcpyHostToDevice);
+
+                ASSERT_TRUE(rocmQuantGemm_biasAdd(d_output, d_bias, M, N, 0, nullptr));
+
+                std::vector<float> h_result(M * N);
+                hipMemcpy(h_result.data(), d_output, h_result.size() * sizeof(float), hipMemcpyDeviceToHost);
+
+                for (int row = 0; row < M; ++row)
+                {
+                    for (int col = 0; col < N; ++col)
+                    {
+                        const size_t idx = static_cast<size_t>(row) * N + col;
+                        const float expected = h_output[idx] + h_bias[col];
+                        EXPECT_NEAR(h_result[idx], expected, 1e-5f)
+                            << "Bias broadcast mismatch at row=" << row << " col=" << col;
+                    }
+                }
+
+                rocmQuantGemm_freeDevice(d_output, 0);
+                rocmQuantGemm_freeDevice(d_bias, 0);
+            }
 
             /**
              * @test rocmQuantGemm_applyScaling - Full epilogue with alpha, beta, bias
@@ -1953,6 +3587,26 @@ namespace llaminar2
                             C[i * N + j] = static_cast<float>(acc);
                         }
                 }
+
+                ROCmQuantisedGemmKernel createLegacyROCmKernelForTest(
+                    const TensorBase *weights,
+                    int rocm_device_id)
+                {
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+                    ROCmQuantisedGemmKernel kernel(weights, rocm_device_id);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+                    return kernel;
+                }
             } // anonymous namespace
 
             /**
@@ -2043,6 +3697,68 @@ namespace llaminar2
                 float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
                 LOG_INFO("[Dispatch] Q8_0 prefill M=64 N=" << N << " K=" << K << ": cosine=" << cos);
                 EXPECT_GT(cos, 0.985f) << "Q8_0 prefill cosine too low";
+
+                cleanupWorkspace(kernel);
+            }
+
+            /**
+             * @test Prefill bias is applied on the INT8 dispatch path (Q8_0).
+             *
+             * Uses the same packed weights and activations for two runs, with and
+             * without a bias tensor. The delta must equal bias[col] for every row.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_Q8_0_Prefill_M64_BiasBroadcastsPerColumn)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 64, N = 4864, K = 896;
+
+                auto weights = TestTensorFactory::createQ8_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                ROCmPackedWeights packed;
+                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+                EXPECT_FALSE(packed.int8_data.empty());
+                EXPECT_TRUE(packed.native_vnni_payload.empty());
+
+                ROCmQuantisedGemmKernel kernel(&packed, 0);
+                ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto output_no_bias = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto output_with_bias = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto bias = TestTensorFactory::createFP32({static_cast<size_t>(N)});
+
+                float *bias_data = bias->mutable_data();
+                for (int col = 0; col < N; ++col)
+                {
+                    bias_data[col] = 0.125f * static_cast<float>((col % 17) - 8);
+                }
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(output_no_bias->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(output_with_bias->allocateOnDevice(DeviceId::rocm(0)));
+
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_no_bias.get(), M, N, K));
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_with_bias.get(), M, N, K,
+                                                   true, 1.0f, 0.0f, bias.get()));
+                (void)hipDeviceSynchronize();
+                output_no_bias->mark_device_dirty();
+                output_with_bias->mark_device_dirty();
+
+                const float *no_bias = output_no_bias->data();
+                const float *with_bias = output_with_bias->data();
+
+                for (int row = 0; row < M; ++row)
+                {
+                    for (int col = 0; col < N; ++col)
+                    {
+                        const size_t idx = static_cast<size_t>(row) * N + col;
+                        const float expected_delta = bias_data[col];
+                        const float actual_delta = with_bias[idx] - no_bias[idx];
+                        EXPECT_NEAR(actual_delta, expected_delta, 1e-4f)
+                            << "row=" << row << " col=" << col;
+                    }
+                }
 
                 cleanupWorkspace(kernel);
             }
@@ -2177,6 +3893,68 @@ namespace llaminar2
                 float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
                 LOG_INFO("[Dispatch] Q4_0 prefill M=64 N=" << N << " K=" << K << ": cosine=" << cos);
                 EXPECT_GT(cos, 0.990f) << "Q4_0 prefill cosine too low";
+
+                cleanupWorkspace(kernel);
+            }
+
+            /**
+             * @test Prefill bias is applied on the native-VNNI dispatch path (Q4_0).
+             *
+             * This covers the same bias plumbing used by Qwen2 fused QKV prefill
+             * projections, but through the single-projection multiply_tensor API.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_Q4_0_Prefill_M64_BiasBroadcastsPerColumn)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 64, N = 4864, K = 896;
+
+                auto weights = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                ROCmPackedWeights packed;
+                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+                EXPECT_FALSE(packed.native_vnni_payload.empty());
+                EXPECT_TRUE(packed.int8_data.empty());
+
+                ROCmQuantisedGemmKernel kernel(&packed, 0);
+                ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto output_no_bias = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto output_with_bias = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto bias = TestTensorFactory::createFP32({static_cast<size_t>(N)});
+
+                float *bias_data = bias->mutable_data();
+                for (int col = 0; col < N; ++col)
+                {
+                    bias_data[col] = 0.125f * static_cast<float>((col % 19) - 9);
+                }
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(output_no_bias->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(output_with_bias->allocateOnDevice(DeviceId::rocm(0)));
+
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_no_bias.get(), M, N, K));
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_with_bias.get(), M, N, K,
+                                                   true, 1.0f, 0.0f, bias.get()));
+                (void)hipDeviceSynchronize();
+                output_no_bias->mark_device_dirty();
+                output_with_bias->mark_device_dirty();
+
+                const float *no_bias = output_no_bias->data();
+                const float *with_bias = output_with_bias->data();
+
+                for (int row = 0; row < M; ++row)
+                {
+                    for (int col = 0; col < N; ++col)
+                    {
+                        const size_t idx = static_cast<size_t>(row) * N + col;
+                        const float expected_delta = bias_data[col];
+                        const float actual_delta = with_bias[idx] - no_bias[idx];
+                        EXPECT_NEAR(actual_delta, expected_delta, 1e-4f)
+                            << "row=" << row << " col=" << col;
+                    }
+                }
 
                 cleanupWorkspace(kernel);
             }
@@ -2354,6 +4132,233 @@ namespace llaminar2
                 EXPECT_GT(cos, 0.990f) << "Q5_K decode cosine too low";
 
                 cleanupWorkspace(kernel);
+            }
+
+            /**
+             * @test Fused prefill with pre-packed native-VNNI weights matches separate GEMM
+             *
+             * This specifically exercises multiply_fused_tensor() for M>1 with
+             * native-VNNI weights. The packed constructor mirrors the main cached
+             * weight path used by production inference.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedPrefill_NativeVnniPackedPath_MatchesSeparate)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 32, N = 896, K = 896;
+
+                auto weights = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                ROCmPackedWeights packed;
+                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+                ASSERT_FALSE(packed.native_vnni_payload.empty());
+                ASSERT_TRUE(packed.int8_data_vnni.empty());
+
+                ROCmQuantisedGemmKernel kernel(&packed, 0);
+                ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto output_separate = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto output_fused = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(output_separate->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(output_fused->allocateOnDevice(DeviceId::rocm(0)));
+
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_separate.get(), M, N, K));
+                (void)hipDeviceSynchronize();
+                output_separate->mark_device_dirty();
+
+                std::vector<ITensorGemm::TensorProjectionDesc> projections;
+                projections.emplace_back(&kernel, output_fused.get(), N, nullptr, nullptr, false, "q4_0_native_fused");
+
+                ASSERT_TRUE(kernel.multiply_fused_tensor(input.get(), projections, M, K));
+                (void)hipDeviceSynchronize();
+                output_fused->mark_device_dirty();
+
+                const float *separate = output_separate->data();
+                const float *fused = output_fused->data();
+                const float cos = cosineSim(fused, separate, static_cast<size_t>(M) * N);
+
+                LOG_INFO("[Dispatch] Fused packed native-VNNI Q4_0 cosine=" << cos);
+                EXPECT_GT(cos, 0.9999f) << "Packed native-VNNI fused prefill diverged from separate GEMM";
+
+                cleanupWorkspace(kernel);
+            }
+
+            /**
+             * @test Fused native-VNNI prefill applies per-projection biases.
+             *
+             * Mirrors the Qwen2 fused-QKV prefill structure more closely by running
+             * multiple biased projections through multiply_fused_tensor() and
+             * comparing them against separate bias-aware multiply_tensor() calls.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedPrefill_NativeVnniPackedPath_BiasMatchesSeparate)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 32, N = 896, K = 896;
+
+                auto weights = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                ROCmPackedWeights packed;
+                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+                ASSERT_FALSE(packed.native_vnni_payload.empty());
+                ASSERT_TRUE(packed.int8_data_vnni.empty());
+
+                ROCmQuantisedGemmKernel kernel(&packed, 0);
+                ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto separate_q = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto separate_k = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto separate_v = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto fused_q = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto fused_k = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto fused_v = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto bias_q = TestTensorFactory::createFP32({static_cast<size_t>(N)});
+                auto bias_k = TestTensorFactory::createFP32({static_cast<size_t>(N)});
+                auto bias_v = TestTensorFactory::createFP32({static_cast<size_t>(N)});
+
+                for (int col = 0; col < N; ++col)
+                {
+                    bias_q->mutable_data()[col] = 0.0625f * static_cast<float>((col % 13) - 6);
+                    bias_k->mutable_data()[col] = 0.0625f * static_cast<float>((col % 11) - 5);
+                    bias_v->mutable_data()[col] = 0.0625f * static_cast<float>((col % 9) - 4);
+                }
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(separate_q->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(separate_k->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(separate_v->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(fused_q->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(fused_k->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(fused_v->allocateOnDevice(DeviceId::rocm(0)));
+
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), separate_q.get(), M, N, K,
+                                                   true, 1.0f, 0.0f, bias_q.get()));
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), separate_k.get(), M, N, K,
+                                                   true, 1.0f, 0.0f, bias_k.get()));
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), separate_v.get(), M, N, K,
+                                                   true, 1.0f, 0.0f, bias_v.get()));
+                (void)hipDeviceSynchronize();
+                separate_q->mark_device_dirty();
+                separate_k->mark_device_dirty();
+                separate_v->mark_device_dirty();
+
+                std::vector<ITensorGemm::TensorProjectionDesc> projections;
+                projections.emplace_back(&kernel, fused_q.get(), N, bias_q.get(), nullptr, false, "q_bias");
+                projections.emplace_back(&kernel, fused_k.get(), N, bias_k.get(), nullptr, false, "k_bias");
+                projections.emplace_back(&kernel, fused_v.get(), N, bias_v.get(), nullptr, false, "v_bias");
+
+                ASSERT_TRUE(kernel.multiply_fused_tensor(input.get(), projections, M, K));
+                (void)hipDeviceSynchronize();
+                fused_q->mark_device_dirty();
+                fused_k->mark_device_dirty();
+                fused_v->mark_device_dirty();
+
+                const float q_cos = cosineSim(fused_q->data(), separate_q->data(), static_cast<size_t>(M) * N);
+                const float k_cos = cosineSim(fused_k->data(), separate_k->data(), static_cast<size_t>(M) * N);
+                const float v_cos = cosineSim(fused_v->data(), separate_v->data(), static_cast<size_t>(M) * N);
+
+                LOG_INFO("[Dispatch] Fused packed native-VNNI Q4_0 with bias cosine q=" << q_cos
+                                                                                           << " k=" << k_cos
+                                                                                           << " v=" << v_cos);
+                EXPECT_GT(q_cos, 0.9999f) << "Fused Q projection diverged from separate biased GEMM";
+                EXPECT_GT(k_cos, 0.9999f) << "Fused K projection diverged from separate biased GEMM";
+                EXPECT_GT(v_cos, 0.9999f) << "Fused V projection diverged from separate biased GEMM";
+
+                cleanupWorkspace(kernel);
+            }
+
+            /**
+             * @test Fused prefill with legacy TensorBase-backed native-VNNI weights works
+             *        for representative metadata families.
+             *
+             * This covers the legacy upload path fixed here, including:
+             *   - Q4_0: payload + scales
+             *   - Q4_1: payload + scales + mins
+             *   - IQ4_NL: payload + scales + codebook id
+             *   - Q2_K: payload + scales + emins
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, FusedPrefill_NativeVnniLegacyPath_MetadataFamiliesMatchSeparate)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 32;
+                const int N = 896;
+                const int K = 896;
+
+                struct TestCase
+                {
+                    const char *name;
+                    bool expect_mins;
+                    bool expect_emins;
+                };
+
+                const TestCase cases[] = {
+                    {"Q4_0", false, false},
+                    {"Q4_1", true, false},
+                    {"IQ4_NL", false, false},
+                    {"Q2_K", true, true},
+                };
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+
+                for (const auto &test_case : cases)
+                {
+                    std::unique_ptr<TensorBase> weights;
+                    if (std::strcmp(test_case.name, "Q4_0") == 0)
+                        weights = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                    else if (std::strcmp(test_case.name, "Q4_1") == 0)
+                        weights = TestTensorFactory::createQ4_1Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                    else if (std::strcmp(test_case.name, "IQ4_NL") == 0)
+                        weights = TestTensorFactory::createIQ4_NLRandom({static_cast<size_t>(N), static_cast<size_t>(K)});
+                    else if (std::strcmp(test_case.name, "Q2_K") == 0)
+                        weights = TestTensorFactory::createQ2_KRandom({static_cast<size_t>(N), static_cast<size_t>(K)});
+                    else
+                        FAIL() << "Unhandled test case: " << test_case.name;
+
+                    ASSERT_NE(weights, nullptr);
+
+                    ROCmPackedWeights packed;
+                    ASSERT_TRUE(packWeightsToROCm(weights.get(), packed)) << test_case.name;
+                    ASSERT_FALSE(packed.native_vnni_payload.empty()) << test_case.name;
+                    ASSERT_FALSE(packed.native_vnni_scales.empty()) << test_case.name;
+                    EXPECT_EQ(!packed.native_vnni_mins.empty(), test_case.expect_mins) << test_case.name;
+                    EXPECT_EQ(!packed.native_vnni_emins.empty(), test_case.expect_emins) << test_case.name;
+
+                    ROCmQuantisedGemmKernel kernel = createLegacyROCmKernelForTest(weights.get(), 0);
+                    ASSERT_TRUE(setupWorkspace(kernel, M, N, K)) << test_case.name;
+
+                    auto output_separate = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                    auto output_fused = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+                    ASSERT_TRUE(output_separate->allocateOnDevice(DeviceId::rocm(0))) << test_case.name;
+                    ASSERT_TRUE(output_fused->allocateOnDevice(DeviceId::rocm(0))) << test_case.name;
+
+                    ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_separate.get(), M, N, K)) << test_case.name;
+                    (void)hipDeviceSynchronize();
+                    output_separate->mark_device_dirty();
+
+                    std::vector<ITensorGemm::TensorProjectionDesc> projections;
+                    projections.emplace_back(&kernel, output_fused.get(), N, nullptr, nullptr, false, test_case.name);
+
+                    ASSERT_TRUE(kernel.multiply_fused_tensor(input.get(), projections, M, K)) << test_case.name;
+                    (void)hipDeviceSynchronize();
+                    output_fused->mark_device_dirty();
+
+                    const float *separate = output_separate->data();
+                    const float *fused = output_fused->data();
+                    const float cos = cosineSim(fused, separate, static_cast<size_t>(M) * N);
+
+                    LOG_INFO("[Dispatch] Fused legacy native-VNNI " << test_case.name << " cosine=" << cos);
+                    EXPECT_GT(cos, 0.9999f) << test_case.name << " fused prefill diverged from separate GEMM";
+
+                    cleanupWorkspace(kernel);
+                }
             }
 
             // =============================================================================

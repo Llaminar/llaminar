@@ -5,6 +5,7 @@
  */
 
 #include "TensorClasses.h"
+#include "VnniPackContext.h"
 #include "../kernels/KernelFactory.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
@@ -413,6 +414,28 @@ namespace llaminar2
 
         // Unpack all 8 sub-blocks (256 elements total)
         simd::unpack_iq2_s_superblock_to_int8(super_block, output, scales, mins);
+    }
+
+
+    void IQ2_STensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    {
+        const size_t linear = vnniLinearIdx(ctx, n, b);
+        const int sb_per_row = vnniSuperBlocksPerRow(ctx.K);
+        const int sb_idx = b / 8;
+        const int sub_idx = b % 8;
+        const auto *blk = &typed_data()[static_cast<size_t>(n) * sb_per_row + sb_idx];
+
+        uint8_t payload_buf[9];
+        std::memcpy(payload_buf, blk->qs + sub_idx * 4, 4);
+        payload_buf[4] = blk->qh[sub_idx];
+        std::memcpy(payload_buf + 5, blk->qs + 32 + sub_idx * 4, 4);
+
+        const float d_val = fp16_to_fp32(blk->d);
+        const uint8_t sc = blk->scales[sub_idx];
+
+        std::memcpy(vnniPayloadDst(ctx, linear), payload_buf, 9);
+        ctx.scales_array[linear] = fp32_to_fp16(d_val * (0.5f + static_cast<float>(sc & 0xF)) * 0.25f);
+        ctx.mins_array[linear] = fp32_to_fp16(d_val * (0.5f + static_cast<float>(sc >> 4)) * 0.25f);
     }
 
 } // namespace llaminar2

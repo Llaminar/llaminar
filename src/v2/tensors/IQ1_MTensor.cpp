@@ -5,6 +5,7 @@
  */
 
 #include "TensorClasses.h"
+#include "VnniPackContext.h"
 #include "../kernels/KernelFactory.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
@@ -444,6 +445,44 @@ namespace llaminar2
 
         // Unpack all 8 sub-blocks (256 elements total)
         simd::unpack_iq1_m_superblock_to_int8(super_block, output, scales, mins);
+    }
+
+
+    void IQ1_MTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    {
+        const size_t linear = vnniLinearIdx(ctx, n, b);
+        const int sb_per_row = vnniSuperBlocksPerRow(ctx.K);
+        const int sb_idx = b / 8;
+        const int sub_idx = b % 8;
+        const auto *blk = &typed_data()[static_cast<size_t>(n) * sb_per_row + sb_idx];
+
+        const uint8_t *qs = blk->qs + sub_idx * 4;
+        const uint8_t *qh = blk->qh + sub_idx * 2;
+
+        const uint16_t *sc = reinterpret_cast<const uint16_t *>(blk->scales);
+        const uint16_t scale_u16 = static_cast<uint16_t>(
+            (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+            ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+        const float d_val = fp16_to_fp32(scale_u16);
+
+        const int sc_word_idx = sub_idx / 2;
+        const int sc_bit_offset = 6 * (sub_idx % 2);
+        const int sc3_lo = (sc[sc_word_idx] >> (sc_bit_offset + 0)) & 0x7;
+        const int sc3_hi = (sc[sc_word_idx] >> (sc_bit_offset + 3)) & 0x7;
+        const float dl1 = d_val * (2.0f * static_cast<float>(sc3_lo) + 1.0f);
+        const float dl2 = d_val * (2.0f * static_cast<float>(sc3_hi) + 1.0f);
+
+        uint8_t payload_buf[6];
+        payload_buf[0] = qs[0];
+        payload_buf[1] = qs[1];
+        payload_buf[2] = qs[2];
+        payload_buf[3] = qs[3];
+        payload_buf[4] = qh[0];
+        payload_buf[5] = qh[1];
+
+        std::memcpy(vnniPayloadDst(ctx, linear), payload_buf, 6);
+        ctx.scales_array[linear] = fp32_to_fp16(dl1 * 0.125f);
+        ctx.mins_array[linear] = fp32_to_fp16(dl2 * 0.125f);
     }
 
 } // namespace llaminar2

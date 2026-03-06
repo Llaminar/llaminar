@@ -136,7 +136,7 @@ struct BackendThresholds {
 ### Automatic Snapshot Management
 
 The base class automatically:
-1. **Regenerates PyTorch snapshots** on each test run via `python/reference/generate_qwen2_pipeline_snapshots.py`
+1. **Regenerates PyTorch snapshots** on each test run via `python/reference/generate_qwen_pipeline_snapshots.py`
 2. **Loads snapshots** from `.npy` files using the cnpy library
 3. **Caches snapshots** in memory for efficient multi-snapshot comparisons
 
@@ -174,7 +174,7 @@ Configure thresholds in your test's `SetUp()` method via `config_`:
 struct ParityConfig {
     // Model and test setup
     std::string model_path = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
-    std::string snapshot_dir = "pytorch_qwen2_snapshots";
+    std::string snapshot_dir;  // auto-derived from model_path when empty
     std::string prompt = "The quick brown fox jumps over the lazy dog";
     std::vector<int> token_ids = {785, 3974, ...};  // Pre-tokenized prompt
     int decode_steps = 5;
@@ -474,7 +474,7 @@ For new model architectures, create a snapshot generator in `python/reference/`:
 
 ```python
 # python/reference/generate_llama3_pipeline_snapshots.py
-# (Similar to generate_qwen2_pipeline_snapshots.py)
+# (Similar to generate_qwen_pipeline_snapshots.py)
 ```
 
 Update `ParityTestBase::regeneratePyTorchSnapshots()` if the script name differs.
@@ -532,7 +532,7 @@ mkdir -p tests/v2/integration/parity/<model_name>
 
 ### 2. Create PyTorch Reference Script
 
-Copy and adapt `python/reference/generate_qwen2_pipeline_snapshots.py`:
+Copy and adapt `python/reference/generate_qwen_pipeline_snapshots.py`:
 - Update model loading logic
 - Adjust layer naming to match model architecture
 - Update snapshot key names if layer structure differs
@@ -569,7 +569,7 @@ Different architectures may need different thresholds:
 3. Verify model exists: `ls models/`
 4. Run generator manually:
    ```bash
-   python python/reference/generate_qwen2_pipeline_snapshots.py \
+    python python/reference/generate_qwen_pipeline_snapshots.py \
        --model models/qwen2.5-0.5b-instruct-q4_0.gguf \
        --prompt "Test" --output pytorch_test_snapshots
    ```

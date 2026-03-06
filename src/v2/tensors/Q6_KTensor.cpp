@@ -5,6 +5,9 @@
  */
 
 #include "TensorClasses.h"
+#include "FP16Utils.h"
+
+#include "VnniPackContext.h"
 #include "../kernels/KernelFactory.h"
 #include "SIMDHelpers.h"
 #include "../utils/DebugEnv.h"
@@ -583,4 +586,49 @@ namespace llaminar2
         simd::transcode_q6_k_to_int8(block, sub_idx, dummy_int8, &scale, &min);
         return min;
     }
+
+    void Q6_KTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    {
+        const size_t linear = vnniLinearIdx(ctx, n, b);
+        const int sb_per_row = vnniSuperBlocksPerRow(ctx.K);
+        const int sb_idx = b / 8;
+        const int sub_idx = b % 8;
+        const auto *blk = &typed_data()[static_cast<size_t>(n) * sb_per_row + sb_idx];
+
+        const int half = (sub_idx * 32) / 128;
+        const int sub_in_half = (sub_idx * 32 % 128) / 32;
+        const uint8_t *ql = blk->ql + half * 64;
+        const uint8_t *qh = blk->qh + half * 32;
+
+        uint8_t raw6[32];
+        for (int l = 0; l < 32; ++l)
+        {
+            switch (sub_in_half)
+            {
+            case 0: raw6[l] = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4); break;
+            case 1: raw6[l] = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4); break;
+            case 2: raw6[l] = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4); break;
+            case 3: raw6[l] = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4); break;
+            }
+        }
+
+        uint8_t payload[24];
+        for (int i = 0; i < 16; ++i)
+            payload[i] = (raw6[i] & 0xF) | ((raw6[i + 16] & 0xF) << 4);
+        for (int i = 0; i < 8; ++i)
+            payload[16 + i] = ((raw6[4 * i + 0] >> 4) & 3) |
+                              (((raw6[4 * i + 1] >> 4) & 3) << 2) |
+                              (((raw6[4 * i + 2] >> 4) & 3) << 4) |
+                              (((raw6[4 * i + 3] >> 4) & 3) << 6);
+
+        std::memcpy(vnniPayloadDst(ctx, linear), payload, 24);
+
+        const float d = fp16_to_fp32(blk->d);
+        const int8_t *sc = blk->scales;
+        const int sc_lo_idx = half * 8 + sub_in_half * 2;
+        const int sc_hi_idx = sc_lo_idx + 1;
+        ctx.scales_array[linear] = fp32_to_fp16(d * static_cast<float>(sc[sc_lo_idx]));
+        ctx.mins_array[linear] = fp32_to_fp16(d * static_cast<float>(sc[sc_hi_idx]));
+    }
+
 } // namespace llaminar2

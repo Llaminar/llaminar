@@ -63,7 +63,7 @@ namespace llaminar2
                                                          << " tensor_type=" << input_base->dtype_name()
                                                          << " device=" << params_.device_id.to_string());
 
-        // Create RMSNorm kernel via KernelFactory
+        // Reuse the stage-local RMSNorm kernel unless the input tensor dtype changes.
         auto *kernel = getOrRefreshKernelByTensorType(
             cached_kernel_,
             cached_kernel_tensor_type_,

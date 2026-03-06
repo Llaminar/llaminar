@@ -6,6 +6,7 @@
  */
 
 #include "TensorClasses.h"
+#include "VnniPackContext.h"
 #include "../kernels/KernelFactory.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
@@ -687,6 +688,15 @@ namespace llaminar2
             iq4_block.d,  // Input: IQ4_NL FP16 scale
             output->qs,   // Output: Q8_0 int8 values
             &output->d);  // Output: Q8_0 FP16 scale
+    }
+
+
+    void IQ4_NLTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    {
+        const size_t linear = vnniLinearIdx(ctx, n, b);
+        const auto *blk = &typed_data()[static_cast<size_t>(n) * ctx.blocks_per_row + b];
+        std::memcpy(vnniPayloadDst(ctx, linear), blk->qs, 16);
+        ctx.scales_array[linear] = blk->d;
     }
 
 } // namespace llaminar2

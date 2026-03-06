@@ -25,7 +25,9 @@
 // Include project headers
 #include "tensors/Tensors.h"
 #include "execution/config/RuntimeConfig.h"
+#include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "loaders/ModelContext.h"
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -46,6 +48,7 @@ using namespace llaminar2::test;
 
 namespace
 {
+    const std::string TEST_MODEL_PATH = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
 
     // ============================================================================
     // ROCm Availability Check
@@ -484,6 +487,116 @@ TEST_F(Test__ROCmRoPEParity, RoPE_BF16_Small)
     EXPECT_GE(cosine_k, 0.999);
     EXPECT_LE(l2_error_q, 0.02);
     EXPECT_LE(l2_error_k, 0.02);
+}
+
+TEST_F(Test__ROCmRoPEParity, RoPE_FP32_RealQwen2Layer3ProjectionInputs)
+{
+    SKIP_IF_NO_ROCM();
+
+    std::ifstream model_file(TEST_MODEL_PATH);
+    if (!model_file.good())
+    {
+        GTEST_SKIP() << "Test model not found: " << TEST_MODEL_PATH;
+    }
+
+    auto stage_ctx = ModelContext::createForPPStage(TEST_MODEL_PATH, 0, 4, true, false);
+    ASSERT_NE(stage_ctx, nullptr);
+
+    FactoryPPStageConfig config;
+    config.first_layer = 0;
+    config.last_layer = 4;
+    config.has_embedding = true;
+    config.has_lm_head = false;
+    ASSERT_TRUE(config.isValid());
+
+    auto cpu_runner = createPPStageRunner(stage_ctx, DeviceId::cpu(), config);
+    ASSERT_NE(cpu_runner, nullptr);
+    cpu_runner->enableSnapshotCapture();
+
+    constexpr int seq_len = 64;
+    constexpr int n_heads = 14;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    constexpr float rope_theta = 1000000.0f;
+    const size_t total_q = static_cast<size_t>(seq_len) * n_heads * head_dim;
+    const size_t total_k = static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
+
+    std::vector<int> tokens(seq_len);
+    for (int i = 0; i < seq_len; ++i)
+    {
+        tokens[i] = i % 1024;
+    }
+    ASSERT_TRUE(cpu_runner->forward(tokens.data(), seq_len));
+
+    auto getSnapshotVector = [&](const std::string &key, size_t expected_size) -> std::vector<float>
+    {
+        size_t size = 0;
+        const float *data = cpu_runner->getSnapshot(key, size);
+        EXPECT_NE(data, nullptr) << "Missing snapshot: " << key;
+        EXPECT_EQ(size, expected_size) << "Unexpected snapshot size for " << key;
+        if (!data || size != expected_size)
+        {
+            return {};
+        }
+        return std::vector<float>(data, data + size);
+    };
+
+    std::vector<float> cpu_q = getSnapshotVector("layer3_Q_PROJECTION", total_q);
+    std::vector<float> cpu_k = getSnapshotVector("layer3_K_PROJECTION", total_k);
+    ASSERT_EQ(cpu_q.size(), total_q);
+    ASSERT_EQ(cpu_k.size(), total_k);
+
+    std::vector<int> position_ids(seq_len);
+    for (int i = 0; i < seq_len; ++i)
+    {
+        position_ids[i] = i;
+    }
+
+    std::vector<float> rocm_q = cpu_q;
+    std::vector<float> rocm_k = cpu_k;
+
+    CPURoPEKernelT<ActivationPrecision::FP32> cpu_kernel;
+    cpu_kernel.apply_typed(cpu_q.data(), cpu_k.data(), position_ids.data(),
+                           seq_len, n_heads, n_kv_heads, head_dim, rope_theta, -1);
+
+    rocm::ROCmRoPEKernelT<ActivationPrecision::FP32> rocm_kernel;
+    DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024);
+    auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
+    ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
+    rocm_kernel.bindWorkspace(&workspace);
+
+    float *d_q = nullptr;
+    float *d_k = nullptr;
+    ASSERT_EQ(hipMalloc(&d_q, total_q * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_k, total_k * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_q, rocm_q.data(), total_q * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
+
+    ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_kv_heads,
+                                        head_dim, rope_theta, 0));
+    hipDeviceSynchronize();
+
+    ASSERT_EQ(hipMemcpy(rocm_q.data(), d_q, total_q * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
+    ASSERT_EQ(hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
+
+    ASSERT_EQ(hipFree(d_q), hipSuccess);
+    ASSERT_EQ(hipFree(d_k), hipSuccess);
+
+    ASSERT_FALSE(hasNaNOrInf(rocm_q.data(), total_q));
+    ASSERT_FALSE(hasNaNOrInf(rocm_k.data(), total_k));
+
+    const double cosine_q = cosineSimilarity(rocm_q.data(), cpu_q.data(), total_q);
+    const double l2_error_q = relativeL2Error(rocm_q.data(), cpu_q.data(), total_q);
+    const double cosine_k = cosineSimilarity(rocm_k.data(), cpu_k.data(), total_k);
+    const double l2_error_k = relativeL2Error(rocm_k.data(), cpu_k.data(), total_k);
+
+    std::cout << "  RoPE FP32 real Qwen2 layer3 Q: cosine=" << cosine_q << ", L2_error=" << l2_error_q << std::endl;
+    std::cout << "  RoPE FP32 real Qwen2 layer3 K: cosine=" << cosine_k << ", L2_error=" << l2_error_k << std::endl;
+
+    EXPECT_GE(cosine_q, 0.9999);
+    EXPECT_GE(cosine_k, 0.9999);
+    EXPECT_LE(l2_error_q, 0.01);
+    EXPECT_LE(l2_error_k, 0.01);
 }
 
 TEST_F(Test__ROCmRoPEParity, RoPE_BF16_Large)

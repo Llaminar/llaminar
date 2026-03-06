@@ -149,9 +149,10 @@ namespace llaminar2
     namespace GemmWorkspaceBuffers
     {
         // INT8 quantization buffers
-        constexpr const char *QUANT_A = "gemm_quant_a";     ///< [M × K] INT8 quantized activations
-        constexpr const char *SCALES_A = "gemm_scales_a";   ///< [M] FP32 per-row activation scales
-        constexpr const char *ACC_INT32 = "gemm_acc_int32"; ///< [M × N] INT32 accumulator
+        constexpr const char *QUANT_A = "gemm_quant_a";                       ///< [M × K] INT8 quantized activations
+        constexpr const char *SCALES_A = "gemm_scales_a";                     ///< [M] FP32 per-row activation scales (row-wise mode)
+        constexpr const char *SCALES_A_BLOCKWISE = "gemm_scales_a_blockwise"; ///< [M × blocks_per_row] FP32 per-block activation scales (blockwise mode)
+        constexpr const char *ACC_INT32 = "gemm_acc_int32";                   ///< [M × N] INT32 accumulator
 
         // FP32 temporary buffers
         constexpr const char *TEMP_A_FP32 = "gemm_temp_a_fp32"; ///< [M × K] FP32 activation copy

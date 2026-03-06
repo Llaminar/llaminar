@@ -1112,4 +1112,135 @@ namespace llaminar2
         return result;
     }
 
+    // ===== Efficient requantizeRowToInt8 for Q8_1 =====
+    // Reads blocks directly via typed_data() to avoid per-block virtual dispatch.
+    // Q8_1 is symmetric (min=0, s field is a sum for dot product, not an offset).
+    // Parallelism is provided by the caller (ROCmWeightPacker) which distributes
+    // rows across threads via #pragma omp parallel for.
+    float Q8_1Tensor::requantizeRowToInt8(size_t row_idx, size_t K, int8_t *output) const
+    {
+        const size_t blocks_per_row = K / Q8_1Block::BLOCK_SIZE;
+        const Q8_1Block *all_blocks = typed_data();
+        const Q8_1Block *row_blocks = all_blocks + row_idx * blocks_per_row;
+
+        // Phase 1: Find max absolute dequantized value across all blocks
+        float max_abs = 0.0f;
+#if defined(__AVX2__)
+        for (size_t b = 0; b < blocks_per_row; ++b)
+        {
+            // Vectorized horizontal max of 32 absolute int8 values
+            const __m256i v = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(row_blocks[b].qs));
+            const __m256i abs_v = _mm256_abs_epi8(v);
+            const __m128i lo = _mm256_castsi256_si128(abs_v);
+            const __m128i hi = _mm256_extracti128_si256(abs_v, 1);
+            __m128i mx = _mm_max_epu8(lo, hi);
+            mx = _mm_max_epu8(mx, _mm_srli_si128(mx, 8));
+            mx = _mm_max_epu8(mx, _mm_srli_si128(mx, 4));
+            mx = _mm_max_epu8(mx, _mm_srli_si128(mx, 2));
+            mx = _mm_max_epu8(mx, _mm_srli_si128(mx, 1));
+            const float val = fp16_to_fp32(row_blocks[b].d) *
+                              static_cast<float>(_mm_extract_epi8(mx, 0));
+            if (val > max_abs)
+                max_abs = val;
+        }
+#else
+        for (size_t b = 0; b < blocks_per_row; ++b)
+        {
+            const float block_scale = fp16_to_fp32(row_blocks[b].d);
+            int max_qs = 0;
+            for (int i = 0; i < 32; ++i)
+            {
+                const int abs_qs = row_blocks[b].qs[i] < 0
+                                       ? -row_blocks[b].qs[i]
+                                       : row_blocks[b].qs[i];
+                if (abs_qs > max_qs)
+                    max_qs = abs_qs;
+            }
+            const float val = block_scale * static_cast<float>(max_qs);
+            if (val > max_abs)
+                max_abs = val;
+        }
+#endif
+
+        const float row_scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+        const float inv_row_scale = 1.0f / row_scale;
+
+        // Phase 2: Requantize each block — multiply qs[i] by (block_scale / row_scale),
+        // round to nearest integer, clamp to [-127, 127].
+#if defined(__AVX512F__)
+        {
+            const __m512i clamp_lo = _mm512_set1_epi32(-127);
+            const __m512i clamp_hi = _mm512_set1_epi32(127);
+            for (size_t b = 0; b < blocks_per_row; ++b)
+            {
+                const __m512 vrescale = _mm512_set1_ps(
+                    fp16_to_fp32(row_blocks[b].d) * inv_row_scale);
+                int8_t *dst = output + b * 32;
+                // Process 32 values as 2 x 16 with AVX-512
+                for (int half = 0; half < 2; ++half)
+                {
+                    const __m128i v8 = _mm_loadu_si128(
+                        reinterpret_cast<const __m128i *>(
+                            row_blocks[b].qs + half * 16));
+                    __m512 vf = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(v8));
+                    vf = _mm512_mul_ps(vf, vrescale);
+                    __m512i r = _mm512_cvtps_epi32(vf);
+                    r = _mm512_max_epi32(r, clamp_lo);
+                    r = _mm512_min_epi32(r, clamp_hi);
+                    _mm_storeu_si128(
+                        reinterpret_cast<__m128i *>(dst + half * 16),
+                        _mm512_cvtsepi32_epi8(r));
+                }
+            }
+        }
+#elif defined(__AVX2__)
+        {
+            const __m256i clamp_lo = _mm256_set1_epi32(-127);
+            const __m256i clamp_hi = _mm256_set1_epi32(127);
+            const __m256i pack_perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+            for (size_t b = 0; b < blocks_per_row; ++b)
+            {
+                const __m256 vrescale = _mm256_set1_ps(
+                    fp16_to_fp32(row_blocks[b].d) * inv_row_scale);
+                int8_t *dst = output + b * 32;
+                // Process 32 values as 4 x 8, then pack all 32 at once
+                __m256i groups[4];
+                for (int q = 0; q < 4; ++q)
+                {
+                    const __m128i v8 = _mm_loadl_epi64(
+                        reinterpret_cast<const __m128i *>(
+                            row_blocks[b].qs + q * 8));
+                    __m256 vf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v8));
+                    vf = _mm256_mul_ps(vf, vrescale);
+                    __m256i r = _mm256_cvtps_epi32(vf);
+                    r = _mm256_max_epi32(r, clamp_lo);
+                    groups[q] = _mm256_min_epi32(r, clamp_hi);
+                }
+                // Pack 4x8 int32 -> 32 int8 and fix AVX2 lane-crossing order
+                const __m256i p01 = _mm256_packs_epi32(groups[0], groups[1]);
+                const __m256i p23 = _mm256_packs_epi32(groups[2], groups[3]);
+                __m256i packed = _mm256_packs_epi16(p01, p23);
+                packed = _mm256_permutevar8x32_epi32(packed, pack_perm);
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst), packed);
+            }
+        }
+#else
+        for (size_t b = 0; b < blocks_per_row; ++b)
+        {
+            const float rescale = fp16_to_fp32(row_blocks[b].d) * inv_row_scale;
+            int8_t *dst = output + b * 32;
+            for (int i = 0; i < 32; ++i)
+            {
+                const float val = static_cast<float>(row_blocks[b].qs[i]) * rescale;
+                int32_t q = static_cast<int32_t>(val + (val >= 0.0f ? 0.5f : -0.5f));
+                q = q < -127 ? -127 : (q > 127 ? 127 : q);
+                dst[i] = static_cast<int8_t>(q);
+            }
+        }
+#endif
+
+        return row_scale;
+    }
+
 } // namespace llaminar2

@@ -1497,6 +1497,7 @@ if(HAVE_ROCM)
     # Add ROCm kernel C++ adapter files (compiled with C++ compiler, NOT hipcc)
     # These implement ITensorGemm interface and can include MPI headers
     target_sources(llaminar2_core PRIVATE
+        kernels/rocm/ROCmWeightPacker.cpp               # Weight packing utilities (native-VNNI + INT8 conversion)
         kernels/rocm/gemm/ROCmFloatingPointGemmKernel.cpp
         kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp  # INT8 GEMM adapter (uses CK via extern "C")
         kernels/rocm/gemm/HipBLASGemmKernel.cpp        # hipBLAS GEMM for FP32/FP16 (compiled with g++, linked with hipBLAS)

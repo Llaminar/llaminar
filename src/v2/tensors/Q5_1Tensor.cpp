@@ -7,6 +7,7 @@
  */
 
 #include "TensorClasses.h"
+#include "VnniPackContext.h"
 #include "../kernels/KernelFactory.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/CPUFeatures.h"
@@ -539,6 +540,18 @@ namespace llaminar2
         const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         const Q5_1Block *blocks = reinterpret_cast<const Q5_1Block *>(data_ptr);
         return fp16_to_fp32(blocks[row_idx * blocks_per_row + k_block_offset].m);
+    }
+
+
+    void Q5_1Tensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    {
+        const size_t linear = vnniLinearIdx(ctx, n, b);
+        const auto *blk = &typed_data()[static_cast<size_t>(n) * ctx.blocks_per_row + b];
+        uint8_t *dst = vnniPayloadDst(ctx, linear);
+        std::memcpy(dst, blk->qs, 16);
+        std::memcpy(dst + 16, blk->qh, 4);
+        ctx.scales_array[linear] = blk->d;
+        ctx.mins_array[linear] = blk->m;
     }
 
 } // namespace llaminar2

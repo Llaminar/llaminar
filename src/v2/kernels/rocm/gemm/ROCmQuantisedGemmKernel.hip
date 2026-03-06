@@ -509,6 +509,90 @@ __global__ void fillConstantFloat_kernel(float* __restrict__ dst, int count, flo
 }
 
 // ============================================================================
+// BLOCKWISE ACTIVATION QUANTIZATION KERNEL (C++ linkage — template)
+// ============================================================================
+
+/**
+ * @brief Per-block symmetric quantization: FP32 → INT8 with per-block scale
+ *
+ * Each row is divided into fixed-size blocks of BLOCK_SIZE elements.
+ * Each block gets its own independent scale, providing finer quantization
+ * granularity than the row-wise kernel above.
+ *
+ * Algorithm (per block):
+ *   1. Find max_abs = max(|x_i|) within block
+ *   2. scale = max_abs / 127.0 (or 1.0 if max_abs == 0)
+ *   3. int8_i = round(x_i / scale) clamped to [-127, 127]
+ *
+ * Grid: (M × blocks_per_row, 1, 1)
+ * Block: 64 threads (wave64 on gfx906, 32 do useful work)
+ *
+ * Scale output layout: d_scales[row * blocks_per_row + block_idx]
+ */
+template <int BLOCK_SIZE>
+__global__ void quantizeActivationsQ8_blockwise_kernel(
+    const float *__restrict__ d_A_fp32,
+    int8_t *__restrict__ d_A_int8,
+    float *__restrict__ d_scales,
+    int M, int K, int blocks_per_row)
+{
+    const int linear_block = blockIdx.x;
+    const int row = linear_block / blocks_per_row;
+    const int block_idx = linear_block % blocks_per_row;
+
+    if (row >= M)
+        return;
+
+    const int tid = threadIdx.x;
+    const int k_start = block_idx * BLOCK_SIZE;
+    const int k_end = min(k_start + BLOCK_SIZE, K);
+    const int block_len = k_end - k_start;
+
+    const float *src = d_A_fp32 + static_cast<size_t>(row) * K + k_start;
+    int8_t *dst = d_A_int8 + static_cast<size_t>(row) * K + k_start;
+
+    __shared__ float s_absmax;
+
+    // Step 1: Find max absolute value in this block
+    float local_max = 0.0f;
+    if (tid < block_len)
+    {
+        local_max = fabsf(src[tid]);
+    }
+
+    // Wavefront reduction (wave64 on gfx906)
+    #pragma unroll
+    for (int offset = 32; offset > 0; offset >>= 1)
+    {
+        local_max = fmaxf(local_max, __shfl_down(local_max, offset));
+    }
+
+    if (tid == 0)
+    {
+        s_absmax = local_max;
+    }
+    __syncthreads();
+
+    float max_abs = s_absmax;
+    float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+    float inv_scale = 1.0f / scale;
+
+    // Step 2: Write scale for this block
+    if (tid == 0)
+    {
+        d_scales[static_cast<size_t>(row) * blocks_per_row + block_idx] = scale;
+    }
+
+    // Step 3: Quantize elements in this block
+    if (tid < block_len)
+    {
+        int q = static_cast<int>(rintf(src[tid] * inv_scale));
+        q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+        dst[tid] = static_cast<int8_t>(q);
+    }
+}
+
+// ============================================================================
 // DISPATCH FUNCTIONS
 // ============================================================================
 
@@ -1254,6 +1338,63 @@ extern "C"
         }
 
         // No device-wide sync here; rely on stream ordering + a final sync/copy.
+
+        return true;
+    }
+
+    // =========================================================================
+    // BLOCKWISE ACTIVATION QUANTIZATION LAUNCHER
+    // =========================================================================
+
+    /**
+     * @brief Launch blockwise activation quantization kernel
+     *
+     * Quantizes activations with per-block scales (block_size=32).
+     * This is the V2 activation quantization contract.
+     *
+     * @param d_A_fp32 Input FP32 [M × K] on device
+     * @param d_A_int8 Output INT8 [M × K] on device
+     * @param d_scales_blockwise Output per-block scales [M × blocks_per_row] on device
+     * @param M Number of rows
+     * @param K Number of columns
+     * @param rocm_device_id ROCm device ID
+     * @param stream HIP stream
+     * @return true on success
+     */
+    bool rocmQuantGemm_quantizeActivationsBlockwise(
+        const float *d_A_fp32,
+        int8_t *d_A_int8,
+        float *d_scales_blockwise,
+        int M, int K,
+        int rocm_device_id, void *stream)
+    {
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+            return false;
+
+        if (M <= 0 || K <= 0)
+            return true;
+
+        constexpr int BLOCK_SIZE = 32;
+        const int blocks_per_row = (K + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        const int total_blocks = M * blocks_per_row;
+
+        // Launch: one workgroup per activation block, 64 threads per workgroup
+        // (wave64 on gfx906 — 32 threads do useful work, rest are inactive)
+        dim3 grid(total_blocks, 1, 1);
+        dim3 block(64, 1, 1);
+
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_kernel<BLOCK_SIZE>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_A_fp32, d_A_int8, d_scales_blockwise, M, K, blocks_per_row);
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_quantizeActivationsBlockwise] Kernel launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
 
         return true;
     }

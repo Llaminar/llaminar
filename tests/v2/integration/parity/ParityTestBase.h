@@ -63,6 +63,7 @@
 #include <algorithm>
 #include <set>
 #include <string>
+#include <cctype>
 
 // libfort for formatted table output
 #include "fort.hpp"
@@ -122,7 +123,7 @@ namespace llaminar2::test::parity
     {
         // Model and test setup
         std::string model_path = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
-        std::string snapshot_dir = "pytorch_qwen2_snapshots";
+        std::string snapshot_dir;
         std::string prompt = "The quick brown fox jumps over the lazy dog";
         std::vector<int> token_ids = {785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562};
         int decode_steps = 5;
@@ -1151,11 +1152,66 @@ namespace llaminar2::test::parity
     class ParityTestBase : public ::testing::Test
     {
     private:
-        // Static set of snapshot directories that have been generated this run.
+        // Static set of snapshot generations completed this run.
         // This prevents regenerating snapshots for every test case in a suite.
-        // Key: snapshot_dir path, Value: true if successfully generated
+        // Key: snapshot_dir|model_path
         static inline std::set<std::string> s_generated_snapshots_;
         static inline std::mutex s_snapshot_mutex_;
+
+        static std::string sanitizeSnapshotToken(const std::string &input)
+        {
+            std::string token;
+            token.reserve(input.size());
+
+            bool last_was_underscore = false;
+            for (unsigned char ch : input)
+            {
+                if (std::isalnum(ch))
+                {
+                    token.push_back(static_cast<char>(std::tolower(ch)));
+                    last_was_underscore = false;
+                }
+                else if (!last_was_underscore)
+                {
+                    token.push_back('_');
+                    last_was_underscore = true;
+                }
+            }
+
+            while (!token.empty() && token.front() == '_')
+                token.erase(token.begin());
+            while (!token.empty() && token.back() == '_')
+                token.pop_back();
+
+            return token.empty() ? "model" : token;
+        }
+
+        static std::string inferSnapshotDirFromModelPath(const std::string &model_path)
+        {
+            std::string filename = model_path;
+            const size_t slash = filename.find_last_of("/\\");
+            if (slash != std::string::npos)
+                filename = filename.substr(slash + 1);
+
+            const size_t dot = filename.rfind('.');
+            if (dot != std::string::npos)
+                filename = filename.substr(0, dot);
+
+            return "pytorch_" + sanitizeSnapshotToken(filename) + "_snapshots";
+        }
+
+        void resolveSnapshotDirIfNeeded()
+        {
+            if (config_.snapshot_dir.empty())
+            {
+                config_.snapshot_dir = inferSnapshotDirFromModelPath(config_.model_path);
+            }
+        }
+
+        std::string snapshotCacheKey() const
+        {
+            return config_.snapshot_dir + "|" + config_.model_path;
+        }
 
     protected:
         ParityConfig config_;
@@ -1318,6 +1374,8 @@ namespace llaminar2::test::parity
             // Device-specific setup first (may skip)
             setupDeviceSpecific();
 
+            resolveSnapshotDirIfNeeded();
+
             // Regenerate snapshots only on rank 0 to avoid race conditions
             // and redundant work. All ranks wait at barrier before proceeding.
             // OPTIMIZATION: Only regenerate if this snapshot_dir hasn't been done yet.
@@ -1326,7 +1384,7 @@ namespace llaminar2::test::parity
                 bool need_regen = false;
                 {
                     std::lock_guard<std::mutex> lock(s_snapshot_mutex_);
-                    need_regen = (s_generated_snapshots_.find(config_.snapshot_dir) == s_generated_snapshots_.end());
+                    need_regen = (s_generated_snapshots_.find(snapshotCacheKey()) == s_generated_snapshots_.end());
                 }
 
                 if (need_regen)
@@ -1337,7 +1395,7 @@ namespace llaminar2::test::parity
                     }
                     // Mark as generated
                     std::lock_guard<std::mutex> lock(s_snapshot_mutex_);
-                    s_generated_snapshots_.insert(config_.snapshot_dir);
+                    s_generated_snapshots_.insert(snapshotCacheKey());
                 }
                 else
                 {
@@ -1398,7 +1456,7 @@ namespace llaminar2::test::parity
 
             std::ostringstream cmd;
             cmd << "bash -c 'source /workspaces/llaminar/.venv/bin/activate && python3"
-                << " python/reference/generate_qwen2_pipeline_snapshots.py"
+                << " python/reference/generate_qwen_pipeline_snapshots.py"
                 << " --model " << config_.model_path
                 << " --prompt \"" << config_.prompt << "\""
                 << " --output " << config_.snapshot_dir
@@ -2447,7 +2505,9 @@ namespace llaminar2::test::parity
                     }
                 }
             }
-            summary.lm_head_passed = (summary.lm_head_kl < config_.kl_threshold);
+            summary.lm_head_passed = (summary.lm_head_kl < config_.kl_threshold) &&
+                                     ((summary.lm_head_top1 * 100.0f) >= config_.min_top1_accuracy) &&
+                                     ((summary.lm_head_top5 * 100.0f) >= config_.min_top5_accuracy);
 
             // Count early layers passed
             summary.early_layers_passed = summary.embedding_passed ? 1 : 0;
@@ -2660,7 +2720,9 @@ namespace llaminar2::test::parity
                     }
                 }
             }
-            summary.lm_head_passed = (summary.lm_head_kl < config_.kl_threshold);
+            summary.lm_head_passed = (summary.lm_head_kl < config_.kl_threshold) &&
+                                     ((summary.lm_head_top1 * 100.0f) >= config_.min_top1_accuracy) &&
+                                     ((summary.lm_head_top5 * 100.0f) >= config_.min_top5_accuracy);
 
             // Count early layers passed
             summary.early_layers_passed = summary.embedding_result.passed ? 1 : 0;
@@ -2890,6 +2952,14 @@ namespace llaminar2::test::parity
 
             EXPECT_LT(summary.lm_head_kl, config_.kl_threshold)
                 << "LM_HEAD KL divergence too high: " << summary.lm_head_kl;
+
+            EXPECT_GE(summary.lm_head_top1 * 100.0f, config_.min_top1_accuracy)
+                << "LM_HEAD Top-1 accuracy too low: " << (summary.lm_head_top1 * 100.0f)
+                << "% (required: " << config_.min_top1_accuracy << "%)";
+
+            EXPECT_GE(summary.lm_head_top5 * 100.0f, config_.min_top5_accuracy)
+                << "LM_HEAD Top-5 accuracy too low: " << (summary.lm_head_top5 * 100.0f)
+                << "% (required: " << config_.min_top5_accuracy << "%)";
         }
 
         /**
@@ -2915,6 +2985,14 @@ namespace llaminar2::test::parity
             EXPECT_LT(summary.lm_head_kl, config_.kl_threshold)
                 << "LM_HEAD KL divergence too high: " << summary.lm_head_kl
                 << " (threshold: " << config_.kl_threshold << ")";
+
+            EXPECT_GE(summary.lm_head_top1 * 100.0f, config_.min_top1_accuracy)
+                << "LM_HEAD Top-1 accuracy too low: " << (summary.lm_head_top1 * 100.0f)
+                << "% (required: " << config_.min_top1_accuracy << "%)";
+
+            EXPECT_GE(summary.lm_head_top5 * 100.0f, config_.min_top5_accuracy)
+                << "LM_HEAD Top-5 accuracy too low: " << (summary.lm_head_top5 * 100.0f)
+                << "% (required: " << config_.min_top5_accuracy << "%)";
         }
 
         // =========================================================================

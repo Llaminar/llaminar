@@ -95,6 +95,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
+#include "ActivationQuantLayout.h"
 #include <memory>
 #include <cstdint>
 #include <vector>
@@ -374,13 +375,18 @@ namespace llaminar2
         {
         public:
             /**
-             * @brief Construct kernel for quantized weight tensor (lazy conversion)
+             * @brief Construct kernel for quantized weight tensor (legacy lazy conversion)
+             *
+             * Deprecated: use KernelFactory::getOrCreatePreparedGemmWeights() +
+             * KernelFactory::getOrCreateGemmEngine(), or explicitly pre-pack via
+             * ROCmPackedWeights and use the packed constructor below.
              *
              * @param weights Any quantized tensor (must be on GPU)
              * @param rocm_device_id ROCm device ID (from hipGetDevice, NOT global index)
              *
              * @throws std::runtime_error if weight not quantized or not on GPU
              */
+            [[deprecated("Use KernelFactory::getOrCreatePreparedGemmWeights() + getOrCreateGemmEngine(), or pre-pack via ROCmPackedWeights.")]]
             ROCmQuantisedGemmKernel(const TensorBase *weights, int rocm_device_id);
 
             /**
@@ -645,6 +651,12 @@ namespace llaminar2
             size_t weight_cols() const { return K_; }
             bool weights_converted() const { return weights_converted_; }
 
+            /// Get the current activation quantization mode
+            ActivationQuantMode activationQuantMode() const { return activation_quant_mode_; }
+
+            /// Set the activation quantization mode (ROW_WISE or BLOCKWISE)
+            void setActivationQuantMode(ActivationQuantMode mode) { activation_quant_mode_ = mode; }
+
             /**
              * @brief Prepare weights for efficient execution (ITensorGemm interface)
              *
@@ -714,6 +726,7 @@ namespace llaminar2
                 const int8_t *d_A_int8,
                 float *d_output,
                 const float *d_scales_A,
+                const float *d_scales_A_blockwise,
                 const float *d_scales_B,
                 const float *d_bias,
                 int m, int n, int k,
@@ -802,6 +815,9 @@ namespace llaminar2
             // IWorkspaceConsumer state - REQUIRED for execution
             // Kernels do not own any work buffers; all buffers come from workspace
             DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned, REQUIRED)
+
+            // Activation quantization mode: blockwise (default) or row-wise (legacy)
+            ActivationQuantMode activation_quant_mode_ = ActivationQuantMode::BLOCKWISE;
 
             // GPU stream for graph capture (nullptr = default stream)
             void *gpu_stream_ = nullptr;

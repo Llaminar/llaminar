@@ -85,7 +85,7 @@ Every file that needs changes for a new architecture. Items marked with ★ are 
 | # | File | Change |
 |---|------|--------|
 | 13 | `python/reference/loaders/tensor_name_mapper.py` | **EDIT**: Add GGUF→HuggingFace weight name mappings |
-| 14 | `python/reference/generate_qwen2_pipeline_snapshots.py` | **EDIT**: Add new stage capture logic |
+| 14 | `python/reference/generate_qwen_pipeline_snapshots.py` | **EDIT**: Add new stage capture logic |
 
 ### Tests + Build
 
@@ -384,7 +384,7 @@ QWEN2_TENSOR_MAP = {
 
 ### 9b. Snapshot capture logic
 
-**`python/reference/generate_qwen2_pipeline_snapshots.py`** — add capture code for new stages:
+**`python/reference/generate_qwen_pipeline_snapshots.py`** — add capture code for new stages:
 
 ```python
 # 3.5. QK RMSNorm (Qwen3 only: per-head normalization before RoPE)
@@ -414,7 +414,7 @@ If your new architecture needs a completely different tensor name mapping table,
 ### 9d. Generate snapshots
 
 ```bash
-python3 python/reference/generate_qwen2_pipeline_snapshots.py \
+python3 python/reference/generate_qwen_pipeline_snapshots.py \
     --model models/MyArch-Q8_0.gguf \
     --output pytorch_myarch_snapshots \
     --decode-steps 3 -v
@@ -592,7 +592,7 @@ Some architectures (like Qwen3) specify `head_dim` explicitly via `attention.key
 |------|---------|
 | `python/reference/loaders/tensor_name_mapper.py` | GGUF → HuggingFace weight name mapping |
 | `python/reference/loaders/gguf_loader.py` | GGUF file loading orchestrator |
-| `python/reference/generate_qwen2_pipeline_snapshots.py` | PyTorch reference snapshot generator |
+| `python/reference/generate_qwen_pipeline_snapshots.py` | PyTorch reference snapshot generator |
 
 ### GGUF Loading
 

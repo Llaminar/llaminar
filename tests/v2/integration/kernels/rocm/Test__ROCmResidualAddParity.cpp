@@ -589,6 +589,51 @@ namespace
         EXPECT_LE(rel_error, 0.001) << "Relative L2 error too high";
     }
 
+    TEST_F(ROCmResidualAddParityTest, FP32_ApplyTensor_InPlaceResidual_QwenShape)
+    {
+        const int rows = 64;
+        const int cols = 896;
+        const size_t num_elements = static_cast<size_t>(rows) * cols;
+
+        auto input = TestTensorFactory::createFP32Random({rows, cols}, -4.0f, 4.0f);
+        auto residual = TestTensorFactory::createFP32Random({rows, cols}, -4.0f, 4.0f);
+
+        std::vector<float> expected(num_elements);
+        const float *input_host = input->data();
+        const float *residual_host = residual->data();
+        for (size_t i = 0; i < num_elements; ++i)
+        {
+            expected[i] = input_host[i] + residual_host[i];
+        }
+
+        DeviceId rocm_device = DeviceId::rocm(0);
+        ASSERT_TRUE(input->ensureOnDevice(rocm_device));
+        ASSERT_TRUE(residual->ensureOnDevice(rocm_device));
+
+        // Mirror the pipeline's in-place residual pattern: output aliases residual/hidden.
+        llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP32> rocm_kernel;
+        ASSERT_TRUE(rocm_kernel.apply_tensor(
+            input.get(), residual.get(), residual.get(),
+            num_elements, nullptr, 0));
+
+        hipDeviceSynchronize();
+        residual->mark_device_dirty();
+        const float *result = residual->data();
+        ASSERT_NE(result, nullptr);
+
+        EXPECT_FALSE(hasNanOrInf(result, num_elements)) << "ROCm in-place residual output contains NaN/Inf";
+
+        double cosine = cosineSimilarity(result, expected.data(), num_elements);
+        double rel_error = relativeL2Error(result, expected.data(), num_elements);
+
+        std::cout << "[FP32_ApplyTensor_InPlaceResidual_QwenShape] Cosine similarity: "
+                  << std::fixed << std::setprecision(6) << cosine
+                  << ", Relative L2 error: " << std::scientific << rel_error << std::endl;
+
+        EXPECT_GE(cosine, 0.99999) << "Cosine similarity too low for in-place residual alias pattern";
+        EXPECT_LE(rel_error, 0.001) << "Relative L2 error too high for in-place residual alias pattern";
+    }
+
 #endif // HAVE_ROCM
 
 } // anonymous namespace

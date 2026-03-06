@@ -88,8 +88,10 @@
 #include "TypedTensorBase.h" // CRTP base for type-safe typed_data() access
 #include "TensorKernels.h"
 #include "FP16Utils.h"
-#include "BlockStructures.h" // Must be included BEFORE SIMDHelpers.h
-#include "TensorLayout.h"    // Tensor memory layout contracts
+#include "BlockStructures.h"      // Must be included BEFORE SIMDHelpers.h
+#include "TensorLayout.h"         // Tensor memory layout contracts
+#include "NativeVnniFormatInfo.h" // Format metadata returned by IINT8Unpackable::vnniFormatInfo()
+#include "VnniPackContext.h"      // Packing context for IINT8Unpackable::packVnniBlock()
 #include "SIMDHelpers.h"
 #include "AlignedVector.h"
 #include "../backends/DeviceId.h" // DeviceId for ensureOnDevice
@@ -412,6 +414,33 @@ namespace llaminar2
         virtual ~IINT8Unpackable() = default;
 
         /**
+         * @brief Get native-VNNI format metadata for this tensor type
+         *
+         * Returns intrinsic encoding properties (codebook ID, payload size,
+         * symmetry, etc.) that describe how this format is packed for GPU VNNI
+         * kernels. Only native-VNNI formats (≤6-bit) return non-null.
+         *
+         * @return Pointer to static metadata, or nullptr for non-VNNI formats (Q8_0, Q8_1)
+         */
+        virtual const NativeVnniFormatInfo *vnniFormatInfo() const { return nullptr; }
+
+        /**
+         * @brief Pack one 32-element block into interleaved VNNI layout
+         *
+         * Extracts payload bytes, FP16 scale (and min for asymmetric formats)
+         * from one logical 32-element block and writes them to the interleaved
+         * output arrays in the VnniPackContext.  Super-block formats decompose
+         * on the fly using (b / 8, b % 8) addressing.
+         *
+         * Default is a no-op for non-VNNI formats (Q8_0, Q8_1).
+         *
+         * @param ctx  Packing context with output buffers and layout parameters
+         * @param n    Row index (output feature)
+         * @param b    Block index within the row (0 to blocks_per_row-1)
+         */
+        virtual void packVnniBlock(const VnniPackContext &ctx, int n, int b) const {}
+
+        /**
          * @brief Unpack one quantized block to plain int8 values (native range, NO requantization)
          *
          * Unpacks native format (Q4_0, Q6_K, IQ4_NL) to plain int8 values in their
@@ -517,6 +546,70 @@ namespace llaminar2
             {
                 mins[0] = get_block_min(row_idx, superblock_idx);
             }
+        }
+
+        /**
+         * @brief Requantize one row from native format to per-row INT8 [-127, 127]
+         *
+         * Computes a per-row scale and requantizes all blocks without materializing
+         * a full FP32 intermediate buffer.  Each element becomes:
+         *     output[i] = clamp(round(dequant_value[i] / row_scale), -127, 127)
+         * where row_scale = max_abs / 127.
+         *
+         * Override for format-specific optimizations; the default implementation
+         * uses unpack_block_to_int8() + get_block_scale() + get_block_min().
+         *
+         * @param row_idx Row index in the tensor
+         * @param K       Number of columns (must be divisible by 32)
+         * @param output  Output buffer (K elements)
+         * @return Per-row scale factor (max_abs / 127)
+         */
+        virtual float requantizeRowToInt8(
+            size_t row_idx,
+            size_t K,
+            int8_t *output) const
+        {
+            const size_t blocks_per_row = K / 32;
+
+            // Phase 1: Compute max absolute dequantized value across all blocks
+            float max_abs = 0.0f;
+            alignas(64) int8_t tmp[32];
+            for (size_t b = 0; b < blocks_per_row; ++b)
+            {
+                unpack_block_to_int8(row_idx, b, tmp);
+                const float scale = std::abs(get_block_scale(row_idx, b));
+                const float min_val = get_block_min(row_idx, b);
+                for (int i = 0; i < 32; ++i)
+                {
+                    float val = std::abs(static_cast<float>(tmp[i]) * scale + min_val);
+                    if (val > max_abs)
+                        max_abs = val;
+                }
+            }
+
+            const float row_scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+            const float inv_row_scale = 1.0f / row_scale;
+
+            // Phase 2: Requantize each block to INT8
+            for (size_t b = 0; b < blocks_per_row; ++b)
+            {
+                unpack_block_to_int8(row_idx, b, tmp);
+                const float scale = get_block_scale(row_idx, b);
+                const float min_val = get_block_min(row_idx, b);
+                const float rescale = scale * inv_row_scale;
+                const float min_offset = min_val * inv_row_scale;
+
+                int8_t *dst = output + b * 32;
+                for (int i = 0; i < 32; ++i)
+                {
+                    float val = static_cast<float>(tmp[i]) * rescale + min_offset;
+                    int32_t q = static_cast<int32_t>(val + (val >= 0.0f ? 0.5f : -0.5f));
+                    q = q < -127 ? -127 : (q > 127 ? 127 : q);
+                    dst[i] = static_cast<int8_t>(q);
+                }
+            }
+
+            return row_scale;
         }
     };
 
@@ -2980,6 +3073,12 @@ namespace llaminar2
         float get_block_min(size_t row_idx, size_t k_block_offset) const override;
 
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{4, 16, false, false, false, 127.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
 
         void unpack_superblock_to_int8(
             size_t row_idx,
@@ -3246,6 +3345,10 @@ namespace llaminar2
         }
 
         size_t superblock_size() const override { return 256; }
+
+        /// Efficient override: reads Q8_0 blocks directly via typed_data()
+        /// without virtual dispatch per block.
+        float requantizeRowToInt8(size_t row_idx, size_t K, int8_t *output) const override;
 
         void unpack_superblock_to_int8(
             size_t row_idx,
@@ -3537,6 +3640,10 @@ namespace llaminar2
         }
 
         size_t superblock_size() const override { return 256; }
+
+        /// Efficient override: reads Q8_1 blocks directly via typed_data()
+        /// without virtual dispatch per block.
+        float requantizeRowToInt8(size_t row_idx, size_t K, int8_t *output) const override;
 
         void unpack_superblock_to_int8(
             size_t row_idx,
@@ -4467,6 +4574,12 @@ namespace llaminar2
             size_t k_block_offset) const override;
 
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{0, 16, false, false, false, 8.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
 
         void unpack_superblock_to_int8(
             size_t row_idx,
@@ -4685,6 +4798,12 @@ namespace llaminar2
             size_t k_block_offset) const override;
 
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{5, 16, true, false, false, 15.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
 
         void unpack_superblock_to_int8(
             size_t row_idx,
@@ -4885,6 +5004,12 @@ namespace llaminar2
         float get_block_min(size_t row_idx, size_t k_block_offset) const override { return 0.0f; } // Q5_0 is symmetric
 
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{6, 20, false, false, false, 16.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
 
         void unpack_superblock_to_int8(
             size_t row_idx,
@@ -5088,6 +5213,12 @@ namespace llaminar2
         float get_block_min(size_t row_idx, size_t k_block_offset) const override;
 
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{7, 20, true, false, false, 31.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
 
         void unpack_superblock_to_int8(
             size_t row_idx,
@@ -5274,6 +5405,12 @@ namespace llaminar2
         float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
         float get_block_min(size_t row_idx, size_t k_block_offset) const override;
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{8, 24, true, true, false, 32.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         // Format conversion (TensorBase interface)
@@ -5436,6 +5573,12 @@ namespace llaminar2
         float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
         float get_block_min(size_t row_idx, size_t k_block_offset) const override;
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{10, 8, true, true, true, 3.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         // Format conversion (TensorBase interface)
@@ -5561,6 +5704,12 @@ namespace llaminar2
         float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
         float get_block_min(size_t row_idx, size_t k_block_offset) const override;
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{7, 20, true, true, false, 31.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         DeviceId home_device() const override { return device_; }
@@ -5765,6 +5914,12 @@ namespace llaminar2
         float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
         float get_block_min(size_t row_idx, size_t k_block_offset) const override;
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{9, 12, true, true, false, 4.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         // Format conversion (TensorBase interface)
@@ -5939,6 +6094,12 @@ namespace llaminar2
         float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
         float get_block_min(size_t row_idx, size_t k_block_offset) const override;
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{5, 16, true, true, false, 15.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         // Q8_0 quantization (for quantized GEMM)
@@ -6027,7 +6188,7 @@ namespace llaminar2
     /**
      * @brief Q8_K tensor (8-bit K-quant super-block)
      */
-    class Q8_KTensor : public TypedTensorBase<Q8_KTensor, Q8_KBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class Q8_KTensor : public TypedTensorBase<Q8_KTensor, Q8_KBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -6102,6 +6263,48 @@ namespace llaminar2
 
         // IQ8_0Decodable interface - per-block decode to Q8_0 (used by Q8_0WeightAccessor)
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const override;
+
+        // IINT8Unpackable interface — Q8_K has no per-block scale (scale = 1.0f)
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
+        {
+            // k_block_offset is in 32-element units; Q8_K uses 256-element super-blocks
+            const size_t superblock_idx = k_block_offset / 8;
+            const size_t sub_block = k_block_offset % 8;
+            const Q8_KBlock *block = static_cast<const Q8_KBlock *>(get_raw_block_at(row_idx, superblock_idx));
+            std::memcpy(output, block->qs + sub_block * 32, 32);
+        }
+
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override
+        {
+            (void)row_idx;
+            (void)k_block_offset;
+            return 1.0f; // Q8_K has no per-block scale
+        }
+
+        size_t superblock_size() const override { return 256; }
+
+        /// Efficient override: reads Q8_K superblocks directly via typed_data().
+        /// Q8_K has no per-block scale so values are already int8; only needs
+        /// rescaling to maximize [-127,127] dynamic range.
+        float requantizeRowToInt8(size_t row_idx, size_t K, int8_t *output) const override;
+
+        void unpack_superblock_to_int8(
+            size_t row_idx, size_t superblock_idx,
+            int8_t *output, float *scales = nullptr, float *mins = nullptr) const override
+        {
+            const Q8_KBlock *block = static_cast<const Q8_KBlock *>(get_raw_block_at(row_idx, superblock_idx));
+            std::memcpy(output, block->qs, 256);
+            if (scales)
+            {
+                for (int i = 0; i < 8; ++i)
+                    scales[i] = 1.0f;
+            }
+            if (mins)
+            {
+                for (int i = 0; i < 8; ++i)
+                    mins[i] = 0.0f;
+            }
+        }
 
         // View support (row-slice views for MPI partitioning)
         std::shared_ptr<TensorBase> create_view(
@@ -6330,6 +6533,12 @@ namespace llaminar2
         }
 
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{4, 16, false, true, false, 127.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         // SIMD decode methods (public for testing)
@@ -6507,6 +6716,12 @@ namespace llaminar2
         }
 
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{15, 8, false, true, false, 43.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
@@ -6688,6 +6903,12 @@ namespace llaminar2
         }
 
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{14, 9, true, true, false, 43.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
@@ -6877,6 +7098,12 @@ namespace llaminar2
         }
 
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{12, 12, false, true, false, 62.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         // SIMD decode methods (public for testing)
@@ -7054,6 +7281,12 @@ namespace llaminar2
         }
 
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{13, 9, true, true, false, 43.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
@@ -7239,6 +7472,12 @@ namespace llaminar2
         }
 
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{11, 13, false, true, false, 15.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
@@ -7420,6 +7659,12 @@ namespace llaminar2
         }
 
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{16, 6, true, true, false, 1.125f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
@@ -7601,6 +7846,12 @@ namespace llaminar2
         }
 
         size_t superblock_size() const override { return 256; }
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{17, 6, true, true, false, 1.125f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }

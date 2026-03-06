@@ -433,4 +433,48 @@ namespace llaminar2
         std::memcpy(buffer, temp_fp32.data() + offset, count * sizeof(float));
     }
 
+    // ===== Efficient requantizeRowToInt8 for Q8_K =====
+    // Q8_K has no per-block scale (scale = 1.0), so dequantized values are the raw
+    // int8 qs values. We copy them directly and rescale to maximize [-127,127] range.
+    float Q8_KTensor::requantizeRowToInt8(size_t row_idx, size_t K, int8_t *output) const
+    {
+        const size_t superblocks_per_row = K / Q8_KBlock::BLOCK_SIZE;
+        const Q8_KBlock *all_blocks = typed_data();
+        const Q8_KBlock *row_blocks = all_blocks + row_idx * superblocks_per_row;
+
+        // Phase 1: Copy all qs values and find max absolute value
+        int max_abs_qs = 0;
+        for (size_t sb = 0; sb < superblocks_per_row; ++sb)
+        {
+            std::memcpy(output + sb * 256, row_blocks[sb].qs, 256);
+            for (int i = 0; i < 256; ++i)
+            {
+                int a = row_blocks[sb].qs[i] < 0
+                            ? -static_cast<int>(row_blocks[sb].qs[i])
+                            : static_cast<int>(row_blocks[sb].qs[i]);
+                if (a > max_abs_qs)
+                    max_abs_qs = a;
+            }
+        }
+
+        // Common case: values already fit in [-127, 127]
+        if (max_abs_qs <= 127)
+        {
+            return (max_abs_qs > 0) ? (static_cast<float>(max_abs_qs) / 127.0f) : 1.0f;
+        }
+
+        // Rare: have -128 values. Rescale everything by 128/127.
+        const float row_scale = static_cast<float>(max_abs_qs) / 127.0f;
+        const float inv_row_scale = 127.0f / static_cast<float>(max_abs_qs);
+        for (size_t i = 0; i < K; ++i)
+        {
+            float val = static_cast<float>(output[i]) * inv_row_scale;
+            int32_t q = static_cast<int32_t>(val + (val >= 0.0f ? 0.5f : -0.5f));
+            q = q < -127 ? -127 : (q > 127 ? 127 : q);
+            output[i] = static_cast<int8_t>(q);
+        }
+
+        return row_scale;
+    }
+
 } // namespace llaminar2

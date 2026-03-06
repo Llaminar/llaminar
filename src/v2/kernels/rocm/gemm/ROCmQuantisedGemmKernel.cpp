@@ -72,7 +72,9 @@
  */
 
 #include "ROCmQuantisedGemmKernel.h"
+#include "ActivationQuantLayout.h"
 #include "../ROCmKernelBase.h"
+#include "../ROCmWeightPacker.h"     // packWeightsToROCm, packNativeVNNI
 #include "backends/ComputeBackend.h" // DeviceManager
 #include "backends/DeviceId.h"       // DeviceId
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.
@@ -104,38 +106,6 @@
 #endif
 #include <cstring>
 #include <chrono>
-
-// IQ grid table initialization (implemented in ROCmGemvKernel_native_VNNI.hip)
-extern "C" bool rocmInitIQGridTables(
-    int device_id,
-    const void *h_iq3s_grid, const void *h_iq3xxs_grid,
-    const void *h_iq2s_grid, const void *h_iq2xs_grid,
-    const void *h_iq2xxs_grid, const void *h_iq1s_grid);
-
-// IQ grid table initialization for GEMM TU (implemented in ROCmGemmKernel_native_VNNI.hip)
-extern "C" bool rocmInitIQGridTables_gemm(
-    int device_id,
-    const void *h_iq3s_grid, const void *h_iq3xxs_grid,
-    const void *h_iq2s_grid, const void *h_iq2xs_grid,
-    const void *h_iq2xxs_grid, const void *h_iq1s_grid);
-
-// --------------------------------------------------------------------------
-// Q4_K helper: extract 6-bit scale and min from packed scales[12] array.
-// Matches llama.cpp get_scale_min_k4(). Sub-block index j in [0..7].
-// --------------------------------------------------------------------------
-static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *sc, uint8_t *m)
-{
-    if (j < 4)
-    {
-        *sc = q[j] & 63;
-        *m = q[j + 4] & 63;
-    }
-    else
-    {
-        *sc = (q[j + 4] & 0xF) | (((q[j - 4]) >> 6) << 4);
-        *m = (q[j + 4] >> 4) | (((q[j]) >> 6) << 4);
-    }
-}
 
 namespace llaminar2
 {
@@ -181,6 +151,14 @@ namespace llaminar2
                 const float *d_A_fp32, // [M x K]
                 int8_t *d_A_int8,      // [M x K] output
                 float *d_scales_A,     // [M] output
+                int M, int K,
+                int rocm_device_id, void *stream);
+
+            // Blockwise quantize FP32 activations to INT8 with per-block scales (common .hip)
+            bool rocmQuantGemm_quantizeActivationsBlockwise(
+                const float *d_A_fp32,          // [M x K]
+                int8_t *d_A_int8,               // [M x K] output
+                float *d_scales_blockwise,      // [M x blocks_per_row] output
                 int M, int K,
                 int rocm_device_id, void *stream);
 
@@ -365,6 +343,7 @@ namespace llaminar2
                 const void *d_block_emins,  // uint32_t* (packed FP16 emins, Q2_K only, else NULL)
                 float *d_output,
                 const float *d_scales_A,
+                const float *d_scales_A_blockwise, // [M × blocks_per_row] per-block scales (nullptr = row-wise)
                 int M, int N, int K,
                 uint8_t codebook_id,
                 int device_id, void *stream);
@@ -384,7 +363,8 @@ namespace llaminar2
                 float *d_partial_fp32, // [KB_MAX × N] partial buffer (nullable when KB=1)
                 int N, int K,
                 uint8_t codebook_id,
-                int device_id, void *stream);
+                int device_id, void *stream,
+                const float *d_scale_A_blockwise = nullptr);
 
             // =========================================================================
             // Fused FP32→INT8 quantize + GEMV + scale kernel for decode (M=1)
@@ -600,9 +580,10 @@ namespace llaminar2
 
             // Work buffer pointers - obtained from workspace at execution time
             // These are NOT owned by the kernel - they point into workspace-managed memory
-            int8_t *d_A_int8 = nullptr;   // [M x K] quantized activations
-            float *d_scales_A = nullptr;  // [M] per-row scales
-            int32_t *d_C_int32 = nullptr; // [M x N] INT32 accumulator
+            int8_t *d_A_int8 = nullptr;            // [M x K] quantized activations
+            float *d_scales_A = nullptr;           // [M] per-row scales (row-wise mode)
+            float *d_scales_A_blockwise = nullptr; // [M x blocks_per_row] per-block scales (blockwise mode)
+            int32_t *d_C_int32 = nullptr;          // [M x N] INT32 accumulator
 
             // CK-specific work buffers - also from workspace
             int32_t *d_CK_int32 = nullptr;     // [M x N] CK accumulator
@@ -1325,1302 +1306,9 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // packWeightsToROCm: Convert any quantized tensor to INT8 + scales
+        // Weight packing: see ROCmWeightPacker.cpp
+        // (packNativeVNNI, packWeightsToROCm_Q8_0_fast, packWeightsToROCm)
         // =====================================================================
-
-        bool packNativeVNNI(const TensorBase *tensor, ROCmPackedWeights &out)
-        {
-            if (!tensor)
-                return false;
-
-            const TensorType wt = tensor->native_type();
-
-            // Supported native-VNNI formats: Q4_0, IQ4_NL, Q4_1, Q5_0, Q5_1, IQ4_XS, Q4_K, Q5_K, Q6_K, Q3_K, Q2_K
-            // 32-element block formats have per-block FP16 scale (and optionally min).
-            // IQ4_XS has 256-element super-blocks of 8×32 sub-blocks, each using IQ4_NL LUT.
-            // Q4_K has 256-element super-blocks of 8×32 sub-blocks with packed 6-bit scales/mins.
-            // Q5_K is like Q4_K but with 5th-bit array (qh[32]).
-            // Q6_K has 256-element super-blocks, repacked into 8×32 dual-scale blocks.
-            // Q3_K has 256-element super-blocks, repacked into 8×32 dual-scale blocks (3-bit symmetric).
-            // Q2_K has 256-element super-blocks, repacked into 8×32 dual-scale+min blocks (2-bit asymmetric).
-            // During packing, super-block formats have their sub-block scales precomputed:
-            //   IQ4_XS: d*(ls-32) → FP16, reuses IQ4_NL kernel (codebook_id=4)
-            //   Q4_K:   d*sc → FP16 scale, -dmin*m → FP16 min, reuses Q4_1 kernel (codebook_id=5)
-            //   Q5_K:   d*sc → FP16 scale, -dmin*m → FP16 min, reuses Q5_1 kernel (codebook_id=7)
-            //   Q6_K:   d*scales[lo] → FP16 scale_lo, d*scales[hi] → FP16 scale_hi (codebook_id=8)
-            //   Q3_K:   d*(raw6-32) → FP16 scale_lo/hi (codebook_id=9)
-            //   Q2_K:   d*(sc&0xF) → FP16 scale_lo/hi, -dmin*(sc>>4) → embedded FP16 mins (codebook_id=10)
-            //   IQ3_S:  d*(1+2*nibble) → FP16 scale, grid LUT on GPU, direct signs (codebook_id=11)
-            //   IQ3_XXS:d*(0.5+nibble)*0.5 → FP16 scale, grid LUT on GPU, pre-resolved signs (codebook_id=12)
-            //   IQ2_S:  d*(0.5+nibble)*0.25 → dual FP16, grid LUT, direct signs (codebook_id=13)
-            //   IQ2_XS: d*(0.5+nibble)*0.25 → dual FP16, grid LUT, pre-resolved signs (codebook_id=14)
-            //   IQ2_XXS:d*(0.5+nibble)*0.25 → FP16, grid LUT, pre-resolved signs (codebook_id=15)
-            //
-            // Codebook IDs match the NativeVNNIFormat enum in ROCmGemvKernel_native_VNNI.hip:
-            //   0=Q4_0, 4=IQ4_NL (also IQ4_XS), 5=Q4_1 (also Q4_K), 6=Q5_0,
-            //   7=Q5_1 (also Q5_K), 8=Q6_K, 9=Q3_K, 10=Q2_K,
-            //   11=IQ3_S, 12=IQ3_XXS, 13=IQ2_S, 14=IQ2_XS, 15=IQ2_XXS
-            uint8_t codebook_id;
-            int payload_bytes;
-            bool is_asymmetric;
-            bool is_superblock = false; // IQ4_XS/Q4_K: 256-element super-blocks → 8 sub-blocks of 32
-            float max_abs_factor;       // Conservative max element magnitude / scale
-
-            switch (wt)
-            {
-            case TensorType::Q4_0:
-                codebook_id = 0;
-                payload_bytes = 16;
-                is_asymmetric = false;
-                max_abs_factor = 8.0f; // range [-8,+7]
-                break;
-            case TensorType::IQ4_NL:
-                codebook_id = 4;
-                payload_bytes = 16;
-                is_asymmetric = false;
-                max_abs_factor = 127.0f; // LUT range [-127,+113]
-                break;
-            case TensorType::IQ4_XS:
-                codebook_id = 4; // Reuses IQ4_NL kernel — same LUT decode
-                payload_bytes = 16;
-                is_asymmetric = false;
-                is_superblock = true;
-                max_abs_factor = 127.0f; // LUT range [-127,+113] (same codebook)
-                break;
-            case TensorType::Q4_1:
-                codebook_id = 5;
-                payload_bytes = 16;
-                is_asymmetric = true;
-                max_abs_factor = 15.0f; // range [0,+15]
-                break;
-            case TensorType::Q4_K:
-                codebook_id = 5; // Reuses Q4_1 kernel — same asymmetric nibble decode
-                payload_bytes = 16;
-                is_asymmetric = true;
-                is_superblock = true;
-                max_abs_factor = 15.0f; // range [0,+15] (same nibble range as Q4_1)
-                break;
-            case TensorType::Q5_0:
-                codebook_id = 6;
-                payload_bytes = 20; // qs[16] + qh[4]
-                is_asymmetric = false;
-                max_abs_factor = 16.0f; // range [-16,+15]
-                break;
-            case TensorType::Q5_1:
-                codebook_id = 7;
-                payload_bytes = 20; // qs[16] + qh[4]
-                is_asymmetric = true;
-                max_abs_factor = 31.0f; // range [0,+31]
-                break;
-            case TensorType::Q5_K:
-                codebook_id = 7;    // Reuses Q5_1 kernel — 5-bit asymmetric with min correction
-                payload_bytes = 20; // qs[16] + qh[4] (repacked from super-block)
-                is_asymmetric = true;
-                is_superblock = true;
-                max_abs_factor = 31.0f; // range [0,+31] (same 5-bit range as Q5_1)
-                break;
-            case TensorType::Q6_K:
-                codebook_id = 8;      // New Q6_K kernel — 6-bit symmetric with dual-scale blocks
-                payload_bytes = 24;   // 16B low nibbles + 8B upper 2-bit per 32-element block
-                is_asymmetric = true; // Repurpose mins array for scale_hi (dual-scale)
-                is_superblock = true;
-                max_abs_factor = 32.0f; // range [-32, +31]
-                break;
-            case TensorType::Q3_K:
-                codebook_id = 9;      // Q3_K kernel — 3-bit with BIT_SPREAD decode, dual-scale
-                payload_bytes = 12;   // 8B pre-transposed 2-bit + 4B grouped hbits per 32-element block
-                is_asymmetric = true; // Repurpose mins array for scale_hi (dual-scale)
-                is_superblock = true;
-                max_abs_factor = 4.0f; // range [-4, +3]
-                break;
-            case TensorType::Q2_K:
-                codebook_id = 10;     // Q2_K kernel — 2-bit asymmetric with dual-scale, emins in separate array
-                payload_bytes = 8;    // 8B packed 2-bit per 32-element block (emins stored in native_vnni_emins[])
-                is_asymmetric = true; // Repurpose mins array for scale_hi (dual-scale)
-                is_superblock = true;
-                max_abs_factor = 3.0f; // range [0, +3]
-                break;
-            case TensorType::IQ3_S:
-                codebook_id = 11;
-                payload_bytes = 13; // 8 qs + 1 qh + 4 signs
-                is_asymmetric = false;
-                is_superblock = true;
-                max_abs_factor = 15.0f; // max grid byte value
-                break;
-            case TensorType::IQ3_XXS:
-                codebook_id = 12;
-                payload_bytes = 12; // 8 qs + 4 pre-resolved signs
-                is_asymmetric = false;
-                is_superblock = true;
-                max_abs_factor = 62.0f;
-                break;
-            case TensorType::IQ2_S:
-                codebook_id = 13;
-                payload_bytes = 9;    // 4 qs + 1 qh + 4 signs
-                is_asymmetric = true; // dual scale stored in mins[]
-                is_superblock = true;
-                max_abs_factor = 43.0f;
-                break;
-            case TensorType::IQ2_XS:
-                codebook_id = 14;
-                payload_bytes = 9;    // 4 qs + 1 synth qh + 4 pre-resolved signs
-                is_asymmetric = true; // dual scale stored in mins[]
-                is_superblock = true;
-                max_abs_factor = 43.0f;
-                break;
-            case TensorType::IQ2_XXS:
-                codebook_id = 15;
-                payload_bytes = 8; // 4 qs + 4 pre-resolved signs
-                is_asymmetric = false;
-                is_superblock = true;
-                max_abs_factor = 43.0f;
-                break;
-            case TensorType::IQ1_S:
-                codebook_id = 16;
-                payload_bytes = 6;    // 4 qs_lo + 2 qh_word (scale/min in global arrays)
-                is_asymmetric = true; // delta correction via min = dl * delta
-                is_superblock = true;
-                max_abs_factor = 1.125f; // max |grid + delta| = |1 + 0.125|
-                break;
-            case TensorType::IQ1_M:
-                codebook_id = 17;
-                payload_bytes = 6;    // 4 qs_lo + 2 qh (scales in global arrays, emins baked into grid)
-                is_asymmetric = true; // dual scale + embedded delta corrections
-                is_superblock = true;
-                max_abs_factor = 1.125f;
-                break;
-            default:
-                return false;
-            }
-
-            // Lazy-initialize IQ grid lookup tables in GPU __constant__ memory.
-            // Each device has its own __constant__ memory, so we track which
-            // devices have been initialized.  Thread-safe via static mutex.
-            if (codebook_id >= 11 && codebook_id <= 17)
-            {
-                static std::mutex iq_grid_mutex;
-                static std::set<int> iq_grids_initialized_devices;
-
-                // Determine which GPU is currently active
-                int current_device = 0;
-#ifdef HAVE_ROCM
-                hipGetDevice(&current_device);
-#elif defined(HAVE_CUDA)
-                cudaGetDevice(&current_device);
-#endif
-
-                bool needs_init = false;
-                {
-                    std::lock_guard<std::mutex> lock(iq_grid_mutex);
-                    needs_init = (iq_grids_initialized_devices.find(current_device) ==
-                                  iq_grids_initialized_devices.end());
-                }
-
-                if (needs_init)
-                {
-                    LOG_INFO("[packNativeVNNI] Initializing IQ grid LUT tables on device "
-                             << current_device);
-                    if (!rocmInitIQGridTables(
-                            current_device,
-                            llaminar2::iq3s_grid,
-                            llaminar2::iq3xxs_grid,
-                            llaminar2::iq2s_grid,
-                            llaminar2::iq2xs_grid,
-                            llaminar2::iq2xxs_grid,
-                            llaminar2::iq1s_grid))
-                    {
-                        LOG_ERROR("[packNativeVNNI] Failed to initialize IQ grid tables (GEMV) on device "
-                                  << current_device);
-                        return false;
-                    }
-                    if (!rocmInitIQGridTables_gemm(
-                            current_device,
-                            llaminar2::iq3s_grid,
-                            llaminar2::iq3xxs_grid,
-                            llaminar2::iq2s_grid,
-                            llaminar2::iq2xs_grid,
-                            llaminar2::iq2xxs_grid,
-                            llaminar2::iq1s_grid))
-                    {
-                        LOG_ERROR("[packNativeVNNI] Failed to initialize IQ grid tables (GEMM) on device "
-                                  << current_device);
-                        return false;
-                    }
-
-                    std::lock_guard<std::mutex> lock(iq_grid_mutex);
-                    iq_grids_initialized_devices.insert(current_device);
-                }
-            }
-
-            // Only need IINT8Unpackable for get_block_scale() / get_block_min()
-            auto *quant_accessor = dynamic_cast<const IINT8Unpackable *>(tensor);
-            if (!quant_accessor)
-                return false;
-
-            const int N = static_cast<int>(tensor->rows());
-            const int K = static_cast<int>(tensor->cols());
-            if ((K % 32) != 0)
-                return false;
-
-            const int blocks_per_row = K / 32;
-
-            out.native_vnni_payload.resize(static_cast<size_t>(blocks_per_row) * N * payload_bytes);
-            out.native_vnni_scales.resize(static_cast<size_t>(blocks_per_row) * N);
-            if (is_asymmetric)
-                out.native_vnni_mins.resize(static_cast<size_t>(blocks_per_row) * N);
-            if (tensor->native_type() == TensorType::Q2_K)
-                out.native_vnni_emins.resize(static_cast<size_t>(blocks_per_row) * N);
-            out.native_vnni_codebook_id = codebook_id;
-            out.native_vnni_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
-
-            // Per-row max-abs for CK prefill INT8 requantization compatibility.
-            // The native-VNNI GEMV path doesn't use these, but the force_ck debug path does.
-            out.scales.resize(N);
-#pragma omp parallel for schedule(static)
-            for (int n = 0; n < N; ++n)
-            {
-                float max_abs = 0.0f;
-                for (int b = 0; b < blocks_per_row; ++b)
-                {
-                    const float scale_b = std::abs(quant_accessor->get_block_scale(
-                        static_cast<size_t>(n), static_cast<size_t>(b)));
-                    float block_max = scale_b * max_abs_factor;
-                    if (is_asymmetric)
-                    {
-                        const float min_b = std::abs(quant_accessor->get_block_min(
-                            static_cast<size_t>(n), static_cast<size_t>(b)));
-                        block_max += min_b;
-                    }
-                    max_abs = std::max(max_abs, block_max);
-                }
-                out.scales[n] = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
-            }
-
-            // Interleave payload, scales (and mins) by N for coalesced GPU access.
-            // Access raw blocks via dynamic_cast to concrete tensor type + typed_data().
-            // This avoids ITensorGemmTileDataProvider (being retired).
-            const uint8_t *raw_bytes = static_cast<const uint8_t *>(tensor->raw_data());
-            if (!raw_bytes)
-            {
-                LOG_ERROR("[packNativeVNNI] tensor->raw_data() returned null");
-                return false;
-            }
-
-            bool interleave_error = false;
-#pragma omp parallel for schedule(static)
-            for (int n = 0; n < N; ++n)
-            {
-                if (interleave_error)
-                    continue; // skip remaining rows on error
-                for (int b = 0; b < blocks_per_row; ++b)
-                {
-                    const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
-                    const uint8_t *payload_src = nullptr;
-                    const uint8_t *qh_src = nullptr; // Non-null only for 5-bit formats
-                    uint16_t scale_fp16 = 0;
-                    uint16_t min_fp16 = 0;
-
-                    const size_t block_idx = static_cast<size_t>(n) * blocks_per_row + b;
-
-                    switch (wt)
-                    {
-                    case TensorType::Q4_0:
-                    {
-                        const auto *blk = reinterpret_cast<const Q4_0Block *>(
-                            raw_bytes + block_idx * sizeof(Q4_0Block));
-                        payload_src = blk->qs;
-                        scale_fp16 = blk->d;
-                        break;
-                    }
-                    case TensorType::IQ4_NL:
-                    {
-                        const auto *blk = reinterpret_cast<const IQ4_NLBlock *>(
-                            raw_bytes + block_idx * sizeof(IQ4_NLBlock));
-                        payload_src = blk->qs;
-                        scale_fp16 = blk->d;
-                        break;
-                    }
-                    case TensorType::IQ4_XS:
-                    {
-                        // IQ4_XS: 256-element super-block → 8 sub-blocks of 32 elements
-                        // Each sub-block uses the IQ4_NL LUT (same codebook).
-                        // We precompute the combined scale: d * (ls - 32) → FP16
-                        const int super_blocks_per_row = (K + 255) / 256;
-                        const int sb_idx = b / 8;  // super-block index in this row
-                        const int sub_idx = b % 8; // sub-block within super-block
-                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
-                        const auto *blk = reinterpret_cast<const IQ4_XSBlock *>(
-                            raw_bytes + abs_sb * sizeof(IQ4_XSBlock));
-                        payload_src = blk->qs + sub_idx * 16; // 16 nibble bytes per sub-block
-
-                        // Extract 6-bit sub-block scale: low 4 bits from scales_l, high 2 from scales_h
-                        const int ls = ((blk->scales_l[sub_idx / 2] >> (4 * (sub_idx % 2))) & 0xf) | (((blk->scales_h >> (2 * sub_idx)) & 3) << 4);
-                        const float combined_scale = fp16_to_fp32(blk->d) * static_cast<float>(ls - 32);
-                        scale_fp16 = fp32_to_fp16(combined_scale);
-                        break;
-                    }
-                    case TensorType::Q4_K:
-                    {
-                        // Q4_K: 256-element super-block → 8 sub-blocks of 32 elements
-                        // Asymmetric: value = d*sc*nibble - dmin*m
-                        // Precompute combined scale d*sc → FP16 and combined min -dmin*m → FP16
-                        // This maps to Q4_1 kernel (unsigned nibble [0,15] + min correction)
-                        const int super_blocks_per_row = (K + 255) / 256;
-                        const int sb_idx = b / 8;  // super-block index in this row
-                        const int sub_idx = b % 8; // sub-block within super-block (0-7)
-                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
-                        const auto *blk = reinterpret_cast<const Q4_KBlock *>(
-                            raw_bytes + abs_sb * sizeof(Q4_KBlock));
-
-                        // Q4_K nibble layout: qs[128] → 4 groups of 32 bytes
-                        // Sub-blocks come in pairs sharing 32 qs bytes:
-                        //   sub_idx 0,1 share qs[0..31]  (0=low nibbles, 1=high nibbles)
-                        //   sub_idx 2,3 share qs[32..63] etc.
-                        // The Q4_1 kernel expects 16 bytes in standard GGML nibble packing:
-                        //   byte[i] = elem[i] | (elem[i+16] << 4) for i in [0,15]
-                        // So we must extract 32 nibbles from one half and repack them.
-                        const int group_idx = sub_idx / 2;
-                        const int is_high = sub_idx & 1;
-                        const uint8_t *src32 = blk->qs + group_idx * 32;
-
-                        // Repack: extract 32 nibbles from low or high half, pack into 16 bytes
-                        uint8_t repacked[16];
-                        if (is_high)
-                        {
-                            // Odd sub-block: elem[i] = src32[i] >> 4
-                            for (int i = 0; i < 16; ++i)
-                                repacked[i] = (src32[i] >> 4) | (src32[i + 16] & 0xF0);
-                        }
-                        else
-                        {
-                            // Even sub-block: elem[i] = src32[i] & 0xF
-                            for (int i = 0; i < 16; ++i)
-                                repacked[i] = (src32[i] & 0xF) | ((src32[i + 16] & 0xF) << 4);
-                        }
-
-                        // Copy repacked payload to output
-                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, repacked, 16);
-
-                        // Extract 6-bit scale and min for this sub-block
-                        uint8_t sc, m_val;
-                        get_scale_min_k4(sub_idx, blk->scales, &sc, &m_val);
-                        const float d = fp16_to_fp32(blk->d);
-                        const float dmin = fp16_to_fp32(blk->dmin);
-                        scale_fp16 = fp32_to_fp16(d * static_cast<float>(sc));
-                        min_fp16 = fp32_to_fp16(-dmin * static_cast<float>(m_val));
-
-                        // Payload already written — store scale/min and skip the generic memcpy
-                        out.native_vnni_scales[linear] = scale_fp16;
-                        out.native_vnni_mins[linear] = min_fp16;
-                        continue; // skip generic payload copy below
-                    }
-                    case TensorType::Q5_K:
-                    {
-                        // Q5_K: 256-element super-block → 8 sub-blocks of 32 elements
-                        // Asymmetric: value = d*sc*(nibble + qh_bit*16) - dmin*m
-                        // Reuses Q5_1 kernel: 5-bit unsigned [0,31] + min correction
-                        // Same scales[12] as Q4_K, same qs[128] layout, plus qh[32] for 5th bits
-                        const int super_blocks_per_row = (K + 255) / 256;
-                        const int sb_idx = b / 8;
-                        const int sub_idx = b % 8;
-                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
-                        const auto *blk = reinterpret_cast<const Q5_KBlock *>(
-                            raw_bytes + abs_sb * sizeof(Q5_KBlock));
-
-                        // Nibble repacking: identical to Q4_K
-                        // Sub-blocks come in pairs sharing 32 qs bytes (even=low, odd=high)
-                        const int group_idx = sub_idx / 2;
-                        const int is_high = sub_idx & 1;
-                        const uint8_t *src32 = blk->qs + group_idx * 32;
-
-                        uint8_t repacked_qs[16];
-                        if (is_high)
-                        {
-                            for (int i = 0; i < 16; ++i)
-                                repacked_qs[i] = (src32[i] >> 4) | (src32[i + 16] & 0xF0);
-                        }
-                        else
-                        {
-                            for (int i = 0; i < 16; ++i)
-                                repacked_qs[i] = (src32[i] & 0xF) | ((src32[i + 16] & 0xF) << 4);
-                        }
-
-                        // High-bit extraction: collect bit sub_idx from qh[0..31]
-                        // qh[i] has 8 bits, one per sub-block. Bit sub_idx = 5th bit of element i.
-                        // Pack 32 bits into 4 bytes (same layout as Q5_1Block::qh)
-                        uint8_t repacked_qh[4] = {0, 0, 0, 0};
-                        for (int i = 0; i < 32; ++i)
-                        {
-                            const int bit_val = (blk->qh[i] >> sub_idx) & 1;
-                            repacked_qh[i / 8] |= static_cast<uint8_t>(bit_val << (i % 8));
-                        }
-
-                        // Write payload: 16 bytes nibbles + 4 bytes qh
-                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, repacked_qs, 16);
-                        std::memcpy(dst + 16, repacked_qh, 4);
-
-                        // Extract 6-bit scale and min (same as Q4_K)
-                        uint8_t sc, m_val;
-                        get_scale_min_k4(sub_idx, blk->scales, &sc, &m_val);
-                        const float d = fp16_to_fp32(blk->d);
-                        const float dmin = fp16_to_fp32(blk->dmin);
-                        scale_fp16 = fp32_to_fp16(d * static_cast<float>(sc));
-                        min_fp16 = fp32_to_fp16(-dmin * static_cast<float>(m_val));
-
-                        // Payload already written — store scale/min and skip generic memcpy
-                        out.native_vnni_scales[linear] = scale_fp16;
-                        out.native_vnni_mins[linear] = min_fp16;
-                        continue;
-                    }
-                    case TensorType::Q6_K:
-                    {
-                        // Q6_K: 256-element super-block → 8 dual-scale blocks of 32 elements
-                        // Symmetric: value = d * scales[sub] * (raw6 - 32)
-                        // Each 32-element block has 2 INT8 sub-block scales:
-                        //   scale_lo = d * scales[2*sub_idx]  (elements 0-15)
-                        //   scale_hi = d * scales[2*sub_idx+1] (elements 16-31)
-                        // scale_hi stored in mins array (repurposed for dual-scale)
-                        const int super_blocks_per_row = (K + 255) / 256;
-                        const int sb_idx = b / 8;  // super-block index in this row
-                        const int sub_idx = b % 8; // block within super-block (0-7)
-                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
-                        const auto *blk = reinterpret_cast<const Q6_KBlock *>(
-                            raw_bytes + abs_sb * sizeof(Q6_KBlock));
-
-                        // Decode 32 elements from Q6_K's interleaved storage to raw 6-bit [0,63]
-                        // Q6_K layout: 2 halves × 128 elements, each half has 4 sub-groups
-                        // of 32 that share ql/qh bytes in an interleaved pattern.
-                        const int half = (sub_idx * 32) / 128;             // 0 or 1
-                        const int sub_in_half = (sub_idx * 32 % 128) / 32; // 0-3
-                        const uint8_t *ql = blk->ql + half * 64;
-                        const uint8_t *qh = blk->qh + half * 32;
-
-                        uint8_t raw6[32];
-                        for (int l = 0; l < 32; ++l)
-                        {
-                            switch (sub_in_half)
-                            {
-                            case 0: // ql[l] low nibble, qh[l] bits 0-1
-                                raw6[l] = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
-                                break;
-                            case 1: // ql[l+32] low nibble, qh[l] bits 2-3
-                                raw6[l] = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
-                                break;
-                            case 2: // ql[l] high nibble, qh[l] bits 4-5
-                                raw6[l] = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
-                                break;
-                            case 3: // ql[l+32] high nibble, qh[l] bits 6-7
-                                raw6[l] = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
-                                break;
-                            }
-                        }
-
-                        // Pack raw6[32] into 24-byte Q6_K native-VNNI payload:
-                        //   [0..15]:  ql — paired nibbles = (raw6[i]&0xF) | ((raw6[i+16]&0xF)<<4)
-                        //   [16..23]: qh — packed 2-bit = (raw6[4i]>>4)&3 | ... (4 per byte)
-                        uint8_t payload[24];
-                        for (int i = 0; i < 16; ++i)
-                            payload[i] = (raw6[i] & 0xF) | ((raw6[i + 16] & 0xF) << 4);
-                        for (int i = 0; i < 8; ++i)
-                            payload[16 + i] = ((raw6[4 * i + 0] >> 4) & 3) | (((raw6[4 * i + 1] >> 4) & 3) << 2) | (((raw6[4 * i + 2] >> 4) & 3) << 4) | (((raw6[4 * i + 3] >> 4) & 3) << 6);
-
-                        // Write payload
-                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload, 24);
-
-                        // Compute dual scales from signed INT8 sub-block scales
-                        const float d = fp16_to_fp32(blk->d);
-                        const int8_t *sc = blk->scales;
-                        const int sc_lo_idx = half * 8 + sub_in_half * 2;
-                        const int sc_hi_idx = sc_lo_idx + 1;
-                        scale_fp16 = fp32_to_fp16(d * static_cast<float>(sc[sc_lo_idx]));
-                        min_fp16 = fp32_to_fp16(d * static_cast<float>(sc[sc_hi_idx])); // repurposed as scale_hi
-
-                        // Payload already written — store dual scales and skip generic memcpy
-                        out.native_vnni_scales[linear] = scale_fp16;
-                        out.native_vnni_mins[linear] = min_fp16;
-                        continue;
-                    }
-                    case TensorType::Q3_K:
-                    {
-                        // Q3_K: 256-element super-block → 8 dual-scale blocks of 32 elements
-                        // Symmetric: value = d * (raw6_scale - 32) * (low2 | (hbit<<2) - 4)
-                        // 3-bit: low 2 bits from qs[64] (interleaved), high bit from hmask[32]
-                        // 16 sub-blocks of 16 → paired into 8×32 for dual-scale
-                        //
-                        // 12B native layout: [8B pre-transposed 2-bit][4B grouped hbits]
-                        // - 2-bit: Q2_K-style pre-transpose (byte[j] holds 4 groups' low2)
-                        // - hbits: uint32 where bits [g*4..g*4+3] hold group g's 4 hbits
-                        // Decode: BIT_SPREAD (×0x00204081 & 0x01010101) scatters hbits to bytes
-                        const int super_blocks_per_row = (K + 255) / 256;
-                        const int sb_idx = b / 8;
-                        const int sub_idx = b % 8;
-                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
-                        const auto *blk = reinterpret_cast<const Q3_KBlock *>(
-                            raw_bytes + abs_sb * sizeof(Q3_KBlock));
-
-                        // Extract 32 CONTIGUOUS output elements starting at sub_idx*32.
-                        // Q3_K element i (0-255) in the super-block:
-                        //   qs_byte = (i/128)*32 + (i%32)      (interleaved: each byte holds 4 groups)
-                        //   shift   = ((i%128)/32) * 2          (which 2-bit field in that byte)
-                        //   low 2 bits: qs[qs_byte] >> shift & 3
-                        //   high bit:   hmask[i%32] >> (i/32) & 1
-                        const int base = sub_idx * 32;
-                        uint8_t raw3[32];
-                        for (int e = 0; e < 32; ++e)
-                        {
-                            const int i = base + e;
-                            const int qs_byte = (i / 128) * 32 + (i % 32);
-                            const int shift = ((i % 128) / 32) * 2;
-                            const int low2 = (blk->qs[qs_byte] >> shift) & 3;
-                            const int hbit = (blk->hmask[i % 32] >> (i / 32)) & 1;
-                            raw3[e] = static_cast<uint8_t>(low2 | (hbit << 2));
-                        }
-
-                        // Part 1: 8B pre-transposed 2-bit (Q2_K style)
-                        // byte[h*4+j] holds low2 of elements {hbase+j, hbase+j+4, hbase+j+8, hbase+j+12}
-                        // packed as 2-bit fields at positions {0,2,4,6}
-                        uint8_t payload_buf[12];
-                        for (int h = 0; h < 2; ++h)
-                        {
-                            const int hbase = h * 16;
-                            for (int j = 0; j < 4; ++j)
-                            {
-                                payload_buf[h * 4 + j] = static_cast<uint8_t>(
-                                    (raw3[hbase + j] & 3) |
-                                    ((raw3[hbase + j + 4] & 3) << 2) |
-                                    ((raw3[hbase + j + 8] & 3) << 4) |
-                                    ((raw3[hbase + j + 12] & 3) << 6));
-                            }
-                        }
-
-                        // Part 2: 4B grouped hbits — bit e = high bit of element e
-                        // Groups of 4 consecutive hbits sit at nibble boundaries for BIT_SPREAD decode
-                        uint32_t hbits_u32 = 0;
-                        for (int e = 0; e < 32; ++e)
-                            hbits_u32 |= static_cast<uint32_t>((raw3[e] >> 2) & 1) << e;
-                        std::memcpy(payload_buf + 8, &hbits_u32, 4);
-
-                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload_buf, 12);
-
-                        // Unpack 16 × 6-bit scales from scales[12] and compute dual scales
-                        int8_t unpacked_scales[16];
-                        {
-                            const uint32_t kmask1 = 0x03030303;
-                            const uint32_t kmask2 = 0x0f0f0f0f;
-                            uint32_t aux[4];
-                            std::memcpy(aux, blk->scales, 12);
-                            uint32_t tmp = aux[2];
-                            aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-                            aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-                            aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
-                            aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-                            std::memcpy(unpacked_scales, aux, 16);
-                        }
-
-                        // Contiguous dual scales: elements [base..base+15] → scale[sub_idx*2]
-                        //                         elements [base+16..base+31] → scale[sub_idx*2+1]
-                        const float d = fp16_to_fp32(blk->d);
-                        const int sc_lo_idx = sub_idx * 2;
-                        const int sc_hi_idx = sub_idx * 2 + 1;
-                        scale_fp16 = fp32_to_fp16(d * static_cast<float>(unpacked_scales[sc_lo_idx] - 32));
-                        min_fp16 = fp32_to_fp16(d * static_cast<float>(unpacked_scales[sc_hi_idx] - 32));
-
-                        out.native_vnni_scales[linear] = scale_fp16;
-                        out.native_vnni_mins[linear] = min_fp16;
-                        continue;
-                    }
-                    case TensorType::Q2_K:
-                    {
-                        // Q2_K: 256-element super-block → 8 dual-scale+min blocks of 32 elements
-                        // Asymmetric: value = d * (sc&0xF) * q2 - dmin * (sc>>4)
-                        // 2-bit values from qs[64] (interleaved), 4-bit packed scale+min in scales[16]
-                        const int super_blocks_per_row = (K + 255) / 256;
-                        const int sb_idx = b / 8;
-                        const int sub_idx = b % 8;
-                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
-                        const auto *blk = reinterpret_cast<const Q2_KBlock *>(
-                            raw_bytes + abs_sb * sizeof(Q2_KBlock));
-
-                        // Extract 32 CONTIGUOUS output 2-bit values starting at sub_idx*32.
-                        // Q2_K element i (0-255): same interleaved layout as Q3_K
-                        //   qs_byte = (i/128)*32 + (i%32)
-                        //   shift   = ((i%128)/32) * 2
-                        //   value   = (qs[qs_byte] >> shift) & 3
-                        const int base_elem = sub_idx * 32;
-                        uint8_t raw2[32];
-                        for (int e = 0; e < 32; ++e)
-                        {
-                            const int i = base_elem + e;
-                            const int qs_byte = (i / 128) * 32 + (i % 32);
-                            const int shift = ((i % 128) / 32) * 2;
-                            raw2[e] = (blk->qs[qs_byte] >> shift) & 3;
-                        }
-
-                        // Pre-transposed packing: byte[j] of each half holds one element
-                        // from each of 4 groups at fields 0,1,2,3.  GPU decode becomes
-                        // simple field extraction (AND + shift) with zero v_perm transpose.
-                        //
-                        // half 0: payload[j] = e[j] | e[j+4]<<2 | e[j+8]<<4 | e[j+12]<<6
-                        // half 1: payload[4+j] = e[16+j] | e[16+j+4]<<2 | ...
-                        uint8_t payload_buf[8];
-                        for (int half = 0; half < 2; ++half)
-                        {
-                            const int hbase = half * 16;
-                            for (int j = 0; j < 4; ++j)
-                            {
-                                payload_buf[half * 4 + j] = static_cast<uint8_t>(
-                                    raw2[hbase + j] | (raw2[hbase + j + 4] << 2) | (raw2[hbase + j + 8] << 4) | (raw2[hbase + j + 12] << 6));
-                            }
-                        }
-
-                        // Contiguous dual scales: elements [base..base+15] → scales[sub_idx*2]
-                        //                         elements [base+16..base+31] → scales[sub_idx*2+1]
-                        const int sc_lo_idx = sub_idx * 2;
-                        const int sc_hi_idx = sub_idx * 2 + 1;
-                        const float d_val = fp16_to_fp32(blk->d);
-                        const float dmin = fp16_to_fp32(blk->dmin);
-
-                        // Compute dual scales: d * (sc & 0xF) → FP16
-                        scale_fp16 = fp32_to_fp16(d_val * static_cast<float>(blk->scales[sc_lo_idx] & 0xF));
-                        min_fp16 = fp32_to_fp16(d_val * static_cast<float>(blk->scales[sc_hi_idx] & 0xF));
-
-                        // Store FP16 emins in separate array (not embedded in payload)
-                        // Packed as uint32: {emb_min_lo_fp16, emb_min_hi_fp16}
-                        const uint16_t emb_min_lo = fp32_to_fp16(
-                            -dmin * static_cast<float>(blk->scales[sc_lo_idx] >> 4));
-                        const uint16_t emb_min_hi = fp32_to_fp16(
-                            -dmin * static_cast<float>(blk->scales[sc_hi_idx] >> 4));
-                        out.native_vnni_emins[linear] =
-                            static_cast<uint32_t>(emb_min_lo) | (static_cast<uint32_t>(emb_min_hi) << 16);
-
-                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload_buf, 8);
-
-                        out.native_vnni_scales[linear] = scale_fp16;
-                        out.native_vnni_mins[linear] = min_fp16;
-                        continue;
-                    }
-
-                        // ========== IQ Grid Formats (Tier 3) ==========
-                        // All IQ formats: 256-element super-blocks → 8 sub-blocks of 32
-                        // Grid indices stored compactly; GPU decodes via __constant__ LUT
-                        // Signs either direct bytes (IQ3_S, IQ2_S) or pre-resolved from ksigns_iq2xs
-
-                    case TensorType::IQ3_S:
-                    {
-                        // IQ3_S: 9-bit grid index → iq3s_grid[512], direct sign bytes
-                        // Payload: [qs×8][qh×1][signs×4] = 13 bytes
-                        const int super_blocks_per_row = (K + 255) / 256;
-                        const int sb_idx = b / 8;
-                        const int sub_idx = b % 8;
-                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
-                        const auto *blk = reinterpret_cast<const IQ3_SBlock *>(
-                            raw_bytes + abs_sb * sizeof(IQ3_SBlock));
-
-                        uint8_t payload_buf[13];
-                        // Grid indices: 8 low bytes of 9-bit indices
-                        std::memcpy(payload_buf, blk->qs + sub_idx * 8, 8);
-                        // QH byte: bit g = high bit of grid index g
-                        payload_buf[8] = blk->qh[sub_idx];
-                        // Sign bytes: 4 direct sign bytes (8 bits each, covering 8 elements)
-                        std::memcpy(payload_buf + 9, blk->signs + sub_idx * 4, 4);
-
-                        // Scale: d * (1 + 2 * nibble), from scales[sub_idx/2]
-                        const float d_val = fp16_to_fp32(blk->d);
-                        const uint8_t sc_byte = blk->scales[sub_idx / 2];
-                        const int nibble = (sub_idx & 1) ? (sc_byte >> 4) : (sc_byte & 0xF);
-                        scale_fp16 = fp32_to_fp16(d_val * static_cast<float>(1 + 2 * nibble));
-
-                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload_buf, 13);
-                        out.native_vnni_scales[linear] = scale_fp16;
-                        continue;
-                    }
-                    case TensorType::IQ3_XXS:
-                    {
-                        // IQ3_XXS: 8-bit grid index → iq3xxs_grid[256], indirect signs
-                        // Payload: [qs×8][signs×4] = 12 bytes
-                        const int super_blocks_per_row = (K + 255) / 256;
-                        const int sb_idx = b / 8;
-                        const int sub_idx = b % 8;
-                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
-                        const auto *blk = reinterpret_cast<const IQ3_XXSBlock *>(
-                            raw_bytes + abs_sb * sizeof(IQ3_XXSBlock));
-
-                        uint8_t payload_buf[12];
-                        // Grid indices: 8 bytes (8-bit indices into iq3xxs_grid[256])
-                        std::memcpy(payload_buf, blk->qs + sub_idx * 8, 8);
-
-                        // Scales+signs packed in qs[64..95] as uint32_t per sub-block
-                        uint32_t aux32;
-                        std::memcpy(&aux32, blk->qs + 64 + sub_idx * 4, 4);
-
-                        // Pre-resolve indirect signs via ksigns_iq2xs
-                        payload_buf[8] = llaminar2::ksigns_iq2xs[(aux32 >> 0) & 127];
-                        payload_buf[9] = llaminar2::ksigns_iq2xs[(aux32 >> 7) & 127];
-                        payload_buf[10] = llaminar2::ksigns_iq2xs[(aux32 >> 14) & 127];
-                        payload_buf[11] = llaminar2::ksigns_iq2xs[(aux32 >> 21) & 127];
-
-                        // Scale: d * (0.5 + nibble) * 0.5
-                        const float d_val = fp16_to_fp32(blk->d);
-                        const int nibble = static_cast<int>(aux32 >> 28);
-                        scale_fp16 = fp32_to_fp16(d_val * (0.5f + static_cast<float>(nibble)) * 0.5f);
-
-                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload_buf, 12);
-                        out.native_vnni_scales[linear] = scale_fp16;
-                        continue;
-                    }
-                    case TensorType::IQ2_S:
-                    {
-                        // IQ2_S: 10-bit grid index → iq2s_grid[1024], direct sign bytes, dual scale
-                        // Payload: [qs×4][qh×1][signs×4] = 9 bytes
-                        const int super_blocks_per_row = (K + 255) / 256;
-                        const int sb_idx = b / 8;
-                        const int sub_idx = b % 8;
-                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
-                        const auto *blk = reinterpret_cast<const IQ2_SBlock *>(
-                            raw_bytes + abs_sb * sizeof(IQ2_SBlock));
-
-                        uint8_t payload_buf[9];
-                        // Grid indices: 4 low bytes (low 8 bits of 10-bit index)
-                        std::memcpy(payload_buf, blk->qs + sub_idx * 4, 4);
-                        // QH byte: qh[sub_idx] — 2 bits per group packed as pairs
-                        payload_buf[4] = blk->qh[sub_idx];
-                        // Sign bytes: 4 direct sign bytes from second half of qs[]
-                        std::memcpy(payload_buf + 5, blk->qs + 32 + sub_idx * 4, 4);
-
-                        // Dual scales: d * (0.5 + nibble) * 0.25
-                        const float d_val = fp16_to_fp32(blk->d);
-                        const uint8_t sc = blk->scales[sub_idx];
-                        scale_fp16 = fp32_to_fp16(d_val * (0.5f + static_cast<float>(sc & 0xF)) * 0.25f);
-                        min_fp16 = fp32_to_fp16(d_val * (0.5f + static_cast<float>(sc >> 4)) * 0.25f);
-
-                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload_buf, 9);
-                        out.native_vnni_scales[linear] = scale_fp16;
-                        out.native_vnni_mins[linear] = min_fp16;
-                        continue;
-                    }
-                    case TensorType::IQ2_XS:
-                    {
-                        // IQ2_XS: 9-bit grid index → iq2xs_grid[512], indirect signs, dual scale
-                        // Payload: [qs×4][qh×1][signs×4] = 9 bytes
-                        const int super_blocks_per_row = (K + 255) / 256;
-                        const int sb_idx = b / 8;
-                        const int sub_idx = b % 8;
-                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
-                        const auto *blk = reinterpret_cast<const IQ2_XSBlock *>(
-                            raw_bytes + abs_sb * sizeof(IQ2_XSBlock));
-
-                        uint8_t payload_buf[9];
-                        uint8_t qh_byte = 0;
-                        // Each qs[l] is uint16_t: low 9 bits = grid index, top 7 bits = sign index
-                        for (int l = 0; l < 4; ++l)
-                        {
-                            const uint16_t entry = blk->qs[sub_idx * 4 + l];
-                            payload_buf[l] = static_cast<uint8_t>(entry & 0xFF);      // low 8 of 9-bit index
-                            qh_byte |= static_cast<uint8_t>(((entry >> 8) & 1) << l); // bit 8 → qh bit l
-                            payload_buf[5 + l] = llaminar2::ksigns_iq2xs[entry >> 9]; // pre-resolve sign
-                        }
-                        payload_buf[4] = qh_byte;
-
-                        // Dual scales: d * (0.5 + nibble) * 0.25
-                        const float d_val = fp16_to_fp32(blk->d);
-                        const uint8_t sc = blk->scales[sub_idx];
-                        scale_fp16 = fp32_to_fp16(d_val * (0.5f + static_cast<float>(sc & 0xF)) * 0.25f);
-                        min_fp16 = fp32_to_fp16(d_val * (0.5f + static_cast<float>(sc >> 4)) * 0.25f);
-
-                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload_buf, 9);
-                        out.native_vnni_scales[linear] = scale_fp16;
-                        out.native_vnni_mins[linear] = min_fp16;
-                        continue;
-                    }
-                    case TensorType::IQ2_XXS:
-                    {
-                        // IQ2_XXS: 8-bit grid index → iq2xxs_grid[256], indirect signs
-                        // Payload: [qs×4][signs×4] = 8 bytes
-                        const int super_blocks_per_row = (K + 255) / 256;
-                        const int sb_idx = b / 8;
-                        const int sub_idx = b % 8;
-                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
-                        const auto *blk = reinterpret_cast<const IQ2_XXSBlock *>(
-                            raw_bytes + abs_sb * sizeof(IQ2_XXSBlock));
-
-                        // qs is uint16_t[32] = 64 bytes; each sub-block = 8 bytes as 2×uint32_t
-                        const uint8_t *qs_bytes = reinterpret_cast<const uint8_t *>(blk->qs);
-                        uint32_t aux32[2];
-                        std::memcpy(aux32, qs_bytes + sub_idx * 8, 8);
-
-                        uint8_t payload_buf[8];
-                        // Grid indices: 4 bytes from aux32[0]
-                        payload_buf[0] = static_cast<uint8_t>(aux32[0]);
-                        payload_buf[1] = static_cast<uint8_t>(aux32[0] >> 8);
-                        payload_buf[2] = static_cast<uint8_t>(aux32[0] >> 16);
-                        payload_buf[3] = static_cast<uint8_t>(aux32[0] >> 24);
-                        // Pre-resolve indirect signs from aux32[1]
-                        payload_buf[4] = llaminar2::ksigns_iq2xs[(aux32[1] >> 0) & 127];
-                        payload_buf[5] = llaminar2::ksigns_iq2xs[(aux32[1] >> 7) & 127];
-                        payload_buf[6] = llaminar2::ksigns_iq2xs[(aux32[1] >> 14) & 127];
-                        payload_buf[7] = llaminar2::ksigns_iq2xs[(aux32[1] >> 21) & 127];
-
-                        // Scale: d * (0.5 + nibble) * 0.25
-                        const float d_val = fp16_to_fp32(blk->d);
-                        const int nibble = static_cast<int>(aux32[1] >> 28);
-                        scale_fp16 = fp32_to_fp16(d_val * (0.5f + static_cast<float>(nibble)) * 0.25f);
-
-                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload_buf, 8);
-                        out.native_vnni_scales[linear] = scale_fp16;
-                        continue;
-                    }
-
-                    case TensorType::IQ1_S:
-                    {
-                        // IQ1_S: 11-bit grid index → iq1s_grid[2048], signed values {-1,0,+1}
-                        // Payload: [qs×4][qh_word×2] = 6 bytes
-                        // Delta correction via asymmetric min: min = dl * delta
-                        const int super_blocks_per_row = (K + 255) / 256;
-                        const int sb_idx = b / 8;
-                        const int sub_idx = b % 8;
-                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
-                        const auto *blk = reinterpret_cast<const IQ1_SBlock *>(
-                            raw_bytes + abs_sb * sizeof(IQ1_SBlock));
-
-                        const uint8_t *qs = blk->qs + sub_idx * 4;
-                        uint16_t qh_word;
-                        std::memcpy(&qh_word, &blk->qh[sub_idx], sizeof(uint16_t));
-
-                        uint8_t payload_buf[6];
-                        payload_buf[0] = qs[0];
-                        payload_buf[1] = qs[1];
-                        payload_buf[2] = qs[2];
-                        payload_buf[3] = qs[3];
-                        payload_buf[4] = static_cast<uint8_t>(qh_word & 0xFF);
-                        payload_buf[5] = static_cast<uint8_t>((qh_word >> 8) & 0xFF);
-
-                        // Precompute scale: d * (2 * scale_sel + 1)
-                        const float d_val = fp16_to_fp32(blk->d);
-                        const int scale_sel = (qh_word >> 12) & 7;
-                        const float dl = d_val * (2.0f * static_cast<float>(scale_sel) + 1.0f);
-                        scale_fp16 = fp32_to_fp16(dl);
-
-                        // Delta correction: min = dl * delta, delta = ±0.125
-                        constexpr float IQ1S_DELTA = 0.125f;
-                        const float delta = (qh_word & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        min_fp16 = fp32_to_fp16(dl * delta);
-
-                        // Scale and min stored in global arrays (not embedded in payload)
-                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload_buf, 6);
-                        out.native_vnni_scales[linear] = scale_fp16;
-                        out.native_vnni_mins[linear] = min_fp16;
-                        continue;
-                    }
-
-                    case TensorType::IQ1_M:
-                    {
-                        // IQ1_M: 11-bit grid index → iq1s_grid[2048], dual-scale + per-group delta
-                        //
-                        // Delta baking strategy: grid values are stored ×8 in the kernel's
-                        // 8× lookup table ({-1,1,3}→{-8,8,24}), and ±IQ1S_DELTA (±0.125)
-                        // becomes ±1 added directly to each grid int8 in the decode.
-                        // Scales are stored as dl/8 to compensate, and emin offsets are zero
-                        // since the delta is baked into the grid values.
-                        //
-                        // Payload: [qs×4][qh×2][zero_lo_fp16][zero_hi_fp16][scale_lo_fp16][scale_hi_fp16] = 14 bytes
-                        const int super_blocks_per_row = (K + 255) / 256;
-                        const int sb_idx = b / 8;
-                        const int sub_idx = b % 8;
-                        const size_t abs_sb = static_cast<size_t>(n) * super_blocks_per_row + sb_idx;
-                        const auto *blk = reinterpret_cast<const IQ1_MBlock *>(
-                            raw_bytes + abs_sb * sizeof(IQ1_MBlock));
-
-                        const uint8_t *qs = blk->qs + sub_idx * 4;
-                        const uint8_t *qh = blk->qh + sub_idx * 2;
-
-                        // Reconstruct global FP16 scale from packed high nibbles of scales[]
-                        const uint16_t *sc = reinterpret_cast<const uint16_t *>(blk->scales);
-                        const uint16_t scale_u16 = static_cast<uint16_t>(
-                            (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
-                            ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
-                        const float d_val = fp16_to_fp32(scale_u16);
-
-                        // Per-sub-block dual scales from 3-bit selectors in sc[] words
-                        const int sc_word_idx = sub_idx / 2;
-                        const int sc_bit_offset = 6 * (sub_idx % 2);
-                        const int sc3_lo = (sc[sc_word_idx] >> (sc_bit_offset + 0)) & 0x7;
-                        const int sc3_hi = (sc[sc_word_idx] >> (sc_bit_offset + 3)) & 0x7;
-                        const float dl1 = d_val * (2.0f * static_cast<float>(sc3_lo) + 1.0f);
-                        const float dl2 = d_val * (2.0f * static_cast<float>(sc3_hi) + 1.0f);
-
-                        // Scales divided by 8 to compensate for 8× grid values in kernel
-                        scale_fp16 = fp32_to_fp16(dl1 * 0.125f);
-                        min_fp16 = fp32_to_fp16(dl2 * 0.125f);
-
-                        uint8_t payload_buf[6];
-                        payload_buf[0] = qs[0];
-                        payload_buf[1] = qs[1];
-                        payload_buf[2] = qs[2];
-                        payload_buf[3] = qs[3];
-                        payload_buf[4] = qh[0];
-                        payload_buf[5] = qh[1];
-
-                        // Scale and min stored in global arrays (not embedded in payload).
-                        // Emin = 0: delta is baked into grid values, no asymmetric correction needed.
-                        uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload_buf, 6);
-                        out.native_vnni_scales[linear] = scale_fp16;
-                        out.native_vnni_mins[linear] = min_fp16;
-                        continue;
-                    }
-
-                    case TensorType::Q4_1:
-                    {
-                        const auto *blk = reinterpret_cast<const Q4_1Block *>(
-                            raw_bytes + block_idx * sizeof(Q4_1Block));
-                        payload_src = blk->qs;
-                        scale_fp16 = blk->d;
-                        min_fp16 = blk->m;
-                        break;
-                    }
-                    case TensorType::Q5_0:
-                    {
-                        const auto *blk = reinterpret_cast<const Q5_0Block *>(
-                            raw_bytes + block_idx * sizeof(Q5_0Block));
-                        payload_src = blk->qs;
-                        qh_src = blk->qh;
-                        scale_fp16 = blk->d;
-                        break;
-                    }
-                    case TensorType::Q5_1:
-                    {
-                        const auto *blk = reinterpret_cast<const Q5_1Block *>(
-                            raw_bytes + block_idx * sizeof(Q5_1Block));
-                        payload_src = blk->qs;
-                        qh_src = blk->qh;
-                        scale_fp16 = blk->d;
-                        min_fp16 = blk->m;
-                        break;
-                    }
-                    default:
-                        interleave_error = true;
-                        break;
-                    }
-
-                    if (interleave_error)
-                        break;
-
-                    // Copy payload: qs[16] for 4-bit, qs[16]+qh[4] for 5-bit
-                    uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                    std::memcpy(dst, payload_src, 16);
-                    if (qh_src)
-                        std::memcpy(dst + 16, qh_src, 4);
-
-                    out.native_vnni_scales[linear] = scale_fp16;
-                    if (is_asymmetric)
-                        out.native_vnni_mins[linear] = min_fp16;
-                }
-            }
-
-            if (interleave_error)
-            {
-                LOG_ERROR("[packNativeVNNI] Unexpected type in block loop");
-                return false;
-            }
-
-            LOG_DEBUG("[packNativeVNNI] Built native-VNNI container for " << N << "x" << K
-                                                                          << " (codebook=" << static_cast<int>(out.native_vnni_codebook_id) << ")"
-                                                                          << " payload=" << (out.native_vnni_payload.size() / 1024) << " KB"
-                                                                          << " scales=" << (out.native_vnni_scales.size() * 2 / 1024) << " KB"
-                                                                          << (is_asymmetric ? (" mins=" + std::to_string(out.native_vnni_mins.size() * 2 / 1024) + " KB") : ""));
-            return true;
-        }
-
-        //
-        // This function quantizes weights for CK GEMM using mk_nk_mn layout.
-        //
-        // ## Input Layout (Model Weights)
-        //
-        // Model weights are stored as [N × K] row-major:
-        //   - N = output_features (rows)
-        //   - K = input_features (columns)
-        //   - Element W[n,k] at offset: n * K + k
-        //
-        // ## Output Layout (CK GEMM Weights - mk_nk_mn convention)
-        //
-        // CK's mk_nk_mn layout expects B as [N × K] stored as Column-Major [K × N]:
-        //   - When viewed as B[k,n], element at offset: k + n * K
-        //   - This is EXACTLY the same memory layout as [N × K] Row-Major!
-        //   - W[n,k] at n*K + k == B[k,n] at k + n*K (same offset!)
-        //
-        // ## Key Insight: NO TRANSPOSE NEEDED!
-        //
-        // Model weights [N×K] Row-Major can be directly reinterpreted as
-        // Column-Major [K×N] for CK's mk_nk_mn layout. We just quantize in place.
-        //
-        // ## Quantization
-        //
-        // Per-output-feature (per-row of model weights) symmetric quantization:
-        //   scale[n] = max(|W[n,:]|) / 127.0
-        //   int8[n,k] = round(W[n,k] / scale[n])
-        //
-        // This allows efficient output scaling: output = int32_result * scale_A * scale_B
-        //
-        // =====================================================================
-
-        // =====================================================================
-        // Fast Q8_0 direct path: skip FP32 round-trip entirely.
-        // Q8_0 blocks are {fp16 scale, int8_t qs[32]}. We extract INT8 values
-        // directly and convert per-block scales to per-row scales.
-        // Produces both row-major and VNNI layouts in a single fused pass.
-        // =====================================================================
-        static bool packWeightsToROCm_Q8_0_fast(const TensorBase *tensor, ROCmPackedWeights &out)
-        {
-            const auto *q8_tensor = dynamic_cast<const Q8_0Tensor *>(tensor);
-            if (!q8_tensor)
-                return false;
-
-            const int N = static_cast<int>(tensor->rows());
-            const int K = static_cast<int>(tensor->cols());
-            if (K % 32 != 0)
-                return false; // Q8_0 blocks are 32 elements; non-aligned means partial blocks
-
-            const size_t blocks_per_row = static_cast<size_t>(K) / 32;
-            const Q8_0Block *blocks = q8_tensor->typed_data();
-            if (!blocks)
-                return false;
-
-            out.K = K;
-            out.N = N;
-            out.scales.resize(N);
-            out.int8_data.resize(static_cast<size_t>(N) * K);
-
-            const bool build_vnni = (K % 4) == 0;
-            const size_t k_groups = build_vnni ? (static_cast<size_t>(K) / 4) : 0;
-            if (build_vnni)
-                out.int8_data_vnni.resize(k_groups * static_cast<size_t>(N) * 4);
-            else
-                out.int8_data_vnni.clear();
-
-            // Fused pass: compute per-row scale, rescale INT8 values, emit row-major + VNNI
-#pragma omp parallel for schedule(static)
-            for (int n = 0; n < N; ++n)
-            {
-                const Q8_0Block *row_blocks = blocks + static_cast<size_t>(n) * blocks_per_row;
-
-                // Pass 1: find per-row max absolute dequantized value from block metadata.
-                // For Q8_0, actual value = block_scale * qs[i], and |qs[i]| <= 127.
-                // Per-row max_abs = max over blocks of (block_scale * max(|qs[i]|)).
-                // We can simply find max(block_scale * 127) across all blocks as a
-                // conservative upper bound, OR scan the actual qs values for tighter fit.
-                // For speed, we use the tight path: scan blocks for actual max.
-                float max_abs = 0.0f;
-                for (size_t b = 0; b < blocks_per_row; ++b)
-                {
-                    const float block_scale = fp16_to_fp32(row_blocks[b].d);
-                    // Find max |qs| in this block
-                    int max_qs = 0;
-                    for (int i = 0; i < 32; ++i)
-                    {
-                        int abs_qs = row_blocks[b].qs[i] < 0 ? -row_blocks[b].qs[i] : row_blocks[b].qs[i];
-                        if (abs_qs > max_qs)
-                            max_qs = abs_qs;
-                    }
-                    float val = block_scale * static_cast<float>(max_qs);
-                    if (val > max_abs)
-                        max_abs = val;
-                }
-
-                const float row_scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
-                out.scales[n] = row_scale;
-                const float inv_row_scale = 1.0f / row_scale;
-
-                // Pass 2: rescale and emit both row-major and VNNI in one pass over blocks
-                int8_t *row_dst = out.int8_data.data() + static_cast<size_t>(n) * K;
-
-                for (size_t b = 0; b < blocks_per_row; ++b)
-                {
-                    const Q8_0Block &block = row_blocks[b];
-                    const float rescale = fp16_to_fp32(block.d) * inv_row_scale;
-                    const size_t col_base = b * 32;
-
-                    // Rescale INT8 values: new_qs = round(old_qs * block_scale / row_scale)
-                    for (int i = 0; i < 32; ++i)
-                    {
-                        float val = static_cast<float>(block.qs[i]) * rescale;
-                        int32_t q = static_cast<int32_t>(val + (val >= 0.0f ? 0.5f : -0.5f));
-                        q = q < -127 ? -127 : (q > 127 ? 127 : q);
-                        row_dst[col_base + i] = static_cast<int8_t>(q);
-                    }
-
-                    // Emit VNNI layout inline: [K/4][N][4]
-                    // Each block of 32 elements produces 8 VNNI groups of 4
-                    if (build_vnni)
-                    {
-                        for (int g = 0; g < 8; ++g)
-                        {
-                            const size_t kg = (col_base / 4) + g; // k_group index
-                            const size_t dst_offset = (kg * static_cast<size_t>(N) + static_cast<size_t>(n)) * 4;
-                            const size_t src_offset = col_base + g * 4;
-                            out.int8_data_vnni[dst_offset + 0] = row_dst[src_offset + 0];
-                            out.int8_data_vnni[dst_offset + 1] = row_dst[src_offset + 1];
-                            out.int8_data_vnni[dst_offset + 2] = row_dst[src_offset + 2];
-                            out.int8_data_vnni[dst_offset + 3] = row_dst[src_offset + 3];
-                        }
-                    }
-                }
-            }
-
-            // Phase 3 (opt-in): keep only VNNI host buffer and drop row-major host copy.
-            if (debugEnv().rocm.pack_vnni_only_host && !out.int8_data_vnni.empty())
-            {
-                out.int8_data.clear();
-                out.int8_data.shrink_to_fit();
-            }
-
-            LOG_DEBUG("[packWeightsToROCm] Q8_0 fast-path packed " << N << "x" << K
-                                                                   << " weights (direct INT8, no FP32 round-trip)"
-                                                                   << (out.int8_data_vnni.empty() ? "" : " + VNNI"));
-            return true;
-        }
-
-        bool packWeightsToROCm(const TensorBase *tensor, ROCmPackedWeights &out)
-        {
-            if (!tensor)
-            {
-                LOG_ERROR("[packWeightsToROCm] Null tensor");
-                return false;
-            }
-
-            const int N = static_cast<int>(tensor->rows()); // Output features (model weight rows)
-            const int K = static_cast<int>(tensor->cols()); // Input features (model weight cols)
-
-            out.K = K;
-            out.N = N;
-
-            const TensorType wt = tensor->native_type();
-
-            // ---- Native-VNNI path (≤6-bit formats) ----
-            // These formats get lossless native packing only.
-            // No generic INT8 requantization is performed — the native-VNNI
-            // GEMV and GEMM kernels decode the quantized blocks directly.
-            if (isNativeVnniFormat(wt))
-            {
-                if (!packNativeVNNI(tensor, out))
-                {
-                    LOG_ERROR("[packWeightsToROCm] Native-VNNI packing failed for "
-                              << tensorTypeName(wt) << " " << N << "x" << K);
-                    return false;
-                }
-                LOG_DEBUG("[packWeightsToROCm] Packed " << N << "x" << K << " "
-                                                        << tensorTypeName(wt) << " to native-VNNI only");
-                return true;
-            }
-
-            // ---- INT8-VNNI path (8-bit formats: Q8_0, Q8_1, Q8_K) ----
-            // These formats get symmetric INT8 requantization with per-row scales.
-            // No native-VNNI packing is needed — the INT8-VNNI kernels consume
-            // row-major and VNNI-interleaved INT8 buffers directly.
-            if (isInt8VnniFormat(wt))
-            {
-                // Fast path: Q8_0 direct INT8 extraction (no FP32 round-trip)
-                if (wt == TensorType::Q8_0 && packWeightsToROCm_Q8_0_fast(tensor, out))
-                {
-                    return true;
-                }
-
-                // Generic INT8 path for Q8_1, Q8_K (and Q8_0 if fast path failed)
-                const float *h_weights_fp32 = tensor->fp32_data();
-                if (!h_weights_fp32)
-                {
-                    LOG_ERROR("[packWeightsToROCm] Failed to get FP32 data from "
-                              << tensorTypeName(wt) << " tensor");
-                    return false;
-                }
-
-                out.scales.resize(N);
-                out.int8_data.resize(static_cast<size_t>(N) * K);
-
-                // Per-row (per-output-feature) symmetric quantization
-#pragma omp parallel for schedule(static)
-                for (int n = 0; n < N; ++n)
-                {
-                    float max_abs = 0.0f;
-                    for (int k = 0; k < K; ++k)
-                    {
-                        float val = h_weights_fp32[n * K + k];
-                        max_abs = std::max(max_abs, std::abs(val));
-                    }
-
-                    float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
-                    float inv_scale = 1.0f / scale;
-                    out.scales[n] = scale;
-
-                    for (int k = 0; k < K; ++k)
-                    {
-                        float val = h_weights_fp32[n * K + k];
-                        int8_t quantized = static_cast<int8_t>(
-                            std::round(std::clamp(val * inv_scale, -127.0f, 127.0f)));
-                        out.int8_data[n * K + k] = quantized;
-                    }
-                }
-
-                // VNNI layout: [K/4][N][4]
-                out.int8_data_vnni.clear();
-                if ((K % 4) == 0)
-                {
-                    const size_t k_groups = static_cast<size_t>(K) / 4;
-                    out.int8_data_vnni.resize(k_groups * static_cast<size_t>(N) * 4);
-#pragma omp parallel for schedule(static)
-                    for (int n = 0; n < N; ++n)
-                    {
-                        const size_t row_base = static_cast<size_t>(n) * K;
-                        for (size_t kg = 0; kg < k_groups; ++kg)
-                        {
-                            const size_t src = row_base + kg * 4;
-                            const size_t dst = (kg * static_cast<size_t>(N) + static_cast<size_t>(n)) * 4;
-                            out.int8_data_vnni[dst + 0] = out.int8_data[src + 0];
-                            out.int8_data_vnni[dst + 1] = out.int8_data[src + 1];
-                            out.int8_data_vnni[dst + 2] = out.int8_data[src + 2];
-                            out.int8_data_vnni[dst + 3] = out.int8_data[src + 3];
-                        }
-                    }
-                }
-
-                // Phase 3 (opt-in): keep only VNNI host buffer and drop row-major host copy.
-                if (debugEnv().rocm.pack_vnni_only_host)
-                {
-                    if (!out.int8_data_vnni.empty())
-                    {
-                        out.int8_data.clear();
-                        out.int8_data.shrink_to_fit();
-                        LOG_DEBUG("[packWeightsToROCm] VNNI-only host pack enabled; released row-major host copy for "
-                                  << N << "x" << K << " weights");
-                    }
-                    else
-                    {
-                        LOG_WARN("[packWeightsToROCm] LLAMINAR_ROCM_PACK_VNNI_ONLY=1 requested but VNNI layout unavailable "
-                                 << "(K=" << K << " not divisible by 4). Falling back to row-major host pack.");
-                    }
-                }
-
-                LOG_DEBUG("[packWeightsToROCm] Packed " << N << "x" << K << " "
-                                                        << tensorTypeName(wt) << " to INT8"
-                                                        << (out.int8_data_vnni.empty() ? "" : " + VNNI"));
-                return true;
-            }
-
-            // Unsupported format
-            LOG_ERROR("[packWeightsToROCm] Unsupported tensor type for weight packing: "
-                      << tensorTypeName(wt));
-            return false;
-        }
 
         // =====================================================================
         // Constructor / Destructor
@@ -2646,29 +1334,9 @@ namespace llaminar2
             N_ = weights->rows(); // Output features
             K_ = weights->cols(); // Input features
 
-            // Validate it's a quantized type
+            // Validate it's a quantized type supported by this kernel
             TensorType wt = weights->native_type();
-            bool is_quantized = (wt == TensorType::IQ4_NL ||
-                                 wt == TensorType::Q8_0 ||
-                                 wt == TensorType::Q4_0 ||
-                                 wt == TensorType::Q4_1 ||
-                                 wt == TensorType::Q5_0 ||
-                                 wt == TensorType::Q5_1 ||
-                                 wt == TensorType::Q4_K ||
-                                 wt == TensorType::Q5_K ||
-                                 wt == TensorType::Q6_K ||
-                                 wt == TensorType::Q8_K ||
-                                 wt == TensorType::Q2_K ||
-                                 wt == TensorType::Q3_K ||
-                                 wt == TensorType::Q8_1 ||
-                                 wt == TensorType::IQ4_XS ||
-                                 wt == TensorType::IQ2_XXS ||
-                                 wt == TensorType::IQ2_XS ||
-                                 wt == TensorType::IQ3_XXS ||
-                                 wt == TensorType::IQ2_S ||
-                                 wt == TensorType::IQ3_S ||
-                                 wt == TensorType::IQ1_S ||
-                                 wt == TensorType::IQ1_M);
+            bool is_quantized = isNativeVnniFormat(wt) || isInt8VnniFormat(wt);
 
             if (!is_quantized)
             {
@@ -2783,6 +1451,7 @@ namespace llaminar2
             const int8_t *d_A_int8,
             float *d_output,
             const float *d_scales_A,
+            const float *d_scales_A_blockwise,
             const float *d_scales_B,
             const float *d_bias,
             int m, int n, int k,
@@ -2890,6 +1559,76 @@ namespace llaminar2
             std::chrono::high_resolution_clock::time_point kernel_end{};
             if (profiling_enabled)
                 kernel_start = std::chrono::high_resolution_clock::now();
+
+            if (path == PrefillDispatchPath::NATIVE_VNNI)
+            {
+                LOG_TRACE("[" << callsite << "] Trying native-VNNI prefill (M=" << m
+                                 << " N=" << n << " K=" << k << ")");
+
+                if (!impl_->d_weights_native_payload || !impl_->d_weights_native_scales)
+                {
+                    logFallback("buffers");
+                    return false;
+                }
+
+                native_ok = rocmGemm_native_vnni_fp32(
+                    d_A_int8,
+                    impl_->d_weights_native_payload,
+                    impl_->d_weights_native_scales,
+                    impl_->d_weights_native_mins,
+                    impl_->d_weights_native_emins,
+                    d_output,
+                    d_scales_A,
+                    d_scales_A_blockwise,
+                    m, n, k,
+                    impl_->native_vnni_codebook_id,
+                    rocm_device_id_, gpu_stream_);
+
+                if (profiling_enabled)
+                    kernel_end = std::chrono::high_resolution_clock::now();
+
+                if (!native_ok)
+                {
+                    logFallback("launch_error");
+                    return false;
+                }
+
+                if (profiling_enabled)
+                {
+                    record_kernel_ms(
+                        path,
+                        std::chrono::duration<double, std::milli>(kernel_end - kernel_start).count());
+                }
+
+                if (d_bias)
+                {
+                    std::chrono::high_resolution_clock::time_point epilogue_start{};
+                    if (profiling_enabled)
+                        epilogue_start = std::chrono::high_resolution_clock::now();
+
+                    if (!rocmQuantGemm_biasAdd(
+                            d_output,
+                            d_bias,
+                            m,
+                            n,
+                            rocm_device_id_,
+                            gpu_stream_))
+                    {
+                        logFallback("launch_error");
+                        return false;
+                    }
+
+                    if (profiling_enabled)
+                    {
+                        const auto epilogue_end = std::chrono::high_resolution_clock::now();
+                        record_epilogue_ms(
+                            path,
+                            std::chrono::duration<double, std::milli>(epilogue_end - epilogue_start).count());
+                    }
+                }
+
+                return true;
+            }
 
             if (path == PrefillDispatchPath::INT8_VNNI_NATIVE)
             {
@@ -3517,6 +2256,14 @@ namespace llaminar2
                     const float *d_bias = nullptr;
                     if (bias)
                     {
+                        auto *bias_tensor = const_cast<TensorBase *>(bias);
+                        const auto target_device = DeviceId::rocm(rocm_device_id_);
+                        if (!bias_tensor->ensureOnDevice(target_device))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to upload decode bias tensor to ROCm device");
+                            return false;
+                        }
+
                         if (bias->isBARBacked())
                             d_bias = static_cast<const float *>(bias->rocm_data_ptr());
                         else
@@ -3580,11 +2327,24 @@ namespace llaminar2
                     // =====================================================================
                     if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
                     {
-                        if (!rocmQuantGemm_quantizeActivations(
-                                d_input, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
+                        const bool blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE);
+                        if (blockwise)
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI activation quantization failed");
-                            return false;
+                            if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                                    d_input, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI blockwise activation quantization failed");
+                                return false;
+                            }
+                        }
+                        else
+                        {
+                            if (!rocmQuantGemm_quantizeActivations(
+                                    d_input, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI activation quantization failed");
+                                return false;
+                            }
                         }
 
                         if (!rocmGemv_native_vnni_fp32(
@@ -3598,7 +2358,8 @@ namespace llaminar2
                                 impl_->d_scatter_partial,
                                 n, k,
                                 impl_->native_vnni_codebook_id,
-                                rocm_device_id_, gpu_stream_))
+                                rocm_device_id_, gpu_stream_,
+                                blockwise ? impl_->d_scales_A_blockwise : nullptr))
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI GEMV failed");
                             return false;
@@ -4045,12 +2806,29 @@ namespace llaminar2
             LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Now quantizing activations");
 
             // Quantize activations FP32 → INT8
+            // Blockwise quantization is only used when the kernel's weight format supports native-VNNI
+            // (Q4_0, IQ4_NL, etc.). INT8-VNNI and CK fallback paths require row-wise d_scales_A
+            // which is NOT populated by blockwise quantization.
             if (phase_timing)
                 phase_start = std::chrono::high_resolution_clock::now();
-            if (!rocmQuantGemm_quantizeActivations(d_A_fp32_src, d_A_int8, d_scales_A, m, k, rocm_device_id_, gpu_stream_))
             {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to quantize activations");
-                return false;
+                const bool blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE) && impl_->has_native_vnni;
+                if (blockwise)
+                {
+                    if (!rocmQuantGemm_quantizeActivationsBlockwise(d_A_fp32_src, d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to blockwise-quantize activations");
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!rocmQuantGemm_quantizeActivations(d_A_fp32_src, d_A_int8, d_scales_A, m, k, rocm_device_id_, gpu_stream_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to quantize activations");
+                        return false;
+                    }
+                }
             }
             if (phase_timing)
             {
@@ -4091,9 +2869,17 @@ namespace llaminar2
                 const float *d_prefill_bias = nullptr;
                 if (bias && use_gpu_path)
                 {
-                    d_prefill_bias = bias->isBARBacked()
-                                         ? static_cast<const float *>(bias->rocm_data_ptr())
-                                         : static_cast<const float *>(bias->gpu_data_ptr());
+                    auto *bias_tensor = const_cast<TensorBase *>(bias);
+                    const auto target_device = DeviceId::rocm(rocm_device_id_);
+                    if (!bias_tensor->ensureOnDevice(target_device))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to upload prefill bias tensor to ROCm device");
+                        return false;
+                    }
+
+                    d_prefill_bias = bias_tensor->isBARBacked()
+                                         ? static_cast<const float *>(bias_tensor->rocm_data_ptr())
+                                         : static_cast<const float *>(bias_tensor->gpu_data_ptr());
                 }
 
                 // Try native-VNNI GEMM first (halved HBM bandwidth for Q4_0/IQ4_NL)
@@ -4113,6 +2899,7 @@ namespace llaminar2
                                 impl_->d_weights_native_emins,
                                 d_prefill_output,
                                 d_scales_A,
+                                (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE) ? impl_->d_scales_A_blockwise : nullptr,
                                 m, n, k,
                                 cb_id,
                                 rocm_device_id_, gpu_stream_))
@@ -4167,6 +2954,7 @@ namespace llaminar2
                         d_A_int8,
                         d_prefill_output,
                         d_scales_A,
+                        (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE) ? impl_->d_scales_A_blockwise : nullptr,
                         d_scales_B,
                         d_prefill_bias,
                         m, n, k,
@@ -4745,25 +3533,65 @@ namespace llaminar2
             // Step 2: Validate and populate workspace pointers (shared across all projections)
             validateWorkspace();
 
-            // Step 3: Quantize activations ONCE (shared across all projections)
+            // Step 3: Ensure all projection weights are on GPU before the native-VNNI
+            // pre-scan. has_native_vnni is only set by ensureWeightsConverted(), so we
+            // must call it on every projection kernel before checking the flag.
+            for (size_t pi = 0; pi < projections.size(); ++pi)
+            {
+                auto *rk = dynamic_cast<ROCmQuantisedGemmKernel *>(projections[pi].kernel);
+                if (rk)
+                    rk->ensureWeightsConverted();
+            }
+
+            // Step 4: Quantize activations ONCE (shared across all projections)
             // All M=1 paths now use INT8 scatter kernels which require pre-quantized
             // activations. For M>1, CK GEMM also uses pre-quantized activations.
+            //
+            // Blockwise quantization is only safe when ALL projection kernels use
+            // native-VNNI dispatch. INT8-VNNI and CK paths require row-wise d_scales_A
+            // which blockwise quantization does not populate.
+            bool all_projections_native_vnni = true;
+            for (size_t pi = 0; pi < projections.size(); ++pi)
+            {
+                auto *rk = dynamic_cast<ROCmQuantisedGemmKernel *>(projections[pi].kernel);
+                if (!rk || !rk->impl_ || !rk->impl_->has_native_vnni)
+                {
+                    all_projections_native_vnni = false;
+                    break;
+                }
+            }
             {
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Quantizing activations once, m=" << m << " k=" << k);
 
-                // Note: activations are already on device (d_input), so we can quantize directly
-                if (!rocmQuantGemm_quantizeActivations(
-                        const_cast<float *>(d_input), // Source FP32 on device
-                        impl_->d_A_int8,              // Destination INT8 on device
-                        impl_->d_scales_A,            // Scales on device
-                        m, k, rocm_device_id_, gpu_stream_))
+                const bool blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE) && all_projections_native_vnni;
+                if (blockwise)
                 {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Activation quantization failed");
-                    return false;
+                    if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                            const_cast<float *>(d_input),
+                            impl_->d_A_int8,
+                            impl_->d_scales_A_blockwise,
+                            m, k, rocm_device_id_, gpu_stream_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Blockwise activation quantization failed");
+                        return false;
+                    }
+                }
+                else
+                {
+                    // Note: activations are already on device (d_input), so we can quantize directly
+                    if (!rocmQuantGemm_quantizeActivations(
+                            const_cast<float *>(d_input), // Source FP32 on device
+                            impl_->d_A_int8,              // Destination INT8 on device
+                            impl_->d_scales_A,            // Scales on device
+                            m, k, rocm_device_id_, gpu_stream_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Activation quantization failed");
+                        return false;
+                    }
                 }
             }
 
-            // Step 4: Execute projections using the SHARED quantized activations
+            // Step 5: Execute projections using the SHARED quantized activations
             // For M=1, VNNI projections are batched into a single kernel dispatch.
             // Native-VNNI (Q4/IQ4) and M>1 projections are dispatched individually.
             bool all_success = true;
@@ -4827,10 +3655,8 @@ namespace llaminar2
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                          << " (" << (proj.name ? proj.name : "unnamed") << "): m=" << m << " n=" << n << " k=" << k);
 
-                // Ensure the projection's weights are converted
-                rocm_kernel->ensureWeightsConverted();
-
-                // Validate this projection's workspace is bound and populated
+                // Weights already converted in Step 3 (ensureWeightsConverted loop).
+                // Validate this projection's workspace is bound and populated.
                 rocm_kernel->validateWorkspace();
 
                 // Ensure output tensor is on device
@@ -5007,7 +3833,8 @@ namespace llaminar2
                                 impl_->d_scatter_partial,
                                 n, k,
                                 rocm_kernel->impl_->native_vnni_codebook_id,
-                                rocm_device_id_, gpu_stream_))
+                                rocm_device_id_, gpu_stream_,
+                                (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE) ? impl_->d_scales_A_blockwise : nullptr))
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI GEMV failed for projection " << i);
                             all_success = false;
@@ -5079,10 +3906,13 @@ namespace llaminar2
                 // PREFILL PATH: M>1 CK GEMM
                 // =========================================================================
 
+                const float *blockwise_ptr = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE && all_projections_native_vnni) ? impl_->d_scales_A_blockwise : nullptr;
+
                 if (rocm_kernel->tryPrefillNativeGemm(
                         impl_->d_A_int8,
                         d_output,
                         impl_->d_scales_A,
+                        blockwise_ptr,
                         d_scales_B,
                         d_bias,
                         m, n, k,
@@ -5375,12 +4205,17 @@ namespace llaminar2
             size_t scales_a_bytes = static_cast<size_t>(m) * sizeof(float);
             size_t acc_int32_bytes = static_cast<size_t>(m) * n * sizeof(int32_t);
 
+            // Blockwise activation scales: [M × ceil(K/32)] for blockwise quantization mode
+            const int blocks_per_row = (k + 31) / 32;
+            size_t scales_a_blockwise_bytes = static_cast<size_t>(m) * blocks_per_row * sizeof(float);
+
             // Also need FP32 temp buffers for host→device transfer
             size_t temp_a_fp32_bytes = static_cast<size_t>(m) * k * sizeof(float);
             size_t temp_c_fp32_bytes = static_cast<size_t>(m) * n * sizeof(float);
 
             reqs.buffers.push_back({GemmWorkspaceBuffers::QUANT_A, quant_a_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A, scales_a_bytes, 256, true});
+            reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A_BLOCKWISE, scales_a_blockwise_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32, acc_int32_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_A_FP32, temp_a_fp32_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
@@ -5422,6 +4257,8 @@ namespace llaminar2
             LOG_DEBUG("[ROCmQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
                       << "quant_a=" << (quant_a_bytes / 1024) << "KB, "
                       << "scales_a=" << (scales_a_bytes) << "B, "
+                      << "scales_a_blockwise=" << (scales_a_blockwise_bytes) << "B"
+                      << " (blocks_per_row=" << blocks_per_row << "), "
                       << "acc=" << (acc_int32_bytes / 1024) << "KB, "
                       << "ck_int32=" << (ck_int32_bytes / 1024) << "KB (padded), "
                       << "repack=" << (repack_bytes / 1024) << "KB");
@@ -5780,7 +4617,7 @@ namespace llaminar2
                             }
                         }
 
-                        if (packed_->int8_data_vnni.empty())
+                        if (packed_->int8_data_vnni.empty() && packed_->native_vnni_payload.empty())
                         {
                             LOG_WARN("[ROCmQuantisedGemmKernel] No VNNI layout available. "
                                      "ROCm GEMV/CK prefill paths may not work.");
@@ -5935,7 +4772,9 @@ namespace llaminar2
                 return;
             }
 
-            // Option B (legacy path): Upload only VNNI + scales
+            // Legacy path: upload the packed layouts produced by packWeightsToROCm.
+            // INT8 formats provide VNNI + scales; native-VNNI formats provide
+            // payload + per-block metadata for the dedicated native kernels.
             rocmQuantGemm_setDevice(rocm_device_id_);
 
             // Upload scales
@@ -5981,6 +4820,101 @@ namespace llaminar2
                 }
             }
 
+            // Upload native-VNNI payload + metadata when present.
+            if (!host_packed.native_vnni_payload.empty() && !host_packed.native_vnni_scales.empty())
+            {
+                if (!rocmQuantGemm_allocInt8(reinterpret_cast<int8_t **>(&impl_->d_weights_native_payload),
+                                             host_packed.native_vnni_payload.size(),
+                                             rocm_device_id_))
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI payload");
+                    return;
+                }
+
+                err = hipMemcpy(impl_->d_weights_native_payload,
+                                host_packed.native_vnni_payload.data(),
+                                host_packed.native_vnni_payload.size() * sizeof(uint8_t),
+                                hipMemcpyHostToDevice);
+                if (err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI payload: "
+                              << hipGetErrorString(err));
+                    return;
+                }
+
+                const size_t native_scales_bytes = host_packed.native_vnni_scales.size() * sizeof(uint16_t);
+                err = hipMalloc(&impl_->d_weights_native_scales, native_scales_bytes);
+                if (err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI scales: "
+                              << hipGetErrorString(err));
+                    return;
+                }
+
+                err = hipMemcpy(impl_->d_weights_native_scales,
+                                host_packed.native_vnni_scales.data(),
+                                native_scales_bytes,
+                                hipMemcpyHostToDevice);
+                if (err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI scales: "
+                              << hipGetErrorString(err));
+                    return;
+                }
+
+                if (!host_packed.native_vnni_mins.empty())
+                {
+                    const size_t native_mins_bytes = host_packed.native_vnni_mins.size() * sizeof(uint16_t);
+                    err = hipMalloc(&impl_->d_weights_native_mins, native_mins_bytes);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI mins: "
+                                  << hipGetErrorString(err));
+                        return;
+                    }
+
+                    err = hipMemcpy(impl_->d_weights_native_mins,
+                                    host_packed.native_vnni_mins.data(),
+                                    native_mins_bytes,
+                                    hipMemcpyHostToDevice);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI mins: "
+                                  << hipGetErrorString(err));
+                        return;
+                    }
+                }
+
+                if (!host_packed.native_vnni_emins.empty())
+                {
+                    const size_t native_emins_bytes = host_packed.native_vnni_emins.size() * sizeof(uint32_t);
+                    err = hipMalloc(&impl_->d_weights_native_emins, native_emins_bytes);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI emins: "
+                                  << hipGetErrorString(err));
+                        return;
+                    }
+
+                    err = hipMemcpy(impl_->d_weights_native_emins,
+                                    host_packed.native_vnni_emins.data(),
+                                    native_emins_bytes,
+                                    hipMemcpyHostToDevice);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI emins: "
+                                  << hipGetErrorString(err));
+                        return;
+                    }
+                }
+
+                impl_->native_vnni_codebook_id = host_packed.native_vnni_codebook_id;
+                impl_->native_vnni_blocks_per_row = host_packed.native_vnni_blocks_per_row;
+            }
+
+            impl_->has_native_vnni = (impl_->d_weights_native_payload != nullptr &&
+                                      impl_->d_weights_native_scales != nullptr);
+
             impl_->owns_weight_memory = true; // We now own the device memory
             weights_converted_ = true;
 
@@ -6020,6 +4954,11 @@ namespace llaminar2
             {
                 throw std::runtime_error(
                     "[ROCmQuantisedGemmKernel] Workspace missing required buffer: SCALES_A");
+            }
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE))
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: SCALES_A_BLOCKWISE");
             }
             if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ACC_INT32))
             {
@@ -6072,6 +5011,7 @@ namespace llaminar2
             const auto prev_repack_scratch = impl_->d_B_rowmajor_scratch;
             impl_->d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
             impl_->d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
+            impl_->d_scales_A_blockwise = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
             impl_->d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
             impl_->d_A_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_A_FP32));
             impl_->d_C_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
@@ -6127,225 +5067,7 @@ namespace llaminar2
             int m, int n, int k,
             float alpha, float beta)
         {
-            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] m=" << m << " n=" << n << " k=" << k
-                                                                            << " alpha=" << alpha << " beta=" << beta
-                                                                            << " d_A=" << static_cast<const void *>(d_A)
-                                                                            << " d_C=" << static_cast<void *>(d_C));
-
-            // DECODE FAST PATH: M=1 GEMV
-            if (m == 1)
-            {
-                ensureWeightsConverted();
-                // Option B: weights are VNNI and/or ratio-VNNI on device
-                int8_t *d_vnni = impl_ ? impl_->d_weights_int8_vnni : nullptr;
-                float *d_s = packed_ ? packed_->d_scales : (impl_ ? impl_->d_scales_B : nullptr);
-                if ((impl_ && impl_->has_native_vnni) || (d_vnni && d_s))
-                {
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] GEMV fast path M=1");
-
-                    if (!impl_)
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 GEMV requires impl_ buffers");
-                        return false;
-                    }
-
-                    validateWorkspace();
-
-                    // Native-VNNI path: lossless Q4/IQ4 decode, FP16 block scales, scale_A inline
-                    if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
-                    {
-                        if (!rocmQuantGemm_quantizeActivations(
-                                d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] Native-VNNI activation quantization failed");
-                            return false;
-                        }
-
-                        if (!rocmGemv_native_vnni_fp32(
-                                impl_->d_A_int8,
-                                impl_->d_weights_native_payload,
-                                impl_->d_weights_native_scales,
-                                impl_->d_weights_native_mins,
-                                impl_->d_weights_native_emins,
-                                d_C,
-                                impl_->d_scales_A,
-                                impl_->d_scatter_partial,
-                                n, k,
-                                impl_->native_vnni_codebook_id,
-                                rocm_device_id_, gpu_stream_))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] Native-VNNI GEMV failed");
-                            return false;
-                        }
-                        return true;
-                    }
-
-                    // Use INT8 scatter+reduce GEMV when alpha=1, beta=0 AND VNNI weights available
-                    if (alpha == 1.0f && beta == 0.0f && d_vnni)
-                    {
-                        // Quantize activations (uses shared INT8 buffer)
-                        if (!rocmQuantGemm_quantizeActivations(
-                                d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 scatter activation quantization failed");
-                            return false;
-                        }
-                        if (!rocmGemv_int8_scatter_vnni(
-                                impl_->d_A_int8, d_vnni, d_C, impl_->d_scales_A, d_s, nullptr,
-                                impl_->d_scatter_partial,
-                                n, k, alpha, beta, nullptr,
-                                rocm_device_id_, gpu_stream_))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 scatter GEMV failed");
-                            return false;
-                        }
-                        return true;
-                    }
-
-                    // Fallback: separate quantize → GEMV → applyScaling for non-standard alpha/beta
-                    if (!rocmQuantGemm_quantizeActivations(
-                            d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] Activation quantization failed");
-                        return false;
-                    }
-
-                    const float *d_existing = (beta != 0.0f) ? d_C : nullptr;
-                    bool fused_scale = false;
-                    bool gemv_ok = false;
-                    if (d_vnni)
-                    {
-                        fused_scale = rocmGemv_int8_int8_fp32_vnni_scaled(
-                            impl_->d_A_int8, d_vnni, d_C,
-                            impl_->d_scales_A, d_s,
-                            n, k,
-                            alpha, beta,
-                            d_existing, nullptr,
-                            rocm_device_id_, gpu_stream_);
-
-                        if (!fused_scale)
-                        {
-                            gemv_ok = rocmGemv_int8_int8_int32_vnni(
-                                impl_->d_A_int8, d_vnni, impl_->d_C_int32,
-                                n, k, rocm_device_id_, gpu_stream_);
-                        }
-                    }
-
-                    if (!fused_scale && !gemv_ok)
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 GEMV (VNNI) failed");
-                        return false;
-                    }
-
-                    if (fused_scale)
-                    {
-                        return true;
-                    }
-
-                    return rocmQuantGemm_applyScaling(
-                        impl_->d_C_int32, d_C, impl_->d_scales_A, d_s,
-                        m, n, alpha, beta, d_existing, nullptr, rocm_device_id_, gpu_stream_);
-                }
-            }
-
-            // Ensure weights converted and validate workspace
-            ensureWeightsConverted();
-            validateWorkspace();
-
-            // Option B: Repack VNNI→row-major into workspace scratch for CK GEMM
-            if (!impl_->d_weights_int8_vnni ||
-                !impl_->d_B_rowmajor_scratch)
-            {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] No VNNI weights or repack scratch for CK GEMM");
-                return false;
-            }
-            if (!ensureRepackedWeightsForCK(
-                    impl_.get(), n, k, rocm_device_id_, gpu_stream_,
-                    "ROCmQuantisedGemmKernel::multiply_fp32_to_fp32"))
-            {
-                return false;
-            }
-
-            // Step 1: Quantize FP32 activations to INT8
-            if (!rocmQuantGemm_quantizeActivations(
-                    d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
-            {
-                LOG_ERROR("[ROCmQuantisedGemmKernel] Activation quantization failed");
-                return false;
-            }
-
-            // Step 1b: Try native-VNNI GEMM (halved HBM bandwidth, no epilogue)
-            // This path reads the compact native-VNNI payload (4.5 bpw for Q4_0/IQ4_NL)
-            // directly, decodes to INT8 in-register, and produces FP32 output with
-            // per-block FP16 scales applied inline. No separate scaling epilogue needed.
-            if (m > 1 && impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
-            {
-                const uint8_t cb_id = impl_->native_vnni_codebook_id;
-                {
-                    if (rocmGemm_native_vnni_fp32(
-                            impl_->d_A_int8,
-                            impl_->d_weights_native_payload,
-                            impl_->d_weights_native_scales,
-                            impl_->d_weights_native_mins,
-                            impl_->d_weights_native_emins,
-                            d_C,
-                            impl_->d_scales_A,
-                            m, n, k,
-                            cb_id,
-                            rocm_device_id_, gpu_stream_))
-                    {
-                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] "
-                                  "Native-VNNI GEMM succeeded (M="
-                                  << m << " N=" << n << " K=" << k
-                                  << " codebook=" << static_cast<int>(cb_id) << ")");
-                        return true;
-                    }
-                    // Fall through to INT8 GEMM if native-VNNI GEMM fails
-                    static std::once_flag nvnni_gemm_fallback_once;
-                    std::call_once(nvnni_gemm_fallback_once, [&]()
-                                   { LOG_WARN("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] "
-                                              "Native-VNNI GEMM failed; falling back to INT8 GEMM"); });
-                }
-            }
-
-            if (m > 1 && tryPrefillNativeGemm(
-                             impl_->d_A_int8,
-                             d_C,
-                             impl_->d_scales_A,
-                             impl_->d_scales_B,
-                             nullptr,
-                             m, n, k,
-                             alpha, beta,
-                             "ROCmQuantisedGemmKernel::multiply_fp32_to_fp32"))
-            {
-                return true;
-            }
-
-            // Step 2: Execute CK INT8 GEMM (two-kernel approach: GEMM + scaling separately)
-            // The two-kernel cached version takes a pre-allocated INT32 buffer
-            if (!rocmQuantGemm_executeTwoKernel_cached(
-                    impl_->d_A_int8, impl_->d_B_rowmajor_scratch,
-                    d_C, // Output FP32
-                    impl_->d_scales_A, impl_->d_scales_B,
-                    impl_->d_C_int32, // Pre-allocated INT32 accumulator
-                    m, n, k, rocm_device_id_, gpu_stream_, impl_->ck_kernel_context))
-            {
-                LOG_ERROR("[ROCmQuantisedGemmKernel] CK two-kernel GEMM failed");
-                return false;
-            }
-
-            // Note: The two-kernel approach already applies scaling with alpha=1.0, beta=0.0
-            // If we need different alpha/beta, we'd need to use the full rocmQuantGemm_applyScaling
-            // For now, the simple path works since alpha=1.0 and beta=0.0 is the common case
-            if (alpha != 1.0f || beta != 0.0f)
-            {
-                LOG_WARN("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] "
-                         "Non-trivial alpha/beta not yet supported (alpha="
-                         << alpha << " beta=" << beta << ")");
-            }
-
-            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] Complete");
-            return true;
+            return multiply_fp32_to_fp32_with_bias(d_A, d_C, nullptr, m, n, k, alpha, beta);
         }
 
         bool ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias(
@@ -6381,11 +5103,24 @@ namespace llaminar2
                     // Native-VNNI path: lossless Q4/IQ4 decode, FP16 block scales, scale_A inline
                     if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
                     {
-                        if (!rocmQuantGemm_quantizeActivations(
-                                d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
+                        const bool blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE);
+                        if (blockwise)
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI activation quantization failed");
-                            return false;
+                            if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                                    d_A, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI blockwise activation quantization failed");
+                                return false;
+                            }
+                        }
+                        else
+                        {
+                            if (!rocmQuantGemm_quantizeActivations(
+                                    d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI activation quantization failed");
+                                return false;
+                            }
                         }
 
                         if (!rocmGemv_native_vnni_fp32(
@@ -6399,7 +5134,8 @@ namespace llaminar2
                                 impl_->d_scatter_partial,
                                 n, k,
                                 impl_->native_vnni_codebook_id,
-                                rocm_device_id_, gpu_stream_))
+                                rocm_device_id_, gpu_stream_,
+                                blockwise ? impl_->d_scales_A_blockwise : nullptr))
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI GEMV failed");
                             return false;
@@ -6499,11 +5235,27 @@ namespace llaminar2
             }
 
             // Step 1: Quantize FP32 activations to INT8
-            if (!rocmQuantGemm_quantizeActivations(
-                    d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
+            // Blockwise only when native-VNNI (INT8-VNNI and CK need row-wise d_scales_A)
             {
-                LOG_ERROR("[ROCmQuantisedGemmKernel] Activation quantization failed");
-                return false;
+                const bool blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE) && impl_->has_native_vnni;
+                if (blockwise)
+                {
+                    if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                            d_A, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Blockwise activation quantization failed");
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!rocmQuantGemm_quantizeActivations(
+                            d_A, impl_->d_A_int8, impl_->d_scales_A, m, k, rocm_device_id_, gpu_stream_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel] Activation quantization failed");
+                        return false;
+                    }
+                }
             }
 
             // Step 1b: Try native-VNNI GEMM (halved HBM bandwidth, no epilogue)
@@ -6521,6 +5273,7 @@ namespace llaminar2
                         impl_->d_weights_native_emins,
                         d_C,
                         impl_->d_scales_A,
+                        (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE) ? impl_->d_scales_A_blockwise : nullptr,
                         m, n, k,
                         cb_id,
                         rocm_device_id_, gpu_stream_))
@@ -6550,6 +5303,7 @@ namespace llaminar2
                              impl_->d_A_int8,
                              d_C,
                              impl_->d_scales_A,
+                             (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE) ? impl_->d_scales_A_blockwise : nullptr,
                              impl_->d_scales_B,
                              d_bias,
                              m, n, k,
@@ -6559,23 +5313,41 @@ namespace llaminar2
                 return true;
             }
 
-            // Step 2: Execute CK INT8 GEMM → INT32 (no scaling)
-            if (!rocmQuantGemm_executeNoScale(
-                    impl_->d_A_int8, impl_->d_B_rowmajor_scratch, impl_->d_C_int32,
-                    m, n, k, rocm_device_id_, gpu_stream_, impl_->ck_kernel_context))
+            // Step 2+3: CK INT8 GEMM with scaling
+            // Fast path: fused two-kernel approach (GEMM + scaling in one cached dispatch)
+            // when no bias and standard alpha/beta. Otherwise, separate GEMM + scaling epilogue.
+            if (!d_bias && alpha == 1.0f && beta == 0.0f)
             {
-                LOG_ERROR("[ROCmQuantisedGemmKernel] CK NoScale GEMM failed");
-                return false;
+                if (!rocmQuantGemm_executeTwoKernel_cached(
+                        impl_->d_A_int8, impl_->d_B_rowmajor_scratch,
+                        d_C,
+                        impl_->d_scales_A, impl_->d_scales_B,
+                        impl_->d_C_int32,
+                        m, n, k, rocm_device_id_, gpu_stream_, impl_->ck_kernel_context))
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel] CK two-kernel fused GEMM failed");
+                    return false;
+                }
             }
-
-            // Step 3: Apply scaling with alpha, beta, and bias
-            const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
-            if (!rocmQuantGemm_applyScaling(
-                    impl_->d_C_int32, d_C, impl_->d_scales_A, impl_->d_scales_B,
-                    m, n, alpha, beta, d_C_existing, d_bias, rocm_device_id_, gpu_stream_))
+            else
             {
-                LOG_ERROR("[ROCmQuantisedGemmKernel] Scaling with bias failed");
-                return false;
+                // Separate GEMM → INT32, then scaling epilogue with bias/alpha/beta
+                if (!rocmQuantGemm_executeNoScale(
+                        impl_->d_A_int8, impl_->d_B_rowmajor_scratch, impl_->d_C_int32,
+                        m, n, k, rocm_device_id_, gpu_stream_, impl_->ck_kernel_context))
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel] CK NoScale GEMM failed");
+                    return false;
+                }
+
+                const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
+                if (!rocmQuantGemm_applyScaling(
+                        impl_->d_C_int32, d_C, impl_->d_scales_A, impl_->d_scales_B,
+                        m, n, alpha, beta, d_C_existing, d_bias, rocm_device_id_, gpu_stream_))
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel] Scaling with bias failed");
+                    return false;
+                }
             }
 
             LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete");

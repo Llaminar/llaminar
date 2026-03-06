@@ -23,8 +23,11 @@
 #include <gtest/gtest.h>
 
 // Include project headers
+#include "backends/DeviceId.h"
+#include "execution/factory/InferenceRunnerFactory.h"
 #include "tensors/Tensors.h"
 #include "execution/config/RuntimeConfig.h"
+#include "loaders/ModelContext.h"
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -36,6 +39,7 @@
 
 #include <vector>
 #include <cmath>
+#include <fstream>
 #include <random>
 #include <iostream>
 #include <iomanip>
@@ -45,6 +49,7 @@ using namespace llaminar2::test;
 
 namespace
 {
+    const std::string TEST_MODEL_PATH = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
 
     // ============================================================================
     // ROCm Availability Check
@@ -668,6 +673,174 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_ApplyTensor)
 
     EXPECT_GE(cosine, 0.9999) << "Cosine similarity too low - apply_tensor() may have pointer issues";
     EXPECT_LE(l2_error, 0.01) << "L2 error too high";
+}
+
+TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_RealQwen2Layer21InputParity)
+{
+    SKIP_IF_NO_ROCM();
+
+    std::ifstream model_file(TEST_MODEL_PATH);
+    if (!model_file.good())
+    {
+        GTEST_SKIP() << "Test model not found: " << TEST_MODEL_PATH;
+    }
+
+    auto prefix_ctx = ModelContext::createForPPStage(TEST_MODEL_PATH, 0, 21, true, false);
+    auto full_ctx = ModelContext::create(TEST_MODEL_PATH);
+    ASSERT_NE(prefix_ctx, nullptr);
+    ASSERT_NE(full_ctx, nullptr);
+
+    FactoryPPStageConfig config;
+    config.first_layer = 0;
+    config.last_layer = 21;
+    config.has_embedding = true;
+    config.has_lm_head = false;
+    ASSERT_TRUE(config.isValid());
+
+    auto prefix_runner = createPPStageRunner(prefix_ctx, DeviceId::cpu(), config);
+    ASSERT_NE(prefix_runner, nullptr);
+
+    constexpr int seq_len = 64;
+    std::vector<int> tokens(seq_len);
+    for (int i = 0; i < seq_len; ++i)
+    {
+        tokens[i] = i % 1024;
+    }
+
+    ASSERT_TRUE(prefix_runner->forward(tokens.data(), seq_len));
+
+    TensorBase *hidden = prefix_runner->getHiddenState();
+    ASSERT_NE(hidden, nullptr);
+
+    const int rows = static_cast<int>(hidden->rows());
+    const int cols = static_cast<int>(hidden->cols());
+    const size_t total = hidden->numel();
+    constexpr float epsilon = 1e-6f;
+
+    auto input = TestTensorFactory::createFP32({rows, cols});
+    std::memcpy(input->mutable_data(), hidden->data(), total * sizeof(float));
+
+    auto gamma = full_ctx->getWeightForDevice("blk.21.attn_norm.weight", DeviceId::cpu());
+    ASSERT_NE(gamma, nullptr) << "Missing blk.21.attn_norm.weight";
+
+    auto cpu_output = TestTensorFactory::createFP32({rows, cols});
+    auto rocm_output = TestTensorFactory::createFP32({rows, cols});
+
+    CPURMSNormKernelT<ActivationPrecision::FP32> cpu_kernel;
+    cpu_kernel.apply(
+        input->data(), gamma->data(), cpu_output->mutable_data(),
+        rows, cols, epsilon, false, nullptr, -1);
+
+    DeviceId rocm_device = DeviceId::rocm(0);
+    ASSERT_TRUE(input->ensureOnDevice(rocm_device));
+    ASSERT_TRUE(gamma->ensureOnDevice(rocm_device));
+    ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device));
+
+    llaminar2::rocm::ROCmRMSNormKernelT<ActivationPrecision::FP32> rocm_kernel;
+    ASSERT_TRUE(rocm_kernel.apply_tensor(
+        input.get(), gamma.get(), rocm_output.get(),
+        rows, cols, epsilon, nullptr, 0));
+
+    hipDeviceSynchronize();
+    rocm_output->mark_device_dirty();
+    const float *result = rocm_output->data();
+
+    ASSERT_FALSE(hasNaNOrInf(result, total)) << "ROCm output contains NaN/Inf";
+
+    double cosine = cosineSimilarity(result, cpu_output->data(), total);
+    double l2_error = relativeL2Error(result, cpu_output->data(), total);
+
+    std::cout << "  RMSNorm FP32 Real Qwen2 layer21 input: cosine=" << std::setprecision(8) << cosine
+              << ", L2_error=" << (l2_error * 100.0) << "%" << std::endl;
+
+    EXPECT_GE(cosine, 0.9999)
+        << "ROCm RMSNorm diverges on real layer-21 hidden state input";
+    EXPECT_LE(l2_error, 0.01)
+        << "ROCm RMSNorm L2 error too high on real layer-21 hidden state input";
+}
+
+TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_RealQwen2Layer3InputParity)
+{
+    SKIP_IF_NO_ROCM();
+
+    std::ifstream model_file(TEST_MODEL_PATH);
+    if (!model_file.good())
+    {
+        GTEST_SKIP() << "Test model not found: " << TEST_MODEL_PATH;
+    }
+
+    auto prefix_ctx = ModelContext::createForPPStage(TEST_MODEL_PATH, 0, 3, true, false);
+    auto full_ctx = ModelContext::create(TEST_MODEL_PATH);
+    ASSERT_NE(prefix_ctx, nullptr);
+    ASSERT_NE(full_ctx, nullptr);
+
+    FactoryPPStageConfig config;
+    config.first_layer = 0;
+    config.last_layer = 3;
+    config.has_embedding = true;
+    config.has_lm_head = false;
+    ASSERT_TRUE(config.isValid());
+
+    auto prefix_runner = createPPStageRunner(prefix_ctx, DeviceId::cpu(), config);
+    ASSERT_NE(prefix_runner, nullptr);
+
+    constexpr int seq_len = 64;
+    std::vector<int> tokens(seq_len);
+    for (int i = 0; i < seq_len; ++i)
+    {
+        tokens[i] = i % 1024;
+    }
+
+    ASSERT_TRUE(prefix_runner->forward(tokens.data(), seq_len));
+
+    TensorBase *hidden = prefix_runner->getHiddenState();
+    ASSERT_NE(hidden, nullptr);
+
+    const int rows = static_cast<int>(hidden->rows());
+    const int cols = static_cast<int>(hidden->cols());
+    const size_t total = hidden->numel();
+    constexpr float epsilon = 1e-6f;
+
+    auto input = TestTensorFactory::createFP32({rows, cols});
+    std::memcpy(input->mutable_data(), hidden->data(), total * sizeof(float));
+
+    auto gamma = full_ctx->getWeightForDevice("blk.3.attn_norm.weight", DeviceId::cpu());
+    ASSERT_NE(gamma, nullptr) << "Missing blk.3.attn_norm.weight";
+
+    auto cpu_output = TestTensorFactory::createFP32({rows, cols});
+    auto rocm_output = TestTensorFactory::createFP32({rows, cols});
+
+    CPURMSNormKernelT<ActivationPrecision::FP32> cpu_kernel;
+    cpu_kernel.apply(
+        input->data(), gamma->data(), cpu_output->mutable_data(),
+        rows, cols, epsilon, false, nullptr, -1);
+
+    DeviceId rocm_device = DeviceId::rocm(0);
+    ASSERT_TRUE(input->ensureOnDevice(rocm_device));
+    ASSERT_TRUE(gamma->ensureOnDevice(rocm_device));
+    ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device));
+
+    llaminar2::rocm::ROCmRMSNormKernelT<ActivationPrecision::FP32> rocm_kernel;
+    ASSERT_TRUE(rocm_kernel.apply_tensor(
+        input.get(), gamma.get(), rocm_output.get(),
+        rows, cols, epsilon, nullptr, 0));
+
+    hipDeviceSynchronize();
+    rocm_output->mark_device_dirty();
+    const float *result = rocm_output->data();
+
+    ASSERT_FALSE(hasNaNOrInf(result, total)) << "ROCm output contains NaN/Inf";
+
+    double cosine = cosineSimilarity(result, cpu_output->data(), total);
+    double l2_error = relativeL2Error(result, cpu_output->data(), total);
+
+    std::cout << "  RMSNorm FP32 Real Qwen2 layer3 input: cosine=" << std::setprecision(8) << cosine
+              << ", L2_error=" << (l2_error * 100.0) << "%" << std::endl;
+
+    EXPECT_GE(cosine, 0.9999)
+        << "ROCm RMSNorm diverges on real layer-3 hidden state input";
+    EXPECT_LE(l2_error, 0.01)
+        << "ROCm RMSNorm L2 error too high on real layer-3 hidden state input";
 }
 
 #else // !HAVE_ROCM

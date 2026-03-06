@@ -42,7 +42,7 @@ Where:
 
 Ground truth validation against PyTorch reference implementation.
 - **Tested**: Llaminar FP32 inference pipeline
-- **Reference**: PyTorch snapshots from `python/reference/generate_qwen2_pipeline_snapshots.py`
+- **Reference**: PyTorch snapshots from `python/reference/generate_qwen_pipeline_snapshots.py`
 - **Purpose**: Ensure Llaminar produces identical results to PyTorch
 
 ### Internal Comparisons (`internal/`)

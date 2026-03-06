@@ -245,6 +245,39 @@ namespace llaminar2
         // Kernel execution
         table << "Kernel Execution" << fmt(total_execute_ms, 2) << per_tok(total_execute_ms) << pct(total_execute_ms) << fort::endr;
 
+        if (!stage_type_execute_ms.empty())
+        {
+            table << fort::separator;
+            table << "STAGE EXECUTION BY TYPE:" << "" << "" << "" << fort::endr;
+
+            std::vector<std::pair<std::string, double>> stage_type_rows(
+                stage_type_execute_ms.begin(), stage_type_execute_ms.end());
+            std::sort(stage_type_rows.begin(), stage_type_rows.end(),
+                      [](const auto &a, const auto &b)
+                      {
+                          return a.second > b.second;
+                      });
+
+            for (const auto &[stage_type, execute_ms_by_type] : stage_type_rows)
+            {
+                std::ostringstream label;
+                label << "  " << stage_type;
+
+                auto count_it = stage_type_counts.find(stage_type);
+                if (count_it != stage_type_counts.end())
+                    label << " (" << count_it->second << ")";
+
+                const double execute_share = total_execute_ms > 0.0
+                                                 ? (execute_ms_by_type / total_execute_ms) * 100.0
+                                                 : 0.0;
+                table << label.str()
+                      << fmt(execute_ms_by_type, 2)
+                      << per_tok(execute_ms_by_type)
+                      << (fmt(execute_share, 1) + "% of exec")
+                      << fort::endr;
+            }
+        }
+
         // Separator before coherence
         table << fort::separator;
         table << "COHERENCE OVERHEAD:" << "" << "" << "" << fort::endr;
@@ -2149,6 +2182,9 @@ namespace llaminar2
             stats_.stage_times_ms[node.name] = total_ms;
             stats_.total_execute_ms += execute_ms;
             stats_.total_stages_executed++;
+            const std::string stage_type_name = computeStageTypeName(node.stage->type());
+            stats_.stage_type_execute_ms[stage_type_name] += execute_ms;
+            stats_.stage_type_counts[stage_type_name]++;
 
             // Accumulate overhead breakdown
             stats_.overhead.input_cohere_ms += input_cohere_ms;
@@ -2653,6 +2689,11 @@ namespace llaminar2
         if (config_.enable_profiling)
         {
             stats_.stage_times_ms[node.name] = ms;
+            stats_.total_execute_ms += ms;
+            stats_.total_stages_executed++;
+            const std::string stage_type_name = computeStageTypeName(node.stage->type());
+            stats_.stage_type_execute_ms[stage_type_name] += ms;
+            stats_.stage_type_counts[stage_type_name]++;
             LOG_DEBUG("[DeviceGraphExecutor] ALLREDUCE '" << node.name << "' via CollectiveContext took " << ms << " ms");
         }
 
@@ -2746,6 +2787,11 @@ namespace llaminar2
         if (config_.enable_profiling)
         {
             stats_.stage_times_ms[node.name] = ms;
+            stats_.total_execute_ms += ms;
+            stats_.total_stages_executed++;
+            const std::string stage_type_name = computeStageTypeName(node.stage->type());
+            stats_.stage_type_execute_ms[stage_type_name] += ms;
+            stats_.stage_type_counts[stage_type_name]++;
             LOG_DEBUG("[DeviceGraphExecutor] ALLGATHER '" << node.name << "' via CollectiveContext took " << ms << " ms");
         }
 
@@ -2812,6 +2858,11 @@ namespace llaminar2
             if (config_.enable_profiling)
             {
                 stats_.stage_times_ms[node.name] = ms;
+                stats_.total_execute_ms += ms;
+                stats_.total_stages_executed++;
+                const std::string stage_type_name = computeStageTypeName(node.stage->type());
+                stats_.stage_type_execute_ms[stage_type_name] += ms;
+                stats_.stage_type_counts[stage_type_name]++;
             }
             LOG_DEBUG("[DeviceGraphExecutor] Strided ALLGATHER '" << node.name << "' via NCCL took " << ms << " ms");
         }

@@ -5,6 +5,7 @@
  */
 
 #include "TensorClasses.h"
+#include "VnniPackContext.h"
 #include "../kernels/KernelFactory.h"
 #include "SIMDHelpers.h"
 #include <cstring>
@@ -787,6 +788,69 @@ namespace llaminar2
         std::vector<float> temp_fp32(element_count());
         to_fp32(temp_fp32.data());
         std::memcpy(buffer, temp_fp32.data() + offset, count * sizeof(float));
+    }
+
+
+    void Q3_KTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    {
+        const size_t linear = vnniLinearIdx(ctx, n, b);
+        const int sb_per_row = vnniSuperBlocksPerRow(ctx.K);
+        const int sb_idx = b / 8;
+        const int sub_idx = b % 8;
+        const auto *blk = &typed_data()[static_cast<size_t>(n) * sb_per_row + sb_idx];
+
+        const int base = sub_idx * 32;
+        uint8_t raw3[32];
+        for (int e = 0; e < 32; ++e)
+        {
+            const int i = base + e;
+            const int qs_byte = (i / 128) * 32 + (i % 32);
+            const int shift = ((i % 128) / 32) * 2;
+            const int low2 = (blk->qs[qs_byte] >> shift) & 3;
+            const int hbit = (blk->hmask[i % 32] >> (i / 32)) & 1;
+            raw3[e] = static_cast<uint8_t>(low2 | (hbit << 2));
+        }
+
+        uint8_t payload_buf[12];
+        for (int h = 0; h < 2; ++h)
+        {
+            const int hbase = h * 16;
+            for (int j = 0; j < 4; ++j)
+            {
+                payload_buf[h * 4 + j] = static_cast<uint8_t>(
+                    (raw3[hbase + j] & 3) |
+                    ((raw3[hbase + j + 4] & 3) << 2) |
+                    ((raw3[hbase + j + 8] & 3) << 4) |
+                    ((raw3[hbase + j + 12] & 3) << 6));
+            }
+        }
+
+        uint32_t hbits_u32 = 0;
+        for (int e = 0; e < 32; ++e)
+            hbits_u32 |= static_cast<uint32_t>((raw3[e] >> 2) & 1) << e;
+        std::memcpy(payload_buf + 8, &hbits_u32, 4);
+
+        std::memcpy(vnniPayloadDst(ctx, linear), payload_buf, 12);
+
+        int8_t unpacked_scales[16];
+        {
+            const uint32_t kmask1 = 0x03030303;
+            const uint32_t kmask2 = 0x0f0f0f0f;
+            uint32_t aux[4];
+            std::memcpy(aux, blk->scales, 12);
+            uint32_t tmp = aux[2];
+            aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+            aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+            aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+            aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+            std::memcpy(unpacked_scales, aux, 16);
+        }
+
+        const float d = fp16_to_fp32(blk->d);
+        const int sc_lo_idx = sub_idx * 2;
+        const int sc_hi_idx = sub_idx * 2 + 1;
+        ctx.scales_array[linear] = fp32_to_fp16(d * static_cast<float>(unpacked_scales[sc_lo_idx] - 32));
+        ctx.mins_array[linear] = fp32_to_fp16(d * static_cast<float>(unpacked_scales[sc_hi_idx] - 32));
     }
 
 } // namespace llaminar2

@@ -310,7 +310,7 @@ namespace
     TEST_F(ROCmQuantisedGemmKernelUnitTest, PackWeights_RowMajorKxNLayout)
     {
         const size_t N = 4;
-        const size_t K = 8;
+        const size_t K = 64; // Must be divisible by Q8_0 block size (32)
 
         auto weights = TestTensorFactory::createQ8_0Random({N, K});
         ROCmPackedWeights packed;

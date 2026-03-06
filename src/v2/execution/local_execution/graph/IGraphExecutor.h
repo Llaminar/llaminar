@@ -145,6 +145,8 @@ namespace llaminar2
         double total_time_ms = 0.0;
         double total_execute_ms = 0.0; ///< Time in actual kernel/stage execution
         std::unordered_map<std::string, double> stage_times_ms;
+        std::unordered_map<std::string, double> stage_type_execute_ms;
+        std::unordered_map<std::string, size_t> stage_type_counts;
 
         /// Accumulated overhead breakdown
         ExecutionOverhead overhead;
@@ -156,6 +158,8 @@ namespace llaminar2
             total_time_ms = 0.0;
             total_execute_ms = 0.0;
             stage_times_ms.clear();
+            stage_type_execute_ms.clear();
+            stage_type_counts.clear();
             overhead.reset();
         }
 

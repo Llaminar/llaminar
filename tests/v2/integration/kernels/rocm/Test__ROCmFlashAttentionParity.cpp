@@ -26,7 +26,10 @@
 
 #include "tensors/Tensors.h"
 #include "execution/config/RuntimeConfig.h"
+#include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/coherence/GpuCoherence.h"
+#include "loaders/ModelContext.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
 
@@ -49,6 +52,7 @@ using namespace llaminar2;
 
 namespace
 {
+    const std::string TEST_MODEL_PATH = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
 
     // ============================================================================
     // ROCm Availability Check
@@ -162,6 +166,74 @@ namespace
         return false;
     }
 
+    inline uint16_t floatToFP16(float f)
+    {
+        uint32_t bits;
+        memcpy(&bits, &f, sizeof(float));
+        uint32_t sign = (bits >> 16) & 0x8000;
+        int32_t exp = ((bits >> 23) & 0xFF) - 127 + 15;
+        uint32_t mant = (bits >> 13) & 0x3FF;
+
+        if (exp <= 0)
+            return static_cast<uint16_t>(sign);
+        if (exp >= 31)
+            return static_cast<uint16_t>(sign | 0x7C00);
+        return static_cast<uint16_t>(sign | (exp << 10) | mant);
+    }
+
+    inline float fp16ToFloat(uint16_t fp16)
+    {
+        uint32_t sign = (fp16 & 0x8000) << 16;
+        int32_t exp = (fp16 >> 10) & 0x1F;
+        uint32_t mant = fp16 & 0x3FF;
+
+        if (exp == 0)
+        {
+            if (mant == 0)
+            {
+                uint32_t bits = sign;
+                float result;
+                memcpy(&result, &bits, sizeof(float));
+                return result;
+            }
+            exp = 1;
+            while (!(mant & 0x400))
+            {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x3FF;
+        }
+        else if (exp == 31)
+        {
+            uint32_t bits = sign | 0x7F800000 | (mant << 13);
+            float result;
+            memcpy(&result, &bits, sizeof(float));
+            return result;
+        }
+
+        uint32_t bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+        float result;
+        memcpy(&result, &bits, sizeof(float));
+        return result;
+    }
+
+    void quantizeToFP16(const float *src, uint16_t *dst, size_t count)
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            dst[i] = floatToFP16(src[i]);
+        }
+    }
+
+    void dequantizeFP16(const uint16_t *src, float *dst, size_t count)
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            dst[i] = fp16ToFloat(src[i]);
+        }
+    }
+
 } // namespace
 
 // ============================================================================
@@ -191,6 +263,16 @@ protected:
         for (auto &val : data)
         {
             val = dist_(rng_);
+        }
+        return data;
+    }
+
+    std::vector<float> randomFP32Scaled(size_t count, float scale)
+    {
+        auto data = randomFP32(count);
+        for (auto &val : data)
+        {
+            val *= scale;
         }
         return data;
     }
@@ -1218,6 +1300,377 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_Large)
     EXPECT_LE(l2_error, 0.05);
 
     LOG_INFO("[FlashAttn2_FP32_Large] PASSED");
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_NativeFP16KV_Qwen2ScaleStress)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    constexpr int seq_len = 64;
+    constexpr int n_heads = 14;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    constexpr float scale = 4.0f;
+
+    const size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+    const size_t kv_size = static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
+    const size_t out_size = q_size;
+
+    auto Q_data = randomFP32Scaled(q_size, scale);
+    auto K_data_fp32 = randomFP32Scaled(kv_size, scale);
+    auto V_data_fp32 = randomFP32Scaled(kv_size, scale);
+
+    std::vector<uint16_t> K_data_fp16(kv_size);
+    std::vector<uint16_t> V_data_fp16(kv_size);
+    quantizeToFP16(K_data_fp32.data(), K_data_fp16.data(), kv_size);
+    quantizeToFP16(V_data_fp32.data(), V_data_fp16.data(), kv_size);
+
+    std::vector<float> K_ref_fp32(kv_size);
+    std::vector<float> V_ref_fp32(kv_size);
+    dequantizeFP16(K_data_fp16.data(), K_ref_fp32.data(), kv_size);
+    dequantizeFP16(V_data_fp16.data(), V_ref_fp32.data(), kv_size);
+
+    std::vector<float> cpu_output(out_size, 0.0f);
+    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    ASSERT_TRUE(cpu_kernel.compute(
+        Q_data.data(), K_ref_fp32.data(), V_ref_fp32.data(), cpu_output.data(),
+        seq_len, n_heads, n_kv_heads, head_dim,
+        true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, -1));
+
+    auto q_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
+    auto k_tensor = std::make_shared<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)},
+        K_data_fp16);
+    auto v_tensor = std::make_shared<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)},
+        V_data_fp16);
+    auto output_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
+    std::copy(Q_data.begin(), Q_data.end(), q_tensor->mutable_data());
+
+    const DeviceId gpu_device = DeviceId::rocm(0);
+    llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device,
+        {q_tensor.get(), k_tensor.get(), v_tensor.get()},
+        {output_tensor.get()},
+        [&]
+        {
+            return rocm_kernel.compute_tensor(
+                q_tensor.get(), k_tensor.get(), v_tensor.get(), output_tensor.get(),
+                1, seq_len, seq_len, n_heads, n_kv_heads, head_dim,
+                true, -1, nullptr, nullptr, &mpi_ctx_, 0);
+        }));
+
+    const float *rocm_output = output_tensor->data();
+    ASSERT_NE(rocm_output, nullptr);
+    ASSERT_FALSE(hasNaNOrInf(rocm_output, out_size));
+
+    const double cosine = cosineSimilarity(rocm_output, cpu_output.data(), out_size);
+    const double l2_error = relativeL2Error(rocm_output, cpu_output.data(), out_size);
+    const double max_error = maxAbsError(rocm_output, cpu_output.data(), out_size);
+
+    printComparisonStats("FlashAttn2 native FP16 KV Qwen2 scale-stress", cosine, l2_error, max_error, out_size);
+
+    EXPECT_GE(cosine, 0.99);
+    EXPECT_LE(l2_error, 0.05);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_NativeQ81KV_Qwen2ScaleStress)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    constexpr int seq_len = 64;
+    constexpr int n_heads = 14;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    constexpr float scale = 4.0f;
+
+    const size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+    const size_t kv_size = static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
+    const size_t out_size = q_size;
+
+    auto Q_data = randomFP32Scaled(q_size, scale);
+    auto K_data_fp32 = randomFP32Scaled(kv_size, scale);
+    auto V_data_fp32 = randomFP32Scaled(kv_size, scale);
+
+    auto k_tensor = Q8_1Tensor::quantize_from_fp32(
+        K_data_fp32.data(), {static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    auto v_tensor = Q8_1Tensor::quantize_from_fp32(
+        V_data_fp32.data(), {static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    ASSERT_NE(k_tensor, nullptr);
+    ASSERT_NE(v_tensor, nullptr);
+
+    const float *K_ref_fp32 = k_tensor->fp32_data();
+    const float *V_ref_fp32 = v_tensor->fp32_data();
+    ASSERT_NE(K_ref_fp32, nullptr);
+    ASSERT_NE(V_ref_fp32, nullptr);
+
+    std::vector<float> cpu_output(out_size, 0.0f);
+    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    ASSERT_TRUE(cpu_kernel.compute(
+        Q_data.data(), K_ref_fp32, V_ref_fp32, cpu_output.data(),
+        seq_len, n_heads, n_kv_heads, head_dim,
+        true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, -1));
+
+    auto q_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
+    auto output_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
+    std::copy(Q_data.begin(), Q_data.end(), q_tensor->mutable_data());
+
+    const DeviceId gpu_device = DeviceId::rocm(0);
+    llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device,
+        {q_tensor.get(), k_tensor.get(), v_tensor.get()},
+        {output_tensor.get()},
+        [&]
+        {
+            return rocm_kernel.compute_tensor(
+                q_tensor.get(), k_tensor.get(), v_tensor.get(), output_tensor.get(),
+                1, seq_len, seq_len, n_heads, n_kv_heads, head_dim,
+                true, -1, nullptr, nullptr, &mpi_ctx_, 0);
+        }));
+
+    const float *rocm_output = output_tensor->data();
+    ASSERT_NE(rocm_output, nullptr);
+    ASSERT_FALSE(hasNaNOrInf(rocm_output, out_size));
+
+    const double cosine = cosineSimilarity(rocm_output, cpu_output.data(), out_size);
+    const double l2_error = relativeL2Error(rocm_output, cpu_output.data(), out_size);
+    const double max_error = maxAbsError(rocm_output, cpu_output.data(), out_size);
+
+    printComparisonStats("FlashAttn2 native Q8_1 KV Qwen2 scale-stress", cosine, l2_error, max_error, out_size);
+
+    EXPECT_GE(cosine, 0.99);
+    EXPECT_LE(l2_error, 0.05);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_RealQwen2Layer3ContextParity)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    std::ifstream model_file(TEST_MODEL_PATH);
+    if (!model_file.good())
+    {
+        GTEST_SKIP() << "Test model not found: " << TEST_MODEL_PATH;
+    }
+
+    auto prefix_ctx = ModelContext::createForPPStage(TEST_MODEL_PATH, 0, 4, true, false);
+    ASSERT_NE(prefix_ctx, nullptr);
+
+    FactoryPPStageConfig config;
+    config.first_layer = 0;
+    config.last_layer = 4;
+    config.has_embedding = true;
+    config.has_lm_head = false;
+    ASSERT_TRUE(config.isValid());
+
+    auto cpu_runner = createPPStageRunner(prefix_ctx, DeviceId::cpu(), config);
+    ASSERT_NE(cpu_runner, nullptr);
+    cpu_runner->enableSnapshotCapture();
+
+    constexpr int seq_len = 64;
+    constexpr int n_heads = 14;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    const size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+    const size_t kv_size = static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
+
+    std::vector<int> tokens(seq_len);
+    for (int i = 0; i < seq_len; ++i)
+    {
+        tokens[i] = i % 1024;
+    }
+    ASSERT_TRUE(cpu_runner->forward(tokens.data(), seq_len));
+
+    auto getSnapshotVector = [&](const std::string &key, size_t expected_size) -> std::vector<float>
+    {
+        size_t size = 0;
+        const float *data = cpu_runner->getSnapshot(key, size);
+        EXPECT_NE(data, nullptr) << "Missing snapshot: " << key;
+        EXPECT_EQ(size, expected_size) << "Unexpected snapshot size for " << key;
+        if (!data || size != expected_size)
+        {
+            return {};
+        }
+        return std::vector<float>(data, data + size);
+    };
+
+    const std::vector<float> q_data = getSnapshotVector("layer3_Q_ROPE", q_size);
+    const std::vector<float> k_data = getSnapshotVector("layer3_K_ROPE", kv_size);
+    const std::vector<float> v_data = getSnapshotVector("layer3_V_PROJECTION", kv_size);
+    ASSERT_EQ(q_data.size(), q_size);
+    ASSERT_EQ(k_data.size(), kv_size);
+    ASSERT_EQ(v_data.size(), kv_size);
+
+    std::vector<float> cpu_output(q_size, 0.0f);
+    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    ASSERT_TRUE(cpu_kernel.compute(
+        q_data.data(), k_data.data(), v_data.data(), cpu_output.data(),
+        seq_len, n_heads, n_kv_heads, head_dim,
+        true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, -1));
+
+    auto q_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
+    auto k_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    auto v_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    auto output_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
+    std::copy(q_data.begin(), q_data.end(), q_tensor->mutable_data());
+    std::copy(k_data.begin(), k_data.end(), k_tensor->mutable_data());
+    std::copy(v_data.begin(), v_data.end(), v_tensor->mutable_data());
+
+    const DeviceId gpu_device = DeviceId::rocm(0);
+    llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device,
+        {q_tensor.get(), k_tensor.get(), v_tensor.get()},
+        {output_tensor.get()},
+        [&]
+        {
+            return rocm_kernel.compute_tensor(
+                q_tensor.get(), k_tensor.get(), v_tensor.get(), output_tensor.get(),
+                1, seq_len, seq_len, n_heads, n_kv_heads, head_dim,
+                true, -1, nullptr, nullptr, &mpi_ctx_, 0);
+        }));
+
+    const float *rocm_output = output_tensor->data();
+    ASSERT_NE(rocm_output, nullptr);
+    ASSERT_FALSE(hasNaNOrInf(rocm_output, q_size));
+
+    const double cosine = cosineSimilarity(rocm_output, cpu_output.data(), q_size);
+    const double l2_error = relativeL2Error(rocm_output, cpu_output.data(), q_size);
+    const double max_error = maxAbsError(rocm_output, cpu_output.data(), q_size);
+
+    printComparisonStats("FlashAttn2 real Qwen2 layer3 context", cosine, l2_error, max_error, q_size);
+
+    EXPECT_GE(cosine, 0.99)
+        << "ROCm FlashAttention diverges on real layer-3 Qwen2 attention inputs";
+    EXPECT_LE(l2_error, 0.05)
+        << "ROCm FlashAttention L2 error too high on real layer-3 Qwen2 attention inputs";
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_RealQwen2Layer3InputSensitivity)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    std::ifstream model_file(TEST_MODEL_PATH);
+    if (!model_file.good())
+    {
+        GTEST_SKIP() << "Test model not found: " << TEST_MODEL_PATH;
+    }
+
+    auto stage_ctx = ModelContext::createForPPStage(TEST_MODEL_PATH, 0, 4, true, false);
+    ASSERT_NE(stage_ctx, nullptr);
+
+    FactoryPPStageConfig config;
+    config.first_layer = 0;
+    config.last_layer = 4;
+    config.has_embedding = true;
+    config.has_lm_head = false;
+    ASSERT_TRUE(config.isValid());
+
+    auto cpu_runner = createPPStageRunner(stage_ctx, DeviceId::cpu(), config);
+    auto rocm_runner = createPPStageRunner(stage_ctx, DeviceId::rocm(0), config);
+    ASSERT_NE(cpu_runner, nullptr);
+    ASSERT_NE(rocm_runner, nullptr);
+
+    cpu_runner->enableSnapshotCapture();
+    rocm_runner->enableSnapshotCapture();
+
+    constexpr int seq_len = 64;
+    constexpr int n_heads = 14;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    const size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+    const size_t kv_size = static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
+
+    std::vector<int> tokens(seq_len);
+    for (int i = 0; i < seq_len; ++i)
+    {
+        tokens[i] = i % 1024;
+    }
+    ASSERT_TRUE(cpu_runner->forward(tokens.data(), seq_len));
+    ASSERT_TRUE(rocm_runner->forward(tokens.data(), seq_len));
+
+    auto getSnapshotVector = [&](IInferenceRunner *runner, const std::string &key, size_t expected_size) -> std::vector<float>
+    {
+        size_t size = 0;
+        const float *data = runner->getSnapshot(key, size);
+        EXPECT_NE(data, nullptr) << "Missing snapshot: " << key;
+        EXPECT_EQ(size, expected_size) << "Unexpected snapshot size for " << key;
+        if (!data || size != expected_size)
+        {
+            return {};
+        }
+        return std::vector<float>(data, data + size);
+    };
+
+    const std::vector<float> cpu_q = getSnapshotVector(cpu_runner.get(), "layer3_Q_ROPE", q_size);
+    const std::vector<float> cpu_k = getSnapshotVector(cpu_runner.get(), "layer3_K_ROPE", kv_size);
+    const std::vector<float> cpu_v = getSnapshotVector(cpu_runner.get(), "layer3_V_PROJECTION", kv_size);
+    const std::vector<float> rocm_q = getSnapshotVector(rocm_runner.get(), "layer3_Q_ROPE", q_size);
+    const std::vector<float> rocm_k = getSnapshotVector(rocm_runner.get(), "layer3_K_ROPE", kv_size);
+    const std::vector<float> rocm_v = getSnapshotVector(rocm_runner.get(), "layer3_V_PROJECTION", kv_size);
+
+    ASSERT_EQ(cpu_q.size(), q_size);
+    ASSERT_EQ(cpu_k.size(), kv_size);
+    ASSERT_EQ(cpu_v.size(), kv_size);
+    ASSERT_EQ(rocm_q.size(), q_size);
+    ASSERT_EQ(rocm_k.size(), kv_size);
+    ASSERT_EQ(rocm_v.size(), kv_size);
+
+    auto runCpuAttention = [&](const std::vector<float> &q,
+                               const std::vector<float> &k,
+                               const std::vector<float> &v) -> std::vector<float>
+    {
+        std::vector<float> output(q_size, 0.0f);
+        CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+        EXPECT_TRUE(cpu_kernel.compute(
+            q.data(), k.data(), v.data(), output.data(),
+            seq_len, n_heads, n_kv_heads, head_dim,
+            true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, -1));
+        return output;
+    };
+
+    const std::vector<float> ref_output = runCpuAttention(cpu_q, cpu_k, cpu_v);
+    const std::vector<float> rocm_input_output = runCpuAttention(rocm_q, rocm_k, rocm_v);
+    const std::vector<float> q_only_output = runCpuAttention(rocm_q, cpu_k, cpu_v);
+    const std::vector<float> k_only_output = runCpuAttention(cpu_q, rocm_k, cpu_v);
+    const std::vector<float> v_only_output = runCpuAttention(cpu_q, cpu_k, rocm_v);
+
+    const double all_inputs_cos = cosineSimilarity(rocm_input_output.data(), ref_output.data(), q_size);
+    const double q_only_cos = cosineSimilarity(q_only_output.data(), ref_output.data(), q_size);
+    const double k_only_cos = cosineSimilarity(k_only_output.data(), ref_output.data(), q_size);
+    const double v_only_cos = cosineSimilarity(v_only_output.data(), ref_output.data(), q_size);
+
+    std::cout << "  Layer3 input sensitivity: all_inputs_cos=" << std::fixed << std::setprecision(6) << all_inputs_cos
+              << ", q_only_cos=" << q_only_cos
+              << ", k_only_cos=" << k_only_cos
+              << ", v_only_cos=" << v_only_cos << std::endl;
+
+    EXPECT_LT(all_inputs_cos, 0.995)
+        << "ROCm layer-3 Q/K/V snapshots should reproduce the bad attention-context cosine on CPU";
 }
 
 TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_VeryLong_Parity)

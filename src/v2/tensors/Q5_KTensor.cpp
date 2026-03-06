@@ -5,6 +5,7 @@
  */
 
 #include "TensorClasses.h"
+#include "VnniPackContext.h"
 #include "../kernels/KernelFactory.h"
 #include <cstring>
 #include <stdexcept>
@@ -758,6 +759,50 @@ namespace llaminar2
 
         // Decode using SIMD helper (auto-dispatches to scalar/AVX2/AVX512)
         simd::decode_q5_k_to_q8_0(block, subblock_idx, output->qs, &output->d);
+    }
+
+
+    void Q5_KTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    {
+        const size_t linear = vnniLinearIdx(ctx, n, b);
+        const int sb_per_row = vnniSuperBlocksPerRow(ctx.K);
+        const int sb_idx = b / 8;
+        const int sub_idx = b % 8;
+        const auto *blk = &typed_data()[static_cast<size_t>(n) * sb_per_row + sb_idx];
+
+        const int group_idx = sub_idx / 2;
+        const int is_high = sub_idx & 1;
+        const uint8_t *src32 = blk->qs + group_idx * 32;
+
+        uint8_t repacked_qs[16];
+        if (is_high)
+        {
+            for (int i = 0; i < 16; ++i)
+                repacked_qs[i] = (src32[i] >> 4) | (src32[i + 16] & 0xF0);
+        }
+        else
+        {
+            for (int i = 0; i < 16; ++i)
+                repacked_qs[i] = (src32[i] & 0xF) | ((src32[i + 16] & 0xF) << 4);
+        }
+
+        uint8_t repacked_qh[4] = {0, 0, 0, 0};
+        for (int i = 0; i < 32; ++i)
+        {
+            const int bit_val = (blk->qh[i] >> sub_idx) & 1;
+            repacked_qh[i / 8] |= static_cast<uint8_t>(bit_val << (i % 8));
+        }
+
+        uint8_t *dst = vnniPayloadDst(ctx, linear);
+        std::memcpy(dst, repacked_qs, 16);
+        std::memcpy(dst + 16, repacked_qh, 4);
+
+        uint8_t sc, m_val;
+        simd::get_scale_min_k4(sub_idx, blk->scales, &sc, &m_val);
+        const float d = fp16_to_fp32(blk->d);
+        const float dmin = fp16_to_fp32(blk->dmin);
+        ctx.scales_array[linear] = fp32_to_fp16(d * static_cast<float>(sc));
+        ctx.mins_array[linear] = fp32_to_fp16(-dmin * static_cast<float>(m_val));
     }
 
 } // namespace llaminar2

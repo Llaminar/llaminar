@@ -255,13 +255,14 @@ TEST_F(Test__ROCmQuantisedGemmKernel_Workspace, ForQuantizedGemmCreateCorrectBuf
     int m = 128, n = 4096, k = 896;
     auto reqs = WorkspaceRequirements::forQuantizedGemm(m, n, k);
 
-    // Should have 3 buffers
-    EXPECT_EQ(reqs.buffers.size(), 3);
+    // Should have 4 buffers (quant_a, scales_a, acc_int32, scales_a_blockwise)
+    EXPECT_EQ(reqs.buffers.size(), 4);
 
     // Verify buffer names match constants
     EXPECT_NE(reqs.find("gemm_quant_a"), nullptr);
     EXPECT_NE(reqs.find("gemm_scales_a"), nullptr);
     EXPECT_NE(reqs.find("gemm_acc_int32"), nullptr);
+    EXPECT_NE(reqs.find("gemm_scales_a_blockwise"), nullptr);
 
     // Verify all are required
     for (const auto &buf : reqs.buffers)

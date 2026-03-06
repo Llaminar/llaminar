@@ -5,6 +5,7 @@
  */
 
 #include "TensorClasses.h"
+#include "VnniPackContext.h"
 #include "../kernels/KernelFactory.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
@@ -448,6 +449,23 @@ namespace llaminar2
         // Symmetric format - no min values
         if (mins)
             std::memset(mins, 0, 8 * sizeof(float));
+    }
+
+
+    void IQ4_XSTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    {
+        const size_t linear = vnniLinearIdx(ctx, n, b);
+        const int sb_per_row = vnniSuperBlocksPerRow(ctx.K);
+        const int sb_idx = b / 8;
+        const int sub_idx = b % 8;
+        const auto *blk = &typed_data()[static_cast<size_t>(n) * sb_per_row + sb_idx];
+
+        std::memcpy(vnniPayloadDst(ctx, linear), blk->qs + sub_idx * 16, 16);
+
+        const int ls = ((blk->scales_l[sub_idx / 2] >> (4 * (sub_idx % 2))) & 0xf) |
+                       (((blk->scales_h >> (2 * sub_idx)) & 3) << 4);
+        const float combined_scale = fp16_to_fp32(blk->d) * static_cast<float>(ls - 32);
+        ctx.scales_array[linear] = fp32_to_fp16(combined_scale);
     }
 
 } // namespace llaminar2

@@ -5,6 +5,7 @@
  */
 
 #include "TensorClasses.h"
+#include "VnniPackContext.h"
 #include "../kernels/KernelFactory.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
@@ -443,6 +444,36 @@ namespace llaminar2
 
         // Unpack all 8 sub-blocks (256 elements total)
         simd::unpack_iq2_xxs_superblock_to_int8(super_block, output, scales, mins);
+    }
+
+
+    void IQ2_XXSTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    {
+        const size_t linear = vnniLinearIdx(ctx, n, b);
+        const int sb_per_row = vnniSuperBlocksPerRow(ctx.K);
+        const int sb_idx = b / 8;
+        const int sub_idx = b % 8;
+        const auto *blk = &typed_data()[static_cast<size_t>(n) * sb_per_row + sb_idx];
+
+        const uint8_t *qs_bytes = reinterpret_cast<const uint8_t *>(blk->qs);
+        uint32_t aux32[2];
+        std::memcpy(aux32, qs_bytes + sub_idx * 8, 8);
+
+        uint8_t payload_buf[8];
+        payload_buf[0] = static_cast<uint8_t>(aux32[0]);
+        payload_buf[1] = static_cast<uint8_t>(aux32[0] >> 8);
+        payload_buf[2] = static_cast<uint8_t>(aux32[0] >> 16);
+        payload_buf[3] = static_cast<uint8_t>(aux32[0] >> 24);
+        payload_buf[4] = ksigns_iq2xs[(aux32[1] >> 0) & 127];
+        payload_buf[5] = ksigns_iq2xs[(aux32[1] >> 7) & 127];
+        payload_buf[6] = ksigns_iq2xs[(aux32[1] >> 14) & 127];
+        payload_buf[7] = ksigns_iq2xs[(aux32[1] >> 21) & 127];
+
+        const float d_val = fp16_to_fp32(blk->d);
+        const int nibble = static_cast<int>(aux32[1] >> 28);
+
+        std::memcpy(vnniPayloadDst(ctx, linear), payload_buf, 8);
+        ctx.scales_array[linear] = fp32_to_fp16(d_val * (0.5f + static_cast<float>(nibble)) * 0.25f);
     }
 
 } // namespace llaminar2

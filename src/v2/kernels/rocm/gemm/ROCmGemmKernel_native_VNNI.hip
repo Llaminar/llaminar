@@ -640,7 +640,8 @@ __device__ __forceinline__ void accumulate_block_gemm(
     const uint16_t* __restrict__ emin_hi_buf,
     const int32_t* __restrict__ sum_a_buf,
     float (&acc)[M_PER_THREAD_][N_TILE / (BLOCK_SIZE_ / (M_TILE / M_PER_THREAD_))],
-    int m_base, int t_n)
+    int m_base, int t_n,
+    const float (&sa_blk)[M_PER_THREAD_])
 {
     using Traits = NVNNIGemmTraits<FMT>;
 
@@ -699,8 +700,8 @@ __device__ __forceinline__ void accumulate_block_gemm(
             #pragma unroll
             for (int mm = 0; mm < M_PER_THREAD; ++mm)
             {
-                acc[mm][nn] = __fmaf_rn(static_cast<float>(temp_acc[mm][nn]), scale_lo, acc[mm][nn]);
-                acc[mm][nn] = __fmaf_rn(static_cast<float>(sa_lo[mm]), emin_lo, acc[mm][nn]);
+                acc[mm][nn] = __fmaf_rn(static_cast<float>(temp_acc[mm][nn]) * sa_blk[mm], scale_lo, acc[mm][nn]);
+                acc[mm][nn] = __fmaf_rn(static_cast<float>(sa_lo[mm]) * sa_blk[mm], emin_lo, acc[mm][nn]);
             }
         }
 
@@ -743,8 +744,8 @@ __device__ __forceinline__ void accumulate_block_gemm(
             #pragma unroll
             for (int mm = 0; mm < M_PER_THREAD; ++mm)
             {
-                acc[mm][nn] = __fmaf_rn(static_cast<float>(temp_acc[mm][nn]), scale_hi, acc[mm][nn]);
-                acc[mm][nn] = __fmaf_rn(static_cast<float>(sa_hi[mm]), emin_hi, acc[mm][nn]);
+                acc[mm][nn] = __fmaf_rn(static_cast<float>(temp_acc[mm][nn]) * sa_blk[mm], scale_hi, acc[mm][nn]);
+                acc[mm][nn] = __fmaf_rn(static_cast<float>(sa_hi[mm]) * sa_blk[mm], emin_hi, acc[mm][nn]);
             }
         }
     }
@@ -800,7 +801,7 @@ __device__ __forceinline__ void accumulate_block_gemm(
                     for (int nn = 0; nn < N_PER_THREAD; ++nn)
                         acc[mm][nn] = __fmaf_rn(
                             static_cast<float>(__builtin_amdgcn_sdot4(
-                                a_reg[mm], b_reg[nn], 0, false)),
+                                a_reg[mm], b_reg[nn], 0, false)) * sa_blk[mm],
                             scale_lo[nn], acc[mm][nn]);
             }
 
@@ -831,7 +832,7 @@ __device__ __forceinline__ void accumulate_block_gemm(
                     for (int nn = 0; nn < N_PER_THREAD; ++nn)
                         acc[mm][nn] = __fmaf_rn(
                             static_cast<float>(__builtin_amdgcn_sdot4(
-                                a_reg[mm], b_reg[nn], 0, false)),
+                                a_reg[mm], b_reg[nn], 0, false)) * sa_blk[mm],
                             scale_hi[nn], acc[mm][nn]);
             }
         }
@@ -877,7 +878,7 @@ __device__ __forceinline__ void accumulate_block_gemm(
                 #pragma unroll
                 for (int mm = 0; mm < M_PER_THREAD; ++mm)
                     acc[mm][nn] = __fmaf_rn(
-                        static_cast<float>(temp_acc[mm][nn]),
+                        static_cast<float>(temp_acc[mm][nn]) * sa_blk[mm],
                         scale_lo, acc[mm][nn]);
             }
 
@@ -915,7 +916,7 @@ __device__ __forceinline__ void accumulate_block_gemm(
                 #pragma unroll
                 for (int mm = 0; mm < M_PER_THREAD; ++mm)
                     acc[mm][nn] = __fmaf_rn(
-                        static_cast<float>(temp_acc[mm][nn]),
+                        static_cast<float>(temp_acc[mm][nn]) * sa_blk[mm],
                         scale_hi, acc[mm][nn]);
             }
         }
@@ -969,8 +970,8 @@ __device__ __forceinline__ void accumulate_block_gemm(
             #pragma unroll
             for (int mm = 0; mm < M_PER_THREAD; ++mm)
             {
-                acc[mm][nn] = __fmaf_rn(static_cast<float>(block_acc[mm][nn]), block_scale, acc[mm][nn]);
-                acc[mm][nn] = __fmaf_rn(static_cast<float>(sum_a[mm]), block_min, acc[mm][nn]);
+                acc[mm][nn] = __fmaf_rn(static_cast<float>(block_acc[mm][nn]) * sa_blk[mm], block_scale, acc[mm][nn]);
+                acc[mm][nn] = __fmaf_rn(static_cast<float>(sum_a[mm]) * sa_blk[mm], block_min, acc[mm][nn]);
             }
         }
     }
@@ -1016,7 +1017,7 @@ __device__ __forceinline__ void accumulate_block_gemm(
             #pragma unroll
             for (int nn = 0; nn < N_PER_THREAD; ++nn)
                 acc[mm][nn] = __fmaf_rn(
-                    static_cast<float>(block_acc[mm][nn]), block_scale[nn], acc[mm][nn]);
+                    static_cast<float>(block_acc[mm][nn]) * sa_blk[mm], block_scale[nn], acc[mm][nn]);
     }
 }
 
@@ -1030,7 +1031,8 @@ void native_vnni_gemm_kernel(
     const uint32_t*  __restrict__ d_block_emins,  // [blocks_per_row × N] packed FP16 emin pair (Q2_K only, else NULL)
     float*           __restrict__ d_output,       // [M × N] FP32 output, row-major
     const float*     __restrict__ d_scales_A,     // [M] per-row activation scales
-    int M, int N, int K)
+    int M, int N, int K,
+    const float*     __restrict__ d_scales_A_blockwise) // [M × blocks_per_row] per-block activation scales (nullable)
 {
     // -------------------------------------------------------------------------
     // Tile and thread geometry
@@ -1089,12 +1091,15 @@ void native_vnni_gemm_kernel(
             acc[mm][nn] = 0.0f;
 
     // Pre-load per-row activation scales (one per M-row this thread owns)
+    // When blockwise scales are active, per-block scales are applied inside
+    // accumulate_block_gemm and the epilogue scale is 1.0f.
     float scale_a[M_PER_THREAD];
     #pragma unroll
     for (int mm = 0; mm < M_PER_THREAD; ++mm)
     {
         const int gm = m_block + m_base + mm;
-        scale_a[mm] = (gm < M) ? d_scales_A[gm] : 0.0f;
+        scale_a[mm] = d_scales_A_blockwise ? 1.0f
+                     : ((gm < M) ? d_scales_A[gm] : 0.0f);
     }
 
     // K dimensions
@@ -1332,15 +1337,30 @@ void native_vnni_gemm_kernel(
             }
         }
 
-        // --- 2. Compute on CURRENT buffer ---
+        // --- 2. Compute on CURRENT buffer (contains tile-1's data) ---
         #pragma unroll
         for (int bp = 0; bp < BPT; ++bp)
+        {
+            float sa_blk[M_PER_THREAD];
+            if (d_scales_A_blockwise) {
+                const int gblk = (tile - 1) * BPT + bp;
+                #pragma unroll
+                for (int mm = 0; mm < M_PER_THREAD; ++mm) {
+                    const int gm = m_block + m_base + mm;
+                    sa_blk[mm] = (gm < M) ? d_scales_A_blockwise[static_cast<int64_t>(gm) * blocks_per_row + gblk] : 0.0f;
+                }
+            } else {
+                #pragma unroll
+                for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                    sa_blk[mm] = 1.0f;
+            }
             accumulate_block_gemm<N_TILE, BPT, M_TILE, FMT>(
                 bp, a_lds[cur_buf], b_lds[cur_buf],
                 scale_lds[cur_buf], aux_lds[cur_buf],
                 emin_lo_lds[cur_buf], emin_hi_lds[cur_buf],
                 sum_a_lds[cur_buf],
-                acc, m_base, t_n);
+                acc, m_base, t_n, sa_blk);
+        }
 
         // --- 3. Barrier: all reads from cur_buf done ---
         __syncthreads();
@@ -1459,15 +1479,30 @@ void native_vnni_gemm_kernel(
             }
         }
 
-        // --- 2. Compute on CURRENT buffer ---
+        // --- 2. Compute on CURRENT buffer (contains tile-1's data) ---
         #pragma unroll
         for (int bp = 0; bp < BPT; ++bp)
+        {
+            float sa_blk[M_PER_THREAD];
+            if (d_scales_A_blockwise) {
+                const int gblk = (tile - 1) * BPT + bp;
+                #pragma unroll
+                for (int mm = 0; mm < M_PER_THREAD; ++mm) {
+                    const int gm = m_block + m_base + mm;
+                    sa_blk[mm] = (gm < M) ? d_scales_A_blockwise[static_cast<int64_t>(gm) * blocks_per_row + gblk] : 0.0f;
+                }
+            } else {
+                #pragma unroll
+                for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                    sa_blk[mm] = 1.0f;
+            }
             accumulate_block_gemm<N_TILE, BPT, M_TILE, FMT>(
                 bp, a_lds[cur_buf], b_lds[cur_buf],
                 scale_lds[cur_buf], aux_lds[cur_buf],
                 emin_lo_lds[cur_buf], emin_hi_lds[cur_buf],
                 sum_a_lds[cur_buf],
-                acc, m_base, t_n);
+                acc, m_base, t_n, sa_blk);
+        }
 
         // --- 3. Barrier: all reads from cur_buf done ---
         __syncthreads();
@@ -1526,12 +1561,27 @@ void native_vnni_gemm_kernel(
 
         #pragma unroll
         for (int bp = 0; bp < BPT; ++bp)
+        {
+            float sa_blk[M_PER_THREAD];
+            if (d_scales_A_blockwise) {
+                const int gblk = (num_block_tiles - 1) * BPT + bp;
+                #pragma unroll
+                for (int mm = 0; mm < M_PER_THREAD; ++mm) {
+                    const int gm = m_block + m_base + mm;
+                    sa_blk[mm] = (gm < M) ? d_scales_A_blockwise[static_cast<int64_t>(gm) * blocks_per_row + gblk] : 0.0f;
+                }
+            } else {
+                #pragma unroll
+                for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                    sa_blk[mm] = 1.0f;
+            }
             accumulate_block_gemm<N_TILE, BPT, M_TILE, FMT>(
                 bp, a_lds[last_buf], b_lds[last_buf],
                 scale_lds[last_buf], aux_lds[last_buf],
                 emin_lo_lds[last_buf], emin_hi_lds[last_buf],
                 sum_a_lds[last_buf],
-                acc, m_base, t_n);
+                acc, m_base, t_n, sa_blk);
+        }
     }
 
     // =========================================================================
@@ -1627,6 +1677,7 @@ void streaming_lm_head_kernel(
     const uint32_t*  __restrict__ d_block_emins,  // [blocks_per_row × N] packed {lo,hi} emins (Q2_K only, else nullptr)
     float*           __restrict__ d_output,       // [M × N] FP32 output
     const float*     __restrict__ d_scales_A,     // [M] per-row activation scales
+    const float*     __restrict__ d_scales_A_blockwise, // [M × blocks_per_row] per-block scales (nullptr = row-wise)
     int M, int N, int K)
 {
     static_assert(M_TILE == 8 || M_TILE == 16 || M_TILE == 32,
@@ -1696,6 +1747,20 @@ void streaming_lm_head_kernel(
     // =========================================================================
     for (int block = 0; block < blocks_per_row; ++block)
     {
+        // --- 0. Compute per-block activation scales ---
+        float sa_blk[M_TILE];
+        if (d_scales_A_blockwise) {
+            #pragma unroll
+            for (int mm = 0; mm < M_TILE; ++mm) {
+                const int gm = m_block + mm;
+                sa_blk[mm] = (m_safe || gm < M) ? d_scales_A_blockwise[static_cast<int64_t>(gm) * blocks_per_row + block] : 0.0f;
+            }
+        } else {
+            #pragma unroll
+            for (int mm = 0; mm < M_TILE; ++mm)
+                sa_blk[mm] = 1.0f;
+        }
+
         // --- 1. Load B payload + scale/aux for this thread's N-column ---
         const size_t linear = static_cast<size_t>(block) * N + n_col;
         uint32_t b_payload_dw[Traits::payload_dwords];
@@ -1756,8 +1821,8 @@ void streaming_lm_head_kernel(
             #pragma unroll
             for (int mm = 0; mm < M_TILE; ++mm)
             {
-                acc[mm] = __fmaf_rn(static_cast<float>(temp_acc[mm]), slo, acc[mm]);
-                acc[mm] = __fmaf_rn(static_cast<float>(temp_sum[mm]), elo, acc[mm]);
+                acc[mm] = __fmaf_rn(static_cast<float>(temp_acc[mm]) * sa_blk[mm], slo, acc[mm]);
+                acc[mm] = __fmaf_rn(static_cast<float>(temp_sum[mm]) * sa_blk[mm], elo, acc[mm]);
             }
 
             // Hi half (reuse temp_acc, temp_sum)
@@ -1787,8 +1852,8 @@ void streaming_lm_head_kernel(
             #pragma unroll
             for (int mm = 0; mm < M_TILE; ++mm)
             {
-                acc[mm] = __fmaf_rn(static_cast<float>(temp_acc[mm]), shi, acc[mm]);
-                acc[mm] = __fmaf_rn(static_cast<float>(temp_sum[mm]), ehi, acc[mm]);
+                acc[mm] = __fmaf_rn(static_cast<float>(temp_acc[mm]) * sa_blk[mm], shi, acc[mm]);
+                acc[mm] = __fmaf_rn(static_cast<float>(temp_sum[mm]) * sa_blk[mm], ehi, acc[mm]);
             }
         }
         else if constexpr (Traits::is_dual_scale)
@@ -1837,7 +1902,7 @@ void streaming_lm_head_kernel(
             const float slo = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
             #pragma unroll
             for (int mm = 0; mm < M_TILE; ++mm)
-                acc[mm] = __fmaf_rn(static_cast<float>(temp_acc[mm]), slo, acc[mm]);
+                acc[mm] = __fmaf_rn(static_cast<float>(temp_acc[mm]) * sa_blk[mm], slo, acc[mm]);
 
             // Hi half (reuse temp_acc)
             #pragma unroll
@@ -1879,7 +1944,7 @@ void streaming_lm_head_kernel(
             const float shi = __half2float(*reinterpret_cast<const __half*>(&aux_bits));
             #pragma unroll
             for (int mm = 0; mm < M_TILE; ++mm)
-                acc[mm] = __fmaf_rn(static_cast<float>(temp_acc[mm]), shi, acc[mm]);
+                acc[mm] = __fmaf_rn(static_cast<float>(temp_acc[mm]) * sa_blk[mm], shi, acc[mm]);
         }
         else if constexpr (Traits::is_asymmetric)
         {
@@ -1931,8 +1996,8 @@ void streaming_lm_head_kernel(
             #pragma unroll
             for (int mm = 0; mm < M_TILE; ++mm)
             {
-                acc[mm] = __fmaf_rn(static_cast<float>(block_acc[mm]), bs, acc[mm]);
-                acc[mm] = __fmaf_rn(static_cast<float>(sum_a_shared[mm * blocks_per_row + block]),
+                acc[mm] = __fmaf_rn(static_cast<float>(block_acc[mm]) * sa_blk[mm], bs, acc[mm]);
+                acc[mm] = __fmaf_rn(static_cast<float>(sum_a_shared[mm * blocks_per_row + block]) * sa_blk[mm],
                                     bm, acc[mm]);
             }
         }
@@ -1984,7 +2049,7 @@ void streaming_lm_head_kernel(
             #pragma unroll
             for (int mm = 0; mm < M_TILE; ++mm)
                 acc[mm] = __fmaf_rn(
-                    static_cast<float>(block_acc[mm]), block_scale, acc[mm]);
+                    static_cast<float>(block_acc[mm]) * sa_blk[mm], block_scale, acc[mm]);
         }
     }
 
@@ -1997,8 +2062,9 @@ void streaming_lm_head_kernel(
         for (int mm = 0; mm < M_TILE; ++mm)
         {
             const int gm = m_block + mm;
+            const float sa = d_scales_A_blockwise ? 1.0f : d_scales_A[gm];
             d_output[static_cast<int64_t>(gm) * N + n_col] =
-                acc[mm] * d_scales_A[gm];
+                acc[mm] * sa;
         }
     }
     else
@@ -2007,9 +2073,11 @@ void streaming_lm_head_kernel(
         for (int mm = 0; mm < M_TILE; ++mm)
         {
             const int gm = m_block + mm;
-            if (gm < M)
+            if (gm < M) {
+                const float sa = d_scales_A_blockwise ? 1.0f : d_scales_A[gm];
                 d_output[static_cast<int64_t>(gm) * N + n_col] =
-                    acc[mm] * d_scales_A[gm];
+                    acc[mm] * sa;
+            }
         }
     }
 }
@@ -2041,6 +2109,7 @@ static bool launch_native_vnni_gemm(
     const uint32_t* d_block_emins,
     float* d_output,
     const float* d_scales_A,
+    const float* d_scales_A_blockwise,
     int M, int N, int K,
     int device_id, void* stream)
 {
@@ -2060,7 +2129,7 @@ static bool launch_native_vnni_gemm(
         native_vnni_gemm_kernel<NT, BPT, MT, FMT>
             <<<grid, block, 0, hip_stream>>>(
                 d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
-                d_output, d_scales_A, M, N, K);
+                d_output, d_scales_A, M, N, K, d_scales_A_blockwise);
 
         return hipGetLastError() == hipSuccess;
     };
@@ -2076,7 +2145,7 @@ static bool launch_native_vnni_gemm(
         native_vnni_gemm_kernel<NT, BPT, MT, FMT, 3>
             <<<grid, block, 0, hip_stream>>>(
                 d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
-                d_output, d_scales_A, M, N, K);
+                d_output, d_scales_A, M, N, K, d_scales_A_blockwise);
 
         return hipGetLastError() == hipSuccess;
     };
@@ -2099,7 +2168,7 @@ static bool launch_native_vnni_gemm(
         streaming_lm_head_kernel<MT, FMT>
             <<<grid, block, shared_bytes, hip_stream>>>(
                 d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
-                d_output, d_scales_A, M, N, K);
+                d_output, d_scales_A, d_scales_A_blockwise, M, N, K);
 
         return hipGetLastError() == hipSuccess;
     };
@@ -2329,6 +2398,7 @@ bool rocmGemm_native_vnni_fp32(
     const void*    d_block_emins,  // [blocks_per_row × N] packed {lo,hi} emins (Q2_K only, nullable)
     float*         d_output,       // [M × N] FP32 output
     const float*   d_scales_A,     // [M] per-row activation scales
+    const float*   d_scales_A_blockwise, // [M × blocks_per_row] per-block scales (nullptr = row-wise)
     int M, int N, int K,
     uint8_t codebook_id,
     int device_id, void* stream)
@@ -2345,7 +2415,7 @@ bool rocmGemm_native_vnni_fp32(
     #define LAUNCH_GEMM(FMT) \
         return launch_native_vnni_gemm<FMT>( \
             d_A_int8, d_payload, scales, mins, emins, d_output, d_scales_A, \
-            M, N, K, device_id, stream)
+            d_scales_A_blockwise, M, N, K, device_id, stream)
 
     switch (codebook_id)
     {

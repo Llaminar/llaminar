@@ -5,6 +5,7 @@
  */
 
 #include "TensorClasses.h"
+#include "VnniPackContext.h"
 #include "../kernels/KernelFactory.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
@@ -431,6 +432,28 @@ namespace llaminar2
             for (int i = 0; i < 8; ++i)
                 mins[i] = 0.0f;
         }
+    }
+
+
+    void IQ3_STensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    {
+        const size_t linear = vnniLinearIdx(ctx, n, b);
+        const int sb_per_row = vnniSuperBlocksPerRow(ctx.K);
+        const int sb_idx = b / 8;
+        const int sub_idx = b % 8;
+        const auto *blk = &typed_data()[static_cast<size_t>(n) * sb_per_row + sb_idx];
+
+        uint8_t payload_buf[13];
+        std::memcpy(payload_buf, blk->qs + sub_idx * 8, 8);
+        payload_buf[8] = blk->qh[sub_idx];
+        std::memcpy(payload_buf + 9, blk->signs + sub_idx * 4, 4);
+
+        const float d_val = fp16_to_fp32(blk->d);
+        const uint8_t sc_byte = blk->scales[sub_idx / 2];
+        const int nibble = (sub_idx & 1) ? (sc_byte >> 4) : (sc_byte & 0xF);
+
+        std::memcpy(vnniPayloadDst(ctx, linear), payload_buf, 13);
+        ctx.scales_array[linear] = fp32_to_fp16(d_val * static_cast<float>(1 + 2 * nibble));
     }
 
 } // namespace llaminar2

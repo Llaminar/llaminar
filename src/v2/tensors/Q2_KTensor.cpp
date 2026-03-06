@@ -5,6 +5,9 @@
  */
 
 #include "TensorClasses.h"
+#include "FP16Utils.h"
+
+#include "VnniPackContext.h"
 #include "../kernels/KernelFactory.h"
 #include "SIMDHelpers.h"
 #include <cstring>
@@ -726,6 +729,54 @@ namespace llaminar2
 
         // Unpack all 8 sub-blocks (256 elements total)
         simd::unpack_q2_k_superblock_to_int8(block, output, scales, mins);
+    }
+
+
+    void Q2_KTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    {
+        const size_t linear = vnniLinearIdx(ctx, n, b);
+        const int sb_per_row = vnniSuperBlocksPerRow(ctx.K);
+        const int sb_idx = b / 8;
+        const int sub_idx = b % 8;
+        const auto *blk = &typed_data()[static_cast<size_t>(n) * sb_per_row + sb_idx];
+
+        const int base_elem = sub_idx * 32;
+        uint8_t raw2[32];
+        for (int e = 0; e < 32; ++e)
+        {
+            const int i = base_elem + e;
+            const int qs_byte = (i / 128) * 32 + (i % 32);
+            const int shift = ((i % 128) / 32) * 2;
+            raw2[e] = (blk->qs[qs_byte] >> shift) & 3;
+        }
+
+        uint8_t payload_buf[8];
+        for (int half = 0; half < 2; ++half)
+        {
+            const int hbase = half * 16;
+            for (int j = 0; j < 4; ++j)
+            {
+                payload_buf[half * 4 + j] = static_cast<uint8_t>(
+                    raw2[hbase + j] |
+                    (raw2[hbase + j + 4] << 2) |
+                    (raw2[hbase + j + 8] << 4) |
+                    (raw2[hbase + j + 12] << 6));
+            }
+        }
+
+        std::memcpy(vnniPayloadDst(ctx, linear), payload_buf, 8);
+
+        const int sc_lo_idx = sub_idx * 2;
+        const int sc_hi_idx = sub_idx * 2 + 1;
+        const float d_val = fp16_to_fp32(blk->d);
+        const float dmin = fp16_to_fp32(blk->dmin);
+        ctx.scales_array[linear] = fp32_to_fp16(d_val * static_cast<float>(blk->scales[sc_lo_idx] & 0xF));
+        ctx.mins_array[linear] = fp32_to_fp16(d_val * static_cast<float>(blk->scales[sc_hi_idx] & 0xF));
+
+        const uint16_t emb_min_lo = fp32_to_fp16(-dmin * static_cast<float>(blk->scales[sc_lo_idx] >> 4));
+        const uint16_t emb_min_hi = fp32_to_fp16(-dmin * static_cast<float>(blk->scales[sc_hi_idx] >> 4));
+        ctx.emins_array[linear] =
+            static_cast<uint32_t>(emb_min_lo) | (static_cast<uint32_t>(emb_min_hi) << 16);
     }
 
 } // namespace llaminar2
