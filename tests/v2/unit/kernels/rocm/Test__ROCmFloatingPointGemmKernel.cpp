@@ -13,8 +13,8 @@
 
 #ifdef HAVE_ROCM
 
-#include "kernels/rocm/ROCmFloatingPointGemmKernel.h"
-#include "kernels/rocm/HipBLASGemmKernel.h"
+#include "kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
+#include "kernels/rocm/gemm/HipBLASGemmKernel.h"
 #include "backends/DeviceId.h"
 #include "tensors/Tensors.h"
 #include "backends/ComputeBackend.h"

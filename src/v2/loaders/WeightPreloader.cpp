@@ -10,7 +10,7 @@
 #include "../backends/DeviceId.h"
 
 #ifdef HAVE_ROCM
-#include "../kernels/rocm/ROCmQuantisedGemmKernel.h"
+#include "../kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #endif
 
 namespace llaminar2

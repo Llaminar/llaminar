@@ -42,7 +42,7 @@
 #include <cstdlib>
 #include <type_traits>
 
-#include "../../backends/rocm/HipDeviceGuard.h"
+#include "../../../backends/rocm/HipDeviceGuard.h"
 
 // ============================================================================
 // Format tags — full set matching ROCmGemvKernel_native_VNNI.hip

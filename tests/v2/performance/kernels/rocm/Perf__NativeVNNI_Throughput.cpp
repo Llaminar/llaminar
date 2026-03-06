@@ -46,7 +46,7 @@
 
 #include <omp.h>
 
-#include "kernels/rocm/ROCmQuantisedGemmKernel.h"
+#include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"

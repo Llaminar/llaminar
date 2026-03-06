@@ -37,8 +37,8 @@
 #include <cmath>
 #include <chrono>
 
-#include "../../backends/rocm/HipDeviceGuard.h"
-#include "../../utils/DebugEnv.h"
+#include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../utils/DebugEnv.h"
 
 // ============================================================================
 // QUANTIZATION SHAPE HELPERS

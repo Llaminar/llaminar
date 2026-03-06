@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-#include "kernels/rocm/ROCmQuantisedGemmKernel.h"
+#include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 #include "../../../utils/TestTensorFactory.h"

@@ -47,8 +47,8 @@
 
 // ROCm kernel classes
 #ifdef HAVE_ROCM
-#include "rocm/ROCmFloatingPointGemmKernel.h"         // FP32/FP16/BF16 via hipBLAS
-#include "rocm/ROCmQuantisedGemmKernel.h"             // Quantized tensors via CK INT8/FP16
+#include "rocm/gemm/ROCmFloatingPointGemmKernel.h"    // FP32/FP16/BF16 via hipBLAS
+#include "rocm/gemm/ROCmQuantisedGemmKernel.h"        // Quantized tensors via CK INT8/FP16
 #include "rocm/kvcache/ROCmRingKVCacheFactory.h"      // ROCm Ring Buffer KV Cache factory
 #include "rocm/ops/ROCmEmbeddingKernelT.h"            // Embedding FP32/BF16/FP16/Q8_1
 #include "rocm/ops/ROCmRMSNormKernelT.h"              // RMSNorm FP32/BF16/FP16

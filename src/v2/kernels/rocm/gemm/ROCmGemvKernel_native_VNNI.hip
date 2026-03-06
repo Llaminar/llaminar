@@ -39,7 +39,7 @@
 #include <cmath>
 #include <cstdlib>
 
-#include "../../backends/rocm/HipDeviceGuard.h"
+#include "../../../backends/rocm/HipDeviceGuard.h"
 
 constexpr uint8_t CODEBOOK_IQ4 = 4;
 

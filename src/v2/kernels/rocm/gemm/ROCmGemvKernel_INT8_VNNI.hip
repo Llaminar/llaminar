@@ -28,7 +28,7 @@
 #include <cstdlib>
 #include <atomic>
 
-#include "../../backends/rocm/HipDeviceGuard.h"
+#include "../../../backends/rocm/HipDeviceGuard.h"
 
 // Tile width: number of output columns per workgroup
 // 256 threads per block — each thread does one output column

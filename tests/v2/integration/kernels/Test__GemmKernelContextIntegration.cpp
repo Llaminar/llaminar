@@ -38,7 +38,7 @@
 #endif
 
 #ifdef HAVE_ROCM
-#include "kernels/rocm/HipBLASGemmKernel.h"
+#include "kernels/rocm/gemm/HipBLASGemmKernel.h"
 #include "backends/GPUDeviceContextPool.h"
 #include <hip/hip_runtime.h>
 #endif

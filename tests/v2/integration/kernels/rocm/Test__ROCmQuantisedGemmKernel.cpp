@@ -23,7 +23,7 @@
 #include <cmath>
 #include <numeric>
 
-#include "kernels/rocm/ROCmQuantisedGemmKernel.h"
+#include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/KernelFactory.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"

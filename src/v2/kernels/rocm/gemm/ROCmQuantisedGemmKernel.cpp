@@ -72,7 +72,7 @@
  */
 
 #include "ROCmQuantisedGemmKernel.h"
-#include "ROCmKernelBase.h"
+#include "../ROCmKernelBase.h"
 #include "backends/ComputeBackend.h" // DeviceManager
 #include "backends/DeviceId.h"       // DeviceId
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.

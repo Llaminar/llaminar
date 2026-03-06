@@ -31,9 +31,9 @@
 
 #pragma once
 
-#include "ROCmKernelBase.h"
-#include "../DeviceKernelCache.h"
-#include "../../backends/DeviceId.h"
+#include "../ROCmKernelBase.h"
+#include "../../DeviceKernelCache.h"
+#include "../../../backends/DeviceId.h"
 #include <cstddef>
 #include <memory>
 #include <stdexcept>

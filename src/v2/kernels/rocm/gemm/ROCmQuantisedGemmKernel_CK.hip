@@ -140,7 +140,7 @@
 #include <array>
 #include <memory>
 
-#include "../../backends/rocm/HipDeviceGuard.h"
+#include "../../../backends/rocm/HipDeviceGuard.h"
 
 // ComposableKernel headers for INT8 GEMM
 

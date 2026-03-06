@@ -23,7 +23,7 @@
 
 #include "HipBLASGemmKernel.h"
 #include "backends/IWorkerGPUContext.h"
-#include "../../backends/rocm/HipDeviceGuard.h"
+#include "../../../backends/rocm/HipDeviceGuard.h"
 #include <stdexcept>
 #include <string>
 
@@ -159,14 +159,15 @@ namespace llaminar2
             // blasHandle() must be called from the worker thread per thread-safety model
             void *blas_handle = nullptr;
             std::exception_ptr eptr = nullptr;
-            ctx->submitAndWait([&]() {
+            ctx->submitAndWait([&]()
+                               {
                 try {
                     blas_handle = ctx->blasHandle();
                 } catch (...) {
                     eptr = std::current_exception();
-                }
-            });
-            if (eptr) {
+                } });
+            if (eptr)
+            {
                 std::rethrow_exception(eptr);
             }
             if (!blas_handle)
@@ -178,9 +179,8 @@ namespace llaminar2
 
             // Get hipBLASLt handle from context (required for fused operations)
             void *lt_handle_ptr = nullptr;
-            ctx->submitAndWait([&]() {
-                lt_handle_ptr = ctx->blasLtHandle();
-            });
+            ctx->submitAndWait([&]()
+                               { lt_handle_ptr = ctx->blasLtHandle(); });
             if (!lt_handle_ptr)
             {
                 throw std::runtime_error(
@@ -241,10 +241,10 @@ namespace llaminar2
                 {
                     hipblasDestroy(static_cast<hipblasHandle_t>(handle_));
                 }
-                
+
                 // Move base class
                 ROCmKernelBase::operator=(std::move(other));
-                
+
                 // Take ownership of other's resources
                 handle_ = other.handle_;
                 lt_handle_ = other.lt_handle_;
@@ -252,7 +252,7 @@ namespace llaminar2
                 precision_ = other.precision_;
                 owns_handle_ = other.owns_handle_;
                 owns_lt_handle_ = other.owns_lt_handle_;
-                
+
                 other.handle_ = nullptr;
                 other.lt_handle_ = nullptr;
                 other.owns_handle_ = false;
