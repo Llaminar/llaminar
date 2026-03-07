@@ -8249,6 +8249,47 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm prefill dispatch comparison performance benchmark")
 
+    # Performance Test: Blockwise VNNI GEMM per-shape tuning
+    # Benchmarks V3/V7 blockwise GEMM variants with different M_TILE values
+    # across all Qwen shapes (0.5B, 3B, 7B) with correctness gate.
+    add_executable(v2_perf_blockwise_vnni_gemm
+        performance/kernels/rocm/Perf__BlockwiseVNNI_GEMM.cpp
+        performance/kernels/rocm/GpuVerification.hip
+    )
+    target_link_libraries(v2_perf_blockwise_vnni_gemm
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+        OpenMP::OpenMP_CXX
+        roc::hipblas
+    )
+    target_compile_options(v2_perf_blockwise_vnni_gemm PRIVATE -fopenmp)
+    target_link_options(v2_perf_blockwise_vnni_gemm PRIVATE -fopenmp)
+    add_v2_test(V2_Perf_BlockwiseVNNI_GEMM
+        COMMAND $<TARGET_FILE:v2_perf_blockwise_vnni_gemm>
+        LABELS "V2;Performance;ROCm;GEMM;INT8;Blockwise;Prefill;Dispatch;Tuning;gfx906;Benchmark"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added blockwise VNNI GEMM per-shape tuning benchmark")
+
+    # Performance Test: Blockwise activation quantization kernel tuning
+    # Benchmarks 5 kernel variants for FP32->INT8 blockwise quantization
+    # across all Qwen activation sizes with correctness gate.
+    add_executable(v2_perf_blockwise_quant_kernel
+        performance/kernels/rocm/Perf__BlockwiseQuantKernel.cpp
+    )
+    target_link_libraries(v2_perf_blockwise_quant_kernel
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_BlockwiseQuantKernel
+        COMMAND $<TARGET_FILE:v2_perf_blockwise_quant_kernel>
+        LABELS "V2;Performance;ROCm;Quantization;Blockwise;INT8;Tuning;gfx906;Benchmark"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added blockwise activation quantization kernel tuning benchmark")
+
     # NOTE: FP16 vs INT8 benchmark removed (January 2026) - INT8 proven faster for all sizes.
     # Results documented in changelog/2026-01-10-rocm-int8-gemm-optimization.md
 

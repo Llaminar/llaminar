@@ -2236,6 +2236,13 @@ namespace llaminar2
         bool wide_tile_v3 = false;             ///< Use V3 wide-tile kernel (LDS double-buffered, N64) (LLAMINAR_ROCM_WIDE_TILE_V3)
         bool wide_tile_v7 = false;             ///< Use V7 wide-tile kernel (safe-tile split, N128) (LLAMINAR_ROCM_WIDE_TILE_V7)
         int wide_tile_kt = 16;                 ///< KT parameter for wide-tile kernels (4, 8, or 16) (LLAMINAR_ROCM_WIDE_TILE_KT)
+        int blockwise_v3_mt = -1;              ///< V3 blockwise M_TILE override (-1=auto, 16/32) (LLAMINAR_ROCM_BLOCKWISE_V3_MT)
+        int blockwise_v7_mt = -1;              ///< V7 blockwise M_TILE override (-1=auto, 16/32/64) (LLAMINAR_ROCM_BLOCKWISE_V7_MT)
+        int blockwise_v3_unroll = -1;          ///< V3 blockwise UNROLL_KK override (-1=auto, 0=disable, 1=full, 2/4=partial) (LLAMINAR_ROCM_BLOCKWISE_V3_UNROLL)
+        int blockwise_v7_unroll = -1;          ///< V7 blockwise UNROLL_KK override (-1=auto, 0=disable, 1=full, 2/4=partial) (LLAMINAR_ROCM_BLOCKWISE_V7_UNROLL)
+        bool blockwise_force_v3 = false;       ///< Force V3 blockwise for all shapes (LLAMINAR_ROCM_BLOCKWISE_FORCE_V3)
+        bool blockwise_force_v7 = false;       ///< Force V7 blockwise for all shapes (LLAMINAR_ROCM_BLOCKWISE_FORCE_V7)
+        int blockwise_quant_variant = 0;       ///< Blockwise quant kernel variant (0=auto, 1-5=manual) (LLAMINAR_ROCM_BLOCKWISE_QUANT_VARIANT)
         int ratio_prefill_variant = -1;        ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
         int ratio_prefill_kb = 0;              ///< Ratio prefill split-K blocks override (0=auto)
         int ratio_prefill_linear_variant = -1; ///< Linear codebook ratio prefill tile override (-1=use global/auto)
@@ -2278,6 +2285,13 @@ namespace llaminar2
             wide_tile_v3 = false;
             wide_tile_v7 = false;
             wide_tile_kt = 16;
+            blockwise_v3_mt = -1;
+            blockwise_v7_mt = -1;
+            blockwise_v3_unroll = -1;
+            blockwise_v7_unroll = -1;
+            blockwise_force_v3 = false;
+            blockwise_force_v7 = false;
+            blockwise_quant_variant = 0;
             ratio_prefill_variant = -1;
             ratio_prefill_kb = 0;
             ratio_prefill_linear_variant = -1;
@@ -2444,6 +2458,48 @@ namespace llaminar2
                 {
                     wide_tile_kt = kt;
                 }
+            }
+
+            const char *bw_v3_mt_env = std::getenv("LLAMINAR_ROCM_BLOCKWISE_V3_MT");
+            if (bw_v3_mt_env)
+            {
+                blockwise_v3_mt = std::atoi(bw_v3_mt_env);
+            }
+
+            const char *bw_v7_mt_env = std::getenv("LLAMINAR_ROCM_BLOCKWISE_V7_MT");
+            if (bw_v7_mt_env)
+            {
+                blockwise_v7_mt = std::atoi(bw_v7_mt_env);
+            }
+
+            const char *bw_v3_unroll_env = std::getenv("LLAMINAR_ROCM_BLOCKWISE_V3_UNROLL");
+            if (bw_v3_unroll_env)
+            {
+                blockwise_v3_unroll = std::clamp(std::atoi(bw_v3_unroll_env), -1, 4);
+            }
+
+            const char *bw_v7_unroll_env = std::getenv("LLAMINAR_ROCM_BLOCKWISE_V7_UNROLL");
+            if (bw_v7_unroll_env)
+            {
+                blockwise_v7_unroll = std::clamp(std::atoi(bw_v7_unroll_env), -1, 4);
+            }
+
+            const char *bw_force_v3_env = std::getenv("LLAMINAR_ROCM_BLOCKWISE_FORCE_V3");
+            if (bw_force_v3_env)
+            {
+                blockwise_force_v3 = (std::atoi(bw_force_v3_env) != 0);
+            }
+
+            const char *bw_force_v7_env = std::getenv("LLAMINAR_ROCM_BLOCKWISE_FORCE_V7");
+            if (bw_force_v7_env)
+            {
+                blockwise_force_v7 = (std::atoi(bw_force_v7_env) != 0);
+            }
+
+            const char *bw_quant_var_env = std::getenv("LLAMINAR_ROCM_BLOCKWISE_QUANT_VARIANT");
+            if (bw_quant_var_env)
+            {
+                blockwise_quant_variant = std::clamp(std::atoi(bw_quant_var_env), 0, 5);
             }
 
             const char *ratio_prefill_variant_env = std::getenv("LLAMINAR_ROCM_RATIO_PREFILL_VARIANT");

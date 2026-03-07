@@ -2678,11 +2678,13 @@ extern "C"
 // - Outputs FP32 (with activation scales applied)
 // - Epilogue only needs to apply weight scale_B[n]
 //
-// Register budget: +M_PER_THREAD×N_PER_THREAD FP32 regs (~32 for M_TILE=128)
-//   V3 base: ~66 VGPRs → blockwise: ~98 VGPRs → 2 waves/SIMD, 0 spills
+// Register budget (ISA-verified gfx906):
+//   M_TILE=16: 101 VGPRs → 2 waves/SIMD  M_TILE=32: 115 VGPRs → 2 waves/SIMD
+//   M_TILE=64: 147 VGPRs → 1 wave (avoid)  M_TILE=128: 213 VGPRs → 1 wave (avoid)
+// Launcher caps at M_TILE=32 for 2 waves/SIMD with 0 spills.
 //
-template <int N_TILE, int M_TILE = 128>
-__global__ __launch_bounds__(256, 0)
+template <int N_TILE, int M_TILE = 128, int UNROLL_KK = 1>
+__global__ __launch_bounds__(256)
 void qgemm_int8_vnni_wide_tile_v3_blockwise_kernel(
     const int8_t* __restrict__ d_A_int8,
     const int8_t* __restrict__ d_B_int8_vnni,
@@ -2902,25 +2904,32 @@ void qgemm_int8_vnni_wide_tile_v3_blockwise_kernel(
         }
 
         // 2. Compute on current buffer
-        #pragma unroll
-        for (int kk = 0; kk < KT; ++kk)
-        {
-            int32_t a_reg[M_PER_THREAD];
-            #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-                a_reg[mm] = a_lds[cur_buf][kk * M_TILE + m_base + mm];
+        // UNROLL_KK: 0=disable, 1=full, 2=unroll_count(2), 4=unroll_count(4)
 
-            int32_t b_reg[N_PER_THREAD];
-            #pragma unroll
-            for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                b_reg[nn] = b_lds[cur_buf][kk * N_TILE + t_n * N_PER_THREAD + nn];
+#define V3_BW_KK_BODY(BUF) \
+                int32_t a_reg[M_PER_THREAD]; int32_t b_reg[N_PER_THREAD]; \
+                _Pragma("unroll") \
+                for (int mm = 0; mm < M_PER_THREAD; ++mm) a_reg[mm] = a_lds[BUF][kk * M_TILE + m_base + mm]; \
+                _Pragma("unroll") \
+                for (int nn = 0; nn < N_PER_THREAD; ++nn) b_reg[nn] = b_lds[BUF][kk * N_TILE + t_n * N_PER_THREAD + nn]; \
+                _Pragma("unroll") \
+                for (int mm = 0; mm < M_PER_THREAD; ++mm) \
+                    _Pragma("unroll") \
+                    for (int nn = 0; nn < N_PER_THREAD; ++nn) \
+                        acc[mm][nn] = __builtin_amdgcn_sdot4(a_reg[mm], b_reg[nn], acc[mm][nn], false);
 
+        if constexpr (UNROLL_KK == 0) {
+            #pragma clang loop unroll(disable)
+            for (int kk = 0; kk < KT; ++kk) { V3_BW_KK_BODY(cur_buf) }
+        } else if constexpr (UNROLL_KK == 2) {
+            _Pragma("clang loop unroll_count(2)")
+            for (int kk = 0; kk < KT; ++kk) { V3_BW_KK_BODY(cur_buf) }
+        } else if constexpr (UNROLL_KK == 4) {
+            _Pragma("clang loop unroll_count(4)")
+            for (int kk = 0; kk < KT; ++kk) { V3_BW_KK_BODY(cur_buf) }
+        } else { // UNROLL_KK == 1: full unroll
             #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-                #pragma unroll
-                for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                    acc[mm][nn] = __builtin_amdgcn_sdot4(
-                        a_reg[mm], b_reg[nn], acc[mm][nn], false);
+            for (int kk = 0; kk < KT; ++kk) { V3_BW_KK_BODY(cur_buf) }
         }
 
         // 2b. BLOCKWISE: Scale partial sums and accumulate to FP32
@@ -2953,30 +2962,25 @@ void qgemm_int8_vnni_wide_tile_v3_blockwise_kernel(
     {
         const int last_buf = (num_tiles - 1) & 1;
 
-        #pragma unroll
-        for (int kk = 0; kk < KT; ++kk)
-        {
-            int32_t a_reg[M_PER_THREAD];
+        if constexpr (UNROLL_KK == 0) {
+            #pragma clang loop unroll(disable)
+            for (int kk = 0; kk < KT; ++kk) { V3_BW_KK_BODY(last_buf) }
+        } else if constexpr (UNROLL_KK == 2) {
+            _Pragma("clang loop unroll_count(2)")
+            for (int kk = 0; kk < KT; ++kk) { V3_BW_KK_BODY(last_buf) }
+        } else if constexpr (UNROLL_KK == 4) {
+            _Pragma("clang loop unroll_count(4)")
+            for (int kk = 0; kk < KT; ++kk) { V3_BW_KK_BODY(last_buf) }
+        } else { // UNROLL_KK == 1: full unroll
             #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-                a_reg[mm] = a_lds[last_buf][kk * M_TILE + m_base + mm];
-
-            int32_t b_reg[N_PER_THREAD];
-            #pragma unroll
-            for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                b_reg[nn] = b_lds[last_buf][kk * N_TILE + t_n * N_PER_THREAD + nn];
-
-            #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-                #pragma unroll
-                for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                    acc[mm][nn] = __builtin_amdgcn_sdot4(
-                        a_reg[mm], b_reg[nn], acc[mm][nn], false);
+            for (int kk = 0; kk < KT; ++kk) { V3_BW_KK_BODY(last_buf) }
         }
 
         // BLOCKWISE: Scale partial sums for the final tile
         blockwise_accumulate(num_tiles - 1);
     }
+
+#undef V3_BW_KK_BODY
 
     // STORE FP32 RESULTS (activation scales already applied)
     #pragma unroll
@@ -3033,8 +3037,13 @@ void qgemm_int8_vnni_wide_tile_v3_blockwise_kernel(
 // Same structure as V7 (safe loop + boundary loop + final tile) but with
 // FP32 running accumulators and per-tile blockwise scale application.
 //
-template <int N_TILE, int M_TILE = 128>
-__global__ __launch_bounds__(256, 2)
+// KT parameter: kk-groups per tile. KT=8 = 1 activation block per tile.
+// KT=16 support exists but M_TILE=64/KT=8 wins benchmarks (772 tok/s) because
+// KT=16 either causes excessive VGPR spills (M_TILE=64→81 spills) or requires
+// smaller M_TILE (M_TILE=32→757 tok/s) with worse weight reuse.
+//
+template <int N_TILE, int M_TILE = 128, int KT = 8, int UNROLL_KK = 0>
+__global__ __launch_bounds__(256)
 void qgemm_int8_vnni_wide_tile_v7_blockwise_kernel(
     const int8_t* __restrict__ d_A_int8,
     const int8_t* __restrict__ d_B_int8_vnni,
@@ -3042,14 +3051,17 @@ void qgemm_int8_vnni_wide_tile_v7_blockwise_kernel(
     const float* __restrict__ d_scales_A_blockwise,
     int M, int N, int K)
 {
-    constexpr int KT = 8; // forced: 1 block per tile
     constexpr int BLOCK_SIZE = 256;
     constexpr int M_PER_THREAD = 4;
     constexpr int THREADS_M = M_TILE / M_PER_THREAD;
     constexpr int THREADS_N = BLOCK_SIZE / THREADS_M;
     constexpr int N_PER_THREAD = N_TILE / THREADS_N;
+    constexpr int KK_PER_BLOCK = 8;  // kk-groups per activation block (32 elements / 4)
+    constexpr int BLOCKS_PER_TILE = KT / KK_PER_BLOCK;  // 1 for KT=8, 2 for KT=16
 
     static_assert(M_TILE == 16 || M_TILE == 32 || M_TILE == 64 || M_TILE == 128);
+    static_assert(KT == 8 || KT == 16);
+    static_assert(KT % KK_PER_BLOCK == 0);
     static_assert(THREADS_M * THREADS_N == BLOCK_SIZE);
     static_assert(N_TILE % THREADS_N == 0);
     static_assert(M_PER_THREAD == 4);
@@ -3079,7 +3091,7 @@ void qgemm_int8_vnni_wide_tile_v7_blockwise_kernel(
             fp32_acc[mm][nn] = 0.0f;
 
     const int total_k_groups = K / 4;
-    const int blocks_per_row = total_k_groups / KT;
+    const int blocks_per_row = total_k_groups / KK_PER_BLOCK;  // K/32: activation blocks per row
     const int32_t* a_global = reinterpret_cast<const int32_t*>(d_A_int8);
     const int32_t* b_global = reinterpret_cast<const int32_t*>(d_B_int8_vnni);
     const int a_row_stride = K / 4;
@@ -3267,43 +3279,60 @@ void qgemm_int8_vnni_wide_tile_v7_blockwise_kernel(
         }
     };
 
-    auto compute_tile = [&](int buf) __attribute__((always_inline))
+    // Fused compute + blockwise accumulate for one LDS tile.
+    // For KT=8 (BLOCKS_PER_TILE=1): single 8-iteration phase + 1 scale application.
+    // For KT=16 (BLOCKS_PER_TILE=2): two 8-iteration phases, each with its own scale.
+    auto compute_and_accumulate_tile = [&](int buf, int tile_idx) __attribute__((always_inline))
     {
         const int32_t* __restrict__ a_ptr = &a_lds[buf][m_base];
         const int32_t* __restrict__ b_ptr = &b_lds[buf][t_n * N_PER_THREAD];
 
-        #pragma clang loop unroll(disable)
-        for (int kk = 0; kk < KT; ++kk)
+        #pragma unroll
+        for (int phase = 0; phase < BLOCKS_PER_TILE; ++phase)
         {
-            int32_t a_reg[M_PER_THREAD];
-            int32_t b_reg[N_PER_THREAD];
+            const int kk_start = phase * KK_PER_BLOCK;
+            const int kk_end = kk_start + KK_PER_BLOCK;
 
-            *reinterpret_cast<uint4*>(&a_reg[0]) =
-                *reinterpret_cast<const uint4*>(&a_ptr[kk * M_TILE]);
+#define V7_BW_KK_BODY \
+                int32_t a_reg[M_PER_THREAD]; \
+                int32_t b_reg[N_PER_THREAD]; \
+                *reinterpret_cast<uint4*>(&a_reg[0]) = \
+                    *reinterpret_cast<const uint4*>(&a_ptr[kk * M_TILE]); \
+                if constexpr (N_PER_THREAD >= 4) { \
+                    _Pragma("unroll") \
+                    for (int c = 0; c < N_PER_THREAD; c += 4) \
+                        *reinterpret_cast<uint4*>(&b_reg[c]) = \
+                            *reinterpret_cast<const uint4*>(&b_ptr[kk * N_TILE + c]); \
+                } else if constexpr (N_PER_THREAD == 2) { \
+                    *reinterpret_cast<uint2*>(&b_reg[0]) = \
+                        *reinterpret_cast<const uint2*>(&b_ptr[kk * N_TILE]); \
+                } else { \
+                    b_reg[0] = b_ptr[kk * N_TILE]; \
+                } \
+                _Pragma("unroll") \
+                for (int mm = 0; mm < M_PER_THREAD; ++mm) \
+                    _Pragma("unroll") \
+                    for (int nn = 0; nn < N_PER_THREAD; ++nn) \
+                        acc[mm][nn] = __builtin_amdgcn_sdot4( \
+                            a_reg[mm], b_reg[nn], acc[mm][nn], false);
 
-            if constexpr (N_PER_THREAD >= 4)
-            {
+            if constexpr (UNROLL_KK == 0) {
+                #pragma clang loop unroll(disable)
+                for (int kk = kk_start; kk < kk_end; ++kk) { V7_BW_KK_BODY }
+            } else if constexpr (UNROLL_KK == 2) {
+                _Pragma("clang loop unroll_count(2)")
+                for (int kk = kk_start; kk < kk_end; ++kk) { V7_BW_KK_BODY }
+            } else if constexpr (UNROLL_KK == 4) {
+                _Pragma("clang loop unroll_count(4)")
+                for (int kk = kk_start; kk < kk_end; ++kk) { V7_BW_KK_BODY }
+            } else { // UNROLL_KK == 1: full unroll
                 #pragma unroll
-                for (int c = 0; c < N_PER_THREAD; c += 4)
-                    *reinterpret_cast<uint4*>(&b_reg[c]) =
-                        *reinterpret_cast<const uint4*>(&b_ptr[kk * N_TILE + c]);
-            }
-            else if constexpr (N_PER_THREAD == 2)
-            {
-                *reinterpret_cast<uint2*>(&b_reg[0]) =
-                    *reinterpret_cast<const uint2*>(&b_ptr[kk * N_TILE]);
-            }
-            else
-            {
-                b_reg[0] = b_ptr[kk * N_TILE];
+                for (int kk = kk_start; kk < kk_end; ++kk) { V7_BW_KK_BODY }
             }
 
-            #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-                #pragma unroll
-                for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                    acc[mm][nn] = __builtin_amdgcn_sdot4(
-                        a_reg[mm], b_reg[nn], acc[mm][nn], false);
+#undef V7_BW_KK_BODY
+
+            blockwise_accumulate(tile_idx * BLOCKS_PER_TILE + phase);
         }
     };
 
@@ -3332,8 +3361,7 @@ void qgemm_int8_vnni_wide_tile_v7_blockwise_kernel(
         safe_issue_a_loads(kt_base);
         safe_issue_b_loads(kt_base);
 
-        compute_tile(cur_buf);
-        blockwise_accumulate(tile - 1);
+        compute_and_accumulate_tile(cur_buf, tile - 1);
 
         __syncthreads();
 
@@ -3355,8 +3383,7 @@ void qgemm_int8_vnni_wide_tile_v7_blockwise_kernel(
             boundary_issue_a_loads(kt_base);
             boundary_issue_b_loads(kt_base);
 
-            compute_tile(cur_buf);
-            blockwise_accumulate(tile - 1);
+            compute_and_accumulate_tile(cur_buf, tile - 1);
 
             __syncthreads();
 
@@ -3368,8 +3395,7 @@ void qgemm_int8_vnni_wide_tile_v7_blockwise_kernel(
     }
 
     // FINAL TILE
-    compute_tile((num_tiles - 1) & 1);
-    blockwise_accumulate(num_tiles - 1);
+    compute_and_accumulate_tile((num_tiles - 1) & 1, num_tiles - 1);
 
     // STORE FP32 RESULTS
     #pragma unroll
@@ -3437,7 +3463,9 @@ extern "C"
         float* d_C_fp32,
         const float* d_scales_A_blockwise,
         int M, int N, int K,
-        int rocm_device_id, void* stream)
+        int rocm_device_id, void* stream,
+        int m_tile_override,
+        int unroll_kk)
     {
         if (!d_A_int8 || !d_B_int8_vnni || !d_C_fp32 || !d_scales_A_blockwise ||
             M <= 0 || N <= 0 || K <= 0)
@@ -3457,12 +3485,15 @@ extern "C"
 
         constexpr int N_TILE = 64;
         constexpr int BLOCK_SIZE = 256;
+        // Cap M_TILE at 32 for blockwise: ISA shows M_TILE=64 → 147 VGPRs (1 wave),
+        // M_TILE=128 → 213 VGPRs (1 wave). M_TILE=32 → 115 VGPRs, 2 waves, 0 spills.
+        constexpr int MAX_M_TILE = 32;
         const auto s = static_cast<hipStream_t>(stream);
 
         auto select_m_tile = [](int rows) -> int {
-            int best_mt = 128;
-            int best_waste = ((rows + 127) / 128) * 128 - rows;
-            for (int mt : {64, 32, 16}) {
+            int best_mt = MAX_M_TILE;
+            int best_waste = ((rows + MAX_M_TILE - 1) / MAX_M_TILE) * MAX_M_TILE - rows;
+            for (int mt : {16}) {
                 int waste = ((rows + mt - 1) / mt) * mt - rows;
                 if (waste < best_waste) {
                     best_waste = waste;
@@ -3472,22 +3503,36 @@ extern "C"
             return best_mt;
         };
 
-        const int m_tile = (M <= 128) ? select_m_tile(M) : 128;
+        // Use override if provided, otherwise auto-select
+        int m_tile;
+        if (m_tile_override > 0) {
+            m_tile = m_tile_override;
+        } else {
+            m_tile = (M <= MAX_M_TILE) ? select_m_tile(M) : MAX_M_TILE;
+        }
         const unsigned n_tiles = static_cast<unsigned>((N + N_TILE - 1) / N_TILE);
         const unsigned m_tiles = static_cast<unsigned>((M + m_tile - 1) / m_tile);
         const dim3 grid(n_tiles, m_tiles, 1);
         const dim3 block(BLOCK_SIZE, 1, 1);
 
-#define LAUNCH_V3B(MT) \
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v3_blockwise_kernel<N_TILE, MT>), \
+#define LAUNCH_V3B(MT, UK) \
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v3_blockwise_kernel<N_TILE, MT, UK>), \
                            grid, block, 0, s, d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, M, N, K)
 
-        switch (m_tile) {
-            case 16:  LAUNCH_V3B(16);  break;
-            case 32:  LAUNCH_V3B(32);  break;
-            case 64:  LAUNCH_V3B(64);  break;
-            default:  LAUNCH_V3B(128); break;
+#define LAUNCH_V3B_UNROLL(MT) \
+        switch (unroll_kk) { \
+            case 0:  LAUNCH_V3B(MT, 0); break; \
+            case 1:  LAUNCH_V3B(MT, 1); break; \
+            case 4:  LAUNCH_V3B(MT, 4); break; \
+            default: LAUNCH_V3B(MT, 2); break; \
         }
+
+        switch (m_tile) {
+            case 16:  LAUNCH_V3B_UNROLL(16);  break;
+            case 64:  LAUNCH_V3B_UNROLL(64);  break;
+            default:  LAUNCH_V3B_UNROLL(32);  break;
+        }
+#undef LAUNCH_V3B_UNROLL
 #undef LAUNCH_V3B
 
         const hipError_t err = hipGetLastError();
@@ -3502,10 +3547,14 @@ extern "C"
     }
 
     /**
-     * @brief Dispatch blockwise V7 INT8 GEMM (safe-tile split, KT=8 forced).
+     * @brief Dispatch blockwise V7 INT8 GEMM (safe-tile split).
      *
      * Output is FP32 with per-block activation scales already applied.
      * Caller must apply weight scales (scale_B) in a separate epilogue.
+     *
+     * Dispatches KT=16 when K is a multiple of 64 (2 activation blocks per tile),
+     * otherwise falls back to KT=8 (1 block per tile). KT=16 halves the tile count,
+     * reducing barrier and LDS load overhead.
      */
     bool rocmQuantGemm_int8_int8_fp32_vnni_prefill_wide_tile_v7_blockwise(
         const int8_t* d_A_int8,
@@ -3513,7 +3562,9 @@ extern "C"
         float* d_C_fp32,
         const float* d_scales_A_blockwise,
         int M, int N, int K,
-        int rocm_device_id, void* stream)
+        int rocm_device_id, void* stream,
+        int m_tile_override,
+        int unroll_kk)
     {
         if (!d_A_int8 || !d_B_int8_vnni || !d_C_fp32 || !d_scales_A_blockwise ||
             M <= 0 || N <= 0 || K <= 0)
@@ -3533,12 +3584,16 @@ extern "C"
 
         constexpr int N_TILE = 128;
         constexpr int BLOCK_SIZE = 256;
+        // Cap M_TILE at 64 for blockwise: ISA shows M_TILE=128 → 128 VGPRs but 167 spills!
+        // M_TILE=64 → 123 VGPRs, 2 waves, 0 spills. Best weight reuse at 2 waves.
+        // Measured: M_TILE=64→772 tok/s, M_TILE=32→727, M_TILE=16→691 (more tiles = more overhead).
+        constexpr int MAX_M_TILE = 64;
         const auto s = static_cast<hipStream_t>(stream);
 
         auto select_m_tile = [](int rows) -> int {
-            int best_mt = 128;
-            int best_waste = ((rows + 127) / 128) * 128 - rows;
-            for (int mt : {64, 32, 16}) {
+            int best_mt = MAX_M_TILE;
+            int best_waste = ((rows + MAX_M_TILE - 1) / MAX_M_TILE) * MAX_M_TILE - rows;
+            for (int mt : {32, 16}) {
                 int waste = ((rows + mt - 1) / mt) * mt - rows;
                 if (waste < best_waste) {
                     best_waste = waste;
@@ -3548,22 +3603,36 @@ extern "C"
             return best_mt;
         };
 
-        const int m_tile = (M <= 128) ? select_m_tile(M) : 128;
+        // Use override if provided, otherwise auto-select
+        int m_tile;
+        if (m_tile_override > 0) {
+            m_tile = m_tile_override;
+        } else {
+            m_tile = (M <= MAX_M_TILE) ? select_m_tile(M) : MAX_M_TILE;
+        }
         const unsigned n_tiles = static_cast<unsigned>((N + N_TILE - 1) / N_TILE);
         const unsigned m_tiles = static_cast<unsigned>((M + m_tile - 1) / m_tile);
         const dim3 grid(n_tiles, m_tiles, 1);
         const dim3 block(BLOCK_SIZE, 1, 1);
 
-#define LAUNCH_V7B(MT) \
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v7_blockwise_kernel<N_TILE, MT>), \
+#define LAUNCH_V7B(MT, UK) \
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v7_blockwise_kernel<N_TILE, MT, 8, UK>), \
                            grid, block, 0, s, d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, M, N, K)
 
-        switch (m_tile) {
-            case 16:  LAUNCH_V7B(16);  break;
-            case 32:  LAUNCH_V7B(32);  break;
-            case 64:  LAUNCH_V7B(64);  break;
-            default:  LAUNCH_V7B(128); break;
+#define LAUNCH_V7B_UNROLL(MT) \
+        switch (unroll_kk) { \
+            case 0:  LAUNCH_V7B(MT, 0); break; \
+            case 1:  LAUNCH_V7B(MT, 1); break; \
+            case 4:  LAUNCH_V7B(MT, 4); break; \
+            default: LAUNCH_V7B(MT, 2); break; \
         }
+
+        switch (m_tile) {
+            case 16:  LAUNCH_V7B_UNROLL(16);  break;
+            case 32:  LAUNCH_V7B_UNROLL(32);  break;
+            default:  LAUNCH_V7B_UNROLL(64);  break;
+        }
+#undef LAUNCH_V7B_UNROLL
 #undef LAUNCH_V7B
 
         const hipError_t err = hipGetLastError();
