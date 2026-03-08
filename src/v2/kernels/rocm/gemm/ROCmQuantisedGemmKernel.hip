@@ -5,7 +5,6 @@
  * This file contains shared infrastructure used by all quantized GEMM backends:
  *
  *   GPU Kernels:
- *     - quantizeActivationsQ8_kernel_t : FP32 → INT8 per-row symmetric quantization
  *     - applyScales_kernel             : INT32 → FP32 with per-row/col scales
  *     - applyScaling_full_kernel       : Full epilogue (alpha, beta, bias)
  *     - applyScaling_m1_vec4_kernel    : M=1 decode-optimized scaling
@@ -16,7 +15,6 @@
  *     - rocmQuantGemm_setDevice()              : HIP device selection
  *     - rocmQuantGemm_uploadWeights()          : Weight upload H2D
  *     - rocmQuantGemm_ensureWorkBuffers()      : Work buffer management
- *     - rocmQuantGemm_quantizeActivations()    : FP32 → INT8 activation quantization
  *     - rocmQuantGemm_applyScaling()           : INT32 → FP32 scaling epilogue
  *     - rocmQuantGemm_biasAdd()                : In-place bias addition
  *     - rocmQuantGemm_executeTwoKernel*()      : CK GEMM + scaling orchestrators
@@ -39,265 +37,6 @@
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../utils/DebugEnv.h"
-
-// ============================================================================
-// QUANTIZATION SHAPE HELPERS
-// ============================================================================
-//
-// These helpers select thread counts and LDS policies for the quantization
-// kernel based on the shape (aspect ratio) of the activation matrix.
-//
-// ============================================================================
-
-namespace {
-
-enum class QuantShapeClass
-{
-    ExtremeWide,
-    Wide,
-    Balanced,
-    Tall,
-};
-
-struct QuantAspectThresholds
-{
-    double extreme_wide;
-    double wide;
-    double balanced_min;
-};
-
-struct QuantLdsPolicy
-{
-    int max_k;
-    int min_m;
-};
-
-static QuantAspectThresholds getQuantAspectThresholds()
-{
-    static const QuantAspectThresholds thresholds{64.0, 8.0, 0.125};
-
-    return thresholds;
-}
-
-static QuantLdsPolicy getQuantLdsPolicy()
-{
-    static const QuantLdsPolicy policy{4096, 4};
-
-    return policy;
-}
-
-static QuantShapeClass classifyQuantShape(int M, int K)
-{
-    const double safe_m = static_cast<double>(std::max(M, 1));
-    const double aspect_k_over_m = static_cast<double>(K) / safe_m;
-    const QuantAspectThresholds thresholds = getQuantAspectThresholds();
-
-    if (aspect_k_over_m >= thresholds.extreme_wide)
-    {
-        return QuantShapeClass::ExtremeWide;
-    }
-    if (aspect_k_over_m >= thresholds.wide)
-    {
-        return QuantShapeClass::Wide;
-    }
-    if (aspect_k_over_m >= thresholds.balanced_min)
-    {
-        return QuantShapeClass::Balanced;
-    }
-    return QuantShapeClass::Tall;
-}
-
-static int chooseQuantThreadsFromShape(int M, int K)
-{
-    switch (classifyQuantShape(M, K))
-    {
-        case QuantShapeClass::ExtremeWide:
-            return 512;
-        case QuantShapeClass::Wide:
-            return 256;
-        case QuantShapeClass::Balanced:
-            return 256;
-        case QuantShapeClass::Tall:
-            return 128;
-    }
-
-    return 256;
-}
-
-} // anonymous namespace
-
-// ============================================================================
-// HIP Kernel: FP32 → INT8 Activation Quantization (Phase 2)
-// ============================================================================
-
-/**
- * @brief Per-row symmetric quantization: FP32 → INT8 with per-row scale
- *
- * Algorithm:
- *   1. Find max_abs = max(|x_i|) for each row
- *   2. scale = max_abs / 127.0 (or 1.0 if max_abs == 0)
- *   3. int8_i = round(x_i / scale) clamped to [-127, 127]
- *
- * Grid: (M, 1, 1) blocks
- * Block: shape-selected threads (128/256/512), chosen from matrix aspect ratio K/M
- *
- * @param d_A_fp32 Input FP32 matrix [M × K] RowMajor
- * @param d_A_int8 Output INT8 matrix [M × K] RowMajor
- * @param d_scales Output per-row scales [M]
- * @param M Number of rows
- * @param K Number of columns per row
- */
-template <bool UseLdsRowStaging, bool NoTail>
-__global__ void quantizeActivationsQ8_kernel_t(
-    const float *__restrict__ d_A_fp32,
-    int8_t *__restrict__ d_A_int8,
-    float *__restrict__ d_scales,
-    int M, int K)
-{
-    const int row = blockIdx.x;
-    if (row >= M)
-        return;
-
-    const int tid = threadIdx.x;
-    const int block_size = blockDim.x;
-
-    __shared__ float s_wave_max[8];
-    __shared__ float s_absmax;
-
-    extern __shared__ float s_row[];
-
-    float local_max = 0.0f;
-    const float *row_ptr = d_A_fp32 + static_cast<size_t>(row) * K;
-
-    if constexpr (UseLdsRowStaging)
-    {
-        for (int k = tid; k < K; k += block_size)
-        {
-            s_row[k] = row_ptr[k];
-        }
-        __syncthreads();
-    }
-
-    const float *src_ptr = UseLdsRowStaging ? s_row : row_ptr;
-    const int vec_len = NoTail ? K : ((K / 4) * 4);
-    const bool src_aligned16 = ((reinterpret_cast<uintptr_t>(src_ptr) & 0x0F) == 0);
-
-    if (src_aligned16)
-    {
-        for (int k4 = tid * 4; k4 < vec_len; k4 += block_size * 4)
-        {
-            const float4 v = *reinterpret_cast<const float4 *>(src_ptr + k4);
-            local_max = fmaxf(local_max, fabsf(v.x));
-            local_max = fmaxf(local_max, fabsf(v.y));
-            local_max = fmaxf(local_max, fabsf(v.z));
-            local_max = fmaxf(local_max, fabsf(v.w));
-        }
-        if constexpr (!NoTail)
-        {
-            for (int k = vec_len + tid; k < K; k += block_size)
-            {
-                const float value = src_ptr[k];
-                local_max = fmaxf(local_max, fabsf(value));
-            }
-        }
-    }
-    else
-    {
-        for (int k = tid; k < K; k += block_size)
-        {
-            const float value = src_ptr[k];
-            local_max = fmaxf(local_max, fabsf(value));
-        }
-    }
-
-    const int lane = tid & 63;
-    const int wave = tid >> 6;
-    const int wave_count = block_size >> 6;
-    #pragma unroll
-    for (int offset = 32; offset > 0; offset >>= 1)
-    {
-        local_max = fmaxf(local_max, __shfl_down(local_max, offset));
-    }
-
-    if (lane == 0)
-    {
-        s_wave_max[wave] = local_max;
-    }
-    __syncthreads();
-
-    if (wave == 0)
-    {
-        float v = (tid < wave_count) ? s_wave_max[tid] : 0.0f;
-        #pragma unroll
-        for (int offset = 32; offset > 0; offset >>= 1)
-        {
-            v = fmaxf(v, __shfl_down(v, offset));
-        }
-        if (tid == 0)
-        {
-            s_absmax = v;
-        }
-    }
-    __syncthreads();
-
-    const float max_abs = s_absmax;
-    const float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
-    const float inv_scale = 1.0f / scale;
-
-    if (tid == 0)
-    {
-        d_scales[row] = scale;
-    }
-
-    int8_t *out_row = d_A_int8 + static_cast<size_t>(row) * K;
-    const bool int8_aligned4 = ((reinterpret_cast<uintptr_t>(out_row) & 0x03) == 0);
-
-    if (src_aligned16 && int8_aligned4)
-    {
-        for (int k4 = tid * 4; k4 < vec_len; k4 += block_size * 4)
-        {
-            const float4 v = *reinterpret_cast<const float4 *>(src_ptr + k4);
-
-            int q0 = static_cast<int>(rintf(v.x * inv_scale));
-            int q1 = static_cast<int>(rintf(v.y * inv_scale));
-            int q2 = static_cast<int>(rintf(v.z * inv_scale));
-            int q3 = static_cast<int>(rintf(v.w * inv_scale));
-
-            q0 = (q0 < -127) ? -127 : ((q0 > 127) ? 127 : q0);
-            q1 = (q1 < -127) ? -127 : ((q1 > 127) ? 127 : q1);
-            q2 = (q2 < -127) ? -127 : ((q2 > 127) ? 127 : q2);
-            q3 = (q3 < -127) ? -127 : ((q3 > 127) ? 127 : q3);
-
-            const uint32_t packed =
-                static_cast<uint32_t>(static_cast<uint8_t>(q0)) |
-                (static_cast<uint32_t>(static_cast<uint8_t>(q1)) << 8) |
-                (static_cast<uint32_t>(static_cast<uint8_t>(q2)) << 16) |
-                (static_cast<uint32_t>(static_cast<uint8_t>(q3)) << 24);
-
-            *reinterpret_cast<uint32_t *>(out_row + k4) = packed;
-        }
-
-        if constexpr (!NoTail)
-        {
-            for (int k = vec_len + tid; k < K; k += block_size)
-            {
-                int q = static_cast<int>(rintf(src_ptr[k] * inv_scale));
-                q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
-                out_row[k] = static_cast<int8_t>(q);
-            }
-        }
-    }
-    else
-    {
-        for (int k = tid; k < K; k += block_size)
-        {
-            const float scaled = src_ptr[k] * inv_scale;
-            int q = static_cast<int>(rintf(scaled));
-            q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
-            out_row[k] = static_cast<int8_t>(q);
-        }
-    }
-}
 
 // ============================================================================
 // Apply Scales Kernel (for two-kernel approach)
@@ -502,7 +241,7 @@ __global__ void fillConstantFloat_kernel(float* __restrict__ dst, int count, flo
  *
  * Each row is divided into fixed-size blocks of BLOCK_SIZE elements.
  * Each block gets its own independent scale, providing finer quantization
- * granularity than the row-wise kernel above.
+ * granularity than whole-row quantization.
  *
  * Algorithm (per block):
  *   1. Find max_abs = max(|x_i|) within block
@@ -669,7 +408,7 @@ void quantizeActivationsQ8_blockwise_v2_kernel(
 /**
  * Variant V3: Coarsened — each workgroup processes an entire row (or chunk of rows).
  *
- * Modeled after the row-wise quantization kernel but producing per-block scales.
+ * Per-block symmetric quantization producing per-block scales.
  * Uses vectorized float4 loads and packed int8x4 stores.
  *
  * Key insight: We still quantize in 32-element blocks, but the max-finding and
@@ -1720,83 +1459,6 @@ extern "C"
                     hipGetErrorString(err));
             return false;
         }
-        return true;
-    }
-
-    // =========================================================================
-    // ACTIVATION QUANTIZATION (FP32 → INT8)
-    // =========================================================================
-
-    bool rocmQuantGemm_quantizeActivations(
-        const float *d_A_fp32,
-        int8_t *d_A_int8,
-        float *d_scales_A,
-        int M, int K,
-        int rocm_device_id, void* stream)
-    {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
-            return false;
-
-        if (M <= 0 || K <= 0)
-            return true; // Nothing to do
-
-        // Launch kernel: one block per row, thread count selected by shape class.
-        // Policy is based on aspect ratio K/M (row width vs row count), not fixed dimensions.
-        const int block_size = chooseQuantThreadsFromShape(M, K);
-        const bool no_tail = ((K & 0x3) == 0);
-        const QuantLdsPolicy lds_policy = getQuantLdsPolicy();
-        const bool use_lds_row_staging = (K <= lds_policy.max_k) && (M >= lds_policy.min_m);
-        dim3 grid(M, 1, 1);
-        dim3 block(block_size, 1, 1);
-
-        size_t shared_mem_bytes = use_lds_row_staging ? static_cast<size_t>(K) * sizeof(float) : 0;
-
-        if (use_lds_row_staging)
-        {
-            if (no_tail)
-            {
-                hipLaunchKernelGGL(
-                    HIP_KERNEL_NAME(quantizeActivationsQ8_kernel_t<true, true>),
-                    grid, block, shared_mem_bytes, static_cast<hipStream_t>(stream),
-                    d_A_fp32, d_A_int8, d_scales_A, M, K);
-            }
-            else
-            {
-                hipLaunchKernelGGL(
-                    HIP_KERNEL_NAME(quantizeActivationsQ8_kernel_t<true, false>),
-                    grid, block, shared_mem_bytes, static_cast<hipStream_t>(stream),
-                    d_A_fp32, d_A_int8, d_scales_A, M, K);
-            }
-        }
-        else
-        {
-            if (no_tail)
-            {
-                hipLaunchKernelGGL(
-                    HIP_KERNEL_NAME(quantizeActivationsQ8_kernel_t<false, true>),
-                    grid, block, 0, static_cast<hipStream_t>(stream),
-                    d_A_fp32, d_A_int8, d_scales_A, M, K);
-            }
-            else
-            {
-                hipLaunchKernelGGL(
-                    HIP_KERNEL_NAME(quantizeActivationsQ8_kernel_t<false, false>),
-                    grid, block, 0, static_cast<hipStream_t>(stream),
-                    d_A_fp32, d_A_int8, d_scales_A, M, K);
-            }
-        }
-
-        // Check for launch errors
-        hipError_t err = hipGetLastError();
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_quantizeActivations] Kernel launch failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-
-        // No device-wide sync here; rely on stream ordering + a final sync/copy.
-
         return true;
     }
 

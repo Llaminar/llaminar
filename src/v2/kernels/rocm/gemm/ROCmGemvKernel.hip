@@ -7,11 +7,11 @@
  *   ROCmGemvKernel_INT8_VNNI.hip
  *       All ratio-VNNI (INT8×INT8) kernels and their C dispatch wrappers:
  *       - Basic decode:         rocmGemv_int8_int8_int32_vnni
- *       - Scaled decode:        rocmGemv_int8_int8_fp32_vnni_scaled
+ *       - Blockwise scaled:     rocmGemv_int8_int8_fp32_vnni_blockwise_scaled
  *       - Fused FP32→INT8:      rocmGemv_fused_fp32_int8_vnni
  *       - Scatter/reduce:       rocmGemv_fused_scatter_fp32_int8_vnni
  *       - Self-reduce:          rocmGemv_fused_scatter_selfreduce_fp32_int8_vnni
- *       - Pre-quantized scatter:rocmGemv_int8_scatter_vnni
+ *       - Blockwise scatter:    rocmGemv_int8_scatter_vnni_blockwise
  *       - Batched scatter:      rocmGemv_int8_scatter_batched_vnni
  *       - VNNI repack:          rocmGemv_repackVNNI_to_rowmajor
  *       - Prefill GEMM:         rocmGemm_int8_int8_int32_vnni_prefill

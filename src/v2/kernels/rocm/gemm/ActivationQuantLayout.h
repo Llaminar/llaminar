@@ -5,10 +5,7 @@
  * @brief Metadata for ROCm activation quantization layout
  *
  * Describes how FP32 activations are quantized to INT8 for ROCm GEMM/GEMV,
- * including the scale granularity (row-wise vs blockwise).
- *
- * Part of Milestone 1: Contract Skeleton for blockwise activation quantization.
- * See docs/v2/cleanup/ROCM_BLOCKWISE_ACTIVATION_QUANTIZATION_PLAN.md
+ * using blockwise scale granularity.
  */
 
 #include <cstdint>
@@ -19,16 +16,9 @@ namespace llaminar2::rocm
 
     /**
      * @brief Activation quantization granularity mode
-     *
-     * Controls how activation scales are computed and stored during
-     * FP32 → INT8 quantization before GEMM/GEMV.
      */
     enum class ActivationQuantMode : uint8_t
     {
-        /// One symmetric scale per row. d_scales_A shape: [M]
-        /// This is the legacy/default mode.
-        ROW_WISE = 0,
-
         /// One symmetric scale per K-block of 32 elements.
         /// d_scales_A shape: [M × ceil(K/block_size)]
         BLOCKWISE = 1,
@@ -53,12 +43,12 @@ namespace llaminar2::rocm
      */
     struct ActivationQuantLayout
     {
-        ActivationQuantMode mode = ActivationQuantMode::ROW_WISE;
+        ActivationQuantMode mode = ActivationQuantMode::BLOCKWISE;
 
         int rows = 0;           ///< M (number of activation rows)
         int cols = 0;           ///< K (number of activation columns / input features)
-        int block_size = 0;     ///< Elements per quantization block (0 for ROW_WISE, 32 for BLOCKWISE)
-        int blocks_per_row = 0; ///< Number of scale blocks per row (1 for ROW_WISE, ceil(K/block_size) for BLOCKWISE)
+        int block_size = 0;     ///< Elements per quantization block (e.g. 32)
+        int blocks_per_row = 0; ///< Number of scale blocks per row (ceil(K/block_size))
 
         /// Total number of FP32 scale values
         int scaleCount() const { return rows * blocks_per_row; }
@@ -75,27 +65,12 @@ namespace llaminar2::rocm
             return static_cast<size_t>(rows) * cols * sizeof(int8_t);
         }
 
-        /// Is this the legacy row-wise mode?
-        bool isRowWise() const { return mode == ActivationQuantMode::ROW_WISE; }
-
         /// Is this blockwise mode?
         bool isBlockwise() const { return mode == ActivationQuantMode::BLOCKWISE; }
 
         // =========================================================================
         // Factory methods
         // =========================================================================
-
-        /// Create a row-wise activation quant layout (legacy default)
-        static ActivationQuantLayout rowWise(int M, int K)
-        {
-            ActivationQuantLayout layout;
-            layout.mode = ActivationQuantMode::ROW_WISE;
-            layout.rows = M;
-            layout.cols = K;
-            layout.block_size = K; // entire row is one "block"
-            layout.blocks_per_row = 1;
-            return layout;
-        }
 
         /// Create a blockwise activation quant layout
         static ActivationQuantLayout blockwise(int M, int K, int block_sz = 32)

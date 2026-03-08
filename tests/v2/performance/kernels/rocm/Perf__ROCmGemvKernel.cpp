@@ -39,50 +39,13 @@
 // GEMV + CK GEMM kernel C API
 extern "C"
 {
-    bool rocmQuantGemm_quantizeActivations(
-        const float *d_A_fp32,
-        int8_t *d_A_int8,
-        float *d_scales_A,
-        int M, int K,
-        int rocm_device_id, void *stream);
-
     bool rocmQuantGemm_quantizeActivationsBlockwise(
         const float *d_A_fp32,
         int8_t *d_A_int8,
         float *d_scales_A_blockwise,
         int M, int K,
-        int rocm_device_id, void *stream);
-
-    bool rocmQuantGemm_applyScaling(
-        const int32_t *d_C_int32,
-        float *d_C_fp32,
-        const float *d_scales_A,
-        const float *d_scales_B,
-        int M, int N,
-        float alpha, float beta,
-        const float *d_C_existing,
-        const float *d_bias,
-        int rocm_device_id, void *stream);
-
-    bool rocmGemv_int8_int8_int32_vnni(
-        const int8_t *d_A_int8,
-        const int8_t *d_B_int8_vnni,
-        int32_t *d_C_int32,
-        int N, int K,
-        int device_id, void *stream);
-
-    bool rocmGemv_int8_int8_fp32_vnni_scaled(
-        const int8_t *d_A_int8,
-        const int8_t *d_B_int8_vnni,
-        float *d_C_fp32,
-        const float *d_scale_A,
-        const float *d_scale_B,
-        int N, int K,
-        float alpha,
-        float beta,
-        const float *d_C_existing,
-        const float *d_bias,
-        int device_id, void *stream);
+        int rocm_device_id, void *stream,
+        int block_size);
 
     void rocmGemv_int8_vnni_set_tuning_overrides(
         int tn,
@@ -491,14 +454,16 @@ namespace
             float *d_A = nullptr, *d_scale = nullptr, *d_C = nullptr;
             int8_t *d_B_vnni = nullptr;
             int8_t *d_A_int8 = nullptr;
-            float *d_scale_A = nullptr;
+            float *d_scale_A_bw = nullptr;
             int32_t *d_C_int32 = nullptr;
+
+            const int blocks_per_row = (K + 31) / 32;
 
             hipMalloc(&d_A, K * sizeof(float));
             hipMalloc(&d_scale, N * sizeof(float));
             hipMalloc(&d_C, N * sizeof(float));
             hipMalloc(&d_A_int8, K * sizeof(int8_t));
-            hipMalloc(&d_scale_A, sizeof(float));
+            hipMalloc(&d_scale_A_bw, blocks_per_row * sizeof(float));
             hipMalloc(&d_C_int32, N * sizeof(int32_t));
             hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
 
@@ -507,19 +472,13 @@ namespace
             hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
             hipDeviceSynchronize();
 
-            // --- Warmup (INT8 VNNI pipeline) ---
+            // --- Warmup (blockwise INT8 VNNI pipeline) ---
             for (int i = 0; i < warmup_runs; ++i)
             {
-                rocmQuantGemm_quantizeActivations(d_A, d_A_int8, d_scale_A, 1, K, device_id_, nullptr);
-                bool fused_scale = rocmGemv_int8_int8_fp32_vnni_scaled(
-                    d_A_int8, d_B_vnni, d_C, d_scale_A, d_scale,
+                rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_bw, 1, K, device_id_, nullptr, 32);
+                rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                    d_A_int8, d_B_vnni, d_C, d_scale_A_bw, d_scale,
                     N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
-                if (!fused_scale)
-                {
-                    rocmGemv_int8_int8_int32_vnni(d_A_int8, d_B_vnni, d_C_int32, N, K, device_id_, nullptr);
-                    rocmQuantGemm_applyScaling(d_C_int32, d_C, d_scale_A, d_scale,
-                                               1, N, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
-                }
             }
             hipDeviceSynchronize();
 
@@ -558,39 +517,27 @@ namespace
                 float scale_ms = 0.0f;
                 bool fused_scale = false;
 
-                // Step 1: Quantize activations FP32 → INT8
+                // Step 1: Quantize activations FP32 → INT8 (blockwise)
                 hipEventRecord(quant_start, 0);
-                ok = rocmQuantGemm_quantizeActivations(d_A, d_A_int8, d_scale_A, 1, K, device_id_, nullptr);
+                ok = rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_bw, 1, K, device_id_, nullptr, 32);
                 hipEventRecord(quant_stop, 0);
                 hipEventSynchronize(quant_stop);
                 hipEventElapsedTime(&quant_ms, quant_start, quant_stop);
 
-                // Step 2: INT8 VNNI GEMV
+                // Step 2: INT8 VNNI GEMV (blockwise — always fuses scaling)
                 if (ok)
                 {
                     hipEventRecord(gemv_start, 0);
-                    fused_scale = rocmGemv_int8_int8_fp32_vnni_scaled(
-                        d_A_int8, d_B_vnni, d_C, d_scale_A, d_scale,
+                    fused_scale = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                        d_A_int8, d_B_vnni, d_C, d_scale_A_bw, d_scale,
                         N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
-                    if (!fused_scale)
-                    {
-                        ok = rocmGemv_int8_int8_int32_vnni(d_A_int8, d_B_vnni, d_C_int32, N, K, device_id_, nullptr);
-                    }
+                    ok = fused_scale;
                     hipEventRecord(gemv_stop, 0);
                     hipEventSynchronize(gemv_stop);
                     hipEventElapsedTime(&gemv_ms, gemv_start, gemv_stop);
                 }
 
-                // Step 3: Apply scaling INT32 → FP32
-                if (ok && !fused_scale)
-                {
-                    hipEventRecord(scale_start, 0);
-                    ok = rocmQuantGemm_applyScaling(d_C_int32, d_C, d_scale_A, d_scale,
-                                                    1, N, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
-                    hipEventRecord(scale_stop, 0);
-                    hipEventSynchronize(scale_stop);
-                    hipEventElapsedTime(&scale_ms, scale_start, scale_stop);
-                }
+                // Step 3: No longer needed — blockwise always fuses scaling
 
                 hipEventRecord(total_stop, 0);
                 hipEventSynchronize(total_stop);
@@ -603,7 +550,7 @@ namespace
                     hipFree(d_scale);
                     hipFree(d_C);
                     hipFree(d_A_int8);
-                    hipFree(d_scale_A);
+                    hipFree(d_scale_A_bw);
                     hipFree(d_C_int32);
                     hipFree(d_B_vnni);
                     return result;
@@ -629,7 +576,7 @@ namespace
             hipFree(d_C);
             hipFree(d_B_vnni);
             hipFree(d_A_int8);
-            hipFree(d_scale_A);
+            hipFree(d_scale_A_bw);
             hipFree(d_C_int32);
 
             // --- Statistics ---
@@ -715,7 +662,7 @@ namespace
 
             for (int i = 0; i < warmup_runs; ++i)
             {
-                rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr);
+                rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr, 32);
                 bool ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                     d_A_int8, d_B_vnni, d_C, d_scale_A_blockwise, d_scale,
                     N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
@@ -756,7 +703,7 @@ namespace
 
                 hipEventRecord(quant_start, 0);
                 bool ok = rocmQuantGemm_quantizeActivationsBlockwise(
-                    d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr);
+                    d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr, 32);
                 hipEventRecord(quant_stop, 0);
                 hipEventSynchronize(quant_stop);
                 hipEventElapsedTime(&quant_ms, quant_start, quant_stop);
@@ -901,7 +848,7 @@ namespace
 
             for (int i = 0; i < warmup_runs; ++i)
             {
-                rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr);
+                rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr, 32);
                 for (size_t proj = 0; proj < Ns.size(); ++proj)
                 {
                     bool ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
@@ -945,7 +892,7 @@ namespace
                 hipEventRecord(total_start, 0);
 
                 hipEventRecord(quant_start, 0);
-                bool ok = rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr);
+                bool ok = rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr, 32);
                 hipEventRecord(quant_stop, 0);
                 hipEventSynchronize(quant_stop);
                 float quant_ms = 0.0f;
@@ -1106,7 +1053,7 @@ namespace
 
             for (int i = 0; i < warmup_runs; ++i)
             {
-                rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr);
+                rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr, 32);
                 bool ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
                     d_A_int8, d_scale_A_blockwise, static_cast<int>(Ns.size()),
                     d_B_ptrs.data(), d_C_ptrs.data(), d_scale_ptrs.data(), d_bias_ptrs.data(), Ns.data(),
@@ -1149,7 +1096,7 @@ namespace
                 hipEventRecord(total_start, 0);
 
                 hipEventRecord(quant_start, 0);
-                bool ok = rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr);
+                bool ok = rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr, 32);
                 hipEventRecord(quant_stop, 0);
                 hipEventSynchronize(quant_stop);
                 float quant_ms = 0.0f;
@@ -1476,30 +1423,29 @@ namespace
             std::vector<int8_t> h_B_vnni;
             packVnniWeights(h_B, N, K, h_B_vnni);
 
-            // GPU: INT8 VNNI pipeline (quantize → VNNI GEMV → scale)
+            // GPU: INT8 VNNI pipeline (blockwise quantize → fused blockwise GEMV)
             float *d_A = nullptr, *d_scale = nullptr, *d_C = nullptr;
             int8_t *d_B_vnni = nullptr;
             int8_t *d_A_int8 = nullptr;
-            float *d_scale_A = nullptr;
-            int32_t *d_C_int32 = nullptr;
+            float *d_scale_A_bw = nullptr;
 
+            const int blocks_per_row = (K + 31) / 32;
             hipMalloc(&d_A, K * sizeof(float));
             hipMalloc(&d_scale, N * sizeof(float));
             hipMalloc(&d_C, N * sizeof(float));
             hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
             hipMalloc(&d_A_int8, K * sizeof(int8_t));
-            hipMalloc(&d_scale_A, sizeof(float));
-            hipMalloc(&d_C_int32, N * sizeof(int32_t));
+            hipMalloc(&d_scale_A_bw, blocks_per_row * sizeof(float));
 
             hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
             hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
             hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
             hipDeviceSynchronize();
 
-            rocmQuantGemm_quantizeActivations(d_A, d_A_int8, d_scale_A, 1, K, device_id_, nullptr);
-            rocmGemv_int8_int8_int32_vnni(d_A_int8, d_B_vnni, d_C_int32, N, K, device_id_, nullptr);
-            rocmQuantGemm_applyScaling(d_C_int32, d_C, d_scale_A, d_scale,
-                                       1, N, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
+            rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_bw, 1, K, device_id_, nullptr, 32);
+            rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                d_A_int8, d_B_vnni, d_C, d_scale_A_bw, d_scale,
+                N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
             hipDeviceSynchronize();
 
             std::vector<float> gpu_out(N);
@@ -1510,8 +1456,7 @@ namespace
             hipFree(d_C);
             hipFree(d_B_vnni);
             hipFree(d_A_int8);
-            hipFree(d_scale_A);
-            hipFree(d_C_int32);
+            hipFree(d_scale_A_bw);
 
             return checkCorrectness(gpu_out.data(), ref.data(), N);
 #endif
@@ -1555,21 +1500,20 @@ namespace
             std::vector<int8_t> h_B_vnni;
             packVnniWeights(h_B, N, K, h_B_vnni);
 
-            // GPU: INT8 VNNI pipeline with bias (quantize → VNNI GEMV → scale+bias)
+            // GPU: INT8 VNNI pipeline with bias (blockwise quantize → fused blockwise GEMV+bias)
             float *d_A = nullptr, *d_scale = nullptr, *d_bias = nullptr, *d_C = nullptr;
             int8_t *d_B_vnni = nullptr;
             int8_t *d_A_int8 = nullptr;
-            float *d_scale_A = nullptr;
-            int32_t *d_C_int32 = nullptr;
+            float *d_scale_A_bw = nullptr;
 
+            const int blocks_per_row = (K + 31) / 32;
             hipMalloc(&d_A, K * sizeof(float));
             hipMalloc(&d_scale, N * sizeof(float));
             hipMalloc(&d_bias, N * sizeof(float));
             hipMalloc(&d_C, N * sizeof(float));
             hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
             hipMalloc(&d_A_int8, K * sizeof(int8_t));
-            hipMalloc(&d_scale_A, sizeof(float));
-            hipMalloc(&d_C_int32, N * sizeof(int32_t));
+            hipMalloc(&d_scale_A_bw, blocks_per_row * sizeof(float));
 
             hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
             hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
@@ -1577,10 +1521,10 @@ namespace
             hipMemcpy(d_bias, h_bias.data(), N * sizeof(float), hipMemcpyHostToDevice);
             hipDeviceSynchronize();
 
-            rocmQuantGemm_quantizeActivations(d_A, d_A_int8, d_scale_A, 1, K, device_id_, nullptr);
-            rocmGemv_int8_int8_int32_vnni(d_A_int8, d_B_vnni, d_C_int32, N, K, device_id_, nullptr);
-            rocmQuantGemm_applyScaling(d_C_int32, d_C, d_scale_A, d_scale,
-                                       1, N, 1.0f, 0.0f, nullptr, d_bias, device_id_, nullptr);
+            rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_bw, 1, K, device_id_, nullptr, 32);
+            rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                d_A_int8, d_B_vnni, d_C, d_scale_A_bw, d_scale,
+                N, K, 1.0f, 0.0f, nullptr, d_bias, device_id_, nullptr);
             hipDeviceSynchronize();
 
             std::vector<float> gpu_out(N);
@@ -1592,8 +1536,7 @@ namespace
             hipFree(d_C);
             hipFree(d_B_vnni);
             hipFree(d_A_int8);
-            hipFree(d_scale_A);
-            hipFree(d_C_int32);
+            hipFree(d_scale_A_bw);
 
             return checkCorrectness(gpu_out.data(), ref.data(), N);
 #endif
@@ -2359,11 +2302,14 @@ namespace
             float *d_A = nullptr, *d_C = nullptr;
             int8_t *d_A_int8 = nullptr, *d_B_int8 = nullptr;
             float *d_scales_A = nullptr, *d_scales_B = nullptr;
+            float *d_scales_A_bw = nullptr;
             int32_t *d_C_int32 = nullptr;
 
+            const int blocks_per_row = (K + 31) / 32;
             hipMalloc(&d_A, M_padded * K * sizeof(float));
             hipMalloc(&d_A_int8, M_padded * K * sizeof(int8_t));
             hipMalloc(&d_scales_A, M_padded * sizeof(float));
+            hipMalloc(&d_scales_A_bw, M_padded * blocks_per_row * sizeof(float));
             hipMalloc(&d_B_int8, static_cast<size_t>(K) * N * sizeof(int8_t));
             hipMalloc(&d_scales_B, N * sizeof(float));
             hipMalloc(&d_C, M_padded * N * sizeof(float));
@@ -2384,12 +2330,15 @@ namespace
             hipMemcpy(d_A, h_A.data(), M_padded * K * sizeof(float), hipMemcpyHostToDevice);
             hipMemcpy(d_B_int8, h_B.data(), static_cast<size_t>(K) * N * sizeof(int8_t), hipMemcpyHostToDevice);
             hipMemcpy(d_scales_B, h_s.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            // CK executeTwoKernel_cached requires per-row scales; fill with 1.0 for throughput benchmark
+            std::vector<float> h_unit_scales(M_padded, 1.0f);
+            hipMemcpy(d_scales_A, h_unit_scales.data(), M_padded * sizeof(float), hipMemcpyHostToDevice);
             hipDeviceSynchronize();
 
             // Warmup CK
             for (int i = 0; i < 3; ++i)
             {
-                rocmQuantGemm_quantizeActivations(d_A, d_A_int8, d_scales_A, M_padded, K, device_id_, nullptr);
+                rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scales_A_bw, M_padded, K, device_id_, nullptr, 32);
                 rocmQuantGemm_executeTwoKernel_cached(d_A_int8, d_B_int8, d_C, d_scales_A, d_scales_B,
                                                       d_C_int32, M_padded, N, K, device_id_, nullptr);
             }
@@ -2401,7 +2350,7 @@ namespace
             {
                 hipDeviceSynchronize();
                 auto t0 = std::chrono::high_resolution_clock::now();
-                rocmQuantGemm_quantizeActivations(d_A, d_A_int8, d_scales_A, M_padded, K, device_id_, nullptr);
+                rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scales_A_bw, M_padded, K, device_id_, nullptr, 32);
                 rocmQuantGemm_executeTwoKernel_cached(d_A_int8, d_B_int8, d_C, d_scales_A, d_scales_B,
                                                       d_C_int32, M_padded, N, K, device_id_, nullptr);
                 hipDeviceSynchronize();
@@ -2412,6 +2361,7 @@ namespace
             hipFree(d_A);
             hipFree(d_A_int8);
             hipFree(d_scales_A);
+            hipFree(d_scales_A_bw);
             hipFree(d_B_int8);
             hipFree(d_scales_B);
             hipFree(d_C);
@@ -3578,7 +3528,7 @@ namespace
             hipDeviceSynchronize();
 
             // Quantize activations once
-            rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_bw, 1, K, device_id_, nullptr);
+            rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_bw, 1, K, device_id_, nullptr, 32);
             hipDeviceSynchronize();
 
             // Create HIP events and second stream

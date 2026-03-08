@@ -377,7 +377,7 @@ namespace
                                              const GpuWeightsCache &gpu_weights)
         {
             BenchResult result;
-            result.variant_name = "RowWise";
+            result.variant_name = "Blockwise";
             result.shape_name = shape.name;
             result.category = shape.category;
             result.M = M;
@@ -394,8 +394,6 @@ namespace
                 return result;
 
             ROCmQuantisedGemmKernel kernel(&packed, 0);
-            // Force row-wise activation quantization
-            kernel.setActivationQuantMode(ActivationQuantMode::ROW_WISE);
 
             auto reqs = kernel.getWorkspaceRequirements(M, shape.N, shape.K);
             const size_t budget = reqs.total_bytes_with_alignment() + (8 * 1024 * 1024);

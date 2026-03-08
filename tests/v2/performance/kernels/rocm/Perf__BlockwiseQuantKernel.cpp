@@ -47,14 +47,8 @@ extern "C"
         int8_t *d_A_int8,
         float *d_scales_blockwise,
         int M, int K,
-        int rocm_device_id, void *stream);
-
-    bool rocmQuantGemm_quantizeActivations(
-        const float *d_A_fp32,
-        int8_t *d_A_int8,
-        float *d_scales_A,
-        int M, int K,
-        int rocm_device_id, void *stream);
+        int rocm_device_id, void *stream,
+        int block_size);
 }
 
 namespace
@@ -276,7 +270,7 @@ namespace
                 hipMemset(d_scales, 0, scale_bytes);
 
                 bool ok = rocmQuantGemm_quantizeActivationsBlockwise(
-                    d_fp32, d_int8, d_scales, M, shape.K, 0, nullptr);
+                    d_fp32, d_int8, d_scales, M, shape.K, 0, nullptr, 32);
                 (void)hipDeviceSynchronize();
 
                 if (!ok)
@@ -320,7 +314,7 @@ namespace
             for (int i = 0; i < WARMUP_RUNS; ++i)
             {
                 rocmQuantGemm_quantizeActivationsBlockwise(
-                    d_fp32, d_int8, d_scales, M, shape.K, 0, nullptr);
+                    d_fp32, d_int8, d_scales, M, shape.K, 0, nullptr, 32);
             }
             (void)hipDeviceSynchronize();
 
@@ -337,7 +331,7 @@ namespace
                 (void)hipDeviceSynchronize();
                 hipEventRecord(start);
                 rocmQuantGemm_quantizeActivationsBlockwise(
-                    d_fp32, d_int8, d_scales, M, shape.K, 0, nullptr);
+                    d_fp32, d_int8, d_scales, M, shape.K, 0, nullptr, 32);
                 hipEventRecord(stop);
                 hipEventSynchronize(stop);
 
@@ -370,14 +364,15 @@ namespace
                                           const float *h_fp32)
         {
             QuantBenchResult result;
-            result.variant_name = "RowWise";
+            result.variant_name = "Blockwise32_baseline";
             result.shape_name = shape.name;
             result.M = M;
             result.K = shape.K;
 
+            const int blocks_per_row = (shape.K + 31) / 32;
             const size_t fp32_bytes = static_cast<size_t>(M) * shape.K * sizeof(float);
             const size_t int8_bytes = static_cast<size_t>(M) * shape.K * sizeof(int8_t);
-            const size_t scale_bytes = static_cast<size_t>(M) * sizeof(float);
+            const size_t scale_bytes = static_cast<size_t>(M) * blocks_per_row * sizeof(float);
 
             float *d_fp32 = nullptr;
             int8_t *d_int8 = nullptr;
@@ -397,13 +392,13 @@ namespace
             }
 
             hipMemcpy(d_fp32, h_fp32, fp32_bytes, hipMemcpyHostToDevice);
-            result.correctness_pass = true; // Row-wise is the reference path
+            result.correctness_pass = true; // Blockwise baseline is the reference path
 
             // Warmup
             for (int i = 0; i < WARMUP_RUNS; ++i)
             {
-                rocmQuantGemm_quantizeActivations(
-                    d_fp32, d_int8, d_scales, M, shape.K, 0, nullptr);
+                rocmQuantGemm_quantizeActivationsBlockwise(
+                    d_fp32, d_int8, d_scales, M, shape.K, 0, nullptr, 32);
             }
             (void)hipDeviceSynchronize();
 
@@ -419,8 +414,8 @@ namespace
             {
                 (void)hipDeviceSynchronize();
                 hipEventRecord(start);
-                rocmQuantGemm_quantizeActivations(
-                    d_fp32, d_int8, d_scales, M, shape.K, 0, nullptr);
+                rocmQuantGemm_quantizeActivationsBlockwise(
+                    d_fp32, d_int8, d_scales, M, shape.K, 0, nullptr, 32);
                 hipEventRecord(stop);
                 hipEventSynchronize(stop);
 

@@ -57,7 +57,8 @@ extern "C" bool rocmQuantGemm_quantizeActivationsBlockwise(
     int8_t *d_A_int8,
     float *d_scales_A_blockwise,
     int M, int K,
-    int rocm_device_id, void *stream);
+    int rocm_device_id, void *stream,
+    int block_size);
 
 extern "C" bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
     const int8_t* d_A_int8,
@@ -89,14 +90,6 @@ extern "C" bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
 // Forward declarations for HIP functions used in integration tests
 extern "C"
 {
-    // Activation quantization kernel
-    bool rocmQuantGemm_quantizeActivations(
-        const float *d_A_fp32,
-        int8_t *d_A_int8,
-        float *d_scales_A,
-        int M, int K,
-        int rocm_device_id, void *stream);
-
     // Work buffer management
     bool rocmQuantGemm_ensureWorkBuffers(
         int8_t **d_A_int8,
@@ -242,61 +235,6 @@ namespace llaminar2
                     }
 
                     return reference;
-                }
-
-                std::vector<float> computeNativeReferenceFromQuantizedActivations(
-                    const std::vector<int8_t> &activations_int8,
-                    const std::vector<float> &scales_a,
-                    const NativeWeightReference &weights,
-                    int M, int N, int K)
-                {
-                    const int blocks_per_row = weights.blocks_per_row;
-                    std::vector<int32_t> activation_block_sums(static_cast<size_t>(M) * blocks_per_row);
-                    std::vector<float> output(static_cast<size_t>(M) * N, 0.0f);
-
-#pragma omp parallel for schedule(static)
-                    for (int m = 0; m < M; ++m)
-                    {
-                        for (int block = 0; block < blocks_per_row; ++block)
-                        {
-                            int32_t sum = 0;
-                            const int8_t *a_block = &activations_int8[static_cast<size_t>(m) * K + block * 32];
-                            for (int i = 0; i < 32; ++i)
-                            {
-                                sum += static_cast<int32_t>(a_block[i]);
-                            }
-                            activation_block_sums[static_cast<size_t>(m) * blocks_per_row + block] = sum;
-                        }
-                    }
-
-#pragma omp parallel for schedule(static)
-                    for (int m = 0; m < M; ++m)
-                    {
-                        for (int n = 0; n < N; ++n)
-                        {
-                            float accum = 0.0f;
-                            const float scale_a = scales_a[static_cast<size_t>(m)];
-                            for (int block = 0; block < blocks_per_row; ++block)
-                            {
-                                const size_t linear = static_cast<size_t>(n) * blocks_per_row + block;
-                                const int8_t *a_block = &activations_int8[static_cast<size_t>(m) * K + block * 32];
-                                const int8_t *b_block = &weights.unpacked_blocks[linear * 32];
-                                int32_t dot = 0;
-                                for (int i = 0; i < 32; ++i)
-                                {
-                                    dot += static_cast<int32_t>(a_block[i]) * static_cast<int32_t>(b_block[i]);
-                                }
-
-                                const float scale_b = weights.block_scales[linear];
-                                const float min_b = weights.block_mins[linear];
-                                const int32_t sum_a = activation_block_sums[static_cast<size_t>(m) * blocks_per_row + block];
-                                accum += scale_a * (static_cast<float>(dot) * scale_b + static_cast<float>(sum_a) * min_b);
-                            }
-                            output[static_cast<size_t>(m) * N + n] = accum;
-                        }
-                    }
-
-                    return output;
                 }
 
                 void quantizeActivationsPerBlock32(
@@ -837,19 +775,23 @@ namespace llaminar2
 
                 // Upload and quantize
                 ASSERT_TRUE(rocmQuantGemm_copyHostToDevice(d_activations, h_activations.data(), M * K, 0));
-                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(d_activations, d_A_int8, d_scales_A, M, K, 0, nullptr));
+
+                const int blocks_per_row = (K + 31) / 32;
+                float *d_scales_bw = nullptr;
+                ASSERT_EQ(hipMalloc(&d_scales_bw, static_cast<size_t>(M) * blocks_per_row * sizeof(float)), hipSuccess);
+                ASSERT_TRUE(rocmQuantGemm_quantizeActivationsBlockwise(d_activations, d_A_int8, d_scales_bw, M, K, 0, nullptr, 32));
 
                 // Download results
                 std::vector<int8_t> h_A_int8(M * K);
-                std::vector<float> h_scales_A(M);
+                std::vector<float> h_scales_bw(static_cast<size_t>(M) * blocks_per_row);
 
                 ASSERT_EQ(hipMemcpy(h_A_int8.data(), d_A_int8, M * K * sizeof(int8_t), hipMemcpyDeviceToHost), hipSuccess);
-                ASSERT_EQ(hipMemcpy(h_scales_A.data(), d_scales_A, M * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
+                ASSERT_EQ(hipMemcpy(h_scales_bw.data(), d_scales_bw, static_cast<size_t>(M) * blocks_per_row * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
 
-                // Verify scales are positive
-                for (int m = 0; m < M; ++m)
+                // Verify per-block scales are positive
+                for (size_t i = 0; i < static_cast<size_t>(M) * blocks_per_row; ++i)
                 {
-                    EXPECT_GT(h_scales_A[m], 0.0f) << "Scale for row " << m << " should be positive";
+                    EXPECT_GT(h_scales_bw[i], 0.0f) << "Blockwise scale at index " << i << " should be positive";
                 }
 
                 // Verify INT8 values are in valid range
@@ -860,6 +802,7 @@ namespace llaminar2
                 }
 
                 // Cleanup
+                hipFree(d_scales_bw);
                 rocmQuantGemm_freeDevice(d_activations, 0);
                 rocmQuantGemm_freeDevice(d_A_int8, 0);
                 rocmQuantGemm_freeDevice(d_scales_A, 0);
@@ -1189,22 +1132,27 @@ namespace llaminar2
 
                 // Upload and quantize
                 ASSERT_TRUE(rocmQuantGemm_copyHostToDevice(d_activations, h_activations.data(), M * K, 0));
-                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(d_activations, d_A_int8, d_scales_A, M, K, 0, nullptr));
+
+                const int blocks_per_row = (K + 31) / 32;
+                float *d_scales_bw = nullptr;
+                ASSERT_EQ(hipMalloc(&d_scales_bw, static_cast<size_t>(M) * blocks_per_row * sizeof(float)), hipSuccess);
+                ASSERT_TRUE(rocmQuantGemm_quantizeActivationsBlockwise(d_activations, d_A_int8, d_scales_bw, M, K, 0, nullptr, 32));
 
                 // Download results
                 std::vector<int8_t> h_A_int8(M * K);
-                std::vector<float> h_scales_A(M);
+                std::vector<float> h_scales_bw(static_cast<size_t>(M) * blocks_per_row);
 
                 ASSERT_EQ(hipMemcpy(h_A_int8.data(), d_A_int8, M * K * sizeof(int8_t), hipMemcpyDeviceToHost), hipSuccess);
-                ASSERT_EQ(hipMemcpy(h_scales_A.data(), d_scales_A, M * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
+                ASSERT_EQ(hipMemcpy(h_scales_bw.data(), d_scales_bw, static_cast<size_t>(M) * blocks_per_row * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
 
-                // Verify scales are positive
-                for (int m = 0; m < M; ++m)
+                // Verify per-block scales are positive
+                for (size_t i = 0; i < static_cast<size_t>(M) * blocks_per_row; ++i)
                 {
-                    EXPECT_GT(h_scales_A[m], 0.0f);
+                    EXPECT_GT(h_scales_bw[i], 0.0f);
                 }
 
                 // Cleanup
+                hipFree(d_scales_bw);
                 rocmQuantGemm_freeDevice(d_activations, 0);
                 rocmQuantGemm_freeDevice(d_A_int8, 0);
                 rocmQuantGemm_freeDevice(d_scales_A, 0);
@@ -1254,19 +1202,24 @@ namespace llaminar2
                     M, K, N, 0));
 
                 ASSERT_TRUE(rocmQuantGemm_copyHostToDevice(d_activations, h_activations.data(), M * K, 0));
-                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(d_activations, d_A_int8, d_scales_A, M, K, 0, nullptr));
 
-                // Download scales
-                std::vector<float> h_scales_A(M);
-                ASSERT_EQ(hipMemcpy(h_scales_A.data(), d_scales_A, M * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
+                const int blocks_per_row = (K + 31) / 32;
+                float *d_scales_bw = nullptr;
+                ASSERT_EQ(hipMalloc(&d_scales_bw, static_cast<size_t>(M) * blocks_per_row * sizeof(float)), hipSuccess);
+                ASSERT_TRUE(rocmQuantGemm_quantizeActivationsBlockwise(d_activations, d_A_int8, d_scales_bw, M, K, 0, nullptr, 32));
 
-                // All scales should be positive (zero row gets small epsilon scale)
-                for (int m = 0; m < M; ++m)
+                // Download per-block scales
+                std::vector<float> h_scales_bw(static_cast<size_t>(M) * blocks_per_row);
+                ASSERT_EQ(hipMemcpy(h_scales_bw.data(), d_scales_bw, static_cast<size_t>(M) * blocks_per_row * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
+
+                // All per-block scales should be positive (zero row blocks get small epsilon scale)
+                for (size_t i = 0; i < static_cast<size_t>(M) * blocks_per_row; ++i)
                 {
-                    EXPECT_GT(h_scales_A[m], 0.0f) << "Scale for row " << m << " should be positive";
+                    EXPECT_GT(h_scales_bw[i], 0.0f) << "Blockwise scale at index " << i << " should be positive";
                 }
 
                 // Cleanup
+                hipFree(d_scales_bw);
                 rocmQuantGemm_freeDevice(d_activations, 0);
                 rocmQuantGemm_freeDevice(d_A_int8, 0);
                 rocmQuantGemm_freeDevice(d_scales_A, 0);
@@ -1306,23 +1259,28 @@ namespace llaminar2
                     M, K, N, 0));
 
                 ASSERT_TRUE(rocmQuantGemm_copyHostToDevice(d_activations, h_activations.data(), M * K, 0));
-                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(d_activations, d_A_int8, d_scales_A, M, K, 0, nullptr));
+
+                const int blocks_per_row = (K + 31) / 32;
+                float *d_scales_bw = nullptr;
+                ASSERT_EQ(hipMalloc(&d_scales_bw, static_cast<size_t>(M) * blocks_per_row * sizeof(float)), hipSuccess);
+                ASSERT_TRUE(rocmQuantGemm_quantizeActivationsBlockwise(d_activations, d_A_int8, d_scales_bw, M, K, 0, nullptr, 32));
 
                 // Download results
                 std::vector<int8_t> h_A_int8(M * K);
-                std::vector<float> h_scales_A(M);
+                std::vector<float> h_scales_bw(static_cast<size_t>(M) * blocks_per_row);
 
                 ASSERT_EQ(hipMemcpy(h_A_int8.data(), d_A_int8, M * K * sizeof(int8_t), hipMemcpyDeviceToHost), hipSuccess);
-                ASSERT_EQ(hipMemcpy(h_scales_A.data(), d_scales_A, M * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
+                ASSERT_EQ(hipMemcpy(h_scales_bw.data(), d_scales_bw, static_cast<size_t>(M) * blocks_per_row * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
 
-                // Compute reconstruction error
+                // Compute reconstruction error (blockwise: each 32-element block has its own scale)
                 float max_error = 0.0f;
                 float total_error = 0.0f;
                 for (int m = 0; m < M; ++m)
                 {
-                    float scale = h_scales_A[m];
                     for (int k = 0; k < K; ++k)
                     {
+                        const int block_idx = k / 32;
+                        float scale = h_scales_bw[static_cast<size_t>(m) * blocks_per_row + block_idx];
                         float original = h_activations[m * K + k];
                         float reconstructed = static_cast<float>(h_A_int8[m * K + k]) * scale;
                         float error = std::abs(original - reconstructed);
@@ -1333,15 +1291,15 @@ namespace llaminar2
 
                 float avg_error = total_error / (M * K);
 
-                // INT8 quantization: max error should be < 1 quantization step
-                // For [-1, 1] range mapped to [-127, 127], step = 2/254 ≈ 0.008
-                // Allow some tolerance for edge cases
+                // Blockwise INT8 quantization: tighter error bounds than row-wise
+                // Each 32-element block has its own scale, reducing quantization error
                 EXPECT_LT(max_error, 0.02f) << "Max reconstruction error too high";
                 EXPECT_LT(avg_error, 0.01f) << "Average reconstruction error too high";
 
                 LOG_INFO("[Integration] Reconstruction: max_error=" << max_error << ", avg_error=" << avg_error);
 
                 // Cleanup
+                hipFree(d_scales_bw);
                 rocmQuantGemm_freeDevice(d_activations, 0);
                 rocmQuantGemm_freeDevice(d_A_int8, 0);
                 rocmQuantGemm_freeDevice(d_scales_A, 0);
@@ -1862,25 +1820,28 @@ namespace llaminar2
                     &d_A_int8, &d_scales_A, &d_C_int32, &work_buffer_M,
                     M, K, N, 0));
 
-                // Step 5: Quantize activations on device
-                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(
-                    d_activations, d_A_int8, d_scales_A, M, K, 0, nullptr));
+                // Step 5: Quantize activations on device (blockwise)
+                const int blocks_per_row = (K + 31) / 32;
+                float *d_scales_bw = nullptr;
+                ASSERT_EQ(hipMalloc(&d_scales_bw, static_cast<size_t>(M) * blocks_per_row * sizeof(float)), hipSuccess);
+                ASSERT_TRUE(rocmQuantGemm_quantizeActivationsBlockwise(
+                    d_activations, d_A_int8, d_scales_bw, M, K, 0, nullptr, 32));
 
                 // Step 6: Verify quantized activations
                 std::vector<int8_t> h_A_int8(M * K);
-                std::vector<float> h_scales_A(M);
+                std::vector<float> h_scales_bw(static_cast<size_t>(M) * blocks_per_row);
 
                 ASSERT_EQ(hipMemcpy(h_A_int8.data(), d_A_int8, M * K * sizeof(int8_t),
                                     hipMemcpyDeviceToHost),
                           hipSuccess);
-                ASSERT_EQ(hipMemcpy(h_scales_A.data(), d_scales_A, M * sizeof(float),
+                ASSERT_EQ(hipMemcpy(h_scales_bw.data(), d_scales_bw, static_cast<size_t>(M) * blocks_per_row * sizeof(float),
                                     hipMemcpyDeviceToHost),
                           hipSuccess);
 
-                // Check all scales are positive
-                for (int m = 0; m < M; ++m)
+                // Check all per-block scales are positive
+                for (size_t i = 0; i < static_cast<size_t>(M) * blocks_per_row; ++i)
                 {
-                    EXPECT_GT(h_scales_A[m], 0.0f) << "Row " << m << " has non-positive scale";
+                    EXPECT_GT(h_scales_bw[i], 0.0f) << "Blockwise scale at index " << i << " is non-positive";
                 }
 
                 // Check INT8 values in valid range
@@ -1890,13 +1851,14 @@ namespace llaminar2
                     EXPECT_LE(h_A_int8[i], 127);
                 }
 
-                // Verify reconstruction accuracy
+                // Verify reconstruction accuracy (blockwise: each 32-element block has its own scale)
                 float max_error = 0.0f;
                 for (int m = 0; m < M; ++m)
                 {
-                    float scale = h_scales_A[m];
                     for (int k = 0; k < K; ++k)
                     {
+                        const int block_idx = k / 32;
+                        float scale = h_scales_bw[static_cast<size_t>(m) * blocks_per_row + block_idx];
                         float original = h_activations[m * K + k];
                         float reconstructed = h_A_int8[m * K + k] * scale;
                         float error = std::abs(original - reconstructed);
@@ -1904,7 +1866,7 @@ namespace llaminar2
                     }
                 }
 
-                float max_scale = *std::max_element(h_scales_A.begin(), h_scales_A.end());
+                float max_scale = *std::max_element(h_scales_bw.begin(), h_scales_bw.end());
                 EXPECT_LT(max_error, max_scale * 1.01f)
                     << "Activation reconstruction error too large";
 
@@ -1912,6 +1874,7 @@ namespace llaminar2
                                                                  << " → INT8, max_error=" << max_error);
 
                 // Cleanup
+                hipFree(d_scales_bw);
                 rocmQuantGemm_freeDevice(d_activations, 0);
                 rocmQuantGemm_freeDevice(d_A_int8, 0);
                 rocmQuantGemm_freeDevice(d_scales_A, 0);
@@ -1974,11 +1937,16 @@ namespace llaminar2
                     ASSERT_TRUE(rocmQuantGemm_ensureWorkBuffers(
                         &d_A_int8, &d_scales_A, &d_C_int32, &work_buffer_M,
                         tc.M, tc.K, tc.N, 0));
-                    ASSERT_TRUE(rocmQuantGemm_quantizeActivations(
-                        d_activations, d_A_int8, d_scales_A, tc.M, tc.K, 0, nullptr))
+
+                    const int blocks_per_row = (tc.K + 31) / 32;
+                    float *d_scales_bw = nullptr;
+                    ASSERT_EQ(hipMalloc(&d_scales_bw, static_cast<size_t>(tc.M) * blocks_per_row * sizeof(float)), hipSuccess);
+                    ASSERT_TRUE(rocmQuantGemm_quantizeActivationsBlockwise(
+                        d_activations, d_A_int8, d_scales_bw, tc.M, tc.K, 0, nullptr, 32))
                         << "Failed to quantize activations for " << tc.name;
 
                     // Cleanup
+                    hipFree(d_scales_bw);
                     rocmQuantGemm_freeDevice(d_activations, 0);
                     rocmQuantGemm_freeDevice(d_A_int8, 0);
                     rocmQuantGemm_freeDevice(d_scales_A, 0);
@@ -3180,10 +3148,14 @@ namespace llaminar2
                     N,
                     0));
                 ASSERT_TRUE(rocmQuantGemm_copyHostToDevice(d_input, input_host.data(), static_cast<size_t>(M) * K, 0));
-                ASSERT_TRUE(rocmQuantGemm_quantizeActivations(d_input, d_input_q, d_scales_a, M, K, 0, nullptr));
+
+                const int blocks_per_row = (K + 31) / 32;
+                float *d_scales_bw = nullptr;
+                ASSERT_EQ(hipMalloc(&d_scales_bw, static_cast<size_t>(M) * blocks_per_row * sizeof(float)), hipSuccess);
+                ASSERT_TRUE(rocmQuantGemm_quantizeActivationsBlockwise(d_input, d_input_q, d_scales_bw, M, K, 0, nullptr, 32));
 
                 std::vector<int8_t> activations_int8(static_cast<size_t>(M) * K);
-                std::vector<float> scales_a(static_cast<size_t>(M));
+                std::vector<float> scales_a_bw(static_cast<size_t>(M) * blocks_per_row);
                 ASSERT_EQ(hipMemcpy(
                               activations_int8.data(),
                               d_input_q,
@@ -3191,26 +3163,30 @@ namespace llaminar2
                               hipMemcpyDeviceToHost),
                           hipSuccess);
                 ASSERT_EQ(hipMemcpy(
-                              scales_a.data(),
-                              d_scales_a,
-                              scales_a.size() * sizeof(float),
+                              scales_a_bw.data(),
+                              d_scales_bw,
+                              scales_a_bw.size() * sizeof(float),
                               hipMemcpyDeviceToHost),
                           hipSuccess);
 
+                hipFree(d_scales_bw);
                 rocmQuantGemm_freeDevice(d_input, 0);
                 rocmQuantGemm_freeDevice(d_input_q, 0);
                 rocmQuantGemm_freeDevice(d_scales_a, 0);
                 rocmQuantGemm_freeDevice(d_acc, 0);
 
                 const NativeWeightReference weight_reference = buildNativeWeightReference(*unpackable, N, K);
-                const std::vector<float> quantized_reference = computeNativeReferenceFromQuantizedActivations(
+
+                // GPU blockwise quantize reference
+                const std::vector<float> gpu_blockwise_reference = computeNativeReferenceFromBlockwiseQuantizedActivations(
                     activations_int8,
-                    scales_a,
+                    scales_a_bw,
                     weight_reference,
                     M,
                     N,
                     K);
 
+                // CPU blockwise quantize reference (independent implementation)
                 std::vector<int8_t> activations_int8_blockwise;
                 std::vector<float> scales_a_blockwise;
                 quantizeActivationsPerBlock32(
@@ -3219,7 +3195,7 @@ namespace llaminar2
                     K,
                     activations_int8_blockwise,
                     scales_a_blockwise);
-                const std::vector<float> blockwise_quantized_reference = computeNativeReferenceFromBlockwiseQuantizedActivations(
+                const std::vector<float> cpu_blockwise_reference = computeNativeReferenceFromBlockwiseQuantizedActivations(
                     activations_int8_blockwise,
                     scales_a_blockwise,
                     weight_reference,
@@ -3291,22 +3267,19 @@ namespace llaminar2
                     rocm_output->data(),
                     rocm_output->data() + static_cast<size_t>(M * N));
 
-                const float rocm_vs_quantized_ref = cosineSimilarity(rocm_values, quantized_reference);
-                const float rocm_vs_blockwise_quantized_ref = cosineSimilarity(rocm_values, blockwise_quantized_reference);
-                const float cpu_vs_quantized_ref = cosineSimilarity(cpu_values, quantized_reference);
-                const float cpu_vs_blockwise_quantized_ref = cosineSimilarity(cpu_values, blockwise_quantized_reference);
+                const float rocm_vs_gpu_bw_ref = cosineSimilarity(rocm_values, gpu_blockwise_reference);
+                const float rocm_vs_cpu_bw_ref = cosineSimilarity(rocm_values, cpu_blockwise_reference);
+                const float cpu_vs_cpu_bw_ref = cosineSimilarity(cpu_values, cpu_blockwise_reference);
                 const float cpu_vs_rocm = cosineSimilarity(cpu_values, rocm_values);
 
-                LOG_INFO("[Integration] Real Qwen2 layer 0 down_proj quantized-reference: rocm_vs_quantized_ref="
-                         << rocm_vs_quantized_ref
-                         << " rocm_vs_blockwise_quantized_ref=" << rocm_vs_blockwise_quantized_ref
-                         << " cpu_vs_quantized_ref=" << cpu_vs_quantized_ref
-                         << " cpu_vs_blockwise_quantized_ref=" << cpu_vs_blockwise_quantized_ref
+                LOG_INFO("[Integration] Real Qwen2 layer 0 down_proj blockwise-reference:"
+                         << " rocm_vs_gpu_bw_ref=" << rocm_vs_gpu_bw_ref
+                         << " rocm_vs_cpu_bw_ref=" << rocm_vs_cpu_bw_ref
+                         << " cpu_vs_cpu_bw_ref=" << cpu_vs_cpu_bw_ref
                          << " cpu_vs_rocm=" << cpu_vs_rocm);
 
-                // Blockwise activation quantization reduces quantization error vs row-wise,
-                // so ROCm (which uses blockwise) should match the blockwise reference tightly.
-                EXPECT_GT(rocm_vs_blockwise_quantized_ref, ROCM_TO_QUANTIZED_REF_THRESHOLD)
+                // ROCm uses blockwise quantization — should match blockwise references tightly.
+                EXPECT_GT(rocm_vs_cpu_bw_ref, ROCM_TO_QUANTIZED_REF_THRESHOLD)
                     << "ROCm down_proj diverges from blockwise quantized-activation native reference";
             }
 
@@ -3335,6 +3308,8 @@ namespace llaminar2
                 int32_t *d_C_int32 = nullptr;
                 int work_buffer_M = 0;
 
+                const int blocks_per_row = (K + 31) / 32;
+
                 for (int M : batch_sizes)
                 {
                     auto activations = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
@@ -3352,10 +3327,13 @@ namespace llaminar2
 
                     EXPECT_GE(work_buffer_M, M) << "Work buffer too small for M=" << M;
 
-                    ASSERT_TRUE(rocmQuantGemm_quantizeActivations(
-                        d_activations, d_A_int8, d_scales_A, M, K, 0, nullptr))
+                    float *d_scales_bw = nullptr;
+                    ASSERT_EQ(hipMalloc(&d_scales_bw, static_cast<size_t>(M) * blocks_per_row * sizeof(float)), hipSuccess);
+                    ASSERT_TRUE(rocmQuantGemm_quantizeActivationsBlockwise(
+                        d_activations, d_A_int8, d_scales_bw, M, K, 0, nullptr, 32))
                         << "Failed to quantize for M=" << M;
 
+                    hipFree(d_scales_bw);
                     rocmQuantGemm_freeDevice(d_activations, 0);
                 }
 
@@ -3727,47 +3705,29 @@ namespace llaminar2
                 ASSERT_TRUE(packed.native_vnni_payload.empty());
 
                 auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
-                auto rowwise_output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
-                auto blockwise_output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
 
                 ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
-                ASSERT_TRUE(rowwise_output->allocateOnDevice(DeviceId::rocm(0)));
-                ASSERT_TRUE(blockwise_output->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
 
                 {
-                    ROCmQuantisedGemmKernel rowwise_kernel(&packed, 0);
-                    rowwise_kernel.setActivationQuantMode(ActivationQuantMode::ROW_WISE);
-                    ASSERT_TRUE(setupWorkspace(rowwise_kernel, M, N, K));
-                    ASSERT_TRUE(rowwise_kernel.multiply_tensor(input.get(), rowwise_output.get(), M, N, K));
-                    cleanupWorkspace(rowwise_kernel);
-                }
-
-                {
-                    ROCmQuantisedGemmKernel blockwise_kernel(&packed, 0);
-                    blockwise_kernel.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
-                    ASSERT_TRUE(setupWorkspace(blockwise_kernel, M, N, K));
-                    ASSERT_TRUE(blockwise_kernel.multiply_tensor(input.get(), blockwise_output.get(), M, N, K));
-                    cleanupWorkspace(blockwise_kernel);
+                    ROCmQuantisedGemmKernel kernel(&packed, 0);
+                    ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+                    ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
+                    cleanupWorkspace(kernel);
                 }
 
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                rowwise_output->mark_device_dirty();
-                blockwise_output->mark_device_dirty();
+                output->mark_device_dirty();
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
                 cpuFP32GemmRef(in_host, W_fp32.data(), ref.data(), M, N, K);
 
-                const float rowwise_cos = cosineSim(rowwise_output->data(), ref.data(), static_cast<size_t>(M) * N);
-                const float blockwise_cos = cosineSim(blockwise_output->data(), ref.data(), static_cast<size_t>(M) * N);
-                const float cross_cos = cosineSim(rowwise_output->data(), blockwise_output->data(), static_cast<size_t>(M) * N);
+                const float blockwise_cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
 
-                LOG_INFO("[Dispatch] Q8_0 decode medium-shape rowwise cosine=" << rowwise_cos
-                                                                                << " blockwise cosine=" << blockwise_cos
-                                                                                << " cross cosine=" << cross_cos);
-                EXPECT_GT(rowwise_cos, 0.985f) << "Row-wise medium-shape decode cosine too low";
+                LOG_INFO("[Dispatch] Q8_0 decode medium-shape blockwise cosine=" << blockwise_cos);
                 EXPECT_GT(blockwise_cos, 0.985f) << "Blockwise medium-shape decode cosine too low";
-                EXPECT_GT(cross_cos, 0.995f) << "Medium-shape blockwise decode diverged from row-wise baseline";
             }
 
             TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_Q8_0_Decode_KVShapeBlockwiseMatchesReference)
@@ -3801,47 +3761,29 @@ namespace llaminar2
                 ASSERT_TRUE(packed.native_vnni_payload.empty());
 
                 auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
-                auto rowwise_output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
-                auto blockwise_output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
 
                 ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
-                ASSERT_TRUE(rowwise_output->allocateOnDevice(DeviceId::rocm(0)));
-                ASSERT_TRUE(blockwise_output->allocateOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
 
                 {
-                    ROCmQuantisedGemmKernel rowwise_kernel(&packed, 0);
-                    rowwise_kernel.setActivationQuantMode(ActivationQuantMode::ROW_WISE);
-                    ASSERT_TRUE(setupWorkspace(rowwise_kernel, M, N, K));
-                    ASSERT_TRUE(rowwise_kernel.multiply_tensor(input.get(), rowwise_output.get(), M, N, K));
-                    cleanupWorkspace(rowwise_kernel);
-                }
-
-                {
-                    ROCmQuantisedGemmKernel blockwise_kernel(&packed, 0);
-                    blockwise_kernel.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
-                    ASSERT_TRUE(setupWorkspace(blockwise_kernel, M, N, K));
-                    ASSERT_TRUE(blockwise_kernel.multiply_tensor(input.get(), blockwise_output.get(), M, N, K));
-                    cleanupWorkspace(blockwise_kernel);
+                    ROCmQuantisedGemmKernel kernel(&packed, 0);
+                    ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+                    ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
+                    cleanupWorkspace(kernel);
                 }
 
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                rowwise_output->mark_device_dirty();
-                blockwise_output->mark_device_dirty();
+                output->mark_device_dirty();
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
                 cpuFP32GemmRef(in_host, W_fp32.data(), ref.data(), M, N, K);
 
-                const float rowwise_cos = cosineSim(rowwise_output->data(), ref.data(), static_cast<size_t>(M) * N);
-                const float blockwise_cos = cosineSim(blockwise_output->data(), ref.data(), static_cast<size_t>(M) * N);
-                const float cross_cos = cosineSim(rowwise_output->data(), blockwise_output->data(), static_cast<size_t>(M) * N);
+                const float blockwise_cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
 
-                LOG_INFO("[Dispatch] Q8_0 decode KV-shape rowwise cosine=" << rowwise_cos
-                                                                            << " blockwise cosine=" << blockwise_cos
-                                                                            << " cross cosine=" << cross_cos);
-                EXPECT_GT(rowwise_cos, 0.985f) << "Row-wise KV-shape decode cosine too low";
+                LOG_INFO("[Dispatch] Q8_0 decode KV-shape blockwise cosine=" << blockwise_cos);
                 EXPECT_GT(blockwise_cos, 0.985f) << "Blockwise KV-shape decode cosine too low";
-                EXPECT_GT(cross_cos, 0.995f) << "KV-shape blockwise decode diverged from row-wise baseline";
             }
 
             /**
@@ -3939,7 +3881,7 @@ namespace llaminar2
                     hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
 
                     ASSERT_TRUE(rocmQuantGemm_quantizeActivationsBlockwise(
-                        d_A, d_A_int8, d_scale_A_bw, 1, K, 0, nullptr));
+                        d_A, d_A_int8, d_scale_A_bw, 1, K, 0, nullptr, 32));
                     hipDeviceSynchronize();
 
                     // Output buffers: individual (reference) + pair (test)
@@ -4637,9 +4579,6 @@ namespace llaminar2
                 ROCmQuantisedGemmKernel q_kernel(&packed_q, 0);
                 ROCmQuantisedGemmKernel k_kernel(&packed_k, 0);
                 ROCmQuantisedGemmKernel v_kernel(&packed_v, 0);
-                q_kernel.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
-                k_kernel.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
-                v_kernel.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
 
                 auto q_workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 64 * 1024 * 1024);
                 auto k_workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 64 * 1024 * 1024);
@@ -4737,8 +4676,6 @@ namespace llaminar2
 
                 ROCmQuantisedGemmKernel gate_kernel(&packed_gate, 0);
                 ROCmQuantisedGemmKernel up_kernel(&packed_up, 0);
-                gate_kernel.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
-                up_kernel.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
 
                 auto gate_workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 64 * 1024 * 1024);
                 auto up_workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 64 * 1024 * 1024);
@@ -4815,8 +4752,6 @@ namespace llaminar2
 
                 ROCmQuantisedGemmKernel kernel0(&packed0, 0);
                 ROCmQuantisedGemmKernel kernel1(&packed1, 0);
-                kernel0.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
-                kernel1.setActivationQuantMode(ActivationQuantMode::BLOCKWISE);
 
                 auto workspace0 = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 64 * 1024 * 1024);
                 auto workspace1 = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 64 * 1024 * 1024);

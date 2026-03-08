@@ -2668,7 +2668,7 @@ extern "C"
 // ============================================================================
 //
 // Variant of V3 GEMM kernel that applies per-K-block activation scales during
-// accumulation instead of a single row-wise scale in the epilogue.
+// accumulation instead of a single per-row scale in the epilogue.
 //
 // Key differences from V3:
 // - Forces KT=8 (8 k-groups = 32 elements = 1 activation block)

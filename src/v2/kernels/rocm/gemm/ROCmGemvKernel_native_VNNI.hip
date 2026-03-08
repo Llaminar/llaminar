@@ -566,8 +566,8 @@ __global__ void gemv_native_vnni_kernel_t(
     const uint32_t*  __restrict__ d_block_emins,   // [blocks_per_row × N] packed {lo,hi} emins (Q2_K only, else nullptr)
     float*           __restrict__ d_C_fp32,        // [N] output (FP32), used when kblocks=1
     float*           __restrict__ d_partial_fp32,  // [KB × N] partials, used when kblocks>1
-    const float*     __restrict__ d_scale_A,       // [1] row-wise activation scale (used when d_scale_A_blockwise==nullptr)
-    const float*     __restrict__ d_scale_A_blockwise, // [blocks_per_row] per-block activation scales (nullptr for row-wise)
+    const float*     __restrict__ d_scale_A,       // [1] per-row activation scale (CK fallback, used when d_scale_A_blockwise==nullptr)
+    const float*     __restrict__ d_scale_A_blockwise, // [blocks_per_row] per-block activation scales
     int N, int K, int kblocks)
 {
     using Traits = NVNNITraits<FMT>;
@@ -662,7 +662,7 @@ __global__ void gemv_native_vnni_kernel_t(
         // ---- Original single-block loop for non-IQ formats ----
         for (int b = b_start; b < b_end; ++b)
         {
-            // Per-block activation scale (blockwise) or 1.0 (row-wise)
+            // Per-block activation scale (blockwise) or 1.0 (fallback)
             const float scale_ab = d_scale_A_blockwise ? d_scale_A_blockwise[b] : 1.0f;
 
             // A pointer for this block's 32 INT8 activation values

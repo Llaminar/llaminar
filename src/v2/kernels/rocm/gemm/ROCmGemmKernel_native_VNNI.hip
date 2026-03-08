@@ -1692,7 +1692,7 @@ void streaming_lm_head_kernel(
     const uint32_t*  __restrict__ d_block_emins,  // [blocks_per_row × N] packed {lo,hi} emins (Q2_K only, else nullptr)
     float*           __restrict__ d_output,       // [M × N] FP32 output
     const float*     __restrict__ d_scales_A,     // [M] per-row activation scales
-    const float*     __restrict__ d_scales_A_blockwise, // [M × blocks_per_row] per-block scales (nullptr = row-wise)
+    const float*     __restrict__ d_scales_A_blockwise, // [M × blocks_per_row] per-block activation scales
     int M, int N, int K)
 {
     static_assert(M_TILE == 8 || M_TILE == 16 || M_TILE == 32,
@@ -2536,7 +2536,7 @@ bool rocmGemm_native_vnni_fp32(
     const void*    d_block_emins,  // [blocks_per_row × N] packed {lo,hi} emins (Q2_K only, nullable)
     float*         d_output,       // [M × N] FP32 output
     const float*   d_scales_A,     // [M] per-row activation scales
-    const float*   d_scales_A_blockwise, // [M × blocks_per_row] per-block scales (nullptr = row-wise)
+    const float*   d_scales_A_blockwise, // [M × blocks_per_row] per-block activation scales
     int M, int N, int K,
     uint8_t codebook_id,
     int device_id, void* stream)
